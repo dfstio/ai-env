@@ -1,0 +1,18 @@
+[package]
+name = "ai-env-age"
+description = "Read-only age header parser and tagged-recipient matcher for ai-env (no decryption, no curve arithmetic)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+proptest = { workspace = true }

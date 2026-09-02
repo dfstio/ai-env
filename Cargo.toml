@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/ai-env-age", "crates/ai-env-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/dfstio/ai-env"
+
+[workspace.dependencies]
+ai-env-age = { path = "crates/ai-env-age" }
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+hex = "=0.4.3"
+zeroize = "=1.9.0"
+thiserror = "=2.0.20"
+clap = { version = "=4.6.1", features = ["derive", "env"] }
+toml = "=0.8.23"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+proptest = "=1.9.0"
+tempfile = "=3.27.0"
+
+[profile.release]
+lto = true
+strip = "debuginfo"
