@@ -84,6 +84,7 @@ ai-env encrypt [FILE] [-k NAME] [--stdout] [--force]      # in place; no prompt
 ai-env show    [FILE] [-k NAME] [-i IDENTITY]             # print plaintext (Touch ID)
 ai-env decrypt [FILE] [-o OUT | --force]                  # restore plaintext (Touch ID)
 ai-env run     [-f FILE] [-k NAME] -- CMD ARGS...         # exec with decrypted env (Touch ID)
+ai-env edit    [FILE] [-k NAME] [-i IDENTITY]             # secure in-terminal editor (Touch ID)
 ai-env which   [FILE]                                     # which key opens this? no prompt
 ai-env info    [FILE] [--json]                            # header details, no prompt
 ai-env keys    list | show NAME | default NAME | forget NAME [--yes]
@@ -119,6 +120,25 @@ default_key = "myapp-devnet"
 paths = ["*.mainnet.env", "deploy/prod/*"]
 key   = "myapp-mainnet"
 ```
+
+## Editing (`ai-env edit`)
+
+A secure form-style editor: variable **names** are listed, every **value** stays sealed
+(masked) and is decrypted only while you edit it — **at most one value is ever plaintext in
+memory**, inside a locked, guard-paged buffer. Values re-seal after 30s idle. `Enter`
+reveals/commits, `Esc` discards, `a` adds, `r` renames, `d` deletes, `u` undoes (sealed
+history), `Ctrl+S` saves (streams values one at a time into age — never a whole-file
+plaintext buffer), `Ctrl+Q` quits.
+
+The in-memory sealing follows OpenSSH's ssh-agent key-shielding design: an ephemeral 16 KiB
+prekey in mlocked guard-paged memory, per-value XChaCha20-Poly1305 cells bound to their
+variable name, 256-byte padding buckets. It defeats a **snapshot** adversary (core dumps —
+also disabled outright, crash reports, forensic memory scans, swap images): a captured
+snapshot contains at most one plaintext value instead of all of them. It does **not** defeat
+a live same-user attacker (who could simply run `ai-env show`), the pixels of a revealed
+value in your terminal emulator's memory, or screen capture. `edit` refuses to run under
+tmux/screen (their server process keeps a copy of the drawn screen and outlives the editor;
+`--insecure-terminal` overrides) and denies debugger attach for its lifetime.
 
 ## Git: commit the ciphertext
 

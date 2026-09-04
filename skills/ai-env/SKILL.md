@@ -29,6 +29,12 @@ only be used after the **user** approves a Touch ID prompt.
 
 ## Editing the variables
 
+Preferred (plaintext never touches disk; user gets a secure in-terminal form):
+```sh
+ai-env edit                 # user Touch ID; interactive — the USER must drive it, not you
+```
+`edit` is interactive and refuses non-TTY stdin, so run it in the user's terminal or ask the
+user to run it. Fallback (leaves plaintext on disk between the two steps):
 ```sh
 ai-env decrypt --force      # restore plaintext in place (user Touch ID)
 # ... edit .env ...

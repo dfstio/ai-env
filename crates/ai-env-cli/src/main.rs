@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod container;
 mod dotenv;
+mod edit;
 mod errors;
 mod git;
 mod select;
@@ -111,6 +112,21 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Edit an encrypted .env in a secure form (ONE Touch ID prompt);
+    /// values stay sealed in memory, at most one revealed at a time
+    Edit {
+        #[arg(default_value = ".env")]
+        file: PathBuf,
+        /// Key override (normally auto-detected from the file's recipient tag)
+        #[arg(short, long, value_name = "NAME")]
+        key: Option<String>,
+        /// Recovery: open with an age identity FILE instead of the enclave
+        #[arg(short = 'i', long, value_name = "FILE")]
+        identity: Option<PathBuf>,
+        /// Allow running inside tmux/screen (their servers keep a copy of the screen)
+        #[arg(long)]
+        insecure_terminal: bool,
+    },
     /// Which key opens this file? (no prompt, no decryption)
     Which {
         #[arg(default_value = ".env")]
@@ -201,6 +217,10 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Run { file, key, identity, command } => {
             let age = age_cmd::AgeTool::probe()?;
             commands::run(&store, &age, &commands::RunOpts { file, key, identity, command })
+        }
+        Cmd::Edit { file, key, identity, insecure_terminal } => {
+            let age = age_cmd::AgeTool::probe()?;
+            edit::run_edit(&store, &age, &edit::EditOpts { file, key, identity, insecure_terminal })
         }
         Cmd::Which { file } => commands::which(&store, &file),
         Cmd::Info { file, json } => commands::info(&store, &file, json),

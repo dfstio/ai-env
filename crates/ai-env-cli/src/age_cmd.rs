@@ -11,7 +11,7 @@
 //! * stderr is classified ONLY for exit 5 (plugin missing) and best-effort
 //!   exit 3 (cancel). Never 4 or 6 — those are decided before age is spawned.
 use crate::errors::{CliError, Result};
-use std::io::Write as _;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
@@ -131,6 +131,65 @@ impl AgeTool {
         Ok(out.stdout)
     }
 
+    /// Encrypt via `age -R recipients.txt`, with the PLAINTEXT STREAMED by
+    /// the caller directly into age's stdin — used by `edit`'s save path so
+    /// at most one unsealed value exists at a time (never a whole-file
+    /// plaintext buffer). stdout/stderr are drained on threads (the inverse
+    /// of `encrypt`'s threaded-stdin pattern, same 64 KiB pipe-deadlock
+    /// rationale). Returns the binary ciphertext.
+    pub fn encrypt_streaming(
+        &self,
+        recipients_file: &Path,
+        write_plaintext: impl FnOnce(&mut dyn Write) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        let mut child = self
+            .cmd()
+            .arg("-e")
+            .arg("-R")
+            .arg(safe_path(recipients_file))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| CliError::Msg(format!("cannot spawn age: {e}")))?;
+
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let write_result = write_plaintext(&mut stdin);
+        drop(stdin); // EOF to age
+
+        let ciphertext = out_thread.join().unwrap_or_default();
+        let errtext = err_thread.join().unwrap_or_default();
+        let status = child.wait()?;
+        if let Err(e) = write_result {
+            // The writer usually fails BECAUSE age died (broken pipe) — age's
+            // own stderr is the actionable message, not "broken pipe"
+            // (audit fix 21).
+            if !errtext.is_empty() {
+                return Err(classify_failure(&errtext, "encryption"));
+            }
+            return Err(e);
+        }
+        if !status.success() {
+            return Err(classify_failure(&errtext, "encryption"));
+        }
+        Ok(ciphertext)
+    }
+
     /// Decrypt with EXACTLY ONE identity file, capturing plaintext in memory
     /// (for `run`). Touch ID fires here for policy-protected SE identities.
     pub fn decrypt_to_bytes(
@@ -172,12 +231,56 @@ impl AgeTool {
             let mut stdin = stdin;
             let _ = stdin.write_all(&payload);
         });
-        let out = child.wait_with_output()?;
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+
+        // Drain stdout OURSELVES into a buffer pre-reserved to the ciphertext
+        // size: decrypted output is always smaller, so the Vec NEVER
+        // reallocates — `read_to_end`'s geometric growth would strew partial
+        // plaintext copies across the heap (audit fix 6). The read chunk is
+        // wiped after the loop.
+        let plaintext = match child.stdout.take() {
+            Some(mut out_pipe) => {
+                use std::io::Read as _;
+                let mut out = Vec::with_capacity(ciphertext.len().max(64));
+                let mut chunk = [0u8; 8192];
+                let read_result = loop {
+                    match out_pipe.read(&mut chunk) {
+                        Ok(0) => break Ok(()),
+                        Ok(n) => {
+                            if out.len() + n > out.capacity() {
+                                break Err(CliError::Msg(
+                                    "decrypted output larger than ciphertext — refusing".into(),
+                                ));
+                            }
+                            out.extend_from_slice(&chunk[..n]);
+                        }
+                        Err(e) => break Err(e.into()),
+                    }
+                };
+                // SAFETY: chunk is a live local buffer; volatile wipe.
+                unsafe { memsec::memzero(chunk.as_mut_ptr(), chunk.len()) };
+                read_result.map(|()| out)
+            }
+            None => Ok(Vec::new()), // stdout inherited (show): nothing to capture
+        };
+
         let _ = writer.join();
-        if !out.status.success() {
-            return Err(classify_failure(&out.stderr, "decryption"));
+        let errtext = err_thread.join().unwrap_or_default();
+        let status = child.wait()?;
+        if !status.success() {
+            if let Ok(mut leaked) = plaintext {
+                use zeroize::Zeroize as _;
+                leaked.zeroize();
+            }
+            return Err(classify_failure(&errtext, "decryption"));
         }
-        Ok(out.stdout)
+        plaintext
     }
 
     /// `age-keygen`: a fresh X25519 identity. Returns (secret identity line,
