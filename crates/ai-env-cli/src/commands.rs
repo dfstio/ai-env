@@ -397,14 +397,72 @@ pub fn keys_forget(store: &Keystore, name: &str, yes: bool) -> Result<()> {
 // ---- rekey ------------------------------------------------------------------
 
 pub fn rekey(store: &Keystore, age: &AgeTool, dir: &Path, dry_run: bool, yes: bool) -> Result<()> {
-    let mut targets: Vec<PathBuf> = Vec::new();
-    discover_containers(dir, 0, &mut targets)?;
-    if targets.is_empty() {
+    rekey_filtered(store, age, dir, dry_run, yes, None)
+}
+
+/// The rekey sweep, optionally restricted to files that resolve to one key
+/// (used by `keys add-recipient --rekey`).
+fn rekey_filtered(
+    store: &Keystore,
+    age: &AgeTool,
+    dir: &Path,
+    dry_run: bool,
+    yes: bool,
+    key_filter: Option<&str>,
+) -> Result<()> {
+    let mut discovered: Vec<PathBuf> = Vec::new();
+    discover_containers(dir, 0, &mut discovered)?;
+    if discovered.is_empty() {
         outln!("no ai-env containers found under {}", dir.display());
         return Ok(());
     }
-    for t in &targets {
-        outln!("{}", t.display());
+    // Resolve every container up front (prompt-free header matching), so the
+    // listing, the dry-run, and the >10 --yes gate all describe EXACTLY the
+    // files that will be touched — never foreign-key files that would only
+    // be skipped anyway.
+    let mut targets: Vec<(PathBuf, container::Container, String)> = Vec::new();
+    let mut skipped = 0usize;
+    for path in discovered {
+        // A container none of our keys can open (someone else's file, a
+        // forgotten key, a corrupt payload) is skipped with a warning — not
+        // a reason to abort the rest of the sweep.
+        let cont = match load_container(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping {} — {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        let key = match select::resolve_for_decrypt(store, None, &cont) {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("skipping {} — {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        if let Some(only) = key_filter {
+            if key != only {
+                eprintln!(
+                    "skipping {} — belongs to key {key:?}, not {only:?}",
+                    path.display()
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+        targets.push((path, cont, key));
+    }
+    if targets.is_empty() {
+        outln!(
+            "nothing to re-encrypt under {} ({skipped} file(s) skipped)",
+            dir.display()
+        );
+        return Ok(());
+    }
+    for (path, _, key) in &targets {
+        outln!("{}  (key {key:?})", path.display());
     }
     if dry_run {
         outln!("(dry run: {} file(s) would be re-encrypted)", targets.len());
@@ -418,27 +476,26 @@ pub fn rekey(store: &Keystore, age: &AgeTool, dir: &Path, dry_run: bool, yes: bo
             targets.len()
         );
     }
-    let mut skipped = 0usize;
-    for path in &targets {
-        let cont = load_container(path)?;
-        // A container none of our keys can open (someone else's file, or a
-        // forgotten key) is skipped with a warning — not a reason to abort
-        // the rest of the sweep.
-        let key = match select::resolve_for_decrypt(store, None, &cont) {
-            Ok(key) => key,
-            Err(e) => {
-                eprintln!("skipping {} — {e}", path.display());
-                skipped += 1;
-                continue;
-            }
-        };
-        let plaintext = age.decrypt_to_bytes(&store.identity_path(&key), &cont.data)?;
-        let ciphertext = age.encrypt(&store.recipients_path(&key), &plaintext)?;
-        write_atomic(path, container::write(&ciphertext).as_bytes())?;
+    let total = targets.len();
+    for (done, (path, cont, key)) in targets.iter().enumerate() {
+        let result = (|| -> Result<()> {
+            let plaintext = age.decrypt_to_bytes(&store.identity_path(key), &cont.data)?;
+            let ciphertext = age.encrypt(&store.recipients_path(key), &plaintext)?;
+            write_atomic(path, container::write(&ciphertext).as_bytes())
+        })();
+        if let Err(e) = result {
+            // Partial completion must be visible: everything re-encrypted so
+            // far is fine; re-running the same command finishes the rest.
+            eprintln!(
+                "aborted after {done} of {total} file(s) — re-run the same command to \
+                 finish the remainder"
+            );
+            return Err(e);
+        }
         eprintln!("re-encrypted {} with key {key:?}", path.display());
     }
     if skipped > 0 {
-        eprintln!("({skipped} file(s) skipped — no key in this keystore opens them)");
+        eprintln!("({skipped} file(s) skipped)");
     }
     Ok(())
 }
@@ -467,22 +524,128 @@ fn discover_containers(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Resu
     Ok(())
 }
 
+/// `keys add-recipient`: add a public recipient (server key, teammate) to a
+/// named key, so every FUTURE encrypt with this key includes it; `--rekey`
+/// re-encrypts existing files too (one Touch ID prompt per file).
+pub fn keys_add_recipient(
+    store: &Keystore,
+    age: &AgeTool,
+    name: &str,
+    recipient: &str,
+    label: Option<&str>,
+    rekey_dir: Option<&Path>,
+    yes: bool,
+) -> Result<()> {
+    if !store.key_exists(name) {
+        return Err(CliError::NoKey(format!("key {name:?} does not exist (ai-env keys list)")));
+    }
+    // The label is interpolated into a recipients.txt comment — a newline in
+    // it would inject arbitrary (live) recipient lines.
+    if label.is_some_and(|l| l.chars().any(char::is_control)) {
+        return Err(CliError::Usage(
+            "--label must be a single line without control characters".into(),
+        ));
+    }
+    let trimmed = recipient.trim();
+
+    // THE guard this command exists for: a mispasted PRIVATE identity must
+    // never land in a world-readable recipients.txt.
+    if trimmed.to_ascii_uppercase().contains("AGE-SECRET-KEY") {
+        bail!(
+            "that is a PRIVATE identity — a recipient is the public `age1…` half \
+             (get it with: age-keygen -y). Never store or share the private part; \
+             if it was ever exposed, rotate it"
+        );
+    }
+    // Normalize: bech32 is single-case, and age accepts only lowercase in -R
+    // files — an appended UPPERCASE line (QR decoders, autocapitalize) would
+    // make age reject the whole file and brick every future encrypt.
+    let recipient = trimmed.to_ascii_lowercase();
+    let decoded = ai_env_age::decode_recipient(&recipient)
+        .map_err(|e| CliError::Msg(format!("not a valid age recipient: {e}")))?;
+
+    let path = store.recipients_path(name);
+    let existing = fs::read_to_string(&path)
+        .map_err(|e| CliError::Msg(format!("cannot read {}: {e}", path.display())))?;
+    if existing.lines().any(|l| l.trim().to_ascii_lowercase() == recipient) {
+        outln!("{recipient} is already a recipient of key {name:?} — nothing to do");
+    } else {
+        let mut updated = existing.clone();
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&format!(
+            "# added {}: {}\n{recipient}\n",
+            crate::ceremony::today_string(),
+            label.unwrap_or("additional recipient"),
+        ));
+        write_atomic(&path, updated.as_bytes())?;
+        // age itself must accept the updated file — roll back if not, so
+        // recipients.txt can never be committed in a state that breaks every
+        // future encrypt with this key. (Prompt-free: encryption never asks.)
+        if let Err(e) = age.encrypt(&path, b"ai-env add-recipient probe") {
+            let _ = write_atomic(&path, existing.as_bytes());
+            bail!("age rejected the updated recipients file ({e}) — change rolled back");
+        }
+        outln!("added recipient to key {name:?}: {recipient}");
+
+        // A tag recipient that IS another local key's enclave key changes
+        // resolution for new files (Ambiguous → -k required); warn precisely.
+        let mut collides_with: Option<String> = None;
+        if let Some(point) = decoded.p256_point() {
+            for (other, _) in store.keys() {
+                if other != name && store.tag_point_of(&other)?.as_ref() == Some(point) {
+                    collides_with = Some(other);
+                    break;
+                }
+            }
+        }
+        if let Some(other) = collides_with {
+            outln!(
+                "WARNING: this is key {other:?}'s Secure Enclave recipient — files encrypted \
+                 with {name:?} from now on will match BOTH keys, and show/decrypt will need \
+                 -k to disambiguate"
+            );
+        } else if matches!(decoded, ai_env_age::Recipient::Tag(_) | ai_env_age::Recipient::Se(_)) {
+            outln!(
+                "note: a tagged (Secure Enclave) recipient — it decrypts on the OTHER party's \
+                 hardware and does not affect this keystore's key resolution"
+            );
+        }
+    }
+    // Reached on the already-present path too: re-running with --rekey after
+    // an earlier add without it must still sweep.
+    match rekey_dir {
+        Some(dir) => {
+            outln!("re-encrypting existing files under {} …", dir.display());
+            rekey_filtered(store, age, dir, false, yes, Some(name))?;
+        }
+        None => outln!(
+            "NEW files encrypted with {name:?} include this recipient; existing files gain \
+             it only after re-encryption: ai-env keys add-recipient … --rekey DIR, or ai-env rekey"
+        ),
+    }
+    Ok(())
+}
+
 /// `keys restore --rekey DIR`: re-encrypt every container the pasted recovery
 /// identity opens to `key_name`'s current recipients. Software-only decrypt —
 /// ZERO Touch ID prompts; the identity travels via the FIFO path, never disk.
-/// Files the identity cannot open (other keys' files, corrupt containers)
-/// are skipped with a note. Returns (re-encrypted, skipped).
+/// Files the identity cannot open are skipped with the REAL error (an
+/// infrastructure failure must not masquerade as "someone else's file");
+/// per-file encrypt/write failures do not abort the rest of the sweep.
+/// Returns (re-encrypted, skipped, failed) — the caller reports them.
 pub fn restore_rekey_sweep(
     store: &Keystore,
     age: &AgeTool,
     dir: &Path,
     identity: &Zeroizing<String>,
     key_name: &str,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let mut targets: Vec<PathBuf> = Vec::new();
     discover_containers(dir, 0, &mut targets)?;
     let recipients = store.recipients_path(key_name);
-    let (mut done, mut skipped) = (0usize, 0usize);
+    let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for path in &targets {
         let cont = match load_container(path) {
             Ok(c) => c,
@@ -494,21 +657,30 @@ pub fn restore_rekey_sweep(
         };
         match age.decrypt_with_identity_string(identity, &cont.data) {
             Ok(plaintext) => {
-                let ciphertext = age.encrypt(&recipients, &plaintext)?;
-                write_atomic(path, container::write(&ciphertext).as_bytes())?;
-                eprintln!("re-encrypted {} to key {key_name:?}", path.display());
-                done += 1;
+                let written = age
+                    .encrypt(&recipients, &plaintext)
+                    .and_then(|ct| write_atomic(path, container::write(&ct).as_bytes()));
+                match written {
+                    Ok(()) => {
+                        eprintln!("re-encrypted {} to key {key_name:?}", path.display());
+                        done += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("FAILED {} — {e}", path.display());
+                        failed += 1;
+                    }
+                }
             }
-            Err(_) => {
+            Err(e) => {
                 eprintln!(
-                    "skipping {} — not addressed to this recovery identity",
+                    "skipping {} — cannot decrypt with the pasted identity ({e})",
                     path.display()
                 );
                 skipped += 1;
             }
         }
     }
-    Ok((done, skipped))
+    Ok((done, skipped, failed))
 }
 
 // ---- verify-recovery --------------------------------------------------------
@@ -521,10 +693,10 @@ pub fn verify_recovery(store: &Keystore, age: &AgeTool, name: &str) -> Result<()
         CliError::Msg(format!("key {name:?} was created with --no-recovery — nothing to verify"))
     })?;
 
-    let pasted = crate::ceremony::read_secret_from_tty(&format!(
+    let mut pasted = crate::ceremony::read_secret_from_tty(&format!(
         "Paste the recovery identity for {name:?} from Strongbox (or the paper sheet): "
     ))?;
-    let pasted = Zeroizing::new(pasted.trim().to_string());
+    crate::ceremony::trim_in_place(&mut pasted);
     let derived = age.identity_to_recipient(&pasted)?;
     if derived != expected {
         bail!(

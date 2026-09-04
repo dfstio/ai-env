@@ -359,19 +359,21 @@ impl AgeTool {
         };
         let result = self.run_decrypt(&fifo_path, ciphertext, Stdio::piped());
         // If age exited without ever opening the FIFO (bad ciphertext, early
-        // error), the writer thread is still blocked in open(2). Open the
-        // read end non-blocking ourselves to release it — otherwise join()
-        // would hang the process.
-        if !writer.is_finished() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let _ = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&fifo_path);
-            }
-        }
+        // error), the writer thread may still be blocked in open(2). Open the
+        // read end non-blocking to release it, and HOLD the fd until the
+        // writer is joined — closing it immediately would re-strand a writer
+        // that only reaches open(2) after our close (join would then hang).
+        #[cfg(unix)]
+        let _unblock: Option<std::fs::File> = if writer.is_finished() {
+            None
+        } else {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo_path)
+                .ok()
+        };
         let _ = writer.join();
         let _ = std::fs::remove_file(&fifo_path);
         drop(fifo_dir);

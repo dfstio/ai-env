@@ -15,7 +15,7 @@ use crate::bail;
 use crate::errors::{CliError, Result};
 use crate::store::{validate_identity_file, validate_key_name, write_atomic, KeyMeta, Keystore};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 
 use std::process::Command;
 use zeroize::Zeroizing;
@@ -37,9 +37,14 @@ pub struct KeygenOpts {
     pub no_recovery: bool,
 }
 
-/// Shared preflight for keygen and restore: name/policy validation,
+/// Shared preflight for keygen and restore: name/policy/entry validation,
 /// existing-key refusal, plugin discovery.
-fn preflight_new_key(store: &Keystore, name: &str, access_control: &str) -> Result<std::path::PathBuf> {
+fn preflight_new_key(
+    store: &Keystore,
+    name: &str,
+    access_control: &str,
+    strongbox_entry: Option<&str>,
+) -> Result<std::path::PathBuf> {
     validate_key_name(name)?;
     if !ACCESS_CONTROLS.contains(&access_control) {
         bail!(
@@ -47,6 +52,13 @@ fn preflight_new_key(store: &Keystore, name: &str, access_control: &str) -> Resu
             access_control,
             ACCESS_CONTROLS.join(", ")
         );
+    }
+    // The entry name is interpolated into a recipients.txt comment — a
+    // newline in it would inject arbitrary (live) recipient lines.
+    if strongbox_entry.is_some_and(|e| e.chars().any(char::is_control)) {
+        return Err(CliError::Usage(
+            "--strongbox-entry must be a single line without control characters".into(),
+        ));
     }
     if store.key_exists(name) {
         bail!(
@@ -138,7 +150,12 @@ fn create_se_identity(
 }
 
 pub fn keygen(store: &Keystore, age: &AgeTool, opts: &KeygenOpts) -> Result<()> {
-    let plugin = preflight_new_key(store, &opts.name, &opts.access_control)?;
+    let plugin = preflight_new_key(
+        store,
+        &opts.name,
+        &opts.access_control,
+        opts.strongbox_entry.as_deref(),
+    )?;
     let key_dir = store.key_dir(&opts.name);
     let file_pub = create_se_identity(store, &plugin, &opts.name, &opts.access_control)?;
 
@@ -201,36 +218,58 @@ pub struct RestoreOpts {
 /// paste -> a NEW Secure Enclave key -> (optionally) existing files
 /// re-encrypted to it. The old SE key is unrecoverable by design (CryptoKit
 /// SE keys cannot be enumerated); this restores the WORKFLOW, not that key.
+/// When the key ALREADY exists and `--rekey` is given, no key is created:
+/// the paste is verified against the stored recovery recipient and only the
+/// sweep runs — this is what the exit-4 advice tells users to do.
 pub fn restore(store: &Keystore, age: &AgeTool, opts: &RestoreOpts) -> Result<()> {
-    let plugin = preflight_new_key(store, &opts.name, &opts.access_control)?;
+    // Catch a typo'd --rekey directory BEFORE any paste or key creation.
+    if let Some(dir) = &opts.rekey {
+        if !dir.is_dir() {
+            bail!("--rekey {}: not a readable directory", dir.display());
+        }
+    }
+    if store.key_exists(&opts.name) && opts.rekey.is_some() && !opts.new_recovery {
+        return sweep_only(store, age, opts);
+    }
+
+    let plugin = preflight_new_key(
+        store,
+        &opts.name,
+        &opts.access_control,
+        opts.strongbox_entry.as_deref(),
+    )?;
 
     // Obtain + verify the recovery identity BEFORE creating anything — a bad
     // paste must leave the keystore untouched. The paste proves possession,
-    // which is exactly what the keygen ceremony's paste-back verifies.
+    // which is exactly what the keygen ceremony's paste-back verifies. With
+    // --new-recovery the OLD identity is only needed to drive the --rekey
+    // sweep (it is never stored).
     let mut pasted = Zeroizing::new(String::new());
     let mut recovery_recipient = String::new();
-    if !opts.new_recovery {
+    if !opts.new_recovery || opts.rekey.is_some() {
+        let what = if opts.new_recovery {
+            "OLD recovery identity (used only to re-encrypt existing files)"
+        } else {
+            "recovery identity"
+        };
         let mut verified = false;
         for attempt in 1..=3 {
-            let line = Zeroizing::new(
-                read_secret_from_tty(&format!(
-                    "Paste the recovery identity for {:?} from Strongbox (attempt {attempt}/3): ",
-                    opts.name
-                ))?
-                .trim()
-                .to_string(),
-            );
+            let mut line = read_secret_from_tty(&format!(
+                "Paste the {what} for {:?} from Strongbox (attempt {attempt}/3): ",
+                opts.name
+            ))?;
+            trim_in_place(&mut line);
             if line.is_empty() {
                 continue;
             }
             match age.identity_to_recipient(&line) {
                 Ok(recipient) => {
                     recovery_recipient = recipient;
-                    *pasted = line.to_string();
+                    pasted = line;
                     verified = true;
                     break;
                 }
-                Err(_) => outprint("that is not a valid AGE-SECRET-KEY line\n")?,
+                Err(_) => tty_print("that is not a valid AGE-SECRET-KEY line\n"),
             }
         }
         if !verified {
@@ -279,9 +318,6 @@ pub fn restore(store: &Keystore, age: &AgeTool, opts: &RestoreOpts) -> Result<()
 
         write_atomic(&store.recipients_path(&opts.name), recipients.as_bytes())?;
         store.save_meta(&opts.name, &meta)?;
-        if store.default_key().is_none() {
-            store.set_default(&opts.name)?;
-        }
 
         // Self-test: a probe encrypted to the NEW recipients must open with
         // the pasted identity (skipped for --new-recovery: its own ceremony
@@ -300,6 +336,11 @@ pub fn restore(store: &Keystore, age: &AgeTool, opts: &RestoreOpts) -> Result<()
         let _ = fs::remove_dir_all(&key_dir);
         return Err(e);
     }
+    // Only after the key is fully committed and self-tested (a failure above
+    // removes the key dir — a default set earlier would dangle).
+    if store.default_key().is_none() {
+        store.set_default(&opts.name)?;
+    }
 
     outprint(&format!(
         "restored key {:?} with a NEW Secure Enclave key (access control: {})\n  \
@@ -313,24 +354,105 @@ pub fn restore(store: &Keystore, age: &AgeTool, opts: &RestoreOpts) -> Result<()
     ))?;
 
     if let Some(dir) = &opts.rekey {
-        if opts.new_recovery {
-            outprint(
-                "note: --rekey with --new-recovery uses the OLD pasted identity — not \
-                 available in this mode; run the sweep manually with the old identity\n",
-            )?;
-        } else {
-            let (done, skipped) =
-                crate::commands::restore_rekey_sweep(store, age, dir, &pasted, &opts.name)?;
-            outprint(&format!(
-                "re-encrypted {done} file(s) to the new key ({skipped} skipped — not \
-                 addressed to this recovery identity)\n"
-            ))?;
-        }
+        // In --new-recovery mode this sweeps with the OLD pasted identity
+        // (the only one that opens the existing files); it was never stored.
+        run_sweep(store, age, dir, &pasted, &opts.name)?;
     } else {
         outprint(
-            "run with --rekey DIR (or re-run: ai-env keys restore … --rekey .) to re-encrypt \
-             existing files so Touch ID opens them again\n",
+            "run with --rekey DIR (or re-run: ai-env keys restore … --rekey . — the key \
+             stays, only the files are re-encrypted) so Touch ID opens them again\n",
         )?;
+    }
+    Ok(())
+}
+
+/// `keys restore NAME --rekey DIR` on an EXISTING key: verify the paste
+/// against the stored recovery recipient, then only re-encrypt — the working
+/// remedy for exit 4 after a restore that skipped the sweep.
+fn sweep_only(store: &Keystore, age: &AgeTool, opts: &RestoreOpts) -> Result<()> {
+    let mut meta = store.load_meta(&opts.name).ok_or_else(|| {
+        CliError::Msg(format!("key {:?} exists but its meta.toml is unreadable", opts.name))
+    })?;
+    let expected = meta.recovery_recipient.clone().ok_or_else(|| {
+        CliError::Msg(format!(
+            "key {:?} was created with --no-recovery — there is no recovery identity to \
+             sweep with",
+            opts.name
+        ))
+    })?;
+    outprint(&format!(
+        "key {:?} already exists — sweep-only mode (no new key will be created)\n",
+        opts.name
+    ))?;
+
+    let mut pasted = Zeroizing::new(String::new());
+    let mut verified = false;
+    for attempt in 1..=3 {
+        let mut line = read_secret_from_tty(&format!(
+            "Paste the recovery identity for {:?} from Strongbox (attempt {attempt}/3): ",
+            opts.name
+        ))?;
+        trim_in_place(&mut line);
+        if line.is_empty() {
+            continue;
+        }
+        match age.identity_to_recipient(&line) {
+            Ok(derived) if derived == expected => {
+                pasted = line;
+                verified = true;
+                break;
+            }
+            Ok(derived) => bail!(
+                "that identity derives recipient {derived}, but key {:?} expects {expected} \
+                 — WRONG RECOVERY KEY (nothing was changed)",
+                opts.name
+            ),
+            Err(_) => tty_print("that is not a valid AGE-SECRET-KEY line\n"),
+        }
+    }
+    if !verified {
+        bail!("no valid recovery identity provided — nothing was changed");
+    }
+    // Possession + match against the stored recipient IS the quarterly drill.
+    meta.recovery_verified = Some(today_string());
+    store.save_meta(&opts.name, &meta)?;
+
+    let dir = opts.rekey.as_deref().expect("sweep_only requires --rekey");
+    run_sweep(store, age, dir, &pasted, &opts.name)
+}
+
+/// Run the software-identity sweep and report: loud when the identity opened
+/// nothing (a wrong-but-valid paste must not look like success) and failing
+/// when files could not be re-encrypted.
+fn run_sweep(
+    store: &Keystore,
+    age: &AgeTool,
+    dir: &std::path::Path,
+    pasted: &Zeroizing<String>,
+    name: &str,
+) -> Result<()> {
+    let (done, skipped, failed) = crate::commands::restore_rekey_sweep(store, age, dir, pasted, name)?;
+    if done == 0 && skipped == 0 && failed == 0 {
+        outprint(&format!("no ai-env containers found under {}\n", dir.display()))?;
+        return Ok(());
+    }
+    outprint(&format!(
+        "re-encrypted {done} file(s) to key {name:?} ({skipped} skipped, {failed} failed)\n"
+    ))?;
+    if done == 0 && skipped > 0 {
+        outprint(&format!(
+            "WARNING: the pasted identity opened NONE of the {skipped} container(s) under \
+             {} — it is likely a DIFFERENT key's recovery identity. Check the Strongbox \
+             entry; the files remain encrypted to the old key.\n",
+            dir.display()
+        ))?;
+    }
+    if failed > 0 {
+        bail!(
+            "{failed} file(s) could not be re-encrypted — fix the cause above and re-run: \
+             ai-env keys restore {name} --rekey {}",
+            dir.display()
+        );
     }
     Ok(())
 }
@@ -377,10 +499,10 @@ fn run_recovery_ceremony(
         // Paste-back: proves the secret survived the trip to Strongbox.
         let mut verified = false;
         for attempt in 1..=3 {
-            let pasted = read_secret_from_tty(&format!(
+            let mut pasted = read_secret_from_tty(&format!(
                 "Paste the recovery identity back to confirm you saved it (attempt {attempt}/3): "
             ))?;
-            let pasted = Zeroizing::new(pasted.trim().to_string());
+            trim_in_place(&mut pasted);
             if pasted.is_empty() {
                 continue;
             }
@@ -398,10 +520,10 @@ fn run_recovery_ceremony(
                         verified = true;
                         break;
                     }
-                    outprint("self-test decrypt failed — paste the exact AGE-SECRET-KEY line\n")?;
+                    tty_print("self-test decrypt failed — paste the exact AGE-SECRET-KEY line\n");
                 }
-                Ok(_) => outprint("that identity does not match the one shown above\n")?,
-                Err(_) => outprint("that is not a valid AGE-SECRET-KEY line\n")?,
+                Ok(_) => tty_print("that identity does not match the one shown above\n"),
+                Err(_) => tty_print("that is not a valid AGE-SECRET-KEY line\n"),
             }
         }
         if !verified {
@@ -450,17 +572,86 @@ fn outprint(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read one '\n'-terminated line byte-wise into Zeroizing storage. No
+/// BufReader: nothing buffers the secret outside the returned wrapper, and
+/// nothing past the newline is consumed.
+fn read_secret_line(f: &mut fs::File) -> Result<Zeroizing<String>> {
+    use std::io::Read;
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(256));
+    let mut b = [0u8; 1];
+    loop {
+        match f.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {
+                if b[0] == b'\n' {
+                    break;
+                }
+                if buf.len() >= 4096 {
+                    b[0] = 0;
+                    bail!("pasted line is too long");
+                }
+                buf.push(b[0]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    b[0] = 0;
+    let s = std::str::from_utf8(&buf)
+        .map_err(|_| CliError::Msg("pasted input is not valid UTF-8".into()))?;
+    Ok(Zeroizing::new(s.to_string()))
+}
+
+/// A dup of fd 0 as a File: reading through it never touches the
+/// process-global `std::io::stdin()` buffer, which lives (un-zeroized) for
+/// the rest of the process once a secret has passed through it.
+fn stdin_file() -> Result<fs::File> {
+    // SAFETY: dup of fd 0; on success the new descriptor is exclusively ours.
+    let fd = unsafe { libc::dup(0) };
+    if fd < 0 {
+        return Err(CliError::Msg("cannot read stdin".into()));
+    }
+    use std::os::fd::FromRawFd;
+    // SAFETY: fd is a freshly dup'd descriptor owned by this File.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// Trim ASCII/Unicode whitespace in place — the buffer never leaves the
+/// caller's Zeroizing wrapper (no `.trim().to_string()` orphan copy).
+pub fn trim_in_place(s: &mut String) {
+    s.truncate(s.trim_end().len());
+    let lead = s.len() - s.trim_start().len();
+    if lead > 0 {
+        s.drain(..lead);
+    }
+}
+
+/// Diagnostics for the paste loops go to the channel the user is typing on:
+/// /dev/tty when that is where the prompt went, stderr in the piped-stdin
+/// paths — never stdout, which may be redirected to a file.
+fn tty_print(s: &str) {
+    let stdin_paste = std::env::var("AI_ENV_PASTE_STDIN").as_deref() == Ok("1");
+    if !stdin_paste {
+        if let Ok(mut t) = fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = t.write_all(s.as_bytes());
+            return;
+        }
+    }
+    eprint!("{s}");
+}
+
 /// Read a line from /dev/tty with echo disabled (the pasted secret must not
-/// land in the terminal scrollback a second time).
-pub fn read_secret_from_tty(prompt: &str) -> Result<String> {
+/// land in the terminal scrollback a second time). Any unread tty input —
+/// the rest of a multi-line paste — is DISCARDED before returning: a queued
+/// `AGE-SECRET-KEY` line delivered to the shell after exit would be echoed,
+/// executed, and persisted to shell history.
+pub fn read_secret_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
     // Automation/tests: force the piped-stdin path (never used interactively).
     if std::env::var("AI_ENV_PASTE_STDIN").as_deref() == Ok("1") {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
             eprint!("{prompt}");
-            let mut line = String::new();
-            std::io::stdin().lock().read_line(&mut line)?;
-            return Ok(line);
+            return read_secret_line(&mut stdin_file()?);
         }
     }
     let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
@@ -472,9 +663,7 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<String> {
             use std::io::IsTerminal;
             if !std::io::stdin().is_terminal() {
                 eprint!("{prompt}");
-                let mut line = String::new();
-                std::io::stdin().lock().read_line(&mut line)?;
-                return Ok(line);
+                return read_secret_line(&mut stdin_file()?);
             }
             return Err(CliError::Msg(
                 "no terminal available for the paste step — run interactively \
@@ -491,6 +680,8 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<String> {
 
     /// RAII echo restore: runs on normal return AND on unwind, so a panic
     /// mid-read does not leave the user's terminal with echo disabled.
+    /// TCSAFLUSH also discards all unread tty input on the way out, so
+    /// leftover pasted lines can never reach the shell.
     /// (A default-action SIGINT still bypasses this — shells reset echo on
     /// the next prompt in practice.)
     struct EchoGuard {
@@ -502,7 +693,7 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<String> {
         fn drop(&mut self) {
             if self.active {
                 // SAFETY: restoring termios state we captured on a valid fd.
-                unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+                unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved) };
             }
         }
     }
@@ -515,10 +706,13 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<String> {
         term.c_lflag &= !libc::ECHO;
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
     }
-    let mut line = String::new();
-    let read_result = BufReader::new(&tty).read_line(&mut line);
-    drop(guard); // restore echo before writing the newline
+    let read_result = read_secret_line(&mut tty);
+    drop(guard); // restore echo + flush queued paste leftovers
+    if !have_termios {
+        // No termios on this tty: still drop any queued paste leftovers.
+        // SAFETY: plain tcflush on a valid fd we own.
+        unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+    }
     let _ = tty.write_all(b"\n");
-    read_result?;
-    Ok(line)
+    read_result
 }

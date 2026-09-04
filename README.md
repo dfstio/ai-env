@@ -87,7 +87,33 @@ One paste from your vault → a **new** Secure Enclave key → every file under 
 recovery identity opens is re-encrypted to it (software-only — zero Touch ID prompts; files
 belonging to other keys are skipped untouched). The Strongbox entry stays valid: by default the
 pasted identity remains the key's recovery recipient (`--new-recovery` runs a fresh ceremony
-instead, for suspected-compromise restores).
+instead, for suspected-compromise restores — with `--rekey` it first asks for the OLD identity,
+used only to re-encrypt the existing files).
+
+If the key **already exists**, the same command runs in **sweep-only mode**: the paste is
+verified against the key's stored recovery recipient (wrong key → refused) and only the
+re-encryption sweep runs — the working remedy when old files still exit 4 after a restore
+without `--rekey`. A sweep that re-encrypts **zero** files warns loudly: that means the pasted
+identity opened nothing and is probably a different key's recovery.
+
+### Sharing with a server or teammate (`keys add-recipient`)
+
+To let another party decrypt — a deploy target's age key (e.g. the per-stack server identity
+in AWS SSM), or a colleague — add their **public** recipient to your key:
+
+```sh
+ai-env keys add-recipient silvana-mainnet age1xyz… --label "server-mainnet (SSM)" --rekey .
+```
+
+The recipient must be the public `age1…` half (from `age-keygen -y`); pasting an
+`AGE-SECRET-KEY` private identity is refused before anything is written, input is normalized
+to lowercase (bech32 is single-case; age rejects uppercase lines), the label must be a single
+line, and after every append ai-env probe-encrypts against the updated file and **rolls back**
+if age rejects it — recipients.txt can never be left in a state that breaks encryption.
+Adding is idempotent and only affects **new** encryptions — pass `--rekey DIR` to re-encrypt
+the key's existing containers too (one Touch ID prompt per file; the count, listing, and >10
+confirmation cover only this key's files, and re-running with `--rekey` still sweeps even when
+the recipient is already present).
 
 ## Commands
 
@@ -101,6 +127,7 @@ ai-env edit    [FILE] [-k NAME] [-i IDENTITY]             # secure in-terminal e
 ai-env which   [FILE]                                     # which key opens this? no prompt
 ai-env info    [FILE] [--json]                            # header details, no prompt
 ai-env keys    list | show NAME | default NAME | forget NAME [--yes]
+ai-env keys    add-recipient NAME RECIPIENT [--label TEXT] [--rekey DIR] [--yes]
 ai-env keys    restore NAME [--rekey DIR] [--new-recovery]   # recreate from Strongbox identity
 ai-env rekey   [DIR] [--dry-run] [--yes]                  # re-encrypt containers under DIR
 ai-env verify-recovery NAME                               # the quarterly drill

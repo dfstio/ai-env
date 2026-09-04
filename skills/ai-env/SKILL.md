@@ -52,3 +52,10 @@ corrupt or is plaintext where a container was expected.
 On exit `4`: if the user has the recovery identity in their password manager, suggest
 `ai-env keys restore NAME --rekey .` — it is interactive (the USER pastes the identity into
 their terminal; do not handle the secret yourself) and restores normal Touch ID access.
+It works whether or not the key still exists: a missing key is recreated; an existing key
+enters sweep-only mode (paste verified against the stored recovery recipient, files
+re-encrypted, no new key).
+
+To grant a server or teammate decrypt access, use
+`ai-env keys add-recipient NAME age1… [--label TEXT] [--rekey DIR]` with their PUBLIC
+recipient only — never an `AGE-SECRET-KEY` private identity (the CLI refuses it).

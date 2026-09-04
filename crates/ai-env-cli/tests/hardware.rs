@@ -142,4 +142,82 @@ fn restore_roundtrip_with_rekey_sweep() {
     let out = ai_env(&keystore, work.path(), &["which", "other.env"], None);
     assert_ok(&out, "which other.env");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "k2");
+
+    // Sweep-only mode (v5.2): the key exists now, so the SAME command
+    // verifies the paste against the stored recovery recipient and only
+    // re-encrypts — no new key.
+    let out = ai_env(
+        &keystore,
+        work.path(),
+        &["keys", "restore", "k1", "--rekey", "."],
+        Some(&format!("{identity_line}\n")),
+    );
+    assert_ok(&out, "sweep-only restore");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sweep-only"));
+    let out = ai_env(&keystore, work.path(), &["show", "mine.env"], None);
+    assert_ok(&out, "show mine.env after sweep-only restore");
+}
+
+#[test]
+#[ignore = "needs a physical Secure Enclave + age binaries; set AI_ENV_SE_TESTS=1"]
+fn add_recipient_with_rekey_grants_access() {
+    if !enabled() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let keystore = work.path().join("ks");
+
+    assert_ok(
+        &ai_env(&keystore, work.path(), &["keygen", "k1", "--access-control=none", "--no-recovery"], None),
+        "keygen k1",
+    );
+    assert_ok(
+        &ai_env(&keystore, work.path(), &["keygen", "k2", "--access-control=none", "--no-recovery"], None),
+        "keygen k2",
+    );
+    fs::write(work.path().join("mine.env"), "SRV=payload\n").unwrap();
+    fs::write(work.path().join("other.env"), "OTHER=1\n").unwrap();
+    assert_ok(&ai_env(&keystore, work.path(), &["encrypt", "mine.env", "-k", "k1", "--force"], None), "encrypt mine");
+    assert_ok(&ai_env(&keystore, work.path(), &["encrypt", "other.env", "-k", "k2", "--force"], None), "encrypt other");
+    let other_before = fs::read(work.path().join("other.env")).unwrap();
+
+    // A "server" identity whose public half we grant access to.
+    let keygen_out = Command::new("age-keygen").output().expect("age-keygen on PATH");
+    let identity_text = String::from_utf8(keygen_out.stdout).unwrap();
+    let identity_file = work.path().join("server.key");
+    fs::write(&identity_file, &identity_text).unwrap();
+    let recipient = {
+        let out = Command::new("age-keygen")
+            .arg("-y")
+            .arg(&identity_file)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+
+    // Grant + sweep (k1 files only; zero prompts with policy none).
+    assert_ok(
+        &ai_env(
+            &keystore,
+            work.path(),
+            &["keys", "add-recipient", "k1", &recipient, "--label", "server", "--rekey", ".", "--yes"],
+            None,
+        ),
+        "add-recipient --rekey",
+    );
+
+    // The server identity now opens mine.env…
+    let out = ai_env(
+        &keystore,
+        work.path(),
+        &["show", "mine.env", "-i", identity_file.to_str().unwrap()],
+        None,
+    );
+    assert_ok(&out, "show via server identity");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("SRV=payload"));
+
+    // …k1's own key still opens it, and k2's file was untouched.
+    let out = ai_env(&keystore, work.path(), &["show", "mine.env"], None);
+    assert_ok(&out, "show via k1");
+    assert_eq!(fs::read(work.path().join("other.env")).unwrap(), other_before);
 }

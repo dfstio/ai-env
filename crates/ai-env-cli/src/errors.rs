@@ -13,6 +13,7 @@ use ai_env_age::ParseError;
 #[derive(Debug)]
 pub enum CliError {
     Msg(String),             // 1
+    Usage(String),           // 2 (same class as clap usage errors)
     Cancelled,               // 3
     NoKey(String),           // 4
     AuthUnavailable(String), // 5
@@ -28,6 +29,7 @@ impl CliError {
         match self {
             CliError::BrokenPipe => 0,
             CliError::Msg(_) => 1,
+            CliError::Usage(_) => 2,
             CliError::Cancelled => 3,
             CliError::NoKey(_) => 4,
             CliError::AuthUnavailable(_) => 5,
@@ -39,8 +41,8 @@ impl CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CliError::Msg(m) | CliError::NoKey(m) | CliError::AuthUnavailable(m)
-            | CliError::Corrupt(m) => f.write_str(m),
+            CliError::Msg(m) | CliError::Usage(m) | CliError::NoKey(m)
+            | CliError::AuthUnavailable(m) | CliError::Corrupt(m) => f.write_str(m),
             CliError::Cancelled => f.write_str("cancelled"),
             CliError::BrokenPipe => f.write_str("broken pipe"),
         }

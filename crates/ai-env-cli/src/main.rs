@@ -173,6 +173,24 @@ enum KeysCmd {
     Show { name: String },
     /// Set the default key
     Default { name: String },
+    /// Add a public recipient (e.g. a server's age key) to a named key
+    AddRecipient {
+        /// Key name
+        name: String,
+        /// The PUBLIC recipient (age1…, from `age-keygen -y`) — never the
+        /// AGE-SECRET-KEY private half
+        recipient: String,
+        /// Note stored beside the recipient in recipients.txt
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Also re-encrypt this key's existing containers under DIR
+        /// (one Touch ID prompt per file)
+        #[arg(long, value_name = "DIR")]
+        rekey: Option<PathBuf>,
+        /// Skip the >10-files confirmation for --rekey
+        #[arg(long)]
+        yes: bool,
+    },
     /// Recreate a key from its Strongbox recovery identity (new SE key;
     /// optionally re-encrypt existing files to it)
     Restore {
@@ -185,7 +203,8 @@ enum KeysCmd {
         #[arg(long, value_name = "TEXT")]
         strongbox_entry: Option<String>,
         /// After restoring, re-encrypt every container under DIR that the
-        /// pasted identity opens (no Touch ID prompts)
+        /// pasted identity opens (no Touch ID prompts). If the key already
+        /// exists, only this sweep runs — no new key is created
         #[arg(long, value_name = "DIR")]
         rekey: Option<PathBuf>,
         /// Generate a FRESH recovery identity (full ceremony) instead of
@@ -248,6 +267,18 @@ fn run(cli: Cli) -> Result<()> {
             KeysCmd::List => commands::keys_list(&store),
             KeysCmd::Show { name } => commands::keys_show(&store, &name),
             KeysCmd::Default { name } => commands::keys_default(&store, &name),
+            KeysCmd::AddRecipient { name, recipient, label, rekey, yes } => {
+                let age = age_cmd::AgeTool::probe()?;
+                commands::keys_add_recipient(
+                    &store,
+                    &age,
+                    &name,
+                    &recipient,
+                    label.as_deref(),
+                    rekey.as_deref(),
+                    yes,
+                )
+            }
             KeysCmd::Restore { name, access_control, strongbox_entry, rekey, new_recovery } => {
                 let age = age_cmd::AgeTool::probe()?;
                 ceremony::restore(

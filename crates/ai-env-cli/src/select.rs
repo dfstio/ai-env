@@ -40,9 +40,10 @@ pub fn resolve_for_decrypt(
         MatchResult::One(i) => Ok(names[i].to_string()),
         MatchResult::None => Err(CliError::NoKey(
             "no key in your keystore can open this file — if you have the recovery \
-             identity (Strongbox), use: ai-env decrypt -i IDENTITY_FILE (or the stock \
-             recovery one-liner in the file header), or recreate a working key with: \
-             ai-env keys restore NAME --rekey ."
+             identity (Strongbox), run: ai-env keys restore NAME --rekey . (re-encrypts \
+             the files to the key, creating it only if missing), or decrypt directly: \
+             ai-env decrypt -i IDENTITY_FILE (or the stock recovery one-liner in the \
+             file header)"
                 .into(),
         )),
         MatchResult::Ambiguous(indices) => {
