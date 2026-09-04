@@ -37,32 +37,41 @@ pub struct KeygenOpts {
     pub no_recovery: bool,
 }
 
-pub fn keygen(store: &Keystore, age: &AgeTool, opts: &KeygenOpts) -> Result<()> {
-    validate_key_name(&opts.name)?;
-    if !ACCESS_CONTROLS.contains(&opts.access_control.as_str()) {
+/// Shared preflight for keygen and restore: name/policy validation,
+/// existing-key refusal, plugin discovery.
+fn preflight_new_key(store: &Keystore, name: &str, access_control: &str) -> Result<std::path::PathBuf> {
+    validate_key_name(name)?;
+    if !ACCESS_CONTROLS.contains(&access_control) {
         bail!(
             "unknown --access-control {:?} (one of: {})",
-            opts.access_control,
+            access_control,
             ACCESS_CONTROLS.join(", ")
         );
     }
-    if store.key_exists(&opts.name) {
+    if store.key_exists(name) {
         bail!(
-            "key {:?} already exists — keys are never replaced in place; pick a new name \
-             (or `ai-env keys forget {}` first, which orphans the old enclave key forever)",
-            opts.name,
-            opts.name
+            "key {name:?} already exists — keys are never replaced in place; pick a new name \
+             (or `ai-env keys forget {name}` first, which orphans the old enclave key forever)"
         );
     }
-    let plugin = find_plugin().ok_or_else(|| {
+    find_plugin().ok_or_else(|| {
         CliError::AuthUnavailable(
             "age-plugin-se is not installed — run: brew install age-plugin-se".into(),
         )
-    })?;
+    })
+}
 
-    // 1. Directories first (see module doc).
+/// Create the key dir (0700, FIRST — the plugin writes nothing yet exits 0
+/// into a missing dir) and the SE identity, with full post-verification.
+/// Returns the SE public recipient. Removes the dir on failure.
+fn create_se_identity(
+    store: &Keystore,
+    plugin: &std::path::Path,
+    name: &str,
+    access_control: &str,
+) -> Result<String> {
     store.ensure_dirs()?;
-    let key_dir = store.key_dir(&opts.name);
+    let key_dir = store.key_dir(name);
     fs::create_dir_all(&key_dir)?;
     #[cfg(unix)]
     {
@@ -70,55 +79,68 @@ pub fn keygen(store: &Keystore, age: &AgeTool, opts: &KeygenOpts) -> Result<()> 
         fs::set_permissions(&key_dir, fs::Permissions::from_mode(0o700))?;
     }
 
-    // 2. SE identity (no prompt: key creation never prompts).
-    let identity_path = store.identity_path(&opts.name);
-    let out = Command::new(&plugin)
-        .env("PATH", effective_path())
-        .arg("keygen")
-        .arg(format!("--access-control={}", opts.access_control))
-        .arg("--recipient-type=tag")
-        .arg("-o")
-        .arg(&identity_path)
-        .output()
-        .map_err(|e| CliError::Msg(format!("cannot run age-plugin-se: {e}")))?;
-    if !out.status.success() {
-        let _ = fs::remove_dir_all(&key_dir);
-        bail!(
-            "age-plugin-se keygen failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let plugin_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let plugin_stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let printed_pub = plugin_stdout
-        .lines()
-        .chain(plugin_stderr.lines())
-        .find_map(|l| l.split("ublic key:").nth(1).map(str::trim).map(str::to_owned))
-        .filter(|s| s.starts_with("age1tag1"));
-
-    // Post-verify: file exists, exactly one SE identity, zero software keys,
-    // and the file's recipient comment matches what the plugin printed.
-    validate_identity_file(&identity_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))?;
-    }
-    let identity_text = fs::read_to_string(&identity_path)?;
-    let file_pub = identity_text
-        .lines()
-        .find_map(|l| l.split("ublic key:").nth(1).map(str::trim).map(str::to_owned))
-        .filter(|s| s.starts_with("age1tag1"))
-        .ok_or_else(|| {
-            CliError::Msg("identity file has no `# public key: age1tag1…` comment".into())
-        })?;
-    if let Some(printed) = &printed_pub {
-        if printed != &file_pub {
-            bail!("plugin printed public key {printed} but the file says {file_pub} — aborting");
+    let result = (|| -> Result<String> {
+        let identity_path = store.identity_path(name);
+        let out = Command::new(plugin)
+            .env("PATH", effective_path())
+            .arg("keygen")
+            .arg(format!("--access-control={access_control}"))
+            .arg("--recipient-type=tag")
+            .arg("-o")
+            .arg(&identity_path)
+            .output()
+            .map_err(|e| CliError::Msg(format!("cannot run age-plugin-se: {e}")))?;
+        if !out.status.success() {
+            bail!(
+                "age-plugin-se keygen failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
+        let plugin_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let plugin_stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let printed_pub = plugin_stdout
+            .lines()
+            .chain(plugin_stderr.lines())
+            .find_map(|l| l.split("ublic key:").nth(1).map(str::trim).map(str::to_owned))
+            .filter(|s| s.starts_with("age1tag1"));
+
+        // Post-verify: file exists, exactly one SE identity, zero software
+        // keys, and the file's comment matches what the plugin printed.
+        validate_identity_file(&identity_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))?;
+        }
+        let identity_text = fs::read_to_string(&identity_path)?;
+        let file_pub = identity_text
+            .lines()
+            .find_map(|l| l.split("ublic key:").nth(1).map(str::trim).map(str::to_owned))
+            .filter(|s| s.starts_with("age1tag1"))
+            .ok_or_else(|| {
+                CliError::Msg("identity file has no `# public key: age1tag1…` comment".into())
+            })?;
+        if let Some(printed) = &printed_pub {
+            if printed != &file_pub {
+                bail!(
+                    "plugin printed public key {printed} but the file says {file_pub} — aborting"
+                );
+            }
+        }
+        ai_env_age::decode_recipient(&file_pub)
+            .map_err(|e| CliError::Msg(format!("plugin produced an undecodable recipient: {e}")))?;
+        Ok(file_pub)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&key_dir);
     }
-    ai_env_age::decode_recipient(&file_pub)
-        .map_err(|e| CliError::Msg(format!("plugin produced an undecodable recipient: {e}")))?;
+    result
+}
+
+pub fn keygen(store: &Keystore, age: &AgeTool, opts: &KeygenOpts) -> Result<()> {
+    let plugin = preflight_new_key(store, &opts.name, &opts.access_control)?;
+    let key_dir = store.key_dir(&opts.name);
+    let file_pub = create_se_identity(store, &plugin, &opts.name, &opts.access_control)?;
 
     let mut recipients = format!(
         "# ai-env key {name}  (created {date})\n# Secure Enclave (daily, Touch ID):\n{file_pub}\n",
@@ -162,6 +184,152 @@ pub fn keygen(store: &Keystore, age: &AgeTool, opts: &KeygenOpts) -> Result<()> 
     {
         outprint(
             "  NOTE: current-biometry keys stop working if you add or remove a fingerprint\n",
+        )?;
+    }
+    Ok(())
+}
+
+pub struct RestoreOpts {
+    pub name: String,
+    pub access_control: String,
+    pub strongbox_entry: Option<String>,
+    pub rekey: Option<std::path::PathBuf>,
+    pub new_recovery: bool,
+}
+
+/// Recreate a usable named key from the Strongbox recovery identity: one
+/// paste -> a NEW Secure Enclave key -> (optionally) existing files
+/// re-encrypted to it. The old SE key is unrecoverable by design (CryptoKit
+/// SE keys cannot be enumerated); this restores the WORKFLOW, not that key.
+pub fn restore(store: &Keystore, age: &AgeTool, opts: &RestoreOpts) -> Result<()> {
+    let plugin = preflight_new_key(store, &opts.name, &opts.access_control)?;
+
+    // Obtain + verify the recovery identity BEFORE creating anything — a bad
+    // paste must leave the keystore untouched. The paste proves possession,
+    // which is exactly what the keygen ceremony's paste-back verifies.
+    let mut pasted = Zeroizing::new(String::new());
+    let mut recovery_recipient = String::new();
+    if !opts.new_recovery {
+        let mut verified = false;
+        for attempt in 1..=3 {
+            let line = Zeroizing::new(
+                read_secret_from_tty(&format!(
+                    "Paste the recovery identity for {:?} from Strongbox (attempt {attempt}/3): ",
+                    opts.name
+                ))?
+                .trim()
+                .to_string(),
+            );
+            if line.is_empty() {
+                continue;
+            }
+            match age.identity_to_recipient(&line) {
+                Ok(recipient) => {
+                    recovery_recipient = recipient;
+                    *pasted = line.to_string();
+                    verified = true;
+                    break;
+                }
+                Err(_) => outprint("that is not a valid AGE-SECRET-KEY line\n")?,
+            }
+        }
+        if !verified {
+            bail!("no valid recovery identity provided — nothing was created");
+        }
+    }
+
+    // New SE key (the paste is settled; from here failures clean up).
+    let key_dir = store.key_dir(&opts.name);
+    let file_pub = create_se_identity(store, &plugin, &opts.name, &opts.access_control)?;
+
+    let commit_result = (|| -> Result<()> {
+        let mut recipients = format!(
+            "# ai-env key {name}  (restored {date})\n# Secure Enclave (daily, Touch ID):\n{file_pub}\n",
+            name = opts.name,
+            date = today_string(),
+        );
+        let mut meta = KeyMeta {
+            created: today_string(),
+            access_control: opts.access_control.clone(),
+            recovery_recipient: None,
+            strongbox_entry: None,
+            recovery_verified: None,
+        };
+
+        if opts.new_recovery {
+            // Full fresh ceremony (compromise-suspected restores).
+            let kopts = KeygenOpts {
+                name: opts.name.clone(),
+                access_control: opts.access_control.clone(),
+                strongbox_entry: opts.strongbox_entry.clone(),
+                no_recovery: false,
+            };
+            run_recovery_ceremony(store, age, &kopts, &file_pub, &mut recipients, &mut meta)?;
+        } else {
+            let entry_name = opts
+                .strongbox_entry
+                .clone()
+                .unwrap_or_else(|| format!("ai-env: {} recovery", opts.name));
+            recipients
+                .push_str(&format!("# recovery (Strongbox: {entry_name}):\n{recovery_recipient}\n"));
+            meta.recovery_recipient = Some(recovery_recipient.clone());
+            meta.strongbox_entry = Some(entry_name);
+            meta.recovery_verified = Some(today_string());
+        }
+
+        write_atomic(&store.recipients_path(&opts.name), recipients.as_bytes())?;
+        store.save_meta(&opts.name, &meta)?;
+        if store.default_key().is_none() {
+            store.set_default(&opts.name)?;
+        }
+
+        // Self-test: a probe encrypted to the NEW recipients must open with
+        // the pasted identity (skipped for --new-recovery: its own ceremony
+        // already self-tested the fresh identity).
+        if !opts.new_recovery {
+            let probe = b"ai-env restore self-test";
+            let ct = age.encrypt(&store.recipients_path(&opts.name), probe)?;
+            let pt = age.decrypt_with_identity_string(&pasted, &ct)?;
+            if &**pt != probe {
+                bail!("self-test failed: the pasted identity does not decrypt the probe");
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = commit_result {
+        let _ = fs::remove_dir_all(&key_dir);
+        return Err(e);
+    }
+
+    outprint(&format!(
+        "restored key {:?} with a NEW Secure Enclave key (access control: {})\n  \
+         keystore : {}\n  recipient: {}\n  \
+         NOTE: the previous enclave key is orphaned; files encrypted to it open via this\n  \
+         key only after re-encryption.\n",
+        opts.name,
+        opts.access_control,
+        store.key_dir(&opts.name).display(),
+        file_pub,
+    ))?;
+
+    if let Some(dir) = &opts.rekey {
+        if opts.new_recovery {
+            outprint(
+                "note: --rekey with --new-recovery uses the OLD pasted identity — not \
+                 available in this mode; run the sweep manually with the old identity\n",
+            )?;
+        } else {
+            let (done, skipped) =
+                crate::commands::restore_rekey_sweep(store, age, dir, &pasted, &opts.name)?;
+            outprint(&format!(
+                "re-encrypted {done} file(s) to the new key ({skipped} skipped — not \
+                 addressed to this recovery identity)\n"
+            ))?;
+        }
+    } else {
+        outprint(
+            "run with --rekey DIR (or re-run: ai-env keys restore … --rekey .) to re-encrypt \
+             existing files so Touch ID opens them again\n",
         )?;
     }
     Ok(())
@@ -285,17 +453,36 @@ fn outprint(s: &str) -> Result<()> {
 /// Read a line from /dev/tty with echo disabled (the pasted secret must not
 /// land in the terminal scrollback a second time).
 pub fn read_secret_from_tty(prompt: &str) -> Result<String> {
-    let mut tty = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| {
-            CliError::Msg(
-                "no terminal available for the paste-back step — run keygen interactively \
+    // Automation/tests: force the piped-stdin path (never used interactively).
+    if std::env::var("AI_ENV_PASTE_STDIN").as_deref() == Ok("1") {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            eprint!("{prompt}");
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            return Ok(line);
+        }
+    }
+    let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+    let mut tty = match tty {
+        Ok(t) => t,
+        Err(_) => {
+            // No controlling terminal. If stdin is piped (scripts, tests),
+            // read the secret from it — it still never touches argv or disk.
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                eprint!("{prompt}");
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                return Ok(line);
+            }
+            return Err(CliError::Msg(
+                "no terminal available for the paste step — run interactively \
                  (or use --no-recovery for a throwaway key)"
                     .into(),
-            )
-        })?;
+            ));
+        }
+    };
     tty.write_all(prompt.as_bytes())?;
     tty.flush()?;
 

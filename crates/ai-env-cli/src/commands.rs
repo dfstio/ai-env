@@ -387,7 +387,10 @@ pub fn keys_forget(store: &Keystore, name: &str, yes: bool) -> Result<()> {
     if store.default_key().as_deref() == Some(name) {
         let _ = fs::remove_file(store.root().join("default"));
     }
-    outln!("forgot key {name:?} (recovery identity in Strongbox still opens its files)");
+    outln!(
+        "forgot key {name:?} (recovery identity in Strongbox still opens its files; \
+         recreate a working key later with: ai-env keys restore {name})"
+    );
     Ok(())
 }
 
@@ -462,6 +465,50 @@ fn discover_containers(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Resu
         }
     }
     Ok(())
+}
+
+/// `keys restore --rekey DIR`: re-encrypt every container the pasted recovery
+/// identity opens to `key_name`'s current recipients. Software-only decrypt —
+/// ZERO Touch ID prompts; the identity travels via the FIFO path, never disk.
+/// Files the identity cannot open (other keys' files, corrupt containers)
+/// are skipped with a note. Returns (re-encrypted, skipped).
+pub fn restore_rekey_sweep(
+    store: &Keystore,
+    age: &AgeTool,
+    dir: &Path,
+    identity: &Zeroizing<String>,
+    key_name: &str,
+) -> Result<(usize, usize)> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    discover_containers(dir, 0, &mut targets)?;
+    let recipients = store.recipients_path(key_name);
+    let (mut done, mut skipped) = (0usize, 0usize);
+    for path in &targets {
+        let cont = match load_container(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping {} — {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        match age.decrypt_with_identity_string(identity, &cont.data) {
+            Ok(plaintext) => {
+                let ciphertext = age.encrypt(&recipients, &plaintext)?;
+                write_atomic(path, container::write(&ciphertext).as_bytes())?;
+                eprintln!("re-encrypted {} to key {key_name:?}", path.display());
+                done += 1;
+            }
+            Err(_) => {
+                eprintln!(
+                    "skipping {} — not addressed to this recovery identity",
+                    path.display()
+                );
+                skipped += 1;
+            }
+        }
+    }
+    Ok((done, skipped))
 }
 
 // ---- verify-recovery --------------------------------------------------------

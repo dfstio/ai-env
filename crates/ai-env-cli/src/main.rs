@@ -173,6 +173,26 @@ enum KeysCmd {
     Show { name: String },
     /// Set the default key
     Default { name: String },
+    /// Recreate a key from its Strongbox recovery identity (new SE key;
+    /// optionally re-encrypt existing files to it)
+    Restore {
+        /// Key name (may reuse a forgotten key's name)
+        name: String,
+        /// Authentication required to use the new key
+        #[arg(long, default_value = "any-biometry-or-passcode")]
+        access_control: String,
+        /// Name of the Strongbox entry (informational)
+        #[arg(long, value_name = "TEXT")]
+        strongbox_entry: Option<String>,
+        /// After restoring, re-encrypt every container under DIR that the
+        /// pasted identity opens (no Touch ID prompts)
+        #[arg(long, value_name = "DIR")]
+        rekey: Option<PathBuf>,
+        /// Generate a FRESH recovery identity (full ceremony) instead of
+        /// keeping the pasted one — for suspected-compromise restores
+        #[arg(long)]
+        new_recovery: bool,
+    },
     /// Remove a key's LOCAL files (the enclave key is orphaned forever)
     Forget {
         name: String,
@@ -228,6 +248,14 @@ fn run(cli: Cli) -> Result<()> {
             KeysCmd::List => commands::keys_list(&store),
             KeysCmd::Show { name } => commands::keys_show(&store, &name),
             KeysCmd::Default { name } => commands::keys_default(&store, &name),
+            KeysCmd::Restore { name, access_control, strongbox_entry, rekey, new_recovery } => {
+                let age = age_cmd::AgeTool::probe()?;
+                ceremony::restore(
+                    &store,
+                    &age,
+                    &ceremony::RestoreOpts { name, access_control, strongbox_entry, rekey, new_recovery },
+                )
+            }
             KeysCmd::Forget { name, yes } => commands::keys_forget(&store, &name, yes),
         },
         Cmd::Rekey { dir, dry_run, yes } => {

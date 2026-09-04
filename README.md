@@ -76,6 +76,19 @@ ai-env verify-recovery myproject     # paste from the vault; proves it still dec
 
 `ai-env keys list` shows when each key's recovery was last verified and flags anything >90 days.
 
+**Forgot a key (`keys forget`), migrated Macs, or lost the keystore?** The enclave key is gone
+for good — but the recovery identity brings the *workflow* back:
+
+```sh
+ai-env keys restore mykey --rekey .
+```
+
+One paste from your vault → a **new** Secure Enclave key → every file under `.` that the
+recovery identity opens is re-encrypted to it (software-only — zero Touch ID prompts; files
+belonging to other keys are skipped untouched). The Strongbox entry stays valid: by default the
+pasted identity remains the key's recovery recipient (`--new-recovery` runs a fresh ceremony
+instead, for suspected-compromise restores).
+
 ## Commands
 
 ```
@@ -88,6 +101,7 @@ ai-env edit    [FILE] [-k NAME] [-i IDENTITY]             # secure in-terminal e
 ai-env which   [FILE]                                     # which key opens this? no prompt
 ai-env info    [FILE] [--json]                            # header details, no prompt
 ai-env keys    list | show NAME | default NAME | forget NAME [--yes]
+ai-env keys    restore NAME [--rekey DIR] [--new-recovery]   # recreate from Strongbox identity
 ai-env rekey   [DIR] [--dry-run] [--yes]                  # re-encrypt containers under DIR
 ai-env verify-recovery NAME                               # the quarterly drill
 ai-env doctor                                             # environment + repo health check

@@ -48,3 +48,7 @@ Remind the user to re-encrypt if a plaintext `.env` is left behind (`ai-env doct
 `3` user cancelled the Touch ID prompt · `4` no local key opens this file (recovery identity
 needed) · `5` age/age-plugin-se missing or no GUI session (e.g. over SSH) · `6` the file is
 corrupt or is plaintext where a container was expected.
+
+On exit `4`: if the user has the recovery identity in their password manager, suggest
+`ai-env keys restore NAME --rekey .` — it is interactive (the USER pastes the identity into
+their terminal; do not handle the secret yourself) and restores normal Touch ID access.
