@@ -22,7 +22,9 @@ pub struct AgeTool {
     pub version: (u32, u32, u32),
 }
 
-fn find_in_path(name: &str, path: &str) -> Option<PathBuf> {
+/// First regular file named `name` in the `:`-separated `path` (also used by
+/// the bridge doctor to note a PATH-only `ai-env-claude`).
+pub fn find_in_path(name: &str, path: &str) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|d| d.join(name))
         .find(|p| p.is_file())

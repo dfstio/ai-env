@@ -22,6 +22,9 @@ pub fn outln(args: std::fmt::Arguments<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Status-line printer for any module (`use crate::outln;`): routes through
+/// [`outln`] so a closed pipe becomes the documented exit 0.
+#[macro_export]
 macro_rules! outln {
     () => { $crate::commands::outln(format_args!(""))? };
     ($($arg:tt)*) => { $crate::commands::outln(format_args!($($arg)*))? };
@@ -720,20 +723,79 @@ pub fn verify_recovery(store: &Keystore, age: &AgeTool, name: &str) -> Result<()
 
 // ---- doctor -----------------------------------------------------------------
 
-pub fn doctor(store: &Keystore, file: &Path) -> Result<()> {
-    outln!("ai-env doctor");
+/// Doctor row tag — the four-character bracket shown before a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tag {
+    Ok,
+    No,
+    Skip,
+    Warn,
+}
+
+impl Tag {
+    #[must_use]
+    pub fn bracket(self) -> &'static str {
+        match self {
+            Tag::Ok => "[ok ]",
+            Tag::No => "[NO ]",
+            Tag::Skip => "[-  ]",
+            Tag::Warn => "[!! ]",
+        }
+    }
+
+    #[must_use]
+    pub fn json_name(self) -> &'static str {
+        match self {
+            Tag::Ok => "ok",
+            Tag::No => "no",
+            Tag::Skip => "skip",
+            Tag::Warn => "warn",
+        }
+    }
+}
+
+/// One line of doctor output: a tagged row or a bare informational line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoctorLine {
+    Row { tag: Tag, text: String },
+    Plain(String),
+}
+
+impl DoctorLine {
+    pub fn row(tag: Tag, text: impl Into<String>) -> Self {
+        DoctorLine::Row { tag, text: text.into() }
+    }
+
+    pub fn plain(text: impl Into<String>) -> Self {
+        DoctorLine::Plain(text.into())
+    }
+
+    #[must_use]
+    pub fn is_no(&self) -> bool {
+        matches!(self, DoctorLine::Row { tag: Tag::No, .. })
+    }
+}
+
+/// The classic checks (age, the plugin, the GUI session, the keystore and the
+/// current directory's `.env`) as rows. Row text is byte-identical to the
+/// historical `ai-env doctor` output; the bridge feature appends its own rows.
+pub fn doctor_lines(store: &Keystore, file: &Path) -> Result<Vec<DoctorLine>> {
+    let mut lines = Vec::new();
     match AgeTool::probe() {
         Ok(age) => {
             let (a, b, c) = age.version;
             let hint = if (a, b, c) < (1, 3, 2) { "  (1.3.2+ recommended)" } else { "" };
-            outln!("  [ok ] age v{a}.{b}.{c}{hint}");
-            outln!(
-                "  [{}] age-plugin-se{}",
-                if age.plugin_se_available() { "ok " } else { "NO " },
-                if age.plugin_se_available() { "" } else { "  <- brew install age-plugin-se (needed for keygen/decrypt)" }
-            );
+            lines.push(DoctorLine::row(Tag::Ok, format!("age v{a}.{b}.{c}{hint}")));
+            let plugin = age.plugin_se_available();
+            lines.push(DoctorLine::row(
+                if plugin { Tag::Ok } else { Tag::No },
+                format!(
+                    "age-plugin-se{}",
+                    if plugin { "" } else { "  <- brew install age-plugin-se (needed for keygen/decrypt)" }
+                ),
+            ));
         }
-        Err(e) => outln!("  [NO ] age: {e}"),
+        Err(e) => lines.push(DoctorLine::row(Tag::No, format!("age: {e}"))),
     }
     let gui = Path::new("/dev/tty").exists()
         && std::process::Command::new("launchctl")
@@ -741,15 +803,17 @@ pub fn doctor(store: &Keystore, file: &Path) -> Result<()> {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Aqua")
             .unwrap_or(false);
-    outln!(
-        "  [{}] GUI session (Touch ID prompts need one){}",
-        if gui { "ok " } else { "NO " },
-        if gui { "" } else { "  <- decryption will fail over SSH" }
-    );
-    outln!("  keystore: {}", store.root().display());
+    lines.push(DoctorLine::row(
+        if gui { Tag::Ok } else { Tag::No },
+        format!(
+            "GUI session (Touch ID prompts need one){}",
+            if gui { "" } else { "  <- decryption will fail over SSH" }
+        ),
+    ));
+    lines.push(DoctorLine::plain(format!("keystore: {}", store.root().display())));
     let keys = store.keys();
     if keys.is_empty() {
-        outln!("  [NO ] no keys — run: ai-env keygen NAME");
+        lines.push(DoctorLine::row(Tag::No, "no keys — run: ai-env keygen NAME"));
     }
     for (name, meta) in &keys {
         let recovery = if meta.recovery_recipient.is_none() {
@@ -765,32 +829,44 @@ pub fn doctor(store: &Keystore, file: &Path) -> Result<()> {
         } else {
             "ok"
         };
-        outln!("  [ok ] key {name:<20} {recovery}");
+        lines.push(DoctorLine::row(Tag::Ok, format!("key {name:<20} {recovery}")));
     }
 
     // File-level checks.
     if file.exists() {
         let text = read_file_string(file)?;
         if container::has_marker(&text) {
-            outln!("  [ok ] {} is encrypted", file.display());
+            lines.push(DoctorLine::row(Tag::Ok, format!("{} is encrypted", file.display())));
             if text.contains('\r') {
-                outln!("  [NO ] {} contains CR characters — a CRLF checkout will corrupt the base64", file.display());
+                lines.push(DoctorLine::row(
+                    Tag::No,
+                    format!(
+                        "{} contains CR characters — a CRLF checkout will corrupt the base64",
+                        file.display()
+                    ),
+                ));
             }
         } else {
-            outln!("  [NO ] {} is PLAINTEXT — run: ai-env encrypt", file.display());
+            lines.push(DoctorLine::row(
+                Tag::No,
+                format!("{} is PLAINTEXT — run: ai-env encrypt", file.display()),
+            ));
         }
         if let Some(ctx) = git::inspect(file) {
             if ctx.file_ignored {
-                outln!(
-                    "  [-  ] {} is gitignored — the encrypted file is safe to commit and \
-                     committing it is its backup",
-                    file.display()
-                );
+                lines.push(DoctorLine::row(
+                    Tag::Skip,
+                    format!(
+                        "{} is gitignored — the encrypted file is safe to commit and \
+                         committing it is its backup",
+                        file.display()
+                    ),
+                ));
             }
-            outln!(
-                "  [{}] pre-commit guard against plaintext .env commits",
-                if ctx.hook_installed { "ok " } else { "-  " }
-            );
+            lines.push(DoctorLine::row(
+                if ctx.hook_installed { Tag::Ok } else { Tag::Skip },
+                "pre-commit guard against plaintext .env commits",
+            ));
             // Plaintext siblings.
             if let Some(parent) = file.parent() {
                 if let Ok(entries) = fs::read_dir(if parent.as_os_str().is_empty() {
@@ -808,10 +884,13 @@ pub fn doctor(store: &Keystore, file: &Path) -> Result<()> {
                         if looks_env || (backupish && name.contains("env")) {
                             if let Ok(t) = fs::read_to_string(entry.path()) {
                                 if !container::has_marker(&t) && entry.path() != *file {
-                                    outln!(
-                                        "  [!! ] plaintext env-like sibling: {name}  <- rotate \
-                                         or encrypt it"
-                                    );
+                                    lines.push(DoctorLine::row(
+                                        Tag::Warn,
+                                        format!(
+                                            "plaintext env-like sibling: {name}  <- rotate \
+                                             or encrypt it"
+                                        ),
+                                    ));
                                 }
                             }
                         }
@@ -820,15 +899,89 @@ pub fn doctor(store: &Keystore, file: &Path) -> Result<()> {
             }
         }
     } else {
-        outln!("  [-  ] {} does not exist in this directory", file.display());
+        lines.push(DoctorLine::row(
+            Tag::Skip,
+            format!("{} does not exist in this directory", file.display()),
+        ));
+    }
+    Ok(lines)
+}
+
+/// Print rows in the historical text format.
+pub fn print_doctor(lines: &[DoctorLine]) -> Result<()> {
+    outln!("ai-env doctor");
+    for line in lines {
+        match line {
+            DoctorLine::Row { tag, text } => outln!("  {} {text}", tag.bracket()),
+            DoctorLine::Plain(text) => outln!("  {text}"),
+        }
     }
     Ok(())
+}
+
+/// Machine-readable form: `{"ok":bool,"exit":n,"rows":[{"tag":"ok","text":"…"}]}`
+/// (`Plain` lines carry the tag `info`).
+#[must_use]
+pub fn doctor_json(lines: &[DoctorLine], exit: i32) -> String {
+    let mut out = String::from("{\"ok\":");
+    out.push_str(if exit == 0 { "true" } else { "false" });
+    out.push_str(&format!(",\"exit\":{exit},\"rows\":["));
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let (tag, text) = match line {
+            DoctorLine::Row { tag, text } => (tag.json_name(), text.as_str()),
+            DoctorLine::Plain(text) => ("info", text.as_str()),
+        };
+        out.push_str(&format!("{{\"tag\":{},\"text\":{}}}", json_string(tag), json_string(text)));
+    }
+    out.push_str("]}");
+    out
+}
+
+/// Exit policy shared by every doctor variant: 5 when a credential source is
+/// unavailable, 1 when any row is `[NO ]`, else 0.
+#[must_use]
+pub fn doctor_exit_code(lines: &[DoctorLine], auth_unavailable: bool) -> i32 {
+    if auth_unavailable {
+        5
+    } else if lines.iter().any(DoctorLine::is_no) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Emit the report (text or JSON) — every row is printed before a non-zero
+/// exit — and turn the exit policy into a result.
+pub fn doctor_report(lines: &[DoctorLine], json: bool, auth_unavailable: bool) -> Result<()> {
+    let exit = doctor_exit_code(lines, auth_unavailable);
+    if json {
+        outln!("{}", doctor_json(lines, exit));
+    } else {
+        print_doctor(lines)?;
+    }
+    match exit {
+        0 => Ok(()),
+        5 => Err(CliError::AuthUnavailable("credentials unavailable".into())),
+        _ => {
+            let n = lines.iter().filter(|l| l.is_no()).count();
+            Err(CliError::Msg(format!("{n} problem(s) found")))
+        }
+    }
+}
+
+/// `ai-env doctor` with the classic rows only.
+pub fn doctor(store: &Keystore, file: &Path, json: bool) -> Result<()> {
+    let lines = doctor_lines(store, file)?;
+    doctor_report(&lines, json, false)
 }
 
 // ---- shared helpers ---------------------------------------------------------
 
 /// Minimal JSON string encoder (escapes quotes, backslashes, control chars).
-fn json_string(s: &str) -> String {
+pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

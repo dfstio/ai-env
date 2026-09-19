@@ -1,17 +1,6 @@
-#![allow(dead_code)] // the included modules expose more than these tests use
-//! Container format tests — the G6-frozen behavior.
-//!
-//! NOTE: this integration test exercises the format through the binary's own
-//! modules by round-tripping real files in a temp dir with a fake `age` on
-//! PATH where needed; the pure read/write logic is included directly.
-#[path = "../src/errors.rs"]
-mod errors;
-#[path = "../src/container.rs"]
-mod container;
-
-// (errors.rs #[macro_export]s `bail!` at this test-crate's root, which is
-// exactly where the included container.rs expects to find it.)
-
+//! Container format tests — the G6-frozen behavior, exercised through the
+//! `ai_env_cli` library (no `#[path]` includes of src/).
+use ai_env_cli::container;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 

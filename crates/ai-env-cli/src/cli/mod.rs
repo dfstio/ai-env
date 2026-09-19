@@ -1,20 +1,12 @@
-//! `ai-env` — encrypted `.env` files that stay `.env`, unlocked by Touch ID.
-mod age_cmd;
-mod ceremony;
-mod commands;
-mod config;
-mod container;
-mod dotenv;
-mod edit;
-mod errors;
-mod git;
-mod select;
-mod store;
+//! clap tree and dispatch for the `ai-env` bin: the classic Touch ID
+//! commands plus, behind features, the bridge operator commands and the VM
+//! `shim` mode. Moved verbatim from the old `src/main.rs`.
 
+use crate::errors::Result;
+use crate::store::Keystore;
+use crate::{age_cmd, ceremony, commands, edit};
 use clap::{Parser, Subcommand};
-use errors::Result;
 use std::path::PathBuf;
-use store::Keystore;
 
 fn default_file() -> PathBuf {
     PathBuf::from(".env")
@@ -28,9 +20,10 @@ fn default_file() -> PathBuf {
              but the secrets are age-encrypted to a Secure Enclave key behind Touch ID",
     after_help = "Encryption never prompts (public-key only). Decryption asks for Touch ID.\n\
         Exit codes: 0 ok, 1 error, 2 usage, 3 cancelled, 4 no/wrong key,\n\
-        5 auth unavailable, 6 corrupt file. Broken pipes exit 0."
+        5 auth unavailable, 6 corrupt file, 7 AWS/infra, 8 VM lost, 9 policy.\n\
+        Broken pipes exit 0."
 )]
-struct Cli {
+pub struct Cli {
     /// Keystore directory (default: ~/.config/ai-env)
     #[arg(long, global = true, env = "AI_ENV_DIR", value_name = "DIR")]
     key_dir: Option<PathBuf>,
@@ -40,7 +33,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+pub enum Cmd {
     /// Create a named key: Secure Enclave identity + recovery identity ceremony
     Keygen {
         /// Key name, e.g. myproject-devnet (lowercase, digits, dashes)
@@ -162,11 +155,32 @@ enum Cmd {
         name: String,
     },
     /// Check age, the plugin, the keystore, and the current directory's .env
-    Doctor,
+    /// (exit 1 when any row is [NO ], 5 when credentials are unavailable)
+    Doctor {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the G1–G8 pre-code gates of the MicroVM bridge and write plans/gates.md
+    #[cfg(feature = "bridge")]
+    Gates {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Write the table to FILE instead of <repo>/plans/gates.md
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Run only these gates (comma-separated, e.g. G1,G3); the file is not rewritten
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+    },
+    /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
+    #[cfg(feature = "shim")]
+    Shim(crate::shim::ShimArgs),
 }
 
 #[derive(Subcommand)]
-enum KeysCmd {
+pub enum KeysCmd {
     /// List keys with policy and recovery status
     List,
     /// Show one key's details and public recipients
@@ -221,7 +235,7 @@ enum KeysCmd {
     },
 }
 
-fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<()> {
     let store = Keystore::resolve(cli.key_dir)?;
     match cli.cmd {
         Cmd::Keygen { name, access_control, strongbox_entry, no_recovery } => {
@@ -297,20 +311,31 @@ fn run(cli: Cli) -> Result<()> {
             let age = age_cmd::AgeTool::probe()?;
             commands::verify_recovery(&store, &age, &name)
         }
-        Cmd::Doctor => commands::doctor(&store, &default_file()),
+        Cmd::Doctor { json } => doctor(&store, &default_file(), json),
+        #[cfg(feature = "bridge")]
+        Cmd::Gates { json, out, only } => crate::bridge::gates::main(json, out, only),
+        #[cfg(feature = "shim")]
+        Cmd::Shim(args) => crate::shim::run(args),
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(()) => {}
-        Err(e) => {
-            let code = e.exit_code();
-            if code != 0 {
-                eprintln!("ai-env: {e}");
-            }
-            std::process::exit(code);
+/// `ai-env doctor`: the classic rows, plus the bridge rows when built with
+/// the `bridge` feature. Exit 1 on any `[NO ]`, 5 when credentials are
+/// unavailable, else 0.
+fn doctor(store: &Keystore, file: &std::path::Path, json: bool) -> Result<()> {
+    #[allow(unused_mut)]
+    let mut lines = commands::doctor_lines(store, file)?;
+    let auth_unavailable = {
+        #[cfg(feature = "bridge")]
+        {
+            let bridge = crate::bridge::doctor::rows(store);
+            lines.extend(bridge.lines);
+            bridge.auth_unavailable
         }
-    }
+        #[cfg(not(feature = "bridge"))]
+        {
+            false
+        }
+    };
+    commands::doctor_report(&lines, json, auth_unavailable)
 }

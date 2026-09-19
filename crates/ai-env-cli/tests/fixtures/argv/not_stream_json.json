@@ -1,0 +1,6 @@
+{
+  "name": "not_stream_json",
+  "argv": ["--output-format", "json", "--verbose"],
+  "route": "local",
+  "reason": "not_stream_json"
+}

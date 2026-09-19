@@ -1,0 +1,6 @@
+{
+  "name": "auth_status",
+  "argv": ["auth", "status", "--json"],
+  "route": "local",
+  "reason": "subcommand:auth"
+}

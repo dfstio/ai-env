@@ -574,20 +574,20 @@ fn outprint(s: &str) -> Result<()> {
 
 /// Read one '\n'-terminated line byte-wise into Zeroizing storage. No
 /// BufReader: nothing buffers the secret outside the returned wrapper, and
-/// nothing past the newline is consumed.
+/// nothing past the newline is consumed. The one-byte read buffer is
+/// Zeroizing too, so its wipe cannot be optimised away.
 fn read_secret_line(f: &mut fs::File) -> Result<Zeroizing<String>> {
     use std::io::Read;
     let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(256));
-    let mut b = [0u8; 1];
+    let mut b: Zeroizing<[u8; 1]> = Zeroizing::new([0u8; 1]);
     loop {
-        match f.read(&mut b) {
+        match f.read(&mut b[..]) {
             Ok(0) => break,
             Ok(_) => {
                 if b[0] == b'\n' {
                     break;
                 }
                 if buf.len() >= 4096 {
-                    b[0] = 0;
                     bail!("pasted line is too long");
                 }
                 buf.push(b[0]);
@@ -596,7 +596,6 @@ fn read_secret_line(f: &mut fs::File) -> Result<Zeroizing<String>> {
             Err(e) => return Err(e.into()),
         }
     }
-    b[0] = 0;
     let s = std::str::from_utf8(&buf)
         .map_err(|_| CliError::Msg("pasted input is not valid UTF-8".into()))?;
     Ok(Zeroizing::new(s.to_string()))

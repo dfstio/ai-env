@@ -1,0 +1,32 @@
+# Read by every `cargo clippy` in the workspace, in BOTH cfg worlds (Mac
+# all-features and shim-only). Entries whose crate is absent in some world
+# carry `allow-invalid = true`; without it clippy warns that the path does not
+# refer to a reachable function in that world.
+
+# Guards that must never live across an `.await` in the wrapper or the shim:
+#  * tracing `enter()` guards mis-attribute spans across await points (the
+#    redaction layer keys on span fields — a wrong span leaks context);
+#  * a StdoutLock/StdinLock across an await deadlocks the NDJSON pump — stdout
+#    IS the JSON channel.
+await-holding-invalid-types = [
+    { path = "tracing::span::Entered", reason = "use `Instrument::instrument` or `Span::in_scope`; never hold `enter()` across .await" },
+    { path = "tracing::span::EnteredSpan", reason = "use `Instrument::instrument`; never hold `entered()` across .await" },
+    { path = "std::io::StdoutLock", reason = "stdout is the JSON channel: write one whole line, drop the lock, then await" },
+    { path = "std::io::StdinLock", reason = "use tokio::io::stdin in async code" },
+]
+
+# TLS/WS policy (plan §2.8 invariant 15): exactly one client configuration —
+# bridge::tls::client_config() (TLS 1.3 floor, Amazon Root CA 1–4, aws-lc-rs) —
+# reaches tokio-tungstenite through `Connector::Rustls(..)` and reqwest through
+# `use_preconfigured_tls`. Everything that would pick a DIFFERENT config is
+# disallowed. `Connector::Plain` is a unit variant that this lint cannot name:
+# `make lint` greps for it instead.
+disallowed-methods = [
+    { path = "tokio_tungstenite::connect_async", reason = "default connector; dial via bridge::transport with Connector::Rustls(tls::client_config())", allow-invalid = true },
+    { path = "tokio_tungstenite::connect_async_with_config", reason = "same as connect_async", allow-invalid = true },
+    { path = "tokio_tungstenite::client_async_tls", reason = "default connector; use client_async_tls_with_config(.., Some(Connector::Rustls(..)))", allow-invalid = true },
+    { path = "reqwest::ClientBuilder::danger_accept_invalid_certs", reason = "certificate verification is mandatory", allow-invalid = true },
+    { path = "reqwest::ClientBuilder::danger_accept_invalid_hostnames", reason = "hostname verification is mandatory", allow-invalid = true },
+    { path = "rustls::ClientConfig::dangerous", reason = "no custom certificate verifiers", allow-invalid = true },
+    { path = "rustls::ConfigBuilder::dangerous", reason = "no custom certificate verifiers (builder form)", allow-invalid = true },
+]

@@ -1,3 +1,5 @@
 /target
 /plans
 .DS_Store
+# cross-built VM shim binary (image/Dockerfile is committed, the binary is not)
+/image/ai-env

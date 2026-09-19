@@ -199,16 +199,11 @@ fn aad(name: &str, generation: u64) -> Vec<u8> {
     aad
 }
 
-/// Fill from the kernel CSPRNG via getentropy(2) (max 256 bytes per call).
+/// Fill from the OS CSPRNG via the `getrandom` crate: getentropy(2) on macOS,
+/// getrandom(2) resolved through dlsym with a /dev/urandom fallback on Linux.
+/// (The VM image links against an old glibc that has no `getentropy` symbol.)
 pub fn fill_random(buf: &mut [u8]) -> Result<()> {
-    for chunk in buf.chunks_mut(256) {
-        // SAFETY: valid pointer + length ≤ 256 as required by getentropy.
-        let rc = unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) };
-        if rc != 0 {
-            return Err(CliError::Msg("getentropy failed".into()));
-        }
-    }
-    Ok(())
+    getrandom::fill(buf).map_err(|e| CliError::Msg(format!("getrandom failed: {e}")))
 }
 
 /// Capped ring of sealed snapshots — the committed-undo history. Never holds

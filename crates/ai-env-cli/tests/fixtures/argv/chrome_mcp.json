@@ -1,0 +1,6 @@
+{
+  "name": "chrome_mcp",
+  "argv": ["--claude-in-chrome-mcp"],
+  "route": "local",
+  "reason": "chrome_mcp"
+}

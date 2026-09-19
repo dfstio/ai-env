@@ -1,0 +1,17 @@
+{
+  "name": "session",
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--resume=8f3c1b2e-4d5a-7b6c-9d8e-0f1a2b3c4d5e", "--mcp-config", "{\"mcpServers\":{\"x\":{\"command\":\"npx\",\"args\":[\"--add-dir\",\"y\"]}}}", "--model", "claude-sonnet-4-5", "--effort", "high", "--thinking", "adaptive", "--tools", "default", "--add-dir", "/Users/mike/other", "--debug-file", "/Users/mike/Library/Logs/claude-debug.log"],
+  "route": "remote",
+  "session": {
+    "resume": "8f3c1b2e-4d5a-7b6c-9d8e-0f1a2b3c4d5e",
+    "thinking_disabled": false,
+    "add_dirs": ["/Users/mike/other"],
+    "permission_mode": "default",
+    "model": "claude-sonnet-4-5",
+    "has_mcp_config": true,
+    "setting_sources": "user,project,local",
+    "continue": false,
+    "debug": true
+  },
+  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--resume=8f3c1b2e-4d5a-7b6c-9d8e-0f1a2b3c4d5e", "--mcp-config", "{\"mcpServers\":{\"x\":{\"command\":\"npx\",\"args\":[\"--add-dir\",\"y\"]}}}", "--model", "claude-sonnet-4-5", "--effort", "high", "--thinking", "adaptive", "--tools", "default", "--session-mirror"]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "plugin_list",
+  "argv": ["plugin", "list", "--json"],
+  "route": "local",
+  "reason": "subcommand:plugin"
+}

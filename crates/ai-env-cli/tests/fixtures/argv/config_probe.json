@@ -1,0 +1,17 @@
+{
+  "name": "config_probe",
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--thinking", "disabled", "--max-turns", "1"],
+  "route": "remote",
+  "session": {
+    "resume": null,
+    "thinking_disabled": true,
+    "add_dirs": [],
+    "permission_mode": "default",
+    "model": null,
+    "has_mcp_config": false,
+    "setting_sources": "user,project,local",
+    "continue": false,
+    "debug": false
+  },
+  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--thinking", "disabled", "--max-turns", "1", "--session-mirror"]
+}

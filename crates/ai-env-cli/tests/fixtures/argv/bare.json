@@ -1,0 +1,7 @@
+{
+  "name": "bare",
+  "argv": ["--output-format", "stream-json", "--input-format", "stream-json", "--bare"],
+  "route": "local",
+  "reason": "bare",
+  "sanitise_error": "--bare"
+}

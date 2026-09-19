@@ -3,15 +3,77 @@ name = "ai-env-cli"
 description = "ai-env: encrypted .env files that stay .env, unlocked by Touch ID"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Literal on purpose: aws-sdk-lambdamicrovms 1.8.0 needs 1.94.1; ai-env-age
+# keeps the workspace 1.88.
+rust-version = "1.94.1"
 license.workspace = true
 repository.workspace = true
+# src/main.rs is gone: never auto-discover a third bin named `ai-env-cli`.
+autobins = false
+# Every integration test is declared below with its required-features.
+autotests = false
+
+[lib]
+name = "ai_env_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "ai-env"
-path = "src/main.rs"
+path = "src/bin/ai-env.rs"
+test = false
+
+# The Cursor wrapper; skipped silently by shim-only builds.
+[[bin]]
+name = "ai-env-claude"
+path = "src/bin/ai-env-claude.rs"
+test = false
+required-features = ["bridge"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "container"
+path = "tests/container.rs"
+
+[[test]]
+name = "hardware"
+path = "tests/hardware.rs"
+
+[[test]]
+name = "wrapper"
+path = "tests/wrapper.rs"
+required-features = ["bridge"]
+
+[[test]]
+name = "aws"
+path = "tests/aws.rs"
+required-features = ["bridge"]
+
+[[test]]
+name = "shim_local"
+path = "tests/shim_local.rs"
+required-features = ["shim"]
+
+[features]
+default = ["bridge", "shim"]
+# Mac side: AWS control plane, TLS client stack, WebSocket client.
+bridge = [
+    "dep:aws-config",
+    "dep:aws-sdk-lambdamicrovms",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
+    "tokio-tungstenite/connect",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+]
+# VM side: HTTP listeners, WebSocket server via the hyper upgrade, PID-1 duties.
+shim = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:nix"]
 
 [dependencies]
+# classic
 ai-env-age = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -26,6 +88,33 @@ serde = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 zeroize = { workspace = true }
+# every feature set
+getrandom = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true } # non-optional: `handshake` in every build
+futures-util = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+subtle = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+unicode-normalization = { workspace = true }
+# bridge
+aws-config = { workspace = true, optional = true }
+aws-sdk-lambdamicrovms = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+# shim
+axum = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = { workspace = true }

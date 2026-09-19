@@ -1,0 +1,6 @@
+{
+  "name": "version",
+  "argv": ["--version"],
+  "route": "local",
+  "reason": "version"
+}

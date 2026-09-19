@@ -5,12 +5,13 @@ members = ["crates/ai-env-age", "crates/ai-env-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.88" # consumed by crates/ai-env-age only; ai-env-cli pins 1.94.1 itself
 license = "Apache-2.0"
 repository = "https://github.com/dfstio/ai-env"
 
 [workspace.dependencies]
 ai-env-age = { path = "crates/ai-env-age" }
+# --- classic ---
 hkdf = "=0.12.4"
 sha2 = "=0.10.9"
 base64 = "=0.22.1"
@@ -23,9 +24,36 @@ thiserror = "=2.0.20"
 clap = { version = "=4.6.1", features = ["derive", "env"] }
 toml = "=0.8.23"
 serde = { version = "1", features = ["derive"] }
-libc = "0.2"
+libc = "=0.2.189"
 proptest = "=1.9.0"
 tempfile = "=3.27.0"
+# --- every feature set (wire + runtime) ---
+getrandom = "=0.3.4"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "fs", "net", "process", "signal"] }
+tokio-tungstenite = { version = "=0.26.2", default-features = false, features = ["handshake"] }
+futures-util = { version = "=0.3.34", features = ["sink"] }
+http = "=1.5.0"
+bytes = "=1.12.1"
+serde_json = "=1.0.151"
+uuid = { version = "=1.26.0", features = ["v7"] }
+subtle = "=2.6.1"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+unicode-normalization = "=0.1.25"
+# --- shim (VM) only ---
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path", "tracing"] } # never "ws"
+hyper = { version = "=1.11.1", features = ["http1", "server"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+http-body-util = "=0.1.5"
+nix = { version = "=0.30.1", features = ["process", "signal", "user", "fs"] }
+# --- bridge (Mac) only ---
+rustls = { version = "=0.23.43", default-features = false, features = ["std", "aws-lc-rs"] }
+rustls-pki-types = "=1.15.1"
+webpki-roots = "=1.0.9"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "stream"] }
+aws-config = { version = "=1.12.0", default-features = false, features = ["rt-tokio", "credentials-process", "default-https-client"] } # no `sso` (pulls ring)
+# no `rustls` feature: it selects the legacy hyper-0.14 client and duplicates hyper.
+aws-sdk-lambdamicrovms = { version = "=1.8.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 [profile.release]
 lto = true

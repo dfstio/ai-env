@@ -1,0 +1,6 @@
+{
+  "name": "mcp_add",
+  "argv": ["mcp", "add", "--transport", "http", "github", "https://api.githubcopilot.com/mcp/"],
+  "route": "local",
+  "reason": "subcommand:mcp"
+}

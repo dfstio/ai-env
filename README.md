@@ -10,7 +10,7 @@ age-encrypted to a key in your Mac's **Secure Enclave**. Using them requires **T
 
 ```sh
 brew install age age-plugin-se
-cargo install --path crates/ai-env-cli     # no Xcode needed
+cargo install --path crates/ai-env-cli --locked   # installs ai-env + ai-env-claude; no Xcode needed
 
 ai-env keygen myproject                    # one-time: enclave key + recovery ceremony
 ai-env encrypt                             # .env becomes ciphertext, in place — no prompt
@@ -131,12 +131,21 @@ ai-env keys    add-recipient NAME RECIPIENT [--label TEXT] [--rekey DIR] [--yes]
 ai-env keys    restore NAME [--rekey DIR] [--new-recovery]   # recreate from Strongbox identity
 ai-env rekey   [DIR] [--dry-run] [--yes]                  # re-encrypt containers under DIR
 ai-env verify-recovery NAME                               # the quarterly drill
-ai-env doctor                                             # environment + repo health check
+ai-env doctor [--json]                                    # environment + repo health check (exit 1 on any [NO ] row)
+ai-env gates  [--json] [--only G1,G3]                     # MicroVM bridge pre-code gates → plans/gates.md (bridge feature)
+ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
+ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
 
 Exit codes: `0` ok (broken pipes too) · `1` error · `2` usage · `3` cancelled at the prompt ·
-`4` no key opens this file · `5` auth unavailable (plugin missing, no GUI session) · `6` corrupt
-or plaintext file where a container was expected.
+`4` no key opens this file · `5` auth unavailable (plugin missing, no GUI session, AWS credentials
+unavailable) · `6` corrupt or plaintext file where a container was expected · `7` AWS/infra API
+failure · `8` MicroVM terminal or transport lost · `9` policy refusal (tripwire, egress gate,
+workspace outside the approved roots).
+
+`ai-env doctor` exits `1` when any row is `[NO ]` and `5` when AWS credentials are unavailable;
+every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings) never
+change the exit code.
 
 ### Access-control policies (`keygen --access-control`)
 
@@ -220,10 +229,27 @@ the diffs annoy you.
 
 | crate | role |
 |---|---|
-| `crates/ai-env-age` | pure-Rust age *header* parser + tag matcher (`#![forbid(unsafe_code)]`, no crypto beyond SHA-256/HKDF-Extract, fuzz-tested, KAT-frozen against real age output) |
-| `crates/ai-env-cli` | the `ai-env` binary |
+| `crates/ai-env-age` | pure-Rust age *header* parser + tag matcher (`#![forbid(unsafe_code)]`, no crypto beyond SHA-256/HKDF-Extract, fuzz-tested, KAT-frozen against real age output; MSRV 1.88) |
+| `crates/ai-env-cli` | one library (`ai_env_cli`) and two binaries: `ai-env` (the classic commands, the MicroVM-bridge operator commands behind the `bridge` feature, and the `shim` VM mode behind the `shim` feature) and `ai-env-claude` (the Cursor wrapper; `required-features = ["bridge"]`). Rust 1.94.1+ (the AWS SDK's MSRV); toolchain pinned to 1.98.1 |
+
+Features: `default = ["bridge", "shim"]`. The VM image is built with `--no-default-features
+--features shim`, which contains no AWS SDK, no TLS client and no crypto provider (`make
+check-features` asserts it). The bridge design and its stages live in `plans/v6-microvm-bridge.md`
+(gitignored working documents).
 
 ```sh
+make help                                         # every target, one line each
+make build test                                   # all four feature sets
+make clippy lint                                  # -D warnings in every cfg world + TLS/WS grep guards
+make check-bins check-features check-msrv         # packaging invariants
+make vm-build                                     # cargo lambda build --arm64 (shim only) → image/ai-env
+make vm-run ARGS='shim --help'                    # run image/ai-env inside the AL2023 arm64 base image
+make gates                                        # G1–G8 pre-code gates → plans/gates.md
 cargo test                                        # everything except hardware
 AI_ENV_SE_TESTS=1 cargo test -- --ignored         # real enclave round-trips (this Mac only)
 ```
+
+Cross-building needs cargo-lambda ≥ 1.9.2 (older releases embed a cargo-zigbuild that cannot link
+aarch64 on rustc 1.9x) and the `aarch64-unknown-linux-gnu` target on the pinned toolchain
+(`rustup target add aarch64-unknown-linux-gnu --toolchain 1.98.1`). `rustfmt` is advisory: the
+house style is wider than rustfmt's defaults, so `make fmt` reports but never gates.

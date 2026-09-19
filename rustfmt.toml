@@ -1,0 +1,6 @@
+# House style is wider than rustfmt's defaults. This is the closest stable
+# configuration; `make fmt` is ADVISORY and never a gate, and the classic
+# modules were not reformatted when the crate was split into lib + bins.
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Max"
