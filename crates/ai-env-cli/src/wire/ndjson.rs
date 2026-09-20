@@ -26,11 +26,9 @@ impl LineSplitter {
         Self::default()
     }
 
+    /// Buffer a chunk. While an over-cap line is being discarded the bytes are
+    /// still buffered: `next_line`/`finish` count and drop them.
     pub fn push(&mut self, chunk: &[u8]) {
-        if self.discarding {
-            self.buf.extend_from_slice(chunk);
-            return;
-        }
         self.buf.extend_from_slice(chunk);
     }
 
@@ -170,6 +168,32 @@ mod tests {
         s.push(&line);
         assert!(matches!(s.next_line().unwrap(), Err(LineError::TooLong { .. })));
         assert_eq!(s.next_line().unwrap().unwrap().as_ref(), b"ok");
+    }
+
+    #[test]
+    fn finish_while_discarding_reports_drop_without_phantom_line() {
+        let mut s = LineSplitter::new();
+        s.push(&vec![b'a'; MAX_LINE_BYTES + 1]);
+        assert!(s.next_line().is_none()); // over cap, now discarding
+        s.push(b"tail"); // still the same line, no newline yet; left undrained on purpose
+        assert_eq!(s.finish(), Some(Err(LineError::TooLong { dropped_bytes: MAX_LINE_BYTES + 1 + 4 })));
+        assert!(s.finish().is_none()); // no phantom line, nothing left to report
+        // The splitter is clean afterwards: a new line is delivered normally.
+        s.push(b"ok\n");
+        assert_eq!(s.next_line().unwrap().unwrap().as_ref(), b"ok");
+        assert!(s.finish().is_none());
+    }
+
+    #[test]
+    fn finish_after_too_long_error_is_clean() {
+        // `TooLong` already returned (newline arrived), nothing buffered after it.
+        let mut s = LineSplitter::new();
+        let mut line = vec![b'a'; MAX_LINE_BYTES + 1];
+        line.extend_from_slice(b"\n");
+        s.push(&line);
+        assert!(matches!(s.next_line().unwrap(), Err(LineError::TooLong { .. })));
+        assert!(s.next_line().is_none());
+        assert!(s.finish().is_none());
     }
 
     #[test]

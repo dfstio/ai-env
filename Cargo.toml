@@ -23,7 +23,7 @@ chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 thiserror = "=2.0.20"
 clap = { version = "=4.6.1", features = ["derive", "env"] }
 toml = "=0.8.23"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
 libc = "=0.2.189"
 proptest = "=1.9.0"
 tempfile = "=3.27.0"
@@ -54,6 +54,9 @@ reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-
 aws-config = { version = "=1.12.0", default-features = false, features = ["rt-tokio", "credentials-process", "default-https-client"] } # no `sso` (pulls ring)
 # no `rustls` feature: it selects the legacy hyper-0.14 client and duplicates hyper.
 aws-sdk-lambdamicrovms = { version = "=1.8.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# The SDK's hyper-1 client, already in the graph through `default-https-client`; a direct
+# dependency so tls.rs can build it under the one TLS policy (Amazon roots, aws-lc-rs, no proxy).
+aws-smithy-http-client = { version = "=1.4.2", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 
 [profile.release]
 lto = true

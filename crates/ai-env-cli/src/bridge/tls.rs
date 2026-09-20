@@ -1,8 +1,10 @@
 //! One TLS client policy for everything the Mac dials (the MicroVM endpoint
-//! over WebSocket and HTTPS, later the AWS SDK's own client): TLS 1.3 only,
+//! over WebSocket and HTTPS, and the AWS SDK's own client): TLS 1.3 only,
 //! Amazon Root CA 1–4 as the only trust anchors, aws-lc-rs as the only crypto
 //! provider, and proxy environment variables ignored. Nothing else in the
-//! crate may build a `ClientConfig` (`make lint` greps for it).
+//! crate may build a `ClientConfig` or touch `aws_smithy_http_client`
+//! (`make lint` greps for both).
+use aws_sdk_lambdamicrovms::config::SharedHttpClient;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::CertificateDer;
@@ -84,6 +86,45 @@ pub fn reqwest_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder().use_preconfigured_tls((*client_config()).clone()).no_proxy().build()
 }
 
+/// The AWS SDK's HTTP client under the same policy, for `api::sdk_config()`:
+/// rustls on aws-lc-rs, a trust store that starts EMPTY (never the platform
+/// store) and holds only the four embedded Amazon roots, and the proxy
+/// configuration pinned to disabled. The SDK's own default client
+/// (`aws-smithy-runtime`'s `default-https-client`) would instead load the
+/// native roots and honour `HTTPS_PROXY`/`NO_PROXY`.
+///
+/// Documented exception to the policy: the TLS 1.3-only floor of the
+/// WebSocket/reqwest path is not reachable through this API — the crate
+/// builds the rustls `ClientConfig` itself with its safe default versions
+/// (1.2 + 1.3), so the control plane negotiates whatever the AWS endpoint
+/// selects (1.3). `PROTOCOL_VERSIONS` does not apply here.
+#[must_use]
+pub fn sdk_http_client() -> SharedHttpClient {
+    use aws_smithy_http_client::proxy::ProxyConfig;
+    use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
+    use aws_smithy_http_client::tls::{Provider, TlsContext, TrustStore};
+    use aws_smithy_http_client::{Builder, Connector};
+
+    // Same aws-lc-rs process default as the WS/reqwest path (idempotent).
+    let _ = crypto_provider();
+    let mut trust = TrustStore::empty();
+    for pem in AMAZON_ROOT_CA_PEMS {
+        trust.add_pem_certificate(pem.as_bytes());
+    }
+    let context = TlsContext::builder().with_trust_store(trust).build().expect("a TLS context from PEM bytes cannot fail to build");
+    // `Builder::build_https` has no proxy setter and the SDK's default path installs
+    // `ProxyConfig::from_env()`; the connector-fn form is the one that takes an explicit
+    // `ProxyConfig` while still honouring the SDK's connect/read timeouts and sleep impl.
+    Builder::new().build_with_connector_fn(move |settings, components| {
+        let mut builder = Connector::builder().proxy_config(ProxyConfig::disabled());
+        builder.set_connector_settings(settings.cloned());
+        if let Some(components) = components {
+            builder.set_sleep_impl(components.sleep_impl());
+        }
+        builder.tls_provider(Provider::Rustls(CryptoMode::AwsLc)).tls_context(context.clone()).build()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +164,25 @@ mod tests {
     #[test]
     fn reqwest_client_builds() {
         assert!(reqwest_client().is_ok());
+    }
+
+    #[test]
+    fn sdk_http_client_builds_and_is_accepted_by_the_sdk() {
+        use aws_sdk_lambdamicrovms::config::{HttpClient, Region};
+        let client = sdk_http_client();
+        // The type does not expose the TLS provider; the metadata does say it is the
+        // smithy hyper-1 client (the rustls provider is the only TLS feature we enable on it).
+        let meta = client.connector_metadata().expect("hyper client reports metadata");
+        assert_eq!(meta.name(), "hyper");
+        assert_eq!(meta.version().as_deref(), Some("1.x"));
+        // `Client::from_conf` validates the base config, which builds the connector once:
+        // that is where the embedded PEMs are parsed into the rustls root store (a bad
+        // PEM panics here). Offline: nothing is dialed.
+        let conf = aws_sdk_lambdamicrovms::Config::builder()
+            .behavior_version_latest()
+            .region(Region::new(crate::bridge::config::REGION))
+            .http_client(client)
+            .build();
+        let _sdk = aws_sdk_lambdamicrovms::Client::from_conf(conf);
     }
 }

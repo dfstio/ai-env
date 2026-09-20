@@ -132,7 +132,8 @@ ai-env keys    restore NAME [--rekey DIR] [--new-recovery]   # recreate from Str
 ai-env rekey   [DIR] [--dry-run] [--yes]                  # re-encrypt containers under DIR
 ai-env verify-recovery NAME                               # the quarterly drill
 ai-env doctor [--json]                                    # environment + repo health check (exit 1 on any [NO ] row)
-ai-env gates  [--json] [--only G1,G3]                     # MicroVM bridge pre-code gates → plans/gates.md (bridge feature)
+ai-env gates  [--json] [--only G1,G3] [--out FILE]        # MicroVM bridge pre-code gates → plans/gates.md (bridge feature);
+                                                          #   --only re-measures a subset: nothing is written, go/no-go is not evaluated
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```

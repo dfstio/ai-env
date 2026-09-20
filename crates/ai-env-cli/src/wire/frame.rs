@@ -381,7 +381,7 @@ mod tests {
     fn every_variant() -> Vec<Frame> {
         vec![
             Frame::Hello {
-                session_token: Secret::new("c2Vzc2lvbi10b2tlbi0xMjM".into()),
+                session_token: Secret::new("fake-session-token".into()),
                 client: ClientInfo { name: "ai-env-claude".into(), version: "0.1.0".into(), host: "mike@mbp".into() },
                 resume: vec![ResumePoint { spawn_id: sid(), from_seq: 42 }],
             },
@@ -440,7 +440,7 @@ mod tests {
         let f = &every_variant()[0];
         assert_eq!(
             f.to_json(),
-            format!("{{\"v\":1,\"t\":\"hello\",\"session_token\":\"c2Vzc2lvbi10b2tlbi0xMjM\",\"client\":{{\"name\":\"ai-env-claude\",\"version\":\"0.1.0\",\"host\":\"mike@mbp\"}},\"resume\":[{{\"spawn_id\":\"{SID}\",\"from_seq\":42}}]}}")
+            format!("{{\"v\":1,\"t\":\"hello\",\"session_token\":\"fake-session-token\",\"client\":{{\"name\":\"ai-env-claude\",\"version\":\"0.1.0\",\"host\":\"mike@mbp\"}},\"resume\":[{{\"spawn_id\":\"{SID}\",\"from_seq\":42}}]}}")
         );
     }
 
@@ -505,6 +505,7 @@ mod tests {
         let p = RunHookPayload::new(&Secret::new("test-token".into()), "mike@mbp", "2026-09-19T08:00:00Z");
         assert_eq!(
             p.to_json().unwrap(),
+            // sha256("test-token") — public known-answer, not a credential.
             "{\"v\":1,\"commit\":\"4c5dc9b7708905f77f5e5d16316b5dfb425e68cb326dcd55a860e90a7707031e\",\"owner\":\"mike@mbp\",\"created\":\"2026-09-19T08:00:00Z\"}"
         );
         let back: RunHookPayload = serde_json::from_str(&p.to_json().unwrap()).unwrap();

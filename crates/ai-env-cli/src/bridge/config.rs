@@ -196,15 +196,27 @@ impl Default for EgressCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// `[review] tripwires settings_policy` — the two scan lists `box review`,
+/// seed and `make image-zip` read. Both default to files under the bridge
+/// root, so an empty table is the documented setup.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewCfg {
-    pub pre_push_hook: bool,
+    pub tripwires: Option<PathBuf>,
+    pub settings_policy: Option<PathBuf>,
 }
 
-impl Default for ReviewCfg {
-    fn default() -> Self {
-        ReviewCfg { pre_push_hook: true }
+impl ReviewCfg {
+    /// `[review].tripwires` | `<root>/tripwires.txt`.
+    #[must_use]
+    pub fn tripwires_path(&self, paths: &Paths) -> PathBuf {
+        self.tripwires.clone().unwrap_or_else(|| paths.root.join("tripwires.txt"))
+    }
+
+    /// `[review].settings_policy` | `<root>/settings-policy.txt`.
+    #[must_use]
+    pub fn settings_policy_path(&self, paths: &Paths) -> PathBuf {
+        self.settings_policy.clone().unwrap_or_else(|| paths.root.join("settings-policy.txt"))
     }
 }
 
@@ -336,6 +348,28 @@ mod tests {
         let q = Paths::from_root_and_env(PathBuf::from("/r"), Some(PathBuf::from("/x/b.toml")));
         assert_eq!(q.config, PathBuf::from("/x/b.toml"));
         assert_eq!(q.logs(), PathBuf::from("/r/logs"));
+    }
+
+    #[test]
+    fn review_paths_override_and_default() {
+        let p = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        let c = BridgeConfig::parse("[review]\ntripwires = \"/x/t.txt\"\n").unwrap();
+        assert_eq!(c.review.tripwires, Some(PathBuf::from("/x/t.txt")));
+        assert_eq!(c.review.tripwires_path(&p), PathBuf::from("/x/t.txt"));
+        assert_eq!(c.review.settings_policy, None);
+        assert_eq!(c.review.settings_policy_path(&p), PathBuf::from("/r/settings-policy.txt"));
+        let d = BridgeConfig::parse("").unwrap();
+        assert_eq!(d.review, ReviewCfg::default());
+        assert_eq!(d.review.tripwires_path(&p), PathBuf::from("/r/tripwires.txt"));
+        assert_eq!(d.review.settings_policy_path(&p), PathBuf::from("/r/settings-policy.txt"));
+        let e = BridgeConfig::parse("[review]\nsettings_policy = \"/x/p.toml\"\n").unwrap();
+        assert_eq!(e.review.settings_policy_path(&p), PathBuf::from("/x/p.toml"));
+    }
+
+    #[test]
+    fn review_pre_push_hook_is_unknown() {
+        let e = BridgeConfig::parse("[review]\npre_push_hook = true\n").unwrap_err();
+        assert!(e.to_string().contains("pre_push_hook"), "{e}");
     }
 
     #[test]

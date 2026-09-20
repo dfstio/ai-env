@@ -1,7 +1,7 @@
 //! Bridge tests that touch the AWS SDK types and the TLS/WebSocket request
-//! path (`--features bridge`). Offline unless marked `#[ignore]`; the region
-//! test mutates the process environment, so run this file with
-//! `--test-threads=1` when it fails intermittently.
+//! path (`--features bridge`). Offline unless marked `#[ignore]`. Nothing
+//! here mutates the process environment: the region test that does lives
+//! alone in `tests/aws_region.rs`.
 use ai_env_cli::bridge::api::{hooks_config, idle_policy, sdk_config, Call, FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, VmState};
 use ai_env_cli::bridge::tls;
 use ai_env_cli::bridge::transport::agent_request;
@@ -41,6 +41,7 @@ fn hooks_config_matches_spec() {
 #[test]
 fn derive_accept_key_kat() {
     use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    // RFC 6455 §1.3 / §4.2.2 example handshake: public spec constants, not credentials.
     assert_eq!(derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 }
 
@@ -61,13 +62,10 @@ fn ws_request_bytes() {
 }
 
 #[tokio::test]
-async fn sdk_config_region_pinned_despite_env() {
-    std::env::set_var("AWS_REGION", "eu-west-3");
-    std::env::set_var("AWS_DEFAULT_REGION", "eu-west-3");
+async fn sdk_config_installs_the_bridge_http_client() {
     let cfg = sdk_config().await;
     assert_eq!(cfg.region().map(|r| r.as_ref().to_string()), Some("eu-central-1".to_string()));
-    std::env::remove_var("AWS_REGION");
-    std::env::remove_var("AWS_DEFAULT_REGION");
+    assert!(cfg.http_client().is_some(), "sdk_config must install bridge::tls::sdk_http_client(), never the SDK default");
 }
 
 #[test]
@@ -77,10 +75,19 @@ fn tls_policy_holds() {
     assert!(matches!(tls::ws_connector(), tokio_tungstenite::Connector::Rustls(_)));
 }
 
+/// Gate for the `#[ignore]`d live tests: says so on stderr instead of passing silently.
+fn live() -> bool {
+    if std::env::var("AI_ENV_AWS_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_AWS_TESTS=1 to run live tests");
+    false
+}
+
 #[tokio::test]
 #[ignore = "live TLS handshake; run with AI_ENV_AWS_TESTS=1 cargo test --test aws -- --ignored"]
 async fn tls_live_amazontrust() {
-    if std::env::var("AI_ENV_AWS_TESTS").as_deref() != Ok("1") {
+    if !live() {
         return;
     }
     let client = tls::reqwest_client().unwrap();
@@ -90,7 +97,7 @@ async fn tls_live_amazontrust() {
 
 fn spec(token: &str) -> RunSpec {
     RunSpec {
-        image_arn: "arn:aws:lambda:eu-central-1:058264205854:microvm-image:ai-env-agent".into(),
+        image_arn: "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent".into(),
         image_version: "1".into(),
         execution_role_arn: None,
         egress_connectors: vec![],

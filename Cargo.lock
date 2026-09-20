@@ -40,6 +40,7 @@ dependencies = [
  "ai-env-age",
  "aws-config",
  "aws-sdk-lambdamicrovms",
+ "aws-smithy-http-client",
  "axum",
  "base64",
  "bytes",

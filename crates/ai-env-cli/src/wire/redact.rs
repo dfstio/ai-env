@@ -133,6 +133,11 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
+/// Bytes that make up a key name (`session_token`, `x-aws-proxy-auth`, …).
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
 /// Mask secrets in a log line: `sk-ant-…` tokens, `eyJ…` tokens of at least
 /// [`JWE_MIN_LEN`] chars, registered values, and the values of key-shaped
 /// assignments (`token=`, `Authorization:`, `x-aws-proxy-auth:`, …).
@@ -177,16 +182,25 @@ pub fn scrub(text: &str) -> Cow<'_, str> {
             }
         }
         // Key-shaped: `<name-containing-keyword> [=:] "?value` up to a delimiter.
-        if let Some(value_start) = key_shaped(rest) {
-            let value = &rest[value_start..];
-            let vlen = value.find(['"', ',', '}', '\n', '\r']).unwrap_or(value.len());
-            let raw = &value[..vlen];
-            if !raw.trim().is_empty() {
-                out.push_str(&rest[..value_start]);
-                out.push_str(&format!("[redacted:len={}]", raw.len()));
-                i += value_start + vlen;
-                changed = true;
-                continue;
+        // Only tried where a key name can start (offset 0 or after a non-identifier
+        // byte): a key found mid-identifier would already have matched at its start,
+        // and scanning the identifier from every offset is quadratic on long lines.
+        let at_ident_start = i == 0 || !is_ident_char(s.as_bytes()[i - 1]);
+        if at_ident_start {
+            if let Some(m) = key_shaped(rest) {
+                let value = &rest[m.value_start..];
+                // A quoted value ends at its closing quote; a header value runs to the end of
+                // the line (it may hold `,`); a bare `k=v` stops at the next list delimiter.
+                let stops: &[char] = if m.quoted || m.header { &['"', '\n', '\r'] } else { &['"', ',', '}', '\n', '\r'] };
+                let vlen = value.find(stops).unwrap_or(value.len());
+                let raw = &value[..vlen];
+                if !raw.trim().is_empty() {
+                    out.push_str(&rest[..m.value_start]);
+                    out.push_str(&format!("[redacted:len={}]", raw.len()));
+                    i += m.value_start + vlen;
+                    changed = true;
+                    continue;
+                }
             }
         }
         let ch = s[i..].chars().next().unwrap_or('\0');
@@ -204,35 +218,71 @@ pub fn scrub(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// A key-shaped assignment found at the start of a slice by [`key_shaped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyMatch {
+    /// Offset of the first byte of the secret value: past the separator, the
+    /// surrounding whitespace, an opening `"` and a visible auth scheme.
+    value_start: usize,
+    /// The value opened with `"` (`"token": "…"`), so it ends at the closing
+    /// quote rather than at the first `,` or `}`.
+    quoted: bool,
+    /// HTTP header form `Name: value` (bare key, colon separator): an
+    /// `Authorization: Bearer …` / `Basic …` scheme is kept visible, only the
+    /// credential after it is masked, and the value runs to the end of the
+    /// line (header values may contain `,`).
+    header: bool,
+}
+
+/// Auth schemes left visible in a header value; the credential follows them.
+const AUTH_SCHEMES: [&str; 2] = ["bearer", "basic"];
+
+fn ws_len(s: &str) -> usize {
+    s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count()
+}
+
 /// If `rest` starts with a key-shaped assignment whose key contains one of the
-/// secret-bearing names, return the offset where the value starts.
-fn key_shaped(rest: &str) -> Option<usize> {
-    let key_len = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).map(char::len_utf8).sum::<usize>();
+/// secret-bearing names, describe where its value starts. Forms recognised:
+/// `token=abc`, `token: abc`, JSON `"token": "abc"`, and the HTTP headers
+/// `Authorization: Bearer abc` / `x-aws-proxy-auth: abc`.
+fn key_shaped(rest: &str) -> Option<KeyMatch> {
+    let key_len = rest.bytes().take_while(|b| is_ident_char(*b)).count();
     if key_len == 0 {
         return None;
     }
-    let key = &rest[..key_len];
-    let lower = key.to_ascii_lowercase();
+    let lower = rest[..key_len].to_ascii_lowercase();
     if !KEY_NAMES.iter().any(|k| lower.contains(k)) {
         return None;
     }
     // JSON keys are quoted: `"session_token":"…"` — skip the closing quote.
-    let quote = usize::from(rest[key_len..].starts_with('"'));
-    let after = &rest[key_len + quote..];
-    let ws = after.chars().take_while(|c| *c == ' ' || *c == '\t').count();
-    let after2 = &after[ws..];
-    let sep = after2.chars().next()?;
+    let json_key = rest[key_len..].starts_with('"');
+    let mut pos = key_len + usize::from(json_key);
+    pos += ws_len(&rest[pos..]);
+    let sep = rest[pos..].chars().next()?;
     if sep != '=' && sep != ':' {
         return None;
     }
-    let mut pos = key_len + quote + ws + 1;
-    let tail = &rest[pos..];
-    let ws2 = tail.chars().take_while(|c| *c == ' ' || *c == '\t').count();
-    pos += ws2;
-    if rest[pos..].starts_with('"') {
+    pos += 1;
+    pos += ws_len(&rest[pos..]);
+    let quoted = rest[pos..].starts_with('"');
+    if quoted {
         pos += 1;
     }
-    Some(pos)
+    let header = sep == ':' && !json_key;
+    if header {
+        // `Authorization: Bearer <cred>`: keep the scheme, mask the credential.
+        let tail = rest.as_bytes().get(pos..).unwrap_or_default();
+        for scheme in AUTH_SCHEMES {
+            let n = scheme.len();
+            let followed_by_ws = matches!(tail.get(n), Some(b' ' | b'\t'));
+            if followed_by_ws && tail[..n].eq_ignore_ascii_case(scheme.as_bytes()) {
+                pos += n;
+                pos += ws_len(&rest[pos..]);
+                break;
+            }
+        }
+    }
+    Some(KeyMatch { value_start: pos, quoted, header })
 }
 
 /// `io::Write` adapter that scrubs each complete line before forwarding it.
@@ -315,9 +365,10 @@ mod tests {
 
     #[test]
     fn scrub_sk_ant() {
-        let line = "unseal token sk-ant-oat01-SECRETSECRETSECRET done";
-        let out = scrub(line);
-        assert!(!out.contains("SECRETSECRET"), "{out}");
+        let tok = format!("sk-ant-oat01-{}", "X".repeat(20));
+        let line = format!("unseal token {tok} done");
+        let out = scrub(&line);
+        assert!(!out.contains("XXXXXXXX"), "{out}");
         assert!(out.contains("sk-ant-[redacted:len="), "{out}");
         assert!(out.ends_with(" done"), "{out}");
     }
@@ -346,12 +397,15 @@ mod tests {
 
     #[test]
     fn scrub_key_shaped_names() {
+        // Built at runtime so no `token=<16+ chars>` literal sits in the source.
+        let fake = format!("FAKEFAKE{}", "12345678");
+        let session = format!("session_token={fake}");
         let cases = [
-            ("session_token=abcdef0123456789", "abcdef0123456789"),
+            (session.as_str(), fake.as_str()),
             ("Authorization: Bearer xyz.123", "xyz.123"),
             ("x-aws-proxy-auth: not-a-jwe-but-secret", "not-a-jwe-but-secret"),
             ("GIT_CONFIG_VALUE_0=http.extraHeader=Authorization: Basic abc", "Basic abc"),
-            ("{\"session_token\":\"c2Vj\",\"client\":\"x\"}", "c2Vj"),
+            ("{\"session_token\":\"fakevalue\",\"client\":\"x\"}", "fakevalue"),
         ];
         for (line, secret) in cases {
             let out = scrub(line);
@@ -359,6 +413,83 @@ mod tests {
             assert!(out.contains("[redacted:len="), "{line} -> {out}");
         }
         assert_eq!(scrub("port=8080 owner=mike"), "port=8080 owner=mike");
+    }
+
+    #[test]
+    fn scrub_form_key_equals_value() {
+        // A bare `k=v` value runs to the next list delimiter, not to whitespace.
+        assert_eq!(scrub("token=abc12345 next=1"), "token=[redacted:len=15]");
+        assert_eq!(scrub("token=abc12345,next=1"), "token=[redacted:len=8],next=1");
+    }
+
+    #[test]
+    fn scrub_form_key_colon_value() {
+        assert_eq!(scrub("token: abc12345"), "token: [redacted:len=8]");
+        assert_eq!(scrub("token:abc12345\nnext"), "token:[redacted:len=8]\nnext");
+    }
+
+    #[test]
+    fn scrub_form_json_quoted() {
+        assert_eq!(scrub("{\"token\": \"abc12345\", \"n\": 1}"), "{\"token\": \"[redacted:len=8]\", \"n\": 1}");
+        // A quoted value keeps going past `,` and `}` up to its closing quote.
+        assert_eq!(scrub("{\"token\":\"a,b}c\"}"), "{\"token\":\"[redacted:len=5]\"}");
+        // A quoted JSON key is not a header: `Bearer` stays inside the masked value.
+        assert_eq!(scrub("{\"authorization\":\"Bearer abc\"}"), "{\"authorization\":\"[redacted:len=10]\"}");
+    }
+
+    #[test]
+    fn scrub_form_authorization_bearer_header() {
+        assert_eq!(scrub("Authorization: Bearer abc12345"), "Authorization: Bearer [redacted:len=8]");
+        assert_eq!(scrub("authorization: bearer abc12345"), "authorization: bearer [redacted:len=8]");
+        assert_eq!(scrub("Authorization: Basic abc123"), "Authorization: Basic [redacted:len=6]");
+        // A bare scheme with nothing after it is left alone (nothing to mask).
+        assert_eq!(scrub("Authorization: Bearer "), "Authorization: Bearer ");
+        // Header values run to the end of the line.
+        assert_eq!(scrub("Authorization: Bearer a, b\nok"), "Authorization: Bearer [redacted:len=4]\nok");
+    }
+
+    #[test]
+    fn scrub_form_x_aws_proxy_auth_header() {
+        assert_eq!(scrub("x-aws-proxy-auth: abc12345"), "x-aws-proxy-auth: [redacted:len=8]");
+        assert_eq!(scrub("X-Aws-Proxy-Auth:\tabc12345\r"), "X-Aws-Proxy-Auth:\t[redacted:len=8]\r");
+    }
+
+    #[test]
+    fn scrub_key_only_matched_at_identifier_start() {
+        // `mytoken` matches at its start; the `token` inside it is never re-scanned.
+        assert_eq!(scrub("mytoken=abc12345"), "mytoken=[redacted:len=8]");
+        // A key after a non-identifier byte is still found.
+        assert_eq!(scrub("cfg.token=abc12345"), "cfg.token=[redacted:len=8]");
+        assert_eq!(scrub("(token=abc12345)"), "(token=[redacted:len=9]");
+        // Non-matching keys are untouched.
+        assert_eq!(scrub("tokens_per_second=8080 owner=mike"), "tokens_per_second=[redacted:len=15]");
+        assert_eq!(scrub("port=8080 owner=mike token"), "port=8080 owner=mike token");
+    }
+
+    #[test]
+    fn scrub_64k_line_without_secrets_is_fast() {
+        let line = "abcdefgh".repeat(8192);
+        assert_eq!(line.len(), 64 * 1024);
+        let t = std::time::Instant::now();
+        let out = scrub(&line);
+        let took = t.elapsed();
+        assert_eq!(out, line);
+        assert!(took < std::time::Duration::from_millis(500), "scrub took {took:?}");
+    }
+
+    #[test]
+    fn scrub_64k_line_with_registered_secret_is_fast() {
+        let secret = format!("perf-secret-{}", "Z".repeat(20));
+        register_secret(&secret);
+        let half = "abcdefgh".repeat(4096);
+        let line = format!("{half}{secret}{half}");
+        assert!(line.len() > 64 * 1024);
+        let t = std::time::Instant::now();
+        let out = scrub(&line);
+        let took = t.elapsed();
+        assert!(!out.contains("ZZZZZZZZ"), "secret leaked");
+        assert!(out.contains(&format!("[redacted:len={}]", secret.len())), "{}", &out[half.len() - 8..half.len() + 40]);
+        assert!(took < std::time::Duration::from_millis(500), "scrub took {took:?}");
     }
 
     #[test]

@@ -21,6 +21,8 @@ await-holding-invalid-types = [
 # `use_preconfigured_tls`. Everything that would pick a DIFFERENT config is
 # disallowed. `Connector::Plain` is a unit variant that this lint cannot name:
 # `make lint` greps for it instead.
+# `allow-invalid = true` keeps the shim world quiet; examples/tls_lint_negative.rs
+# (`make lint-negative`) proves these paths still resolve.
 disallowed-methods = [
     { path = "tokio_tungstenite::connect_async", reason = "default connector; dial via bridge::transport with Connector::Rustls(tls::client_config())", allow-invalid = true },
     { path = "tokio_tungstenite::connect_async_with_config", reason = "same as connect_async", allow-invalid = true },

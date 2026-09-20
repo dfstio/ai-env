@@ -972,12 +972,6 @@ pub fn doctor_report(lines: &[DoctorLine], json: bool, auth_unavailable: bool) -
     }
 }
 
-/// `ai-env doctor` with the classic rows only.
-pub fn doctor(store: &Keystore, file: &Path, json: bool) -> Result<()> {
-    let lines = doctor_lines(store, file)?;
-    doctor_report(&lines, json, false)
-}
-
 // ---- shared helpers ---------------------------------------------------------
 
 /// Minimal JSON string encoder (escapes quotes, backslashes, control chars).
@@ -1072,4 +1066,195 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
     file.write_all(data)?;
     file.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{doctor_exit_code, doctor_json, doctor_report, json_string, DoctorLine, Tag};
+    use crate::errors::CliError;
+
+    fn ok(text: &str) -> DoctorLine {
+        DoctorLine::row(Tag::Ok, text)
+    }
+
+    fn no(text: &str) -> DoctorLine {
+        DoctorLine::row(Tag::No, text)
+    }
+
+    // ---- doctor_exit_code -------------------------------------------------
+
+    #[test]
+    fn exit_is_zero_without_no_rows_and_with_auth() {
+        assert_eq!(doctor_exit_code(&[], false), 0);
+        let lines = [ok("age v1.3.2"), DoctorLine::plain("keystore: /k"), ok("key x  ok")];
+        assert_eq!(doctor_exit_code(&lines, false), 0);
+    }
+
+    #[test]
+    fn exit_is_one_on_any_no_row() {
+        assert_eq!(doctor_exit_code(&[no("age-plugin-se")], false), 1);
+        let lines = [ok("age v1.3.2"), DoctorLine::plain("keystore: /k"), no(".env is PLAINTEXT"), ok("k")];
+        assert_eq!(doctor_exit_code(&lines, false), 1);
+        // Several problems still map to the single generic code.
+        assert_eq!(doctor_exit_code(&[no("a"), no("b"), no("c")], false), 1);
+    }
+
+    #[test]
+    fn exit_is_five_when_auth_unavailable() {
+        assert_eq!(doctor_exit_code(&[], true), 5);
+        assert_eq!(doctor_exit_code(&[ok("all good")], true), 5);
+    }
+
+    #[test]
+    fn auth_unavailable_takes_precedence_over_no_rows() {
+        assert_eq!(doctor_exit_code(&[no("x"), ok("y")], true), 5);
+    }
+
+    #[test]
+    fn warn_skip_and_plain_never_change_the_exit() {
+        let soft = [
+            DoctorLine::row(Tag::Warn, "plaintext env-like sibling: .env.bak"),
+            DoctorLine::row(Tag::Skip, ".env does not exist in this directory"),
+            DoctorLine::plain("keystore: /k"),
+        ];
+        assert_eq!(doctor_exit_code(&soft, false), 0);
+        let mut with_no = soft.to_vec();
+        with_no.push(no("age: missing"));
+        assert_eq!(doctor_exit_code(&with_no, false), 1);
+        assert_eq!(doctor_exit_code(&soft, true), 5);
+    }
+
+    // ---- doctor_json --------------------------------------------------------
+
+    #[test]
+    fn json_shape_is_exact_for_a_single_row() {
+        assert_eq!(doctor_json(&[ok("a")], 0), r#"{"ok":true,"exit":0,"rows":[{"tag":"ok","text":"a"}]}"#);
+        assert_eq!(doctor_json(&[], 5), r#"{"ok":false,"exit":5,"rows":[]}"#);
+    }
+
+    #[test]
+    fn json_carries_every_tag_and_plain_lines_as_info() {
+        let lines = [
+            ok("age v1.3.2"),
+            no("age-plugin-se  <- brew install age-plugin-se"),
+            DoctorLine::row(Tag::Skip, "pre-commit guard"),
+            DoctorLine::row(Tag::Warn, "plaintext sibling"),
+            DoctorLine::plain("keystore: /Users/x/.ai-env"),
+        ];
+        let text = doctor_json(&lines, 1);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert_eq!(v["ok"], serde_json::Value::Bool(false));
+        assert_eq!(v["exit"], serde_json::json!(1));
+        let rows = v["rows"].as_array().expect("rows is an array");
+        assert_eq!(rows.len(), lines.len());
+        let tags: Vec<&str> = rows.iter().map(|r| r["tag"].as_str().unwrap()).collect();
+        assert_eq!(tags, ["ok", "no", "skip", "warn", "info"]);
+        assert_eq!(rows[1]["text"], "age-plugin-se  <- brew install age-plugin-se");
+        assert_eq!(rows[4]["text"], "keystore: /Users/x/.ai-env");
+        for row in rows {
+            assert_eq!(row.as_object().unwrap().len(), 2, "rows carry exactly tag and text: {row}");
+        }
+    }
+
+    #[test]
+    fn json_ok_mirrors_exit_zero_only() {
+        for exit in [0, 1, 5] {
+            let v: serde_json::Value = serde_json::from_str(&doctor_json(&[ok("x")], exit)).unwrap();
+            assert_eq!(v["ok"].as_bool(), Some(exit == 0), "exit {exit}");
+            assert_eq!(v["exit"].as_i64(), Some(i64::from(exit)));
+        }
+    }
+
+    #[test]
+    fn json_row_text_is_escaped() {
+        let lines = [ok("path \"C:\\x\"\tdone\n"), DoctorLine::plain("é — ✓")];
+        let text = doctor_json(&lines, 0);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert_eq!(v["rows"][0]["text"], "path \"C:\\x\"\tdone\n");
+        assert_eq!(v["rows"][1]["text"], "é — ✓");
+    }
+
+    // ---- json_string --------------------------------------------------------
+
+    #[test]
+    fn json_string_escapes_the_named_characters() {
+        assert_eq!(json_string(""), r#""""#);
+        assert_eq!(json_string("plain"), r#""plain""#);
+        assert_eq!(json_string("say \"hi\""), r#""say \"hi\"""#);
+        assert_eq!(json_string("a\\b"), r#""a\\b""#);
+        assert_eq!(json_string("l1\nl2"), r#""l1\nl2""#);
+        assert_eq!(json_string("a\tb"), r#""a\tb""#);
+        assert_eq!(json_string("a\rb"), r#""a\rb""#);
+    }
+
+    #[test]
+    fn json_string_uses_u00xx_for_other_control_chars() {
+        assert_eq!(json_string("\u{0}"), r#""\u0000""#);
+        assert_eq!(json_string("\u{1}x\u{1f}"), r#""\u0001x\u001f""#);
+        assert_eq!(json_string("\u{8}\u{c}"), r#""\u0008\u000c""#);
+        assert_eq!(json_string("\u{1b}[0m"), r#""\u001b[0m""#);
+    }
+
+    #[test]
+    fn json_string_passes_non_ascii_through() {
+        assert_eq!(json_string("é — ✓ 日本 🙂"), "\"é — ✓ 日本 🙂\"");
+        // DEL and the space are not control characters in JSON's sense.
+        assert_eq!(json_string("a\u{7f} b"), "\"a\u{7f} b\"");
+    }
+
+    #[test]
+    fn json_string_round_trips_through_serde_json() {
+        let samples = [
+            "",
+            "plain",
+            "quote\" backslash\\ slash/",
+            "tab\t nl\n cr\r",
+            "\u{0}\u{1}\u{1f}\u{7f}",
+            "é — ✓ 日本 🙂",
+            "\u{2028}\u{2029}",
+            "<- brew install age-plugin-se (needed for keygen/decrypt)",
+        ];
+        for s in samples {
+            let encoded = json_string(s);
+            let decoded: String = serde_json::from_str(&encoded).unwrap_or_else(|e| panic!("{e}: {encoded}"));
+            assert_eq!(decoded, s, "{encoded}");
+        }
+    }
+
+    // ---- doctor_report ------------------------------------------------------
+
+    #[test]
+    fn report_is_ok_on_exit_zero() {
+        let lines = [ok("age v1.3.2"), DoctorLine::plain("keystore: /k"), DoctorLine::row(Tag::Warn, "w")];
+        assert!(doctor_report(&lines, false, false).is_ok());
+        assert!(doctor_report(&lines, true, false).is_ok());
+        assert!(doctor_report(&[], true, false).is_ok());
+    }
+
+    #[test]
+    fn report_is_msg_error_counting_no_rows_on_exit_one() {
+        let lines = [ok("a"), no("b"), DoctorLine::row(Tag::Skip, "c"), no("d")];
+        for json in [false, true] {
+            match doctor_report(&lines, json, false) {
+                Err(CliError::Msg(m)) => assert_eq!(m, "2 problem(s) found"),
+                other => panic!("expected CliError::Msg (exit 1), got {other:?}"),
+            }
+        }
+        match doctor_report(&[no("only")], false, false) {
+            Err(e) => assert_eq!(e.exit_code(), 1),
+            Ok(()) => panic!("a [NO ] row must not report Ok"),
+        }
+    }
+
+    #[test]
+    fn report_is_auth_unavailable_on_exit_five() {
+        for json in [false, true] {
+            let e = doctor_report(&[ok("a")], json, true).expect_err("auth unavailable must fail");
+            assert!(matches!(e, CliError::AuthUnavailable(_)), "{e:?}");
+            assert_eq!(e.exit_code(), 5);
+        }
+        // Precedence: 5 even when [NO ] rows are present too.
+        let e = doctor_report(&[no("a"), no("b")], false, true).expect_err("must fail");
+        assert!(matches!(e, CliError::AuthUnavailable(_)), "{e:?}");
+    }
 }

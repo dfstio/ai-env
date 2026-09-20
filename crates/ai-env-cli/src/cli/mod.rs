@@ -236,6 +236,12 @@ pub enum KeysCmd {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    // The VM entrypoint runs as PID 1 with a bare environment: it must never
+    // depend on `HOME` or a keystore directory.
+    #[cfg(feature = "shim")]
+    if let Cmd::Shim(args) = cli.cmd {
+        return crate::shim::run(args);
+    }
     let store = Keystore::resolve(cli.key_dir)?;
     match cli.cmd {
         Cmd::Keygen { name, access_control, strongbox_entry, no_recovery } => {
@@ -315,7 +321,7 @@ pub fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "bridge")]
         Cmd::Gates { json, out, only } => crate::bridge::gates::main(json, out, only),
         #[cfg(feature = "shim")]
-        Cmd::Shim(args) => crate::shim::run(args),
+        Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
     }
 }
 

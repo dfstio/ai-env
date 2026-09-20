@@ -134,11 +134,14 @@ pub fn hooks_config() -> Hooks {
         .build()
 }
 
-/// SDK configuration with the region pinned in code; `AWS_REGION` and
-/// `AWS_DEFAULT_REGION` are never consulted.
+/// SDK configuration with the region pinned in code (`AWS_REGION` and
+/// `AWS_DEFAULT_REGION` are never consulted) and the HTTP client from
+/// `bridge::tls` (Amazon roots only, aws-lc-rs, proxy env ignored) in place
+/// of the SDK default, which would load native roots and honour `HTTPS_PROXY`.
 pub async fn sdk_config() -> aws_config::SdkConfig {
     aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_sdk_lambdamicrovms::config::Region::new(REGION))
+        .http_client(crate::bridge::tls::sdk_http_client())
         .load()
         .await
 }

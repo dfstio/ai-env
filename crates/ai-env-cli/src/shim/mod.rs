@@ -50,6 +50,8 @@ async fn serve(args: ShimArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", args.app_port))
         .await
         .map_err(|e| CliError::Msg(format!("cannot bind app port {}: {e}", args.app_port)))?;
+    // One line, the ACTUALLY bound address (`--app-port 0` picks a free port):
+    // tests/shim_local.rs parses the port after "listening on ".
     eprintln!("ai-env: shim {} listening on {}", env!("CARGO_PKG_VERSION"), listener.local_addr()?);
     axum::serve(listener, health::router(state))
         .with_graceful_shutdown(shutdown_signal())

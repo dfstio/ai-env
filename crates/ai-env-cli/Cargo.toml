@@ -12,6 +12,13 @@ repository.workspace = true
 autobins = false
 # Every integration test is declared below with its required-features.
 autotests = false
+# The only example is the negative clippy fixture, declared below; never auto-discovered.
+autoexamples = false
+
+# Dependencies pinned by the plan ahead of the stage that consumes them (see the
+# trailing comment on each line under [dependencies]); `make check-deps` runs cargo machete.
+[package.metadata.cargo-machete]
+ignored = ["uuid", "nix", "hyper", "hyper-util", "http-body-util", "futures-util"]
 
 [lib]
 name = "ai_env_cli"
@@ -51,10 +58,23 @@ name = "aws"
 path = "tests/aws.rs"
 required-features = ["bridge"]
 
+# Mutates AWS_REGION/AWS_DEFAULT_REGION: alone in its own process so it never races `aws`.
+[[test]]
+name = "aws_region"
+path = "tests/aws_region.rs"
+required-features = ["bridge"]
+
 [[test]]
 name = "shim_local"
 path = "tests/shim_local.rs"
 required-features = ["shim"]
+
+# Negative fixture for `make lint-negative`: clippy must REJECT it (every clippy.toml
+# disallowed method is called once). Built only with the lint-negative feature.
+[[example]]
+name = "tls_lint_negative"
+path = "examples/tls_lint_negative.rs"
+required-features = ["lint-negative"]
 
 [features]
 default = ["bridge", "shim"]
@@ -62,15 +82,21 @@ default = ["bridge", "shim"]
 bridge = [
     "dep:aws-config",
     "dep:aws-sdk-lambdamicrovms",
+    "dep:aws-smithy-http-client",
     "dep:reqwest",
     "dep:rustls",
     "dep:rustls-pki-types",
     "dep:webpki-roots",
     "tokio-tungstenite/connect",
+    # This feature is the only public way to obtain `Connector::Rustls`; it pulls
+    # webpki-roots 0.26 (a re-export of the pinned 1.0.9) which tls.rs never uses —
+    # the WS client installs its own root store.
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 # VM side: HTTP listeners, WebSocket server via the hyper upgrade, PID-1 duties.
 shim = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:nix"]
+# `make lint-negative` only: builds examples/tls_lint_negative.rs, which clippy must reject.
+lint-negative = ["bridge"]
 
 [dependencies]
 # classic
@@ -92,11 +118,11 @@ zeroize = { workspace = true }
 getrandom = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true } # non-optional: `handshake` in every build
-futures-util = { workspace = true }
+futures-util = { workspace = true } # S6 pump (not consumed before then; cargo-machete allowlist above)
 http = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true } # S2 pump ids (v7) (not consumed before then; cargo-machete allowlist above)
 subtle = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -104,16 +130,17 @@ unicode-normalization = { workspace = true }
 # bridge
 aws-config = { workspace = true, optional = true }
 aws-sdk-lambdamicrovms = { workspace = true, optional = true }
+aws-smithy-http-client = { workspace = true, optional = true } # built by src/bridge/tls.rs only (`make lint` greps)
 reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 # shim
 axum = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
-nix = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
+hyper-util = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
+http-body-util = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
+nix = { workspace = true, optional = true } # S3 PID-1 reaper (not consumed before then; cargo-machete allowlist above)
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -900,3 +900,55 @@ fn restore_rekey_warns_when_identity_opens_nothing() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a readable directory"));
     assert!(!keystore.join("keys/other").exists());
 }
+
+/// `doctor --json` against the classic rows only: stdout is one JSON document
+/// of the documented shape and the process exit mirrors its `exit` field.
+/// The GUI row depends on the host (launchctl managername), so the test pins
+/// the invariants, not a fixed exit. Excluded from `bridge` builds: those rows
+/// probe the machine (rustup, aws credentials, the Cursor bundle).
+#[cfg(not(feature = "bridge"))]
+#[test]
+fn doctor_json_shape_matches_process_exit() {
+    let shim = Shim::new();
+    let work = tempfile::tempdir().unwrap();
+    let keystore = work.path().join("ks");
+    fake_keystore(&keystore);
+    fs::write(work.path().join(".env"), fixture_container()).unwrap();
+
+    let out = run_ai_env(&shim, &keystore, work.path(), &["doctor", "--json"]);
+    let code = out.status.code().expect("exit code");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.trim().lines().count(), 1, "exactly one JSON document, no text rows: {stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+
+    let top = v.as_object().expect("top-level object");
+    for key in ["ok", "exit", "rows"] {
+        assert!(top.contains_key(key), "missing {key}: {stdout}");
+    }
+    let exit = v["exit"].as_i64().expect("exit is an integer");
+    assert_eq!(i64::from(code), exit, "process exit must equal the exit field: {stdout}");
+    assert_eq!(v["ok"].as_bool(), Some(exit == 0), "{stdout}");
+    assert!(exit == 0 || exit == 1, "classic rows can only yield 0 or 1: {stdout}");
+
+    let rows = v["rows"].as_array().expect("rows is an array");
+    assert!(!rows.is_empty(), "{stdout}");
+    for row in rows {
+        let obj = row.as_object().expect("row is an object");
+        assert_eq!(obj.len(), 2, "rows carry exactly tag and text: {row}");
+        assert!(matches!(row["tag"].as_str(), Some("ok" | "no" | "skip" | "warn" | "info")), "{row}");
+        assert!(row["text"].is_string(), "{row}");
+    }
+    // The exit field follows the rows: 1 iff some row is tagged "no".
+    let any_no = rows.iter().any(|r| r["tag"] == "no");
+    assert_eq!(exit == 1, any_no, "{stdout}");
+
+    // The classic rows the fixture guarantees: the shimmed age, the keystore
+    // info line, the fixture key and the encrypted .env in the work dir.
+    let texts: Vec<&str> = rows.iter().filter_map(|r| r["text"].as_str()).collect();
+    assert!(texts.iter().any(|t| t.starts_with("age v1.3.2")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.starts_with("keystore: ")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.starts_with("key testkey")), "{texts:?}");
+    assert!(texts.contains(&".env is encrypted"), "{texts:?}");
+    assert!(!shim.argv_log().contains("-d "), "doctor must never decrypt: {}", shim.argv_log());
+}
