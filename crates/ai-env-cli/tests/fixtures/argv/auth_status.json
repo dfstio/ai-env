@@ -1,5 +1,6 @@
 {
   "name": "auth_status",
+  "ext_version": "2.1.278",
   "argv": ["auth", "status", "--json"],
   "route": "local",
   "reason": "subcommand:auth"

@@ -5,9 +5,13 @@
 //! Facts this file encodes (verified against extension 2.1.278): `--resume=`
 //! and `--setting-sources=` are `=`-joined; `--permission-mode M`,
 //! `--mcp-config JSON`, `--tools …` and `--add-dir DIR` (repeated pairs) are
-//! space-separated; the extension never emits `--debug-to-stderr` nor
-//! `--replay-user-messages`, so neither is assumed here; `--session-mirror`
-//! is a hidden CLI flag the wrapper appends itself.
+//! space-separated; every session and probe spawn ends with the fixed group
+//! `--debug --debug-to-stderr --enable-auth-status --no-chrome
+//! --replay-user-messages` (the extension's `extraArgs`), so `strip_debug`
+//! drops `--debug-to-stderr` too while `--replay-user-messages` passes
+//! through; `--session-mirror` is a hidden CLI flag the wrapper appends
+//! itself. `tests/fixtures/argv/*.json` are tagged with the extension version
+//! they were captured from (`FIXTURE_EXT_VERSION`).
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -44,6 +48,33 @@ pub fn split(argv: &[OsString]) -> Result<Invocation, ArgvError> {
     Ok(Invocation { real_binary: PathBuf::from(real), args })
 }
 
+/// The extension version `tests/fixtures/argv/*.json` were captured from;
+/// `ai-env doctor` warns when the installed bundle differs.
+pub const FIXTURE_EXT_VERSION: &str = "2.1.278";
+
+/// Every fixture name under `tests/fixtures/argv/` (one source of truth:
+/// the in-crate KAT includes exactly these, `tests/route.rs` checks the
+/// directory holds exactly these).
+pub const FIXTURE_NAMES: [&str; 17] = [
+    "session",
+    "session_resume",
+    "session_multiroot",
+    "session_chrome_mcp",
+    "config_probe",
+    "login_probe",
+    "design_login",
+    "auth_status",
+    "plugin_list",
+    "plugin_marketplace_list",
+    "mcp_add",
+    "mcp_remove",
+    "edit_permission_rules",
+    "chrome_mcp",
+    "version",
+    "bare",
+    "not_stream_json",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalReason {
     NoArgs,
@@ -52,6 +83,29 @@ pub enum LocalReason {
     ChromeMcp,
     Bare,
     NotStreamJson,
+    /// A stream-json session whose cwd is not under an approved workspace root
+    /// (decided by `bridge::route`, never by `classify`).
+    OutsideRoots,
+    /// A stream-json session with no usable `bridge.toml` (absent or invalid).
+    Unconfigured,
+}
+
+impl LocalReason {
+    /// The census/fixture spelling of the reason (`subcommand:<word>` carries
+    /// the first argv token).
+    #[must_use]
+    pub fn name(&self) -> String {
+        match self {
+            LocalReason::NoArgs => "no_args".into(),
+            LocalReason::Version => "version".into(),
+            LocalReason::Subcommand(s) => format!("subcommand:{s}"),
+            LocalReason::ChromeMcp => "chrome_mcp".into(),
+            LocalReason::Bare => "bare".into(),
+            LocalReason::NotStreamJson => "not_stream_json".into(),
+            LocalReason::OutsideRoots => "outside_roots".into(),
+            LocalReason::Unconfigured => "unconfigured".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -173,7 +227,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn is_debug_flag(tok: &str) -> bool {
-    tok == "--debug" || tok.starts_with("--debug=") || tok == "--debug-file" || tok.starts_with("--debug-file=")
+    tok == "--debug" || tok.starts_with("--debug=") || tok == "--debug-file" || tok.starts_with("--debug-file=") || tok == "--debug-to-stderr"
 }
 
 /// Decide where an invocation runs. Local reasons are checked in order.
@@ -258,7 +312,7 @@ pub fn sanitise(args: &[String], opts: SanitiseOpts) -> Result<Vec<String>, Argv
             i += 1;
             continue;
         }
-        if opts.strip_debug && (tok == "--debug" || tok.starts_with("--debug=")) {
+        if opts.strip_debug && (tok == "--debug" || tok.starts_with("--debug=") || tok == "--debug-to-stderr") {
             i += 1;
             continue;
         }
@@ -312,6 +366,7 @@ mod tests {
     #[derive(Deserialize)]
     struct Fixture {
         name: String,
+        ext_version: String,
         argv: Vec<String>,
         route: String,
         reason: Option<String>,
@@ -320,27 +375,50 @@ mod tests {
         sanitise_error: Option<String>,
     }
 
-    const FIXTURES: [&str; 10] = [
+    /// Same order as `FIXTURE_NAMES` (asserted by `fixture_names_are_the_index`).
+    const FIXTURES: [&str; 17] = [
         include_str!("../../tests/fixtures/argv/session.json"),
+        include_str!("../../tests/fixtures/argv/session_resume.json"),
+        include_str!("../../tests/fixtures/argv/session_multiroot.json"),
+        include_str!("../../tests/fixtures/argv/session_chrome_mcp.json"),
         include_str!("../../tests/fixtures/argv/config_probe.json"),
         include_str!("../../tests/fixtures/argv/login_probe.json"),
+        include_str!("../../tests/fixtures/argv/design_login.json"),
         include_str!("../../tests/fixtures/argv/auth_status.json"),
         include_str!("../../tests/fixtures/argv/plugin_list.json"),
+        include_str!("../../tests/fixtures/argv/plugin_marketplace_list.json"),
         include_str!("../../tests/fixtures/argv/mcp_add.json"),
+        include_str!("../../tests/fixtures/argv/mcp_remove.json"),
+        include_str!("../../tests/fixtures/argv/edit_permission_rules.json"),
         include_str!("../../tests/fixtures/argv/chrome_mcp.json"),
         include_str!("../../tests/fixtures/argv/version.json"),
         include_str!("../../tests/fixtures/argv/bare.json"),
         include_str!("../../tests/fixtures/argv/not_stream_json.json"),
     ];
 
-    fn reason_name(r: &LocalReason) -> String {
-        match r {
-            LocalReason::NoArgs => "no_args".into(),
-            LocalReason::Version => "version".into(),
-            LocalReason::Subcommand(s) => format!("subcommand:{s}"),
-            LocalReason::ChromeMcp => "chrome_mcp".into(),
-            LocalReason::Bare => "bare".into(),
-            LocalReason::NotStreamJson => "not_stream_json".into(),
+    #[test]
+    fn fixture_names_are_the_index() {
+        assert_eq!(FIXTURES.len(), FIXTURE_NAMES.len());
+        for (text, name) in FIXTURES.iter().zip(FIXTURE_NAMES) {
+            let f: Fixture = serde_json::from_str(text).expect("fixture json");
+            assert_eq!(f.name, name, "FIXTURES and FIXTURE_NAMES disagree at {name}");
+        }
+    }
+
+    #[test]
+    fn reason_names_are_stable() {
+        let all = [
+            (LocalReason::NoArgs, "no_args"),
+            (LocalReason::Version, "version"),
+            (LocalReason::Subcommand("auth".into()), "subcommand:auth"),
+            (LocalReason::ChromeMcp, "chrome_mcp"),
+            (LocalReason::Bare, "bare"),
+            (LocalReason::NotStreamJson, "not_stream_json"),
+            (LocalReason::OutsideRoots, "outside_roots"),
+            (LocalReason::Unconfigured, "unconfigured"),
+        ];
+        for (r, want) in all {
+            assert_eq!(r.name(), want);
         }
     }
 
@@ -348,10 +426,11 @@ mod tests {
     fn kat_fixtures() {
         for text in FIXTURES {
             let f: Fixture = serde_json::from_str(text).expect("fixture json");
+            assert_eq!(f.ext_version, FIXTURE_EXT_VERSION, "fixture {} is tagged with another extension version", f.name);
             let route = classify(&f.argv);
             match (&route, f.route.as_str()) {
                 (Route::Local(r), "local") => {
-                    assert_eq!(Some(reason_name(r)), f.reason, "fixture {}", f.name);
+                    assert_eq!(Some(r.name()), f.reason, "fixture {}", f.name);
                 }
                 (Route::Remote(s), "remote") => {
                     let e = f.session.as_ref().unwrap_or_else(|| panic!("fixture {} lacks session", f.name));
@@ -415,9 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitise_passthrough_unexpected_debug_to_stderr() {
-        let out = sanitise(&v(&["--debug-to-stderr", "--replay-user-messages"]), SanitiseOpts::default()).unwrap();
-        assert_eq!(out, v(&["--debug-to-stderr", "--replay-user-messages", "--session-mirror"]));
+    fn sanitise_strips_debug_to_stderr_and_keeps_the_rest_of_the_tail() {
+        // The extension's fixed trailing group: only the two debug flags go.
+        let tail = v(&["--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"]);
+        let out = sanitise(&tail, SanitiseOpts::default()).unwrap();
+        assert_eq!(out, v(&["--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]));
+        let kept = sanitise(&tail, SanitiseOpts { strip_add_dir: true, strip_debug: false }).unwrap();
+        assert_eq!(kept.len(), tail.len() + 1, "strip_debug=false keeps every tail flag");
+        assert!(matches!(classify(&v(&["--output-format", "stream-json", "--debug-to-stderr"])), Route::Remote(s) if s.debug), "--debug-to-stderr counts as a debug flag");
     }
 
     #[test]
@@ -454,6 +538,8 @@ mod tests {
             Just(v(&["--add-dir=/Users/mike/y"])),
             Just(v(&["--debug"])),
             Just(v(&["--debug-file", "/tmp/log"])),
+            Just(v(&["--debug-to-stderr"])),
+            Just(v(&["--replay-user-messages"])),
             Just(v(&["--session-mirror"])),
             Just(v(&["--mcp-config", "{\"a\":\"--add-dir\"}"])),
             // Unknown boolean flags and `--k=v` forms: the extension's spawn

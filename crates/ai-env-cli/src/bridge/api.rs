@@ -12,6 +12,15 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Mutex;
 
+/// The pinned region for every SDK call. `BridgeConfig::parse` already
+/// rejected any `[aws].region` that differs, so the config carries no other
+/// answer; keeping the SDK type here leaves `bridge::config` SDK-free for the
+/// wrapper binary.
+#[must_use]
+pub fn region(_cfg: &crate::bridge::config::BridgeConfig) -> aws_sdk_lambdamicrovms::config::Region {
+    aws_sdk_lambdamicrovms::config::Region::new(REGION)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmState {
     Pending,

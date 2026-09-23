@@ -2,11 +2,13 @@
 //! function of already-collected inputs so it is unit-testable without the
 //! subprocesses that `rows` runs (5 s timeout each).
 use crate::age_cmd::{effective_path, find_in_path};
+use crate::bridge::census::read_rows;
 use crate::bridge::config::{env_region_warning, BridgeConfig, Paths, REGION};
 use crate::bridge::errors::BridgeError;
-use crate::bridge::sibling::{find_sibling, Sibling, INSTALL_HINT};
+use crate::bridge::sibling::{exists_exec, find_sibling, Sibling, INSTALL_HINT};
 use crate::commands::{DoctorLine, Tag};
 use crate::store::Keystore;
+use crate::wire::argv::FIXTURE_EXT_VERSION;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -301,13 +303,19 @@ pub fn row_keystore_key(exists: bool, key: &str) -> DoctorLine {
 #[must_use]
 pub fn pick_bundle(dirs: &[String]) -> Option<(String, String)> {
     dirs.iter()
-        .filter_map(|d| {
-            let rest = d.strip_prefix("anthropic.claude-code-")?;
-            let ver = rest.strip_suffix("-darwin-arm64")?;
-            semver(ver).map(|t| (t, ver.to_string(), d.clone()))
-        })
+        .filter_map(|d| bundle_version(d).and_then(|ver| semver(&ver).map(|t| (t, ver, d.clone()))))
         .max_by_key(|(t, _, _)| *t)
         .map(|(_, ver, dir)| (ver, dir))
+}
+
+/// The version inside a bundle directory name
+/// (`anthropic.claude-code-2.1.278-darwin-arm64` → `2.1.278`); also used by
+/// the census to tag rows from the real binary's path.
+#[must_use]
+pub fn bundle_version(dir_name: &str) -> Option<String> {
+    let rest = dir_name.strip_prefix("anthropic.claude-code-")?;
+    let ver = rest.strip_suffix("-darwin-arm64")?;
+    semver(ver).map(|_| ver.to_string())
 }
 
 #[must_use]
@@ -323,6 +331,20 @@ pub fn row_cursor_bundle(dirs: &[String], bundled_version: Option<&str>) -> Doct
             DoctorLine::row(Tag::Ok, text)
         }
         None => DoctorLine::row(Tag::Skip, "Cursor Claude extension not found under ~/.cursor/extensions"),
+    }
+}
+
+/// `Some(Warn)` when the installed bundle (the directory version that
+/// `row_cursor_bundle` reports) differs from the version the argv fixtures
+/// were captured from; `None` when they agree or no bundle is installed.
+#[must_use]
+pub fn row_fixture_drift(bundle_version: Option<&str>) -> Option<DoctorLine> {
+    match bundle_version {
+        Some(v) if v != FIXTURE_EXT_VERSION => Some(DoctorLine::row(
+            Tag::Warn,
+            format!("cursor extension {v} ≠ fixtures tagged {FIXTURE_EXT_VERSION}  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"),
+        )),
+        _ => None,
     }
 }
 
@@ -360,12 +382,14 @@ pub fn row_same_version(sibling_version_out: Option<&str>, mine: &str) -> Doctor
 }
 
 /// Rows for Cursor's wrapper setting; `exists_exec(path) -> (exists, executable)`.
+/// A wrapper under a `target/` component is a debug build that `cargo clean`
+/// removes (T1.4 installs one on purpose), so it is warned about, not refused.
 #[must_use]
 pub fn row_wrapper_setting(settings: Option<&serde_json::Value>, exists_exec: &dyn Fn(&Path) -> (bool, bool), sibling: &Sibling) -> Vec<DoctorLine> {
     let mut rows = Vec::new();
     let wrapper = settings.and_then(|s| s.get(WRAPPER_SETTING)).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     match wrapper {
-        None => rows.push(DoctorLine::row(Tag::Skip, format!("{WRAPPER_SETTING} not set (ai-env wrapper install, S1)"))),
+        None => rows.push(DoctorLine::row(Tag::Skip, format!("{WRAPPER_SETTING} not set  <- ai-env wrapper install --write"))),
         Some(p) => {
             let path = Path::new(p);
             let (exists, exec) = exists_exec(path);
@@ -379,6 +403,9 @@ pub fn row_wrapper_setting(settings: Option<&serde_json::Value>, exists_exec: &d
             if NODE_SUFFIXES.iter().any(|s| p.ends_with(s)) {
                 rows.push(DoctorLine::row(Tag::Warn, "wrapper path ends in a JS/TS suffix: Cursor would run it under node (extensionless bin required)"));
             }
+            if path.components().any(|c| c.as_os_str() == "target") {
+                rows.push(DoctorLine::row(Tag::Warn, format!("wrapper under a build directory ({p}): cargo clean breaks Cursor  <- ai-env wrapper install --write from the installed ai-env")));
+            }
             if let Sibling::Next(sib) | Sibling::PathOnly(sib) = sibling {
                 if sib != path {
                     rows.push(DoctorLine::row(Tag::Warn, format!("wrapper points elsewhere than the sibling ({})", sib.display())));
@@ -386,10 +413,23 @@ pub fn row_wrapper_setting(settings: Option<&serde_json::Value>, exists_exec: &d
             }
         }
     }
-    if settings.and_then(|s| s.get(PERMISSION_SETTING)).and_then(|v| v.as_str()).is_none() {
-        rows.push(DoctorLine::row(Tag::Skip, format!("{PERMISSION_SETTING} unset (sessions start in Manual mode)")));
+    match settings.and_then(|s| s.get(PERMISSION_SETTING)).and_then(|v| v.as_str()) {
+        Some(mode) => rows.push(DoctorLine::row(Tag::Ok, format!("{PERMISSION_SETTING} = {mode}"))),
+        None => rows.push(DoctorLine::row(Tag::Skip, format!("{PERMISSION_SETTING} unset (sessions start in Manual mode)  <- ai-env wrapper install --write"))),
     }
     rows
+}
+
+/// The census row: `rows` as `census::read_rows` returns them (oldest first),
+/// `path` for the hint when there are none. The last row's `ts`, `route` and
+/// `reason` are shown as recorded (`?` when a field is missing).
+#[must_use]
+pub fn row_census(rows: &[serde_json::Value], path: &Path) -> DoctorLine {
+    let Some(last) = rows.last() else {
+        return DoctorLine::row(Tag::Skip, format!("no census yet ({})  <- run one Cursor session with the wrapper installed", path.display()));
+    };
+    let field = |k: &str| last.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    DoctorLine::row(Tag::Ok, format!("census: {} rows, last {} route={} reason={}", rows.len(), field("ts"), field("route"), field("reason")))
 }
 
 /// Row for a `settings.json` that could not be parsed at all.
@@ -498,28 +538,11 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
-#[cfg(unix)]
-fn access_x(p: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `c` is a valid NUL-terminated path; access(2) only reads it.
-    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
-}
-
-#[cfg(not(unix))]
-fn access_x(_: &Path) -> bool {
-    true
-}
-
-/// `(exists, executable)` — a regular file this user may execute (access(2),
-/// not mode bits: ACLs and ownership count).
-fn exists_exec(p: &Path) -> (bool, bool) {
-    let Ok(meta) = std::fs::metadata(p) else {
-        return (false, false);
-    };
-    (true, meta.is_file() && access_x(p))
+/// Cursor's user settings on macOS (the only scope where the machine-scoped
+/// `claudeCode.claudeProcessWrapper` takes effect).
+#[must_use]
+pub fn cursor_settings_path() -> PathBuf {
+    home().join("Library").join("Application Support").join("Cursor").join("User").join("settings.json")
 }
 
 /// Collect the inputs and build every bridge row.
@@ -559,24 +582,32 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     });
     lines.push(row_iam_simulate(sim.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
 
-    match Paths::resolve() {
+    let census_path = match Paths::resolve() {
         Ok(paths) => {
             let loaded = BridgeConfig::load(&paths);
             lines.push(row_bridge_config(&paths, &loaded));
+            Some(paths.census())
         }
-        Err(e) => lines.push(DoctorLine::row(Tag::No, format!("bridge paths: {e}"))),
-    }
+        Err(e) => {
+            lines.push(DoctorLine::row(Tag::No, format!("bridge paths: {e}")));
+            None
+        }
+    };
     lines.push(row_keystore_key(store.key_exists("ai-env-bridge"), "ai-env-bridge"));
 
     let ext_dir = home().join(".cursor").join("extensions");
     let dirs: Vec<String> = std::fs::read_dir(&ext_dir)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
         .unwrap_or_default();
-    let bundled_out = pick_bundle(&dirs).and_then(|(_, dir)| {
+    let bundle = pick_bundle(&dirs);
+    let bundled_out = bundle.as_ref().and_then(|(_, dir)| {
         let bin = ext_dir.join(dir).join("resources").join("native-binary").join("claude");
         run_capture(&bin.to_string_lossy(), &["--version"], t).ok()
     });
     lines.push(row_cursor_bundle(&dirs, bundled_out.as_deref()));
+    if let Some(row) = row_fixture_drift(bundle.as_ref().map(|(ver, _)| ver.as_str())) {
+        lines.push(row);
+    }
     let path_claude = find_in_path("claude", &effective_path());
     let path_out = path_claude.as_ref().and_then(|p| run_capture(&p.to_string_lossy(), &["--version"], t).ok());
     lines.push(row_path_claude(path_claude.as_deref().zip(path_out.as_deref()), bundled_out.as_deref()));
@@ -589,10 +620,17 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     };
     lines.push(row_same_version(sib_out.as_deref(), env!("CARGO_PKG_VERSION")));
 
-    let settings_path = home().join("Library").join("Application Support").join("Cursor").join("User").join("settings.json");
+    let settings_path = cursor_settings_path();
     match std::fs::read_to_string(&settings_path).ok().map(|t| parse_settings(&t)) {
         Some(Err(e)) => lines.push(row_settings_unparseable(&settings_path, &e)),
         other => lines.extend(row_wrapper_setting(other.and_then(Result::ok).as_ref(), &exists_exec, &sibling)),
+    }
+
+    if let Some(path) = census_path {
+        match read_rows(&path, None) {
+            Ok(rows) => lines.push(row_census(&rows, &path)),
+            Err(e) => lines.push(DoctorLine::row(Tag::Warn, format!("census unreadable: {e}"))),
+        }
     }
 
     BridgeDoctor { lines, auth_unavailable }
@@ -777,6 +815,16 @@ mod tests {
     }
 
     #[test]
+    fn fixture_drift_row() {
+        assert_eq!(FIXTURE_EXT_VERSION, "2.1.278");
+        assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION)), None, "the fixtures match the installed bundle");
+        assert_eq!(row_fixture_drift(None), None, "no bundle: nothing to drift from");
+        let (tag, t) = text(&row_fixture_drift(Some("2.1.290")).unwrap());
+        assert_eq!(tag, Tag::Warn);
+        assert!(t.starts_with("cursor extension 2.1.290 ≠ fixtures tagged 2.1.278  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"), "{t}");
+    }
+
+    #[test]
     fn sibling_and_version_rows() {
         assert_eq!(text(&row_sibling(&Sibling::Next(PathBuf::from("/b/ai-env-claude")))).0, Tag::Ok);
         assert_eq!(text(&row_sibling(&Sibling::PathOnly(PathBuf::from("/p/ai-env-claude")))).0, Tag::Ok);
@@ -807,18 +855,32 @@ mod tests {
     fn wrapper_setting_rows() {
         let sib = Sibling::Next(PathBuf::from("/Users/mike/.cargo/bin/ai-env-claude"));
         let none = row_wrapper_setting(None, &|_| (false, false), &sib);
-        assert_eq!(text(&none[0]).0, Tag::Skip);
-        assert!(text(&none[1]).1.contains(PERMISSION_SETTING));
+        assert_eq!(none.len(), 2);
+        let (tag, t) = text(&none[0]);
+        assert_eq!(tag, Tag::Skip);
+        assert_eq!(t, format!("{WRAPPER_SETTING} not set  <- ai-env wrapper install --write"));
+        let (tag, t) = text(&none[1]);
+        assert_eq!(tag, Tag::Skip);
+        assert_eq!(t, format!("{PERMISSION_SETTING} unset (sessions start in Manual mode)  <- ai-env wrapper install --write"));
 
         let ok = parse_settings("{\n  // comment\n  \"claudeCode.claudeProcessWrapper\": \"/Users/mike/.cargo/bin/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"default\",\n}").unwrap();
         let rows = row_wrapper_setting(Some(&ok), &|_| (true, true), &sib);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(text(&rows[0]).0, Tag::Ok);
+        assert_eq!(rows.len(), 2, "wrapper Ok + permission Ok, no warnings: {rows:?}");
+        assert_eq!(text(&rows[0]), (Tag::Ok, format!("{WRAPPER_SETTING} = /Users/mike/.cargo/bin/ai-env-claude")));
+        assert_eq!(text(&rows[1]), (Tag::Ok, format!("{PERMISSION_SETTING} = default")));
+
+        let manual = parse_settings("{\"claudeCode.initialPermissionMode\": \"manual\"}").unwrap();
+        let rows = row_wrapper_setting(Some(&manual), &|_| (true, true), &sib);
+        assert_eq!(text(&rows[1]), (Tag::Ok, format!("{PERMISSION_SETTING} = manual")));
+        let not_a_string = parse_settings("{\"claudeCode.initialPermissionMode\": 3}").unwrap();
+        let rows = row_wrapper_setting(Some(&not_a_string), &|_| (true, true), &sib);
+        assert_eq!(text(&rows[1]).0, Tag::Skip, "a non-string mode counts as unset");
 
         let js = parse_settings("{\"claudeCode.claudeProcessWrapper\": \"/x/wrapper.js\"}").unwrap();
         let rows = row_wrapper_setting(Some(&js), &|_| (true, true), &sib);
         assert!(rows.iter().any(|r| text(r).0 == Tag::Warn && text(r).1.contains("under node")));
         assert!(rows.iter().any(|r| text(r).0 == Tag::Warn && text(r).1.contains("points elsewhere")));
+        assert!(!rows.iter().any(|r| text(r).1.contains("build directory")));
 
         let missing = parse_settings("{\"claudeCode.claudeProcessWrapper\": \"/gone\"}").unwrap();
         let rows = row_wrapper_setting(Some(&missing), &|_| (false, false), &sib);
@@ -829,6 +891,46 @@ mod tests {
         let (tag, t) = text(&row_settings_unparseable(Path::new("/s.json"), "expected value at line 1 column 2"));
         assert_eq!(tag, Tag::Warn);
         assert!(t.contains("wrapper rows not checked") && t.ends_with("/s.json"), "{t}");
+    }
+
+    #[test]
+    fn wrapper_under_target_warns() {
+        let p = "/Users/mike/Documents/DeFi/ai-env/target/debug/ai-env-claude";
+        let sib = Sibling::Next(PathBuf::from(p));
+        let dbg = parse_settings(&format!("{{\"claudeCode.claudeProcessWrapper\": \"{p}\", \"claudeCode.initialPermissionMode\": \"default\"}}")).unwrap();
+        let rows = row_wrapper_setting(Some(&dbg), &|_| (true, true), &sib);
+        assert_eq!(text(&rows[0]).0, Tag::Ok, "a debug wrapper still works today");
+        let warns: Vec<String> = rows.iter().filter(|r| text(r).0 == Tag::Warn).map(|r| text(r).1).collect();
+        assert_eq!(warns, vec![format!("wrapper under a build directory ({p}): cargo clean breaks Cursor  <- ai-env wrapper install --write from the installed ai-env")]);
+        assert_eq!(rows.len(), 3, "Ok, the target warning, the permission row: {rows:?}");
+
+        // Only a component named exactly `target` counts: a `targets/` or `my-target/` directory is not a build directory.
+        for other in ["/Users/mike/targets/ai-env-claude", "/opt/my-target/bin/ai-env-claude", "/Users/mike/.cargo/bin/ai-env-claude"] {
+            let s = parse_settings(&format!("{{\"claudeCode.claudeProcessWrapper\": \"{other}\"}}")).unwrap();
+            let rows = row_wrapper_setting(Some(&s), &|_| (true, true), &Sibling::Next(PathBuf::from(other)));
+            assert!(!rows.iter().any(|r| text(r).1.contains("build directory")), "{other}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn census_rows() {
+        let path = Path::new("/r/logs/census.jsonl");
+        let (tag, t) = text(&row_census(&[], path));
+        assert_eq!(tag, Tag::Skip);
+        assert_eq!(t, "no census yet (/r/logs/census.jsonl)  <- run one Cursor session with the wrapper installed");
+
+        let rows = vec![
+            serde_json::json!({"v": 1, "ts": "2026-09-22T10:00:00Z", "route": "local", "reason": "subcommand:auth"}),
+            serde_json::json!({"v": 1, "ts": "2026-09-22T10:00:05Z", "route": "remote", "reason": "session"}),
+        ];
+        let (tag, t) = text(&row_census(&rows, path));
+        assert_eq!(tag, Tag::Ok);
+        assert_eq!(t, "census: 2 rows, last 2026-09-22T10:00:05Z route=remote reason=session", "the last row wins");
+
+        let partial = vec![serde_json::json!({"v": 1, "ts": 12, "route": "local"})];
+        let (tag, t) = text(&row_census(&partial, path));
+        assert_eq!(tag, Tag::Ok);
+        assert_eq!(t, "census: 1 rows, last ? route=local reason=?", "missing or non-string fields read as ?");
     }
 
     #[cfg(unix)]

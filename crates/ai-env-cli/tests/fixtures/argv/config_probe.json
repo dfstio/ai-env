@@ -1,6 +1,7 @@
 {
   "name": "config_probe",
-  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--thinking", "disabled", "--max-turns", "1"],
+  "ext_version": "2.1.278",
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--thinking", "disabled", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
   "route": "remote",
   "session": {
     "resume": null,
@@ -11,7 +12,7 @@
     "has_mcp_config": false,
     "setting_sources": "user,project,local",
     "continue": false,
-    "debug": false
+    "debug": true
   },
-  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--thinking", "disabled", "--max-turns", "1", "--session-mirror"]
+  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--thinking", "disabled", "--permission-prompt-tool", "stdio", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]
 }

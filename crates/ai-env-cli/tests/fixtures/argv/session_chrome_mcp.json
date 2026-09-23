@@ -1,0 +1,18 @@
+{
+  "name": "session_chrome_mcp",
+  "ext_version": "2.1.278",
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--mcp-config", "{\"mcpServers\":{\"claude-in-chrome\":{\"type\":\"stdio\",\"command\":\"/Users/mike/.cargo/bin/ai-env-claude\",\"args\":[\"/Users/mike/.cursor/extensions/anthropic.claude-code-2.1.278-darwin-arm64/resources/native-binary/claude\",\"--claude-in-chrome-mcp\"]}}}", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
+  "route": "remote",
+  "session": {
+    "resume": null,
+    "thinking_disabled": false,
+    "add_dirs": [],
+    "permission_mode": "default",
+    "model": null,
+    "has_mcp_config": true,
+    "setting_sources": "user,project,local",
+    "continue": false,
+    "debug": true
+  },
+  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--mcp-config", "{\"mcpServers\":{\"claude-in-chrome\":{\"type\":\"stdio\",\"command\":\"/Users/mike/.cargo/bin/ai-env-claude\",\"args\":[\"/Users/mike/.cursor/extensions/anthropic.claude-code-2.1.278-darwin-arm64/resources/native-binary/claude\",\"--claude-in-chrome-mcp\"]}}}", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]
+}

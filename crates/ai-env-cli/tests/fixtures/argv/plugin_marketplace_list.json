@@ -1,0 +1,7 @@
+{
+  "name": "plugin_marketplace_list",
+  "ext_version": "2.1.278",
+  "argv": ["plugin", "marketplace", "list", "--json"],
+  "route": "local",
+  "reason": "subcommand:plugin"
+}

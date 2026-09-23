@@ -9,6 +9,16 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Milliseconds since the Unix epoch (0 if the clock is before it); the
+/// census `start` field, so the S2 teardown gaps (2 s / 5 s) are measurable.
+#[must_use]
+pub fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ` for a Unix timestamp (Howard Hinnant's
 /// civil-from-days, the inverse of `commands::days_since`).
 #[must_use]
@@ -44,5 +54,15 @@ mod tests {
     #[test]
     fn now_is_after_2026() {
         assert!(unix_now() > 1_767_225_600);
+    }
+
+    #[test]
+    fn millis_agree_with_seconds_and_never_go_backwards() {
+        let secs = unix_now();
+        let a = unix_now_ms();
+        let b = unix_now_ms();
+        assert!(a >= secs * 1000, "{a} < {secs}s");
+        assert!(a / 1000 <= secs + 1, "{a} ms is more than a second past {secs}s");
+        assert!(b >= a);
     }
 }

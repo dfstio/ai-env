@@ -40,6 +40,18 @@ impl Paths {
     pub fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }
+
+    /// The invocation census (one JSON line per wrapper invocation).
+    #[must_use]
+    pub fn census(&self) -> PathBuf {
+        self.logs().join("census.jsonl")
+    }
+
+    /// Version-stamped probe verdicts.
+    #[must_use]
+    pub fn probes(&self) -> PathBuf {
+        self.root.join("lab").join("probes.jsonl")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -270,10 +282,19 @@ impl BridgeConfig {
         }
     }
 
-    /// Always the pinned region; the environment is never consulted.
+    /// Every approved workspace root: `[workspaces].roots` followed by each
+    /// `[[workspace]].path`, without duplicates, in file order. The pinned
+    /// region lives in `bridge::api::region` (the only SDK-typed value), so
+    /// this module stays SDK-free for the wrapper binary.
     #[must_use]
-    pub fn region(&self) -> aws_sdk_lambdamicrovms::config::Region {
-        aws_sdk_lambdamicrovms::config::Region::new(REGION)
+    pub fn roots(&self) -> Vec<&Path> {
+        let mut out: Vec<&Path> = Vec::new();
+        for r in self.workspaces.roots.iter().chain(self.workspace_overrides.iter().map(|w| &w.path)) {
+            if !r.as_os_str().is_empty() && !out.contains(&r.as_path()) {
+                out.push(r.as_path());
+            }
+        }
+        out
     }
 
     /// One budget covers running + suspended unless overridden.
@@ -314,7 +335,7 @@ mod tests {
         assert_eq!(c.suspended_s(), 28_800);
         assert_eq!(c.creds.key, "ai-env-bridge");
         assert!(c.egress.require);
-        assert_eq!(c.region().as_ref(), "eu-central-1");
+        assert_eq!(crate::bridge::api::region(&c).as_ref(), "eu-central-1");
     }
 
     #[test]
@@ -339,6 +360,10 @@ mod tests {
         assert!(c.under_roots(Path::new("/Users/mike/Documents/DeFi/ai-env")));
         assert!(!c.under_roots(Path::new("/tmp/x")));
         assert_eq!(c.workspace_overrides[0].egress_allow, vec!["github.com".to_string()]);
+        assert_eq!(c.roots(), vec![Path::new("/Users/mike/Documents/DeFi"), Path::new("/Users/mike/Documents/DeFi/ai-env")], "[[workspace]].path counts as a root");
+        let d = BridgeConfig::parse("[workspaces]\nroots = [\"/a\", \"/b\"]\n[[workspace]]\npath = \"/a\"\n[[workspace]]\npath = \"\"\n").unwrap();
+        assert_eq!(d.roots(), vec![Path::new("/a"), Path::new("/b")], "deduped, empty path ignored, order kept");
+        assert!(BridgeConfig::default().roots().is_empty());
     }
 
     #[test]

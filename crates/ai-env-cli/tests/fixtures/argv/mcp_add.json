@@ -1,6 +1,7 @@
 {
   "name": "mcp_add",
-  "argv": ["mcp", "add", "--transport", "http", "github", "https://api.githubcopilot.com/mcp/"],
+  "ext_version": "2.1.278",
+  "argv": ["mcp", "add", "--scope", "user", "--transport", "stdio", "--env", "GITHUB_TOKEN=[redacted:len=40]", "--", "github", "…"],
   "route": "local",
   "reason": "subcommand:mcp"
 }

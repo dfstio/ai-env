@@ -134,6 +134,9 @@ ai-env verify-recovery NAME                               # the quarterly drill
 ai-env doctor [--json]                                    # environment + repo health check (exit 1 on any [NO ] row)
 ai-env gates  [--json] [--only G1,G3] [--out FILE]        # MicroVM bridge pre-code gates → plans/gates.md (bridge feature);
                                                           #   --only re-measures a subset: nothing is written, go/no-go is not evaluated
+ai-env wrapper install [--write] [--permission-mode M]    # point Cursor's claudeProcessWrapper at the sibling ai-env-claude
+                                                          #   (dry run unless --write; backs up settings.json; bridge feature)
+ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
@@ -147,6 +150,21 @@ workspace outside the approved roots).
 `ai-env doctor` exits `1` when any row is `[NO ]` and `5` when AWS credentials are unavailable;
 every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings) never
 change the exit code.
+
+### The Cursor wrapper (stage S1)
+
+`ai-env wrapper install --write` writes two user settings, `claudeCode.claudeProcessWrapper`
+(the absolute path of the `ai-env-claude` next to `ai-env`) and `claudeCode.initialPermissionMode`
+(default `default`, i.e. the mode Cursor labels Manual; with a wrapper configured the extension
+always passes `--permission-mode` explicitly). It backs up `settings.json` first, keeps comments
+and key order, and prints the exact snippet when it cannot write. Reload the window afterwards.
+Every invocation the wrapper handles — chat sessions, config probes, `auth status --json`,
+`plugin list --json`, `mcp add` … — execs the bundled binary locally and appends one redacted
+JSON line to `~/.config/ai-env/bridge/logs/census.jsonl` (environment variable NAMES, a short
+allowlist of non-secret values, argv with MCP credentials and the positional tail after `--`
+masked). `ai-env wrapper census` prints it; `--record-probes` writes the `entrypoint` and
+`stock-ext-oauth` verdicts to `lab/probes.jsonl`. `AI_ENV_BRIDGE_LOCAL=1` in the extension's
+environment is the kill switch: exec the real binary, no census, no bridge.
 
 ### Access-control policies (`keygen --access-control`)
 

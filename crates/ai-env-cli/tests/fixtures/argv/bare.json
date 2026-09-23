@@ -1,5 +1,6 @@
 {
   "name": "bare",
+  "ext_version": "2.1.278",
   "argv": ["--output-format", "stream-json", "--input-format", "stream-json", "--bare"],
   "route": "local",
   "reason": "bare",

@@ -1,5 +1,6 @@
 {
   "name": "not_stream_json",
+  "ext_version": "2.1.278",
   "argv": ["--output-format", "json", "--verbose"],
   "route": "local",
   "reason": "not_stream_json"

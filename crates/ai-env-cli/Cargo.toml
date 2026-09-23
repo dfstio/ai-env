@@ -54,6 +54,16 @@ path = "tests/wrapper.rs"
 required-features = ["bridge"]
 
 [[test]]
+name = "route"
+path = "tests/route.rs"
+required-features = ["bridge"]
+
+[[test]]
+name = "wrapper_install"
+path = "tests/wrapper_install.rs"
+required-features = ["bridge"]
+
+[[test]]
 name = "aws"
 path = "tests/aws.rs"
 required-features = ["bridge"]

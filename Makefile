@@ -1,6 +1,6 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean
+.PHONY: help build check-bins test test-aws perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean
 
 SHELL        := /bin/bash
 STACK        ?= dev
@@ -40,6 +40,7 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	@test -x target/matrix/none/debug/ai-env && test ! -e target/matrix/none/debug/ai-env-claude
 	@target/matrix/none/debug/ai-env vm --help >/dev/null 2>&1;   test $$? -eq 2 || { echo "expected exit 2 for 'vm' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env shim --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'shim' without shim"; exit 1; }
+	@target/matrix/none/debug/ai-env wrapper --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'wrapper' without bridge"; exit 1; }
 	@out=$$($(CARGO) build -p $(PKG) --bin ai-env-claude --no-default-features --features shim 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-claude built without bridge"; exit 1; }; \
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
@@ -53,6 +54,9 @@ test: ## Unit + integration tests in all four feature sets
 
 test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code)
 	AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1
+
+perf-wrapper: ## T1.2 overhead: ai-env-claude (release) vs a bare exec of the fake, 100 interleaved runs, median delta <= 10 ms
+	AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test wrapper -- --ignored overhead --nocapture --test-threads=1
 
 install: ## cargo install both bins (ai-env + ai-env-claude) into $(INSTALL_ROOT)/bin with the committed Cargo.lock; asserts one version
 	$(CARGO) install --path crates/$(PKG) --locked --root "$(INSTALL_ROOT)"

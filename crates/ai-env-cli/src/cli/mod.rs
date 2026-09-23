@@ -174,9 +174,44 @@ pub enum Cmd {
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
     },
+    /// Cursor wrapper: install the claudeProcessWrapper setting, inspect the invocation census
+    #[cfg(feature = "bridge")]
+    Wrapper {
+        #[command(subcommand)]
+        cmd: WrapperCmd,
+    },
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
     Shim(crate::shim::ShimArgs),
+}
+
+/// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum WrapperCmd {
+    /// Point Cursor's claudeCode.claudeProcessWrapper at the sibling ai-env-claude (dry run unless --write; backs up settings.json)
+    Install {
+        /// Edit settings.json (default: a dry run that prints the snippet)
+        #[arg(long)]
+        write: bool,
+        /// claudeCode.initialPermissionMode to write: default, manual, acceptEdits, plan or bypassPermissions
+        /// (default: [wrapper].initial_permission_mode from bridge.toml, else default)
+        #[arg(long, value_name = "M")]
+        permission_mode: Option<String>,
+    },
+    /// Print the invocation census (logs/census.jsonl); --record-probes writes the entrypoint/stock-ext-oauth verdicts to lab/probes.jsonl
+    Census {
+        /// Only the last N rows
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+        /// Raw JSON lines instead of the text table
+        #[arg(long)]
+        json: bool,
+        /// Derive the S1 probe verdicts from the newest session row and append them to lab/probes.jsonl
+        /// (exit 1 when a verdict differs from its expectation; the rows are written first)
+        #[arg(long)]
+        record_probes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -320,6 +355,11 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Doctor { json } => doctor(&store, &default_file(), json),
         #[cfg(feature = "bridge")]
         Cmd::Gates { json, out, only } => crate::bridge::gates::main(json, out, only),
+        #[cfg(feature = "bridge")]
+        Cmd::Wrapper { cmd } => match cmd {
+            WrapperCmd::Install { write, permission_mode } => crate::bridge::wrapper::install(write, permission_mode),
+            WrapperCmd::Census { last, json, record_probes } => crate::bridge::wrapper::census(last, json, record_probes),
+        },
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
     }

@@ -39,6 +39,32 @@ pub fn find_sibling_in(exe: &Path, path_env: &str, name: &str) -> Sibling {
     }
 }
 
+#[cfg(unix)]
+fn access_x(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated path; access(2) only reads it.
+    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn access_x(_: &Path) -> bool {
+    true
+}
+
+/// `(exists, executable)` — a regular file this user may execute (access(2),
+/// not mode bits: ACLs and ownership count). Shared by the doctor rows, the
+/// wrapper binary and `wrapper install`.
+#[must_use]
+pub fn exists_exec(p: &Path) -> (bool, bool) {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return (false, false);
+    };
+    (true, meta.is_file() && access_x(p))
+}
+
 /// Resolve relative to the current executable.
 #[must_use]
 pub fn find_sibling(name: &str) -> Sibling {

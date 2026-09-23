@@ -1,7 +1,7 @@
 {
-  "name": "login_probe",
+  "name": "design_login",
   "ext_version": "2.1.278",
-  "argv": ["design-login", "--json"],
+  "argv": ["design-login", "--json", "--status"],
   "route": "local",
   "reason": "subcommand:design-login"
 }

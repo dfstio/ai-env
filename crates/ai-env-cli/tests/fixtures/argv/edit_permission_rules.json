@@ -1,0 +1,7 @@
+{
+  "name": "edit_permission_rules",
+  "ext_version": "2.1.278",
+  "argv": ["edit-permission-rules", "--json"],
+  "route": "local",
+  "reason": "subcommand:edit-permission-rules"
+}
