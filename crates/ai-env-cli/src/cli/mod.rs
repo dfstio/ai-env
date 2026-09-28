@@ -180,6 +180,12 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: WrapperCmd,
     },
+    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget
+    #[cfg(feature = "bridge")]
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
     Shim(crate::shim::ShimArgs),
@@ -211,6 +217,31 @@ pub enum WrapperCmd {
         /// (exit 1 when a verdict differs from its expectation; the rows are written first)
         #[arg(long)]
         record_probes: bool,
+    },
+}
+
+/// `ai-env session …` (feature `bridge`): the session registry the S2 pump writes.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum SessionCmd {
+    /// List registered sessions, newest first
+    List {
+        /// Pretty JSON array instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one session row
+    Show {
+        /// Session id (a uuid)
+        uuid: String,
+        /// Pretty JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a session's row and its scratch config dir (refused while the session is active)
+    Forget {
+        /// Session id (a uuid)
+        uuid: String,
     },
 }
 
@@ -359,6 +390,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Wrapper { cmd } => match cmd {
             WrapperCmd::Install { write, permission_mode } => crate::bridge::wrapper::install(write, permission_mode),
             WrapperCmd::Census { last, json, record_probes } => crate::bridge::wrapper::census(last, json, record_probes),
+        },
+        #[cfg(feature = "bridge")]
+        Cmd::Session { cmd } => match cmd {
+            SessionCmd::List { json } => crate::bridge::registry::cmd_list(json),
+            SessionCmd::Show { uuid, json } => crate::bridge::registry::cmd_show(&uuid, json),
+            SessionCmd::Forget { uuid } => crate::bridge::registry::cmd_forget(&uuid),
         },
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),

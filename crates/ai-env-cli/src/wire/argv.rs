@@ -11,7 +11,11 @@
 //! drops `--debug-to-stderr` too while `--replay-user-messages` passes
 //! through; `--session-mirror` is a hidden CLI flag the wrapper appends
 //! itself. `tests/fixtures/argv/*.json` are tagged with the extension version
-//! they were captured from (`FIXTURE_EXT_VERSION`).
+//! they were captured from (`FIXTURE_EXT_VERSION`). The 2.1.282 SDK builder
+//! can also push `--managed-settings X`, `--plugin-dir-no-mcp X` and
+//! `--channels X` (space-separated values, listed in `VALUE_FLAGS`) and
+//! `--no-session-persistence` (a query whose transcript is never written —
+//! the prompt-suggestions call; `SessionArgs::no_session_persistence`).
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -119,6 +123,9 @@ pub struct SessionArgs {
     pub setting_sources: Option<String>,
     pub continue_: bool,
     pub debug: bool,
+    /// `--no-session-persistence`: the CLI writes no transcript, so there is
+    /// nothing to register, mirror or resume.
+    pub no_session_persistence: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +135,7 @@ pub enum Route {
 }
 
 /// Flags that consume the following token (unless written as `--flag=value`).
-const VALUE_FLAGS: [&str; 27] = [
+const VALUE_FLAGS: [&str; 30] = [
     "--output-format",
     "--input-format",
     "--permission-mode",
@@ -156,6 +163,9 @@ const VALUE_FLAGS: [&str; 27] = [
     "--resume",
     "--session-id",
     "--setting-sources",
+    "--managed-settings",
+    "--plugin-dir-no-mcp",
+    "--channels",
 ];
 
 #[must_use]
@@ -261,6 +271,7 @@ pub fn classify(args: &[String]) -> Route {
         setting_sources: value_of(args, "--setting-sources").map(str::to_string),
         continue_: has_flag(args, "--continue"),
         debug: args.iter().take_while(|t| t.as_str() != "--").any(|t| is_debug_flag(t)),
+        no_session_persistence: has_flag(args, "--no-session-persistence"),
     })
 }
 
@@ -361,6 +372,8 @@ mod tests {
         continue_: bool,
         #[serde(default)]
         debug: bool,
+        #[serde(default)]
+        no_session_persistence: bool,
     }
 
     #[derive(Deserialize)]
@@ -443,6 +456,7 @@ mod tests {
                     assert_eq!(s.setting_sources, e.setting_sources, "{}", f.name);
                     assert_eq!(s.continue_, e.continue_, "{}", f.name);
                     assert_eq!(s.debug, e.debug, "{}", f.name);
+                    assert_eq!(s.no_session_persistence, e.no_session_persistence, "{}", f.name);
                 }
                 (r, want) => panic!("fixture {}: got {r:?}, want {want}", f.name),
             }
@@ -502,6 +516,18 @@ mod tests {
         let kept = sanitise(&tail, SanitiseOpts { strip_add_dir: true, strip_debug: false }).unwrap();
         assert_eq!(kept.len(), tail.len() + 1, "strip_debug=false keeps every tail flag");
         assert!(matches!(classify(&v(&["--output-format", "stream-json", "--debug-to-stderr"])), Route::Remote(s) if s.debug), "--debug-to-stderr counts as a debug flag");
+    }
+
+    #[test]
+    fn no_session_persistence_and_the_new_value_flags() {
+        let a = v(&["--output-format", "stream-json", "--thinking", "disabled", "--model", "claude-haiku-4-5-20251001", "--no-session-persistence"]);
+        assert!(matches!(classify(&a), Route::Remote(s) if s.no_session_persistence && s.thinking_disabled));
+        assert!(matches!(classify(&v(&["--output-format", "stream-json"])), Route::Remote(s) if !s.no_session_persistence));
+        // A space-separated value is never mistaken for a flag of its own.
+        let b = v(&["--output-format", "stream-json", "--managed-settings", "--resume=x", "--channels", "--add-dir"]);
+        assert!(matches!(classify(&b), Route::Remote(s) if s.resume.is_none() && s.add_dirs.is_empty()));
+        assert_eq!(sanitise(&b, SanitiseOpts::default()).unwrap(), v(&["--output-format", "stream-json", "--managed-settings", "--resume=x", "--channels", "--add-dir", "--session-mirror"]));
+        assert!(takes_value("--plugin-dir-no-mcp"));
     }
 
     #[test]

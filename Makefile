@@ -41,6 +41,7 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	@target/matrix/none/debug/ai-env vm --help >/dev/null 2>&1;   test $$? -eq 2 || { echo "expected exit 2 for 'vm' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env shim --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'shim' without shim"; exit 1; }
 	@target/matrix/none/debug/ai-env wrapper --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'wrapper' without bridge"; exit 1; }
+	@target/matrix/none/debug/ai-env session --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'session' without bridge"; exit 1; }
 	@out=$$($(CARGO) build -p $(PKG) --bin ai-env-claude --no-default-features --features shim 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-claude built without bridge"; exit 1; }; \
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }

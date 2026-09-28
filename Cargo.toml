@@ -29,12 +29,12 @@ proptest = "=1.9.0"
 tempfile = "=3.27.0"
 # --- every feature set (wire + runtime) ---
 getrandom = "=0.3.4"
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "fs", "net", "process", "signal"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "fs", "net", "process", "signal"] } # io-std: the S2 pump's host stdio
 tokio-tungstenite = { version = "=0.26.2", default-features = false, features = ["handshake"] }
 futures-util = { version = "=0.3.34", features = ["sink"] }
 http = "=1.5.0"
 bytes = "=1.12.1"
-serde_json = "=1.0.151"
+serde_json = { version = "=1.0.151", features = ["raw_value"] } # raw_value: the S2 mirror writer appends entries byte-for-byte
 uuid = { version = "=1.26.0", features = ["v7"] }
 subtle = "=2.6.1"
 tracing = "=0.1.44"

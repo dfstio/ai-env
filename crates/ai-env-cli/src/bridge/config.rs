@@ -52,6 +52,30 @@ impl Paths {
     pub fn probes(&self) -> PathBuf {
         self.root.join("lab").join("probes.jsonl")
     }
+
+    /// The wrapper's own log (the S2 pump is its first writer).
+    #[must_use]
+    pub fn wrapper_log(&self) -> PathBuf {
+        self.logs().join("wrapper.log")
+    }
+
+    /// `state/sessions`: one `<uuid>.toml` per session the wrapper registered.
+    #[must_use]
+    pub fn sessions(&self) -> PathBuf {
+        self.root.join("state").join("sessions")
+    }
+
+    /// `state/scratch`: per-session scratch `CLAUDE_CONFIG_DIR`s (`local-scratch` mode).
+    #[must_use]
+    pub fn scratch(&self) -> PathBuf {
+        self.root.join("state").join("scratch")
+    }
+
+    /// `audit.jsonl`: one JSON line per audited event, fsync'ed per line.
+    #[must_use]
+    pub fn audit(&self) -> PathBuf {
+        self.root.join("audit.jsonl")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -326,6 +350,18 @@ pub fn env_region_warning() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_derive_state_dirs() {
+        let p = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        assert_eq!(p.config, PathBuf::from("/r/bridge.toml"));
+        assert_eq!(p.census(), PathBuf::from("/r/logs/census.jsonl"));
+        assert_eq!(p.wrapper_log(), PathBuf::from("/r/logs/wrapper.log"));
+        assert_eq!(p.sessions(), PathBuf::from("/r/state/sessions"));
+        assert_eq!(p.scratch(), PathBuf::from("/r/state/scratch"));
+        assert_eq!(p.audit(), PathBuf::from("/r/audit.jsonl"));
+        assert_eq!(p.probes(), PathBuf::from("/r/lab/probes.jsonl"));
+    }
 
     #[test]
     fn defaults_from_empty() {

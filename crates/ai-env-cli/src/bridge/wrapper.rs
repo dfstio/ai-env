@@ -140,12 +140,22 @@ fn record_probes(paths: &Paths, rows: &[serde_json::Value]) -> Result<()> {
 
 /// The text rendering of one census row: `ts route reason ext cwd argv[2..]`
 /// (the argv tail joined by spaces, at most 120 characters, `…` when cut).
+/// The S2 pump's end row (it carries `end`) also shows `exit=<n> dur=<ms>ms`
+/// before the argv tail (`exit=null` when the wrapper could not know it).
 fn census_line(row: &serde_json::Value) -> String {
     let field = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("-").to_string();
     let argv: Vec<&str> = row.get("argv").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|t| t.as_str()).collect()).unwrap_or_default();
     let tail = argv.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
     let tail = if tail.chars().count() > 120 { format!("{}\u{2026}", tail.chars().take(119).collect::<String>()) } else { tail };
-    format!("{}  {:<6} {:<24} {}  {}  {tail}", field("ts"), field("route"), field("reason"), field("ext"), field("cwd"))
+    let end = match row.get("end").and_then(serde_json::Value::as_u64) {
+        Some(end) => {
+            let exit = row.get("exit").and_then(serde_json::Value::as_i64).map_or_else(|| "null".to_string(), |c| c.to_string());
+            let dur = row.get("start").and_then(serde_json::Value::as_u64).map_or_else(|| "?".to_string(), |s| end.saturating_sub(s).to_string());
+            format!("exit={exit} dur={dur}ms  ")
+        }
+        None => String::new(),
+    };
+    format!("{}  {:<6} {:<24} {}  {}  {end}{tail}", field("ts"), field("route"), field("reason"), field("ext"), field("cwd"))
 }
 
 /// `ai-env wrapper census [--last N] [--json] [--record-probes]`: print the
@@ -827,6 +837,19 @@ mod tests {
         assert!(tail.ends_with('\u{2026}'));
         let none = census_line(&serde_json::json!({"route": "local"}));
         assert!(none.starts_with("-  local  -"), "{none}");
+    }
+
+    #[test]
+    fn census_line_shows_exit_and_duration_of_an_end_row() {
+        let mut end = session_row(&[]);
+        end["start"] = serde_json::json!(1_000_u64);
+        end["end"] = serde_json::json!(6_123_u64);
+        end["exit"] = serde_json::json!(0);
+        assert_eq!(census_line(&end), "2026-09-23T08:00:00Z  remote session                  2.1.278  /Users/mike/Documents/DeFi/ai-env  exit=0 dur=5123ms  --output-format stream-json");
+        end["exit"] = serde_json::Value::Null;
+        assert!(census_line(&end).contains("exit=null dur=5123ms  --output-format"), "{}", census_line(&end));
+        let start = session_row(&[]);
+        assert!(!census_line(&start).contains("exit="), "a start row has no end fields");
     }
 
     #[test]

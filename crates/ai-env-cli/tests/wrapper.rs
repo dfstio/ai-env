@@ -1,10 +1,13 @@
 //! Wrapper tests (T1.2) — compiled only with `bridge` (`CARGO_BIN_EXE_ai-env-claude`
 //! is unset otherwise). std::process only (assert_cmd is not vendored). Every
-//! wrapper run execs `tests/fakes/claude.sh` copied into a tempdir, with the
-//! child's `HOME` and `AI_ENV_BRIDGE_DIR` pointed at that tempdir, so the
-//! census, `bridge.toml` and the argv log never touch the developer's
-//! `~/.config/ai-env`. Nothing here mutates the test process's environment:
-//! every variable is set on the child `Command`.
+//! wrapper run execs `tests/fakes/claude.sh` hard-linked into a tempdir (from
+//! the fake cache of `tests/common`), with the child's `HOME` and
+//! `AI_ENV_BRIDGE_DIR` pointed at that tempdir, so the census, `bridge.toml`
+//! and the argv log never touch the developer's `~/.config/ai-env`. Nothing
+//! here mutates the test process's environment: every variable is set on the
+//! child `Command`.
+mod common;
+
 use ai_env_cli::bridge::census::CENSUS_VALUE_ALLOWLIST;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,8 +18,20 @@ fn wrapper() -> &'static str {
     env!("CARGO_BIN_EXE_ai-env-claude")
 }
 
-/// The fake `claude`, copied into every `FakeClaude` tempdir.
-const FAKE_SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/claude.sh");
+/// Variables a developer's shell may carry that would steer the wrapper (the
+/// kill switch, the lab knobs, a config-path override, the S2 pump mode and
+/// its knobs — a set mode would turn these exec tests into piped runs).
+const WRAPPER_ENV: [&str; 9] = [
+    "AI_ENV_BRIDGE_LOCAL",
+    "AI_ENV_BRIDGE_LAB_EXIT",
+    "AI_ENV_BRIDGE_CONFIG",
+    "AI_ENV_BRIDGE_MODE",
+    "AI_ENV_BRIDGE_MIRROR_ROOT",
+    "AI_ENV_BRIDGE_LAB_IGNORE_EOF",
+    "AI_ENV_BRIDGE_LAB_STDOUT_NOISE",
+    "AI_ENV_BRIDGE_LAB_DELAY_INIT_MS",
+    "AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS",
+];
 
 /// Lossy text of a captured stream, for assertions and their messages.
 fn text(bytes: &[u8]) -> String {
@@ -61,11 +76,13 @@ fn semver_token_parses_pre_release_banners() {
     assert_eq!(semver_token("1.2.3-"), None);
 }
 
-/// `tests/fakes/claude.sh` copied into a tempdir as `claude` (0755): it logs
-/// every argument to `$ARGV_LOG`, prints `$FAKE_STDOUT` when set, copies stdin
-/// to stdout when `FAKE_ECHO_STDIN=1` and exits `${FAKE_EXIT:-0}`. The same
-/// tempdir is the child's `HOME`, and `<tmp>/bridge` its `AI_ENV_BRIDGE_DIR`,
-/// so `bridge.toml`, the census and the argv log all live under it.
+/// `tests/fakes/claude.sh` hard-linked into a tempdir as `claude` (0755; one
+/// cached master per content, so macOS assesses only the master's first
+/// exec): it logs every argument to `$ARGV_LOG`, prints `$FAKE_STDOUT` when
+/// set, copies stdin to stdout when `FAKE_ECHO_STDIN=1` and exits
+/// `${FAKE_EXIT:-0}`. The same tempdir is the child's `HOME`, and
+/// `<tmp>/bridge` its `AI_ENV_BRIDGE_DIR`, so `bridge.toml`, the census and
+/// the argv log all live under it.
 struct FakeClaude {
     dir: tempfile::TempDir,
 }
@@ -73,13 +90,7 @@ struct FakeClaude {
 impl FakeClaude {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("claude");
-        std::fs::copy(FAKE_SCRIPT, &script).unwrap_or_else(|e| panic!("copy {FAKE_SCRIPT}: {e}"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        common::install_fake_v1(&dir.path().join("claude"));
         FakeClaude { dir }
     }
 
@@ -111,15 +122,16 @@ impl FakeClaude {
     }
 
     /// `wrapper <real> <args…>` with the child's environment prepared: the
-    /// argv log, `HOME` and `AI_ENV_BRIDGE_DIR` set; the kill switch, the lab
-    /// knob and a config-path override removed (a developer's shell may carry
-    /// them); then `envs` applied in order, so a test may set any of them.
-    /// The cwd is left to the caller.
+    /// argv log, `HOME` and `AI_ENV_BRIDGE_DIR` set; [`WRAPPER_ENV`] removed
+    /// (a developer's shell may carry them); then `envs` applied in order, so
+    /// a test may set any of them. The cwd is left to the caller.
     fn command(&self, real: &Path, args: &[&str], envs: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(wrapper());
         cmd.arg(real).args(args);
         cmd.env("ARGV_LOG", self.log_path()).env("HOME", self.tmp()).env("AI_ENV_BRIDGE_DIR", self.bridge_dir());
-        cmd.env_remove("AI_ENV_BRIDGE_LOCAL").env_remove("AI_ENV_BRIDGE_LAB_EXIT").env_remove("AI_ENV_BRIDGE_CONFIG");
+        for k in WRAPPER_ENV {
+            cmd.env_remove(k);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -704,4 +716,59 @@ mod gates {
         assert!(stderr.contains("go/no-go is not evaluated"), "{stderr}");
         assert!(!tmp.path().join("gates.md").exists(), "--only must not write the file");
     }
+}
+
+// ---- S2: the pump mode never touches the exec path ------------------------------------
+
+/// `<bridge>/logs/wrapper.log`: written only by a piped session.
+fn wrapper_log_path(fake: &FakeClaude) -> PathBuf {
+    fake.bridge_dir().join("logs").join("wrapper.log")
+}
+
+#[test]
+fn local_route_leaves_no_pump_state() {
+    let fake = FakeClaude::new();
+    let out = fake.run(&AUTH_STATUS, &[("AI_ENV_BRIDGE_MODE", "local-child")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), AUTH_STATUS, "exec'd verbatim: no --session-mirror, no pump");
+    assert!(!wrapper_log_path(&fake).exists(), "a Local route writes no wrapper.log");
+    assert!(!fake.bridge_dir().join("state").exists(), "a Local route creates no state/ (sessions, scratch)");
+    assert!(!fake.bridge_dir().join("audit.jsonl").exists());
+    let row = fake.only_row();
+    assert_eq!(row["reason"], "subcommand:auth");
+    let note = row["note"].as_str().expect("the mode is noted");
+    assert!(note.split("; ").any(|p| p == "mode:local-child"), "{note}");
+    assert!(row.get("end").is_none() && row.get("exit").is_none(), "exec leaves no end/exit: {row}");
+}
+
+#[test]
+fn invalid_mode_execs_verbatim_with_a_note() {
+    let fake = FakeClaude::new();
+    let out = fake.run_in(fake.tmp(), &STREAM_JSON, &[("AI_ENV_BRIDGE_MODE", "garbage")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), STREAM_JSON, "exec'd verbatim: no --session-mirror");
+    let err = text(&out.stderr);
+    assert!(err.lines().any(|l| l == "ai-env-claude: AI_ENV_BRIDGE_MODE=garbage unknown; passthrough"), "{err}");
+    assert!(!wrapper_log_path(&fake).exists(), "passthrough writes no wrapper.log");
+    assert!(!fake.bridge_dir().join("state").exists());
+    let row = fake.only_row();
+    let note = row["note"].as_str().expect("the invalid mode is noted");
+    assert!(note.split("; ").any(|p| p == "mode_invalid:garbage"), "{note}");
+    assert_eq!(row["route"], "local");
+    assert_eq!(row["reason"], "unconfigured");
+}
+
+#[test]
+fn unset_mode_session_still_execs() {
+    let fake = FakeClaude::new();
+    let out = fake.command(&fake.bin(), &STREAM_JSON, &[]).env_remove("AI_ENV_BRIDGE_MODE").current_dir(fake.tmp()).output().expect("spawn wrapper");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), STREAM_JSON, "exec'd verbatim: no --session-mirror");
+    assert!(!wrapper_log_path(&fake).exists(), "no pump, no wrapper.log");
+    assert!(!fake.bridge_dir().join("state").exists());
+    let row = fake.only_row();
+    assert!(row["note"].is_null(), "the default mode earns no note: {row}");
+    assert!(row.get("end").is_none(), "{row}");
 }

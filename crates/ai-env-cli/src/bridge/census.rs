@@ -27,7 +27,7 @@ pub const MAX_ROW_BYTES: usize = 64 * 1024;
 /// keeps `TOKEN|KEY|SECRET|PASSWORD|AUTH|CREDENTIAL` out of this list).
 /// Presence or absence of anything else (`CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`,
 /// `CLAUDECODE`, `NODE_OPTIONS`) is read from `env_names`.
-pub const CENSUS_VALUE_ALLOWLIST: [&str; 13] = [
+pub const CENSUS_VALUE_ALLOWLIST: [&str; 19] = [
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_AGENT_SDK_VERSION",
     "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
@@ -41,10 +41,19 @@ pub const CENSUS_VALUE_ALLOWLIST: [&str; 13] = [
     "LANG",
     "TERM",
     "AI_ENV_BRIDGE_LAB_EXIT",
+    // S2: the pump mode, the mirror root and the pump-stage lab knobs.
+    "AI_ENV_BRIDGE_MODE",
+    "AI_ENV_BRIDGE_MIRROR_ROOT",
+    "AI_ENV_BRIDGE_LAB_IGNORE_EOF",
+    "AI_ENV_BRIDGE_LAB_STDOUT_NOISE",
+    "AI_ENV_BRIDGE_LAB_DELAY_INIT_MS",
+    "AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS",
 ];
 
-/// One census line. `end`/`exit` stay absent until the S2 pump: the S1
-/// wrapper execs the real binary, so nothing can write them.
+/// One census line. `end`/`exit` are absent on the start row of every
+/// invocation; the S2 pump appends a second row for a piped session (a clone
+/// of the start row with `end`, `exit` and an extended `note`), paired on
+/// `(pid, start)`. An exec'd invocation has only the start row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CensusRow {
     pub v: u8,

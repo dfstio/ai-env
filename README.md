@@ -137,6 +137,7 @@ ai-env gates  [--json] [--only G1,G3] [--out FILE]        # MicroVM bridge pre-c
 ai-env wrapper install [--write] [--permission-mode M]    # point Cursor's claudeProcessWrapper at the sibling ai-env-claude
                                                           #   (dry run unless --write; backs up settings.json; bridge feature)
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
+ai-env session list [--json] | show UUID [--json] | forget UUID   # sessions the S2 pump registered (bridge feature)
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
@@ -151,7 +152,7 @@ workspace outside the approved roots).
 every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings) never
 change the exit code.
 
-### The Cursor wrapper (stage S1)
+### The Cursor wrapper (stages S1–S2)
 
 `ai-env wrapper install --write` writes two user settings, `claudeCode.claudeProcessWrapper`
 (the absolute path of the `ai-env-claude` next to `ai-env`) and `claudeCode.initialPermissionMode`
@@ -165,6 +166,31 @@ allowlist of non-secret values, argv with MCP credentials and the positional tai
 masked). `ai-env wrapper census` prints it; `--record-probes` writes the `entrypoint` and
 `stock-ext-oauth` verdicts to `lab/probes.jsonl`. `AI_ENV_BRIDGE_LOCAL=1` in the extension's
 environment is the kill switch: exec the real binary, no census, no bridge.
+
+With `AI_ENV_BRIDGE_MODE=local-child` (or `local-scratch`) in `claudeCode.environmentVariables`,
+a stream-json chat session is no longer exec'd: the wrapper spawns the bundled binary as a piped
+child with `--session-mirror` appended and stands between it and the extension (stage S2, no AWS).
+Everything else — every subcommand, `--version`, and every session while the variable is unset —
+still execs exactly as above. The pump:
+
+- peels the child's `transcript_mirror` frames (never forwarded) and, when
+  `AI_ENV_BRIDGE_MIRROR_ROOT` is set or the child uses another config dir, appends their entries
+  byte-for-byte under the same relative path (0600 files, 0700 directories, no symlinks);
+- records the extension's `initialize` and state requests (permission mode, `apply_flag_settings`,
+  MCP servers, …) and replays them into a respawned child without the extension noticing;
+- `local-scratch` runs the child with its own `CLAUDE_CONFIG_DIR` under
+  `~/.config/ai-env/bridge/state/scratch/`, seeds it with the Mac transcript before `--resume`, and
+  retries once when the child reports `No conversation found with session ID:` (the child is logged
+  out unless `CLAUDE_CODE_OAUTH_TOKEN` is set — S7 delivers it);
+- writes `logs/wrapper.log`, a second census row with `end`/`exit` (`ai-env wrapper census` shows
+  `exit=… dur=…`), `audit.jsonl` rows for retries, and one `state/sessions/<uuid>.toml` per chat
+  (`ai-env session list|show|forget`; rows hold digests and a summary, never request bodies);
+- exits within 1.5 s of the extension closing stdin (SIGTERM at +0.8 s, SIGKILL at +1.2 s) and
+  within 1 s of a SIGTERM.
+
+Debug builds also honour the lab knobs `AI_ENV_BRIDGE_LAB_EXIT=<code>:<msg>:after-init`,
+`AI_ENV_BRIDGE_LAB_IGNORE_EOF=1|2`, `AI_ENV_BRIDGE_LAB_STDOUT_NOISE=1` and
+`AI_ENV_BRIDGE_LAB_DELAY_INIT_MS=<n>` (compiled out of release builds).
 
 ### Access-control policies (`keygen --access-control`)
 

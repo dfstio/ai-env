@@ -3,27 +3,47 @@
 //! forwarded lines stay byte-identical.
 use bytes::{Buf, Bytes, BytesMut};
 
-/// Longest line accepted (Claude frames are far smaller; this bounds memory).
+/// Longest line accepted by default: the WebSocket framing cap (S6), which
+/// bounds memory per frame.
 pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The Claude CLI's own stream-json line limit (268,435,456 characters in
+/// 2.1.282): a local pump must never drop a line the CLI would accept (a user
+/// message with pasted images, a transcript entry holding them).
+pub const CLI_LINE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineError {
-    /// A line exceeded [`MAX_LINE_BYTES`]; `dropped_bytes` were discarded up
+    /// A line exceeded the splitter's cap ([`MAX_LINE_BYTES`] by default); `dropped_bytes` were discarded up
     /// to (not including) the next newline, and splitting resumes after it.
     TooLong { dropped_bytes: usize },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LineSplitter {
     buf: BytesMut,
     discarding: bool,
     dropped: usize,
+    cap: usize,
+}
+
+impl Default for LineSplitter {
+    fn default() -> Self {
+        Self::with_cap(MAX_LINE_BYTES)
+    }
 }
 
 impl LineSplitter {
+    /// A splitter with the default cap ([`MAX_LINE_BYTES`]).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A splitter whose longest accepted line is `cap` bytes.
+    #[must_use]
+    pub fn with_cap(cap: usize) -> Self {
+        LineSplitter { buf: BytesMut::new(), discarding: false, dropped: 0, cap }
     }
 
     /// Buffer a chunk. While an over-cap line is being discarded the bytes are
@@ -51,7 +71,7 @@ impl LineSplitter {
             };
         }
         match self.buf.iter().position(|b| *b == b'\n') {
-            Some(i) if i > MAX_LINE_BYTES => {
+            Some(i) if i > self.cap => {
                 self.buf.advance(i + 1);
                 Some(Err(LineError::TooLong { dropped_bytes: i }))
             }
@@ -61,7 +81,7 @@ impl LineSplitter {
                 Some(Ok(line))
             }
             None => {
-                if self.buf.len() > MAX_LINE_BYTES {
+                if self.buf.len() > self.cap {
                     self.dropped = self.buf.len();
                     self.buf.clear();
                     self.discarding = true;
@@ -83,7 +103,7 @@ impl LineSplitter {
         if self.buf.is_empty() {
             return None;
         }
-        if self.buf.len() > MAX_LINE_BYTES {
+        if self.buf.len() > self.cap {
             let dropped = self.buf.len();
             self.buf.clear();
             return Some(Err(LineError::TooLong { dropped_bytes: dropped }));
@@ -204,6 +224,23 @@ mod tests {
         assert!(s.next_line().is_none());
         assert_eq!(s.finish().unwrap().unwrap().as_ref(), b"b");
         assert!(s.finish().is_none());
+    }
+
+    #[test]
+    fn a_custom_cap_applies_everywhere() {
+        let mut s = LineSplitter::with_cap(4);
+        s.push(b"abcd\nabcde\nok\n");
+        assert_eq!(drain(&mut s), vec![Ok(b"abcd".to_vec()), Err(LineError::TooLong { dropped_bytes: 5 }), Ok(b"ok".to_vec())]);
+        s.push(b"123456");
+        assert!(s.next_line().is_none(), "over the cap while unterminated: discarding");
+        s.push(b"7\nz");
+        assert_eq!(s.next_line(), Some(Err(LineError::TooLong { dropped_bytes: 7 })));
+        assert_eq!(s.finish(), Some(Ok(Bytes::from_static(b"z"))));
+        let mut big = LineSplitter::with_cap(CLI_LINE_BYTES);
+        let line = vec![b'x'; MAX_LINE_BYTES + 1];
+        big.push(&line);
+        big.push(b"\n");
+        assert_eq!(big.next_line().unwrap().unwrap().len(), MAX_LINE_BYTES + 1, "a 4 MiB+1 line passes the CLI cap");
     }
 
     #[test]

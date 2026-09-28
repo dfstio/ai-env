@@ -18,7 +18,7 @@ autoexamples = false
 # Dependencies pinned by the plan ahead of the stage that consumes them (see the
 # trailing comment on each line under [dependencies]); `make check-deps` runs cargo machete.
 [package.metadata.cargo-machete]
-ignored = ["uuid", "nix", "hyper", "hyper-util", "http-body-util", "futures-util"]
+ignored = ["nix", "hyper", "hyper-util", "http-body-util", "futures-util"]
 
 [lib]
 name = "ai_env_cli"
@@ -61,6 +61,21 @@ required-features = ["bridge"]
 [[test]]
 name = "wrapper_install"
 path = "tests/wrapper_install.rs"
+required-features = ["bridge"]
+
+[[test]]
+name = "hoststate"
+path = "tests/hoststate.rs"
+required-features = ["bridge"]
+
+[[test]]
+name = "mirror"
+path = "tests/mirror.rs"
+required-features = ["bridge"]
+
+[[test]]
+name = "race"
+path = "tests/race.rs"
 required-features = ["bridge"]
 
 [[test]]
@@ -132,7 +147,7 @@ futures-util = { workspace = true } # S6 pump (not consumed before then; cargo-m
 http = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true } # S2 pump ids (v7) (not consumed before then; cargo-machete allowlist above)
+uuid = { workspace = true } # S2 pump: fresh request ids (v7) for a replay
 subtle = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

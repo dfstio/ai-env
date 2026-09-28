@@ -1,25 +1,27 @@
 //! `ai-env-claude` — Cursor's `claudeCode.claudeProcessWrapper` target,
 //! exec'd as `<wrapper> <realBinary> <claude args…>`. `--version` is its only
-//! other mode. In S1 every route execs the real binary locally with argv
-//! verbatim (the remote route is a census label until the S2 pump), before
-//! any tokio runtime, SDK or TLS object exists: this binary links only
-//! `wire::argv`, `bridge::{route, census, lab, sibling, config}` and
-//! `age_cmd`.
+//! other mode. Every Local route (subcommands, `--version`, …) and, with
+//! `AI_ENV_BRIDGE_MODE` unset, every route execs the real binary locally with
+//! argv verbatim, before any tokio runtime, SDK or TLS object exists. A
+//! stream-json session under `AI_ENV_BRIDGE_MODE=local-child|local-scratch`
+//! (S2; `Route::Remote` from S8) is piped instead: `bridge::pump::run` builds
+//! the only runtime this binary ever has, after the census row is written.
 //!
-//! The ORDER below is the invariant (plan §4 step 9): `--version` → kill
-//! switch (raw exec, no census, no config read) → `argv::split` (exit 2 only
-//! for a missing argv[1] or an argument that is not valid UTF-8 — Cursor's
-//! argv comes from JS strings, so the latter never happens from the
-//! extension; the kill switch execs raw bytes regardless) →
+//! The ORDER below is the invariant (plan S1 §4 step 9, S2 step 12):
+//! `--version` → kill switch (raw exec, no census, no config read) →
+//! `argv::split` (exit 2 only for a missing argv[1] or an argument that is
+//! not valid UTF-8 — Cursor's argv comes from JS strings, so the latter never
+//! happens from the extension; the kill switch execs raw bytes regardless) →
 //! `route::load_for_wrapper` + `current_dir` → `route::decide` → notes
-//! (`mcp add|remove`, missing cwd, lab knob, local fallback) → the binary
-//! check, so the row can carry the fallback note → `census::record` (one
-//! stderr line on failure, never blocking) → the lab exit knob (debug
-//! builds) → exec. stderr lines are prefixed `ai-env-claude:` (the extension
-//! shows the last 2 KiB of stderr only on a non-zero exit); stdout belongs to
-//! Claude's stream-json.
+//! (`mcp add|remove`, missing cwd, lab knob, the pump mode, local fallback) →
+//! the binary check, so the row can carry the fallback note →
+//! `census::record` (one stderr line on failure, never blocking) → the lab
+//! exit knob (debug builds) → the piped branch (`route::piped`) → exec.
+//! stderr lines are prefixed `ai-env-claude:` (the extension shows the last
+//! 2 KiB of stderr only on a non-zero exit); stdout belongs to Claude's
+//! stream-json.
 use ai_env_cli::bridge::sibling::exists_exec;
-use ai_env_cli::bridge::{census, lab, route};
+use ai_env_cli::bridge::{census, lab, pump, route};
 use ai_env_cli::wire::argv::{self, ArgvError};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -98,6 +100,11 @@ fn main() {
     if let Some((code, _)) = &knob {
         notes.push(format!("lab_exit:{code}"));
     }
+    // The pump mode: one environment variable, read on the exec path too.
+    let (mode, mode_note) = route::mode_from_env();
+    if let Some(n) = mode_note {
+        notes.push(n);
+    }
 
     // The binary check comes before the census so the row carries the
     // fallback note; a failure is remembered and reported after the row.
@@ -124,11 +131,13 @@ fn main() {
         }
     };
 
-    // The census: one redacted row, never blocking the exec.
+    // The census: one redacted row, never blocking the exec. A piped session
+    // appends a second row (the same row + end, exit) when it ends.
     let note = if notes.is_empty() { None } else { Some(notes.join("; ")) };
+    let start_row = census::build_row(&argv, &route, cwd.as_deref(), note);
     match &loaded.paths {
         Some(paths) => {
-            if let Err(e) = census::record(&paths.census(), &census::build_row(&argv, &route, cwd.as_deref(), note)) {
+            if let Err(e) = census::record(&paths.census(), &start_row) {
                 eprintln!("ai-env-claude: census: {e}");
             }
         }
@@ -140,6 +149,23 @@ fn main() {
     if let Some((code, msg)) = knob {
         eprintln!("{msg}");
         std::process::exit(code);
+    }
+
+    // The piped branch (S2): a stream-json session in a local pump mode.
+    // Without a state root (HOME unset) there is nowhere to log or register:
+    // exec as S1 does.
+    if let (Ok(bin), Some(paths), Some(session)) = (&bin, &loaded.paths, route::piped(mode, &route, &inv.args)) {
+        pump::run(pump::Session {
+            real_binary: bin.clone(),
+            args: inv.args.clone(),
+            route: route.clone(),
+            session,
+            cwd: cwd.clone(),
+            paths: paths.clone(),
+            cfg: loaded.cfg.clone(),
+            mode,
+            start_row,
+        });
     }
 
     match bin {

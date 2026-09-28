@@ -20,10 +20,14 @@
 //! Roots are `[workspaces].roots` ∪ `[[workspace]].path`
 //! (`BridgeConfig::roots`), each canonicalised when it exists so a symlinked
 //! cwd still matches; the comparison is component-wise (`Path::starts_with`):
-//! cwd == root matches, `/a/b2` is not under `/a/b`. In S1 every route execs
-//! the real binary locally; `Remote` is a census label until S2.
+//! cwd == root matches, `/a/b2` is not under `/a/b`.
+//!
+//! `AI_ENV_BRIDGE_MODE` ([`Mode`]) decides what happens to a stream-json
+//! session: unset keeps S1's exec for every route; `local-child` and
+//! `local-scratch` pipe it through the S2 pump ([`piped`]); `remote` is
+//! parsed and execs until S8.
 use crate::bridge::config::{BridgeConfig, Paths};
-use crate::wire::argv::{classify, LocalReason, Route};
+use crate::wire::argv::{classify, LocalReason, Route, SessionArgs};
 use std::path::{Path, PathBuf};
 
 /// What the wrapper learned before deciding, never fatal: `paths` is `None`
@@ -97,9 +101,164 @@ pub fn decide(args: &[String], cwd: Option<&Path>, cfg: Option<&BridgeConfig>) -
     }
 }
 
+/// `AI_ENV_BRIDGE_MODE`: whether a stream-json session is exec'd (S1) or
+/// piped through the wrapper (S2's local modes; `remote` is S8's).
+pub const MODE_ENV: &str = "AI_ENV_BRIDGE_MODE";
+
+/// How a stream-json session runs. Unset means `Passthrough` — S1's exec for
+/// every route — so a daily Cursor setup is untouched until the variable is
+/// set on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Exec the real binary for every route (S1 behaviour; the default).
+    Passthrough,
+    /// Pipe the session through the wrapper to a local child that uses the
+    /// Mac's own config dir (writer validated via `AI_ENV_BRIDGE_MIRROR_ROOT`).
+    LocalChild,
+    /// Pipe the session to a local child whose `CLAUDE_CONFIG_DIR` is a
+    /// per-session scratch dir (resume seeding; needs a token — S7).
+    LocalScratch,
+    /// Parsed, not implemented until S8: behaves as `Passthrough` + a census note.
+    Remote,
+}
+
+impl Mode {
+    /// The spelling of `AI_ENV_BRIDGE_MODE` and of the census note.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Passthrough => "passthrough",
+            Mode::LocalChild => "local-child",
+            Mode::LocalScratch => "local-scratch",
+            Mode::Remote => "remote",
+        }
+    }
+}
+
+/// `None` (unset) or `passthrough` → `Passthrough`; the three other names
+/// map to their mode; anything else → `Err(value)`.
+pub fn parse_mode(value: Option<&str>) -> Result<Mode, String> {
+    match value {
+        None | Some("passthrough") => Ok(Mode::Passthrough),
+        Some("local-child") => Ok(Mode::LocalChild),
+        Some("local-scratch") => Ok(Mode::LocalScratch),
+        Some("remote") => Ok(Mode::Remote),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// The mode from the environment plus the census note it earns:
+/// `mode:<name>` for a non-default mode, `mode:remote(unimplemented)` for
+/// `remote`, `mode_invalid:<value>` (scrubbed, ≤ 64 chars) for an unknown
+/// value — which also prints one stderr line and falls back to passthrough.
+/// Reads one environment variable and nothing else, so it may run on the
+/// exec path.
+#[must_use]
+pub fn mode_from_env() -> (Mode, Option<String>) {
+    let raw = std::env::var_os(MODE_ENV).map(|v| v.to_string_lossy().into_owned());
+    mode_and_note(raw.as_deref())
+}
+
+/// The pure half of [`mode_from_env`].
+#[must_use]
+pub fn mode_and_note(raw: Option<&str>) -> (Mode, Option<String>) {
+    match parse_mode(raw) {
+        Ok(Mode::Passthrough) => (Mode::Passthrough, None),
+        Ok(Mode::Remote) => (Mode::Remote, Some("mode:remote(unimplemented)".to_string())),
+        Ok(mode) => (mode, Some(format!("mode:{}", mode.name()))),
+        Err(value) => {
+            let shown: String = crate::wire::redact::scrub(&value).chars().take(64).collect();
+            eprintln!("ai-env-claude: {MODE_ENV}={shown} unknown; passthrough");
+            (Mode::Passthrough, Some(format!("mode_invalid:{shown}")))
+        }
+    }
+}
+
+/// The session payload when this invocation is piped, else `None` (exec).
+/// `Passthrough` and `Remote` (until S8) never pipe. The two local modes
+/// pipe every stream-json session shape — `Remote(_)` and the two demoted
+/// reasons `Local(OutsideRoots | Unconfigured)`, whose payload comes from
+/// `classify` again — because a local child needs neither roots nor a
+/// `bridge.toml`. Every other `Local` reason (subcommands, `--version`,
+/// `--bare`, …) execs.
+#[must_use]
+pub fn piped(mode: Mode, route: &Route, args: &[String]) -> Option<SessionArgs> {
+    match mode {
+        Mode::Passthrough | Mode::Remote => None,
+        Mode::LocalChild | Mode::LocalScratch => match route {
+            Route::Remote(s) => Some(s.clone()),
+            Route::Local(LocalReason::OutsideRoots | LocalReason::Unconfigured) => match classify(args) {
+                Route::Remote(s) => Some(s),
+                Route::Local(_) => None,
+            },
+            Route::Local(_) => None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_mode_names() {
+        assert_eq!(parse_mode(None), Ok(Mode::Passthrough));
+        for m in [Mode::Passthrough, Mode::LocalChild, Mode::LocalScratch, Mode::Remote] {
+            assert_eq!(parse_mode(Some(m.name())), Ok(m), "{}", m.name());
+        }
+        assert_eq!(parse_mode(Some("Local-Child")), Err("Local-Child".to_string()), "names are case-sensitive");
+        assert_eq!(parse_mode(Some("")), Err(String::new()));
+    }
+
+    #[test]
+    fn mode_notes() {
+        assert_eq!(mode_and_note(None), (Mode::Passthrough, None));
+        assert_eq!(mode_and_note(Some("passthrough")), (Mode::Passthrough, None));
+        assert_eq!(mode_and_note(Some("local-child")), (Mode::LocalChild, Some("mode:local-child".into())));
+        assert_eq!(mode_and_note(Some("local-scratch")), (Mode::LocalScratch, Some("mode:local-scratch".into())));
+        assert_eq!(mode_and_note(Some("remote")), (Mode::Remote, Some("mode:remote(unimplemented)".into())));
+        assert_eq!(mode_and_note(Some("garbage")), (Mode::Passthrough, Some("mode_invalid:garbage".into())));
+        let long = "x".repeat(200);
+        let (_, note) = mode_and_note(Some(&long));
+        assert_eq!(note.unwrap().len(), "mode_invalid:".len() + 64, "the echoed value is capped");
+    }
+
+    #[test]
+    fn piped_matrix() {
+        let session = session_argv();
+        let session_payload = match classify(&session) {
+            Route::Remote(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let auth = v(&["auth", "status", "--json"]);
+        let routes: [(Route, &[String]); 8] = [
+            (Route::Remote(session_payload.clone()), &session),
+            (Route::Local(LocalReason::OutsideRoots), &session),
+            (Route::Local(LocalReason::Unconfigured), &session),
+            (Route::Local(LocalReason::Subcommand("auth".into())), &auth),
+            (Route::Local(LocalReason::Version), &[]),
+            (Route::Local(LocalReason::NoArgs), &[]),
+            (Route::Local(LocalReason::Bare), &[]),
+            (Route::Local(LocalReason::NotStreamJson), &[]),
+        ];
+        for mode in [Mode::Passthrough, Mode::Remote] {
+            for (route, args) in &routes {
+                assert_eq!(piped(mode, route, args), None, "{mode:?} {route:?}");
+            }
+        }
+        for mode in [Mode::LocalChild, Mode::LocalScratch] {
+            for (i, (route, args)) in routes.iter().enumerate() {
+                let got = piped(mode, route, args);
+                if i < 3 {
+                    assert_eq!(got.as_ref(), Some(&session_payload), "{mode:?} {route:?}");
+                } else {
+                    assert_eq!(got, None, "{mode:?} {route:?}");
+                }
+            }
+        }
+        // A demoted reason whose argv is not a session shape never pipes.
+        assert_eq!(piped(Mode::LocalChild, &Route::Local(LocalReason::OutsideRoots), &auth), None);
+    }
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()
