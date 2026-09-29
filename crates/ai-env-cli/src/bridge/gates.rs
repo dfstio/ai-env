@@ -239,6 +239,16 @@ fn g2() -> GateResult {
     )
 }
 
+/// The image's base container: the `FROM` operand of `image/Dockerfile`
+/// (digest-pinned since S3; the Makefile's `BASE_IMAGE` reads the same line).
+#[must_use]
+pub fn from_line(dockerfile: &str) -> Option<String> {
+    dockerfile.lines().find_map(|l| l.trim_start().strip_prefix("FROM ")).map(|s| s.split_whitespace().next().unwrap_or("").to_string()).filter(|s| !s.is_empty())
+}
+
+/// The fallback when `image/Dockerfile` is unreadable.
+const BASE_TAG: &str = "public.ecr.aws/lambda/microvms:al2023-minimal";
+
 fn g3(repo_root: &Path) -> GateResult {
     let bin = repo_root.join("image").join("ai-env");
     let cmd = "inspect image/ai-env from the last make vm-build (not rebuilt here): file; llvm-objdump -T; llvm-nm -D; docker run … al2023-minimal";
@@ -287,9 +297,10 @@ fn g3(repo_root: &Path) -> GateResult {
         }
     }
     let dir = bin.parent().unwrap_or(repo_root).to_string_lossy().into_owned();
+    let base = std::fs::read_to_string(repo_root.join("image").join("Dockerfile")).ok().and_then(|d| from_line(&d)).unwrap_or_else(|| BASE_TAG.to_string());
     let docker = run_capture(
         "docker",
-        &["run", "--rm", "--platform", "linux/arm64", "--entrypoint", "/b/ai-env", "-v", &format!("{dir}:/b:ro"), "public.ecr.aws/lambda/microvms:al2023-minimal", "--version"],
+        &["run", "--rm", "--platform", "linux/arm64", "--entrypoint", "/b/ai-env", "-v", &format!("{dir}:/b:ro"), &base, "--version"],
         Duration::from_secs(120),
     );
     match docker {
@@ -387,13 +398,13 @@ fn g6() -> GateResult {
 fn g7() -> GateResult {
     let cmd = "aws iam simulate-principal-policy … iam:CreateUser iam:CreateAccessKey budgets:ModifyBudget";
     let expected = "recorded either way (denied ⇒ named-profile fallback)";
-    let arn = run_capture("aws", &["sts", "get-caller-identity", "--query", "Arn", "--output", "text"], Duration::from_secs(20));
+    let arn = run_capture("aws", &["sts", "get-caller-identity", "--region", crate::bridge::config::REGION, "--query", "Arn", "--output", "text"], Duration::from_secs(20));
     let Ok(arn) = arn else {
         return gate("G7", "IAM for the runtime principal", cmd, expected, format!("no identity: {}", arn.err().unwrap_or_default()), GateStatus::Skipped);
     };
     let sim = run_capture(
         "aws",
-        &["iam", "simulate-principal-policy", "--policy-source-arn", &arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "budgets:ModifyBudget", "--output", "json"],
+        &["iam", "simulate-principal-policy", "--region", crate::bridge::config::REGION, "--policy-source-arn", &arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "budgets:ModifyBudget", "--output", "json"],
         Duration::from_secs(30),
     );
     match sim {
@@ -665,6 +676,16 @@ mod tests {
 
     fn row(id: &'static str, status: GateStatus, observed: &str) -> GateResult {
         GateResult { id, name: "n", command: "c".into(), expected: "e".into(), observed: observed.into(), status, date: "2026-09-19".into() }
+    }
+
+    #[test]
+    fn from_line_reads_the_pinned_base() {
+        let df = "# comment\n# FROM not-this\nFROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:00 AS base\nRUN true\nFROM other\n";
+        assert_eq!(from_line(df).as_deref(), Some("public.ecr.aws/lambda/microvms:al2023-minimal@sha256:00"));
+        assert_eq!(from_line("RUN true\n"), None);
+        let repo = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/Dockerfile")).unwrap();
+        let base = from_line(&repo).unwrap();
+        assert!(base.starts_with(BASE_TAG) && base.contains("@sha256:"), "the image is digest-pinned: {base}");
     }
 
     #[test]

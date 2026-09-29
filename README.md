@@ -138,6 +138,12 @@ ai-env wrapper install [--write] [--permission-mode M]    # point Cursor's claud
                                                           #   (dry run unless --write; backs up settings.json; bridge feature)
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env session list [--json] | show UUID [--json] | forget UUID   # sessions the S2 pump registered (bridge feature)
+ai-env infra  scan DIR [--profile image|repo] [--json]    # secrets + unsafe-settings scan of an image tree; exit 9 on a finding
+ai-env infra  pin [--manifest FILE | --check-bundle] [--lock FILE]  # image/claude.lock from a release manifest; lock vs Cursor bundle
+ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi outputs + a live image read → bridge.toml [aws] + state/infra.toml
+ai-env infra  base-image [--name al2023-1] [--version 1]  # the pinned managed base image is AVAILABLE
+ai-env infra  versions-diff --before F --after F [--record-probe]   # image versions around a deploy (bridge feature)
+ai-env creds  aws-set [--user ai-env-runtime] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
@@ -191,6 +197,43 @@ still execs exactly as above. The pump:
 Debug builds also honour the lab knobs `AI_ENV_BRIDGE_LAB_EXIT=<code>:<msg>:after-init`,
 `AI_ENV_BRIDGE_LAB_IGNORE_EOF=1|2`, `AI_ENV_BRIDGE_LAB_STDOUT_NOISE=1` and
 `AI_ENV_BRIDGE_LAB_DELAY_INIT_MS=<n>` (compiled out of release builds).
+
+### The MicroVM image and its infrastructure (stage S3)
+
+`image/` holds everything the MicroVM image is built from, and `image/MANIFEST` lists it:
+`make image-zip` cross-builds the shim (`make vm-build`), copies exactly the listed files into
+`target/image/stage` with the listed modes (an unlisted file stops the build), scans the staged tree
+with `ai-env infra scan` (built-in tripwires for API keys, private keys, age identities, JWTs and
+URL credentials, plus rules for the baked Claude settings: no `bypassPermissions`, no broad allow
+entries, no secret-named `env` keys; exit 9 names file, line and rule, never the matched text), and
+writes a deterministic zip plus `target/image/image.json` (its sha256 and S3 key). The image pins
+Claude Code by version, size and SHA-256 (`image/claude.lock`; `make claude-pin CLAUDE_VERSION=<v>`
+refreshes it from the release manifest, verifying its signature when the release key is in gpg)
+and bakes a fresh, reviewed config subset — never the Mac's own `~/.claude`.
+
+`ai-env shim` is the image's ENTRYPOINT. As PID 1 it is a small init (child subreaper, signal
+forwarding, orphan reaping) that runs the same binary as its worker; the worker serves the
+platform hooks on 9000 (`/ready` waits for the listeners and one `claude --version`, `/validate`
+checks the version against the lock, the settings files and that no build-time state leaked into
+the snapshot, `/run` is first-wins and fail-closed without a payload), `/health` on 8080 and a
+placeholder on 9418. In v0 it logs where hook requests come from and measures the clock without
+stepping it (`--hook-source enforce` and `--clock forward` exist for S6).
+
+```sh
+make image-zip                 # vm-build + stage + scan + zip
+make test-docker               # the shim in the base image (L1) and the built image (L2); stamps the zip
+make s3-preflight PHASE=a      # build-side preconditions, one row each
+make check-policies preview-scratch   # IAM Access Analyzer + a throwaway-backend Pulumi preview (read-only)
+make deploy                    # (Mike) Pulumi up of infra/ in eu-central-1, then waits for the image build
+make infra-status WRITE=1      # stack outputs (+ the image's live state) → bridge.toml [aws] (comments kept) + state/infra.toml
+make runtime-key               # seal a key of the ai-env-runtime user under the bridge keystore key
+```
+
+Pulumi state stays in the operator's local backend; `infra/Pulumi.dev.yaml` and
+`infra/config/dev.env` (budget email and limit) are not committed — copy the `.example` files. No
+secret ever enters Pulumi config, outputs or state: the runtime user's access key is created by
+`make runtime-key`, piped straight into `ai-env creds aws-set` and sealed to
+`~/.config/ai-env/bridge/credentials/aws.env`.
 
 ### Access-control policies (`keygen --access-control`)
 
@@ -288,6 +331,7 @@ make build test                                   # all four feature sets
 make clippy lint                                  # -D warnings in every cfg world + TLS/WS grep guards
 make check-bins check-features check-msrv         # packaging invariants
 make vm-build                                     # cargo lambda build --arm64 (shim only) → image/ai-env
+make image-zip test-docker                        # the S3 image: stage + scan + zip, then the opt-in Docker tests
 make vm-run ARGS='shim --help'                    # run image/ai-env inside the AL2023 arm64 base image
 make gates                                        # G1–G8 pre-code gates → plans/gates.md
 cargo test                                        # everything except hardware

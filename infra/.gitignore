@@ -1,0 +1,13 @@
+# Installed by `make infra-install` (npm ci from the committed package-lock.json).
+node_modules/
+# Stack files carry the encryptionsalt; the repo is public (D17). Only the example is committed.
+Pulumi.*.yaml
+!Pulumi.dev.yaml.example
+# Per-stack settings (budget email, limit); only the examples are committed.
+config/*.env
+!config/*.env.example
+# tsc output (the program itself runs through Pulumi's ts-node; check-policies compiles into target/).
+bin/
+*.js
+*.js.map
+*.tsbuildinfo

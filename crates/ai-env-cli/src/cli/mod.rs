@@ -186,9 +186,116 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// MicroVM infrastructure: image scan, claude pin, stack outputs → bridge.toml, base image, version diffs
+    #[cfg(feature = "bridge")]
+    Infra {
+        #[command(subcommand)]
+        cmd: InfraCmd,
+    },
+    /// Bridge credentials sealed under the bridge keystore key (credentials/*.env)
+    #[cfg(feature = "bridge")]
+    Creds {
+        #[command(subcommand)]
+        cmd: CredsCmd,
+    },
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
     Shim(crate::shim::ShimArgs),
+}
+
+/// `ai-env infra …` (feature `bridge`): the S3 infrastructure helpers the Makefile drives.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum InfraCmd {
+    /// Scan a directory (the staged image tree) for secrets and unsafe Claude settings; exit 9 on any finding
+    Scan {
+        /// Directory to scan
+        dir: PathBuf,
+        /// Rule profile: image (tripwires + the baked-settings rules) or repo (tripwires only)
+        #[arg(long, value_enum, default_value_t = crate::bridge::scan::Profile::Image)]
+        profile: crate::bridge::scan::Profile,
+        /// Extra tripwire patterns, one per line (default: [review].tripwires when that file exists)
+        #[arg(long, value_name = "FILE")]
+        tripwires: Option<PathBuf>,
+        /// Allowed settings.json permission entries, one `allow <entry>` per line (default: [review].settings_policy when that file exists)
+        #[arg(long, value_name = "FILE")]
+        settings_policy: Option<PathBuf>,
+        /// Machine-readable findings
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write image/claude.lock from a release manifest.json, print it, or compare it with the installed Cursor bundle
+    Pin {
+        /// Release manifest.json to pin from (downloaded and signature-checked by `make claude-pin`)
+        #[arg(long, value_name = "FILE", conflicts_with = "check_bundle")]
+        manifest: Option<PathBuf>,
+        /// The lock file to write or read
+        #[arg(long, value_name = "FILE", default_value = "image/claude.lock")]
+        lock: PathBuf,
+        /// Exit 1 unless the lock's version equals the installed Cursor extension bundle's
+        #[arg(long)]
+        check_bundle: bool,
+        /// With --manifest: refuse a manifest whose version is not this one (lock not written)
+        #[arg(long, value_name = "V", requires = "manifest")]
+        expect_version: Option<String>,
+    },
+    /// Read the Pulumi stack outputs plus one live read-only get-microvm-image, and show (or --write) the bridge.toml [aws] table and state/infra.toml
+    Status {
+        /// Edit bridge.toml [aws] in place (backup first) and write state/infra.toml
+        #[arg(long)]
+        write: bool,
+        /// Read the outputs from FILE instead of `pulumi stack output --json` (tests; the live get-microvm-image read still runs, so tests put a fake aws first on PATH)
+        #[arg(long, value_name = "FILE", hide = true)]
+        json_in: Option<PathBuf>,
+        /// Pulumi stack
+        #[arg(long, default_value = "dev")]
+        stack: String,
+        /// Pulumi project directory
+        #[arg(long, value_name = "DIR", default_value = "infra")]
+        cwd: PathBuf,
+    },
+    /// Check that the pinned managed base image version is AVAILABLE (exit 1 otherwise)
+    BaseImage {
+        /// Managed base image name
+        #[arg(long, default_value = "al2023-1")]
+        name: String,
+        /// Pinned version
+        #[arg(long, default_value = "1")]
+        version: String,
+        /// Read `list-managed-microvm-image-versions` JSON from FILE instead of calling AWS (tests)
+        #[arg(long, value_name = "FILE", hide = true)]
+        json_in: Option<PathBuf>,
+    },
+    /// Compare two `list-microvm-image-versions` snapshots taken around a deploy
+    VersionsDiff {
+        /// Snapshot taken before the deploy
+        #[arg(long, value_name = "FILE")]
+        before: PathBuf,
+        /// Snapshot taken after the deploy
+        #[arg(long, value_name = "FILE")]
+        after: PathBuf,
+        /// Append the image-version-delete probe verdict to lab/probes.jsonl
+        #[arg(long)]
+        record_probe: bool,
+    },
+}
+
+/// `ai-env creds …` (feature `bridge`): credentials the bridge holds, sealed to the bridge keystore key.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum CredsCmd {
+    /// Seal the JSON of `aws iam create-access-key` (read from stdin) into credentials/aws.env
+    AwsSet {
+        /// IAM user the access key must belong to
+        #[arg(long, default_value = "ai-env-runtime")]
+        user: String,
+        /// Preflight only: keystore key, recovery recipient, age, writable target, fewer than two existing keys
+        #[arg(long)]
+        check: bool,
+        /// Seal even when the keystore key has no recovery recipient
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands.
@@ -396,6 +503,20 @@ pub fn run(cli: Cli) -> Result<()> {
             SessionCmd::List { json } => crate::bridge::registry::cmd_list(json),
             SessionCmd::Show { uuid, json } => crate::bridge::registry::cmd_show(&uuid, json),
             SessionCmd::Forget { uuid } => crate::bridge::registry::cmd_forget(&uuid),
+        },
+        #[cfg(feature = "bridge")]
+        Cmd::Infra { cmd } => match cmd {
+            InfraCmd::Scan { dir, profile, tripwires, settings_policy, json } => {
+                crate::bridge::scan::cmd_scan(&dir, profile, tripwires.as_deref(), settings_policy.as_deref(), json)
+            }
+            InfraCmd::Pin { manifest, lock, check_bundle, expect_version } => crate::bridge::imagepin::cmd_pin(manifest.as_deref(), &lock, check_bundle, expect_version.as_deref()),
+            InfraCmd::Status { write, json_in, stack, cwd } => crate::bridge::infra::cmd_status(write, json_in.as_deref(), &stack, &cwd),
+            InfraCmd::BaseImage { name, version, json_in } => crate::bridge::infra::cmd_base_image(&name, &version, json_in.as_deref()),
+            InfraCmd::VersionsDiff { before, after, record_probe } => crate::bridge::infra::cmd_versions_diff(&before, &after, record_probe),
+        },
+        #[cfg(feature = "bridge")]
+        Cmd::Creds { cmd } => match cmd {
+            CredsCmd::AwsSet { user, check, force } => crate::bridge::creds::cmd_aws_set(&store, &user, check, force),
         },
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),

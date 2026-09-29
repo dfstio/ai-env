@@ -1,0 +1,20 @@
+{
+  "name": "ai-env-infra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ai-env S3 infrastructure: bucket, roles, runtime principal, log group, budget and the aws-native MicrovmImage",
+  "main": "index.ts",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@pulumi/aws": "7.10.0",
+    "@pulumi/aws-native": "1.79.0",
+    "@pulumi/pulumi": "3.265.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "typescript": "5.9.3"
+  }
+}

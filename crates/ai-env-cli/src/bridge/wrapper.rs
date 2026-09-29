@@ -451,9 +451,20 @@ fn json_str(s: &str) -> String {
 }
 
 /// The backup name next to `path`: `settings.json.<unix seconds>.ai-env.bak`.
+#[cfg(test)]
 fn backup_path(path: &Path, now: u64) -> PathBuf {
+    backup_path_n(path, now, 0)
+}
+
+/// The `n`-th backup name within one second: `<name>.<secs>.ai-env.bak`
+/// for `n == 0`, else `<name>.<secs>-<n>.ai-env.bak`.
+fn backup_path_n(path: &Path, now: u64, n: u32) -> PathBuf {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "settings.json".to_string());
-    path.with_file_name(format!("{name}.{now}.ai-env.bak"))
+    if n == 0 {
+        path.with_file_name(format!("{name}.{now}.ai-env.bak"))
+    } else {
+        path.with_file_name(format!("{name}.{now}-{n}.ai-env.bak"))
+    }
 }
 
 /// `ai-env wrapper install [--write] [--permission-mode M]` (plan §7): find
@@ -589,11 +600,11 @@ pub(crate) fn commit_settings(path: &Path, meta: Option<&std::fs::Metadata>, bef
         Err(e) => bail!("cannot stat {}: {e}", path.display()),
     };
     if stamp(now_meta.as_ref()) != before {
-        bail!("settings.json changed while editing; re-run");
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        bail!("{name} changed while editing; re-run");
     }
     let backup = match meta {
         Some(m) => {
-            let bak = backup_path(path, unix_now());
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create_new(true);
             #[cfg(unix)]
@@ -601,7 +612,18 @@ pub(crate) fn commit_settings(path: &Path, meta: Option<&std::fs::Metadata>, bef
                 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
                 opts.mode(m.permissions().mode() & 0o777);
             }
-            let mut f = opts.open(&bak).map_err(|e| CliError::Msg(format!("cannot create backup {}: {e}", bak.display())))?;
+            // Never clobber a backup: a second edit within the same second
+            // gets `<name>.<secs>-<n>.ai-env.bak`.
+            let now = unix_now();
+            let mut n = 0u32;
+            let (bak, mut f) = loop {
+                let bak = backup_path_n(path, now, n);
+                match opts.open(&bak) {
+                    Ok(f) => break (bak, f),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 9 => n += 1,
+                    Err(e) => return Err(CliError::Msg(format!("cannot create backup {}: {e}", bak.display()))),
+                }
+            };
             f.write_all(old_text.as_bytes())?;
             f.sync_all()?;
             drop(f);
@@ -625,6 +647,40 @@ pub(crate) fn commit_settings(path: &Path, meta: Option<&std::fs::Metadata>, bef
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_twice_in_one_second_keeps_both_backups_and_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.toml");
+        let texts = ["[aws]\n", "[aws]\nregion = \"eu-central-1\"\n", "[aws]\nregion = \"eu-central-1\"\nbudget_name = \"b\"\n"];
+        std::fs::write(&path, texts[0]).unwrap();
+        // Squat this second's and the next second's backup names: the commit
+        // must pick a `-<n>` name and leave the squatters alone.
+        let now = unix_now();
+        let squatters = [backup_path(&path, now), backup_path(&path, now + 1)];
+        for s in &squatters {
+            std::fs::write(s, "squatter").unwrap();
+        }
+        let mut backups = Vec::new();
+        for pair in texts.windows(2) {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            backups.push(commit_settings(&path, Some(&meta), stamp(Some(&meta)), pair[0], pair[1]).unwrap().expect("a backup"));
+        }
+        assert_ne!(backups[0], backups[1], "no clobbering: {backups:?}");
+        for b in &backups {
+            assert!(!squatters.contains(b), "a numbered name next to the squatter: {b:?}");
+            assert!(b.file_name().unwrap().to_string_lossy().ends_with("-1.ai-env.bak") || b.file_name().unwrap().to_string_lossy().ends_with("-2.ai-env.bak"), "{b:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), texts[0]);
+        assert_eq!(std::fs::read_to_string(&backups[1]).unwrap(), texts[1]);
+        for s in &squatters {
+            assert_eq!(std::fs::read_to_string(s).unwrap(), "squatter");
+        }
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        std::fs::write(&path, "changed").unwrap();
+        let err = commit_settings(&path, Some(&meta), stamp(Some(&meta)), texts[2], "x").unwrap_err();
+        assert!(err.to_string().starts_with("bridge.toml changed while editing"), "{err}");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -858,6 +914,7 @@ mod tests {
         assert_eq!(s, "{\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"default\"\n}");
         assert!(parse_settings(&s).is_ok());
         assert_eq!(backup_path(Path::new("/u/User/settings.json"), 17), PathBuf::from("/u/User/settings.json.17.ai-env.bak"));
+        assert_eq!(backup_path_n(Path::new("/b/bridge.toml"), 17, 2), PathBuf::from("/b/bridge.toml.17-2.ai-env.bak"));
         assert_eq!(PERMISSION_MODES.len(), 5);
         assert!(PERMISSION_MODES.contains(&"manual"));
     }

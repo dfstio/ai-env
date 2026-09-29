@@ -74,7 +74,7 @@ impl From<ParseError> for CliError {
     }
 }
 
-/// Shared tail of every bin (`ai-env`, `ai-env-claude`): map the error to its
+/// The `ai-env` bin's tail (the wrapper reports its own errors): map the error to its
 /// documented exit code, print `<prefix>: <message>` on stderr for non-zero
 /// codes (the exit-0 broken-pipe case stays silent), and exit. Returns
 /// normally on `Ok` so `main` falls off the end exactly as before.
@@ -82,7 +82,11 @@ pub fn exit_on_error(prefix: &str, result: Result<()>) {
     if let Err(e) = result {
         let code = e.exit_code();
         if code != 0 {
-            eprintln!("{prefix}: {e}");
+            // Never `eprintln!`: it panics when stderr is a closed pipe, which
+            // would turn the documented code into 101 (PID 1 in the VM keeps
+            // its exit code even when nobody reads its stderr).
+            use std::io::Write as _;
+            let _ = std::io::stderr().lock().write_all(format!("{prefix}: {e}\n").as_bytes());
         }
         std::process::exit(code);
     }

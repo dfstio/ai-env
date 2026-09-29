@@ -38,6 +38,33 @@ fn hooks_config_matches_spec() {
     assert_eq!((i.validate(), i.validate_timeout_in_seconds()), (&HookState::Enabled, 300));
 }
 
+/// infra/image-config.json (what the Pulumi program deploys) and
+/// `hooks_config()` (what the Rust side assumes) are one contract: plan D19.
+#[test]
+fn image_config_matches_hooks_config() {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/image-config.json")).unwrap();
+    let c: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let h = hooks_config();
+    let (m, i) = (h.microvm_hooks().unwrap(), h.microvm_image_hooks().unwrap());
+    let hooks = &c["hooks"];
+    let n = |k: &str| hooks[k].as_i64().unwrap_or_else(|| panic!("hooks.{k} missing"));
+    assert_eq!(Some(n("port") as i32), h.port());
+    assert_eq!(n("runTimeoutSeconds") as i32, m.run_timeout_in_seconds());
+    assert_eq!(n("resumeTimeoutSeconds") as i32, m.resume_timeout_in_seconds());
+    assert_eq!(n("suspendTimeoutSeconds") as i32, m.suspend_timeout_in_seconds());
+    assert_eq!(n("terminateTimeoutSeconds") as i32, m.terminate_timeout_in_seconds());
+    assert_eq!(n("readyTimeoutSeconds") as i32, i.ready_timeout_in_seconds());
+    assert_eq!(n("validateTimeoutSeconds") as i32, i.validate_timeout_in_seconds());
+    assert_eq!(c["imageName"], "ai-env-agent");
+    assert_eq!(c["architecture"], "ARM_64");
+    assert_eq!(c["memoryMiB"], 2048);
+    assert_eq!(c["baseImage"]["name"], "al2023-1");
+    assert_eq!(c["baseImage"]["version"], "1", "a string: the API's version identifier");
+    assert_eq!(c["additionalOsCapabilities"], serde_json::json!([]), "plan D20: least privilege in v0");
+    assert_eq!(c["logGroup"], "/aws/lambda-microvms/ai-env-agent", "the platform's own prefix (plan D21)");
+    assert_eq!(c["logGroup"].as_str().unwrap().rsplit('/').next(), c["imageName"].as_str());
+}
+
 #[test]
 fn derive_accept_key_kat() {
     use tokio_tungstenite::tungstenite::handshake::derive_accept_key;

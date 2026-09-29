@@ -201,6 +201,9 @@ pub enum WireError {
     NotData(&'static str),
     LineTooLong(usize),
     PayloadTooLarge(usize),
+    /// A run-hook payload that parses as JSON but breaks the schema; the text
+    /// names the field, never its value.
+    BadPayload(&'static str),
 }
 
 impl std::fmt::Display for WireError {
@@ -212,6 +215,7 @@ impl std::fmt::Display for WireError {
             WireError::NotData(k) => write!(f, "{k} frame carries no data"),
             WireError::LineTooLong(n) => write!(f, "line of {n} bytes exceeds the cap"),
             WireError::PayloadTooLarge(n) => write!(f, "run-hook payload of {n} bytes exceeds 4096"),
+            WireError::BadPayload(why) => write!(f, "bad run-hook payload: {why}"),
         }
     }
 }
@@ -301,8 +305,10 @@ pub fn commitment_hex(token: &[u8]) -> String {
 }
 
 /// The ≤4096-byte payload handed to the VM's `/run` hook: a commitment to the
-/// session token plus ownership metadata. Never the token itself.
+/// session token plus ownership metadata. Never the token itself. Unknown
+/// fields are refused: a new field is a new `v`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunHookPayload {
     pub v: u8,
     pub commit: String,
@@ -312,6 +318,38 @@ pub struct RunHookPayload {
 
 impl RunHookPayload {
     pub const MAX_BYTES: usize = 4096;
+    /// Longest `owner` accepted (`user@host`, printable ASCII).
+    pub const MAX_OWNER: usize = 256;
+
+    /// Parse the `runHookPayload` string the platform hands to `/run`: at most
+    /// [`Self::MAX_BYTES`] bytes, strict JSON, then [`Self::validate`].
+    pub fn from_json(text: &str) -> Result<Self, WireError> {
+        if text.len() > Self::MAX_BYTES {
+            return Err(WireError::PayloadTooLarge(text.len()));
+        }
+        let p: RunHookPayload = serde_json::from_str(text)?;
+        p.validate()?;
+        Ok(p)
+    }
+
+    /// Schema checks the type system cannot express: `v` is the wire version,
+    /// `commit` is 64 lowercase hex digits, `owner` is 1–256 printable ASCII
+    /// characters without spaces, `created` is RFC 3339 UTC.
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.v != WIRE_VERSION {
+            return Err(WireError::BadPayload("v"));
+        }
+        if self.commit.len() != 64 || !self.commit.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+            return Err(WireError::BadPayload("commit"));
+        }
+        if self.owner.is_empty() || self.owner.len() > Self::MAX_OWNER || !self.owner.bytes().all(|c| c.is_ascii_graphic()) {
+            return Err(WireError::BadPayload("owner"));
+        }
+        if crate::wire::time::parse_rfc3339_utc(&self.created).is_none() {
+            return Err(WireError::BadPayload("created"));
+        }
+        Ok(())
+    }
 
     #[must_use]
     pub fn new(token: &Secret<String>, owner: &str, created_rfc3339: &str) -> Self {
@@ -516,6 +554,42 @@ mod tests {
     fn run_hook_payload_cap_4096() {
         let p = RunHookPayload::new(&Secret::new("t".into()), &"o".repeat(4100), "2026-09-19T08:00:00Z");
         assert!(matches!(p.to_json(), Err(WireError::PayloadTooLarge(_))));
+    }
+
+    #[test]
+    fn from_json_accepts_a_valid_payload_and_names_the_bad_field() {
+        let good = RunHookPayload::new(&Secret::new("test-token".into()), "mike@mbp", "2026-09-19T08:00:00Z");
+        let text = good.to_json().unwrap();
+        assert_eq!(RunHookPayload::from_json(&text).unwrap(), good);
+        let cases: [(RunHookPayload, &str); 7] = [
+            (RunHookPayload { v: 2, ..good.clone() }, "v"),
+            (RunHookPayload { commit: "ab".repeat(31), ..good.clone() }, "commit"),
+            (RunHookPayload { commit: "AB".repeat(32), ..good.clone() }, "commit"),
+            (RunHookPayload { owner: String::new(), ..good.clone() }, "owner"),
+            (RunHookPayload { owner: "mike @mbp".into(), ..good.clone() }, "owner"),
+            (RunHookPayload { created: "yesterday".into(), ..good.clone() }, "created"),
+            // A multi-byte character straddling byte 19 is refused, not a panic.
+            (RunHookPayload { created: "2026-09-25T01:39:3\u{e9}Z".into(), ..good.clone() }, "created"),
+        ];
+        for (p, field) in cases {
+            let e = RunHookPayload::from_json(&serde_json::to_string(&p).unwrap()).unwrap_err();
+            assert!(matches!(e, WireError::BadPayload(f) if f == field), "{field}: {e}");
+            assert!(!e.to_string().contains(&p.owner) || p.owner.is_empty(), "the value never appears: {e}");
+        }
+        let long = RunHookPayload { owner: "o".repeat(RunHookPayload::MAX_OWNER + 1), ..good.clone() };
+        assert!(matches!(RunHookPayload::from_json(&serde_json::to_string(&long).unwrap()), Err(WireError::BadPayload("owner"))));
+    }
+
+    #[test]
+    fn from_json_refuses_unknown_fields_non_json_and_oversize() {
+        let good = RunHookPayload::new(&Secret::new("t".into()), "o", "2026-09-19T08:00:00Z").to_json().unwrap();
+        let extra = good.replacen('{', "{\"x\":1,", 1);
+        assert!(matches!(RunHookPayload::from_json(&extra), Err(WireError::Json(_))), "{extra}");
+        assert!(matches!(RunHookPayload::from_json("not json"), Err(WireError::Json(_))));
+        let padded = format!("{good}{}", " ".repeat(RunHookPayload::MAX_BYTES + 1 - good.len()));
+        assert!(matches!(RunHookPayload::from_json(&padded), Err(WireError::PayloadTooLarge(n)) if n == RunHookPayload::MAX_BYTES + 1));
+        let at_cap = format!("{good}{}", " ".repeat(RunHookPayload::MAX_BYTES - good.len()));
+        assert!(RunHookPayload::from_json(&at_cap).is_ok(), "exactly 4096 bytes is accepted");
     }
 
     #[test]

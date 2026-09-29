@@ -6,8 +6,10 @@
 pub mod argv;
 pub mod claude;
 pub mod frame;
+pub mod managed;
 pub mod mirror;
 pub mod ndjson;
+pub mod pin;
 pub mod redact;
 pub mod slug;
 pub mod time;

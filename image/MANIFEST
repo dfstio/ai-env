@@ -1,0 +1,15 @@
+# Everything `make image-zip` stages into the image build context, and
+# nothing else: a file in image/ that is not listed here stops the build
+# (MANIFEST itself and .DS_Store excepted). Modes are set on staging.
+# kind  path                    mode
+file    Dockerfile              0644
+file    claude.lock             0644
+file    managed-settings.json   0644
+dir     claude                  0755
+file    claude/settings.json    0644
+file    claude/CLAUDE.md        0644
+file    claude/claude.json      0600
+dir     claude/agents           0755
+dir     claude/skills           0755
+dir     claude/commands         0755
+file    ai-env                  0755

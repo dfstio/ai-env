@@ -20,14 +20,16 @@ impl Paths {
     /// `AI_ENV_BRIDGE_DIR` | `$HOME/.config/ai-env/bridge`; config from
     /// `AI_ENV_BRIDGE_CONFIG` | `<root>/bridge.toml`.
     pub fn resolve() -> Result<Paths, BridgeError> {
-        let root = match std::env::var_os("AI_ENV_BRIDGE_DIR") {
+        // Set-but-empty counts as unset, as the Makefile's `${AI_ENV_BRIDGE_DIR:-…}`
+        // reads it: an empty root would put the state under the working directory.
+        let root = match std::env::var_os("AI_ENV_BRIDGE_DIR").filter(|d| !d.is_empty()) {
             Some(d) => PathBuf::from(d),
             None => {
                 let home = std::env::var_os("HOME").ok_or_else(|| BridgeError::Config("HOME is not set".into()))?;
                 PathBuf::from(home).join(".config").join("ai-env").join("bridge")
             }
         };
-        Ok(Self::from_root_and_env(root, std::env::var_os("AI_ENV_BRIDGE_CONFIG").map(PathBuf::from)))
+        Ok(Self::from_root_and_env(root, std::env::var_os("AI_ENV_BRIDGE_CONFIG").filter(|c| !c.is_empty()).map(PathBuf::from)))
     }
 
     #[must_use]
@@ -75,6 +77,25 @@ impl Paths {
     #[must_use]
     pub fn audit(&self) -> PathBuf {
         self.root.join("audit.jsonl")
+    }
+
+    /// `credentials/`: ai-env containers sealed to the `[creds].key` keystore key.
+    #[must_use]
+    pub fn credentials(&self) -> PathBuf {
+        self.root.join("credentials")
+    }
+
+    /// `credentials/aws.env`: the runtime principal's access key (S3 `make runtime-key`).
+    #[must_use]
+    pub fn aws_env(&self) -> PathBuf {
+        self.credentials().join("aws.env")
+    }
+
+    /// `state/infra.toml`: what `ai-env infra status --write` learned from the stack
+    /// (image state and versions, zip hash, bucket, log group) for doctor.
+    #[must_use]
+    pub fn infra_state(&self) -> PathBuf {
+        self.root.join("state").join("infra.toml")
     }
 }
 
@@ -361,6 +382,9 @@ mod tests {
         assert_eq!(p.scratch(), PathBuf::from("/r/state/scratch"));
         assert_eq!(p.audit(), PathBuf::from("/r/audit.jsonl"));
         assert_eq!(p.probes(), PathBuf::from("/r/lab/probes.jsonl"));
+        assert_eq!(p.credentials(), PathBuf::from("/r/credentials"));
+        assert_eq!(p.aws_env(), PathBuf::from("/r/credentials/aws.env"));
+        assert_eq!(p.infra_state(), PathBuf::from("/r/state/infra.toml"));
     }
 
     #[test]

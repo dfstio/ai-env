@@ -18,7 +18,7 @@ autoexamples = false
 # Dependencies pinned by the plan ahead of the stage that consumes them (see the
 # trailing comment on each line under [dependencies]); `make check-deps` runs cargo machete.
 [package.metadata.cargo-machete]
-ignored = ["nix", "hyper", "hyper-util", "http-body-util", "futures-util"]
+ignored = ["hyper", "hyper-util", "http-body-util", "futures-util"]
 
 [lib]
 name = "ai_env_cli"
@@ -94,6 +94,19 @@ name = "shim_local"
 path = "tests/shim_local.rs"
 required-features = ["shim"]
 
+# Opt-in (AI_ENV_DOCKER_TESTS=1, every test #[ignore]d): the shim inside the AL2023
+# base image and the locally built image (`make test-docker`).
+[[test]]
+name = "shim_docker"
+path = "tests/shim_docker.rs"
+required-features = ["shim"]
+
+# S3 infra helpers through the real binary; the areas live in tests/infra/*.rs.
+[[test]]
+name = "infra"
+path = "tests/infra.rs"
+required-features = ["bridge"]
+
 # Negative fixture for `make lint-negative`: clippy must REJECT it (every clippy.toml
 # disallowed method is called once). Built only with the lint-negative feature.
 [[example]]
@@ -165,7 +178,7 @@ axum = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
 hyper-util = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
 http-body-util = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
-nix = { workspace = true, optional = true } # S3 PID-1 reaper (not consumed before then; cargo-machete allowlist above)
+nix = { workspace = true, optional = true } # S3 PID-1 init, signals, prctl
 
 [dev-dependencies]
 tempfile = { workspace = true }

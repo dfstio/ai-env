@@ -1,0 +1,11 @@
+# Stack config for `dev` (D17). The real Pulumi.dev.yaml is NOT committed: `pulumi stack init dev` writes it with
+# the stack's encryptionsalt and the repo is public. Nothing here is secret, and nothing ever should be.
+#
+#   cd infra && pulumi stack init dev          # local backend, a passphrase dedicated to this stack
+#   pulumi config set --path 'pulumi:disable-default-providers[0]' '*' --stack dev
+#
+# Do not set aws:region or aws-native:region: both providers are explicit and pinned to eu-central-1 in code, and
+# the program refuses any other value. Budget email and limit live in config/dev.env (see config/dev.env.example).
+config:
+  pulumi:disable-default-providers:
+    - "*"

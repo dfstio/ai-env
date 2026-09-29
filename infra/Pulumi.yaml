@@ -1,0 +1,3 @@
+name: ai-env
+runtime: nodejs
+description: ai-env MicroVM bridge infrastructure (image, roles, runtime principal, log group, budget) in eu-central-1

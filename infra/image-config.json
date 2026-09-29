@@ -1,0 +1,19 @@
+{
+  "imageName": "ai-env-agent",
+  "description": "ai-env MicroVM agent image (Claude Code + ai-env shim)",
+  "baseImage": { "name": "al2023-1", "version": "1" },
+  "architecture": "ARM_64",
+  "memoryMiB": 2048,
+  "additionalOsCapabilities": [],
+  "hooks": {
+    "port": 9000,
+    "runTimeoutSeconds": 30,
+    "resumeTimeoutSeconds": 30,
+    "suspendTimeoutSeconds": 30,
+    "terminateTimeoutSeconds": 60,
+    "readyTimeoutSeconds": 600,
+    "validateTimeoutSeconds": 300
+  },
+  "logGroup": "/aws/lambda-microvms/ai-env-agent",
+  "logRetentionDays": 14
+}

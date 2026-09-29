@@ -4,7 +4,9 @@
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
 use crate::bridge::config::{env_region_warning, BridgeConfig, Paths, REGION};
+use crate::bridge::creds::{aws_env_state, AwsEnvState};
 use crate::bridge::errors::BridgeError;
+use crate::bridge::infra::{base_image_verdict, read_infra_state, InfraState};
 use crate::bridge::sibling::{exists_exec, find_sibling, Sibling, INSTALL_HINT};
 use crate::commands::{DoctorLine, Tag};
 use crate::store::Keystore;
@@ -432,6 +434,114 @@ pub fn row_census(rows: &[serde_json::Value], path: &Path) -> DoctorLine {
     DoctorLine::row(Tag::Ok, format!("census: {} rows, last {} route={} reason={}", rows.len(), field("ts"), field("route"), field("reason")))
 }
 
+// ---- S3 rows ------------------------------------------------------------------------
+
+/// The managed base image the Pulumi program pins (infra/image-config.json;
+/// a unit test keeps the two equal).
+pub const BASE_IMAGE_NAME: &str = "al2023-1";
+pub const BASE_IMAGE_VERSION: &str = "1";
+
+/// `credentials/aws.env`: the sealed runtime access key (`make runtime-key`),
+/// classified by [`aws_env_state`], the check `creds aws-set` makes before
+/// it seals: anything there that is not a regular ai-env container (a
+/// plaintext key after `ai-env decrypt --force`, a symlink) is `[NO ]`.
+#[must_use]
+pub fn row_runtime_credentials(state: &AwsEnvState, path: &Path) -> DoctorLine {
+    match state {
+        AwsEnvState::Sealed => DoctorLine::row(Tag::Ok, format!("runtime credentials sealed ({})", path.display())),
+        AwsEnvState::Absent => DoctorLine::row(Tag::Skip, format!("runtime credentials absent ({})  <- make runtime-key (after make deploy)", path.display())),
+        AwsEnvState::NotSealed(why) => DoctorLine::row(
+            Tag::No,
+            format!("runtime credentials NOT sealed: {} {why}  <- move it away, then make runtime-key ROTATE=1 (seals a new key and deletes the exposed one; plain make runtime-key when ai-env-runtime has no key left)", path.display()),
+        ),
+    }
+}
+
+/// The runtime credentials row for the file at `path`, as `rows` builds it.
+#[must_use]
+pub fn runtime_credentials(path: &Path) -> DoctorLine {
+    row_runtime_credentials(&aws_env_state(path), path)
+}
+
+/// `state/infra.toml`: what the last `ai-env infra status --write` learned,
+/// with where the image state came from (a live `get-microvm-image`, or the
+/// stack outputs of the last successful `pulumi up` when that read failed).
+#[must_use]
+pub fn row_infra_state(state: &Result<Option<InfraState>, BridgeError>, path: &Path) -> DoctorLine {
+    match state {
+        Ok(Some(s)) => {
+            let image = s.image_name.as_deref().unwrap_or("image");
+            let st = s.image_state.as_deref().unwrap_or("?");
+            let active = s.latest_active_image_version.as_deref().unwrap_or("none");
+            let mut text = format!("infra: {image} {st}, active version {active}, claude {}, stack {} (written {})", s.claude_version.as_deref().unwrap_or("?"), s.stack, s.written);
+            let failed = s.latest_failed_image_version.as_deref();
+            if let Some(f) = failed {
+                text.push_str(&format!("; latest FAILED version {f}"));
+            }
+            text.push_str(&format!("; image state from {}", s.image_state_source.as_deref().unwrap_or("an unrecorded source  <- make infra-status WRITE=1")));
+            // Only a live read vouches for the image: the stack outputs are as
+            // old as the last `pulumi up` (rollbacks, a deleted image).
+            let live = s.image_state_source.as_deref().is_some_and(|src| src.starts_with("live "));
+            let ok = live && matches!(st, "CREATED" | "UPDATED") && failed.is_none_or(|f| s.latest_active_image_version.as_deref().is_some_and(|a| a.parse::<u64>().ok() > f.parse::<u64>().ok()));
+            DoctorLine::row(if ok { Tag::Ok } else { Tag::Warn }, text)
+        }
+        Ok(None) => DoctorLine::row(Tag::Skip, format!("no infra state yet ({})  <- make deploy, then make infra-status WRITE=1", path.display())),
+        Err(e) => DoctorLine::row(Tag::Warn, format!("infra state unreadable: {e}")),
+    }
+}
+
+/// The deployed image's claude against the Cursor bundle: the pin follows the
+/// bundle (plan D2). `None` when either side is unknown.
+#[must_use]
+pub fn row_image_claude(image_claude: Option<&str>, bundle: Option<&str>) -> Option<DoctorLine> {
+    let (img, bun) = (image_claude?, bundle?);
+    Some(if img == bun {
+        DoctorLine::row(Tag::Ok, format!("image claude {img} = Cursor bundle"))
+    } else {
+        DoctorLine::row(Tag::Warn, format!("image claude {img} != Cursor bundle {bun}  <- make claude-pin CLAUDE_VERSION={bun} && make deploy (or install the wrapper to freeze the bundle)"))
+    })
+}
+
+/// The two operator scan lists; absent files mean built-in defaults only.
+#[must_use]
+pub fn row_review_files(tripwires: &Path, tripwires_exist: bool, policy: &Path, policy_exists: bool) -> DoctorLine {
+    let one = |p: &Path, e: bool| if e { format!("{} present", p.display()) } else { format!("{} absent", p.display()) };
+    let text = format!("scan lists: {}; {}", one(tripwires, tripwires_exist), one(policy, policy_exists));
+    if tripwires_exist || policy_exists {
+        DoctorLine::row(Tag::Ok, text)
+    } else {
+        DoctorLine::row(Tag::Skip, format!("{text} (built-in tripwires only, empty settings allow list)"))
+    }
+}
+
+/// The pinned managed base image version, from the
+/// `list-managed-microvm-image-versions` call: `None` when it was not made
+/// (no AWS identity, `[-  ]`); `Some(Err)` when the call itself failed (a
+/// timeout, throttling, AccessDenied, an aws CLI without `lambda-microvms`),
+/// which says nothing about the version (`[!! ] not checked`); otherwise
+/// [`base_image_verdict`] on the listing: AVAILABLE, or `[NO ]` naming the
+/// status, with one hint.
+#[must_use]
+pub fn row_base_image(listing: Option<Result<&str, &str>>) -> DoctorLine {
+    let pinned = format!("base image {BASE_IMAGE_NAME} version {BASE_IMAGE_VERSION}");
+    match listing {
+        None => DoctorLine::row(Tag::Skip, format!("{pinned} not checked (no AWS identity)")),
+        Some(Err(e)) => DoctorLine::row(Tag::Warn, format!("{pinned} not checked: {e}")),
+        Some(Ok(json)) => match base_image_verdict(json, BASE_IMAGE_VERSION) {
+            Ok(v) => DoctorLine::row(Tag::Ok, format!("{pinned}: {v}")),
+            // The verdict names its own fix for a listed version that is not AVAILABLE.
+            Err(e) if e.contains("<- ") => DoctorLine::row(Tag::No, format!("{pinned}: {e}")),
+            Err(e) => DoctorLine::row(Tag::No, format!("{pinned}: {e}  <- pick an AVAILABLE version in infra/image-config.json")),
+        },
+    }
+}
+
+/// `aws iam simulate-principal-policy` for `arn` (the doctor's IAM row):
+/// the region is pinned like every aws call, although IAM is global.
+fn iam_simulate_args(arn: &str) -> [&str; 11] {
+    ["iam", "simulate-principal-policy", "--region", REGION, "--policy-source-arn", arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "--output", "json"]
+}
+
 /// Row for a `settings.json` that could not be parsed at all.
 #[must_use]
 pub fn row_settings_unparseable(path: &Path, err: &str) -> DoctorLine {
@@ -573,19 +683,20 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     let arn = sts.as_ref().and_then(|r| r.as_ref().ok()).and_then(|json| {
         serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.get("Arn").and_then(|a| a.as_str()).map(str::to_string))
     });
-    let sim = arn.map(|arn| {
-        run_capture(
-            "aws",
-            &["iam", "simulate-principal-policy", "--policy-source-arn", &arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "--output", "json"],
-            Duration::from_secs(15),
-        )
-    });
+    let sim = arn.as_ref().map(|arn| run_capture("aws", &iam_simulate_args(arn), Duration::from_secs(15)));
     lines.push(row_iam_simulate(sim.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    let base = arn.as_ref().map(|_| {
+        let id = format!("arn:aws:lambda:{REGION}:aws:microvm-image:{BASE_IMAGE_NAME}");
+        run_capture("aws", &["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", &id, "--region", REGION, "--output", "json"], Duration::from_secs(15))
+    });
+    lines.push(row_base_image(base.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
 
-    let census_path = match Paths::resolve() {
+    let paths = Paths::resolve();
+    let loaded = paths.as_ref().ok().map(BridgeConfig::load);
+    let census_path = match &paths {
         Ok(paths) => {
-            let loaded = BridgeConfig::load(&paths);
-            lines.push(row_bridge_config(&paths, &loaded));
+            let loaded = loaded.as_ref().expect("loaded with the paths");
+            lines.push(row_bridge_config(paths, loaded));
             Some(paths.census())
         }
         Err(e) => {
@@ -593,7 +704,20 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             None
         }
     };
-    lines.push(row_keystore_key(store.key_exists("ai-env-bridge"), "ai-env-bridge"));
+    let cfg = loaded.and_then(Result::ok).flatten().unwrap_or_default();
+    let key = cfg.creds.key.as_str();
+    lines.push(row_keystore_key(store.key_exists(key), key));
+    let infra_state = match &paths {
+        Ok(paths) => {
+            lines.push(runtime_credentials(&paths.aws_env()));
+            let state = read_infra_state(paths);
+            lines.push(row_infra_state(&state, &paths.infra_state()));
+            let (tw, sp) = (cfg.review.tripwires_path(paths), cfg.review.settings_policy_path(paths));
+            lines.push(row_review_files(&tw, tw.is_file(), &sp, sp.is_file()));
+            state.ok().flatten()
+        }
+        Err(_) => None,
+    };
 
     let ext_dir = home().join(".cursor").join("extensions");
     let dirs: Vec<String> = std::fs::read_dir(&ext_dir)
@@ -606,6 +730,9 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     });
     lines.push(row_cursor_bundle(&dirs, bundled_out.as_deref()));
     if let Some(row) = row_fixture_drift(bundle.as_ref().map(|(ver, _)| ver.as_str())) {
+        lines.push(row);
+    }
+    if let Some(row) = row_image_claude(infra_state.as_ref().and_then(|s| s.claude_version.as_deref()), bundle.as_ref().map(|(ver, _)| ver.as_str())) {
         lines.push(row);
     }
     let path_claude = find_in_path("claude", &effective_path());
@@ -639,6 +766,122 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row follows what is at the path, the way `creds aws-set` judges
+    /// it: only a regular ai-env container is sealed; a plaintext key (what
+    /// `ai-env decrypt --force` leaves in place), a symlink, even to a
+    /// container, or a directory is `[NO ]`, and the row never shows the
+    /// file's contents.
+    #[test]
+    fn runtime_credentials_row_follows_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("aws.env");
+        let (tag, t) = text(&runtime_credentials(&p));
+        assert!(tag == Tag::Skip && t.contains("runtime credentials absent") && t.contains("make runtime-key"), "{t}");
+
+        let sealed = d.path().join("sealed.env");
+        std::fs::write(&sealed, crate::container::write(b"age-encryption.org/v1\n-> x\n--- y\n")).unwrap();
+        assert_eq!(text(&runtime_credentials(&sealed)), (Tag::Ok, format!("runtime credentials sealed ({})", sealed.display())));
+
+        let plain_value = format!("{}{}", "placeholder-", "not-a-key");
+        std::fs::write(&p, format!("AWS_ACCESS_KEY_ID=example-id\nAWS_SECRET_ACCESS_KEY={plain_value}\n")).unwrap();
+        let (tag, t) = text(&runtime_credentials(&p));
+        assert_eq!(tag, Tag::No, "{t}");
+        assert!(t.contains("NOT sealed") && t.contains("is not an ai-env container") && t.contains("move it away, then make runtime-key ROTATE=1"), "{t}");
+        assert!(!t.contains(&plain_value) && !t.contains("example-id"), "{t}");
+        std::fs::remove_file(&p).unwrap();
+
+        std::os::unix::fs::symlink(&sealed, &p).unwrap();
+        let (tag, t) = text(&runtime_credentials(&p));
+        assert!(tag == Tag::No && t.contains("is a symlink"), "{t}");
+        std::fs::remove_file(&p).unwrap();
+
+        std::fs::create_dir(&p).unwrap();
+        let (tag, t) = text(&runtime_credentials(&p));
+        assert!(tag == Tag::No && t.contains("is not a regular file"), "{t}");
+    }
+
+    /// A failed listing call (timeout, throttling, AccessDenied, an old CLI)
+    /// is no verdict on the version: `[!! ] not checked`, doctor exit 0. Only
+    /// a listing that names the version as not AVAILABLE is `[NO ]`, with one hint.
+    #[test]
+    fn base_image_row_separates_a_failed_call_from_the_verdict() {
+        let listing = |status: &str| serde_json::json!({"items": [{"imageArn": "arn:aws:lambda:eu-central-1:aws:microvm-image:al2023-1", "imageVersion": BASE_IMAGE_VERSION, "status": status}]}).to_string();
+        let (tag, t) = text(&row_base_image(Some(Ok(&listing("AVAILABLE")))));
+        assert!(tag == Tag::Ok && t.ends_with("AVAILABLE"), "{t}");
+        let (tag, t) = text(&row_base_image(Some(Ok(&listing("DEPRECATED")))));
+        assert!(tag == Tag::No && t.contains("is DEPRECATED"), "{t}");
+        assert_eq!(t.matches("<- ").count(), 1, "one hint: {t}");
+        let (tag, t) = text(&row_base_image(Some(Ok("{\"items\": []}"))));
+        assert!(tag == Tag::No && t.contains("not listed") && t.contains("<- pick an AVAILABLE version in infra/image-config.json"), "{t}");
+        assert_eq!(text(&row_base_image(None)).0, Tag::Skip);
+
+        for call in ["An error occurred (ThrottlingException) when calling the ListManagedMicrovmImageVersions operation: Rate exceeded", "aws: timed out after 15s", "usage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]"] {
+            let row = row_base_image(Some(Err(call)));
+            let (tag, t) = text(&row);
+            assert_eq!(tag, Tag::Warn, "{call}: {t}");
+            assert_eq!(t, format!("base image {BASE_IMAGE_NAME} version {BASE_IMAGE_VERSION} not checked: {call}"));
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0, "{call}");
+        }
+    }
+
+    #[test]
+    fn the_doctor_iam_call_pins_the_region() {
+        let args = iam_simulate_args("arn:aws:iam::123456789012:user/example");
+        assert!(args.windows(2).any(|w| w == ["--region", "eu-central-1"]), "{args:?}");
+        assert_eq!(&args[..2], ["iam", "simulate-principal-policy"]);
+        assert!(args.windows(2).any(|w| w == ["--policy-source-arn", "arn:aws:iam::123456789012:user/example"]), "{args:?}");
+    }
+
+    #[test]
+    fn s3_rows() {
+        let sp = Path::new("/r/state/infra.toml");
+        let good = InfraState {
+            stack: "dev".into(),
+            written: "2026-09-29T08:00:00Z".into(),
+            image_name: Some("ai-env-agent".into()),
+            image_state: Some("UPDATED".into()),
+            latest_active_image_version: Some("3".into()),
+            image_state_source: Some("live 2026-09-29T08:00:00Z".into()),
+            claude_version: Some("2.1.283".into()),
+            ..InfraState::default()
+        };
+        let (tag, t) = text(&row_infra_state(&Ok(Some(good.clone())), sp));
+        assert!(tag == Tag::Ok && t.contains("ai-env-agent UPDATED, active version 3, claude 2.1.283"), "{t}");
+        assert!(t.ends_with("; image state from live 2026-09-29T08:00:00Z"), "the source is shown: {t}");
+        let fallback = InfraState { image_state_source: Some("pulumi outputs (live read failed: aws: timed out after 60s)".into()), ..good.clone() };
+        let (tag, t) = text(&row_infra_state(&Ok(Some(fallback)), sp));
+        assert!(tag == Tag::Warn && t.ends_with("; image state from pulumi outputs (live read failed: aws: timed out after 60s)"), "only a live read vouches for the image: {t}");
+        let unrecorded = InfraState { image_state_source: None, ..good.clone() };
+        let (tag, t) = text(&row_infra_state(&Ok(Some(unrecorded)), sp));
+        assert!(tag == Tag::Warn && t.contains("image state from an unrecorded source  <- make infra-status WRITE=1"), "{t}");
+        let older_failure = InfraState { latest_failed_image_version: Some("2".into()), ..good.clone() };
+        assert_eq!(text(&row_infra_state(&Ok(Some(older_failure)), sp)).0, Tag::Ok, "a failure older than the active version is history");
+        let newer_failure = InfraState { latest_failed_image_version: Some("4".into()), ..good.clone() };
+        let (tag, t) = text(&row_infra_state(&Ok(Some(newer_failure)), sp));
+        assert!(tag == Tag::Warn && t.contains("latest FAILED version 4"), "{t}");
+        let failed = InfraState { image_state: Some("CREATE_FAILED".into()), ..good };
+        assert_eq!(text(&row_infra_state(&Ok(Some(failed)), sp)).0, Tag::Warn);
+        let (tag, t) = text(&row_infra_state(&Ok(None), sp));
+        assert!(tag == Tag::Skip && t.contains("make infra-status WRITE=1"), "{t}");
+        assert_eq!(text(&row_infra_state(&Err(BridgeError::Config("bad".into())), sp)).0, Tag::Warn);
+
+        assert!(row_image_claude(None, Some("2.1.283")).is_none());
+        assert_eq!(text(&row_image_claude(Some("2.1.283"), Some("2.1.283")).unwrap()).0, Tag::Ok);
+        let (tag, t) = text(&row_image_claude(Some("2.1.283"), Some("2.1.284")).unwrap());
+        assert!(tag == Tag::Warn && t.contains("make claude-pin CLAUDE_VERSION=2.1.284"), "{t}");
+
+        let (tw, pol) = (Path::new("/r/tripwires.txt"), Path::new("/r/settings-policy.txt"));
+        assert_eq!(text(&row_review_files(tw, false, pol, false)).0, Tag::Skip);
+        assert_eq!(text(&row_review_files(tw, true, pol, false)).0, Tag::Ok);
+    }
+
+    #[test]
+    fn base_image_constants_match_the_pulumi_config() {
+        let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/image-config.json")).unwrap()).unwrap();
+        assert_eq!(c["baseImage"]["name"], BASE_IMAGE_NAME);
+        assert_eq!(c["baseImage"]["version"], BASE_IMAGE_VERSION);
+    }
 
     fn text(l: &DoctorLine) -> (Tag, String) {
         match l {
