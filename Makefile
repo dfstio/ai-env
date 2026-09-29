@@ -265,9 +265,13 @@ image-zip: ## vm-build, stage + scan, then a deterministic $(IMAGE_ZIP) and $(IM
 	  printf '{"zip":"%s","sha256":"%s","key":"ai-env/image-%s.zip","claudeVersion":"%s","shimVersion":"%s"}\n' "$(IMAGE_ZIP)" "$$sha" "$${sha:0:16}" "$$claude" "$$shim" > "$(IMAGE_JSON)"; \
 	  ls -l "$$zip_abs"; cat "$(IMAGE_JSON)"
 
+# The build context is a fresh copy with current mtimes: the stage carries the zip's fixed 1980 mtimes, and
+# BuildKit's context sync skips a file whose size and mtime are unchanged, so a same-length edit (a new
+# claude.lock) would silently reuse the previous content. Layer caching stays content-based.
 image-build-local: ## docker build the staged context (as the platform would) into $(LOCAL_IMAGE); downloads the pinned claude
 	@test -f "$(STAGE)/Dockerfile" || { echo "image-build-local: run make image-zip first"; exit 1; }
-	docker build --platform linux/arm64 -t $(LOCAL_IMAGE) "$(STAGE)"
+	@set -e; ctx="$(IMAGE_OUT)/docker-context"; rm -rf "$$ctx"; cp -R "$(STAGE)" "$$ctx"; find "$$ctx" -exec touch {} +
+	docker build --platform linux/arm64 -t $(LOCAL_IMAGE) "$(IMAGE_OUT)/docker-context"
 	@docker image inspect -f 'image-build-local: $(LOCAL_IMAGE) {{.Size}} bytes' $(LOCAL_IMAGE)
 
 image-run-local: ## Run $(LOCAL_IMAGE) with its ports on 127.0.0.1:18080 (app), :19000 (hooks), :19418 (code)
@@ -309,7 +313,7 @@ s3-preflight: ## S3 preconditions P1-P12 (PHASE=a: build + read-only checks; PHA
 	  if [ "$$phase" = b ]; then \
 	    if (cd infra && pulumi stack ls --json 2>/dev/null) | grep -q '"name": *"$(STACK)"'; then row "[ok ]" "P6 pulumi stack $(STACK) ($$(pulumi whoami -v 2>/dev/null | sed -n 's/^Backend URL: *//p'))"; else row "[NO ]" "P6 pulumi stack $(STACK) missing: cd infra && pulumi stack init $(STACK)"; fi; fi; \
 	  if pulumi plugin ls --json 2>/dev/null | node -e 'const p=JSON.parse(require("fs").readFileSync(0,"utf8"));const has=(n,v)=>p.some(x=>x.name===n&&x.kind==="resource"&&x.version===v);process.exit(has("aws","7.10.0")&&has("aws-native","1.79.0")?0:1)'; then row "[ok ]" "P7 pulumi plugins aws 7.10.0, aws-native 1.79.0"; else row "[NO ]" "P7 pulumi plugin install resource aws 7.10.0; pulumi plugin install resource aws-native 1.79.0"; fi; \
-	  if arn=$$(aws sts get-caller-identity --region $(REGION) --query Arn --output text 2>/dev/null); then row "[ok ]" "P8 deploy identity $${arn##*/}"; else row "[NO ]" "P8 no AWS credentials for the deploy identity"; fi; \
+	  if arn=$$(aws sts get-caller-identity --region $(REGION) --query Arn --output text 2>/dev/null); then row "[ok ]" "P8 deploy identity $${arn##*:}"; else row "[NO ]" "P8 no AWS credentials for the deploy identity"; fi; \
 	  if [ "$$phase" = b ]; then \
 	    if out=$$($(AI_ENV) creds aws-set --check 2>&1); then row "[ok ]" "P9 runtime-key preconditions"; else row "[-  ]" "P9 runtime-key preconditions not met yet (needed by make runtime-key, not by deploy)"; fi; fi; \
 	  if out=$$($(AI_ENV) infra pin --check-bundle --lock image/claude.lock 2>&1); then row "[ok ]" "P10 $$(echo "$$out" | tail -1)"; else row "[NO ]" "P10 $$(echo "$$out" | tail -1)"; fi; \
