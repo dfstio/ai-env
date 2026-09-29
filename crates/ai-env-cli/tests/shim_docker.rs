@@ -248,6 +248,42 @@ fn l1_run_first_wins_and_health() {
     assert!(logs.contains("ai-env: hook run peer=") && logs.contains("origin=remote"), "a request from the host is remote:\n{logs}");
 }
 
+/// Plan S4 D19: the Linux run report as PID 1 — one after the accepted /run
+/// (not after the replay), one at /terminate, both with the VM id, the boot
+/// id of the boot line, a real disk, PID 1's environment names (no AWS
+/// credential variables) and no zombies.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_run_report_as_pid1() {
+    let (c, _f) = l1("", &[], &[]);
+    wait_ready(&c, 20);
+    let hooks = c.port(9000);
+    let body = run_body("mvm-l1", Some(&payload("mike@mbp")));
+    assert_eq!(http(hooks, "POST", &format!("{PREFIX}/run"), &body).0, 200);
+    assert_eq!(http(hooks, "POST", &format!("{PREFIX}/run"), &body).0, 200, "replay: no second report");
+    assert_eq!(http(hooks, "POST", &format!("{PREFIX}/terminate"), "{}").0, 200);
+    let logs = c.wait_log(5, "\"hook\":\"terminate\"");
+    let boot: serde_json::Value = logs.lines().find_map(|l| l.split_once("ai-env: boot ").and_then(|(_, j)| serde_json::from_str(j).ok())).expect("a boot line");
+    let reports: Vec<serde_json::Value> = logs.lines().filter_map(|l| l.split_once("ai-env: run-report ").and_then(|(_, j)| serde_json::from_str(j).ok())).collect();
+    let hooks_seen: Vec<&str> = reports.iter().map(|r| r["hook"].as_str().unwrap()).collect();
+    assert_eq!(hooks_seen, ["run", "terminate"], "{logs}");
+    for r in &reports {
+        assert_eq!(r["microvm_id"], "mvm-l1", "{r}");
+        assert!(r.get("unsupported").is_none(), "{r}");
+        let id = r["boot_id"].as_str().unwrap_or_default();
+        assert_eq!(id.len(), 36, "{r}");
+        assert_eq!(boot["boot_id"].as_str(), Some(id), "the boot line's boot id");
+        let (total, used) = (r["disk_total_bytes"].as_u64().unwrap(), r["disk_used_bytes"].as_u64().unwrap());
+        assert!(total > 0 && used <= total, "{r}");
+        assert_eq!(r["env"]["values"]["HOME"], "/root", "{r}");
+        let names: Vec<&str> = r["env"]["names"].as_array().unwrap().iter().filter_map(|n| n.as_str()).collect();
+        assert!(names.contains(&"HOME") && names.contains(&"PATH"), "{names:?}");
+        assert_eq!(r["aws_credential_env"], serde_json::json!([]), "{r}");
+        assert_eq!(r["zombies"], 0, "{r}");
+        assert_eq!((r["uid"].as_u64(), r["gid"].as_u64()), (Some(0), Some(0)), "{r}");
+    }
+}
+
 #[test]
 #[ignore = "Docker: make test-docker"]
 fn l1_enforce_rejects_loopback_and_container_ip() {

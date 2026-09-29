@@ -81,9 +81,18 @@ pub fn ws_connector() -> tokio_tungstenite::Connector {
 }
 
 /// HTTPS client for `/health` and similar side channels: same TLS policy,
-/// proxy environment ignored.
+/// proxy environment ignored, https only, and redirects never followed —
+/// reqwest would otherwise follow up to ten and, across hosts, strip only the
+/// standard credential headers, forwarding `x-aws-proxy-auth` to wherever a
+/// `Location` points.
 pub fn reqwest_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().use_preconfigured_tls((*client_config()).clone()).no_proxy().build()
+    reqwest_builder().https_only(true).build()
+}
+
+/// Everything of [`reqwest_client`] but `https_only`, so the redirect policy
+/// is testable over loopback http.
+fn reqwest_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().use_preconfigured_tls((*client_config()).clone()).no_proxy().redirect(reqwest::redirect::Policy::none())
 }
 
 /// The AWS SDK's HTTP client under the same policy, for `api::sdk_config()`:
@@ -128,6 +137,43 @@ pub fn sdk_http_client() -> SharedHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 302 is returned, never followed: the `x-aws-proxy-auth` header never
+    /// reaches the `Location` target (reqwest would strip only its own list of
+    /// credential headers on a cross-host hop).
+    #[tokio::test]
+    async fn redirects_are_never_followed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn answer(mut s: tokio::net::TcpStream, reply: String) {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(reply.as_bytes()).await;
+        }
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let dialled = Arc::new(AtomicUsize::new(0));
+        let seen = dialled.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = target.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                answer(s, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()).await;
+            }
+        });
+        let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = redirector.accept().await {
+                answer(s, format!("HTTP/1.1 302 Found\r\nlocation: http://{target_addr}/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")).await;
+            }
+        });
+        let r = reqwest_builder().build().unwrap().get(format!("http://{redirector_addr}/health")).header("x-aws-proxy-auth", "t".repeat(24)).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 302, "the redirect itself is the answer");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(dialled.load(Ordering::SeqCst), 0, "the Location target was dialled");
+        let refused = reqwest_client().unwrap().get(format!("http://{redirector_addr}/health")).send().await;
+        assert!(refused.is_err(), "https_only: plaintext is refused before any connection");
+    }
 
     #[test]
     fn four_roots_parse() {

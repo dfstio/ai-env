@@ -144,6 +144,13 @@ ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi out
 ai-env infra  base-image [--name al2023-1] [--version 1]  # the pinned managed base image is AVAILABLE
 ai-env infra  versions-diff --before F --after F [--record-probe]   # image versions around a deploy (bridge feature)
 ai-env creds  aws-set [--user ai-env-runtime] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin
+ai-env vm     images [--managed] | list [--all] | status ID | health ID   # MicroVMs of the ai-env image (bridge feature)
+ai-env vm     run [--workspace PATH] [--max-duration S] [--egress internet|vpc] [--shell] [--json] …
+ai-env vm     token ID [--port 8080|8082|9418] [--minutes M] [--reveal]   # the value only with --reveal
+ai-env vm     suspend ID | resume ID | terminate ID|--all [--yes] | gc [--yes] [--include-orphans AGE]
+ai-env vm     shell ID [--auth header|subprotocol]         # experimental: the platform shell (VM started with --shell)
+ai-env vm     smoke [--max-duration 900] [--keep] [--json] # run → RUNNING → /health → terminate, with timings
+ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]   # probes → lab/probes.jsonl
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
@@ -234,6 +241,50 @@ Pulumi state stays in the operator's local backend; `infra/Pulumi.dev.yaml` and
 secret ever enters Pulumi config, outputs or state: the runtime user's access key is created by
 `make runtime-key`, piped straight into `ai-env creds aws-set` and sealed to
 `~/.config/ai-env/bridge/credentials/aws.env`.
+
+### MicroVM lifecycle (stage S4)
+
+`ai-env vm` starts, inspects and stops MicroVMs of the image S3 deployed. Every command that talks
+to AWS unseals the runtime principal's key from `credentials/aws.env` in-process (one Touch ID per
+command; `[aws] credentials = "profile:<name>"` reads that one profile instead) and never hands it
+to a child process. The region, the control-plane URL and the TLS policy (TLS 1.3 to the MicroVM
+endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code; `AWS_REGION`,
+`AWS_ENDPOINT_URL*`, `AWS_PROFILE` and `~/.aws/config` cannot move them.
+
+- `vm run` always passes an idle policy (`[vm] max_idle_s`, `suspended_s`, `auto_resume`), resolves
+  the image version live (`active` = the latest SUCCESSFUL/ACTIVE), writes a pending row under
+  `state/vms/` before `RunMicrovm` and waits for RUNNING (60 s; a VM that does not get there is
+  terminated). Without an egress connector (S5) it needs an explicit, audited `--egress internet`;
+  `vm smoke` and `lab run` imply it because no credential ever enters those VMs.
+- `--workspace PATH` holds `state/workspaces/<slug>.lock` until the VM is RUNNING and reuses the
+  workspace's VM when its image, egress and shell setting match and enough wall time is left;
+  `[vm] max_concurrent` is counted across workspaces (ListMicrovms ∪ the registry) under
+  `state/vms.lock` — over the limit is exit 9.
+- MicroVMs cannot be tagged: ownership is the image filter plus the `owner` the VM's `/health`
+  reports (from the run-hook payload). `vm gc` reports (default), `--yes` terminates expired
+  registry VMs, adopts crashed runs and clears stale rows, `--include-orphans AGE` also terminates
+  your own row-less VMs; another owner's VM is never touched, a SUSPENDED one never probed.
+- Endpoint tokens are scoped to one port (8080, 8082 or 9418), live 1–60 minutes and are shown only
+  by `vm token --reveal`. The session token in a VM row (0600) is never printed.
+
+`ai-env lab run` records the platform probes in `lab/probes.jsonl`: `payload-size`,
+`no-traffic-before-run`, `snapshot-uniqueness` and `idle-policy-limits` start (and always
+terminate) their own short VMs; `hooks-port`, `hooks-source-ip`, `runtime-env`, `disk-budget` and
+the second pass of `snapshot-uniqueness` read a runtime log (`make logs SINCE=30m > FILE`, then
+`--log FILE`; the shim logs one `ai-env: run-report` line after `/run` and at `/terminate`);
+`cloudtrail-payload ID` asks CloudTrail as the operator's own `aws` identity.
+
+```sh
+make test-aws-readonly         # part A: TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm (read-only)
+make s4-smoke                  # T4.1: three `vm smoke --max-duration 900 --json` passes → target/s4/smoke.jsonl
+make test-aws [SLOW=1] [PROBES=1]   # the live suite (+ the 6-minute token-expiry test, + re-recorded probes)
+```
+
+Debug builds also honour `AI_ENV_BRIDGE_LAB_FAKE_API=<file.json>` (a file-backed fake control plane
+and endpoint shared by processes), `AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL=1` and
+`AI_ENV_BRIDGE_LAB_BACKOFF_MS=<n>`; an active knob is announced on stderr, and every `--json` record
+says `"backend":"fake"` (the fake API) or `"backend":"sdk+knobs"` (the real service with another
+knob) instead of `"sdk"`. The live Makefile targets drop all three; `make s4-smoke` accepts only `"sdk"`.
 
 ### Access-control policies (`keygen --access-control`)
 

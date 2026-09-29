@@ -141,7 +141,7 @@ fn io_at<'a>(what: &'static str, path: &'a Path) -> impl FnOnce(std::io::Error) 
 /// Make `dir` a real 0700 directory: created (with missing parents, 0700) when
 /// absent, refused when it is a symlink or not a directory, chmod'ed to 0700
 /// when it exists wider (it is the bridge's own state directory).
-fn ensure_private_dir(dir: &Path) -> Result<(), BridgeError> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), BridgeError> {
     match std::fs::symlink_metadata(dir) {
         Ok(meta) if meta.file_type().is_symlink() => Err(BridgeError::Config(format!("{} is a symlink; refusing to write sessions through it", dir.display()))),
         Ok(meta) if !meta.is_dir() => Err(BridgeError::Config(format!("{} is not a directory", dir.display()))),
@@ -162,7 +162,7 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// Remove `path` if it exists; a missing file is not an error.
-fn remove_if_present(path: &Path) -> Result<bool, BridgeError> {
+pub(crate) fn remove_if_present(path: &Path) -> Result<bool, BridgeError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
@@ -237,7 +237,7 @@ pub fn read(paths: &Paths, session_id: &str) -> Result<Option<SessionRow>, Bridg
 }
 
 /// The contents of `path` when it is a regular file; `None` when it is missing.
-fn read_regular_file(path: &Path) -> Result<Option<String>, BridgeError> {
+pub(crate) fn read_regular_file(path: &Path) -> Result<Option<String>, BridgeError> {
     let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path);
     let mut file = match opened {
         Ok(f) => f,

@@ -1,0 +1,7 @@
+2026-09-29T10:10:40 ai-env: init pid 1 supervising worker pid 7
+2026-09-29T10:10:41 ai-env: hook ready peer=127.0.0.1:41000 local=127.0.0.1:9000 origin=loopback len=- status=200 ms=1
+2026-09-29T10:21:08 ai-env: hook run peer=127.0.0.1:34567 local=127.0.0.1:9000 origin=loopback len=238 status=200 ms=190
+2026-09-29T10:21:08 ai-env: clock guest=1790000468 rtc=1790000468 drift_s=0
+2026-09-29T10:25:00 ai-env: hook suspend peer=127.0.0.1:35000 local=127.0.0.1:9000 origin=loopback len=- status=200 ms=2
+2026-09-29T10:26:00 ai-env: hook resume peer=127.0.0.1:35100 local=127.0.0.1:9000 origin=loopback len=- status=200 ms=4
+2026-09-29T10:27:00 ai-env: hook terminate peer=127.0.0.1:35200 local=127.0.0.1:9000 origin=loopback len=- status=200 ms=3

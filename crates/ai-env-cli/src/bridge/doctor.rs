@@ -3,14 +3,16 @@
 //! subprocesses that `rows` runs (5 s timeout each).
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
-use crate::bridge::config::{env_region_warning, BridgeConfig, Paths, REGION};
+use crate::bridge::config::{env_region_warning, AwsCfg, BridgeConfig, Paths, VmCfg, REGION};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::{base_image_verdict, read_infra_state, InfraState};
 use crate::bridge::sibling::{exists_exec, find_sibling, Sibling, INSTALL_HINT};
+use crate::bridge::vm::registry::{list_rows, RowStatus, VmRow, PENDING_STALE_S};
 use crate::commands::{DoctorLine, Tag};
 use crate::store::Keystore;
 use crate::wire::argv::FIXTURE_EXT_VERSION;
+use crate::wire::time::{parse_rfc3339_utc, unix_now};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -482,7 +484,9 @@ pub fn row_infra_state(state: &Result<Option<InfraState>, BridgeError>, path: &P
             // Only a live read vouches for the image: the stack outputs are as
             // old as the last `pulumi up` (rollbacks, a deleted image).
             let live = s.image_state_source.as_deref().is_some_and(|src| src.starts_with("live "));
-            let ok = live && matches!(st, "CREATED" | "UPDATED") && failed.is_none_or(|f| s.latest_active_image_version.as_deref().is_some_and(|a| a.parse::<u64>().ok() > f.parse::<u64>().ok()));
+            // Versions are `N.0` (the service) or `N` (older state): both sides must parse.
+            let newer = |a: &str, f: &str| matches!((image_version_key(a), image_version_key(f)), (Some(a), Some(f)) if a > f);
+            let ok = live && matches!(st, "CREATED" | "UPDATED") && failed.is_none_or(|f| s.latest_active_image_version.as_deref().is_some_and(|a| newer(a, f)));
             DoctorLine::row(if ok { Tag::Ok } else { Tag::Warn }, text)
         }
         Ok(None) => DoctorLine::row(Tag::Skip, format!("no infra state yet ({})  <- make deploy, then make infra-status WRITE=1", path.display())),
@@ -540,6 +544,146 @@ pub fn row_base_image(listing: Option<Result<&str, &str>>) -> DoctorLine {
 /// the region is pinned like every aws call, although IAM is global.
 fn iam_simulate_args(arn: &str) -> [&str; 11] {
     ["iam", "simulate-principal-policy", "--region", REGION, "--policy-source-arn", arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "--output", "json"]
+}
+
+// ---- S4 rows ------------------------------------------------------------------------
+
+/// Service Quotas code of "Max allocated ARM_64 MicroVM memory" (Gigabytes,
+/// per account and region; default 400).
+pub const MICROVM_MEMORY_QUOTA_CODE: &str = "L-CD1C0CC4";
+
+/// An image version as a comparable key: the service writes `N.0`, older
+/// state and the stack outputs `N`, so `"1.0"` → `(1, 0)` and `"3"` →
+/// `(3, 0)`. Digits only (no sign, no space, at most one dot); anything
+/// else is `None`.
+#[must_use]
+pub fn image_version_key(v: &str) -> Option<(u64, u64)> {
+    let num = |s: &str| if !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) { s.parse::<u64>().ok() } else { None };
+    match v.split_once('.') {
+        None => Some((num(v)?, 0)),
+        Some((major, minor)) => Some((num(major)?, num(minor)?)),
+    }
+}
+
+/// `aws service-quotas get-service-quota` for the MicroVM memory quota
+/// (the operator's identity; region pinned).
+fn quota_args() -> [&'static str; 10] {
+    ["service-quotas", "get-service-quota", "--service-code", "lambda", "--quota-code", MICROVM_MEMORY_QUOTA_CODE, "--region", REGION, "--output", "json"]
+}
+
+/// `mib` as gigabytes for a row (`6`, `1.5`).
+fn gib(mib: u64) -> String {
+    if mib.is_multiple_of(1024) {
+        (mib / 1024).to_string()
+    } else {
+        format!("{:.1}", mib as f64 / 1024.0)
+    }
+}
+
+/// The MicroVM memory quota against what `[vm]` may run at once
+/// (`max_concurrent × memory_mib`). `q` is the output of [`quota_args`]:
+/// `None` when not run (no aws identity, `[-  ]`); `Some(Err)` when the call
+/// failed (`[!! ]` with the reason: no verdict); otherwise the quota's
+/// `Quota.Value` in Gigabytes: `[ok ]` when `value × 1024 ≥ max_concurrent ×
+/// memory_mib`, else `[!! ]` (the platform refuses the run that crosses it
+/// with ServiceQuotaExceeded).
+#[must_use]
+pub fn row_microvm_quota(q: Option<Result<&str, &str>>, max_concurrent: u32, memory_mib: u32) -> DoctorLine {
+    let name = format!("microvm memory quota {MICROVM_MEMORY_QUOTA_CODE}");
+    let json = match q {
+        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked (no aws identity)")),
+        Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("{name} not checked: {e}")),
+        Some(Ok(json)) => json,
+    };
+    let value = serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.get("Quota")?.get("Value")?.as_f64()).filter(|g| g.is_finite() && *g >= 0.0);
+    let Some(gb) = value else {
+        return DoctorLine::row(Tag::Warn, format!("{name} not checked: no Quota.Value in the get-service-quota output"));
+    };
+    let need_mib = u64::from(max_concurrent) * u64::from(memory_mib);
+    let need = format!("[vm] max_concurrent {max_concurrent} × {memory_mib} MiB = {} GB", gib(need_mib));
+    if gb * 1024.0 >= need_mib as f64 {
+        DoctorLine::row(Tag::Ok, format!("{name} {gb} GB in {REGION} covers {need}"))
+    } else {
+        DoctorLine::row(Tag::Warn, format!("{name} {gb} GB in {REGION} < {need}  <- lower [vm].max_concurrent or request an increase (Service Quotas, lambda {MICROVM_MEMORY_QUOTA_CODE}, {REGION})"))
+    }
+}
+
+/// `[vm]` as a flag-less `ai-env vm run` uses it: the settings when
+/// [`VmCfg::validate`] accepts them, else `[NO ]` with its message (those
+/// commands refuse to start; the wrapper is unaffected). The suspended
+/// duration shown is the one sent, `min([vm].suspended_s, max duration)`
+/// (plan D8); a larger configured value is named as capped (it applies to a
+/// run with a longer `--max-duration`).
+#[must_use]
+pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
+    match vm.validate() {
+        Ok(()) => {
+            let suspended = vm.suspended_s.unwrap_or(vm.max_duration_s).min(vm.max_duration_s);
+            let note = match vm.suspended_s {
+                None => " (the max duration)".to_string(),
+                Some(s) if s > vm.max_duration_s => format!(" ([vm].suspended_s {s} capped at the max duration)"),
+                Some(_) => String::new(),
+            };
+            DoctorLine::row(
+                Tag::Ok,
+                format!("[vm] max_concurrent {}, memory {} MiB, max duration {} s, idle {} s, suspended {suspended} s{note}", vm.max_concurrent, vm.memory_mib, vm.max_duration_s, vm.max_idle_s),
+            )
+        }
+        Err(e) => DoctorLine::row(Tag::No, format!("{e}  <- fix [vm] in bridge.toml (ai-env vm and lab refuse it)")),
+    }
+}
+
+/// The rows that read `bridge.toml` itself — [`row_execution_role`],
+/// [`row_vm_config`], [`row_microvm_quota`] (`quota` as there) — only for a
+/// file that parsed: for an absent or unparseable one they would describe
+/// the built-in defaults as if configured, so one `[-  ]` line says they
+/// were not checked (the bridge.toml row already names the reason).
+#[must_use]
+pub fn rows_bridge_settings(loaded: &Result<Option<BridgeConfig>, BridgeError>, quota: Option<Result<&str, &str>>) -> Vec<DoctorLine> {
+    let why = match loaded {
+        Ok(Some(cfg)) => return vec![row_execution_role(&cfg.aws), row_vm_config(&cfg.vm), row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib)],
+        Ok(None) => "no bridge.toml",
+        Err(_) => "bridge.toml unparseable",
+    };
+    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm] and microvm memory quota not checked ({why})"))]
+}
+
+/// `state/vms`: the rows by status, and whether a pending row (a
+/// `pending-<client_token>.toml` written before `RunMicrovm` and never
+/// promoted to an id row) is older than [`PENDING_STALE_S`]: the trace of a
+/// run that died before the answer, possibly with a VM running that no row
+/// names, which `ai-env vm gc` adopts or clears. A pending row whose
+/// `created` does not parse counts as stale; an id row still `pending` (a
+/// `--no-wait` run) is a VM the service knows and is only counted. `[-  ]`
+/// when there are no rows.
+#[must_use]
+pub fn row_vm_registry(rows: &[VmRow], now: u64) -> DoctorLine {
+    if rows.is_empty() {
+        return DoctorLine::row(Tag::Skip, "no VMs recorded (state/vms)");
+    }
+    let counts: Vec<String> = [RowStatus::Pending, RowStatus::Running, RowStatus::Suspended, RowStatus::Terminated, RowStatus::Unknown]
+        .iter()
+        .map(|s| (s.as_str(), rows.iter().filter(|r| r.status == *s).count()))
+        .filter(|(_, n)| *n > 0)
+        .map(|(s, n)| format!("{n} {s}"))
+        .collect();
+    let stale = rows.iter().filter(|r| r.is_pending_row() && parse_rfc3339_utc(&r.created).is_none_or(|c| now.saturating_sub(c) > PENDING_STALE_S)).count();
+    let text = format!("vm registry: {} ({} rows)", counts.join(", "), rows.len());
+    if stale == 0 {
+        DoctorLine::row(Tag::Ok, text)
+    } else {
+        DoctorLine::row(Tag::Warn, format!("{text}; {stale} pending row(s) older than {} min  <- run: ai-env vm gc (--yes clears them)", PENDING_STALE_S / 60))
+    }
+}
+
+/// `[aws].execution_role_arn`: passed to `RunMicrovm` when set; without it
+/// the VM has no runtime logs and no run reports (plan D12).
+#[must_use]
+pub fn row_execution_role(aws: &AwsCfg) -> DoctorLine {
+    match aws.execution_role_arn.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(arn) => DoctorLine::row(Tag::Ok, format!("execution role {arn}")),
+        None => DoctorLine::row(Tag::Warn, "[aws].execution_role_arn unset: runtime logs and run reports need it  <- make infra-status WRITE=1"),
+    }
 }
 
 /// Row for a `settings.json` that could not be parsed at all.
@@ -693,6 +837,10 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
 
     let paths = Paths::resolve();
     let loaded = paths.as_ref().ok().map(BridgeConfig::load);
+    // The operator's identity, like every aws call here (doctor never unseals
+    // the runtime key); only for a parsed `[vm]` the quota could cover.
+    let parsed = matches!(loaded, Some(Ok(Some(_))));
+    let quota = arn.as_ref().filter(|_| parsed).map(|_| run_capture("aws", &quota_args(), Duration::from_secs(15)));
     let census_path = match &paths {
         Ok(paths) => {
             let loaded = loaded.as_ref().expect("loaded with the paths");
@@ -704,7 +852,7 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             None
         }
     };
-    let cfg = loaded.and_then(Result::ok).flatten().unwrap_or_default();
+    let cfg = loaded.as_ref().and_then(|l| l.as_ref().ok()).and_then(Option::clone).unwrap_or_default();
     let key = cfg.creds.key.as_str();
     lines.push(row_keystore_key(store.key_exists(key), key));
     let infra_state = match &paths {
@@ -712,6 +860,12 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             lines.push(runtime_credentials(&paths.aws_env()));
             let state = read_infra_state(paths);
             lines.push(row_infra_state(&state, &paths.infra_state()));
+            let loaded = loaded.as_ref().expect("loaded with the paths");
+            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+            lines.push(match list_rows(paths) {
+                Ok(vms) => row_vm_registry(&vms, unix_now()),
+                Err(e) => DoctorLine::row(Tag::Warn, format!("vm registry unreadable: {e}")),
+            });
             let (tw, sp) = (cfg.review.tripwires_path(paths), cfg.review.settings_policy_path(paths));
             lines.push(row_review_files(&tw, tw.is_file(), &sp, sp.is_file()));
             state.ok().flatten()
@@ -874,6 +1028,208 @@ mod tests {
         let (tw, pol) = (Path::new("/r/tripwires.txt"), Path::new("/r/settings-policy.txt"));
         assert_eq!(text(&row_review_files(tw, false, pol, false)).0, Tag::Skip);
         assert_eq!(text(&row_review_files(tw, true, pol, false)).0, Tag::Ok);
+    }
+
+    #[test]
+    fn image_version_keys() {
+        for (v, k) in [("1.0", (1, 0)), ("3", (3, 0)), ("12.5", (12, 5)), ("10", (10, 0)), ("007.0", (7, 0))] {
+            assert_eq!(image_version_key(v), Some(k), "{v}");
+        }
+        for junk in ["", "1.", ".0", "1.0.0", "v1", "+1", "-1", " 1", "1.0 ", "a.b", "1,0"] {
+            assert_eq!(image_version_key(junk), None, "{junk:?}");
+        }
+        assert_eq!(image_version_key(&"9".repeat(20)), None, "beyond u64");
+        assert!(image_version_key("10.0") > image_version_key("9.0"), "numeric, not lexical");
+        assert_eq!(image_version_key("3"), image_version_key("3.0"), "N and N.0 are one version");
+    }
+
+    /// The service's `N.0` versions (`"1.0"` did not parse as u64, so every
+    /// state with a failure read as a newer failure).
+    #[test]
+    fn row_infra_state_orders_n0_versions() {
+        let sp = Path::new("/r/state/infra.toml");
+        let state = |active: &str, failed: &str| InfraState {
+            stack: "dev".into(),
+            written: "2026-09-29T08:00:00Z".into(),
+            image_state: Some("UPDATED".into()),
+            latest_active_image_version: Some(active.into()),
+            latest_failed_image_version: Some(failed.into()),
+            image_state_source: Some("live 2026-09-29T08:00:00Z".into()),
+            ..InfraState::default()
+        };
+        for (active, failed, want) in [
+            ("2.0", "1.0", Tag::Ok),
+            ("10.0", "9.0", Tag::Ok),
+            ("3", "2.0", Tag::Ok),
+            ("1.0", "2.0", Tag::Warn),
+            ("2.0", "2.0", Tag::Warn),
+            ("junk", "1.0", Tag::Warn),
+            ("2.0", "junk", Tag::Warn),
+        ] {
+            let (tag, t) = text(&row_infra_state(&Ok(Some(state(active, failed))), sp));
+            assert_eq!(tag, want, "active {active}, failed {failed}: {t}");
+            assert!(t.contains(&format!("active version {active}")) && t.contains(&format!("latest FAILED version {failed}")), "{t}");
+        }
+    }
+
+    fn quota_json(gb: &str) -> String {
+        format!("{{\"Quota\": {{\"ServiceCode\": \"lambda\", \"QuotaCode\": \"{MICROVM_MEMORY_QUOTA_CODE}\", \"QuotaName\": \"Max allocated ARM_64 MicroVM memory\", \"Value\": {gb}, \"Unit\": \"None\"}}}}")
+    }
+
+    #[test]
+    fn row_microvm_quota_compares_gigabytes_with_max_concurrent_times_memory() {
+        let (tag, t) = text(&row_microvm_quota(Some(Ok(&quota_json("400.0"))), 3, 2048));
+        assert_eq!(tag, Tag::Ok, "{t}");
+        assert_eq!(t, "microvm memory quota L-CD1C0CC4 400 GB in eu-central-1 covers [vm] max_concurrent 3 × 2048 MiB = 6 GB");
+        assert_eq!(text(&row_microvm_quota(Some(Ok(&quota_json("6.0"))), 3, 2048)).0, Tag::Ok, "exactly enough is enough");
+        let (tag, t) = text(&row_microvm_quota(Some(Ok(&quota_json("4"))), 3, 2048));
+        assert_eq!(tag, Tag::Warn, "{t}");
+        assert!(t.starts_with("microvm memory quota L-CD1C0CC4 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB  <- lower [vm].max_concurrent"), "{t}");
+        assert_eq!(t.matches("<- ").count(), 1, "one hint: {t}");
+        let (tag, t) = text(&row_microvm_quota(Some(Ok(&quota_json("5.5"))), 11, 512));
+        assert!(tag == Tag::Ok && t.contains("5.5 GB") && t.ends_with("= 5.5 GB"), "fractions on both sides: {t}");
+        assert_eq!(text(&row_microvm_quota(Some(Ok(&quota_json("5.5"))), 3, 2048)).0, Tag::Warn);
+    }
+
+    #[test]
+    fn row_microvm_quota_without_a_verdict() {
+        let (tag, t) = text(&row_microvm_quota(None, 3, 2048));
+        assert_eq!(tag, Tag::Skip);
+        assert_eq!(t, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)");
+        let call = "An error occurred (AccessDeniedException) when calling the GetServiceQuota operation: User is not authorized";
+        let row = row_microvm_quota(Some(Err(call)), 3, 2048);
+        assert_eq!(text(&row), (Tag::Warn, format!("microvm memory quota L-CD1C0CC4 not checked: {call}")));
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0, "a failed call is no verdict");
+        for junk in ["not json", "{}", "{\"Quota\": {}}", "{\"Quota\": {\"Value\": \"400\"}}", "{\"Quota\": {\"Value\": -1}}"] {
+            let (tag, t) = text(&row_microvm_quota(Some(Ok(junk)), 3, 2048));
+            assert!(tag == Tag::Warn && t.ends_with("no Quota.Value in the get-service-quota output"), "{junk}: {t}");
+        }
+    }
+
+    #[test]
+    fn the_doctor_quota_call_pins_the_region_and_the_code() {
+        let args = quota_args();
+        assert_eq!(&args[..2], ["service-quotas", "get-service-quota"]);
+        for pair in [["--region", "eu-central-1"], ["--service-code", "lambda"], ["--quota-code", "L-CD1C0CC4"], ["--output", "json"]] {
+            assert!(args.windows(2).any(|w| w == pair), "{pair:?} in {args:?}");
+        }
+    }
+
+    /// The row reads what tests/fakes/aws.sh answers for the doctor's own
+    /// argv (the fake refuses a call without `--region eu-central-1`).
+    #[cfg(unix)]
+    #[test]
+    fn row_microvm_quota_reads_the_fake_aws_answer() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/aws.sh");
+        let call = |gb: Option<&str>, args: &[&str]| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg(fake).args(args).env_remove("FAKE_AWS_FAIL").env_remove("FAKE_AWS_LOG").env_remove("FAKE_AWS_QUOTA_GB");
+            if let Some(gb) = gb {
+                cmd.env("FAKE_AWS_QUOTA_GB", gb);
+            }
+            run_capture_cmd(cmd, None, Duration::from_secs(10))
+        };
+        let out = call(None, &quota_args());
+        let (tag, t) = text(&row_microvm_quota(Some(out.as_deref().map_err(String::as_str)), 3, 2048));
+        assert!(tag == Tag::Ok && t.contains(" 400 GB "), "the default quota: {t}");
+        let out = call(Some("4"), &quota_args());
+        assert_eq!(text(&row_microvm_quota(Some(out.as_deref().map_err(String::as_str)), 3, 2048)).0, Tag::Warn);
+        let other = quota_args().map(|a| if a == MICROVM_MEMORY_QUOTA_CODE { "L-00000000" } else { a });
+        let err = call(None, &other).unwrap_err();
+        assert!(err.starts_with("An error occurred (NoSuchResourceException)"), "{err}");
+        let (tag, t) = text(&row_microvm_quota(Some(Err(&err)), 3, 2048));
+        assert!(tag == Tag::Warn && t.contains("not checked: An error occurred (NoSuchResourceException)"), "{t}");
+    }
+
+    #[test]
+    fn row_vm_config_summarises_or_names_the_bad_key() {
+        let (tag, t) = text(&row_vm_config(&VmCfg::default()));
+        assert_eq!(tag, Tag::Ok);
+        assert_eq!(t, "[vm] max_concurrent 3, memory 2048 MiB, max duration 28800 s, idle 300 s, suspended 28800 s (the max duration)");
+        let set = VmCfg { max_concurrent: 1, memory_mib: 4096, max_duration_s: 900, max_idle_s: 600, suspended_s: Some(900), ..VmCfg::default() };
+        assert_eq!(text(&row_vm_config(&set)), (Tag::Ok, "[vm] max_concurrent 1, memory 4096 MiB, max duration 900 s, idle 600 s, suspended 900 s".to_string()));
+        let below = VmCfg { suspended_s: Some(600), ..set.clone() };
+        assert!(text(&row_vm_config(&below)).1.ends_with("idle 600 s, suspended 600 s"), "{:?}", text(&row_vm_config(&below)));
+        // `vm run` sends min([vm].suspended_s, max duration) (plan D8): never the larger value.
+        let (tag, t) = text(&row_vm_config(&VmCfg { suspended_s: Some(28_800), ..set }));
+        assert_eq!(tag, Tag::Ok, "valid: a longer --max-duration uses it");
+        assert_eq!(t, "[vm] max_concurrent 1, memory 4096 MiB, max duration 900 s, idle 600 s, suspended 900 s ([vm].suspended_s 28800 capped at the max duration)");
+        for (bad, key) in [
+            (VmCfg { max_concurrent: 0, ..VmCfg::default() }, "[vm].max_concurrent: must be at least 1"),
+            (VmCfg { max_idle_s: 60, ..VmCfg::default() }, "[vm].max_idle_s: must be 300..=28800"),
+            (VmCfg { max_duration_s: 28_801, ..VmCfg::default() }, "[vm].max_duration_s: must be 1..=28800"),
+            (VmCfg { suspended_s: Some(0), ..VmCfg::default() }, "[vm].suspended_s: must be 1..=28800"),
+            (VmCfg { memory_mib: 0, ..VmCfg::default() }, "[vm].memory_mib: must be positive"),
+        ] {
+            let row = row_vm_config(&bad);
+            let (tag, t) = text(&row);
+            assert_eq!(tag, Tag::No, "{t}");
+            assert!(t.starts_with(&format!("config: {key}")) && t.ends_with("  <- fix [vm] in bridge.toml (ai-env vm and lab refuse it)"), "{t}");
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 1);
+        }
+    }
+
+    /// An absent or unparseable bridge.toml never has its defaults reported
+    /// as the configuration (and the quota answer is not used).
+    #[test]
+    fn rows_bridge_settings_only_for_a_parsed_bridge_toml() {
+        let quota = quota_json("4");
+        for (loaded, why) in [(Ok(None), "no bridge.toml"), (Err(BridgeError::Config("[vm].max_concurrent: invalid type".into())), "bridge.toml unparseable")] {
+            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)));
+            let got: Vec<(Tag, String)> = rows.iter().map(text).collect();
+            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm] and microvm memory quota not checked ({why})"))]);
+            assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0);
+        }
+        let cfg = BridgeConfig { vm: VmCfg { max_concurrent: 3, memory_mib: 2048, ..VmCfg::default() }, ..BridgeConfig::default() };
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), Some(Ok(&quota))).iter().map(text).collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0], text(&row_execution_role(&cfg.aws)));
+        assert_eq!(got[1], text(&row_vm_config(&cfg.vm)));
+        assert!(got[2].0 == Tag::Warn && got[2].1.contains(" 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB"), "{got:?}");
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg)), None).iter().map(text).collect();
+        assert_eq!(got[2], (Tag::Skip, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)".to_string()));
+    }
+
+    fn vm(id: &str, status: RowStatus, created: &str) -> VmRow {
+        VmRow { id: id.into(), client_token: "01926f2e-0000-7000-8000-000000000001".into(), status, created: created.into(), ..VmRow::default() }
+    }
+
+    #[test]
+    fn row_vm_registry_counts_and_flags_stale_pending_rows() {
+        let now = 1_790_000_000;
+        let at = |age: u64| crate::wire::time::rfc3339_utc_ms((now - age) * 1000 + 999);
+        assert_eq!(text(&row_vm_registry(&[], now)), (Tag::Skip, "no VMs recorded (state/vms)".to_string()));
+        let mut rows = vec![
+            vm("microvm-a", RowStatus::Running, &at(3600)),
+            vm("microvm-b", RowStatus::Running, &at(60)),
+            vm("microvm-c", RowStatus::Terminated, &at(86_400)),
+            vm("microvm-d", RowStatus::Suspended, &at(600)),
+            vm("", RowStatus::Pending, &at(60)),
+        ];
+        let (tag, t) = text(&row_vm_registry(&rows, now));
+        assert_eq!(tag, Tag::Ok, "a young pending row is a run in progress: {t}");
+        assert_eq!(t, "vm registry: 1 pending, 2 running, 1 suspended, 1 terminated (5 rows)");
+        rows.push(vm("", RowStatus::Pending, &at(PENDING_STALE_S)));
+        assert_eq!(text(&row_vm_registry(&rows, now)).0, Tag::Ok, "exactly 5 min is not older than 5 min");
+        rows.push(vm("", RowStatus::Pending, &at(PENDING_STALE_S + 1)));
+        let (tag, t) = text(&row_vm_registry(&rows, now));
+        assert_eq!(tag, Tag::Warn, "{t}");
+        assert_eq!(t, "vm registry: 3 pending, 2 running, 1 suspended, 1 terminated (7 rows); 1 pending row(s) older than 5 min  <- run: ai-env vm gc (--yes clears them)");
+        rows.push(vm("", RowStatus::Pending, "not a date"));
+        assert!(text(&row_vm_registry(&rows, now)).1.contains("; 2 pending row(s) older than 5 min"), "an undated pending row counts as stale");
+        // An id row still `pending` (a `--no-wait` run) is a VM the service knows: counted, not flagged.
+        let id_row = [vm("microvm-e", RowStatus::Pending, &at(7200)), vm("microvm-f", RowStatus::Unknown, &at(10))];
+        assert_eq!(text(&row_vm_registry(&id_row, now)), (Tag::Ok, "vm registry: 1 pending, 1 unknown (2 rows)".to_string()));
+    }
+
+    #[test]
+    fn row_execution_role_warns_when_unset() {
+        let unset = "[aws].execution_role_arn unset: runtime logs and run reports need it  <- make infra-status WRITE=1".to_string();
+        assert_eq!(text(&row_execution_role(&AwsCfg::default())), (Tag::Warn, unset.clone()));
+        assert_eq!(text(&row_execution_role(&AwsCfg { execution_role_arn: Some("  ".into()), ..AwsCfg::default() })), (Tag::Warn, unset));
+        let arn = "arn:aws:iam::123456789012:role/ai-env-microvm-exec";
+        assert_eq!(text(&row_execution_role(&AwsCfg { execution_role_arn: Some(arn.into()), ..AwsCfg::default() })), (Tag::Ok, format!("execution role {arn}")));
+        assert_eq!(crate::commands::doctor_exit_code(&[row_execution_role(&AwsCfg::default())], false), 0, "a warning, not a failure");
     }
 
     #[test]

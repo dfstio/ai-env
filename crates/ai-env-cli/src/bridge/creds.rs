@@ -273,12 +273,13 @@ fn refuse_tty(stdin_is_tty: bool) -> Result<()> {
 
 // ---- cleanup notes -------------------------------------------------------------------
 
+/// The delete command needs the full access key id (an identifier, not a
+/// secret), so it is kept verbatim — the scrubber's key-id rule would mask it —
+/// while the user name still passes the scrubber.
 fn not_stored_note(user: &str, id: &str) -> String {
     let tail = &id[id.len().saturating_sub(4)..];
-    scrub(&format!(
-        "the access key ...{tail} of IAM user {user} was NOT stored; if you just created it, delete it:\n  aws iam delete-access-key --user-name {user} --access-key-id {id} --region {REGION}"
-    ))
-    .into_owned()
+    let user = scrub(user);
+    format!("the access key ...{tail} of IAM user {user} was NOT stored; if you just created it, delete it:\n  aws iam delete-access-key --user-name {user} --access-key-id {id} --region {REGION}")
 }
 
 fn unknown_key_note(user: &str) -> String {
@@ -289,7 +290,7 @@ fn unknown_key_note(user: &str) -> String {
 
 /// `e` with `note` appended, keeping its exit class. A broken pipe (exit 0)
 /// becomes exit 1: a failure to store a key must never look like success.
-fn with_note(e: CliError, note: &str) -> CliError {
+pub(crate) fn with_note(e: CliError, note: &str) -> CliError {
     let add = |m: String| format!("{m}\n{note}");
     match e {
         CliError::Msg(m) => CliError::Msg(add(m)),

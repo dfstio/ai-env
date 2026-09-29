@@ -909,9 +909,15 @@ impl Shim {
 
 /// Blocking HTTP/1.1 for the binary tests; (status, body).
 fn http_sync(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
+    http_sync_body(addr, method, path, b"")
+}
+
+/// [`http_sync`] with a request body (no Content-Type: the hooks take any).
+fn http_sync_body(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, String) {
     let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+    s.write_all(body).unwrap();
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).unwrap();
     let (st, _, body) = split_response(&buf);
@@ -933,6 +939,66 @@ fn binary_binds_three_ports() {
     assert_eq!(s, 200);
     shim.wait_line(5, |l| l.starts_with("ai-env: hook suspend peer=127.0.0.1:") && l.contains("origin=loopback") && l.contains("status=200"));
     shim.wait_line(5, |l| l.starts_with("ai-env: boot {\"pid\":"));
+}
+
+/// Plan S4 D19: one `ai-env: run-report <json>` line after the first `/run`
+/// that answers 200 — none for its byte-identical replay or for a 409 —
+/// and one at `/terminate`, each a whole JSON document on one line carrying
+/// the accepted `/run`'s microvm id. On Linux the body is the report; here
+/// (the Mac) it is the portable twin, so only the portable fields are
+/// asserted everywhere.
+#[test]
+fn run_report_logged_once_after_run_and_at_terminate() {
+    let t = tempfile::tempdir().unwrap();
+    let shim = Shim::start(&fake_claude(t.path(), ""), &[]);
+    let hooks_addr = shim.addr("hooks");
+    let id = "microvm-00000000-0000-4000-8000-000000000042";
+    let payload = payload_json("mike@mbp");
+    let body = run_body(id, Some(&payload));
+    let run = format!("{PREFIX}/run");
+    assert_eq!(http_sync_body(hooks_addr, "POST", &run, &body).0, 200);
+    let (s, b) = http_sync_body(hooks_addr, "POST", &run, &body);
+    assert!(s == 200 && b.contains("\"replay\":true"), "{s}: {b}");
+    let (s, b) = http_sync_body(hooks_addr, "POST", &run, &run_body("microvm-00000000-0000-4000-8000-000000000043", None));
+    assert_eq!(s, 409, "{b}");
+    // The /run report is written off the hook's path: wait for it.
+    shim.wait_line(10, |l| l.starts_with("ai-env: run-report ") && l.contains("\"hook\":\"run\""));
+    assert_eq!(http_sync_body(hooks_addr, "POST", &format!("{PREFIX}/terminate"), b"{}").0, 200);
+    shim.wait_line(10, |l| l.starts_with("ai-env: hook terminate ") && l.contains("status=200"));
+    // A report a replay or a refusal had (wrongly) spawned would be in by now.
+    std::thread::sleep(Duration::from_millis(300));
+    let lines = shim.lines.lock().unwrap().clone();
+    let hook_lines = |status: &str| lines.iter().filter(|l| l.starts_with("ai-env: hook run ") && l.contains(&format!(" status={status} "))).count();
+    assert_eq!((hook_lines("200"), hook_lines("409")), (2, 1), "the first /run, its replay, the conflict: {lines:?}");
+    let reports: Vec<serde_json::Value> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("ai-env: run-report "))
+        .map(|j| serde_json::from_str(j).unwrap_or_else(|e| panic!("a run report is one JSON document ({e}): {j}")))
+        .collect();
+    let hooks: Vec<&str> = reports.iter().map(|r| r["hook"].as_str().unwrap_or("?")).collect();
+    assert_eq!(hooks, ["run", "terminate"], "exactly one per hook, in order: {lines:?}");
+    let commit = RunHookPayload::from_json(&payload).unwrap().commit;
+    // The shim runs as this uid, so it may read PID 1's environ exactly when the test may.
+    let environ_readable = std::fs::read("/proc/1/environ").is_ok();
+    for r in &reports {
+        assert_eq!(r["microvm_id"], id, "the accepted /run's id: {r}");
+        assert!(!r.to_string().contains(&commit), "no payload material: {r}");
+        if cfg!(target_os = "linux") {
+            // Values, not key presence: the report emits every key, null when unread.
+            assert!(r["boot_id"].as_str().is_some_and(|b| b.len() == 36 && b.matches('-').count() == 4), "a uuid boot_id: {r}");
+            let (total, used) = (r["disk_total_bytes"].as_u64(), r["disk_used_bytes"].as_u64());
+            assert!(total.is_some_and(|t| t > 0) && used.is_some_and(|u| Some(u) <= total), "statvfs(/): {r}");
+            assert!(r["zombies"].is_u64(), "/proc is listable: {r}");
+            assert_eq!((r["env"].is_object(), r["aws_credential_env"].is_array()), (environ_readable, environ_readable), "PID 1's environ exactly when readable: {r}");
+            assert_eq!((r["uid"].as_u64(), r["gid"].as_u64()), (Some(u64::from(uid_gid().0)), Some(u64::from(uid_gid().1))), "{r}");
+            assert!(r.get("unsupported").is_none(), "{r}");
+        } else {
+            assert_eq!(r["unsupported"], true, "the portable twin: {r}");
+        }
+    }
+    if cfg!(target_os = "linux") {
+        assert_eq!(reports[0]["boot_id"], reports[1]["boot_id"], "one boot: {reports:?}");
+    }
 }
 
 #[test]

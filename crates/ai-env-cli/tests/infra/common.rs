@@ -8,8 +8,8 @@ pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-env")
 }
 
-/// `ai-env <args>` with a clean bridge + keystore under `tmp` and no AWS or
-/// Pulumi environment leaking in from the developer's shell.
+/// `ai-env <args>` with a clean bridge + keystore under `tmp` and no AWS,
+/// Pulumi or lab-knob environment leaking in from the developer's shell.
 pub fn ai_env(tmp: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(bin());
     cmd.args(args)
@@ -20,7 +20,7 @@ pub fn ai_env(tmp: &Path, args: &[&str]) -> Command {
         .stdin(Stdio::null());
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().to_string();
-        if k.starts_with("AWS_") || k.starts_with("PULUMI_") {
+        if k.starts_with("AWS_") || k.starts_with("PULUMI_") || k.starts_with("AI_ENV_BRIDGE_LAB_") {
             cmd.env_remove(&k);
         }
     }
@@ -43,7 +43,7 @@ pub fn isolate<'a>(cmd: &'a mut Command, tmp: &Path) -> &'a mut Command {
     }
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().to_string();
-        if k.starts_with("AWS_") || k.starts_with("PULUMI_") {
+        if k.starts_with("AWS_") || k.starts_with("PULUMI_") || k.starts_with("AI_ENV_BRIDGE_LAB_") {
             cmd.env_remove(&k);
         }
     }

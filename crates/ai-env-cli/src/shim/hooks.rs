@@ -10,6 +10,12 @@
 //! timed-out `/run` may terminate the VM, so `/run` never waits on anything
 //! but `--delay-run`.
 //!
+//! Run report (plan S4 D19): one `ai-env: run-report <json>` line after the
+//! first `/run` that answers 200 (never on a replay or a refusal; written
+//! off the hook's path) and one per `/terminate` (before its answer, bounded:
+//! it is the zombie sample, and the shim stops soon after). See
+//! [`sys::run_report`].
+//!
 //! Source policy: where hook requests come from is documented nowhere, so S3
 //! only LOGS each request's origin (`--hook-source log`, the image default).
 //! `enforce` refuses runtime hooks from this VM itself (loopback or our own
@@ -280,6 +286,9 @@ async fn run(State(state): State<Arc<ShimState>>, body: Bytes) -> Response {
         tokio::time::sleep(std::time::Duration::from_secs(state.opts.delay_run)).await;
     }
     state.run.mark_seen();
+    // Detached: the report reads /proc and statvfs, and /run waits on
+    // nothing but --delay-run. Only this (first, accepted) /run gets here.
+    drop(tokio::task::spawn_blocking(move || errln!("ai-env: run-report {}", sys::run_report("run", microvm_id.as_deref()))));
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
 
@@ -300,6 +309,14 @@ async fn suspend(_body: Bytes) -> Response {
 
 async fn terminate(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     state.set_draining();
+    // Logged before the answer (the platform stops the VM soon after), with
+    // the id of the accepted /run; bounded like resume's clock report.
+    let id = state.run.view().microvm_id;
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), tokio::task::spawn_blocking(move || sys::run_report("terminate", id.as_deref()))).await;
+    match report {
+        Ok(Ok(r)) => errln!("ai-env: run-report {r}"),
+        _ => errln!("ai-env: run report on terminate did not finish within 5 s"),
+    }
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
 

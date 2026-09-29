@@ -97,6 +97,91 @@ impl Paths {
     pub fn infra_state(&self) -> PathBuf {
         self.root.join("state").join("infra.toml")
     }
+
+    /// `state/vms`: one `<microvm id>.toml` per VM `ai-env vm` started, plus
+    /// `pending-<client_token>.toml` rows written before `RunMicrovm` (S4).
+    #[must_use]
+    pub fn vms(&self) -> PathBuf {
+        self.root.join("state").join("vms")
+    }
+
+    /// `state/vms.lock`: held while counting VMs against `[vm].max_concurrent`
+    /// and writing the pending row, so the limit holds across workspaces.
+    #[must_use]
+    pub fn placement_lock(&self) -> PathBuf {
+        self.root.join("state").join("vms.lock")
+    }
+
+    /// `state/workspaces`: the per-workspace locks (S4) and rows (S8).
+    #[must_use]
+    pub fn workspaces(&self) -> PathBuf {
+        self.root.join("state").join("workspaces")
+    }
+
+    /// `state/workspaces/<slug>.lock`, held from SELECT_VM until the VM is
+    /// RUNNING. `slug` must already be a project dir name (`[A-Za-z0-9-]`).
+    #[must_use]
+    pub fn workspace_lock(&self, slug: &str) -> PathBuf {
+        self.workspaces().join(format!("{slug}.lock"))
+    }
+
+    /// `logs/ai-env.log`: the operator CLI's own log (`ai-env vm|lab`).
+    #[must_use]
+    pub fn cli_log(&self) -> PathBuf {
+        self.logs().join("ai-env.log")
+    }
+}
+
+/// Where `ai-env vm` gets the runtime principal's AWS credentials
+/// (`[aws].credentials`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialsSource {
+    /// `credentials/aws.env`, an ai-env container sealed to `[creds].key`,
+    /// unsealed in-process (one Touch ID per command).
+    Container,
+    /// Exactly this profile of `~/.aws/{config,credentials}`.
+    Profile(String),
+}
+
+impl CredentialsSource {
+    /// `"container"` or `"profile:<name>"` (`<name>` of `[A-Za-z0-9_.-]`);
+    /// anything else is a config error naming the key.
+    pub fn parse(value: &str) -> Result<CredentialsSource, BridgeError> {
+        if value == "container" {
+            return Ok(CredentialsSource::Container);
+        }
+        match value.strip_prefix("profile:") {
+            Some(name) if !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')) => {
+                Ok(CredentialsSource::Profile(name.to_string()))
+            }
+            _ => Err(BridgeError::Config(format!("[aws].credentials = {value:?}: expected \"container\" or \"profile:<name>\""))),
+        }
+    }
+}
+
+impl VmCfg {
+    /// The ranges `ai-env vm`/`lab` need (plan §2.8 timing budgets). Checked by
+    /// those commands only, never by [`BridgeConfig::parse`]: the wrapper
+    /// routes on a file S1–S3 already accepted.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        let bad = |key: &str, why: &str| Err(BridgeError::Config(format!("[vm].{key}: {why}")));
+        if self.max_concurrent == 0 {
+            return bad("max_concurrent", "must be at least 1");
+        }
+        if !(1..=28_800).contains(&self.max_duration_s) {
+            return bad("max_duration_s", "must be 1..=28800 (the service maximum, 8 h)");
+        }
+        if !(300..=28_800).contains(&self.max_idle_s) {
+            return bad("max_idle_s", "must be 300..=28800 (plan §2.8: suspending sooner costs more than it saves)");
+        }
+        if self.suspended_s.is_some_and(|s| s == 0 || s > 28_800) {
+            return bad("suspended_s", "must be 1..=28800");
+        }
+        if self.memory_mib == 0 {
+            return bad("memory_mib", "must be positive");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

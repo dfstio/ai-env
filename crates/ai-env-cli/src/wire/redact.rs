@@ -139,8 +139,9 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 /// Mask secrets in a log line: `sk-ant-…` tokens, `eyJ…` tokens of at least
-/// [`JWE_MIN_LEN`] chars, registered values, and the values of key-shaped
-/// assignments (`token=`, `Authorization:`, `x-aws-proxy-auth:`, …).
+/// [`JWE_MIN_LEN`] chars, AWS access key ids (`AKIA…`/`ASIA…`), registered
+/// values, and the values of key-shaped assignments (`token=`,
+/// `Authorization:`, `x-aws-proxy-auth:`, …).
 pub fn scrub(text: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
@@ -168,6 +169,19 @@ pub fn scrub(text: &str) -> Cow<'_, str> {
                 let total = 7 + body.chars().take(n).map(char::len_utf8).sum::<usize>();
                 out.push_str(&format!("sk-ant-[redacted:len={total}]"));
                 i += total;
+                changed = true;
+                continue;
+            }
+        }
+        // AWS access key ids (`AKIA…` long-term, `ASIA…` session): 4 + 16 of
+        // `[A-Z0-9]`, not glued to a longer identifier on either side.
+        if (rest.starts_with("AKIA") || rest.starts_with("ASIA")) && (i == 0 || !s.as_bytes()[i - 1].is_ascii_alphanumeric()) {
+            let b = rest.as_bytes();
+            let body_ok = b.len() >= 20 && b[4..20].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+            if body_ok && b.get(20).is_none_or(|c| !c.is_ascii_alphanumeric()) {
+                out.push_str(&rest[..4]);
+                out.push_str("[redacted:len=20]");
+                i += 20;
                 changed = true;
                 continue;
             }
@@ -346,6 +360,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aws_access_key_ids_are_masked_unregistered() {
+        let long = format!("AKIA{}", "Q7".repeat(8));
+        let session = format!("ASIA{}", "Z9".repeat(8));
+        let line = format!("access_key_id: \"{long}\", other={session} end");
+        let out = scrub(&line);
+        assert!(!out.contains(&long[4..]) && !out.contains(&session[4..]), "{out}");
+        assert!(out.contains("AKIA[redacted:len=20]") && out.contains("ASIA[redacted:len=20]"), "{out}");
+        for keep in [format!("XAKIA{}", "Q7".repeat(8)), format!("AKIA{}X", "Q7".repeat(8)), format!("AKIA{}", "q7".repeat(8)), "AKIA-short".to_string()] {
+            assert_eq!(scrub(&keep), keep, "not a standalone key id: {keep}");
+        }
+    }
 
     #[test]
     fn secret_debug_is_redacted_len() {

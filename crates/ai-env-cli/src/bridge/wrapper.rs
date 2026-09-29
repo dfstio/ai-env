@@ -8,13 +8,12 @@
 use crate::bridge::census::read_rows;
 use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::doctor::{cursor_settings_path, parse_settings, run_capture, version_token, PERMISSION_SETTING, WRAPPER_SETTING};
-use crate::bridge::logging::open_log_file;
+use crate::bridge::probes::{append_row, Expectation};
 use crate::bridge::sibling::{exists_exec, require_sibling, INSTALL_HINT};
 use crate::errors::{CliError, Result};
 use crate::store::write_atomic;
 use crate::wire::time::{rfc3339_utc, unix_now};
 use crate::{bail, outln};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -35,24 +34,9 @@ const OAUTH_REFRESH_VAR: &str = "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH";
 /// The stage every probe recorded by this command is stamped with.
 const PROBE_STAGE: &str = "S1";
 
-/// One line of `lab/probes.jsonl`: a version-stamped verdict for one probe.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeRow {
-    /// `entrypoint` or `stock-ext-oauth`.
-    pub probe: String,
-    /// The stage that recorded the row (`S1`).
-    pub stage: String,
-    /// The extension bundle version of the session row the verdict came from.
-    pub ext: Option<String>,
-    /// `CLAUDE_AGENT_SDK_VERSION` of that session, when recorded.
-    pub sdk: Option<String>,
-    /// What was observed.
-    pub verdict: String,
-    /// What the stage expects; a row whose verdict differs is a failed probe.
-    pub expected: String,
-    /// RFC 3339 seconds, when the verdict was derived.
-    pub ts: String,
-}
+/// One line of `lab/probes.jsonl` (moved to `bridge::probes` in S4; re-exported
+/// here for the S1 callers).
+pub use crate::bridge::probes::ProbeRow;
 
 // ---- probes ------------------------------------------------------------------------
 
@@ -70,26 +54,13 @@ pub fn probe_verdicts(row: &serde_json::Value) -> Vec<ProbeRow> {
     let ts = rfc3339_utc(unix_now());
     let entrypoint = text(row.pointer("/env_selected/CLAUDE_CODE_ENTRYPOINT")).unwrap_or_else(|| "missing".to_string());
     let has_oauth = row.get("env_names").and_then(|n| n.as_array()).is_some_and(|names| names.iter().any(|n| n.as_str() == Some(OAUTH_REFRESH_VAR)));
-    vec![
-        ProbeRow {
-            probe: "entrypoint".to_string(),
-            stage: PROBE_STAGE.to_string(),
-            ext: ext.clone(),
-            sdk: sdk.clone(),
-            verdict: entrypoint,
-            expected: "claude-vscode".to_string(),
-            ts: ts.clone(),
-        },
-        ProbeRow {
-            probe: "stock-ext-oauth".to_string(),
-            stage: PROBE_STAGE.to_string(),
-            ext,
-            sdk,
-            verdict: if has_oauth { "present" } else { "absent" }.to_string(),
-            expected: "absent".to_string(),
-            ts,
-        },
-    ]
+    let row = |probe: &str, verdict: String, expected: &str| ProbeRow {
+        ext: ext.clone(),
+        sdk: sdk.clone(),
+        ts: ts.clone(),
+        ..ProbeRow::new(probe, PROBE_STAGE, &verdict, &Expectation::Exact(expected.to_string()))
+    };
+    vec![row("entrypoint", entrypoint, "claude-vscode"), row("stock-ext-oauth", if has_oauth { "present" } else { "absent" }.to_string(), "absent")]
 }
 
 /// A census row that went through the session classifier: `route` is
@@ -109,24 +80,11 @@ fn record_probes(paths: &Paths, rows: &[serde_json::Value]) -> Result<()> {
     };
     let verdicts = probe_verdicts(session);
     let probes_path = paths.probes();
-    let existing = read_rows(&probes_path, None)?;
-    let mut file = open_log_file(&probes_path)?;
     let mut failed = Vec::new();
     for v in &verdicts {
-        let previous = existing.iter().rev().find(|r| r.get("probe").and_then(|p| p.as_str()) == Some(v.probe.as_str()));
-        if let Some(old) = previous.and_then(|r| r.get("verdict")).and_then(|o| o.as_str()) {
-            if old != v.verdict {
-                outln!("probe {}: {old} -> {}", v.probe, v.verdict);
-            }
-        }
-        let mut line = serde_json::to_vec(v).map_err(|e| CliError::Msg(format!("probe row: {e}")))?;
-        line.push(b'\n');
-        let written = file.write(&line)?;
-        if written != line.len() {
-            bail!("short probe write: {written} of {} bytes to {}", line.len(), probes_path.display());
-        }
+        let holds = append_row(&probes_path, v)?;
         outln!("recorded {}={} (expected {})", v.probe, v.verdict, v.expected);
-        if v.verdict != v.expected {
+        if !holds {
             failed.push(format!("{}={} (expected {})", v.probe, v.verdict, v.expected));
         }
     }

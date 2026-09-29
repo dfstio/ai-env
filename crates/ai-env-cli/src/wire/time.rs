@@ -39,6 +39,14 @@ pub fn rfc3339_utc(secs: u64) -> String {
     format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` for Unix milliseconds: the run-hook payload's
+/// `created`, precise enough that `(owner, created)` identifies one run.
+#[must_use]
+pub fn rfc3339_utc_ms(ms: u64) -> String {
+    let secs = rfc3339_utc(ms / 1000);
+    format!("{}.{:03}Z", &secs[..secs.len() - 1], ms % 1000)
+}
+
 /// Unix seconds for `YYYY-MM-DDTHH:MM:SS[.fff]Z` (UTC only, the shape
 /// `rfc3339_utc` writes; a fraction is accepted and truncated). `None` for
 /// any other shape, an impossible date, or a time before 1970. Hinnant's
@@ -95,6 +103,13 @@ mod tests {
         assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339_utc(1_789_804_800), "2026-09-19T08:00:00Z");
         assert_eq!(rfc3339_utc(1_789_804_800 + 3661), "2026-09-19T09:01:01Z");
+    }
+
+    #[test]
+    fn rfc3339_ms_kats() {
+        assert_eq!(rfc3339_utc_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339_utc_ms(1_789_804_800_007), "2026-09-19T08:00:00.007Z");
+        assert_eq!(parse_rfc3339_utc(&rfc3339_utc_ms(1_789_804_800_999)), Some(1_789_804_800), "parses, fraction truncated");
     }
 
     #[test]

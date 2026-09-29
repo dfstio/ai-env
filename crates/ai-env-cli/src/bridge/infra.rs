@@ -26,12 +26,12 @@
 //! the `image-version-delete` probe: whether the update handler, which holds
 //! `lambda:DeleteMicrovmImageVersion`, removed any earlier version.
 use crate::bridge::audit::{self, AuditRow};
-use crate::bridge::census::read_rows;
 use crate::bridge::config::{AwsCfg, BridgeConfig, Paths, REGION};
 use crate::bridge::doctor::run_capture_cmd;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::logging::open_log_file;
-use crate::bridge::wrapper::{commit_settings, ProbeRow};
+use crate::bridge::probes::{append_row, Expectation, ProbeRow};
+use crate::bridge::wrapper::commit_settings;
 use crate::errors::{CliError, Result};
 use crate::outln;
 use crate::wire::time::{rfc3339_utc, unix_now};
@@ -1192,12 +1192,16 @@ impl VersionInfo {
 /// The states of a version whose delete was requested (it may stay listed a while).
 const DELETION_STATES: [&str; 3] = ["DELETING", "DELETED", "DELETE_FAILED"];
 
-/// Numbers in numeric order, anything else after them in text order.
-fn version_key(v: &str) -> (Option<u64>, String) {
-    (v.parse().ok(), v.to_string())
+/// The service's versions (`N.0`, or a bare `N`) in numeric order, anything
+/// else after them in text order.
+type VersionKey = (bool, Option<(u64, u64)>, String);
+
+fn version_key(v: &str) -> VersionKey {
+    let k = crate::bridge::doctor::image_version_key(v);
+    (k.is_none(), k, v.to_string())
 }
 
-fn snapshot(json: &str, which: &str) -> std::result::Result<BTreeMap<(Option<u64>, String), VersionInfo>, String> {
+fn snapshot(json: &str, which: &str) -> std::result::Result<BTreeMap<VersionKey, VersionInfo>, String> {
     let mut out = BTreeMap::new();
     for item in version_items(json).map_err(|e| format!("{which}: {e}"))? {
         let version = text_of(&item, "imageVersion").ok_or_else(|| format!("{which}: an item has no imageVersion"))?;
@@ -1237,20 +1241,8 @@ fn describe(v: &VersionInfo) -> String {
 fn append_probe_row(paths: &Paths, verdict: &str) -> Result<()> {
     let probes = paths.probes();
     let ext = read_infra_state(paths).ok().flatten().and_then(|s| s.claude_version);
-    let row = ProbeRow { probe: PROBE_NAME.to_string(), stage: PROBE_STAGE.to_string(), ext, sdk: None, verdict: verdict.to_string(), expected: PROBE_EXPECTED.to_string(), ts: rfc3339_utc(unix_now()) };
-    let previous = read_rows(&probes, None)?.into_iter().rev().find(|r| r.get("probe").and_then(|p| p.as_str()) == Some(PROBE_NAME));
-    if let Some(old) = previous.as_ref().and_then(|r| r.get("verdict")).and_then(|v| v.as_str()) {
-        if old != verdict {
-            outln!("probe {PROBE_NAME}: {old} -> {verdict}");
-        }
-    }
-    let mut line = serde_json::to_vec(&row).map_err(|e| CliError::Msg(format!("probe row: {e}")))?;
-    line.push(b'\n');
-    let mut file = open_log_file(&probes)?;
-    let written = file.write(&line)?;
-    if written != line.len() {
-        return Err(CliError::Msg(format!("short probe write: {written} of {} bytes to {}", line.len(), probes.display())));
-    }
+    let row = ProbeRow { ext, ..ProbeRow::new(PROBE_NAME, PROBE_STAGE, verdict, &Expectation::Exact(PROBE_EXPECTED.to_string())) };
+    append_row(&probes, &row)?;
     outln!("recorded {PROBE_NAME}={verdict} (expected {PROBE_EXPECTED}) in {}", probes.display());
     Ok(())
 }
@@ -1663,6 +1655,15 @@ mod tests {
         let kept = versions_diff(&versions(&[("1", "SUCCESSFUL", "ACTIVE")]), &versions(&[("1", "SUCCESSFUL", "ACTIVE"), ("2", "IN_PROGRESS", "INACTIVE")])).unwrap();
         assert_eq!(kept.probe_verdict(), "kept");
         assert_eq!(kept.added.len(), 1);
+    }
+
+    #[test]
+    fn versions_diff_orders_the_services_n0_versions_numerically() {
+        let d = versions_diff(&versions(&[("10.0", "SUCCESSFUL", "ACTIVE"), ("9.0", "SUCCESSFUL", "INACTIVE"), ("x", "FAILED", "INACTIVE")]), "{}").unwrap();
+        let order: Vec<&str> = d.removed.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(order, ["9.0", "10.0", "x"], "9.0 before 10.0, non-numbers last");
+        let mixed = versions_diff(&versions(&[("10.0", "SUCCESSFUL", "ACTIVE"), ("9", "SUCCESSFUL", "ACTIVE")]), "{}").unwrap();
+        assert_eq!(mixed.removed.iter().map(|v| v.version.as_str()).collect::<Vec<_>>(), ["9", "10.0"]);
     }
 
     #[test]

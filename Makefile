@@ -1,11 +1,11 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
+.PHONY: help build check-bins test test-aws test-aws-readonly s4-smoke perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
         claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
 
 SHELL        := /bin/bash
-# The switches that delete, rotate, write, pick a version or skip a gate (YES, KEEP, VERSION, ROTATE, WRITE, CONFIRM,
-# RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE) count only when given on the make command line (`make image-prune YES=1`;
+# The switches that delete, rotate, write, pick a version, skip a gate or widen a live run (YES, KEEP, VERSION, ROTATE,
+# WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES) count only when given on the make command line (`make image-prune YES=1`;
 # a sub-make inherits them): the same name exported in the environment is ignored. $(call cmdline,NAME) is the value, or empty.
 cmdline       = $(if $(filter command line,$(origin $(1))),$($(1)))
 STACK        ?= dev
@@ -87,6 +87,7 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	@target/matrix/none/debug/ai-env session --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'session' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env infra --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'infra' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env creds --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'creds' without bridge"; exit 1; }
+	@target/matrix/none/debug/ai-env lab --help >/dev/null 2>&1;   test $$? -eq 2 || { echo "expected exit 2 for 'lab' without bridge"; exit 1; }
 	@out=$$($(CARGO) build -p $(PKG) --bin ai-env-claude --no-default-features --features shim 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-claude built without bridge"; exit 1; }; \
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
@@ -98,8 +99,25 @@ test: ## Unit + integration tests in all four feature sets
 	$(CARGO) test -p $(PKG) --no-default-features --features shim
 	$(CARGO) test -p $(PKG) --no-default-features --features bridge
 
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code)
-	AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1
+# Live targets never run against a fake: every lab knob of the developer's shell is dropped.
+LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS
+
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code). SLOW=1 adds the 6-minute token-expiry test; PROBES=1 re-records the live S4 probes
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1
+	@$(if $(filter 1,$(call cmdline,PROBES)),rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
+	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
+
+test-aws-readonly: ## Part A live checks, read-only (this identity, eu-central-1): TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm of an unknown id
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored readonly_ --test-threads=1
+
+s4-smoke: ## T4.1 gate: three `ai-env vm smoke --max-duration 900 --json` passes (live, one Touch ID each); records appended to target/s4/smoke.jsonl
+	@mkdir -p target/s4
+	@for i in 1 2 3; do \
+	  out=$$($(LAB_UNSET) $(AI_ENV) vm smoke --max-duration 900 --json) || { echo "$$out"; echo "s4-smoke: pass $$i failed"; exit 1; }; \
+	  printf '%s\n' "$$out" >> target/s4/smoke.jsonl; \
+	  grep -q '"backend":"sdk"' <<<"$$out" || { echo "$$out"; echo "s4-smoke: pass $$i did not use the SDK backend"; exit 1; }; \
+	  echo "s4-smoke: pass $$i ok"; \
+	done; echo "s4-smoke: 3/3 ok (target/s4/smoke.jsonl)"
 
 perf-wrapper: ## T1.2 overhead: ai-env-claude (release) vs a bare exec of the fake, 100 interleaved runs, median delta <= 10 ms
 	AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test wrapper -- --ignored overhead --nocapture --test-threads=1

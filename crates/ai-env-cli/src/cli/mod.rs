@@ -198,9 +198,246 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: CredsCmd,
     },
+    /// MicroVMs of the ai-env image: images, run, list, status, health, token, suspend, resume, terminate, gc, shell, smoke
+    #[cfg(feature = "bridge")]
+    Vm {
+        #[command(subcommand)]
+        cmd: VmCmd,
+    },
+    /// Platform probes (lab/probes.jsonl): list, show, run
+    #[cfg(feature = "bridge")]
+    Lab {
+        #[command(subcommand)]
+        cmd: LabCmd,
+    },
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
     Shim(crate::shim::ShimArgs),
+}
+
+/// `--egress` of `ai-env vm run`.
+#[cfg(feature = "bridge")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum EgressArg {
+    /// The platform default (INTERNET_EGRESS); audited. Only for VMs that never receive a credential
+    Internet,
+    /// [aws].egress_connector_arn (S5); exit 9 when none is configured
+    Vpc,
+}
+
+/// `--auth` of `ai-env vm shell`.
+#[cfg(feature = "bridge")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShellAuthArg {
+    /// x-aws-proxy-auth + x-aws-proxy-port headers (default)
+    Header,
+    /// The documented subprotocol form (fails when the proxy echoes no subprotocol)
+    Subprotocol,
+}
+
+/// `ai-env vm …` (feature `bridge`): the MicroVM lifecycle (plan S4 §6). Every
+/// command unseals the runtime key (one Touch ID) once its flags passed.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum VmCmd {
+    /// The image, its versions (state, status, memory) and the one `vm run` uses
+    Images {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// List the managed base images instead
+        #[arg(long)]
+        managed: bool,
+    },
+    /// Start a MicroVM (or reuse the workspace's), wait until RUNNING, record it in state/vms
+    Run {
+        /// Image ARN (default: [aws].image_arn)
+        #[arg(long, value_name = "ARN")]
+        image: Option<String>,
+        /// Image version: N, N.M or active (default: [aws].image_version)
+        #[arg(long, value_name = "V")]
+        version: Option<String>,
+        /// Maximum duration in seconds, running + suspended (default: [vm].max_duration_s)
+        #[arg(long, value_name = "S", value_parser = clap::value_parser!(u32).range(1..=28_800))]
+        max_duration: Option<u32>,
+        /// Suspend after this many idle seconds (>= 300; default: [vm].max_idle_s)
+        #[arg(long, value_name = "S")]
+        idle: Option<u32>,
+        /// Terminate after this many seconds suspended (<= max duration; default: min([vm].suspended_s, max duration))
+        #[arg(long, value_name = "S")]
+        suspended: Option<u32>,
+        /// Do not resume automatically on the next request
+        #[arg(long)]
+        no_auto_resume: bool,
+        /// Egress: internet (audited) or vpc (default: vpc when [aws].egress_connector_arn is set)
+        #[arg(long, value_enum)]
+        egress: Option<EgressArg>,
+        /// Workspace directory (under [workspaces].roots): locks it and reuses its VM
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Start a new VM even when the workspace has one
+        #[arg(long, requires = "workspace")]
+        new: bool,
+        /// A label stored in the row
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Also attach the SHELL_INGRESS connector (for `vm shell`)
+        #[arg(long)]
+        shell: bool,
+        /// Do not pass [aws].execution_role_arn (no runtime logs)
+        #[arg(long)]
+        no_execution_role: bool,
+        /// Return once RunMicrovm answered (do not wait for RUNNING)
+        #[arg(long)]
+        no_wait: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// VMs of the image (ListMicrovms) joined with state/vms; TERMINATED hidden without --all
+    List {
+        /// Include TERMINATED VMs and terminated rows
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// GetMicrovm of one VM (state, reason, idle policy, connectors); refreshes its row
+    Status {
+        /// MicroVM id
+        id: String,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// GET /health through the endpoint (a 5-minute Port(8080) token)
+    Health {
+        /// MicroVM id
+        id: String,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mint an endpoint token for one port; the value is printed only with --reveal
+    Token {
+        /// MicroVM id
+        id: String,
+        /// Port the token is scoped to: 8080, 8082 or 9418
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Lifetime in minutes
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=60))]
+        minutes: u16,
+        /// Print the token value (alone, on stdout)
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Suspend a RUNNING VM and wait until SUSPENDED
+    Suspend {
+        /// MicroVM id
+        id: String,
+        /// Do not wait
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Resume a SUSPENDED VM and wait until RUNNING
+    Resume {
+        /// MicroVM id
+        id: String,
+        /// Do not wait
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Terminate one VM, or --all of yours (rows + own orphans)
+    Terminate {
+        /// MicroVM id
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        /// Every VM you started (registry rows and your own orphans; never another owner's)
+        #[arg(long)]
+        all: bool,
+        /// Confirm (needed for --all and for a VM without a row)
+        #[arg(long)]
+        yes: bool,
+        /// Do not wait for TERMINATED
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Reconcile ListMicrovms with state/vms: report (default), --yes acts on registry VMs, --include-orphans also on your own orphans
+    Gc {
+        /// Act (terminate expired registry VMs, adopt, clear stale rows)
+        #[arg(long)]
+        yes: bool,
+        /// Also terminate your own orphans older than AGE (90s, 30m, 1h, 2d)
+        #[arg(long, value_name = "AGE", requires = "yes")]
+        include_orphans: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Interactive shell in the VM host (experimental; the VM needs `vm run --shell`)
+    Shell {
+        /// MicroVM id
+        id: String,
+        /// Shell token lifetime in minutes
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u16).range(1..=60))]
+        minutes: u16,
+        /// How the token is presented
+        #[arg(long, value_enum, default_value_t = ShellAuthArg::Header)]
+        auth: ShellAuthArg,
+    },
+    /// T4.1: run → RUNNING → token → /health → terminate → TERMINATED, with timings
+    Smoke {
+        /// Maximum duration of the smoke VM in seconds
+        #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u32).range(60..=28_800))]
+        max_duration: u32,
+        /// Do not pass [aws].execution_role_arn
+        #[arg(long)]
+        no_execution_role: bool,
+        /// Leave the VM running
+        #[arg(long)]
+        keep: bool,
+        /// One JSON record on stdout (the step lines go to stderr)
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `ai-env lab …` (feature `bridge`): the probe records (plan §7, S4 §8).
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum LabCmd {
+    /// Every probe with its expectation and last recorded verdict
+    List {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// The recorded rows of one probe
+    Show {
+        /// Probe name (ai-env lab list)
+        probe: String,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a probe and append its verdict to lab/probes.jsonl (exit 1 after writing when it misses the expectation)
+    Run {
+        /// Probe name (ai-env lab list)
+        probe: String,
+        /// MicroVM id (cloudtrail-payload)
+        id: Option<String>,
+        /// Derive the verdict from this runtime log (`make logs SINCE=30m > FILE`)
+        #[arg(long, value_name = "FILE")]
+        log: Option<PathBuf>,
+        /// Record this verdict by hand (what you observed)
+        #[arg(long, value_name = "VERDICT", conflicts_with = "log")]
+        manual: Option<String>,
+        /// A note stored with the row
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
 }
 
 /// `ai-env infra …` (feature `bridge`): the S3 infrastructure helpers the Makefile drives.
@@ -518,6 +755,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Creds { cmd } => match cmd {
             CredsCmd::AwsSet { user, check, force } => crate::bridge::creds::cmd_aws_set(&store, &user, check, force),
         },
+        #[cfg(feature = "bridge")]
+        Cmd::Vm { cmd } => crate::bridge::vm::cmd::main(&store, cmd),
+        #[cfg(feature = "bridge")]
+        Cmd::Lab { cmd } => crate::bridge::vm::cmd::lab_main(&store, cmd),
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
     }

@@ -118,6 +118,72 @@ pub fn pump_knobs() -> PumpKnobs {
     PumpKnobs::default()
 }
 
+// ---- S4: `ai-env vm` / `lab` knobs ---------------------------------------------------
+
+/// The S4 knob names, for the banner and the test harnesses' scrub lists.
+pub const VM_KNOBS: [&str; 3] = ["AI_ENV_BRIDGE_LAB_FAKE_API", "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "AI_ENV_BRIDGE_LAB_BACKOFF_MS"];
+
+/// The S4 knobs `ai-env vm` and `ai-env lab` honour (debug builds only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmKnobs {
+    /// `AI_ENV_BRIDGE_LAB_FAKE_API=<file.json>`: the control plane AND the
+    /// endpoint are `vm::fake_file::FileFakeMicrovmApi` over this file (state
+    /// shared by processes under `flock(<file>.lock)`); no SDK, no network.
+    pub fake_api: Option<std::path::PathBuf>,
+    /// `AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL=1`: with the fake API, still unseal
+    /// `credentials/aws.env` (tests of the container path with a fake age).
+    pub fake_api_unseal: bool,
+    /// `AI_ENV_BRIDGE_LAB_BACKOFF_MS=<n>`: every poll step and budget scaled
+    /// from 1 s to `n` ms (the process-level tests run in milliseconds).
+    pub backoff_ms: Option<u64>,
+}
+
+impl VmKnobs {
+    /// The names of the active knobs (empty when none): an active knob is
+    /// announced on stderr and marks every `--json` record `"backend":"fake"`
+    /// (with the fake API) or `"backend":"sdk+knobs"` (any other knob).
+    #[must_use]
+    pub fn active(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.fake_api.is_some() {
+            out.push(VM_KNOBS[0]);
+        }
+        if self.fake_api_unseal {
+            out.push(VM_KNOBS[1]);
+        }
+        if self.backoff_ms.is_some() {
+            out.push(VM_KNOBS[2]);
+        }
+        out
+    }
+}
+
+/// Pure parser over the three raw values (unset = `None`); anything
+/// unparseable is off.
+#[must_use]
+pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: Option<&str>) -> VmKnobs {
+    VmKnobs {
+        fake_api: fake_api.map(str::trim).filter(|p| !p.is_empty()).map(std::path::PathBuf::from),
+        fake_api_unseal: unseal.map(str::trim) == Some("1"),
+        backoff_ms: backoff_ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| *ms > 0),
+    }
+}
+
+/// The S4 knobs from the environment (debug builds only).
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn vm_knobs() -> VmKnobs {
+    let get = |k: &str| std::env::var(k).ok();
+    parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref())
+}
+
+/// Release builds: every knob off, whatever the environment says.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub fn vm_knobs() -> VmKnobs {
+    VmKnobs::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +225,18 @@ mod tests {
         assert_eq!(parse_pump_knobs(Some("2"), None, None, None).ignore_eof, 2);
         assert_eq!(parse_pump_knobs(Some("yes"), Some("true"), Some("-5"), Some("x")), PumpKnobs::default(), "garbage is off");
         assert_eq!(parse_pump_knobs(None, None, Some("0"), Some("0")), PumpKnobs::default(), "0 ms is no knob");
+    }
+
+    #[test]
+    fn vm_knobs_parse_and_default() {
+        assert_eq!(parse_vm_knobs(None, None, None), VmKnobs::default());
+        assert!(VmKnobs::default().active().is_empty());
+        let k = parse_vm_knobs(Some("/tmp/f.json"), Some("1"), Some("2"));
+        assert_eq!(k.fake_api.as_deref(), Some(std::path::Path::new("/tmp/f.json")));
+        assert!(k.fake_api_unseal);
+        assert_eq!(k.backoff_ms, Some(2));
+        assert_eq!(k.active(), VM_KNOBS.to_vec());
+        assert_eq!(parse_vm_knobs(Some(" "), Some("yes"), Some("0")), VmKnobs::default(), "blank, garbage and 0 are off");
     }
 
     #[cfg(debug_assertions)]

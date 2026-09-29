@@ -8,8 +8,15 @@
 //! `clock-after-resume` probe has data. Entropy: `/run` mixes per-VM material
 //! into `/dev/urandom` and attempts `RNDRESEEDCRNG` (needs CAP_SYS_ADMIN;
 //! logged, never fatal); the boot nonce does not depend on either.
+//!
+//! The run report (plan S4 D19) is logged once after the first accepted
+//! `/run` and once at `/terminate`: what the VM looks like from inside
+//! (boot id, disk, PID 1's environment by NAME, zombies), for the
+//! `runtime-env`, `disk-budget` and `snapshot-uniqueness` probes.
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 /// A drift below this is left alone even under `--clock forward`.
 pub const STEP_THRESHOLD_S: u64 = 2;
@@ -273,7 +280,7 @@ pub struct BootReport {
     pub guest_s: u64,
 }
 
-fn read_trim(path: &str) -> Option<String> {
+fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
@@ -304,6 +311,192 @@ pub fn boot_report(sys: &dyn SysOps) -> BootReport {
         boot_id: read_trim("/proc/sys/kernel/random/boot_id"),
         guest_s: sys.now().0,
     }
+}
+
+// ---- run report (S4 D19) -----------------------------------------------------------
+
+/// The PID 1 variables whose VALUES the run report shows; every other
+/// variable is reported by name only.
+pub const REPORT_ENV_VALUES: [&str; 6] = ["HOME", "PATH", "AWS_REGION", "AWS_LAMBDA_MICROVM_IMAGE_NAME", "AWS_LAMBDA_MICROVM_IMAGE_ARN", "AWS_LAMBDA_MICROVM_IMAGE_VERSION"];
+
+/// Does `name` carry (or point at) AWS credentials? The run report lists
+/// such names in `aws_credential_env` and never shows their values.
+#[must_use]
+pub fn is_aws_credential_name(name: &str) -> bool {
+    matches!(name, "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN") || name.starts_with("AWS_CONTAINER_")
+}
+
+/// An environment as the run report shows it: names, a few allowlisted
+/// values, and which credential variables exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EnvSummary {
+    /// Every variable name, sorted, without duplicates.
+    pub names: Vec<String>,
+    /// The values of the [`REPORT_ENV_VALUES`] that are set (the first
+    /// occurrence wins, as for `getenv`); nothing else.
+    pub values: BTreeMap<String, String>,
+    /// The names [`is_aws_credential_name`] accepts, sorted: names only,
+    /// never values.
+    pub aws_credential_env: Vec<String>,
+}
+
+/// Parse a `/proc/<pid>/environ` image: NUL-separated `KEY=VALUE` entries.
+/// An entry without `=` or with an empty name is skipped; bytes that are not
+/// UTF-8 are replaced (lossy). Pure; never panics.
+#[must_use]
+pub fn parse_environ(bytes: &[u8]) -> EnvSummary {
+    let mut s = EnvSummary::default();
+    for entry in bytes.split(|&b| b == 0) {
+        let Some(eq) = entry.iter().position(|&b| b == b'=') else { continue };
+        if eq == 0 {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&entry[..eq]).into_owned();
+        if REPORT_ENV_VALUES.contains(&name.as_str()) && !s.values.contains_key(&name) {
+            s.values.insert(name.clone(), String::from_utf8_lossy(&entry[eq + 1..]).into_owned());
+        }
+        if is_aws_credential_name(&name) {
+            s.aws_credential_env.push(name.clone());
+        }
+        s.names.push(name);
+    }
+    for v in [&mut s.names, &mut s.aws_credential_env] {
+        v.sort();
+        v.dedup();
+    }
+    s
+}
+
+/// How many of `stat_lines` (each the text of one `/proc/<pid>/stat`) are
+/// zombies: the state field right after the `)` that closes `comm`. `comm`
+/// may itself hold spaces and parentheses, so the LAST `)` is the one; a
+/// line without one is not counted.
+#[must_use]
+pub fn count_zombies(stat_lines: &[&str]) -> usize {
+    stat_lines.iter().filter(|l| l.rfind(')').and_then(|i| l[i + 1..].split_whitespace().next()) == Some("Z")).count()
+}
+
+/// What a Linux run report is built from, already read (each `None` when
+/// its source was missing or unreadable). `Debug` is hand-written: `environ`
+/// is PID 1's raw environment, credential values included, so it prints as
+/// its length only (and `stat_lines` as a count).
+#[derive(Clone, Copy)]
+pub struct ReportFacts<'a> {
+    /// `run` | `terminate`.
+    pub hook: &'a str,
+    /// The id of the accepted `/run` (`None` before one, or when its id was
+    /// not safe to log).
+    pub microvm_id: Option<&'a str>,
+    /// `/proc/sys/kernel/random/boot_id` (identical in every clone of a
+    /// snapshot: recorded, not relied on).
+    pub boot_id: Option<&'a str>,
+    /// `(total, used)` bytes of `/` (statvfs).
+    pub disk: Option<(u64, u64)>,
+    /// `/proc/1/environ`.
+    pub environ: Option<&'a [u8]>,
+    /// Every `/proc/<pid>/stat` that could be read.
+    pub stat_lines: Option<&'a [&'a str]>,
+    /// The shim's effective uid.
+    pub uid: u32,
+    /// The shim's effective gid.
+    pub gid: u32,
+}
+
+impl std::fmt::Debug for ReportFacts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the bytes of `environ`: they hold PID 1's credential values.
+        let environ = self.environ.map(|e| format!("<{} bytes>", e.len()));
+        let stats = self.stat_lines.map(|s| format!("<{} lines>", s.len()));
+        f.debug_struct("ReportFacts")
+            .field("hook", &self.hook)
+            .field("microvm_id", &self.microvm_id)
+            .field("boot_id", &self.boot_id)
+            .field("disk", &self.disk)
+            .field("environ", &format_args!("{}", environ.as_deref().unwrap_or("None")))
+            .field("stat_lines", &format_args!("{}", stats.as_deref().unwrap_or("None")))
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .finish()
+    }
+}
+
+/// The run report's JSON from [`ReportFacts`] (pure, so it is tested on every
+/// platform): `hook`, `microvm_id`, `boot_id`, `disk_total_bytes`,
+/// `disk_used_bytes`, `env` (`names`, `values`), `aws_credential_env`,
+/// `zombies`, `uid`, `gid`; a missing source is `null`. No credential value
+/// can reach it: `env.values` holds the [`REPORT_ENV_VALUES`] only.
+#[must_use]
+pub fn assemble_report(f: &ReportFacts<'_>) -> serde_json::Value {
+    let env = f.environ.map(parse_environ);
+    serde_json::json!({
+        "hook": f.hook,
+        "microvm_id": f.microvm_id,
+        "boot_id": f.boot_id,
+        "disk_total_bytes": f.disk.map(|d| d.0),
+        "disk_used_bytes": f.disk.map(|d| d.1),
+        "env": env.as_ref().map(|e| serde_json::json!({"names": e.names, "values": e.values})),
+        "aws_credential_env": env.as_ref().map(|e| e.aws_credential_env.clone()),
+        "zombies": f.stat_lines.map(count_zombies),
+        "uid": f.uid,
+        "gid": f.gid,
+    })
+}
+
+/// `(total, used)` bytes of the filesystem holding `path`.
+// `c_ulong` and `fsblkcnt_t` are u64 on 64-bit Linux (and `c_ulong` on the Mac).
+#[allow(clippy::useless_conversion)]
+fn disk_usage(path: &Path) -> Option<(u64, u64)> {
+    let s = nix::sys::statvfs::statvfs(path).ok()?;
+    let frag = u64::from(s.fragment_size());
+    let (blocks, free) = (u64::from(s.blocks()), u64::from(s.blocks_free()));
+    Some((blocks.saturating_mul(frag), blocks.saturating_sub(free).saturating_mul(frag)))
+}
+
+/// The text of every readable `<proc>/<pid>/stat` (a process that exits
+/// meanwhile is skipped); `None` when `proc` cannot be listed.
+fn proc_stat_lines(proc: &Path) -> Option<Vec<String>> {
+    let rd = std::fs::read_dir(proc).ok()?;
+    let pids = rd.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())));
+    Some(pids.filter_map(|e| std::fs::read(e.path().join("stat")).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()).collect())
+}
+
+/// The Linux run report with every source under `root` (`/` on the machine;
+/// a planted tree in the tests, so the paths below are exercised on every
+/// platform): `proc/sys/kernel/random/boot_id`, `proc/1/environ`,
+/// `proc/<pid>/stat`, statvfs of `root`, and the shim's own uid/gid.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_json::Value {
+    let proc = root.join("proc");
+    let boot_id = read_trim(proc.join("sys/kernel/random/boot_id"));
+    let environ = std::fs::read(proc.join("1/environ")).ok();
+    let stats = proc_stat_lines(&proc);
+    let stat_refs: Option<Vec<&str>> = stats.as_ref().map(|v| v.iter().map(String::as_str).collect());
+    assemble_report(&ReportFacts {
+        hook,
+        microvm_id,
+        boot_id: boot_id.as_deref(),
+        disk: disk_usage(root),
+        environ: environ.as_deref(),
+        stat_lines: stat_refs.as_deref(),
+        uid: nix::unistd::geteuid().as_raw(),
+        gid: nix::unistd::getegid().as_raw(),
+    })
+}
+
+/// The run report for `hook` (`run` | `terminate`), read from this machine
+/// (see [`assemble_report`]). Never fails: whatever cannot be read is `null`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn run_report(hook: &str, microvm_id: Option<&str>) -> serde_json::Value {
+    read_report(Path::new("/"), hook, microvm_id)
+}
+
+/// The portable twin: `/proc` does not exist here, so the report says so
+/// (native tests on the Mac still see one line per hook, with the id).
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn run_report(hook: &str, microvm_id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({"unsupported": true, "hook": hook, "microvm_id": microvm_id})
 }
 
 #[cfg(test)]
@@ -456,5 +649,236 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"pid\":") && s.contains("\"machine_id\":"), "{s}");
         assert!(["absent", "empty", "present"].contains(&r.machine_id));
+    }
+
+    /// Credential-shaped values, built at run time (no such literal in the tree).
+    fn credential_values() -> [(&'static str, String); 5] {
+        [
+            ("AWS_ACCESS_KEY_ID", format!("{}{}", "AKIA", "Q".repeat(16))),
+            ("AWS_SECRET_ACCESS_KEY", "s3Cr".repeat(10)),
+            ("AWS_SESSION_TOKEN", format!("tok{}", "Zz9".repeat(30))),
+            ("AWS_CONTAINER_AUTHORIZATION_TOKEN", format!("auth{}", "Yy8".repeat(12))),
+            ("AWS_CONTAINER_CREDENTIALS_FULL_URI", format!("http://169.254.170.23/v1/credentials?x={}", "Ww7".repeat(8))),
+        ]
+    }
+
+    fn environ(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (k, v) in entries {
+            b.extend_from_slice(format!("{k}={v}").as_bytes());
+            b.push(0);
+        }
+        b
+    }
+
+    #[test]
+    fn parse_environ_lists_credential_names_never_their_values() {
+        let creds = credential_values();
+        let mut entries: Vec<(&str, &str)> = vec![
+            ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            ("HOME", "/root"),
+            ("AWS_REGION", "eu-central-1"),
+            ("AWS_LAMBDA_MICROVM_IMAGE_VERSION", "1.0"),
+            ("AWS_LAMBDA_MICROVM_IMAGE_NAME", "ai-env-agent"),
+            ("AWS_LAMBDA_MICROVM_IMAGE_ARN", "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent"),
+            ("AWS_DEFAULT_REGION", "eu-west-3"),
+            ("OTHER_SECRET", "not-an-allowlisted-value"),
+        ];
+        entries.extend(creds.iter().map(|(k, v)| (*k, v.as_str())));
+        let s = parse_environ(&environ(&entries));
+        assert_eq!(s.aws_credential_env, ["AWS_ACCESS_KEY_ID", "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]);
+        let mut all: Vec<&str> = entries.iter().map(|(k, _)| *k).collect();
+        all.sort_unstable();
+        assert_eq!(s.names, all, "every name, sorted");
+        assert_eq!(s.values.keys().map(String::as_str).collect::<Vec<_>>(), {
+            let mut want = REPORT_ENV_VALUES.to_vec();
+            want.sort_unstable();
+            want
+        });
+        assert_eq!(s.values["AWS_LAMBDA_MICROVM_IMAGE_VERSION"], "1.0");
+        assert_eq!(s.values["HOME"], "/root");
+        let json = serde_json::to_string(&s).unwrap();
+        let report = assemble_report(&ReportFacts { environ: Some(&environ(&entries)), ..facts() }).to_string();
+        for text in [&json, &report] {
+            for (name, value) in &creds {
+                assert!(text.contains(name), "{name} is listed: {text}");
+                assert!(!text.contains(value.as_str()), "the value of {name} never appears: {text}");
+            }
+            assert!(!text.contains("not-an-allowlisted-value") && !text.contains("eu-west-3"), "only allowlisted values: {text}");
+        }
+    }
+
+    #[test]
+    fn parse_environ_edge_cases() {
+        assert_eq!(parse_environ(b""), EnvSummary::default());
+        assert_eq!(parse_environ(b"\0\0"), EnvSummary::default());
+        let s = parse_environ(b"PATH=/a=b:/c\0NOEQUALS\0=hidden\0HOME=\0PATH=/second\0HOME=/later\0B=1\0A=2\0B=3");
+        assert_eq!(s.names, ["A", "B", "HOME", "PATH"], "no-'=' and empty-name entries skipped, duplicates once, no trailing NUL needed");
+        assert_eq!(s.values["PATH"], "/a=b:/c", "split at the first '=', the first occurrence wins");
+        assert_eq!(s.values["HOME"], "", "an empty value is a value");
+        assert!(s.aws_credential_env.is_empty());
+        let s = parse_environ(b"AWS_REGION=eu-\xffcentral-1\0X\xfe=1\0");
+        assert_eq!(s.values["AWS_REGION"], "eu-\u{fffd}central-1", "lossy, never a panic");
+        assert!(s.names.contains(&"X\u{fffd}".to_string()), "{:?}", s.names);
+        assert!(is_aws_credential_name("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+        assert!(!is_aws_credential_name("AWS_REGION") && !is_aws_credential_name("MY_AWS_ACCESS_KEY_ID") && !is_aws_credential_name("AWS_CONTAINER"));
+    }
+
+    #[test]
+    fn zombies_are_read_after_the_last_parenthesis() {
+        let lines = [
+            "1 (ai-env) S 0 1 1 0 -1",
+            "42 (sh) Z 1 42 42 0",
+            "43 (kworker a b) Z 2 0 0",
+            "44 (x) Z (y) S 1 44",
+            "45 ((sd-pam)) Z 1 45",
+            "46 (evil) R) Z 1 46",
+            "47 ())) Z 1",
+            "48 (Z) S 1",
+            "49 (zombie) z 1",
+            "50 (x)",
+            "",
+            "garbage without a paren Z",
+        ];
+        // 42, 43, 45, 46 and 47; 44's comm is "x) Z (y" (state S).
+        assert_eq!(count_zombies(&lines), 5);
+        assert_eq!(count_zombies(&[]), 0);
+    }
+
+    fn facts() -> ReportFacts<'static> {
+        ReportFacts { hook: "run", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0 }
+    }
+
+    #[test]
+    fn report_shape_with_and_without_sources() {
+        let empty = assemble_report(&facts());
+        for key in ["microvm_id", "boot_id", "disk_total_bytes", "disk_used_bytes", "env", "aws_credential_env", "zombies"] {
+            assert!(empty[key].is_null(), "a missing source is null: {key} in {empty}");
+        }
+        assert_eq!((empty["hook"].as_str(), empty["uid"].as_u64(), empty["gid"].as_u64()), (Some("run"), Some(0), Some(0)));
+        let env = environ(&[("HOME", "/root"), ("AWS_ACCESS_KEY_ID", "x")]);
+        let stats = ["7 (a) Z 1", "8 (b) S 1"];
+        let full = assemble_report(&ReportFacts {
+            hook: "terminate",
+            microvm_id: Some("microvm-00000000-0000-4000-8000-000000000001"),
+            boot_id: Some("b1"),
+            disk: Some((8 << 30, 1 << 29)),
+            environ: Some(&env),
+            stat_lines: Some(&stats),
+            uid: 0,
+            gid: 0,
+        });
+        assert_eq!(full["hook"], "terminate");
+        assert_eq!(full["microvm_id"], "microvm-00000000-0000-4000-8000-000000000001");
+        assert_eq!(full["boot_id"], "b1");
+        assert_eq!((full["disk_total_bytes"].as_u64(), full["disk_used_bytes"].as_u64()), (Some(8 << 30), Some(1 << 29)));
+        assert_eq!(full["env"]["names"], serde_json::json!(["AWS_ACCESS_KEY_ID", "HOME"]));
+        assert_eq!(full["env"]["values"], serde_json::json!({"HOME": "/root"}));
+        assert_eq!(full["aws_credential_env"], serde_json::json!(["AWS_ACCESS_KEY_ID"]));
+        assert_eq!(full["zombies"], 1);
+        assert!(!full.to_string().contains('\n'), "one log line");
+    }
+
+    #[test]
+    fn report_facts_debug_never_shows_the_environment() {
+        let creds = credential_values();
+        let entries: Vec<(&str, &str)> = creds.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let env = environ(&entries);
+        let stats = ["7 (a) Z 1"];
+        let d = format!("{:?}", ReportFacts { environ: Some(&env), stat_lines: Some(&stats), ..facts() });
+        assert!(d.contains(&format!("environ: <{} bytes>", env.len())) && d.contains("stat_lines: <1 lines>"), "{d}");
+        for (name, value) in &creds {
+            // A derived Debug prints the slice as decimal bytes: neither form may appear.
+            let bytes = format!("{:?}", &value.as_bytes()[..6]);
+            assert!(!d.contains(value.as_str()) && !d.contains(bytes.trim_matches(['[', ']'])), "{name}: {d}");
+            assert!(!d.contains(name), "not even the names: {d}");
+        }
+        assert_eq!(format!("{:?}", facts()), "ReportFacts { hook: \"run\", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0 }");
+    }
+
+    /// A `/proc` as the Linux reader sees it, under a temp root: the paths
+    /// the report reads are exercised on the Mac too (the portable twin
+    /// never reads them).
+    fn plant_proc(root: &std::path::Path, files: &[(&str, &[u8])]) {
+        for (rel, bytes) in files {
+            let p = root.join("proc").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn read_report_reads_boot_id_pid1_environ_and_every_pid_stat() {
+        let t = tempfile::tempdir().unwrap();
+        let creds = credential_values();
+        let pid1 = environ(&[("HOME", "/root"), ("AWS_REGION", "eu-central-1"), (creds[0].0, creds[0].1.as_str()), (creds[2].0, creds[2].1.as_str())]);
+        let other = environ(&[("HOME", "/home/not-pid-1"), ("PID2_ONLY", "x")]);
+        let boot = "3f2c9a1e-5b7d-4c8e-9f01-23456789abcd";
+        plant_proc(
+            t.path(),
+            &[
+                ("sys/kernel/random/boot_id", format!("{boot}\n").as_bytes()),
+                ("1/environ", &pid1),
+                ("1/stat", b"1 (ai-env) S 0 1 1 0 -1"),
+                ("2/environ", &other),
+                ("2/stat", b"2 (sh) Z 1 2 2 0"),
+                ("37/stat", b"37 (my (odd) name) Z 1 37"),
+                ("40/stat", b"40 (sleep) S 1 40"),
+                ("self/stat", b"99 (self) Z 1"),
+                ("sys/stat", b"98 (sys) Z 1"),
+            ],
+        );
+        std::fs::create_dir_all(t.path().join("proc/41")).unwrap();
+        let r = read_report(t.path(), "terminate", Some("microvm-00000000-0000-4000-8000-000000000007"));
+        assert_eq!(r["hook"], "terminate");
+        assert_eq!(r["microvm_id"], "microvm-00000000-0000-4000-8000-000000000007");
+        assert_eq!(r["boot_id"], boot, "trimmed: {r}");
+        assert_eq!(r["env"]["names"], serde_json::json!(["AWS_ACCESS_KEY_ID", "AWS_REGION", "AWS_SESSION_TOKEN", "HOME"]), "PID 1's environ, not another pid's: {r}");
+        assert_eq!(r["env"]["values"], serde_json::json!({"AWS_REGION": "eu-central-1", "HOME": "/root"}));
+        assert_eq!(r["aws_credential_env"], serde_json::json!(["AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN"]));
+        assert_eq!(r["zombies"], 2, "pids 2 and 37 (numeric dirs only; 41 has no stat): {r}");
+        let (total, used) = (r["disk_total_bytes"].as_u64(), r["disk_used_bytes"].as_u64());
+        assert!(total.is_some_and(|t| t > 0) && used.is_some_and(|u| Some(u) <= total), "statvfs of the root: {r}");
+        assert_eq!((r["uid"].as_u64(), r["gid"].as_u64()), (Some(u64::from(nix::unistd::geteuid().as_raw())), Some(u64::from(nix::unistd::getegid().as_raw()))));
+        let text = r.to_string();
+        for (_, value) in &creds {
+            assert!(!text.contains(value.as_str()), "{text}");
+        }
+        // Nothing planted: every /proc field is null, the disk still answers.
+        let empty = tempfile::tempdir().unwrap();
+        let r = read_report(empty.path(), "run", None);
+        for key in ["microvm_id", "boot_id", "env", "aws_credential_env", "zombies"] {
+            assert!(r[key].is_null(), "{key} in {r}");
+        }
+        assert!(r["disk_total_bytes"].as_u64().is_some_and(|t| t > 0), "{r}");
+        // A /proc whose PID 1 environ is unreadable (a directory here) and an empty listing.
+        std::fs::create_dir_all(empty.path().join("proc/1/environ")).unwrap();
+        let r = read_report(empty.path(), "run", None);
+        assert!(r["env"].is_null() && r["aws_credential_env"].is_null(), "{r}");
+        assert_eq!(r["zombies"], 0, "a listable /proc without stats: {r}");
+    }
+
+    #[test]
+    fn run_report_on_this_platform_never_panics() {
+        let r = run_report("run", Some("microvm-x"));
+        assert_eq!((r["hook"].as_str(), r["microvm_id"].as_str()), (Some("run"), Some("microvm-x")));
+        if cfg!(target_os = "linux") {
+            // Values, not key presence: `assemble_report` emits every key (null when unread).
+            assert!(r["boot_id"].as_str().is_some_and(|b| b.len() == 36 && b.matches('-').count() == 4), "a uuid boot_id: {r}");
+            assert!(r["zombies"].is_u64(), "/proc is listable: {r}");
+            let (total, used) = (r["disk_total_bytes"].as_u64(), r["disk_used_bytes"].as_u64());
+            assert!(total.is_some_and(|t| t > 0) && used.is_some_and(|u| Some(u) <= total), "statvfs(/) answers on Linux: {r}");
+            let readable = std::fs::read("/proc/1/environ").is_ok();
+            assert_eq!(r["env"].is_object(), readable, "env is PID 1's environ exactly when this uid may read it: {r}");
+            assert_eq!(r["aws_credential_env"].is_array(), readable, "{r}");
+            if readable {
+                assert!(r["env"]["names"].as_array().is_some_and(|n| !n.is_empty()) && r["env"]["values"].is_object(), "{r}");
+            }
+            assert_eq!((r["uid"].as_u64(), r["gid"].as_u64()), (Some(u64::from(nix::unistd::geteuid().as_raw())), Some(u64::from(nix::unistd::getegid().as_raw()))), "{r}");
+            assert!(r.get("unsupported").is_none(), "{r}");
+        } else {
+            assert_eq!(r["unsupported"], true, "{r}");
+        }
+        assert!(run_report("terminate", None)["microvm_id"].is_null());
     }
 }

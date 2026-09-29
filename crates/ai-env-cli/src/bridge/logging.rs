@@ -27,6 +27,11 @@ pub const CAPPED_CRATES: &[&str] = &[
     "aws_credential_types",
 ];
 
+/// Crates held to ERROR: aws-config logs the resolved `Credentials` with
+/// `{:?}` (the access key id) at INFO while building a profile chain, and
+/// the assume-role provider (role ARN, external id) at WARN.
+pub const CAPPED_AT_ERROR: &[&str] = &["aws_config"];
+
 /// Crate families capped the same way: prefix match on the first segment.
 /// The SDK logs under `aws_smithy_runtime::…`, `aws_sdk_lambdamicrovms::…`,
 /// `aws_config::…` — none of them an exact name in [`CAPPED_CRATES`].
@@ -47,14 +52,18 @@ fn ours(target: &str) -> bool {
     krate == "ai_env" || krate.starts_with("ai_env_")
 }
 
-/// `true` when the cap drops an event with this target and level: DEBUG and
-/// TRACE from a capped crate or family. INFO and above always pass.
+/// `true` when the cap drops an event with this target and level: everything
+/// below ERROR from [`CAPPED_AT_ERROR`]; DEBUG and TRACE from a capped crate
+/// or family. INFO and above pass otherwise.
 #[must_use]
 pub fn is_capped(target: &str, level: Level) -> bool {
+    let krate = crate_of(target);
+    if CAPPED_AT_ERROR.contains(&krate) {
+        return level > Level::ERROR;
+    }
     if level <= Level::INFO {
         return false;
     }
-    let krate = crate_of(target);
     CAPPED_CRATES.contains(&krate) || CAPPED_FAMILIES.iter().any(|f| krate.starts_with(f))
 }
 
@@ -225,6 +234,17 @@ mod tests {
         tracing::subscriber::with_default(sub, emit);
         let bytes = sink.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn aws_config_is_held_to_error() {
+        use tracing::Level;
+        for level in [Level::TRACE, Level::DEBUG, Level::INFO, Level::WARN] {
+            assert!(is_capped("aws_config::profile::credentials", level), "{level}");
+        }
+        assert!(!is_capped("aws_config::profile::credentials", Level::ERROR));
+        assert!(!is_capped("aws_smithy_runtime::client", Level::INFO), "other AWS crates keep INFO");
+        assert!(is_capped("aws_smithy_runtime::client", Level::DEBUG));
     }
 
     #[test]

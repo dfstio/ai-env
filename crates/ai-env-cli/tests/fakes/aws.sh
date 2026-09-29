@@ -1,6 +1,6 @@
 #!/bin/sh
-# Fake `aws` CLI for the S3 tests: never talks to AWS. Copied into a temp bin
-# dir as `aws`. Every call except `--version` must carry `--region
+# Fake `aws` CLI for the S3 and S4 tests: never talks to AWS. Copied into a
+# temp bin dir as `aws`. Every call except `--version` must carry `--region
 # eu-central-1` (the house rule for every aws call), else it fails with 252
 # like the real CLI's usage errors. Access key ids and secrets are built at
 # run time (AKIAFAKE + a 12-digit counter; a repeated 4-character block).
@@ -15,6 +15,13 @@
 #                                                (unset: the fake account holds no
 #                                                image, ResourceNotFoundException,
 #                                                exit 254)
+#   aws service-quotas get-service-quota --service-code lambda --quota-code
+#       L-CD1C0CC4 ...                           the quota JSON, Value
+#                                                FAKE_AWS_QUOTA_GB (any other
+#                                                code: NoSuchResourceException,
+#                                                exit 254)
+#   aws cloudtrail lookup-events ...             the contents of FAKE_AWS_CLOUDTRAIL_FILE
+#                                                (unset: {"Events": []})
 # Environment:
 #   FAKE_AWS_LOG    when set, each call's argv is appended here, one line
 #   FAKE_AWS_KEYS   access keys the user already has (default 0)
@@ -26,6 +33,9 @@
 #   FAKE_AWS_IMAGE_STATE   get-microvm-image's state (CREATED, UPDATED, ...)
 #   FAKE_AWS_IMAGE_ACTIVE  its latestActiveImageVersion, a number (unset: null)
 #   FAKE_AWS_IMAGE_FAILED  its latestFailedImageVersion, a number (unset: null)
+#   FAKE_AWS_QUOTA_GB      the MicroVM memory quota's Value in Gigabytes, a
+#                          number (default 400.0, the AWS default)
+#   FAKE_AWS_CLOUDTRAIL_FILE  a lookup-events JSON document to print
 set -u
 if [ -n "${FAKE_AWS_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
@@ -37,12 +47,16 @@ fi
 region=
 user=
 image=
+service=
+quota=
 prev=
 for a in "$@"; do
   case "$prev" in
     --region) region=$a ;;
     --user-name) user=$a ;;
     --image-identifier) image=$a ;;
+    --service-code) service=$a ;;
+    --quota-code) quota=$a ;;
   esac
   prev=$a
 done
@@ -97,6 +111,19 @@ case "${1:-} ${2:-}" in
     fi
     printf '{\n    "imageArn": "%s",\n    "imageName": "%s",\n    "state": "%s",\n    "latestActiveImageVersion": %s,\n    "latestFailedImageVersion": %s\n}\n' \
       "$image" "${image##*:}" "$FAKE_AWS_IMAGE_STATE" "${FAKE_AWS_IMAGE_ACTIVE:-null}" "${FAKE_AWS_IMAGE_FAILED:-null}" ;;
+  "service-quotas get-service-quota")
+    if [ "$service" != lambda ] || [ "$quota" != L-CD1C0CC4 ]; then
+      printf '\nAn error occurred (NoSuchResourceException) when calling the GetServiceQuota operation: The request failed because the specified quota %s does not exist for service %s.\n' "$quota" "$service" >&2
+      exit 254
+    fi
+    printf '{\n    "Quota": {\n        "ServiceCode": "lambda",\n        "ServiceName": "AWS Lambda",\n        "QuotaArn": "arn:aws:servicequotas:%s:123456789012:lambda/%s",\n        "QuotaCode": "%s",\n        "QuotaName": "Max allocated ARM_64 MicroVM memory",\n        "Value": %s,\n        "Unit": "None",\n        "Adjustable": true,\n        "GlobalQuota": false\n    }\n}\n' \
+      "$region" "$quota" "$quota" "${FAKE_AWS_QUOTA_GB:-400.0}" ;;
+  "cloudtrail lookup-events")
+    if [ -n "${FAKE_AWS_CLOUDTRAIL_FILE:-}" ]; then
+      cat "$FAKE_AWS_CLOUDTRAIL_FILE"
+    else
+      printf '{\n    "Events": []\n}\n'
+    fi ;;
   *)
     echo "fake aws: unsupported command: $*" >&2
     exit 2 ;;
