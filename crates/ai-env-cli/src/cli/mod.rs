@@ -428,7 +428,7 @@ pub enum LabCmd {
         probe: String,
         /// MicroVM id (cloudtrail-payload)
         id: Option<String>,
-        /// Derive the verdict from this runtime log (`make logs SINCE=30m > FILE`)
+        /// Derive the verdict from this runtime log (`make logs SINCE=30m > FILE`), or for cloudtrail-payload from a trail's gunzipped CloudTrail log file
         #[arg(long, value_name = "FILE")]
         log: Option<PathBuf>,
         /// Record this verdict by hand (what you observed)

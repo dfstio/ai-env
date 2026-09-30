@@ -128,8 +128,11 @@ async fn tls_live_amazontrust() {
         return;
     }
     let client = tls::reqwest_client().unwrap();
-    let r = client.get("https://www.amazontrust.com/repository/").send().await.unwrap();
-    assert!(r.status().is_success(), "{}", r.status());
+    // CloudFront in front of the site answers 403 to an HTTP/1.1 request without a User-Agent (30 Sep 2026), so the
+    // request names one: a refusal after `send()` succeeded would be the site's policy, not a TLS failure.
+    let r = client.get("https://www.amazontrust.com/repository/").header("user-agent", "ai-env-tests").send().await.unwrap();
+    eprintln!("tls_live_amazontrust: HTTP {} {:?} (TLS 1.3 under Amazon Root CA 1–4)", r.status(), r.version());
+    assert!(r.status().is_success(), "{} (the handshake succeeded; the site refused the request)", r.status());
 }
 
 fn spec(token: &str) -> RunSpec {

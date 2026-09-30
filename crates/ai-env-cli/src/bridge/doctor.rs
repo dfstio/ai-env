@@ -187,9 +187,12 @@ pub fn row_toolchain(rustc_out: Option<&str>) -> DoctorLine {
     }
 }
 
-/// `cargo_lambda`: every `cargo-lambda` on PATH, in PATH order, with its
-/// `lambda --version` output. The first one is what `cargo lambda` runs; a
-/// good one behind a bad one is reported as shadowed.
+/// `cargo_lambda`: every `cargo-lambda` on PATH, in PATH order, then
+/// `~/.cargo/bin`'s when it is not on PATH, each with its `lambda --version`
+/// output. `make vm-build` uses the first that meets the floor (as the
+/// Makefile's `CARGO_LAMBDA` selection does), so a good one behind an old
+/// Homebrew one is `[ok ]` with a note that plain `cargo lambda` still runs
+/// the old one.
 #[must_use]
 pub fn row_cross_tools(cargo_lambda: &[(PathBuf, Option<String>)], zig_out: Option<&str>) -> DoctorLine {
     let zig = zig_out.and_then(version_token).unwrap_or_else(|| "zig missing".to_string());
@@ -206,11 +209,11 @@ pub fn row_cross_tools(cargo_lambda: &[(PathBuf, Option<String>)], zig_out: Opti
     let v = first_ver.clone().unwrap_or_else(|| "unknown".to_string());
     match versions.iter().skip(1).find(|(_, ver)| good(ver)) {
         Some((p2, Some(v2))) => DoctorLine::row(
-            Tag::Warn,
+            Tag::Ok,
             format!(
-                "cargo-lambda {v} < {min} ({}) shadows {v2} ({}) on PATH — put {} first or brew uninstall cargo-lambda",
-                first_path.display(),
+                "cargo-lambda {v2} ({}), zig {zig} (make vm-build uses it; plain `cargo lambda` still runs {v} from {} — brew uninstall cargo-lambda, or put {} first)",
                 p2.display(),
+                first_path.display(),
                 p2.parent().unwrap_or(Path::new("~/.cargo/bin")).display()
             ),
         ),
@@ -540,6 +543,13 @@ pub fn row_base_image(listing: Option<Result<&str, &str>>) -> DoctorLine {
     }
 }
 
+/// `arn:aws:iam::<account>:root`: the account root user, which
+/// `simulate-principal-policy` refuses (`InvalidInput`).
+#[must_use]
+pub fn is_root_arn(arn: &str) -> bool {
+    arn.strip_prefix("arn:aws:iam::").and_then(|r| r.split_once(':')).is_some_and(|(acct, rest)| acct.len() == 12 && acct.bytes().all(|c| c.is_ascii_digit()) && rest == "root")
+}
+
 /// `aws iam simulate-principal-policy` for `arn` (the doctor's IAM row):
 /// the region is pinned like every aws call, although IAM is global.
 fn iam_simulate_args(arn: &str) -> [&str; 11] {
@@ -806,7 +816,15 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     let mut lines = Vec::new();
 
     lines.push(row_toolchain(run_capture("rustup", &["run", EXPECTED_TOOLCHAIN, "rustc", "--version"], t).ok().as_deref()));
-    let cargo_lambda: Vec<(PathBuf, Option<String>)> = all_in_path("cargo-lambda", &effective_path())
+    let mut candidates = all_in_path("cargo-lambda", &effective_path());
+    // The Makefile also looks in ~/.cargo/bin when it is not on PATH.
+    if let Some(home) = std::env::var_os("HOME") {
+        let cargo_bin = PathBuf::from(home).join(".cargo").join("bin").join("cargo-lambda");
+        if cargo_bin.is_file() && !candidates.contains(&cargo_bin) {
+            candidates.push(cargo_bin);
+        }
+    }
+    let cargo_lambda: Vec<(PathBuf, Option<String>)> = candidates
         .into_iter()
         .map(|p| {
             let out = run_capture(&p.to_string_lossy(), &["lambda", "--version"], t).ok();
@@ -827,8 +845,12 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     let arn = sts.as_ref().and_then(|r| r.as_ref().ok()).and_then(|json| {
         serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.get("Arn").and_then(|a| a.as_str()).map(str::to_string))
     });
-    let sim = arn.as_ref().map(|arn| run_capture("aws", &iam_simulate_args(arn), Duration::from_secs(15)));
-    lines.push(row_iam_simulate(sim.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    if arn.as_deref().is_some_and(is_root_arn) {
+        lines.push(DoctorLine::row(Tag::Skip, "iam simulate: not possible for the account root user (use an IAM user or SSO role for day-to-day work)"));
+    } else {
+        let sim = arn.as_ref().map(|arn| run_capture("aws", &iam_simulate_args(arn), Duration::from_secs(15)));
+        lines.push(row_iam_simulate(sim.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    }
     let base = arn.as_ref().map(|_| {
         let id = format!("arn:aws:lambda:{REGION}:aws:microvm-image:{BASE_IMAGE_NAME}");
         run_capture("aws", &["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", &id, "--region", REGION, "--output", "json"], Duration::from_secs(15))
@@ -981,6 +1003,9 @@ mod tests {
 
     #[test]
     fn the_doctor_iam_call_pins_the_region() {
+        assert!(is_root_arn("arn:aws:iam::123456789012:root"));
+        assert!(!is_root_arn("arn:aws:iam::123456789012:user/root"));
+        assert!(!is_root_arn("arn:aws:sts::123456789012:assumed-role/x/y"));
         let args = iam_simulate_args("arn:aws:iam::123456789012:user/example");
         assert!(args.windows(2).any(|w| w == ["--region", "eu-central-1"]), "{args:?}");
         assert_eq!(&args[..2], ["iam", "simulate-principal-policy"]);
@@ -1343,8 +1368,8 @@ mod tests {
         assert_eq!(tag, Tag::Warn);
         assert!(t.contains("1.9.1 < 1.9.2") && t.contains("upgrade:"), "{t}");
         let (tag, t) = text(&row_cross_tools(&[brew.clone(), good.clone()], None));
-        assert_eq!(tag, Tag::Warn);
-        assert!(t.contains("shadows 1.9.2 (/Users/mike/.cargo/bin/cargo-lambda)") && t.contains("put /Users/mike/.cargo/bin first"), "{t}");
+        assert_eq!(tag, Tag::Ok, "make vm-build skips the old Homebrew one: {t}");
+        assert!(t.starts_with("cargo-lambda 1.9.2 (/Users/mike/.cargo/bin/cargo-lambda)") && t.contains("still runs 1.9.1 from /opt/homebrew/bin/cargo-lambda") && t.contains("put /Users/mike/.cargo/bin first"), "{t}");
         let (tag, _) = text(&row_cross_tools(&[good, brew], None));
         assert_eq!(tag, Tag::Ok, "the good one first on PATH is what runs");
         let (tag, t) = text(&row_cross_tools(&[], None));

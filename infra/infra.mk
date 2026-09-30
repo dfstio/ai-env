@@ -166,7 +166,7 @@ runtime-key: ## S3 part B (D23): create an access key for ai-env-runtime, seal i
 	  if [ -n "$$extra" ]; then echo "runtime-key: IAM lists new key(s) sealed nowhere besides the sealed $$sid (a retried create-access-key). Delete them:"; \
 	    for k in $$extra; do echo "  aws iam delete-access-key --user-name $$user --access-key-id $$k --region $(REGION)"; done; fi; \
 	  case "$$rc:$$arn" in \
-	  0:*:user/$$user) echo "runtime-key: the sealed key $$key identifies as user/$$user" ;; \
+	  0:*:user/$$user) echo "runtime-key: the sealed key ...$${key: -4} identifies as user/$$user" ;; \
 	  0:*|42:*) \
 	    if [ -n "$$bak" ]; then echo "runtime-key: the sealed key $$key does not identify as user/$$user. $$sealed now holds it; the previous key $$old is still active and sealed in $$bak. If it never verifies, undo the rotation:"; \
 	    else echo "runtime-key: the sealed key $$key does not identify as user/$$user; the previous key ($${old:-none}) is kept. If it never verifies, delete the new one:"; fi; \

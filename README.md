@@ -272,7 +272,12 @@ endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code
 terminate) their own short VMs; `hooks-port`, `hooks-source-ip`, `runtime-env`, `disk-budget` and
 the second pass of `snapshot-uniqueness` read a runtime log (`make logs SINCE=30m > FILE`, then
 `--log FILE`; the shim logs one `ai-env: run-report` line after `/run` and at `/terminate`);
-`cloudtrail-payload ID` asks CloudTrail as the operator's own `aws` identity.
+`cloudtrail-payload ID` asks CloudTrail as the operator's own `aws` identity: RunMicrovm is a CloudTrail
+data event (resource type `AWS::Lambda::MicrovmImage`, off by default, never in event history). A trail
+or eu-central-1 event data store that logs it → the probe says how to fetch the record and read it with
+`--log FILE` (a gunzipped trail log file or a CloudTrail Lake query result); none → it prints the
+`--manual not-logged` command to run once you have confirmed there is no store in another Region and no
+organization store (invisible from here). It never records a verdict for what it could not see.
 
 ```sh
 make test-aws-readonly         # part A: TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm (read-only)

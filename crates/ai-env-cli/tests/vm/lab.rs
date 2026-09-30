@@ -84,6 +84,22 @@ fn lab_live_probes_against_the_fake_leave_no_vm() {
 }
 
 #[test]
+fn lab_no_traffic_probe_measures_the_window_before_run() {
+    // Live (30 Sep 2026): the endpoint answered /health from a shim that had not seen /run yet.
+    let w = World::new("");
+    w.update(|s| s.pre_run_health = 2);
+    let o = w.run(&["lab", "run", "no-traffic-before-run"]);
+    assert_eq!(code(&o), 0, "recorded, not an expectation miss: {}\n{}", stdout(&o), stderr(&o));
+    let row = rows(&w, "no-traffic-before-run").pop().unwrap();
+    assert_eq!(row["verdict"], "health-before-run");
+    assert_eq!(row["expected"], "recorded");
+    let note = row["note"].as_str().unwrap();
+    // The fake answers twice without /run, then with it: the window closes within its own budget (timing-free).
+    assert!(note.starts_with("first 200 without /run") && note.contains("; run_hook_seen ") && !note.contains("still false"), "{note}");
+    no_vm_left(&w);
+}
+
+#[test]
 fn lab_snapshot_log_pass_needs_the_live_pass_first() {
     let w = World::new("");
     let o = w.run(&["lab", "run", "snapshot-uniqueness", "--log", &fixture("run-report.log")]);
@@ -104,33 +120,120 @@ fn lab_cloudtrail_fixture_verdicts() {
     let id = serde_json::from_str::<serde_json::Value>(&stdout(&run)).unwrap()["id"].as_str().unwrap().to_string();
     let row: toml::Value = toml::from_str(&fs::read_to_string(w.bridge().join("state/vms").join(format!("{id}.toml"))).unwrap()).unwrap();
     let (ct, session) = (row["client_token"].as_str().unwrap().to_string(), row["session_token"].as_str().unwrap().to_string());
-    let events = |payload: &str| {
-        let inner = serde_json::json!({"eventID": "e-1", "requestParameters": {"clientToken": ct, "runHookPayload": payload}, "responseElements": {"microvmId": id}});
-        serde_json::json!({"Events": [{"EventName": "RunMicrovm", "CloudTrailEvent": inner.to_string()}]}).to_string()
+    let aws_log = w.root().join("aws.log");
+    let write = |name: &str, doc: serde_json::Value| {
+        let p = w.root().join(name);
+        fs::write(&p, doc.to_string()).unwrap();
+        p
     };
-    let file = w.root().join("ct.json");
-    let lab = |doc: Option<String>| {
-        if let Some(d) = &doc {
-            fs::write(&file, d).unwrap();
+    let lab = |env: &[(&str, &Path)], log: Option<&Path>| {
+        let mut args = vec!["lab", "run", "cloudtrail-payload", id.as_str()];
+        let log_arg = log.map(|p| p.display().to_string());
+        if let Some(l) = &log_arg {
+            args.extend(["--log", l.as_str()]);
         }
-        let mut c = w.cmd(&["lab", "run", "cloudtrail-payload", &id]);
-        c.env("PATH", &path);
-        if doc.is_some() {
-            c.env("FAKE_AWS_CLOUDTRAIL_FILE", &file);
+        let mut c = w.cmd(&args);
+        c.env("PATH", &path).env("FAKE_AWS_LOG", &aws_log);
+        for (k, v) in env {
+            c.env(k, v);
         }
         c.output().unwrap()
     };
-    let none = lab(None);
-    assert_eq!(code(&none), 1, "not yet visible: {}", stderr(&none));
-    assert!(rows(&w, "cloudtrail-payload").is_empty(), "nothing recorded while CloudTrail has no event");
-    let hidden = lab(Some(events("HIDDEN_DUE_TO_SECURITY_REASONS")));
+    // No trail and no store visible from eu-central-1: the probe still records nothing (stores homed in other Regions
+    // and organization stores are invisible from here) and prints the --manual command for the operator.
+    let none = lab(&[], None);
+    assert_eq!(code(&none), 1, "{}", stderr(&none));
+    assert!(stderr(&none).contains("0 checked") && stderr(&none).contains("other Regions") && stderr(&none).contains("organization"), "{}", stderr(&none));
+    assert!(rows(&w, "cloudtrail-payload").is_empty(), "never a verdict for what it could not see");
+    let manual = stderr(&none).split(&format!("ai-env lab run cloudtrail-payload {id} --manual not-logged --note \"")).nth(1).and_then(|t| t.split('"').next()).map(str::to_string).expect("the printed --manual command");
+    let o = w.run(&["lab", "run", "cloudtrail-payload", &id, "--manual", "not-logged", "--note", &manual]);
+    assert_eq!(code(&o), 0, "the printed command records: {}", stderr(&o));
+    let row = rows(&w, "cloudtrail-payload").pop().unwrap();
+    assert_eq!(row["verdict"], "not-logged");
+    assert!(row["note"].as_str().unwrap().contains("data event (AWS::Lambda::MicrovmImage)"), "{row}");
+    // A trail with management events only (the fake's default selectors): the same answer, counted.
+    let trails = write(
+        "trails.json",
+        serde_json::json!({"trailList": [{"Name": "t", "TrailARN": "arn:aws:cloudtrail:eu-central-1:123456789012:trail/t", "HomeRegion": "eu-central-1", "S3BucketName": "trail-bucket", "S3KeyPrefix": "p"}]}),
+    );
+    let mgmt = lab(&[("FAKE_AWS_TRAILS_FILE", &trails)], None);
+    assert_eq!(code(&mgmt), 1, "{}", stderr(&mgmt));
+    assert!(stderr(&mgmt).contains("no trail (1 checked"), "{}", stderr(&mgmt));
+    // The same trail selecting MicroVM data events (the AWS docs' selector): the record lives in its S3 log files.
+    let selectors = write(
+        "selectors.json",
+        serde_json::json!({"AdvancedEventSelectors": [{"Name": "microvm", "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::Lambda::MicrovmImage"]}]}]}),
+    );
+    let before = rows(&w, "cloudtrail-payload").len();
+    let logged = lab(&[("FAKE_AWS_TRAILS_FILE", &trails), ("FAKE_AWS_SELECTORS_FILE", &selectors)], None);
+    assert_eq!(code(&logged), 1, "{}", stderr(&logged));
+    assert!(stderr(&logged).contains("s3://trail-bucket/p/AWSLogs/") && stderr(&logged).contains("--log FILE"), "{}", stderr(&logged));
+    // An event data store that logs them, even a stopped one (it keeps what it ingested): the exact Lake query.
+    let stores = write("stores.json", serde_json::json!({"EventDataStores": [{"EventDataStoreArn": "arn:aws:cloudtrail:eu-central-1:123456789012:eventdatastore/eds-1"}]}));
+    for status in ["ENABLED", "STOPPED_INGESTION", "PENDING_DELETION"] {
+        let store = write("store.json", serde_json::json!({"Status": status, "AdvancedEventSelectors": [{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "StartsWith": ["AWS::Lambda::"]}]}]}));
+        let by_store = lab(&[("FAKE_AWS_STORES_FILE", &stores), ("FAKE_AWS_STORE_FILE", &store)], None);
+        assert_eq!(code(&by_store), 1, "{status}: {}", stderr(&by_store));
+        let err = stderr(&by_store);
+        assert!(err.contains(&format!("({status})")) && err.contains("FROM eds-1 WHERE eventName = 'RunMicrovm'") && err.contains(&format!("--log ~/ct-{id}.json")), "{status}: {err}");
+    }
+    // A store that logs something else is counted and does not keep the record.
+    let s3_only = write("store-s3.json", serde_json::json!({"Status": "ENABLED", "AdvancedEventSelectors": [{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::S3::Object"]}]}]}));
+    let other_store = lab(&[("FAKE_AWS_STORES_FILE", &stores), ("FAKE_AWS_STORE_FILE", &s3_only)], None);
+    assert_eq!(code(&other_store), 1, "{}", stderr(&other_store));
+    assert!(stderr(&other_store).contains("(1 checked)") && stderr(&other_store).contains("--manual not-logged"), "{}", stderr(&other_store));
+    // What cannot be read fails closed (exit 7, nothing recorded): the listings, a trail's selectors, a store.
+    for (op, env) in [
+        ("cloudtrail describe-trails", vec![]),
+        ("cloudtrail list-event-data-stores", vec![]),
+        ("cloudtrail get-event-selectors", vec![("FAKE_AWS_TRAILS_FILE", trails.as_path())]),
+        ("cloudtrail get-event-data-store", vec![("FAKE_AWS_STORES_FILE", stores.as_path()), ("FAKE_AWS_STORE_FILE", s3_only.as_path())]),
+    ] {
+        let mut c = w.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+        c.env("PATH", &path).env("FAKE_AWS_LOG", &aws_log).env("FAKE_AWS_FAIL_OP", op);
+        for (k, v) in &env {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        assert_eq!(code(&o), 7, "{op}: {}", stderr(&o));
+        assert!(stderr(&o).contains("nothing recorded"), "{op}: {}", stderr(&o));
+    }
+    assert_eq!(rows(&w, "cloudtrail-payload").len(), before, "nothing recorded while the record is elsewhere or unknown");
+    // The trail's log file, passed with --log: the RunMicrovm record of this VM (a TerminateMicrovm record answering
+    // with the same id is skipped).
+    let records = |payload: &str| {
+        serde_json::json!({"Records": [
+            {"eventName": "TerminateMicrovm", "eventID": "e-0", "responseElements": {"microvmId": id}},
+            {"eventName": "RunMicrovm", "eventID": "e-1", "requestParameters": {"clientToken": ct, "runHookPayload": payload}, "responseElements": {"microvmId": id}},
+        ]})
+    };
+    let hidden = lab(&[], Some(&write("ct-hidden.json", records("HIDDEN_DUE_TO_SECURITY_REASONS"))));
     assert_eq!(code(&hidden), 0, "{}", stderr(&hidden));
     assert_eq!(rows(&w, "cloudtrail-payload").pop().unwrap()["verdict"], "hidden");
-    let leaked = lab(Some(events(&format!("{{\"token\":\"{session}\"}}"))));
+    let only_terminate = write("ct-terminate.json", serde_json::json!({"Records": [{"eventName": "TerminateMicrovm", "responseElements": {"microvmId": id}}]}));
+    let other = lab(&[], Some(&only_terminate));
+    assert_eq!(code(&other), 1, "{}", stderr(&other));
+    assert!(stderr(&other).contains("no RunMicrovm record"), "{}", stderr(&other));
+    let leaked = lab(&[], Some(&write("ct-leaked.json", records(&format!("{{\"token\":\"{session}\"}}")))));
     assert_eq!(code(&leaked), 1, "a leak fails, after writing");
     assert_eq!(rows(&w, "cloudtrail-payload").pop().unwrap()["verdict"], "LEAKED");
     assert!(!fs::read_to_string(w.bridge().join("lab/probes.jsonl")).unwrap().contains(&session), "the probe row never carries the token");
     assert_eq!(code(&w.run(&["lab", "run", "cloudtrail-payload"])), 2, "needs an id");
+    // A Lake query result (the printed query's columns), passed with --log.
+    let lake = serde_json::json!({"QueryStatus": "FINISHED", "QueryResultRows": [[
+        {"eventID": "e-9"}, {"eventName": "RunMicrovm"}, {"clientToken": ct}, {"runHookPayload": "HIDDEN_DUE_TO_SECURITY_REASONS"}, {"microvmId": id},
+        {"requestParameters": "{}"}, {"responseElements": "{}"}]]});
+    let from_lake = lab(&[], Some(&write("ct-lake.json", lake)));
+    assert_eq!(code(&from_lake), 0, "{}", stderr(&from_lake));
+    assert!(rows(&w, "cloudtrail-payload").pop().unwrap()["note"].as_str().unwrap().contains("event e-9"));
+    // Every aws call carried --region eu-central-1 (the fake refuses others) and the pinned CloudTrail endpoint, even
+    // with AWS_ENDPOINT_URL set; only read-only CloudTrail calls were made.
+    let mut c = w.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+    c.env("PATH", &path).env("FAKE_AWS_LOG", &aws_log).env("AWS_ENDPOINT_URL", "http://127.0.0.1:9");
+    assert_eq!(code(&c.output().unwrap()), 1);
+    let calls = fs::read_to_string(&aws_log).unwrap();
+    assert!(calls.lines().all(|l| ["cloudtrail describe-trails", "cloudtrail get-event-selectors", "cloudtrail list-event-data-stores", "cloudtrail get-event-data-store"].iter().any(|p| l.starts_with(p))), "{calls}");
+    assert!(calls.lines().all(|l| l.contains("--endpoint-url https://cloudtrail.eu-central-1.amazonaws.com")), "{calls}");
 }
 
 #[test]

@@ -480,7 +480,8 @@ fn runtime_key_verifies_once_with_the_key_the_container_names() {
     std::fs::write(t.path().join("aws/sts-fails"), "2\n").unwrap();
     let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AIENV_KEY", "team-key")]);
     let all = all(&out);
-    assert!(out.status.success() && all.contains(&format!("the sealed key {} identifies as user/ai-env-runtime", key_id(1))), "{all}");
+    assert!(out.status.success() && all.contains(&format!("the sealed key ...{} identifies as user/ai-env-runtime", &key_id(1)[16..])), "{all}");
+    assert!(!all.contains(&key_id(1)), "a verified key is named by its tail only: {all}");
     let runs = decrypts(t.path());
     assert_eq!(runs.len(), 1, "one decrypt, one Touch ID prompt: {runs:?}");
     assert!(!runs[0].contains(" -k "), "ai-env run picks the key from the container: {runs:?}");
@@ -559,7 +560,7 @@ fn runtime_key_names_every_extra_new_key_with_its_own_delete_command() {
     let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AWS_CREATE", "twice")]);
     let all = all(&out);
     assert!(out.status.success(), "the sealed key verifies: {all}");
-    assert!(all.contains(&format!("the sealed key {} identifies as user/ai-env-runtime", key_id(2))), "only the sealed id is named: {all}");
+    assert!(all.contains(&format!("the sealed key ...{} identifies as user/ai-env-runtime", &key_id(2)[16..])), "only the sealed id is named: {all}");
     assert!(all.contains(&format!("besides the sealed {}", key_id(2))) && all.contains(&delete_cmd(&key_id(1))), "the unsealed extra key gets its own delete command: {all}");
     assert!(!all.contains(&delete_cmd(&key_id(2))), "never the sealed one: {all}");
     assert!(!all.contains(&format!("{} {}", key_id(1), key_id(2))), "no two ids in one argument: {all}");
@@ -582,7 +583,7 @@ fn runtime_key_verifies_with_the_sealed_key_alone() {
     let (t, bin) = rk_tree(0);
     let out = runtime_key(t.path(), &bin, &[], &[("AWS_SECURITY_TOKEN", "operator-token"), ("AWS_SESSION_TOKEN", "operator-token"), ("AWS_CREDENTIAL_EXPIRATION", "2000-01-01T00:00:00Z")]);
     let all = all(&out);
-    assert!(out.status.success() && all.contains(&format!("the sealed key {} identifies as user/ai-env-runtime", key_id(1))), "{all}");
+    assert!(out.status.success() && all.contains(&format!("the sealed key ...{} identifies as user/ai-env-runtime", &key_id(1)[16..])), "{all}");
 }
 
 #[test]

@@ -20,8 +20,13 @@
 #                                                FAKE_AWS_QUOTA_GB (any other
 #                                                code: NoSuchResourceException,
 #                                                exit 254)
-#   aws cloudtrail lookup-events ...             the contents of FAKE_AWS_CLOUDTRAIL_FILE
-#                                                (unset: {"Events": []})
+#   aws cloudtrail describe-trails ...           the contents of FAKE_AWS_TRAILS_FILE
+#                                                (unset: {"trailList": []})
+#   aws cloudtrail get-event-selectors ...       the contents of FAKE_AWS_SELECTORS_FILE
+#                                                (unset: management events only)
+#   aws cloudtrail list-event-data-stores ...    the contents of FAKE_AWS_STORES_FILE
+#                                                (unset: {"EventDataStores": []})
+#   aws cloudtrail get-event-data-store ...      the contents of FAKE_AWS_STORE_FILE
 # Environment:
 #   FAKE_AWS_LOG    when set, each call's argv is appended here, one line
 #   FAKE_AWS_KEYS   access keys the user already has (default 0)
@@ -35,7 +40,10 @@
 #   FAKE_AWS_IMAGE_FAILED  its latestFailedImageVersion, a number (unset: null)
 #   FAKE_AWS_QUOTA_GB      the MicroVM memory quota's Value in Gigabytes, a
 #                          number (default 400.0, the AWS default)
-#   FAKE_AWS_CLOUDTRAIL_FILE  a lookup-events JSON document to print
+#   FAKE_AWS_TRAILS_FILE, FAKE_AWS_SELECTORS_FILE, FAKE_AWS_STORES_FILE,
+#   FAKE_AWS_STORE_FILE    CloudTrail JSON documents to print (see above)
+#   FAKE_AWS_FAIL_OP       "<service> <operation>" (e.g. "cloudtrail describe-trails"):
+#                          that call fails with AccessDeniedException, exit 254
 set -u
 if [ -n "${FAKE_AWS_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
@@ -81,6 +89,10 @@ if [ "${FAKE_AWS_FAIL:-0}" = nouser ]; then
     exit 254
   fi
 fi
+if [ -n "${FAKE_AWS_FAIL_OP:-}" ] && [ "${1:-} ${2:-}" = "$FAKE_AWS_FAIL_OP" ]; then
+  printf '\nAn error occurred (AccessDeniedException) when calling the %s operation: fake denial\n' "${2:-}" >&2
+  exit 254
+fi
 keys=${FAKE_AWS_KEYS:-0}
 key_id() { printf 'AKIAFAKE%012d' "$1"; }
 created='2026-09-29T10:00:00+00:00'
@@ -118,11 +130,22 @@ case "${1:-} ${2:-}" in
     fi
     printf '{\n    "Quota": {\n        "ServiceCode": "lambda",\n        "ServiceName": "AWS Lambda",\n        "QuotaArn": "arn:aws:servicequotas:%s:123456789012:lambda/%s",\n        "QuotaCode": "%s",\n        "QuotaName": "Max allocated ARM_64 MicroVM memory",\n        "Value": %s,\n        "Unit": "None",\n        "Adjustable": true,\n        "GlobalQuota": false\n    }\n}\n' \
       "$region" "$quota" "$quota" "${FAKE_AWS_QUOTA_GB:-400.0}" ;;
-  "cloudtrail lookup-events")
-    if [ -n "${FAKE_AWS_CLOUDTRAIL_FILE:-}" ]; then
-      cat "$FAKE_AWS_CLOUDTRAIL_FILE"
+  "cloudtrail describe-trails")
+    if [ -n "${FAKE_AWS_TRAILS_FILE:-}" ]; then cat "$FAKE_AWS_TRAILS_FILE"; else printf '{\n    "trailList": []\n}\n'; fi ;;
+  "cloudtrail get-event-selectors")
+    if [ -n "${FAKE_AWS_SELECTORS_FILE:-}" ]; then
+      cat "$FAKE_AWS_SELECTORS_FILE"
     else
-      printf '{\n    "Events": []\n}\n'
+      printf '{\n    "EventSelectors": [{"ReadWriteType": "All", "IncludeManagementEvents": true, "DataResources": []}]\n}\n'
+    fi ;;
+  "cloudtrail list-event-data-stores")
+    if [ -n "${FAKE_AWS_STORES_FILE:-}" ]; then cat "$FAKE_AWS_STORES_FILE"; else printf '{\n    "EventDataStores": []\n}\n'; fi ;;
+  "cloudtrail get-event-data-store")
+    if [ -n "${FAKE_AWS_STORE_FILE:-}" ]; then
+      cat "$FAKE_AWS_STORE_FILE"
+    else
+      echo 'fake aws: get-event-data-store needs FAKE_AWS_STORE_FILE' >&2
+      exit 254
     fi ;;
   *)
     echo "fake aws: unsupported command: $*" >&2

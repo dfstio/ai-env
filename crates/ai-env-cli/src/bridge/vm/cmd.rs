@@ -156,6 +156,16 @@ pub fn fmt_secs(secs: i64) -> String {
     }
 }
 
+/// The `vm list` WALL-LEFT cell: `-` for a VM that is gone or going (its
+/// row's deadline still counts down, but nothing is left to run).
+fn wall_left_cell(state: &str, row: Option<&registry::VmRow>, now: u64) -> String {
+    let ended = matches!(state, "TERMINATED" | "TERMINATING") || row.is_some_and(|r| r.status == RowStatus::Terminated);
+    if ended {
+        return "-".into();
+    }
+    row.and_then(|r| r.wall_left(now)).map_or_else(|| "-".into(), fmt_secs)
+}
+
 fn ms_s(ms: u64) -> String {
     format!("{:.1} s", ms as f64 / 1000.0)
 }
@@ -468,7 +478,7 @@ async fn list<A: MicrovmApi>(ctx: &Ctx, api: &A, all: bool, json: bool) -> Resul
         outln!("{:<46} {:<12} {:>7} {:>9}  {:<24} SOURCE", "ID", "STATE", "AGE", "WALL-LEFT", "WHERE");
         for (id, state, started, row, source) in &out {
             let age = started.map_or_else(|| "-".into(), |t| fmt_secs(i64::try_from(now.saturating_sub(t)).unwrap_or(i64::MAX)));
-            let left = row.as_ref().and_then(|r| r.wall_left(now)).map_or_else(|| "-".into(), fmt_secs);
+            let left = wall_left_cell(state, row.as_ref(), now);
             let place = row.as_ref().and_then(|r| r.workspace.clone().or_else(|| r.label.clone())).unwrap_or_else(|| "-".into());
             outln!("{id:<46} {state:<12} {age:>7} {left:>9}  {place:<24} {source}");
         }
@@ -950,9 +960,9 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     let paths = Paths::resolve()?;
     let _ = crate::bridge::logging::init(&crate::bridge::logging::LogOpts { path: paths.cli_log(), rust_log: std::env::var("RUST_LOG").ok() });
     // Refuse arguments a probe does not take before anything (a Touch ID, a VM) happens.
-    let takes_log = matches!(name, "hooks-port" | "hooks-source-ip" | "runtime-env" | "disk-budget" | "snapshot-uniqueness");
+    let takes_log = matches!(name, "hooks-port" | "hooks-source-ip" | "runtime-env" | "disk-budget" | "snapshot-uniqueness" | "cloudtrail-payload");
     if log.is_some() && !takes_log {
-        return Err(CliError::Usage(format!("{name} does not read a log (--log is for hooks-port, hooks-source-ip, runtime-env, disk-budget and snapshot-uniqueness)")));
+        return Err(CliError::Usage(format!("{name} does not read a log (--log is for hooks-port, hooks-source-ip, runtime-env, disk-budget, snapshot-uniqueness and cloudtrail-payload)")));
     }
     if id.is_some() && name != "cloudtrail-payload" {
         return Err(CliError::Usage(format!("{name} takes no VM id (only cloudtrail-payload does)")));
@@ -984,8 +994,8 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
         return probes::record(&paths, &probes::stamped(&paths, spec, &v, with_note(format!("{derived} ({src})"), note.as_ref())));
     }
     if name == "cloudtrail-payload" {
-        let id = id.ok_or_else(|| CliError::Usage("cloudtrail-payload needs the id of a VM this ai-env started (≥ 15 min ago)".into()))?;
-        return cloudtrail(&paths, spec, id, note.as_ref());
+        let id = id.ok_or_else(|| CliError::Usage("cloudtrail-payload needs the id of a VM this ai-env started".into()))?;
+        return cloudtrail(&paths, spec, id, log, note.as_ref());
     }
     // The live probes: their own VMs, the runtime key.
     let ctx = Ctx::load()?;
@@ -1021,24 +1031,125 @@ fn snapshot_log_pass(paths: &Paths, spec: &probes::ProbeSpec, text: &str, src: &
     probes::record(paths, &probes::stamped(paths, spec, &verdict, with_note(format!("ids={} boot_ids {same} across snapshot clones: {pairs} ({src})", ids.join(",")), note)))
 }
 
-fn cloudtrail(paths: &Paths, spec: &probes::ProbeSpec, id: &str, note: Option<&String>) -> Result<()> {
+/// The CloudTrail endpoint of eu-central-1, passed on every call: the flag
+/// overrides `AWS_ENDPOINT_URL[_CLOUDTRAIL]` and a profile's `endpoint_url`,
+/// so a stub endpoint cannot answer "no trail" (the SDK pins its control
+/// plane the same way).
+const CLOUDTRAIL_URL: &str = "https://cloudtrail.eu-central-1.amazonaws.com";
+
+/// `aws cloudtrail <op> … --region eu-central-1 --endpoint-url … --output json`, parsed.
+fn cloudtrail_json(args: &[&str]) -> std::result::Result<serde_json::Value, String> {
+    let mut argv = vec!["cloudtrail"];
+    argv.extend_from_slice(args);
+    argv.extend_from_slice(&["--region", REGION, "--endpoint-url", CLOUDTRAIL_URL, "--output", "json"]);
+    let out = crate::bridge::doctor::run_capture("aws", &argv, Duration::from_secs(30)).map_err(|e| format!("aws cloudtrail {}: {e}", args[0]))?;
+    serde_json::from_str(&out).map_err(|e| format!("aws cloudtrail {}: {e}", args[0]))
+}
+
+/// Where RunMicrovm records of this account may be kept.
+enum Keeper {
+    /// A trail (its own, a multi-region trail homed elsewhere, or an organization trail) with its S3 destination.
+    Trail { arn: String, bucket: String, prefix: String },
+    /// A CloudTrail Lake event data store homed in eu-central-1, any status (a stopped or pending-deletion store still
+    /// holds what it ingested).
+    Store { arn: String, status: String },
+}
+
+/// What the operator's CloudTrail shows from eu-central-1. Not visible from
+/// here: event data stores homed in other Regions (listing is per Region)
+/// and organization event data stores (invisible to member accounts).
+struct DataEventCoverage {
+    trails: usize,
+    stores: usize,
+    keepers: Vec<Keeper>,
+    unreadable: Vec<String>,
+}
+
+fn microvm_data_event_coverage() -> std::result::Result<DataEventCoverage, String> {
+    let mut cov = DataEventCoverage { trails: 0, stores: 0, keepers: Vec::new(), unreadable: Vec::new() };
+    let trails = cloudtrail_json(&["describe-trails"])?;
+    for t in trails.get("trailList").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
+        let Some(arn) = t.get("TrailARN").and_then(|a| a.as_str()) else { continue };
+        cov.trails += 1;
+        let s = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        match cloudtrail_json(&["get-event-selectors", "--trail-name", arn]) {
+            Ok(doc) if probes::selectors_log_microvm_data(&doc) => cov.keepers.push(Keeper::Trail { arn: arn.to_string(), bucket: s("S3BucketName"), prefix: s("S3KeyPrefix") }),
+            Ok(_) => {}
+            Err(e) => cov.unreadable.push(format!("trail {arn} (home region {}): {e}", t.get("HomeRegion").and_then(|r| r.as_str()).unwrap_or("?"))),
+        }
+    }
+    let stores = cloudtrail_json(&["list-event-data-stores"])?;
+    for s in stores.get("EventDataStores").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
+        let Some(arn) = s.get("EventDataStoreArn").and_then(|a| a.as_str()) else { continue };
+        cov.stores += 1;
+        match cloudtrail_json(&["get-event-data-store", "--event-data-store", arn]) {
+            Ok(doc) if probes::selectors_log_microvm_data(&doc) => {
+                let status = doc.get("Status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                cov.keepers.push(Keeper::Store { arn: arn.to_string(), status });
+            }
+            Ok(_) => {}
+            Err(e) => cov.unreadable.push(format!("event data store {arn}: {e}")),
+        }
+    }
+    Ok(cov)
+}
+
+/// How to get the RunMicrovm record of `id` out of `k` for `--log`.
+fn keeper_hint(k: &Keeper, id: &str, day: &str) -> String {
+    match k {
+        Keeper::Trail { arn, bucket, prefix } => {
+            let prefix = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+            format!(
+                "trail {arn} logs MicroVM data events to s3://{bucket}/{prefix}AWSLogs/: take the log file under …/CloudTrail/eu-central-1/{}/ that holds {id} (zgrep -l {id}; delivered within ~15 min), gunzip it, then: ai-env lab run cloudtrail-payload {id} --log FILE",
+                day.replace('-', "/")
+            )
+        }
+        Keeper::Store { arn, status } => {
+            let eds = arn.rsplit('/').next().unwrap_or(arn);
+            format!(
+                "event data store {arn} ({status}) logs MicroVM data events: q=$(aws cloudtrail start-query --region {REGION} --query-statement \"SELECT {} FROM {eds} WHERE eventName = 'RunMicrovm' AND eventTime >= '{day} 00:00:00' AND element_at(responseElements, 'microvmId') = '{id}'\" --query QueryId --output text) && sleep 60 && aws cloudtrail get-query-results --region {REGION} --query-id \"$q\" --output json > ~/ct-{id}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}.json",
+                probes::LAKE_COLUMNS
+            )
+        }
+    }
+}
+
+/// cloudtrail-payload (plan S4 §8, corrected in part B): RunMicrovm is a
+/// CloudTrail data event, which event history never holds. With `--log FILE`
+/// the payload verdict is read from the RunMicrovm record in FILE. Without
+/// it the probe looks for a trail or event data store that logs the event:
+/// found → how to get its record for `--log`; none → it still cannot record
+/// `not-logged` itself, because stores homed in other Regions and
+/// organization stores are invisible from here, so it prints the `--manual`
+/// command to run once the operator has confirmed there are none. Fails
+/// closed: never a verdict for what it could not see.
+fn cloudtrail(paths: &Paths, spec: &probes::ProbeSpec, id: &str, log: Option<&std::path::Path>, note: Option<&String>) -> Result<()> {
     let row = registry::read_row(paths, id)?.ok_or_else(|| CliError::Msg(format!("no row for {id} in state/vms: the probe needs the client token and the session token of a VM this ai-env started")))?;
-    let started = row.started_at.ok_or_else(|| CliError::Msg(format!("the row of {id} has no started_at")))?;
-    if unix_now() < started + 900 {
-        eprintln!("ai-env: note: CloudTrail can take up to 15 minutes to deliver the RunMicrovm event");
+    if let Some(file) = log {
+        let text = read_log(file)?;
+        return match probes::verdict_cloudtrail(&text, id, &row.client_token, row.session_token.as_deref(), &row.commit) {
+            Ok(Some((v, derived))) => probes::record(paths, &probes::stamped(paths, spec, &v, with_note(format!("{derived} (from {})", file.display()), note))),
+            Ok(None) => Err(CliError::Msg(format!("no RunMicrovm record for {id} in {}; nothing recorded", file.display()))),
+            Err(e) => Err(CliError::Msg(format!("cloudtrail-payload: {e}; nothing recorded"))),
+        };
     }
-    let (t0, t1) = (rfc3339_utc(started.saturating_sub(900)), rfc3339_utc(started + 900));
-    let out = crate::bridge::doctor::run_capture(
-        "aws",
-        &["cloudtrail", "lookup-events", "--lookup-attributes", "AttributeKey=EventName,AttributeValue=RunMicrovm", "--start-time", &t0, "--end-time", &t1, "--region", REGION, "--output", "json"],
-        Duration::from_secs(30),
-    )
-    .map_err(|e| CliError::Aws(format!("aws cloudtrail lookup-events: {e}")))?;
-    match probes::verdict_cloudtrail(&out, id, &row.client_token, row.session_token.as_deref(), &row.commit) {
-        Ok(Some((v, derived))) => probes::record(paths, &probes::stamped(paths, spec, &v, with_note(derived, note))),
-        Ok(None) => Err(CliError::Msg(format!("no RunMicrovm event for {id} between {t0} and {t1} yet (CloudTrail delivers within ~15 min); nothing recorded"))),
-        Err(e) => Err(CliError::Msg(format!("cloudtrail-payload: {e}"))),
+    let cov = microvm_data_event_coverage().map_err(|e| CliError::Aws(format!("cloudtrail-payload: {e}; nothing recorded")))?;
+    if !cov.unreadable.is_empty() {
+        return Err(CliError::Aws(format!("cloudtrail-payload: could not read what {} logs; nothing recorded", cov.unreadable.join("; "))));
     }
+    let day = row.started_at.map_or_else(|| rfc3339_utc(unix_now())[..10].to_string(), |t| rfc3339_utc(t)[..10].to_string());
+    if !cov.keepers.is_empty() {
+        let hints: Vec<String> = cov.keepers.iter().map(|k| keeper_hint(k, id, &day)).collect();
+        return Err(CliError::Msg(format!("cloudtrail-payload: RunMicrovm records are not in event history; {}; nothing recorded", hints.join("; "))));
+    }
+    let manual_note = format!(
+        "RunMicrovm is a CloudTrail data event ({}), off by default; none of {} trail(s) and {} eu-central-1 event data store(s) logs it, and by hand no event data store in another Region and no organization event data store, so CloudTrail keeps nothing of the run-hook payload",
+        probes::MICROVM_DATA_RESOURCE, cov.trails, cov.stores
+    );
+    Err(CliError::Msg(format!(
+        "cloudtrail-payload: no trail ({} checked, multi-region and organization trails included) and no event data store homed in {REGION} ({} checked) logs RunMicrovm, a CloudTrail data event that is off by default. Not visible from here: event data stores homed in other Regions and, if this account is in an AWS Organization, organization event data stores (CloudTrail console → Lake → Event data stores, per Region). If there are none, record it: ai-env lab run cloudtrail-payload {id} --manual not-logged --note \"{manual_note}\"; nothing recorded",
+        cov.trails, cov.stores
+    )))
 }
 
 #[cfg(test)]
@@ -1060,5 +1171,16 @@ mod tests {
         assert_eq!(fmt_secs(59), "59s");
         assert_eq!(fmt_secs(61), "1m01s");
         assert_eq!(fmt_secs(3_660), "1h01m");
+    }
+
+    #[test]
+    fn wall_left_is_a_dash_once_the_vm_is_gone() {
+        let live = registry::VmRow { status: RowStatus::Running, wall_deadline: Some(1_000), ..Default::default() };
+        assert_eq!(wall_left_cell("RUNNING", Some(&live), 900), "1m40s");
+        assert_eq!(wall_left_cell("TERMINATED", Some(&live), 900), "-", "listed TERMINATED while the row still counts down (live 30 Sep 2026)");
+        assert_eq!(wall_left_cell("TERMINATING", Some(&live), 900), "-");
+        let gone = registry::VmRow { status: RowStatus::Terminated, ..live.clone() };
+        assert_eq!(wall_left_cell("(terminated)", Some(&gone), 900), "-");
+        assert_eq!(wall_left_cell("RUNNING", None, 900), "-");
     }
 }

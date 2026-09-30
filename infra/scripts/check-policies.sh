@@ -57,8 +57,8 @@ exec_role=$(pp --arn execution-role)
 build_role=$(pp --arn build-role)
 egress=$(pp --arn egress)
 other_image="arn:aws:lambda:$region:$acct:microvm-image:not-ai-env"
+other_role="arn:aws:iam::$acct:role/not-ai-env"
 to_lambda="ContextKeyName=iam:PassedToService,ContextKeyValues=lambda.amazonaws.com,ContextKeyType=string"
-to_ec2="ContextKeyName=iam:PassedToService,ContextKeyValues=ec2.amazonaws.com,ContextKeyType=string"
 failed=0
 
 # sim <allowed|implicitDeny> <label> <resource arn> <context entry or -> <action>...
@@ -107,13 +107,15 @@ sim allowed "list actions" "*" - lambda:ListMicrovms lambda:ListManagedMicrovmIm
 sim allowed "get the egress connector (tentative)" "$egress" - lambda:GetNetworkConnector
 sim allowed "pass a connector (tentative)" "*" - lambda:PassNetworkConnector
 sim allowed "pass execution role to lambda" "$exec_role" "$to_lambda" iam:PassRole
+# RunMicrovm's PassRole check does not match iam:PassedToService = lambda.amazonaws.com (S4 T4.1): no condition.
+sim allowed "pass execution role, no service key" "$exec_role" - iam:PassRole
 # Implicitly denied (§9).
 sim implicitDeny "image and version mutations" "$image" - \
     lambda:CreateMicrovmImage lambda:UpdateMicrovmImage lambda:DeleteMicrovmImage \
     lambda:UpdateMicrovmImageVersion lambda:DeleteMicrovmImageVersion lambda:TagResource lambda:UntagResource
 sim implicitDeny "runtime actions on another image" "$other_image" - lambda:RunMicrovm lambda:GetMicrovmImage lambda:CreateMicrovmAuthToken
 sim implicitDeny "pass the build role" "$build_role" "$to_lambda" iam:PassRole
-sim implicitDeny "pass execution role to ec2" "$exec_role" "$to_ec2" iam:PassRole
+sim implicitDeny "pass any other role" "$other_role" - iam:PassRole
 sim implicitDeny "cloudformation, budgets, s3, logs, iam" "*" - \
     cloudformation:CreateResource cloudformation:UpdateResource cloudformation:DeleteResource cloudformation:GetResource \
     budgets:ModifyBudget budgets:ViewBudget \

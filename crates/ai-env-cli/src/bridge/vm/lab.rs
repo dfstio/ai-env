@@ -138,7 +138,13 @@ async fn no_traffic_before_run<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api:
     let budget = Duration::from_millis(ctx.knobs.backoff_ms.map_or(60_000, |ms| ms * 60));
     let (mut attempts, mut states, mut token) = (0u32, Vec::<String>::new(), None);
     let mut out = ProbeOutcome::default();
-    while attempts == 0 || t0.elapsed() < budget {
+    // A first 200 before `/run` (live, 30 Sep 2026: the endpoint forwards while the control plane still says
+    // PENDING) does not end the probe: it keeps asking until the shim has seen `/run`, to measure the window.
+    // The window gets its own budget from that first answer, and at least five more asks (the knob-scaled test
+    // budget is shorter than one ask under load).
+    let mut before: Option<(u128, u32, String)> = None;
+    let mut since = t0;
+    while attempts == 0 || since.elapsed() < budget || before.as_ref().is_some_and(|(_, n, _)| attempts < n + 5) {
         attempts += 1;
         let cur = api.get(&id).await?;
         if states.last().map(String::as_str) != Some(cur.state.as_str()) {
@@ -157,9 +163,20 @@ async fn no_traffic_before_run<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api:
                     out.claude.clone_from(&h.claude_version);
                     out.shim = Some(h.shim_version.clone());
                     out.image_version = Some(cur.image_version.clone());
-                    out.verdict = if h.run_hook_seen { "health-after-run" } else { "health-before-run" }.to_string();
-                    out.note = format!("first 200 {} ms after RunMicrovm was called, {attempts} attempts; states seen {}", t_run.elapsed().as_millis(), states.join("→"));
-                    return Ok(out);
+                    if !h.run_hook_seen {
+                        if before.is_none() {
+                            before = Some((t_run.elapsed().as_millis(), attempts, states.join("→")));
+                            since = Instant::now();
+                        }
+                    } else {
+                        out.verdict = if before.is_some() { "health-before-run" } else { "health-after-run" }.to_string();
+                        let seen = format!("run_hook_seen {} ms after RunMicrovm was called, {attempts} attempts; states seen {}", t_run.elapsed().as_millis(), states.join("→"));
+                        out.note = match &before {
+                            Some((ms, n, st)) => format!("first 200 without /run {ms} ms after RunMicrovm was called ({n} attempts, states {st}); {seen}"),
+                            None => format!("first 200 {seen}"),
+                        };
+                        return Ok(out);
+                    }
                 }
                 Ok(r) if r.status == 401 || r.status == 403 => token = api.create_auth_token(&id, 5, APP_PORT).await.ok(),
                 Ok(_) | Err(BridgeError::Endpoint(_)) => {}
@@ -167,6 +184,11 @@ async fn no_traffic_before_run<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api:
             }
         }
         tokio::time::sleep(step).await;
+    }
+    if let Some((ms, n, st)) = before {
+        out.verdict = "health-before-run".to_string();
+        out.note = format!("first 200 without /run {ms} ms after RunMicrovm was called ({n} attempts, states {st}); run_hook_seen still false after {} s (states seen {})", budget.as_secs(), states.join("→"));
+        return Ok(out);
     }
     Err(BridgeError::Sdk { op: "probe", message: format!("no /health 200 within {} s (states seen {})", budget.as_secs(), states.join("→")) })
 }

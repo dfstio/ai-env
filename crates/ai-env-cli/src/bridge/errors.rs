@@ -59,6 +59,9 @@ impl fmt::Display for BridgeError {
             BridgeError::Http { status, body } => write!(f, "endpoint HTTP {status}: {body}"),
             BridgeError::Conflict(m) => write!(f, "aws conflict: {m}"),
             BridgeError::Throttled(m) => write!(f, "aws throttled (after retries): {m}"),
+            BridgeError::AccessDenied(m) if m.contains("iam:PassRole") => {
+                write!(f, "aws access denied: {m} (the runtime policy must allow iam:PassRole on the execution role; or start the VM without one: vm run/vm smoke --no-execution-role)")
+            }
             BridgeError::AccessDenied(m) => {
                 write!(f, "aws access denied: {m} (the runtime policy allows only the ai-env image; is credentials/aws.env the ai-env-runtime key?)")
             }
@@ -362,5 +365,7 @@ mod tests {
         assert_eq!(e.to_string(), "token rejected: HTTP 403 for port 8080 (x-aws-proxy-error: UNAUTHORIZED)");
         assert_eq!(BridgeError::PayloadTooLarge(4097).to_string(), "run-hook payload of 4097 bytes exceeds 4096");
         assert!(BridgeError::AccessDenied("get_microvm: no".into()).to_string().contains("runtime policy"));
+        let pass = BridgeError::AccessDenied("run_microvm: ... not authorized to perform: iam:PassRole on resource: ...".into()).to_string();
+        assert!(pass.contains("iam:PassRole on the execution role") && pass.contains("--no-execution-role") && !pass.contains("aws.env"), "{pass}");
     }
 }

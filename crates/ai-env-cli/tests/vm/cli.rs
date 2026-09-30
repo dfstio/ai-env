@@ -277,7 +277,11 @@ fn cli_list_hides_terminated_without_all() {
     assert_eq!(code(&w.run(&["vm", "terminate", &id])), 0);
     let l = w.run(&["vm", "list"]);
     assert!(!stdout(&l).contains(&id), "{}", stdout(&l));
-    assert!(stdout(&w.run(&["vm", "list", "--all"])).contains(&id));
+    let all = stdout(&w.run(&["vm", "list", "--all"]));
+    let line = all.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("{all}"));
+    // ID STATE AGE WALL-LEFT WHERE SOURCE: a terminated VM has no wall left (live 30 Sep 2026 it counted down).
+    let cells: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!((cells[1], cells[3]), ("TERMINATED", "-"), "{line}");
 }
 
 #[test]

@@ -201,9 +201,12 @@ pub const CATALOG: [ProbeSpec; 12] = [
     ProbeSpec { name: "hooks-port", stage: "S4", source: Source::Log, expect: Expect::Exact("9000"), recorded_by: "ai-env lab run hooks-port --log FILE", what: "the local port runtime hooks arrive on (= the configured hooks.port)" },
     ProbeSpec { name: "hooks-source-ip", stage: "S4", source: Source::Log, expect: Expect::Exact("loopback"), recorded_by: "ai-env lab run hooks-source-ip --log FILE", what: "where runtime hooks come from" },
     ProbeSpec { name: "payload-size", stage: "S4", source: Source::Live, expect: Expect::Exact("4096=accepted 4097=rejected"), recorded_by: "ai-env lab run payload-size", what: "the service's run-hook payload limit" },
-    ProbeSpec { name: "no-traffic-before-run", stage: "S4", source: Source::Live, expect: Expect::Exact("health-after-run"), recorded_by: "ai-env lab run no-traffic-before-run", what: "whether the endpoint forwards anything before /run returned" },
+    // Recorded, not expected: the AWS docs promise no traffic before /run, but the live endpoint forwarded a /health
+    // while the control plane still said PENDING (30 Sep 2026); it is a race, so the shim must refuse everything but
+    // /health until /run (a hello without the run's commitment already fails).
+    ProbeSpec { name: "no-traffic-before-run", stage: "S4", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run no-traffic-before-run", what: "whether the endpoint forwards anything before /run returned, and for how long" },
     ProbeSpec { name: "runtime-env", stage: "S4", source: Source::Log, expect: Expect::Recorded, recorded_by: "ai-env lab run runtime-env --log FILE", what: "PID 1's environment in a MicroVM (names; credential variables)" },
-    ProbeSpec { name: "cloudtrail-payload", stage: "S4", source: Source::AwsCli, expect: Expect::AnyOf(&["hidden", "absent", "commitment-only"]), recorded_by: "ai-env lab run cloudtrail-payload ID", what: "what CloudTrail keeps of a run-hook payload" },
+    ProbeSpec { name: "cloudtrail-payload", stage: "S4", source: Source::AwsCli, expect: Expect::AnyOf(&["not-logged", "hidden", "absent", "commitment-only"]), recorded_by: "ai-env lab run cloudtrail-payload ID [--log FILE]", what: "what CloudTrail keeps of a run-hook payload (RunMicrovm is a data event, off by default)" },
     ProbeSpec { name: "disk-budget", stage: "S4", source: Source::Log, expect: Expect::Recorded, recorded_by: "ai-env lab run disk-budget --log FILE", what: "disk used by the image in a fresh VM" },
     ProbeSpec { name: "snapshot-uniqueness", stage: "S4", source: Source::LiveThenLog, expect: Expect::Exact("nonce-differs"), recorded_by: "ai-env lab run snapshot-uniqueness [--log FILE]", what: "per-VM boot nonces (boot_id is shared by snapshot clones)" },
     ProbeSpec { name: "idle-policy-limits", stage: "S4", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run idle-policy-limits", what: "which suspended durations the service accepts" },
@@ -420,20 +423,122 @@ pub fn boot_ids(reports: &[serde_json::Value], ids: &[&str]) -> std::result::Res
 
 // ---- CloudTrail ---------------------------------------------------------------------------
 
-/// cloudtrail-payload from `aws cloudtrail lookup-events … --output json`:
-/// the `RunMicrovm` event of this VM (matched by `responseElements.microvmId`
-/// or `requestParameters.clientToken`), then what it kept of
-/// `runHookPayload`: `absent`, `hidden` (a redaction marker),
-/// `commitment-only` (the payload with the commitment and without the
-/// session token), `present-other`, or `LEAKED` when the session token
-/// appears anywhere in the event. `Ok(None)` when no event matched yet
-/// (CloudTrail delivers after up to 15 minutes).
-pub fn verdict_cloudtrail(lookup_json: &str, id: &str, client_token: &str, session_token: Option<&str>, commit: &str) -> std::result::Result<Option<(String, String)>, String> {
-    let doc: serde_json::Value = serde_json::from_str(lookup_json).map_err(|e| format!("lookup-events output: {e}"))?;
-    let events = doc.get("Events").and_then(|e| e.as_array()).ok_or("lookup-events output has no Events array")?;
-    for ev in events {
-        let Some(raw) = ev.get("CloudTrailEvent").and_then(|c| c.as_str()) else { continue };
-        let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
+/// The CloudTrail resource type of Lambda MicroVMs data events. RunMicrovm,
+/// TerminateMicrovm, SuspendMicrovm, ResumeMicrovm and the two token calls
+/// are data events: CloudTrail logs them only for a trail or event data store
+/// that selects this type, and event history (`lookup-events`) never has
+/// them (AWS Lambda MicroVMs docs, "Monitoring"; S4 part B, 30 Sep 2026).
+pub const MICROVM_DATA_RESOURCE: &str = "AWS::Lambda::MicrovmImage";
+
+/// Whether one field selector of an advanced event selector lets `value`
+/// through, as CloudTrail evaluates it ("How CloudTrail evaluates multiple
+/// conditions for a field"): the SELECT operators (`Equals`, `StartsWith`,
+/// `EndsWith`) are OR'd — any match selects, and a field without one selects
+/// everything — and a match of any DESELECT operator (`NotEquals`,
+/// `NotStartsWith`, `NotEndsWith`) excludes.
+fn field_allows(field: &serde_json::Value, value: &str) -> bool {
+    let list = |k: &str| field.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>());
+    let any = |k: &str, f: &dyn Fn(&str) -> bool| list(k).is_some_and(|l| l.iter().any(|x| f(x)));
+    let has_select = ["Equals", "StartsWith", "EndsWith"].iter().any(|k| list(k).is_some());
+    let selected = !has_select || any("Equals", &|x| x == value) || any("StartsWith", &|x| value.starts_with(x)) || any("EndsWith", &|x| value.ends_with(x));
+    let deselected = any("NotEquals", &|x| x == value) || any("NotStartsWith", &|x| value.starts_with(x)) || any("NotEndsWith", &|x| value.ends_with(x));
+    selected && !deselected
+}
+
+/// Whether a `get-event-selectors` (trail) or `get-event-data-store`
+/// document selects the RunMicrovm data event. Conservative: a field the
+/// selector does not constrain lets the event through, and only the fields
+/// that can exclude RunMicrovm are evaluated (`resources.ARN` is not), so a
+/// "maybe" counts as logging — the probe then asks for the trail's record
+/// instead of claiming nothing is kept.
+#[must_use]
+pub fn selectors_log_microvm_data(doc: &serde_json::Value) -> bool {
+    let run_microvm = [("eventCategory", "Data"), ("resources.type", MICROVM_DATA_RESOURCE), ("eventName", "RunMicrovm"), ("eventSource", "lambda.amazonaws.com"), ("readOnly", "false")];
+    let advanced = doc.get("AdvancedEventSelectors").and_then(|a| a.as_array()).is_some_and(|sels| {
+        sels.iter().any(|sel| {
+            let fields = sel.get("FieldSelectors").and_then(|f| f.as_array()).map(Vec::as_slice).unwrap_or_default();
+            run_microvm.iter().all(|(name, value)| fields.iter().filter(|f| f.get("Field").and_then(|v| v.as_str()) == Some(*name)).all(|f| field_allows(f, value)))
+        })
+    });
+    let basic = doc.get("EventSelectors").and_then(|a| a.as_array()).is_some_and(|sels| {
+        sels.iter().any(|sel| {
+            let rw_ok = sel.get("ReadWriteType").and_then(|v| v.as_str()) != Some("ReadOnly");
+            rw_ok && sel.get("DataResources").and_then(|d| d.as_array()).is_some_and(|d| d.iter().any(|r| r.get("Type").and_then(|t| t.as_str()) == Some(MICROVM_DATA_RESOURCE)))
+        })
+    });
+    advanced || basic
+}
+
+/// The columns a CloudTrail Lake query must select (aliased as named) for
+/// `--log`: the record's fields as plain strings, plus the two maps whole so
+/// the session-token search sees everything.
+pub const LAKE_COLUMNS: &str = "eventID, eventName, element_at(requestParameters, 'clientToken') AS clientToken, element_at(requestParameters, 'runHookPayload') AS runHookPayload, element_at(responseElements, 'microvmId') AS microvmId, requestParameters, responseElements";
+
+/// The CloudTrail records in `doc`, each with its raw text (searched for the
+/// session token): a trail's log file (`{"Records": [...]}`, gunzipped), a
+/// `lookup-events` answer (`{"Events": [{"CloudTrailEvent": "..."}]}`), a
+/// CloudTrail Lake `get-query-results` answer over [`LAKE_COLUMNS`]
+/// (`{"QueryResultRows": [[{"eventName": "..."}, ...]]}`), a JSON array of
+/// records, or one record.
+fn cloudtrail_records(doc: &serde_json::Value) -> std::result::Result<Vec<(serde_json::Value, String)>, String> {
+    let own = |r: &serde_json::Value| (r.clone(), r.to_string());
+    if let Some(records) = doc.get("Records").and_then(|r| r.as_array()) {
+        return Ok(records.iter().map(own).collect());
+    }
+    if let Some(rows) = doc.get("QueryResultRows").and_then(|r| r.as_array()) {
+        let mut out = Vec::new();
+        for row in rows {
+            // Each row is a list of one-column maps.
+            let mut cols = serde_json::Map::new();
+            for cell in row.as_array().map(Vec::as_slice).unwrap_or_default() {
+                if let Some(o) = cell.as_object() {
+                    cols.extend(o.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+            }
+            // A column that was not selected cannot be told from an absent field: refuse rather than guess.
+            if let Some(missing) = ["eventName", "microvmId", "clientToken", "runHookPayload"].iter().find(|c| !cols.contains_key(**c)) {
+                return Err(format!("a CloudTrail Lake row without the column {missing}: select {LAKE_COLUMNS}"));
+            }
+            let col = |k: &str| cols.get(k).cloned().filter(|v| !v.as_str().is_some_and(str::is_empty)).unwrap_or(serde_json::Value::Null);
+            let rec = serde_json::json!({
+                "eventName": col("eventName"), "eventID": col("eventID"),
+                "requestParameters": {"clientToken": col("clientToken"), "runHookPayload": col("runHookPayload")},
+                "responseElements": {"microvmId": col("microvmId")},
+            });
+            out.push((rec, serde_json::Value::Object(cols).to_string()));
+        }
+        return Ok(out);
+    }
+    if let Some(events) = doc.get("Events").and_then(|e| e.as_array()) {
+        return Ok(events
+            .iter()
+            .filter_map(|ev| ev.get("CloudTrailEvent").and_then(|c| c.as_str()))
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok().map(|inner| (inner, raw.to_string())))
+            .collect());
+    }
+    if let Some(records) = doc.as_array() {
+        return Ok(records.iter().map(own).collect());
+    }
+    if doc.get("eventName").is_some() {
+        return Ok(vec![own(doc)]);
+    }
+    Err("not a CloudTrail document: no Records, Events or eventName".into())
+}
+
+/// cloudtrail-payload from a CloudTrail document (see [`cloudtrail_records`]):
+/// the `RunMicrovm` record of this VM (matched by `responseElements.microvmId`
+/// or `requestParameters.clientToken`; records of other calls on the same VM
+/// are skipped), then what it kept of `runHookPayload`: `absent`, `hidden` (a
+/// redaction marker), `commitment-only` (the payload with the commitment and
+/// without the session token), `present-other`, or `LEAKED` when the session
+/// token appears anywhere in the record. `Ok(None)` when no record matched.
+pub fn verdict_cloudtrail(doc_json: &str, id: &str, client_token: &str, session_token: Option<&str>, commit: &str) -> std::result::Result<Option<(String, String)>, String> {
+    let doc: serde_json::Value = serde_json::from_str(doc_json).map_err(|e| format!("CloudTrail document: {e}"))?;
+    for (inner, raw) in cloudtrail_records(&doc)? {
+        if inner.get("eventName").and_then(|v| v.as_str()).is_some_and(|n| n != "RunMicrovm") {
+            continue;
+        }
+        let raw = raw.as_str();
         let by_id = inner.pointer("/responseElements/microvmId").and_then(|v| v.as_str()) == Some(id);
         let by_token = !client_token.is_empty() && inner.pointer("/requestParameters/clientToken").and_then(|v| v.as_str()) == Some(client_token);
         if !(by_id || by_token) {
@@ -443,9 +548,14 @@ pub fn verdict_cloudtrail(lookup_json: &str, id: &str, client_token: &str, sessi
         if session_token.is_some_and(|t| !t.is_empty() && raw.contains(t)) {
             return Ok(Some(("LEAKED".to_string(), format!("event {event_id}: the session token itself is in the event"))));
         }
+        // A redaction marker is the whole value, never a substring (a logged payload's owner may say "hidden").
+        let marker = |s: &str| {
+            let s = s.trim();
+            s.eq_ignore_ascii_case("HIDDEN_DUE_TO_SECURITY_REASONS") || s.eq_ignore_ascii_case("REDACTED") || s.eq_ignore_ascii_case("HIDDEN") || (!s.is_empty() && s.chars().all(|c| c == '*'))
+        };
         let verdict = match inner.pointer("/requestParameters/runHookPayload") {
             None | Some(serde_json::Value::Null) => "absent",
-            Some(serde_json::Value::String(s)) if s.to_ascii_uppercase().contains("HIDDEN") || s.to_ascii_uppercase().contains("REDACTED") => "hidden",
+            Some(serde_json::Value::String(s)) if marker(s) => "hidden",
             Some(serde_json::Value::String(s)) if s.contains(commit) => "commitment-only",
             Some(_) => "present-other",
         };
@@ -535,7 +645,7 @@ mod tests {
         let names: std::collections::BTreeSet<&str> = CATALOG.iter().map(|p| p.name).collect();
         assert_eq!(names.len(), CATALOG.len());
         assert_eq!(CATALOG.iter().filter(|p| p.stage == "S4").count(), 9);
-        assert_eq!(spec("cloudtrail-payload").unwrap().expect.expectation().render(), "any-of:hidden|absent|commitment-only");
+        assert_eq!(spec("cloudtrail-payload").unwrap().expect.expectation().render(), "any-of:not-logged|hidden|absent|commitment-only");
     }
 
     #[test]
@@ -600,6 +710,106 @@ mod tests {
         assert_eq!(v(serde_json::json!({"runHookPayload": format!("x{token}")})), "LEAKED");
         assert_eq!(verdict_cloudtrail(&event(serde_json::json!({})), "microvm-other", "", None, &commit).unwrap(), None, "not yet visible");
         assert!(verdict_cloudtrail("{}", "microvm-a", "", None, &commit).is_err());
+        // A trail's log file: the Records of other calls on the same VM (TerminateMicrovm answers with its
+        // microvmId too) must not stand in for RunMicrovm, whose record shape is the AWS docs example.
+        let terminate = serde_json::json!({"eventName":"TerminateMicrovm","eventID":"e0","responseElements":{"microvmId":"microvm-a"}});
+        let run = serde_json::json!({"eventName":"RunMicrovm","eventID":"e2","requestParameters":{"microvmImageArn":"arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent"},
+            "responseElements":{"microvmId":"microvm-a","microvmState":"PENDING"},"eventCategory":"Data","managementEvent":false});
+        let file = |records: Vec<&serde_json::Value>| serde_json::json!({"Records": records}).to_string();
+        assert_eq!(verdict_cloudtrail(&file(vec![&terminate]), "microvm-a", "", None, &commit).unwrap(), None, "only RunMicrovm counts");
+        let (v, note) = verdict_cloudtrail(&file(vec![&terminate, &run]), "microvm-a", "", Some(&token), &commit).unwrap().unwrap();
+        assert_eq!((v.as_str(), note.as_str()), ("absent", "event e2 (matched by microvmId)"));
+        assert_eq!(verdict_cloudtrail(&run.to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "absent", "one record");
+        assert_eq!(verdict_cloudtrail(&serde_json::json!([run]).to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "absent", "an array");
+        let leaked = serde_json::json!({"eventName":"RunMicrovm","responseElements":{"microvmId":"microvm-a"},"requestParameters":{"note":token}});
+        assert_eq!(verdict_cloudtrail(&file(vec![&leaked]), "microvm-a", "", Some(&token), &commit).unwrap().unwrap().0, "LEAKED", "anywhere in the record");
+    }
+
+    #[test]
+    fn microvm_data_event_selectors() {
+        let field = |name: &str, op: &str, values: &[&str]| serde_json::json!({"Field": name, op: values});
+        let adv = |fields: Vec<serde_json::Value>| serde_json::json!({"AdvancedEventSelectors": [{"Name": "s", "FieldSelectors": fields}]});
+        // The AWS docs' selector for MicroVM data events.
+        assert!(selectors_log_microvm_data(&adv(vec![field("eventCategory", "Equals", &["Data"]), field("resources.type", "Equals", &[MICROVM_DATA_RESOURCE])])));
+        assert!(selectors_log_microvm_data(&adv(vec![field("eventCategory", "Equals", &["Data"]), field("resources.type", "StartsWith", &["AWS::Lambda::"])])));
+        assert!(selectors_log_microvm_data(&adv(vec![field("eventCategory", "Equals", &["Data"])])), "an unconstrained type is a maybe: counts as logging");
+        assert!(!selectors_log_microvm_data(&adv(vec![field("eventCategory", "Equals", &["Management"])])), "the default management selector");
+        assert!(!selectors_log_microvm_data(&adv(vec![field("eventCategory", "Equals", &["Data"]), field("resources.type", "Equals", &["AWS::S3::Object"])])));
+        assert!(!selectors_log_microvm_data(&adv(vec![
+            field("eventCategory", "Equals", &["Data"]),
+            field("resources.type", "Equals", &[MICROVM_DATA_RESOURCE]),
+            field("eventName", "NotEquals", &["RunMicrovm"]),
+        ])), "RunMicrovm filtered out");
+        assert!(!selectors_log_microvm_data(&adv(vec![field("eventCategory", "Equals", &["Data"]), field("resources.type", "Equals", &[MICROVM_DATA_RESOURCE]), field("readOnly", "Equals", &["true"])])));
+        let basic = |ty: &str, rw: &str| serde_json::json!({"EventSelectors": [{"ReadWriteType": rw, "IncludeManagementEvents": true, "DataResources": [{"Type": ty, "Values": ["arn:aws:lambda"]}]}]});
+        assert!(selectors_log_microvm_data(&basic(MICROVM_DATA_RESOURCE, "All")));
+        assert!(!selectors_log_microvm_data(&basic(MICROVM_DATA_RESOURCE, "ReadOnly")));
+        assert!(!selectors_log_microvm_data(&basic("AWS::S3::Object", "All")));
+        assert!(!selectors_log_microvm_data(&serde_json::json!({"EventSelectors": [{"ReadWriteType": "All", "IncludeManagementEvents": true, "DataResources": []}]})), "management events only");
+        assert!(!selectors_log_microvm_data(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn field_selector_operators_follow_cloudtrail() {
+        // CloudTrail: SELECT operators (Equals, StartsWith, EndsWith) are OR'd; any DESELECT match excludes.
+        let data = |name: serde_json::Value| {
+            let mut name = name;
+            name["Field"] = serde_json::json!("eventName");
+            serde_json::json!({"AdvancedEventSelectors": [{"FieldSelectors": [
+                {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": [MICROVM_DATA_RESOURCE]}, name]}]})
+        };
+        let on = |name: serde_json::Value| selectors_log_microvm_data(&data(name));
+        assert!(on(serde_json::json!({"Equals": ["RunMicrovm"], "StartsWith": ["CreateMicrovm"]})), "OR: Equals matches");
+        assert!(on(serde_json::json!({"EndsWith": ["Microvm"], "StartsWith": ["Create"]})), "OR: EndsWith matches");
+        assert!(on(serde_json::json!({"Equals": ["TerminateMicrovm"], "StartsWith": ["Run"]})), "OR: StartsWith matches");
+        assert!(on(serde_json::json!({"EndsWith": ["Microvm"]})));
+        assert!(!on(serde_json::json!({"EndsWith": ["Image"]})));
+        assert!(!on(serde_json::json!({"StartsWith": ["Run"], "NotEquals": ["RunMicrovm"]})), "a DESELECT match wins");
+        assert!(!on(serde_json::json!({"NotStartsWith": ["Run"]})));
+        assert!(on(serde_json::json!({"NotStartsWith": ["Terminate"]})));
+        assert!(!on(serde_json::json!({"NotEndsWith": ["Microvm"]})));
+        assert!(on(serde_json::json!({"NotEndsWith": ["Image"]})));
+        // eventSource: the service RunMicrovm is recorded under.
+        let source = |v: &str| {
+            selectors_log_microvm_data(&serde_json::json!({"AdvancedEventSelectors": [{"FieldSelectors": [
+                {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": [MICROVM_DATA_RESOURCE]}, {"Field": "eventSource", "Equals": [v]}]}]}))
+        };
+        assert!(source("lambda.amazonaws.com"));
+        assert!(!source("s3.amazonaws.com"));
+        // The console's usual pair: a management selector, then the data selector — any selector may log it.
+        let pair = serde_json::json!({"AdvancedEventSelectors": [
+            {"Name": "Management events", "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}]},
+            {"Name": "MicroVM", "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": [MICROVM_DATA_RESOURCE]}]}]});
+        assert!(selectors_log_microvm_data(&pair));
+    }
+
+    #[test]
+    fn cloudtrail_matches_by_client_token_reads_lake_rows_and_exact_markers() {
+        let commit = "c".repeat(64);
+        // No microvmId in the record: matched by clientToken.
+        let by_token = serde_json::json!({"Records": [{"eventName": "RunMicrovm", "eventID": "e3", "requestParameters": {"clientToken": "ct-1", "runHookPayload": format!("{{\"commit\":\"{commit}\"}}")}}]});
+        let (v, note) = verdict_cloudtrail(&by_token.to_string(), "microvm-a", "ct-1", None, &commit).unwrap().unwrap();
+        assert_eq!((v.as_str(), note.as_str()), ("commitment-only", "event e3 (matched by clientToken)"));
+        assert_eq!(verdict_cloudtrail(&by_token.to_string(), "microvm-a", "", None, &commit).unwrap(), None, "an empty client token matches nothing");
+        // A payload whose owner says "hidden" is logged, not redacted.
+        let owner = serde_json::json!({"eventName": "RunMicrovm", "responseElements": {"microvmId": "microvm-a"}, "requestParameters": {"runHookPayload": "{\"owner\":\"hidden@host\"}"}});
+        assert_eq!(verdict_cloudtrail(&owner.to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "present-other");
+        for marker in ["HIDDEN_DUE_TO_SECURITY_REASONS", "redacted", "****"] {
+            let m = serde_json::json!({"eventName": "RunMicrovm", "responseElements": {"microvmId": "microvm-a"}, "requestParameters": {"runHookPayload": marker}});
+            assert_eq!(verdict_cloudtrail(&m.to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "hidden", "{marker}");
+        }
+        // CloudTrail Lake get-query-results over LAKE_COLUMNS: one-column maps per row.
+        let token = "s".repeat(64);
+        let lake = |payload: &str, extra: &str| {
+            serde_json::json!({"QueryStatus": "FINISHED", "QueryResultRows": [[
+                {"eventID": "e4"}, {"eventName": "RunMicrovm"}, {"clientToken": "ct-9"}, {"runHookPayload": payload}, {"microvmId": "microvm-a"},
+                {"requestParameters": extra}, {"responseElements": "{microvmId=microvm-a}"}]]}).to_string()
+        };
+        assert_eq!(verdict_cloudtrail(&lake("HIDDEN_DUE_TO_SECURITY_REASONS", "{}"), "microvm-a", "", Some(&token), &commit).unwrap().unwrap().0, "hidden");
+        assert_eq!(verdict_cloudtrail(&lake("", "{}"), "microvm-a", "", None, &commit).unwrap().unwrap().0, "absent", "an empty cell is no payload");
+        assert_eq!(verdict_cloudtrail(&lake("HIDDEN", &format!("{{note={token}}}")), "microvm-a", "", Some(&token), &commit).unwrap().unwrap().0, "LEAKED", "the whole row is searched");
+        let short = serde_json::json!({"QueryResultRows": [[{"eventName": "RunMicrovm"}, {"microvmId": "microvm-a"}]]}).to_string();
+        assert!(verdict_cloudtrail(&short, "microvm-a", "", None, &commit).unwrap_err().contains("runHookPayload") || verdict_cloudtrail(&short, "microvm-a", "", None, &commit).unwrap_err().contains("clientToken"), "a missing column is refused, not read as absent");
     }
 
     #[test]

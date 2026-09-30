@@ -102,13 +102,15 @@ test: ## Unit + integration tests in all four feature sets
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped.
 LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS
 
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code). SLOW=1 adds the 6-minute token-expiry test; PROBES=1 re-records the live S4 probes
-	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1
+# --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
+# cargo hides for passing tests; one thread keeps each test's lines together.
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test; PROBES=1 re-records the live S4 probes
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture
 	@$(if $(filter 1,$(call cmdline,PROBES)),rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
 
 test-aws-readonly: ## Part A live checks, read-only (this identity, eu-central-1): TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm of an unknown id
-	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored readonly_ --test-threads=1
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored readonly_ --test-threads=1 --nocapture
 
 s4-smoke: ## T4.1 gate: three `ai-env vm smoke --max-duration 900 --json` passes (live, one Touch ID each); records appended to target/s4/smoke.jsonl
 	@mkdir -p target/s4

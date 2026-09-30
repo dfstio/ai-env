@@ -109,6 +109,13 @@ export const RUNTIME_LIST_ACTIONS = ["lambda:ListMicrovms", "lambda:ListManagedM
 /**
  * Tentative (D22): S4 confirms or removes them. PassNetworkConnector has no resource type in the IAM service
  * reference (like CreateMicrovmImage and the List* calls), so it can only be granted on "*".
+ *
+ * iam:PassRole on the execution role is measured necessary (S4 T4.1, 30 Sep 2026): RunMicrovm with
+ * --execution-role-arn was denied iam:PassRole under `StringEquals iam:PassedToService = lambda.amazonaws.com`
+ * (the value the IAM service reference lists for RunMicrovm) while simulate-principal-policy with that context
+ * allowed it, so the service sends another value or none. The grant therefore has no condition; it stays scoped to
+ * the one role, whose trust admits only lambda.amazonaws.com and whose policy writes one log group, and the runtime
+ * user has no other call that takes a role.
  */
 export const PASS_CONNECTOR_ACTION = "lambda:PassNetworkConnector";
 export const GET_CONNECTOR_ACTION = "lambda:GetNetworkConnector";
@@ -129,7 +136,7 @@ export function runtimePolicy(n: Names): PolicyDocument {
         { Sid: "ListMicrovms", Effect: "Allow", Action: RUNTIME_LIST_ACTIONS, Resource: ["*"] },
         { Sid: "GetNetworkConnectorsTentative", Effect: "Allow", Action: [GET_CONNECTOR_ACTION], Resource: connectorArns(n) },
         { Sid: "PassNetworkConnectorTentative", Effect: "Allow", Action: [PASS_CONNECTOR_ACTION], Resource: ["*"] },
-        { Sid: "PassExecutionRoleTentative", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, EXECUTION_ROLE_NAME)], Condition: passedToLambda },
+        { Sid: "PassExecutionRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, EXECUTION_ROLE_NAME)] },
     );
 }
 
@@ -162,6 +169,7 @@ export function deployPolicy(n: Names): PolicyDocument {
                 "lambda:ListManagedMicrovmImageVersions", PASS_CONNECTOR_ACTION],
         },
         { Sid: "EgressConnector", Effect: "Allow", Resource: connectorArns(n), Action: [GET_CONNECTOR_ACTION] },
+        // Unproven condition: RunMicrovm did not match it (runtimePolicy); Create/UpdateMicrovmImage may not either.
         { Sid: "PassBuildAndExecutionRoles", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, BUILD_ROLE_NAME), roleArn(n, EXECUTION_ROLE_NAME)], Condition: passedToLambda },
         {
             Sid: "Roles", Effect: "Allow", Resource: [`arn:aws:iam::${acct}:role/${PROJECT}-*`],

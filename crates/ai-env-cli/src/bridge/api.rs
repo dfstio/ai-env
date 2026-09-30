@@ -418,6 +418,14 @@ pub struct FakeState {
     pub health_script: BTreeMap<String, VecDeque<u16>>,
     /// Per VM id: the `/health` body to serve instead of the default.
     pub health_override: BTreeMap<String, Health>,
+    /// Every VM's first N `/health` 200s answer like a shim that has not seen
+    /// `/run` yet: the live endpoint forwards to the app before `/run`
+    /// returned (S4 part B, 30 Sep 2026).
+    #[serde(default)]
+    pub pre_run_health: u32,
+    /// Per VM id: the pre-`/run` answers served so far.
+    #[serde(default)]
+    pub pre_run_served: BTreeMap<String, u32>,
     pub image: Option<ImageInfo>,
     pub versions: Vec<ImageVersion>,
 }
@@ -689,7 +697,13 @@ impl FakeState {
                 return Ok(HealthReply { status, proxy_error: None, retry_after_s, health: None, body: String::new() });
             }
         }
-        let health = self.health_override.get(&id).cloned().unwrap_or_else(|| self.default_health(&id));
+        let mut health = self.health_override.get(&id).cloned().unwrap_or_else(|| self.default_health(&id));
+        let served = self.pre_run_served.entry(id.clone()).or_default();
+        if *served < self.pre_run_health {
+            *served += 1;
+            // What the shim knows before `/run`: no payload (owner, created), no nonce, no uptime.
+            health = Health { run_hook_seen: false, owner: None, created: None, boot_nonce: None, microvm_id: None, uptime_s: 0, ..health };
+        }
         Ok(HealthReply { status: 200, proxy_error: None, retry_after_s: None, health: Some(health), body: String::new() })
     }
 
