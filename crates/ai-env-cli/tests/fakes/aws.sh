@@ -24,9 +24,21 @@
 #                                                (unset: {"trailList": []})
 #   aws cloudtrail get-event-selectors ...       the contents of FAKE_AWS_SELECTORS_FILE
 #                                                (unset: management events only)
-#   aws cloudtrail list-event-data-stores ...    the contents of FAKE_AWS_STORES_FILE
-#                                                (unset: {"EventDataStores": []})
-#   aws cloudtrail get-event-data-store ...      the contents of FAKE_AWS_STORE_FILE
+#   aws cloudtrail list-channels ...             the contents of FAKE_AWS_CHANNELS_FILE, or of
+#                                                FAKE_AWS_CHANNELS_FILE_2 when --next-token is
+#                                                given (it must equal FAKE_AWS_CHANNELS_TOKEN,
+#                                                else InvalidNextTokenException, exit 254)
+#                                                (unset: {"Channels": []})
+#                                                FAKE_AWS_CHANNELS_ENDLESS=1: every page is empty
+#                                                with a new NextToken (the page bound)
+#   aws cloudtrail get-channel --channel ARN ... FAKE_AWS_CHANNEL_DIR/<last ARN segment>.json
+#                                                (missing, or --channel not an ARN:
+#                                                ChannelNotFoundException, exit 254)
+#   aws logs describe-log-groups --log-group-name-pattern cloudtrail [--log-group-class C] ...
+#                                                with C: FAKE_AWS_LOG_GROUPS_<C>_FILE; without:
+#                                                FAKE_AWS_LOG_GROUPS_FILE (names only, as the
+#                                                real pattern answer); unset: {"logGroups": []};
+#                                                any other pattern: InvalidParameterException
 # Environment:
 #   FAKE_AWS_LOG    when set, each call's argv is appended here, one line
 #   FAKE_AWS_KEYS   access keys the user already has (default 0)
@@ -40,8 +52,9 @@
 #   FAKE_AWS_IMAGE_FAILED  its latestFailedImageVersion, a number (unset: null)
 #   FAKE_AWS_QUOTA_GB      the MicroVM memory quota's Value in Gigabytes, a
 #                          number (default 400.0, the AWS default)
-#   FAKE_AWS_TRAILS_FILE, FAKE_AWS_SELECTORS_FILE, FAKE_AWS_STORES_FILE,
-#   FAKE_AWS_STORE_FILE    CloudTrail JSON documents to print (see above)
+#   FAKE_AWS_TRAILS_FILE, FAKE_AWS_SELECTORS_FILE, FAKE_AWS_CHANNELS_FILE[_2],
+#   FAKE_AWS_CHANNELS_TOKEN, FAKE_AWS_CHANNEL_DIR, FAKE_AWS_LOG_GROUPS_FILE
+#                          CloudTrail and CloudWatch Logs JSON documents (see above)
 #   FAKE_AWS_FAIL_OP       "<service> <operation>" (e.g. "cloudtrail describe-trails"):
 #                          that call fails with AccessDeniedException, exit 254
 set -u
@@ -57,6 +70,10 @@ user=
 image=
 service=
 quota=
+next_token=
+channel=
+pattern=
+log_class=
 prev=
 for a in "$@"; do
   case "$prev" in
@@ -65,6 +82,10 @@ for a in "$@"; do
     --image-identifier) image=$a ;;
     --service-code) service=$a ;;
     --quota-code) quota=$a ;;
+    --next-token) next_token=$a ;;
+    --channel) channel=$a ;;
+    --log-group-name-pattern) pattern=$a ;;
+    --log-group-class) log_class=$a ;;
   esac
   prev=$a
 done
@@ -138,15 +159,42 @@ case "${1:-} ${2:-}" in
     else
       printf '{\n    "EventSelectors": [{"ReadWriteType": "All", "IncludeManagementEvents": true, "DataResources": []}]\n}\n'
     fi ;;
-  "cloudtrail list-event-data-stores")
-    if [ -n "${FAKE_AWS_STORES_FILE:-}" ]; then cat "$FAKE_AWS_STORES_FILE"; else printf '{\n    "EventDataStores": []\n}\n'; fi ;;
-  "cloudtrail get-event-data-store")
-    if [ -n "${FAKE_AWS_STORE_FILE:-}" ]; then
-      cat "$FAKE_AWS_STORE_FILE"
+  "cloudtrail list-channels")
+    if [ "${FAKE_AWS_CHANNELS_ENDLESS:-0}" = 1 ]; then
+      printf '{\n    "Channels": [],\n    "NextToken": "%sx"\n}\n' "$next_token"
+    elif [ -n "$next_token" ]; then
+      if [ "$next_token" != "${FAKE_AWS_CHANNELS_TOKEN:-}" ] || [ -z "${FAKE_AWS_CHANNELS_FILE_2:-}" ]; then
+        printf '\nAn error occurred (InvalidNextTokenException) when calling the ListChannels operation: bad token %s\n' "$next_token" >&2
+        exit 254
+      fi
+      cat "$FAKE_AWS_CHANNELS_FILE_2"
+    elif [ -n "${FAKE_AWS_CHANNELS_FILE:-}" ]; then
+      cat "$FAKE_AWS_CHANNELS_FILE"
     else
-      echo 'fake aws: get-event-data-store needs FAKE_AWS_STORE_FILE' >&2
+      printf '{\n    "Channels": []\n}\n'
+    fi ;;
+  "cloudtrail get-channel")
+    doc="${FAKE_AWS_CHANNEL_DIR:-/nonexistent}/${channel##*/}.json"
+    if [ "${channel#arn:aws:cloudtrail:}" != "$channel" ] && [ -f "$doc" ]; then
+      cat "$doc"
+    else
+      printf '\nAn error occurred (ChannelNotFoundException) when calling the GetChannel operation: %s\n' "$channel" >&2
       exit 254
     fi ;;
+  "logs describe-log-groups")
+    if [ "$pattern" != cloudtrail ]; then
+      printf '\nAn error occurred (InvalidParameterException) when calling the DescribeLogGroups operation: fake expects --log-group-name-pattern cloudtrail, got "%s"\n' "$pattern" >&2
+      exit 254
+    fi
+    case "$log_class" in
+      *[!A-Z_]*) echo "fake aws: bad --log-group-class $log_class" >&2; exit 252 ;;
+    esac
+    if [ -n "$log_class" ]; then
+      eval "file=\${FAKE_AWS_LOG_GROUPS_${log_class}_FILE:-}"
+    else
+      file=${FAKE_AWS_LOG_GROUPS_FILE:-}
+    fi
+    if [ -n "$file" ]; then cat "$file"; else printf '{\n    "logGroups": []\n}\n'; fi ;;
   *)
     echo "fake aws: unsupported command: $*" >&2
     exit 2 ;;

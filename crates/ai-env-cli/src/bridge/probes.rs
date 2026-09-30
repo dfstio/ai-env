@@ -425,9 +425,10 @@ pub fn boot_ids(reports: &[serde_json::Value], ids: &[&str]) -> std::result::Res
 
 /// The CloudTrail resource type of Lambda MicroVMs data events. RunMicrovm,
 /// TerminateMicrovm, SuspendMicrovm, ResumeMicrovm and the two token calls
-/// are data events: CloudTrail logs them only for a trail or event data store
-/// that selects this type, and event history (`lookup-events`) never has
-/// them (AWS Lambda MicroVMs docs, "Monitoring"; S4 part B, 30 Sep 2026).
+/// are data events: CloudTrail logs them only for a trail or a service-linked
+/// channel (CloudWatch's CloudTrail ingestion, Security Lake) that selects
+/// this type, and event history (`lookup-events`) never has them (AWS Lambda
+/// MicroVMs docs, "Monitoring"; S4 part B, 30 Sep 2026).
 pub const MICROVM_DATA_RESOURCE: &str = "AWS::Lambda::MicrovmImage";
 
 /// Whether one field selector of an advanced event selector lets `value`
@@ -445,8 +446,8 @@ fn field_allows(field: &serde_json::Value, value: &str) -> bool {
     selected && !deselected
 }
 
-/// Whether a `get-event-selectors` (trail) or `get-event-data-store`
-/// document selects the RunMicrovm data event. Conservative: a field the
+/// Whether a trail's `get-event-selectors` document, or a channel's
+/// `SourceConfig`, selects the RunMicrovm data event. Conservative: a field the
 /// selector does not constrain lets the event through, and only the fields
 /// that can exclude RunMicrovm are evaluated (`resources.ARN` is not), so a
 /// "maybe" counts as logging — the probe then asks for the trail's record
@@ -469,43 +470,181 @@ pub fn selectors_log_microvm_data(doc: &serde_json::Value) -> bool {
     advanced || basic
 }
 
-/// The columns a CloudTrail Lake query must select (aliased as named) for
-/// `--log`: the record's fields as plain strings, plus the two maps whole so
-/// the session-token search sees everything.
-pub const LAKE_COLUMNS: &str = "eventID, eventName, element_at(requestParameters, 'clientToken') AS clientToken, element_at(requestParameters, 'runHookPayload') AS runHookPayload, element_at(responseElements, 'microvmId') AS microvmId, requestParameters, responseElements";
+/// What a CloudTrail channel (`get-channel`) may do with RunMicrovm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelCover {
+    /// Its selectors take RunMicrovm: the destination keeps the record.
+    Logs,
+    /// A service-linked channel whose selectors cannot be read: counted as keeping it.
+    Maybe,
+    /// Its selectors exclude RunMicrovm, or it serves only another Region.
+    No,
+    /// A CloudTrail Lake integration channel (external events into event data stores): not AWS API calls.
+    External,
+}
 
-/// The CloudTrail records in `doc`, each with its raw text (searched for the
-/// session token): a trail's log file (`{"Records": [...]}`, gunzipped), a
-/// `lookup-events` answer (`{"Events": [{"CloudTrailEvent": "..."}]}`), a
-/// CloudTrail Lake `get-query-results` answer over [`LAKE_COLUMNS`]
-/// (`{"QueryResultRows": [[{"eventName": "..."}, ...]]}`), a JSON array of
-/// records, or one record.
-fn cloudtrail_records(doc: &serde_json::Value) -> std::result::Result<Vec<(serde_json::Value, String)>, String> {
-    let own = |r: &serde_json::Value| (r.clone(), r.to_string());
+/// One channel as the probe sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelView {
+    pub name: String,
+    pub arn: String,
+    pub cover: ChannelCover,
+    /// The creating service for a service-linked channel (`cloudwatch`, `security-lake`, …), else `integration`.
+    pub kind: String,
+    /// `(Type, Location)` of each destination.
+    pub destinations: Vec<(String, String)>,
+}
+
+/// Classify a `get-channel` document. Service-linked channels are named
+/// `aws-service-channel/<service>/…` and deliver to `AWS_SERVICE`; CloudWatch
+/// ingests CloudTrail events only through one (`aws-service-channel/cloudwatch/…`).
+/// The selectors sit under `SourceConfig`, in a trail's shape. Conservative:
+/// a service-linked channel without readable selectors is [`ChannelCover::Maybe`].
+#[must_use]
+pub fn channel_cover(doc: &serde_json::Value) -> ChannelView {
+    let s = |p: &str| doc.pointer(p).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let (name, arn) = (s("/Name"), s("/ChannelArn"));
+    let destinations: Vec<(String, String)> = doc
+        .get("Destinations")
+        .and_then(|d| d.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|d| (d.get("Type").and_then(|v| v.as_str()).unwrap_or_default().to_string(), d.get("Location").and_then(|v| v.as_str()).unwrap_or_default().to_string()))
+        .collect();
+    let service_linked = name.starts_with("aws-service-channel/") || destinations.iter().any(|(t, _)| t == "AWS_SERVICE");
+    let kind = if let Some(rest) = name.strip_prefix("aws-service-channel/") {
+        rest.split('/').next().unwrap_or(rest).to_string()
+    } else if let Some((_, loc)) = destinations.iter().find(|(t, _)| t == "AWS_SERVICE") {
+        loc.clone()
+    } else {
+        "integration".to_string()
+    };
+    let view = |cover| ChannelView { name: name.clone(), arn: arn.clone(), cover, kind: kind.clone(), destinations: destinations.clone() };
+    if !service_linked && !destinations.is_empty() && destinations.iter().all(|(t, _)| t == "EVENT_DATA_STORE") {
+        return view(ChannelCover::External);
+    }
+    let region = arn.split(':').nth(3).unwrap_or_default();
+    if doc.pointer("/SourceConfig/ApplyToAllRegions").and_then(serde_json::Value::as_bool) == Some(false) && !region.is_empty() && region != crate::bridge::config::REGION {
+        return view(ChannelCover::No);
+    }
+    let source = doc.get("SourceConfig");
+    let readable = source.and_then(|c| c.get("AdvancedEventSelectors")).and_then(|a| a.as_array()).is_some_and(|a| !a.is_empty());
+    if !readable {
+        return view(ChannelCover::Maybe);
+    }
+    view(if source.is_some_and(selectors_log_microvm_data) { ChannelCover::Logs } else { ChannelCover::No })
+}
+
+/// `(Region, name)` of a CloudWatch Logs log group ARN
+/// (`arn:aws:logs:REGION:ACCT:log-group:NAME:*`, the form `describe-trails`
+/// gives as `CloudWatchLogsLogGroupArn`); `None` for anything else or a name
+/// outside `[A-Za-z0-9._/#-]` (the name is printed inside a shell command).
+#[must_use]
+pub fn log_group_from_arn(arn: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = arn.splitn(7, ':').collect();
+    if parts.len() != 7 || parts[0] != "arn" || parts[2] != "logs" || parts[3].is_empty() || parts[5] != "log-group" {
+        return None;
+    }
+    let name = parts[6].strip_suffix(":*").unwrap_or(parts[6]);
+    is_safe_log_group_name(name).then(|| (parts[3].to_string(), name.to_string()))
+}
+
+/// A log group name the probe may print inside a single-quoted shell word:
+/// non-empty, `[A-Za-z0-9._/#-]` only (a subset of what CloudWatch allows).
+#[must_use]
+pub fn is_safe_log_group_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "._/#-".contains(c))
+}
+
+/// A redaction marker is the whole value, never a substring (a logged
+/// payload's owner may say "hidden").
+fn is_redaction_marker(s: &str) -> bool {
+    let s = s.trim();
+    s.eq_ignore_ascii_case("HIDDEN_DUE_TO_SECURITY_REASONS") || s.eq_ignore_ascii_case("REDACTED") || s.eq_ignore_ascii_case("HIDDEN") || (!s.is_empty() && s.chars().all(|c| c == '*'))
+}
+
+/// Where a record was read from (the row note names it: a CloudWatch copy may
+/// have been transformed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    Trail,
+    LogsRaw,
+    LogsOcsf,
+}
+
+impl Provenance {
+    fn label(self) -> &'static str {
+        match self {
+            Provenance::Trail => "CloudTrail record",
+            Provenance::LogsRaw => "CloudWatch Logs, raw",
+            Provenance::LogsOcsf => "CloudWatch Logs, OCSF",
+        }
+    }
+}
+
+/// One record: the CloudTrail shape, its raw text (searched for the session
+/// token), and where it came from.
+struct CtRecord {
+    rec: serde_json::Value,
+    raw: String,
+    from: Provenance,
+}
+
+/// An OCSF `api.request.data` / `api.response.data` value as a CloudTrail
+/// `requestParameters` / `responseElements`: an object, a JSON string of an
+/// object, or a whole-value redaction marker; anything else is refused.
+fn ocsf_data(v: Option<&serde_json::Value>, required: bool, eid: &str, what: &str) -> std::result::Result<serde_json::Value, String> {
+    match v {
+        None | Some(serde_json::Value::Null) if !required => Ok(serde_json::Value::Null),
+        None | Some(serde_json::Value::Null) => Err(format!("CloudWatch Logs event {eid}: an OCSF record without {what}")),
+        Some(o @ serde_json::Value::Object(_)) => Ok(o.clone()),
+        Some(serde_json::Value::String(s)) if is_redaction_marker(s) => Ok(serde_json::Value::String(s.clone())),
+        Some(serde_json::Value::String(s)) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(o @ serde_json::Value::Object(_)) => Ok(o),
+            _ => Err(format!("CloudWatch Logs event {eid}: {what} is neither an object nor a JSON object string")),
+        },
+        Some(_) => Err(format!("CloudWatch Logs event {eid}: {what} is neither an object nor a JSON object string")),
+    }
+}
+
+/// The CloudTrail records in `doc`: a trail's log file (`{"Records": [...]}`,
+/// gunzipped), `aws logs filter-log-events` output (`{"events": [{"message":
+/// "...", "eventId": "..."}]}` — each message a raw CloudTrail record or an
+/// OCSF one mapped back: `api.operation` → eventName, `metadata.uid` →
+/// eventID, `api.request.data` / `api.response.data` → requestParameters /
+/// responseElements), a `lookup-events` answer (`{"Events":
+/// [{"CloudTrailEvent": "..."}]}`), a JSON array of records, or one record. A
+/// CloudWatch message that cannot be read is an error, never skipped: the
+/// filter output holds only matches.
+fn cloudtrail_records(doc: &serde_json::Value) -> std::result::Result<Vec<CtRecord>, String> {
+    let own = |r: &serde_json::Value| CtRecord { rec: r.clone(), raw: r.to_string(), from: Provenance::Trail };
     if let Some(records) = doc.get("Records").and_then(|r| r.as_array()) {
         return Ok(records.iter().map(own).collect());
     }
-    if let Some(rows) = doc.get("QueryResultRows").and_then(|r| r.as_array()) {
+    if let Some(events) = doc.get("events").and_then(|e| e.as_array()) {
         let mut out = Vec::new();
-        for row in rows {
-            // Each row is a list of one-column maps.
-            let mut cols = serde_json::Map::new();
-            for cell in row.as_array().map(Vec::as_slice).unwrap_or_default() {
-                if let Some(o) = cell.as_object() {
-                    cols.extend(o.iter().map(|(k, v)| (k.clone(), v.clone())));
-                }
+        for ev in events {
+            let eid = ev.get("eventId").and_then(|v| v.as_str()).unwrap_or("?");
+            let msg = ev.get("message").and_then(|m| m.as_str()).ok_or_else(|| format!("CloudWatch Logs event {eid} has no message"))?;
+            let v: serde_json::Value = serde_json::from_str(msg).map_err(|_| format!("CloudWatch Logs event {eid}: the message is not JSON"))?;
+            if v.get("eventName").is_some() {
+                out.push(CtRecord { rec: v, raw: msg.to_string(), from: Provenance::LogsRaw });
+                continue;
             }
-            // A column that was not selected cannot be told from an absent field: refuse rather than guess.
-            if let Some(missing) = ["eventName", "microvmId", "clientToken", "runHookPayload"].iter().find(|c| !cols.contains_key(**c)) {
-                return Err(format!("a CloudTrail Lake row without the column {missing}: select {LAKE_COLUMNS}"));
+            let Some(op) = v.pointer("/api/operation").and_then(|o| o.as_str()) else {
+                return Err(format!("CloudWatch Logs event {eid}: neither a CloudTrail record (eventName) nor OCSF (api.operation)"));
+            };
+            if v.pointer("/api/request").is_none() {
+                return Err(format!("CloudWatch Logs event {eid}: an OCSF record without api.request"));
             }
-            let col = |k: &str| cols.get(k).cloned().filter(|v| !v.as_str().is_some_and(str::is_empty)).unwrap_or(serde_json::Value::Null);
             let rec = serde_json::json!({
-                "eventName": col("eventName"), "eventID": col("eventID"),
-                "requestParameters": {"clientToken": col("clientToken"), "runHookPayload": col("runHookPayload")},
-                "responseElements": {"microvmId": col("microvmId")},
+                "eventName": op,
+                "eventID": v.pointer("/metadata/uid").cloned().unwrap_or(serde_json::Value::Null),
+                "requestParameters": ocsf_data(v.pointer("/api/request/data"), true, eid, "api.request.data")?,
+                "responseElements": ocsf_data(v.pointer("/api/response/data"), false, eid, "api.response.data")?,
             });
-            out.push((rec, serde_json::Value::Object(cols).to_string()));
+            out.push(CtRecord { rec, raw: msg.to_string(), from: Provenance::LogsOcsf });
         }
         return Ok(out);
     }
@@ -513,7 +652,7 @@ fn cloudtrail_records(doc: &serde_json::Value) -> std::result::Result<Vec<(serde
         return Ok(events
             .iter()
             .filter_map(|ev| ev.get("CloudTrailEvent").and_then(|c| c.as_str()))
-            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok().map(|inner| (inner, raw.to_string())))
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok().map(|rec| CtRecord { rec, raw: raw.to_string(), from: Provenance::Trail }))
             .collect());
     }
     if let Some(records) = doc.as_array() {
@@ -522,46 +661,59 @@ fn cloudtrail_records(doc: &serde_json::Value) -> std::result::Result<Vec<(serde
     if doc.get("eventName").is_some() {
         return Ok(vec![own(doc)]);
     }
-    Err("not a CloudTrail document: no Records, Events or eventName".into())
+    Err("not a CloudTrail document: no Records, events (CloudWatch Logs), Events or eventName".into())
 }
 
 /// cloudtrail-payload from a CloudTrail document (see [`cloudtrail_records`]):
-/// the `RunMicrovm` record of this VM (matched by `responseElements.microvmId`
-/// or `requestParameters.clientToken`; records of other calls on the same VM
-/// are skipped), then what it kept of `runHookPayload`: `absent`, `hidden` (a
-/// redaction marker), `commitment-only` (the payload with the commitment and
-/// without the session token), `present-other`, or `LEAKED` when the session
-/// token appears anywhere in the record. `Ok(None)` when no record matched.
+/// every `RunMicrovm` record of this VM (matched by
+/// `responseElements.microvmId` or `requestParameters.clientToken`; records
+/// without an event name or of other calls on the same VM are skipped), then
+/// what each kept of `runHookPayload`: `absent`, `hidden` (a redaction
+/// marker), `commitment-only` (the payload with the commitment and without
+/// the session token), `present-other`, or `LEAKED` when the session token
+/// appears anywhere in a record. LEAKED in any record wins; records that
+/// disagree otherwise are refused, as is a CloudWatch copy with masked
+/// (`****`) text (fetch it with `--unmask`). `Ok(None)` when no record matched.
 pub fn verdict_cloudtrail(doc_json: &str, id: &str, client_token: &str, session_token: Option<&str>, commit: &str) -> std::result::Result<Option<(String, String)>, String> {
     let doc: serde_json::Value = serde_json::from_str(doc_json).map_err(|e| format!("CloudTrail document: {e}"))?;
-    for (inner, raw) in cloudtrail_records(&doc)? {
-        if inner.get("eventName").and_then(|v| v.as_str()).is_some_and(|n| n != "RunMicrovm") {
+    let mut found: Vec<(&'static str, String)> = Vec::new();
+    for r in cloudtrail_records(&doc)? {
+        let inner = &r.rec;
+        if inner.get("eventName").and_then(|v| v.as_str()) != Some("RunMicrovm") {
             continue;
         }
-        let raw = raw.as_str();
         let by_id = inner.pointer("/responseElements/microvmId").and_then(|v| v.as_str()) == Some(id);
         let by_token = !client_token.is_empty() && inner.pointer("/requestParameters/clientToken").and_then(|v| v.as_str()) == Some(client_token);
         if !(by_id || by_token) {
             continue;
         }
         let event_id = inner.get("eventID").and_then(|v| v.as_str()).unwrap_or("?");
-        if session_token.is_some_and(|t| !t.is_empty() && raw.contains(t)) {
-            return Ok(Some(("LEAKED".to_string(), format!("event {event_id}: the session token itself is in the event"))));
+        let label = format!("event {event_id} (matched by {}; {})", if by_id { "microvmId" } else { "clientToken" }, r.from.label());
+        if session_token.is_some_and(|t| !t.is_empty() && r.raw.contains(t)) {
+            return Ok(Some(("LEAKED".to_string(), format!("{label}: the session token itself is in the event"))));
         }
-        // A redaction marker is the whole value, never a substring (a logged payload's owner may say "hidden").
-        let marker = |s: &str| {
-            let s = s.trim();
-            s.eq_ignore_ascii_case("HIDDEN_DUE_TO_SECURITY_REASONS") || s.eq_ignore_ascii_case("REDACTED") || s.eq_ignore_ascii_case("HIDDEN") || (!s.is_empty() && s.chars().all(|c| c == '*'))
-        };
-        let verdict = match inner.pointer("/requestParameters/runHookPayload") {
+        if r.from != Provenance::Trail && r.raw.contains("****") {
+            return Err(format!("{label} has masked text: fetch it again with --unmask"));
+        }
+        let verdict = match inner.get("requestParameters") {
             None | Some(serde_json::Value::Null) => "absent",
-            Some(serde_json::Value::String(s)) if marker(s) => "hidden",
-            Some(serde_json::Value::String(s)) if s.contains(commit) => "commitment-only",
-            Some(_) => "present-other",
+            Some(serde_json::Value::String(s)) if is_redaction_marker(s) => "hidden",
+            Some(serde_json::Value::Object(_)) => match inner.pointer("/requestParameters/runHookPayload") {
+                None | Some(serde_json::Value::Null) => "absent",
+                Some(serde_json::Value::String(s)) if is_redaction_marker(s) => "hidden",
+                Some(serde_json::Value::String(s)) if s.contains(commit) => "commitment-only",
+                Some(_) => "present-other",
+            },
+            Some(_) => return Err(format!("{label}: requestParameters is neither an object nor a redaction marker")),
         };
-        return Ok(Some((verdict.to_string(), format!("event {event_id} (matched by {})", if by_id { "microvmId" } else { "clientToken" }))));
+        found.push((verdict, label));
     }
-    Ok(None)
+    let Some((first, _)) = found.first() else { return Ok(None) };
+    if found.iter().any(|(v, _)| v != first) {
+        let all = found.iter().map(|(v, l)| format!("{l}={v}")).collect::<Vec<_>>().join(", ");
+        return Err(format!("the matching records disagree: {all}"));
+    }
+    Ok(Some((first.to_string(), found.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(", "))))
 }
 
 // ---- `ai-env lab list|show` ---------------------------------------------------------------
@@ -699,7 +851,7 @@ mod tests {
         let token = "s".repeat(64);
         let commit = "c".repeat(64);
         let event = |params: serde_json::Value| {
-            let inner = serde_json::json!({"eventID":"e1","requestParameters":params,"responseElements":{"microvmId":"microvm-a"}});
+            let inner = serde_json::json!({"eventName":"RunMicrovm","eventID":"e1","requestParameters":params,"responseElements":{"microvmId":"microvm-a"}});
             serde_json::json!({"Events":[{"CloudTrailEvent": inner.to_string()}]}).to_string()
         };
         let v = |params: serde_json::Value| verdict_cloudtrail(&event(params), "microvm-a", "", Some(&token), &commit).unwrap().unwrap().0;
@@ -710,6 +862,8 @@ mod tests {
         assert_eq!(v(serde_json::json!({"runHookPayload": format!("x{token}")})), "LEAKED");
         assert_eq!(verdict_cloudtrail(&event(serde_json::json!({})), "microvm-other", "", None, &commit).unwrap(), None, "not yet visible");
         assert!(verdict_cloudtrail("{}", "microvm-a", "", None, &commit).is_err());
+        let nameless = serde_json::json!({"Records": [{"eventID": "e9", "requestParameters": {}, "responseElements": {"microvmId": "microvm-a"}}]}).to_string();
+        assert_eq!(verdict_cloudtrail(&nameless, "microvm-a", "", None, &commit).unwrap(), None, "a record without an event name never stands in for RunMicrovm");
         // A trail's log file: the Records of other calls on the same VM (TerminateMicrovm answers with its
         // microvmId too) must not stand in for RunMicrovm, whose record shape is the AWS docs example.
         let terminate = serde_json::json!({"eventName":"TerminateMicrovm","eventID":"e0","responseElements":{"microvmId":"microvm-a"}});
@@ -718,7 +872,7 @@ mod tests {
         let file = |records: Vec<&serde_json::Value>| serde_json::json!({"Records": records}).to_string();
         assert_eq!(verdict_cloudtrail(&file(vec![&terminate]), "microvm-a", "", None, &commit).unwrap(), None, "only RunMicrovm counts");
         let (v, note) = verdict_cloudtrail(&file(vec![&terminate, &run]), "microvm-a", "", Some(&token), &commit).unwrap().unwrap();
-        assert_eq!((v.as_str(), note.as_str()), ("absent", "event e2 (matched by microvmId)"));
+        assert_eq!((v.as_str(), note.as_str()), ("absent", "event e2 (matched by microvmId; CloudTrail record)"));
         assert_eq!(verdict_cloudtrail(&run.to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "absent", "one record");
         assert_eq!(verdict_cloudtrail(&serde_json::json!([run]).to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "absent", "an array");
         let leaked = serde_json::json!({"eventName":"RunMicrovm","responseElements":{"microvmId":"microvm-a"},"requestParameters":{"note":token}});
@@ -784,12 +938,12 @@ mod tests {
     }
 
     #[test]
-    fn cloudtrail_matches_by_client_token_reads_lake_rows_and_exact_markers() {
+    fn cloudtrail_matches_by_client_token_and_exact_markers() {
         let commit = "c".repeat(64);
         // No microvmId in the record: matched by clientToken.
         let by_token = serde_json::json!({"Records": [{"eventName": "RunMicrovm", "eventID": "e3", "requestParameters": {"clientToken": "ct-1", "runHookPayload": format!("{{\"commit\":\"{commit}\"}}")}}]});
         let (v, note) = verdict_cloudtrail(&by_token.to_string(), "microvm-a", "ct-1", None, &commit).unwrap().unwrap();
-        assert_eq!((v.as_str(), note.as_str()), ("commitment-only", "event e3 (matched by clientToken)"));
+        assert_eq!((v.as_str(), note.as_str()), ("commitment-only", "event e3 (matched by clientToken; CloudTrail record)"));
         assert_eq!(verdict_cloudtrail(&by_token.to_string(), "microvm-a", "", None, &commit).unwrap(), None, "an empty client token matches nothing");
         // A payload whose owner says "hidden" is logged, not redacted.
         let owner = serde_json::json!({"eventName": "RunMicrovm", "responseElements": {"microvmId": "microvm-a"}, "requestParameters": {"runHookPayload": "{\"owner\":\"hidden@host\"}"}});
@@ -798,18 +952,109 @@ mod tests {
             let m = serde_json::json!({"eventName": "RunMicrovm", "responseElements": {"microvmId": "microvm-a"}, "requestParameters": {"runHookPayload": marker}});
             assert_eq!(verdict_cloudtrail(&m.to_string(), "microvm-a", "", None, &commit).unwrap().unwrap().0, "hidden", "{marker}");
         }
-        // CloudTrail Lake get-query-results over LAKE_COLUMNS: one-column maps per row.
+        // requestParameters itself a marker (CloudTrail's form for sensitive parameters): hidden; any other scalar: refused.
+        let whole = |p: serde_json::Value| serde_json::json!({"eventName": "RunMicrovm", "responseElements": {"microvmId": "microvm-a"}, "requestParameters": p}).to_string();
+        assert_eq!(verdict_cloudtrail(&whole(serde_json::json!("HIDDEN_DUE_TO_SECURITY_REASONS")), "microvm-a", "", None, &commit).unwrap().unwrap().0, "hidden");
+        assert!(verdict_cloudtrail(&whole(serde_json::json!("some text")), "microvm-a", "", None, &commit).is_err());
+        assert!(verdict_cloudtrail(&whole(serde_json::json!(42)), "microvm-a", "", None, &commit).is_err());
+    }
+
+    #[test]
+    fn cloudtrail_reads_cloudwatch_events() {
         let token = "s".repeat(64);
-        let lake = |payload: &str, extra: &str| {
-            serde_json::json!({"QueryStatus": "FINISHED", "QueryResultRows": [[
-                {"eventID": "e4"}, {"eventName": "RunMicrovm"}, {"clientToken": "ct-9"}, {"runHookPayload": payload}, {"microvmId": "microvm-a"},
-                {"requestParameters": extra}, {"responseElements": "{microvmId=microvm-a}"}]]}).to_string()
+        let commit = "c".repeat(64);
+        let payload = format!("{{\"commit\":\"{commit}\"}}");
+        // `aws logs filter-log-events --output json`: one message per matching log event.
+        let logs = |messages: Vec<String>| {
+            let events: Vec<serde_json::Value> = messages.iter().enumerate().map(|(i, m)| serde_json::json!({"logStreamName": "s", "timestamp": 1, "message": m, "eventId": format!("ev{i}")})).collect();
+            serde_json::json!({"events": events, "searchedLogStreams": []}).to_string()
         };
-        assert_eq!(verdict_cloudtrail(&lake("HIDDEN_DUE_TO_SECURITY_REASONS", "{}"), "microvm-a", "", Some(&token), &commit).unwrap().unwrap().0, "hidden");
-        assert_eq!(verdict_cloudtrail(&lake("", "{}"), "microvm-a", "", None, &commit).unwrap().unwrap().0, "absent", "an empty cell is no payload");
-        assert_eq!(verdict_cloudtrail(&lake("HIDDEN", &format!("{{note={token}}}")), "microvm-a", "", Some(&token), &commit).unwrap().unwrap().0, "LEAKED", "the whole row is searched");
-        let short = serde_json::json!({"QueryResultRows": [[{"eventName": "RunMicrovm"}, {"microvmId": "microvm-a"}]]}).to_string();
-        assert!(verdict_cloudtrail(&short, "microvm-a", "", None, &commit).unwrap_err().contains("runHookPayload") || verdict_cloudtrail(&short, "microvm-a", "", None, &commit).unwrap_err().contains("clientToken"), "a missing column is refused, not read as absent");
+        let v = |messages: Vec<String>| verdict_cloudtrail(&logs(messages), "microvm-a", "", Some(&token), &commit);
+        let raw = |p: &str| serde_json::json!({"eventName": "RunMicrovm", "eventID": "r1", "requestParameters": {"runHookPayload": p}, "responseElements": {"microvmId": "microvm-a"}}).to_string();
+        let ocsf = |op: &str, request: serde_json::Value| serde_json::json!({"class_uid": 6003, "metadata": {"uid": "o1"}, "api": {"operation": op, "request": request, "response": {"data": {"microvmId": "microvm-a"}}}}).to_string();
+        let (verdict, note) = v(vec![raw("HIDDEN_DUE_TO_SECURITY_REASONS")]).unwrap().unwrap();
+        assert_eq!((verdict.as_str(), note.as_str()), ("hidden", "event r1 (matched by microvmId; CloudWatch Logs, raw)"));
+        assert_eq!(v(vec![ocsf("RunMicrovm", serde_json::json!({"data": {"microvmImageArn": "x"}}))]).unwrap().unwrap().0, "absent", "OCSF, object data");
+        assert_eq!(v(vec![ocsf("RunMicrovm", serde_json::json!({"data": {"runHookPayload": "other"}}))]).unwrap().unwrap().0, "present-other");
+        let (verdict, note) = v(vec![ocsf("RunMicrovm", serde_json::json!({"data": serde_json::json!({"runHookPayload": payload}).to_string()}))]).unwrap().unwrap();
+        assert_eq!((verdict.as_str(), note.as_str()), ("commitment-only", "event o1 (matched by microvmId; CloudWatch Logs, OCSF)"), "OCSF data as a JSON string");
+        assert_eq!(v(vec![ocsf("TerminateMicrovm", serde_json::json!({"data": {}}))]).unwrap(), None, "other operations are skipped");
+        let leaked = serde_json::json!({"eventName": "RunMicrovm", "responseElements": {"microvmId": "microvm-a"}, "requestParameters": {}, "userAgent": token}).to_string();
+        assert_eq!(v(vec![leaked.clone()]).unwrap().unwrap().0, "LEAKED", "anywhere in the message");
+        assert_eq!(v(vec![raw(&payload), leaked]).unwrap().unwrap().0, "LEAKED", "a later LEAKED record wins");
+        assert!(v(vec![raw(&payload), raw("other")]).unwrap_err().contains("disagree"), "records that disagree are refused");
+        assert!(v(vec![ocsf("RunMicrovm", serde_json::json!({"data": "{not json"}))]).unwrap_err().contains("api.request.data"));
+        assert!(v(vec![ocsf("RunMicrovm", serde_json::json!({"data": 7}))]).is_err());
+        assert!(v(vec![serde_json::json!({"api": {"operation": "RunMicrovm"}}).to_string()]).unwrap_err().contains("without api.request"));
+        assert!(v(vec![ocsf("RunMicrovm", serde_json::json!({"uid": "q"}))]).unwrap_err().contains("without api.request.data"));
+        assert!(v(vec!["plain text line".to_string()]).unwrap_err().contains("ev0: the message is not JSON"), "never skipped: the filter output holds only matches");
+        assert!(v(vec![serde_json::json!({"hello": 1}).to_string()]).unwrap_err().contains("neither a CloudTrail record"));
+        assert!(v(vec![raw("{\"commit\":\"********\"}")]).unwrap_err().contains("--unmask"), "masked text is refused, not called hidden");
+        assert!(v(vec![ocsf("RunMicrovm", serde_json::json!({"data": {"runHookPayload": "{\"owner\":\"****\"}"}}))]).unwrap_err().contains("--unmask"), "an OCSF record with a 4-star mask too");
+        // The token anywhere in the OCSF message, outside what is mapped back: LEAKED.
+        let actor = serde_json::json!({"metadata": {"uid": "o2"}, "actor": {"session": token}, "api": {"operation": "RunMicrovm", "request": {"data": {}}, "response": {"data": {"microvmId": "microvm-a"}}}}).to_string();
+        assert_eq!(v(vec![actor]).unwrap().unwrap().0, "LEAKED");
+        // Optional OCSF shapes: request data that is a redaction marker, and no response (matched by clientToken).
+        assert_eq!(v(vec![ocsf("RunMicrovm", serde_json::json!({"data": "HIDDEN_DUE_TO_SECURITY_REASONS"}))]).unwrap().unwrap().0, "hidden");
+        let no_response = serde_json::json!({"metadata": {"uid": "o3"}, "api": {"operation": "RunMicrovm", "request": {"data": {"clientToken": "ct-5"}}}}).to_string();
+        let (verdict, note) = verdict_cloudtrail(&logs(vec![no_response]), "microvm-a", "ct-5", Some(&token), &commit).unwrap().unwrap();
+        assert_eq!((verdict.as_str(), note.as_str()), ("absent", "event o3 (matched by clientToken; CloudWatch Logs, OCSF)"));
+        assert_eq!(v(vec![]).unwrap(), None);
+    }
+
+    #[test]
+    fn channel_cover_cases() {
+        let arn = |region: &str, name: &str| format!("arn:aws:cloudtrail:{region}:123456789012:channel/{name}");
+        let data_sel = serde_json::json!([{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": [MICROVM_DATA_RESOURCE]}]}]);
+        // The live Resource Explorer channel (shape seen 30 Sep 2026): management events only.
+        let rex = serde_json::json!({"ChannelArn": arn("eu-central-1", "aws-service-channel/resource-explorer-2"), "Name": "aws-service-channel/resource-explorer-2/AwsResourceExplorerDefault", "Source": "CloudTrail",
+            "SourceConfig": {"ApplyToAllRegions": true, "AdvancedEventSelectors": [{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}]}]},
+            "Destinations": [{"Type": "AWS_SERVICE", "Location": "resource-explorer-2"}]});
+        let c = channel_cover(&rex);
+        assert_eq!((c.cover, c.kind.as_str()), (ChannelCover::No, "resource-explorer-2"));
+        let cw = serde_json::json!({"ChannelArn": arn("eu-central-1", "cw-1"), "Name": "aws-service-channel/cloudwatch/rule-1", "SourceConfig": {"ApplyToAllRegions": true, "AdvancedEventSelectors": data_sel},
+            "Destinations": [{"Type": "AWS_SERVICE", "Location": "cloudwatch"}]});
+        let c = channel_cover(&cw);
+        assert_eq!((c.cover, c.kind.as_str()), (ChannelCover::Logs, "cloudwatch"));
+        assert!(!selectors_log_microvm_data(&cw), "the selectors sit under SourceConfig: the whole document never matches");
+        let mut no_source = cw.clone();
+        no_source.as_object_mut().unwrap().remove("SourceConfig");
+        assert_eq!(channel_cover(&no_source).cover, ChannelCover::Maybe, "unreadable selectors: may log");
+        let mut empty = cw.clone();
+        empty["SourceConfig"]["AdvancedEventSelectors"] = serde_json::json!([]);
+        assert_eq!(channel_cover(&empty).cover, ChannelCover::Maybe);
+        let lake = serde_json::json!({"ChannelArn": arn("eu-central-1", "int-1"), "Name": "partner-integration", "Destinations": [{"Type": "EVENT_DATA_STORE", "Location": "arn:aws:cloudtrail:eu-central-1:123456789012:eventdatastore/eds-1"}]});
+        let c = channel_cover(&lake);
+        assert_eq!((c.cover, c.kind.as_str()), (ChannelCover::External, "integration"));
+        let mut elsewhere = cw.clone();
+        elsewhere["ChannelArn"] = serde_json::json!(arn("us-east-1", "cw-2"));
+        elsewhere["SourceConfig"]["ApplyToAllRegions"] = serde_json::json!(false);
+        assert_eq!(channel_cover(&elsewhere).cover, ChannelCover::No, "a single-Region channel of another Region");
+        elsewhere["SourceConfig"]["ApplyToAllRegions"] = serde_json::json!(true);
+        assert_eq!(channel_cover(&elsewhere).cover, ChannelCover::Logs, "an all-Region channel homed elsewhere covers this Region");
+        let mut here_only = cw.clone();
+        here_only["SourceConfig"]["ApplyToAllRegions"] = serde_json::json!(false);
+        assert_eq!(channel_cover(&here_only).cover, ChannelCover::Logs, "a single-Region channel of eu-central-1 covers it");
+        // External only for a non-service channel whose destinations are all event data stores.
+        let nowhere = serde_json::json!({"ChannelArn": arn("eu-central-1", "n"), "Name": "partner", "Destinations": []});
+        assert_eq!(channel_cover(&nowhere).cover, ChannelCover::Maybe, "no destinations: unknown, not External");
+        let service_to_store = serde_json::json!({"ChannelArn": arn("eu-central-1", "s"), "Name": "aws-service-channel/cloudwatch/y", "Destinations": [{"Type": "EVENT_DATA_STORE", "Location": "arn:aws:cloudtrail:eu-central-1:123456789012:eventdatastore/eds-2"}]});
+        assert_ne!(channel_cover(&service_to_store).cover, ChannelCover::External, "a service-linked name is never an integration channel");
+        let unnamed_service = serde_json::json!({"ChannelArn": arn("eu-central-1", "x"), "Name": "x", "Destinations": [{"Type": "AWS_SERVICE", "Location": "security-lake"}]});
+        let c = channel_cover(&unnamed_service);
+        assert_eq!((c.cover, c.kind.as_str()), (ChannelCover::Maybe, "security-lake"));
+    }
+
+    #[test]
+    fn log_group_arn_cases() {
+        let g = |a: &str| log_group_from_arn(a);
+        assert_eq!(g("arn:aws:logs:eu-central-1:123456789012:log-group:aws-cloudtrail-logs-1:*"), Some(("eu-central-1".into(), "aws-cloudtrail-logs-1".into())));
+        assert_eq!(g("arn:aws:logs:eu-central-1:123456789012:log-group:aws/cloudtrail/data"), Some(("eu-central-1".into(), "aws/cloudtrail/data".into())));
+        assert_eq!(g("arn:aws:logs:us-east-1:123456789012:log-group:/aws/ct:*"), Some(("us-east-1".into(), "/aws/ct".into())));
+        assert_eq!(g("arn:aws:logs:eu-central-1:123456789012:log-group:bad name'x:*"), None, "a name this probe will not print");
+        assert_eq!(g("arn:aws:s3:::bucket"), None);
+        assert_eq!(g("garbage"), None);
+        assert!(is_safe_log_group_name("aws/cloudtrail/data-events") && !is_safe_log_group_name("") && !is_safe_log_group_name("a'b"));
     }
 
     #[test]

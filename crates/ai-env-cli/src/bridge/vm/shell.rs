@@ -4,8 +4,12 @@
 //! dial is `transport::dial_shell`. The frame format is undocumented, so the
 //! pump is deliberately dumb: stdin bytes go out as binary frames, binary and
 //! text frames come back to stdout, a close ends the session, Ctrl-] quits.
-//! On a terminal, stdin is switched to raw mode for the session and restored
-//! on every exit path ([`RawMode`]).
+//! Measured live (S4 part B, 30 Sep 2026): header and subprotocol auth both
+//! work; the first frame is a text `{"type":"session_init","session_id":…}`,
+//! reported on stderr instead of printed ([`session_init_id`]); the shell is
+//! bash in the image's root filesystem (PID 1 `ai-env`), not a VM host with
+//! `ctr` as the AWS docs describe. On a terminal, stdin is switched to raw
+//! mode for the session and restored on every exit path ([`RawMode`]).
 use crate::bridge::api::MicrovmApi;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::transport::{dial_shell, ShellAuth};
@@ -31,6 +35,17 @@ pub enum PumpEnd {
     Escaped,
     /// The input reached EOF and the remote stayed quiet for the linger (the close was sent).
     InputEof,
+}
+
+/// The session id of the platform's `{"type":"session_init","session_id":…}`
+/// text frame; `None` for anything else (shell output passes through as is).
+#[must_use]
+pub fn session_init_id(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session_init") {
+        return None;
+    }
+    Some(v.get("session_id").and_then(|s| s.as_str()).unwrap_or("?").to_string())
 }
 
 /// Move bytes between `input`/`output` and the WebSocket until one side ends.
@@ -76,7 +91,11 @@ where
                 match msg {
                     None | Some(Ok(Message::Close(_))) => return Ok(PumpEnd::RemoteClosed),
                     Some(Ok(Message::Binary(b))) => output.write_all(&b).await.map_err(|e| lost(&e))?,
-                    Some(Ok(Message::Text(t))) => output.write_all(t.as_bytes()).await.map_err(|e| lost(&e))?,
+                    Some(Ok(Message::Text(t))) => match session_init_id(&t) {
+                        // `\r\n`: the terminal may be in raw mode.
+                        Some(sid) => eprint!("ai-env: shell session {sid}\r\n"),
+                        None => output.write_all(t.as_bytes()).await.map_err(|e| lost(&e))?,
+                    },
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(lost(&e)),
                 }

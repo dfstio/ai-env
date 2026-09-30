@@ -272,12 +272,19 @@ endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code
 terminate) their own short VMs; `hooks-port`, `hooks-source-ip`, `runtime-env`, `disk-budget` and
 the second pass of `snapshot-uniqueness` read a runtime log (`make logs SINCE=30m > FILE`, then
 `--log FILE`; the shim logs one `ai-env: run-report` line after `/run` and at `/terminate`);
-`cloudtrail-payload ID` asks CloudTrail as the operator's own `aws` identity: RunMicrovm is a CloudTrail
-data event (resource type `AWS::Lambda::MicrovmImage`, off by default, never in event history). A trail
-or eu-central-1 event data store that logs it → the probe says how to fetch the record and read it with
-`--log FILE` (a gunzipped trail log file or a CloudTrail Lake query result); none → it prints the
-`--manual not-logged` command to run once you have confirmed there is no store in another Region and no
-organization store (invisible from here). It never records a verdict for what it could not see.
+`cloudtrail-payload ID` asks AWS as the operator's own `aws` identity (within 7 days of the VM's end, while
+its row exists): RunMicrovm is a CloudTrail data event (resource type `AWS::Lambda::MicrovmImage`, off by
+default, never in event history). It checks the trails and the CloudTrail service-linked channels of
+eu-central-1 — CloudWatch's CloudTrail ingestion runs through one, as does Security Lake. A trail or
+CloudWatch channel that takes RunMicrovm → the probe prints how to fetch the record (the trail's S3 log
+file, or an `aws logs filter-log-events … --unmask` command per log group) and reads it with `--log FILE`
+(raw or OCSF CloudWatch records; a CloudWatch copy may be transformed, the row notes where it came from);
+another service's channel → read it there and record with `--manual`; nothing → it prints the
+`--manual not-logged` command to run once you have confirmed what it cannot see (CloudTrail Lake event
+data stores, channels homed in other Regions, organization-level CloudWatch or Security Lake). It never
+records a verdict for what it could not see. The identity needs `cloudtrail:DescribeTrails`,
+`GetEventSelectors`, `ListChannels`, `GetChannel`, `logs:DescribeLogGroups`, and for the printed command
+`logs:FilterLogEvents` and `logs:Unmask`.
 
 ```sh
 make test-aws-readonly         # part A: TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm (read-only)

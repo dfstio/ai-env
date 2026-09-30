@@ -1031,100 +1031,225 @@ fn snapshot_log_pass(paths: &Paths, spec: &probes::ProbeSpec, text: &str, src: &
     probes::record(paths, &probes::stamped(paths, spec, &verdict, with_note(format!("ids={} boot_ids {same} across snapshot clones: {pairs} ({src})", ids.join(",")), note)))
 }
 
-/// The CloudTrail endpoint of eu-central-1, passed on every call: the flag
-/// overrides `AWS_ENDPOINT_URL[_CLOUDTRAIL]` and a profile's `endpoint_url`,
-/// so a stub endpoint cannot answer "no trail" (the SDK pins its control
-/// plane the same way).
+/// The eu-central-1 endpoints of the two services the probe reads, passed on
+/// every call: the flag overrides `AWS_ENDPOINT_URL[_<SERVICE>]` and a
+/// profile's `endpoint_url`, so a stub endpoint cannot answer "no trail" (the
+/// SDK pins its control plane the same way).
 const CLOUDTRAIL_URL: &str = "https://cloudtrail.eu-central-1.amazonaws.com";
+const LOGS_URL: &str = "https://logs.eu-central-1.amazonaws.com";
+/// A bound on `list-channels` pages (the CLI does not paginate that call).
+const MAX_CHANNEL_PAGES: usize = 50;
 
-/// `aws cloudtrail <op> … --region eu-central-1 --endpoint-url … --output json`, parsed.
-fn cloudtrail_json(args: &[&str]) -> std::result::Result<serde_json::Value, String> {
-    let mut argv = vec!["cloudtrail"];
+/// `aws <service> <op> … --region eu-central-1 --endpoint-url … --output json`, parsed.
+fn aws_json(service: &str, endpoint: &str, args: &[&str]) -> std::result::Result<serde_json::Value, String> {
+    let mut argv = vec![service];
     argv.extend_from_slice(args);
-    argv.extend_from_slice(&["--region", REGION, "--endpoint-url", CLOUDTRAIL_URL, "--output", "json"]);
-    let out = crate::bridge::doctor::run_capture("aws", &argv, Duration::from_secs(30)).map_err(|e| format!("aws cloudtrail {}: {e}", args[0]))?;
-    serde_json::from_str(&out).map_err(|e| format!("aws cloudtrail {}: {e}", args[0]))
+    argv.extend_from_slice(&["--region", REGION, "--endpoint-url", endpoint, "--output", "json"]);
+    let what = format!("aws {service} {}", args[0]);
+    let out = crate::bridge::doctor::run_capture("aws", &argv, Duration::from_secs(30)).map_err(|e| format!("{what}: {e}"))?;
+    serde_json::from_str(&out).map_err(|e| format!("{what}: {e}"))
 }
 
 /// Where RunMicrovm records of this account may be kept.
 enum Keeper {
-    /// A trail (its own, a multi-region trail homed elsewhere, or an organization trail) with its S3 destination.
-    Trail { arn: String, bucket: String, prefix: String },
-    /// A CloudTrail Lake event data store homed in eu-central-1, any status (a stopped or pending-deletion store still
-    /// holds what it ingested).
-    Store { arn: String, status: String },
+    /// A trail (its own, a multi-region trail homed elsewhere, or an organization trail): its S3 destination and,
+    /// when it forwards to CloudWatch Logs, that log group's ARN and (Region, name).
+    Trail { arn: String, bucket: String, prefix: String, log_group_arn: Option<String>, log_group: Option<(String, String)>, org: bool },
+    /// A service-linked channel whose selectors take RunMicrovm or cannot be read (CloudWatch's CloudTrail ingestion,
+    /// Security Lake, …).
+    Channel(probes::ChannelView),
 }
 
-/// What the operator's CloudTrail shows from eu-central-1. Not visible from
-/// here: event data stores homed in other Regions (listing is per Region)
-/// and organization event data stores (invisible to member accounts).
+/// What the operator's CloudTrail shows from eu-central-1: trails and channels. Not visible from here: CloudTrail
+/// Lake event data stores (not checked: Lake is closed to new customers since 31 May 2026, and organization stores
+/// are invisible to member accounts), channels homed in other Regions, and organization-level CloudWatch or
+/// Security Lake configuration.
 struct DataEventCoverage {
     trails: usize,
-    stores: usize,
+    channels: usize,
+    /// Event data stores seen as destinations of Lake integration channels (Lake is in use).
+    stores_seen: Vec<String>,
     keepers: Vec<Keeper>,
     unreadable: Vec<String>,
 }
 
+/// Every channel ARN, following `NextToken`; a repeated token, too many pages or an entry without an ARN is an error.
+fn list_channel_arns() -> std::result::Result<Vec<String>, String> {
+    let (mut arns, mut seen, mut token) = (Vec::new(), std::collections::BTreeSet::new(), None::<String>);
+    for _ in 0..MAX_CHANNEL_PAGES {
+        let page = match &token {
+            Some(t) => aws_json("cloudtrail", CLOUDTRAIL_URL, &["list-channels", "--next-token", t])?,
+            None => aws_json("cloudtrail", CLOUDTRAIL_URL, &["list-channels"])?,
+        };
+        for c in page.get("Channels").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
+            let arn = c.get("ChannelArn").and_then(|a| a.as_str()).ok_or_else(|| "aws cloudtrail list-channels: a channel without ChannelArn".to_string())?;
+            arns.push(arn.to_string());
+        }
+        match page.get("NextToken").and_then(|t| t.as_str()).filter(|t| !t.is_empty()) {
+            None => return Ok(arns),
+            Some(t) if !seen.insert(t.to_string()) => return Err("aws cloudtrail list-channels: a repeated NextToken".into()),
+            Some(t) => token = Some(t.to_string()),
+        }
+    }
+    Err(format!("aws cloudtrail list-channels: more than {MAX_CHANNEL_PAGES} pages"))
+}
+
 fn microvm_data_event_coverage() -> std::result::Result<DataEventCoverage, String> {
-    let mut cov = DataEventCoverage { trails: 0, stores: 0, keepers: Vec::new(), unreadable: Vec::new() };
-    let trails = cloudtrail_json(&["describe-trails"])?;
+    let mut cov = DataEventCoverage { trails: 0, channels: 0, stores_seen: Vec::new(), keepers: Vec::new(), unreadable: Vec::new() };
+    let trails = aws_json("cloudtrail", CLOUDTRAIL_URL, &["describe-trails"])?;
     for t in trails.get("trailList").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
-        let Some(arn) = t.get("TrailARN").and_then(|a| a.as_str()) else { continue };
+        let Some(arn) = t.get("TrailARN").and_then(|a| a.as_str()) else {
+            cov.unreadable.push("a trail without TrailARN".into());
+            continue;
+        };
         cov.trails += 1;
         let s = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        match cloudtrail_json(&["get-event-selectors", "--trail-name", arn]) {
-            Ok(doc) if probes::selectors_log_microvm_data(&doc) => cov.keepers.push(Keeper::Trail { arn: arn.to_string(), bucket: s("S3BucketName"), prefix: s("S3KeyPrefix") }),
+        match aws_json("cloudtrail", CLOUDTRAIL_URL, &["get-event-selectors", "--trail-name", arn]) {
+            Ok(doc) if probes::selectors_log_microvm_data(&doc) => {
+                let log_group_arn = t.get("CloudWatchLogsLogGroupArn").and_then(|v| v.as_str()).map(str::to_string);
+                let log_group = log_group_arn.as_deref().and_then(probes::log_group_from_arn);
+                let org = t.get("IsOrganizationTrail").and_then(serde_json::Value::as_bool) == Some(true);
+                cov.keepers.push(Keeper::Trail { arn: arn.to_string(), bucket: s("S3BucketName"), prefix: s("S3KeyPrefix"), log_group_arn, log_group, org });
+            }
             Ok(_) => {}
             Err(e) => cov.unreadable.push(format!("trail {arn} (home region {}): {e}", t.get("HomeRegion").and_then(|r| r.as_str()).unwrap_or("?"))),
         }
     }
-    let stores = cloudtrail_json(&["list-event-data-stores"])?;
-    for s in stores.get("EventDataStores").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
-        let Some(arn) = s.get("EventDataStoreArn").and_then(|a| a.as_str()) else { continue };
-        cov.stores += 1;
-        match cloudtrail_json(&["get-event-data-store", "--event-data-store", arn]) {
-            Ok(doc) if probes::selectors_log_microvm_data(&doc) => {
-                let status = doc.get("Status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                cov.keepers.push(Keeper::Store { arn: arn.to_string(), status });
+    for arn in list_channel_arns()? {
+        cov.channels += 1;
+        match aws_json("cloudtrail", CLOUDTRAIL_URL, &["get-channel", "--channel", &arn]) {
+            Ok(doc) => {
+                let view = probes::channel_cover(&doc);
+                match view.cover {
+                    probes::ChannelCover::Logs | probes::ChannelCover::Maybe => cov.keepers.push(Keeper::Channel(view)),
+                    probes::ChannelCover::External => cov.stores_seen.extend(view.destinations.iter().filter(|(t, _)| t == "EVENT_DATA_STORE").map(|(_, l)| l.clone())),
+                    probes::ChannelCover::No => {}
+                }
             }
-            Ok(_) => {}
-            Err(e) => cov.unreadable.push(format!("event data store {arn}: {e}")),
+            Err(e) => cov.unreadable.push(format!("channel {arn}: {e}")),
         }
     }
     Ok(cov)
 }
 
-/// How to get the RunMicrovm record of `id` out of `k` for `--log`.
-fn keeper_hint(k: &Keeper, id: &str, day: &str) -> String {
-    match k {
-        Keeper::Trail { arn, bucket, prefix } => {
-            let prefix = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
-            format!(
-                "trail {arn} logs MicroVM data events to s3://{bucket}/{prefix}AWSLogs/: take the log file under …/CloudTrail/eu-central-1/{}/ that holds {id} (zgrep -l {id}; delivered within ~15 min), gunzip it, then: ai-env lab run cloudtrail-payload {id} --log FILE",
-                day.replace('-', "/")
-            )
+/// The log classes `describe-log-groups --log-group-class` takes; only STANDARD supports `filter-log-events`.
+const LOG_CLASSES: [&str; 3] = ["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
+
+/// CloudWatch Logs groups in eu-central-1 whose name contains `cloudtrail` (`aws/cloudtrail…` of CloudWatch's
+/// ingestion, `/aws/cloudtrail…`, `aws-cloudtrail-logs-…` of the console's trails), with their log class. A
+/// pattern query answers names only (no `logGroupClass`), so the class comes from one query per class; a name
+/// none of them returned is of an `unknown` class.
+fn cloudtrail_log_groups() -> std::result::Result<Vec<(String, String)>, String> {
+    let names = |class: Option<&str>| -> std::result::Result<Vec<String>, String> {
+        let mut args = vec!["describe-log-groups", "--log-group-name-pattern", "cloudtrail"];
+        if let Some(c) = class {
+            args.extend(["--log-group-class", c]);
         }
-        Keeper::Store { arn, status } => {
-            let eds = arn.rsplit('/').next().unwrap_or(arn);
-            format!(
-                "event data store {arn} ({status}) logs MicroVM data events: q=$(aws cloudtrail start-query --region {REGION} --query-statement \"SELECT {} FROM {eds} WHERE eventName = 'RunMicrovm' AND eventTime >= '{day} 00:00:00' AND element_at(responseElements, 'microvmId') = '{id}'\" --query QueryId --output text) && sleep 60 && aws cloudtrail get-query-results --region {REGION} --query-id \"$q\" --output json > ~/ct-{id}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}.json",
-                probes::LAKE_COLUMNS
-            )
+        let doc = aws_json("logs", LOGS_URL, &args)?;
+        Ok(doc.get("logGroups").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default().iter().filter_map(|g| g.get("logGroupName").and_then(|v| v.as_str()).map(str::to_string)).collect())
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for class in LOG_CLASSES {
+        out.extend(names(Some(class))?.into_iter().map(|n| (n, class.to_string())));
+    }
+    for n in names(None)? {
+        if !out.iter().any(|(g, _)| *g == n) {
+            out.push((n, "unknown".to_string()));
         }
     }
+    Ok(out)
+}
+
+/// Where the search for the RunMicrovm record starts (ms, as `filter-log-events --start-time` takes it): 5 min
+/// before the payload's `created` (written before RunMicrovm), else 15 min before the start, else the oldest a row
+/// can be.
+fn search_start_ms(row: &VmRow) -> u64 {
+    let s = run::created_unix(row).map(|c| c.saturating_sub(300)).or_else(|| row.started_at.map(|t| t.saturating_sub(900))).unwrap_or_else(|| unix_now().saturating_sub(registry::TERMINATED_KEEP_S + 86_400));
+    s * 1000
+}
+
+/// The UTC day (`YYYY-MM-DD`) of the VM's start, whose CloudTrail log folder holds its RunMicrovm; today when the
+/// row has no start.
+fn s3_day(row: &VmRow) -> String {
+    rfc3339_utc(row.started_at.unwrap_or_else(unix_now))[..10].to_string()
+}
+
+/// One `filter-log-events` command per log group, each into its own file (a later empty group must not overwrite
+/// a hit), then the probe over that file. Group names were checked to be shell-safe; the id is `[A-Za-z0-9-]`.
+fn filter_command(group: &str, id: &str, n: usize, start_ms: u64) -> String {
+    format!(
+        "aws logs filter-log-events --region {REGION} --endpoint-url {LOGS_URL} --log-group-name '{group}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json"
+    )
+}
+
+/// How to get the RunMicrovm record of `id` out of each keeper, one line each. Never a command for another Region.
+fn keeper_hints(keepers: &[Keeper], groups: &[(String, String)], id: &str, day: &str, start_ms: u64) -> Vec<String> {
+    let mut n = 0;
+    let mut out = Vec::new();
+    for k in keepers {
+        match k {
+            Keeper::Trail { arn, bucket, prefix, log_group_arn, log_group, org } => {
+                let prefix = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+                // An organization trail is owned by the management account: its bucket and log group are there.
+                let owner_acct = arn.split(':').nth(4).unwrap_or("?");
+                let owner = if *org { format!(" (an organization trail owned by account {owner_acct}: its files and log group are in that account)") } else { String::new() };
+                // The S3 route is always printed: CloudTrail leaves events over 256 KB out of CloudWatch Logs, and the
+                // group's retention may be shorter than the 7 days a row lives.
+                out.push(format!(
+                    "trail {arn} logs MicroVM data events to s3://{bucket}/{prefix}AWSLogs/{owner}: take the log file under …/CloudTrail/{REGION}/{}/ that holds {id} (zgrep -l {id}; delivered within ~15 min), gunzip it, then: ai-env lab run cloudtrail-payload {id} --log FILE",
+                    day.replace('-', "/")
+                ));
+                match (log_group, log_group_arn) {
+                    (Some((r, g)), _) if r == REGION => {
+                        n += 1;
+                        let run_as = if *org { format!(" (run it with credentials of account {owner_acct}, which owns the group)") } else { String::new() };
+                        out.push(format!("trail {arn} also forwards to the CloudWatch Logs group {g}{run_as}: {}", filter_command(g, id, n, start_ms)));
+                    }
+                    (Some((r, g)), _) => out.push(format!("trail {arn} also forwards to the CloudWatch Logs group {g} in {r}, outside the {REGION} pin (no command)")),
+                    (None, Some(raw)) => out.push(format!("trail {arn} also forwards to {raw}, which is not a log group name this probe prints")),
+                    (None, None) => {}
+                }
+            }
+            Keeper::Channel(v) if v.kind == "cloudwatch" => {
+                if groups.is_empty() {
+                    out.push(format!("channel {} (CloudWatch's CloudTrail ingestion) may keep RunMicrovm, but no CloudWatch Logs group with cloudtrail in its name was found in {REGION}: find its log group (CloudWatch → Log groups) and fetch the record with aws logs filter-log-events --unmask, then: ai-env lab run cloudtrail-payload {id} --log FILE", v.name));
+                }
+                for (g, class) in groups {
+                    if !probes::is_safe_log_group_name(g) {
+                        out.push(format!("channel {} (CloudWatch) may have written it to the log group {g:?}, a name this probe does not print into a command: fetch the record with aws logs filter-log-events --unmask, then --log FILE", v.name));
+                    } else if class == "INFREQUENT_ACCESS" {
+                        out.push(format!("channel {} (CloudWatch) may have written it to {g} (log class INFREQUENT_ACCESS: filter-log-events is not supported; search it with CloudWatch Logs Insights and record the verdict with --manual)", v.name));
+                    } else if class != "STANDARD" {
+                        out.push(format!("channel {} (CloudWatch) may have written it to {g} (log class {class}: not searchable with filter-log-events; record what it holds with --manual)", v.name));
+                    } else {
+                        n += 1;
+                        out.push(format!("channel {} (CloudWatch) may have written it to {g}: {}", v.name, filter_command(g, id, n, start_ms)));
+                    }
+                }
+            }
+            Keeper::Channel(v) => {
+                let why = if v.cover == probes::ChannelCover::Maybe { "its selectors cannot be read" } else { "its selectors take RunMicrovm" };
+                let dests = v.destinations.iter().map(|(t, l)| format!("{t} {l}")).collect::<Vec<_>>().join(", ");
+                out.push(format!("service-linked channel {} ({why}) delivers to {dests}: read the RunMicrovm record of {id} there, then record the verdict: ai-env lab run cloudtrail-payload {id} --manual VERDICT --note TEXT", v.name));
+            }
+        }
+    }
+    out
 }
 
 /// cloudtrail-payload (plan S4 §8, corrected in part B): RunMicrovm is a
 /// CloudTrail data event, which event history never holds. With `--log FILE`
-/// the payload verdict is read from the RunMicrovm record in FILE. Without
-/// it the probe looks for a trail or event data store that logs the event:
-/// found → how to get its record for `--log`; none → it still cannot record
-/// `not-logged` itself, because stores homed in other Regions and
-/// organization stores are invisible from here, so it prints the `--manual`
-/// command to run once the operator has confirmed there are none. Fails
-/// closed: never a verdict for what it could not see.
+/// the payload verdict is read from the RunMicrovm records in FILE (a trail's
+/// log file or `aws logs filter-log-events` output). Without it the probe
+/// looks for a trail or a service-linked channel (CloudWatch's CloudTrail
+/// ingestion, Security Lake, …) that takes the event: found → how to fetch
+/// its record; none → it still cannot record `not-logged` itself (CloudTrail
+/// Lake stores, channels homed elsewhere and organization-level configuration
+/// are invisible from here), so it prints the `--manual` command to run once
+/// the operator has confirmed there are none. Fails closed: never a verdict
+/// for what it could not see.
 fn cloudtrail(paths: &Paths, spec: &probes::ProbeSpec, id: &str, log: Option<&std::path::Path>, note: Option<&String>) -> Result<()> {
-    let row = registry::read_row(paths, id)?.ok_or_else(|| CliError::Msg(format!("no row for {id} in state/vms: the probe needs the client token and the session token of a VM this ai-env started")))?;
+    let row = registry::read_row(paths, id)?.ok_or_else(|| CliError::Msg(format!("no row for {id} in state/vms (rows live 7 days after termination): the probe needs the client token and the session token of a VM this ai-env started")))?;
     if let Some(file) = log {
         let text = read_log(file)?;
         return match probes::verdict_cloudtrail(&text, id, &row.client_token, row.session_token.as_deref(), &row.commit) {
@@ -1137,18 +1262,24 @@ fn cloudtrail(paths: &Paths, spec: &probes::ProbeSpec, id: &str, log: Option<&st
     if !cov.unreadable.is_empty() {
         return Err(CliError::Aws(format!("cloudtrail-payload: could not read what {} logs; nothing recorded", cov.unreadable.join("; "))));
     }
-    let day = row.started_at.map_or_else(|| rfc3339_utc(unix_now())[..10].to_string(), |t| rfc3339_utc(t)[..10].to_string());
     if !cov.keepers.is_empty() {
-        let hints: Vec<String> = cov.keepers.iter().map(|k| keeper_hint(k, id, &day)).collect();
-        return Err(CliError::Msg(format!("cloudtrail-payload: RunMicrovm records are not in event history; {}; nothing recorded", hints.join("; "))));
+        let wants_groups = cov.keepers.iter().any(|k| matches!(k, Keeper::Channel(v) if v.kind == "cloudwatch"));
+        let groups = if wants_groups { cloudtrail_log_groups().map_err(|e| CliError::Aws(format!("cloudtrail-payload: {e}; nothing recorded")))? } else { Vec::new() };
+        let hints = keeper_hints(&cov.keepers, &groups, id, &s3_day(&row), search_start_ms(&row));
+        return Err(CliError::Msg(format!("cloudtrail-payload: RunMicrovm records are not in event history; where they may be kept:\n  {}\nnothing recorded", hints.join("\n  "))));
     }
+    let stores = if cov.stores_seen.is_empty() {
+        String::new()
+    } else {
+        format!(" CloudTrail Lake is in use: integration channels deliver to the event data store(s) {} — check what they keep.", cov.stores_seen.join(", "))
+    };
     let manual_note = format!(
-        "RunMicrovm is a CloudTrail data event ({}), off by default; none of {} trail(s) and {} eu-central-1 event data store(s) logs it, and by hand no event data store in another Region and no organization event data store, so CloudTrail keeps nothing of the run-hook payload",
-        probes::MICROVM_DATA_RESOURCE, cov.trails, cov.stores
+        "RunMicrovm is a CloudTrail data event ({}), off by default; no trail ({} checked) and no channel ({} checked) in {REGION} takes it, and by hand no CloudTrail Lake event data store, no channel homed in another Region and no organization-level CloudWatch or Security Lake ingestion, so AWS keeps nothing of the run-hook payload",
+        probes::MICROVM_DATA_RESOURCE, cov.trails, cov.channels
     );
     Err(CliError::Msg(format!(
-        "cloudtrail-payload: no trail ({} checked, multi-region and organization trails included) and no event data store homed in {REGION} ({} checked) logs RunMicrovm, a CloudTrail data event that is off by default. Not visible from here: event data stores homed in other Regions and, if this account is in an AWS Organization, organization event data stores (CloudTrail console → Lake → Event data stores, per Region). If there are none, record it: ai-env lab run cloudtrail-payload {id} --manual not-logged --note \"{manual_note}\"; nothing recorded",
-        cov.trails, cov.stores
+        "cloudtrail-payload: no trail ({} checked, multi-region and organization trails included) and no channel ({} checked: CloudWatch's CloudTrail ingestion, Security Lake, …) in {REGION} takes RunMicrovm, a CloudTrail data event that is off by default.{stores} Not visible from here: CloudTrail Lake event data stores (not checked; organization stores are invisible to member accounts), channels homed in other Regions, and organization-level CloudWatch or Security Lake configuration. If there are none, record it: ai-env lab run cloudtrail-payload {id} --manual not-logged --note \"{manual_note}\"; nothing recorded",
+        cov.trails, cov.channels
     )))
 }
 
@@ -1171,6 +1302,39 @@ mod tests {
         assert_eq!(fmt_secs(59), "59s");
         assert_eq!(fmt_secs(61), "1m01s");
         assert_eq!(fmt_secs(3_660), "1h01m");
+    }
+
+    #[test]
+    fn search_start_falls_back_from_created_to_started_at_to_the_row_lifetime() {
+        let created = registry::VmRow { created: "2026-09-30T13:06:43.060Z".into(), started_at: Some(1_790_000_000), ..Default::default() };
+        assert_eq!(search_start_ms(&created), (run::created_unix(&created).unwrap() - 300) * 1000, "5 min before the payload's created");
+        let started = registry::VmRow { created: "not a time".into(), started_at: Some(1_700_000_000), ..Default::default() };
+        assert_eq!(search_start_ms(&started), (1_700_000_000 - 900) * 1000, "15 min before the start");
+        assert_eq!(s3_day(&started), "2023-11-14", "the day of the start, not of the probe");
+        let neither = registry::VmRow::default();
+        let oldest = (unix_now() - registry::TERMINATED_KEEP_S - 86_400) * 1000;
+        assert!(search_start_ms(&neither).abs_diff(oldest) < 5_000, "the oldest a row can be");
+    }
+
+    #[test]
+    fn trail_hints_keep_the_s3_route_and_name_the_owner_of_an_organization_trail() {
+        let trail = |org: bool, group: Option<(&str, &str)>| Keeper::Trail {
+            arn: "arn:aws:cloudtrail:eu-central-1:123456789012:trail/t".into(),
+            bucket: "b".into(),
+            prefix: String::new(),
+            log_group_arn: group.map(|(r, g)| format!("arn:aws:logs:{r}:123456789012:log-group:{g}:*")),
+            log_group: group.map(|(r, g)| (r.to_string(), g.to_string())),
+            org,
+        };
+        let hints = keeper_hints(&[trail(false, Some(("eu-central-1", "g1")))], &[], "microvm-x", "2026-09-30", 1_000);
+        assert_eq!(hints.len(), 2, "{hints:?}");
+        assert!(hints[0].contains("s3://b/AWSLogs/") && hints[0].contains("CloudTrail/eu-central-1/2026/09/30/"), "the day of the VM's start: {hints:?}");
+        assert!(hints[1].contains("--log-group-name 'g1'") && hints[1].contains("--start-time 1000 ") && hints[1].contains("~/ct-microvm-x-1.json"), "{hints:?}");
+        let org = keeper_hints(&[trail(true, Some(("eu-central-1", "g2")))], &[], "microvm-x", "2026-09-30", 1_000);
+        assert!(org[0].contains("owned by account 123456789012") && org[1].contains("run it with credentials of account 123456789012"), "{org:?}");
+        let far = keeper_hints(&[trail(false, Some(("us-east-1", "g3")))], &[], "microvm-x", "2026-09-30", 1_000);
+        assert!(far[1].contains("g3 in us-east-1") && !far.iter().any(|h| h.contains("filter-log-events")), "{far:?}");
+        assert_eq!(keeper_hints(&[trail(false, None)], &[], "microvm-x", "2026-09-30", 1_000).len(), 1, "S3 only");
     }
 
     #[test]
