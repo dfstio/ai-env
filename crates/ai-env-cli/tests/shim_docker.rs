@@ -502,6 +502,16 @@ fn l2_modes_and_owner() {
 
 #[test]
 #[ignore = "Docker: make test-docker"]
+fn l2_dig_for_the_egress_check() {
+    // S5: `ai-env egress check` and the dns-path probe run dig (bind-utils) in the VM.
+    let c = l2();
+    let v = c.sh("dig -v 2>&1");
+    assert!(v.starts_with("DiG 9."), "{v}");
+    assert_eq!(c.sh("command -v curl"), "/usr/bin/curl", "curl too");
+}
+
+#[test]
+#[ignore = "Docker: make test-docker"]
 fn l2_no_defunct() {
     let c = l2();
     wait_ready(&c, 120);

@@ -130,6 +130,70 @@ impl Paths {
     pub fn cli_log(&self) -> PathBuf {
         self.logs().join("ai-env.log")
     }
+
+    /// `state/egress.lock`: held by `ai-env egress allow|suspend|reload` around
+    /// every read-modify-write of the proxy's SSM parameters (S5).
+    #[must_use]
+    pub fn egress_lock(&self) -> PathBuf {
+        self.root.join("state").join("egress.lock")
+    }
+
+    /// `state/egress-verified.toml`: the passing `ai-env egress check` runs, one
+    /// per (image, image version, connector); `egress::credential_gate` reads it (S5).
+    #[must_use]
+    pub fn egress_verified(&self) -> PathBuf {
+        self.root.join("state").join("egress-verified.toml")
+    }
+}
+
+/// `arn:aws:lambda:eu-central-1:<12 digits>:network-connector:<name>[:<N>]`,
+/// `<name>` 1–64 of `[A-Za-z0-9_-]`, `<N>` a version of digits: a customer
+/// connector in the pinned region. The managed connectors (account `aws`)
+/// never match.
+#[must_use]
+pub fn is_connector_arn(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(&format!("arn:aws:lambda:{REGION}:")) else { return false };
+    let Some((account, tail)) = rest.split_once(":network-connector:") else { return false };
+    let (name, version) = match tail.split_once(':') {
+        Some((n, v)) => (n, Some(v)),
+        None => (tail, None),
+    };
+    let digits = |v: &str| !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit());
+    account.len() == 12
+        && digits(account)
+        && (1..=64).contains(&name.len())
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+        && version.is_none_or(|v| digits(v) && v.len() <= 10)
+}
+
+/// Is `ip` an IPv4 address in RFC 1918 space (10/8, 172.16/12, 192.168/16)?
+#[must_use]
+pub fn is_rfc1918(ip: &str) -> bool {
+    // `Ipv4Addr` refuses octets with leading zeros (no octal ambiguity).
+    ip.parse::<std::net::Ipv4Addr>().is_ok_and(|a| a.is_private())
+}
+
+impl AwsCfg {
+    /// The S5 keys `ai-env vm|lab|egress|proxy` and doctor rely on: a set
+    /// `egress_connector_arn` must be [`is_connector_arn`], a set
+    /// `proxy_private_ip` must be [`is_rfc1918`]. Checked by those commands
+    /// only, never by [`BridgeConfig::parse`] (the wrapper routes on a file
+    /// S1–S4 already accepted). A violation is exit 1 naming the key.
+    pub fn validate_egress(&self) -> Result<(), BridgeError> {
+        if let Some(arn) = self.egress_connector_arn.as_deref().filter(|a| !a.trim().is_empty()) {
+            if !is_connector_arn(arn) {
+                return Err(BridgeError::Config(format!(
+                    "[aws].egress_connector_arn = {arn:?}: expected arn:aws:lambda:{REGION}:<12-digit account>:network-connector:<name>[:<version>] (run `make infra-status WRITE=1`)"
+                )));
+            }
+        }
+        if let Some(ip) = self.proxy_private_ip.as_deref().filter(|a| !a.trim().is_empty()) {
+            if !is_rfc1918(ip) {
+                return Err(BridgeError::Config(format!("[aws].proxy_private_ip = {ip:?}: expected an RFC 1918 IPv4 address (10/8, 172.16/12, 192.168/16)")));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Where `ai-env vm` gets the runtime principal's AWS credentials
@@ -330,11 +394,15 @@ impl Default for CredsCfg {
 pub struct EgressCfg {
     pub require: bool,
     pub disable_nonessential: bool,
+    /// The operator's recorded acceptance of a `platform-dns:<ip>` verdict of
+    /// the `dns-path` probe (S5): without it only `no-dns` lets
+    /// `egress::credential_gate` pass.
+    pub accept_platform_dns: bool,
 }
 
 impl Default for EgressCfg {
     fn default() -> Self {
-        EgressCfg { require: true, disable_nonessential: true }
+        EgressCfg { require: true, disable_nonessential: true, accept_platform_dns: false }
     }
 }
 
@@ -470,6 +538,56 @@ mod tests {
         assert_eq!(p.credentials(), PathBuf::from("/r/credentials"));
         assert_eq!(p.aws_env(), PathBuf::from("/r/credentials/aws.env"));
         assert_eq!(p.infra_state(), PathBuf::from("/r/state/infra.toml"));
+        assert_eq!(p.egress_lock(), PathBuf::from("/r/state/egress.lock"));
+        assert_eq!(p.egress_verified(), PathBuf::from("/r/state/egress-verified.toml"));
+    }
+
+    #[test]
+    fn connector_arns_of_the_pinned_region_only() {
+        for good in [
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress:3",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:A_b-9",
+            &format!("arn:aws:lambda:eu-central-1:123456789012:network-connector:{}", "n".repeat(64)),
+        ] {
+            assert!(is_connector_arn(good), "{good}");
+        }
+        for bad in [
+            "",
+            "arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS",
+            "arn:aws:lambda:eu-west-3:123456789012:network-connector:ai-env-egress",
+            "arn:aws:lambda:eu-central-1:12345678901:network-connector:x",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:a.b",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:x:",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:x:v1",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:x:1:2",
+            "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent",
+            &format!("arn:aws:lambda:eu-central-1:123456789012:network-connector:{}", "n".repeat(65)),
+            " arn:aws:lambda:eu-central-1:123456789012:network-connector:x",
+        ] {
+            assert!(!is_connector_arn(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn egress_keys_are_validated_only_on_request() {
+        let ok = BridgeConfig::parse("[aws]\negress_connector_arn = \"arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress:1\"\nproxy_private_ip = \"10.42.0.10\"\n").unwrap();
+        ok.aws.validate_egress().unwrap();
+        BridgeConfig::parse("[aws]\negress_connector_arn = \"\"\n").unwrap().aws.validate_egress().unwrap();
+        let managed = BridgeConfig::parse("[aws]\negress_connector_arn = \"arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS\"\n").unwrap();
+        let e = managed.aws.validate_egress().unwrap_err();
+        assert!(e.to_string().contains("[aws].egress_connector_arn"), "{e}");
+        for ip in ["8.8.8.8", "169.254.169.254", "10.42.0", "010.42.0.10", "fd00::1", "172.32.0.1"] {
+            let c = BridgeConfig::parse(&format!("[aws]\nproxy_private_ip = \"{ip}\"\n")).unwrap();
+            let e = c.aws.validate_egress().unwrap_err();
+            assert!(e.to_string().contains("[aws].proxy_private_ip"), "{ip}: {e}");
+        }
+        for ip in ["10.0.0.1", "172.16.5.4", "192.168.1.1"] {
+            assert!(is_rfc1918(ip), "{ip}");
+        }
+        assert!(BridgeConfig::parse("[egress]\naccept_platform_dns = true\n").unwrap().egress.accept_platform_dns);
+        assert!(!BridgeConfig::default().egress.accept_platform_dns);
     }
 
     #[test]

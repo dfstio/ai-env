@@ -101,6 +101,13 @@ name = "shim_docker"
 path = "tests/shim_docker.rs"
 required-features = ["shim"]
 
+# Opt-in (AI_ENV_PROXY_TESTS=1, every test #[ignore]d): squid on AL2023 with the S5 proxy
+# config, reload script and allowlist (`make test-proxy`); uses the lib's log parser and hashes.
+[[test]]
+name = "proxy_docker"
+path = "tests/proxy_docker.rs"
+required-features = ["bridge"]
+
 # S3 infra helpers through the real binary; the areas live in tests/infra/*.rs.
 [[test]]
 name = "infra"

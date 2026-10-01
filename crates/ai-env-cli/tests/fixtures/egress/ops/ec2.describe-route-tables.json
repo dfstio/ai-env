@@ -1,0 +1,97 @@
+{
+    "RouteTables": [
+        {
+            "Associations": [
+                {
+                    "Main": true,
+                    "RouteTableAssociationId": "rtbassoc-0a1b2c3d4e5f60001",
+                    "RouteTableId": "rtb-0a1b2c3d4e5f60001",
+                    "AssociationState": {
+                        "State": "associated"
+                    }
+                }
+            ],
+            "PropagatingVgws": [],
+            "RouteTableId": "rtb-0a1b2c3d4e5f60001",
+            "Routes": [
+                {
+                    "DestinationCidrBlock": "10.42.0.0/16",
+                    "GatewayId": "local",
+                    "Origin": "CreateRouteTable",
+                    "State": "active"
+                }
+            ],
+            "Tags": [],
+            "VpcId": "vpc-0123456789abcdef0",
+            "OwnerId": "123456789012"
+        },
+        {
+            "Associations": [
+                {
+                    "Main": false,
+                    "RouteTableAssociationId": "rtbassoc-0a1b2c3d4e5f60002",
+                    "RouteTableId": "rtb-0a1b2c3d4e5f60002",
+                    "SubnetId": "subnet-0ccc2222dddd3333e",
+                    "AssociationState": {
+                        "State": "associated"
+                    }
+                }
+            ],
+            "PropagatingVgws": [],
+            "RouteTableId": "rtb-0a1b2c3d4e5f60002",
+            "Routes": [
+                {
+                    "DestinationCidrBlock": "10.42.0.0/16",
+                    "GatewayId": "local",
+                    "Origin": "CreateRouteTable",
+                    "State": "active"
+                },
+                {
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "GatewayId": "igw-0123456789abcdef0",
+                    "Origin": "CreateRoute",
+                    "State": "active"
+                }
+            ],
+            "Tags": [
+                {
+                    "Key": "Name",
+                    "Value": "ai-env-egress-proxy"
+                }
+            ],
+            "VpcId": "vpc-0123456789abcdef0",
+            "OwnerId": "123456789012"
+        },
+        {
+            "Associations": [
+                {
+                    "Main": false,
+                    "RouteTableAssociationId": "rtbassoc-0a1b2c3d4e5f60003",
+                    "RouteTableId": "rtb-0a1b2c3d4e5f60003",
+                    "SubnetId": "subnet-0aaa1111bbbb2222c",
+                    "AssociationState": {
+                        "State": "associated"
+                    }
+                }
+            ],
+            "PropagatingVgws": [],
+            "RouteTableId": "rtb-0a1b2c3d4e5f60003",
+            "Routes": [
+                {
+                    "DestinationCidrBlock": "10.42.0.0/16",
+                    "GatewayId": "local",
+                    "Origin": "CreateRouteTable",
+                    "State": "active"
+                }
+            ],
+            "Tags": [
+                {
+                    "Key": "Name",
+                    "Value": "ai-env-egress-vms"
+                }
+            ],
+            "VpcId": "vpc-0123456789abcdef0",
+            "OwnerId": "123456789012"
+        }
+    ]
+}

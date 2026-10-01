@@ -210,6 +210,18 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: LabCmd,
     },
+    /// The S5 egress allowlist on the shared proxy: status, allow, suspend, reload, env, check (the aws CLI as the operator)
+    #[cfg(feature = "bridge")]
+    Egress {
+        #[command(subcommand)]
+        cmd: EgressCmd,
+    },
+    /// The S5 egress proxy instance: stop, start, patch (the aws CLI as the operator)
+    #[cfg(feature = "bridge")]
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCmd,
+    },
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
     Shim(crate::shim::ShimArgs),
@@ -223,6 +235,18 @@ pub enum EgressArg {
     Internet,
     /// [aws].egress_connector_arn (S5); exit 9 when none is configured
     Vpc,
+}
+
+#[cfg(feature = "bridge")]
+impl EgressArg {
+    /// The run's egress.
+    #[must_use]
+    pub fn egress(self) -> crate::bridge::vm::run::Egress {
+        match self {
+            EgressArg::Internet => crate::bridge::vm::run::Egress::Internet,
+            EgressArg::Vpc => crate::bridge::vm::run::Egress::Vpc,
+        }
+    }
 }
 
 /// `--auth` of `ai-env vm shell`.
@@ -392,6 +416,9 @@ pub enum VmCmd {
         /// Maximum duration of the smoke VM in seconds
         #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u32).range(60..=28_800))]
         max_duration: u32,
+        /// Egress: internet (audited) or vpc (default: vpc when [aws].egress_connector_arn is set, else internet); the VM must echo exactly that
+        #[arg(long, value_enum)]
+        egress: Option<EgressArg>,
         /// Do not pass [aws].execution_role_arn
         #[arg(long)]
         no_execution_role: bool,
@@ -426,7 +453,7 @@ pub enum LabCmd {
     Run {
         /// Probe name (ai-env lab list)
         probe: String,
-        /// MicroVM id (cloudtrail-payload)
+        /// MicroVM id (cloudtrail-payload), or the ARN of a connector that is not ACTIVE yet (connector-pending)
         id: Option<String>,
         /// Derive the verdict from this runtime log (`make logs SINCE=30m > FILE`), or for cloudtrail-payload from a trail's gunzipped log file or `aws logs filter-log-events` output
         #[arg(long, value_name = "FILE")]
@@ -438,6 +465,78 @@ pub enum LabCmd {
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
     },
+}
+
+/// `ai-env egress …` (feature `bridge`): the S5 allowlist on the shared proxy.
+/// Every command is the aws CLI as the operator (the account of
+/// `[aws].egress_connector_arn`), never the runtime key.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum EgressCmd {
+    /// Connector, VPC, routes, security groups, proxy and parameters against the stack (exit 1 on any drift)
+    Status {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Allow HOST for workspace SLUG (global: the host stays allowed while any workspace lists it)
+    Allow {
+        /// Workspace slug (its project dir name)
+        slug: String,
+        /// An exact host name (no wildcard, IP literal, port, scheme or path)
+        host: String,
+        /// Remove SLUG's entry instead
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Deny HOST on the proxy even when it is allowed (--restore lifts it)
+    Suspend {
+        /// An exact host name
+        host: String,
+        /// Lift the suspension
+        #[arg(long)]
+        restore: bool,
+    },
+    /// Make the proxy re-read its parameters (squid -k parse first; on any error the old config keeps serving)
+    Reload {
+        /// Only when a parameter changed since the proxy's last reload
+        #[arg(long)]
+        if_changed: bool,
+    },
+    /// Print the proxy environment a vpc VM needs (https_proxy, http_proxy, no_proxy, both spellings)
+    Env {
+        /// `export NAME=value` lines for a shell
+        #[arg(long)]
+        shell: bool,
+    },
+    /// From a vpc VM: direct egress and DNS closed, the allowlist working; a pass is recorded in state/egress-verified.toml
+    Check {
+        /// A running VM started with `vm run --egress vpc --shell` (default: start one and terminate it after)
+        #[arg(long, value_name = "ID")]
+        vm: Option<String>,
+        /// Leave the VM this check started running
+        #[arg(long)]
+        keep: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `ai-env proxy …` (feature `bridge`): the S5 proxy instance, as the operator.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum ProxyCmd {
+    /// Stop the proxy instance (refused while vpc VMs run, unless --yes); every vpc VM loses egress
+    Stop {
+        /// Stop even while vpc VMs run
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Start it and wait until squid serves (instance running, SSM online, reload --status)
+    Start,
+    /// Security updates through SSM (dnf upgrade --security), then restart squid
+    Patch,
 }
 
 /// `ai-env infra …` (feature `bridge`): the S3 infrastructure helpers the Makefile drives.
@@ -476,12 +575,12 @@ pub enum InfraCmd {
         #[arg(long, value_name = "V", requires = "manifest")]
         expect_version: Option<String>,
     },
-    /// Read the Pulumi stack outputs plus one live read-only get-microvm-image, and show (or --write) the bridge.toml [aws] table and state/infra.toml
+    /// Read the Pulumi stack outputs plus live read-only get-microvm-image and (S5) get-network-connector, and show (or --write) the bridge.toml [aws] table and state/infra.toml
     Status {
         /// Edit bridge.toml [aws] in place (backup first) and write state/infra.toml
         #[arg(long)]
         write: bool,
-        /// Read the outputs from FILE instead of `pulumi stack output --json` (tests; the live get-microvm-image read still runs, so tests put a fake aws first on PATH)
+        /// Read the outputs from FILE instead of `pulumi stack output --json` (tests; the live get-microvm-image and get-network-connector reads still run, so tests put a fake aws first on PATH)
         #[arg(long, value_name = "FILE", hide = true)]
         json_in: Option<PathBuf>,
         /// Pulumi stack
@@ -759,6 +858,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Vm { cmd } => crate::bridge::vm::cmd::main(&store, cmd),
         #[cfg(feature = "bridge")]
         Cmd::Lab { cmd } => crate::bridge::vm::cmd::lab_main(&store, cmd),
+        #[cfg(feature = "bridge")]
+        Cmd::Egress { cmd } => crate::bridge::egress::cli::main(&store, cmd),
+        #[cfg(feature = "bridge")]
+        Cmd::Proxy { cmd } => crate::bridge::egress::cli::proxy_main(cmd),
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
     }

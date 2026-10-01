@@ -8,6 +8,11 @@
 //! the §7 table ([`classify`], pure), and acts only with `--yes`. A dry run
 //! writes nothing: no row, no audit line.
 //!
+//! With `--yes`, gc also finishes the S5 egress echo gate ([`regate`]): a
+//! live VM whose row's verdict is not `passed` is judged again, or
+//! terminated (`policy`), so a failed terminate or a crash between
+//! RunMicrovm and the gate cannot leave a VM with the wrong egress behind.
+//!
 //! [`reconcile_local`] is the opportunistic variant for `vm run|list|smoke`
 //! (no probes, no action, one hint line); [`terminate_all_plan`] is the
 //! survey behind `vm terminate --all` (D29).
@@ -15,8 +20,8 @@ use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState, VmSummary}
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::vm::owner;
-use crate::bridge::vm::registry::{self, RowStatus, VmRow, PENDING_STALE_S, TERMINATED_KEEP_S};
-use crate::bridge::vm::run::{adopt_pending, audit_event, created_unix, probe_health_once, terminate_and_record, START_SKEW_S};
+use crate::bridge::vm::registry::{self, RowStatus, VmRow, GATE_MISMATCH, GATE_PASSED, PENDING_STALE_S, TERMINATED_KEEP_S};
+use crate::bridge::vm::run::{adopt_pending, audit_event, created_unix, echo_passes, probe_health_once, reject_echo, request_terminate, row_gate, terminate_and_record, START_SKEW_S};
 use crate::wire::time::unix_now;
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -166,6 +171,9 @@ pub struct GcReport {
     pub marked: usize,
     /// One line per action that failed (the others still ran); empty on success.
     pub errors: Vec<String>,
+    /// How many of `errors` are VMs that failed the S5 egress echo gate
+    /// (`vm gc` then exits 9, not 7).
+    pub mismatches: usize,
 }
 
 // ---- classify (pure) -------------------------------------------------------------------
@@ -237,13 +245,14 @@ pub fn classify_surveyed(listing: &[VmSummary], rows: &[VmRow], healths: &BTreeM
             Some(s) if !s.state.is_terminal() => {
                 let deadline = row.wall_deadline.or_else(|| created_unix(row).map(|c| c.saturating_add(u64::from(row.max_duration_s))));
                 let stale_row = if row.status == RowStatus::Terminated { " (the row says terminated)" } else { "" };
+                let gate = gate_note(row);
                 match deadline {
                     Some(d) if d <= now.saturating_add(EXPIRY_MARGIN_S) => {
                         let when = if d <= now { format!("wall passed {} s ago", now - d) } else { format!("wall in {} s", d - now) };
-                        push(GcClass::RegistryExpired, Some(row.id.clone()), Some(row.stem()), age, format!("{} {when}{stale_row}", s.state.as_str()));
+                        push(GcClass::RegistryExpired, Some(row.id.clone()), Some(row.stem()), age, format!("{} {when}{stale_row}{gate}", s.state.as_str()));
                     }
-                    Some(d) => push(GcClass::RegistryLive, Some(row.id.clone()), Some(row.stem()), age, format!("{} wall left {} s{stale_row}", s.state.as_str(), d - now)),
-                    None => push(GcClass::RegistryLive, Some(row.id.clone()), Some(row.stem()), age, format!("{} wall unknown{stale_row}", s.state.as_str())),
+                    Some(d) => push(GcClass::RegistryLive, Some(row.id.clone()), Some(row.stem()), age, format!("{} wall left {} s{stale_row}{gate}", s.state.as_str(), d - now)),
+                    None => push(GcClass::RegistryLive, Some(row.id.clone()), Some(row.stem()), age, format!("{} wall unknown{stale_row}{gate}", s.state.as_str())),
                 }
             }
             _ if row.status == RowStatus::Terminated => {
@@ -324,6 +333,27 @@ pub fn classify_surveyed(listing: &[VmSummary], rows: &[VmRow], healths: &BTreeM
     items
 }
 
+/// A row that says terminated while its VM may still run, which `vm gc
+/// --yes` terminates again ([`regate`]): one the S5 egress gate terminated
+/// (`terminated_by = policy`), or one that ended before its gate passed.
+fn terminate_again(row: &VmRow) -> bool {
+    row.status == RowStatus::Terminated && (row.terminated_by.as_deref() == Some("policy") || row.egress_gate.as_deref() != Some(GATE_PASSED))
+}
+
+/// What the S5 egress verdict of a row whose VM is live adds to its detail:
+/// nothing once `passed`; else what `vm gc --yes` does about it ([`regate`]).
+fn gate_note(row: &VmRow) -> String {
+    if row.status == RowStatus::Terminated {
+        return if terminate_again(row) { "; --yes terminates it again".to_string() } else { String::new() };
+    }
+    match row.egress_gate.as_deref() {
+        Some(GATE_PASSED) => String::new(),
+        Some(GATE_MISMATCH) => "; egress gate mismatch: --yes terminates it".to_string(),
+        Some(g) => format!("; egress gate {g}: --yes gates it again"),
+        None => "; egress gate never ran (a row from before S5): --yes gates it".to_string(),
+    }
+}
+
 // ---- survey ----------------------------------------------------------------------------
 
 /// What [`survey_local`] saw.
@@ -336,14 +366,15 @@ struct Survey {
 }
 
 /// `ListMicrovms(image)`, then `ListMicrovms` of every other image a pending
-/// row or a non-terminated id row names (a crashed `vm run --image OTHER`
-/// must be adoptable; a failure there is logged and the image recorded as
+/// row, a non-terminated id row or a row to terminate again
+/// ([`terminate_again`]) names (a crashed `vm run --image OTHER` must be
+/// adoptable; a failure there is logged and the image recorded as
 /// unsurveyed, never fatal), then `GetMicrovm` of every non-terminated id row
 /// the listings missed (NotFound leaves it out: `registry:gone`), and every row.
 async fn survey_local<A: MicrovmApi>(api: &A, paths: &Paths, image_arn: &str) -> Result<Survey, BridgeError> {
     let mut listing = api.list(Some(image_arn)).await?;
     let rows = registry::list_rows(paths)?;
-    let others: BTreeSet<&str> = rows.iter().filter(|r| r.is_pending_row() || r.status != RowStatus::Terminated).map(|r| r.image_arn.as_str()).filter(|a| !a.is_empty() && *a != image_arn).collect();
+    let others: BTreeSet<&str> = rows.iter().filter(|r| r.is_pending_row() || r.status != RowStatus::Terminated || terminate_again(r)).map(|r| r.image_arn.as_str()).filter(|a| !a.is_empty() && *a != image_arn).collect();
     let mut unsurveyed = BTreeMap::new();
     for other in others {
         match api.list(Some(other)).await {
@@ -394,6 +425,81 @@ async fn probe_rowless<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, listin
     (healths, infos)
 }
 
+// ---- the S5 egress gate, again ---------------------------------------------------------
+
+/// The S5 egress echo gate again (`--yes`, before the table's actions), so a
+/// VM whose gate never finished cannot outlive gc. For every row whose VM
+/// `listing` shows non-terminal: a row to terminate again
+/// ([`terminate_again`]: the gate terminated it, or it ended before its gate
+/// passed) or one whose verdict is `mismatch` (its terminate failed) is
+/// terminated (`policy`) whatever it echoes now; a row still `pending`
+/// (`ai-env` died between RunMicrovm and the gate) or without a verdict (a
+/// row from before S5) is judged on one `GetMicrovm` against its own row
+/// ([`ExpectedEcho::for_row`](crate::bridge::egress::ExpectedEcho::for_row)):
+/// a pass records `passed` and the echo; anything else is a mismatch
+/// (`reject_echo`: verdict, terminate by `policy`, audit `vm_egress_mismatch`
+/// via `gc`), counted in [`GcReport::mismatches`] and reported as an error. A
+/// VM still PENDING without an echo, gone, or that `GetMicrovm` could not
+/// answer for (an error) is left for the next gc. Returns the ids it
+/// terminated (the table's own terminate skips them).
+async fn regate<A: MicrovmApi>(api: &A, paths: &Paths, listing: &[VmSummary], rows: &[VmRow], report: &mut GcReport) -> BTreeSet<String> {
+    let live: BTreeSet<&str> = listing.iter().filter(|s| !s.state.is_terminal()).map(|s| s.id.as_str()).collect();
+    let mut done = BTreeSet::new();
+    for row in rows.iter().filter(|r| !r.is_pending_row() && live.contains(r.id.as_str())) {
+        let id = row.id.as_str();
+        if terminate_again(row) || (row.status != RowStatus::Terminated && row.egress_gate.as_deref() == Some(GATE_MISMATCH)) {
+            match request_terminate(api, paths, id, "policy").await {
+                Ok(recorded) => {
+                    if let Err(e) = recorded {
+                        tracing::warn!("gc: vm row {id}: the policy termination not recorded: {e}");
+                    }
+                    report.terminated += 1;
+                    done.insert(id.to_string());
+                }
+                Err(e) => {
+                    // A VM known to have failed the gate is still running: a policy failure (exit 9), not only an AWS one.
+                    report.mismatches += 1;
+                    report.errors.push(format!("egress-gate {id} → terminate: {e}"));
+                }
+            }
+            continue;
+        }
+        if row.status == RowStatus::Terminated || row.egress_gate.as_deref() == Some(GATE_PASSED) {
+            continue;
+        }
+        let vm = match api.get(id).await {
+            Ok(vm) if vm.state.is_terminal() => continue,
+            // Still booting without an echo (a run's own gate may be waiting for it): the next gc judges it.
+            Ok(vm) if vm.state == VmState::Pending && vm.egress.is_empty() => continue,
+            Ok(vm) => vm,
+            Err(BridgeError::VmNotFound(_)) => continue,
+            Err(e) => {
+                report.errors.push(format!("egress-gate {id} → get: {e}"));
+                continue;
+            }
+        };
+        let (expected, alias) = row_gate(paths, row);
+        if echo_passes(expected.as_ref(), &vm.egress, alias.as_ref()) {
+            let echo: Vec<String> = expected.as_ref().map(|e| e.connectors().to_vec()).unwrap_or_default();
+            if let Err(e) = registry::update_row(paths, id, |r| {
+                r.egress_connectors.clone_from(&echo);
+                r.egress_gate = Some(GATE_PASSED.to_string());
+            }) {
+                report.errors.push(format!("egress-gate {id} → record passed: {e}"));
+            }
+            continue;
+        }
+        let error = reject_echo(api, paths, id, expected.as_ref(), &vm.egress, "gc", "gc").await;
+        report.mismatches += 1;
+        if matches!(&error, BridgeError::EgressMismatch(m) if m.terminated) {
+            report.terminated += 1;
+            done.insert(id.to_string());
+        }
+        report.errors.push(format!("egress-gate {id} → terminate: {error}"));
+    }
+    done
+}
+
 // ---- gc --------------------------------------------------------------------------------
 
 /// `ai-env vm gc` (plan S4 D17): survey, probe `/health` of the row-less
@@ -401,9 +507,13 @@ async fn probe_rowless<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, listin
 /// `opts.yes` — act: `terminate` via [`terminate_and_record`] (`gc-expired` /
 /// `gc-orphan`), `mark-terminated` rows of VMs that are gone, `adopt` pending
 /// rows, `remove-row` stale pending and old terminated rows, then audit
-/// `vm_gc` with the counts. A failed action is recorded in
-/// [`GcReport::errors`] and the others still run. Without `opts.yes` nothing
-/// is written.
+/// `vm_gc` with the counts. First, with `opts.yes`, the S5 egress gate
+/// again ([`regate`]: every live row whose gate did not pass). An adoption
+/// whose VM fails the gate is never adopted: the VM is terminated (`policy`;
+/// counted in `terminated` once confirmed) and the `EgressMismatch` is one of
+/// [`GcReport::errors`] (and of [`GcReport::mismatches`]). A failed action is
+/// recorded in [`GcReport::errors`] and the others still run. Without
+/// `opts.yes` nothing is written.
 pub async fn gc<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths, image_arn: &str, opts: &GcOpts) -> Result<GcReport, BridgeError> {
     let Survey { listing, rows, unsurveyed } = survey_local(api, paths, image_arn).await?;
     let (healths, infos) = if opts.probe_health { probe_rowless(api, ep, &listing, &rows).await } else { Default::default() };
@@ -413,12 +523,15 @@ pub async fn gc<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths
     if !opts.yes {
         return Ok(report);
     }
+    let regated = regate(api, paths, &listing, &rows, &mut report).await;
     let by_stem: BTreeMap<String, &VmRow> = rows.iter().map(|r| (r.stem(), r)).collect();
     let row_of = |item: &GcItem| item.stem.as_ref().and_then(|s| by_stem.get(s).copied());
     for item in report.items.clone() {
         let id = item.id.clone().unwrap_or_default();
         let outcome: Result<(), BridgeError> = match item.action {
             GcAction::Keep | GcAction::Report => continue,
+            // The egress gate terminated it already.
+            GcAction::Terminate if regated.contains(&id) => continue,
             GcAction::Terminate => {
                 let by = if item.class == GcClass::OrphanMine { "gc-orphan" } else { "gc-expired" };
                 terminate_and_record(api, paths, &id, by, None).await.map(|_| report.terminated += 1)
@@ -436,7 +549,20 @@ pub async fn gc<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths
                 None => Err(BridgeError::Config(format!("gc: no row for {id}"))),
             },
             GcAction::Adopt => match (row_of(&item), infos.get(&id)) {
-                (Some(pending), Some(vm)) => adopt_pending(paths, pending, vm).map(|_| report.adopted += 1),
+                (Some(pending), Some(vm)) => match adopt_pending(api, paths, pending, vm).await {
+                    Ok(_) => {
+                        report.adopted += 1;
+                        Ok(())
+                    }
+                    // The S5 egress gate: never adopted; a VM it terminated counts as terminated.
+                    Err(e) => {
+                        if let BridgeError::EgressMismatch(m) = &e {
+                            report.mismatches += 1;
+                            report.terminated += usize::from(m.terminated);
+                        }
+                        Err(e)
+                    }
+                },
                 _ => Err(BridgeError::Config(format!("gc: cannot adopt {id}: its pending row or GetMicrovm answer is missing"))),
             },
             GcAction::RemoveRow => match row_of(&item) {

@@ -1,0 +1,18 @@
+{
+    "FirewallRuleGroupAssociations": [
+        {
+            "Id": "rslvr-frgassoc-0123456789abcdef",
+            "Arn": "arn:aws:route53resolver:eu-central-1:123456789012:firewall-rule-group-association/rslvr-frgassoc-0123456789abcdef",
+            "FirewallRuleGroupId": "rslvr-frg-0123456789abcdef",
+            "VpcId": "vpc-0123456789abcdef0",
+            "Name": "ai-env-egress-block-all",
+            "Priority": 101,
+            "MutationProtection": "DISABLED",
+            "Status": "COMPLETE",
+            "StatusMessage": "Finished rule group association update",
+            "CreatorRequestId": "ai-env-egress-block-all-0001",
+            "CreationTime": "2026-10-01T10:00:00.000000Z",
+            "ModificationTime": "2026-10-01T10:00:00.000000Z"
+        }
+    ]
+}

@@ -38,6 +38,10 @@ pub enum BridgeError {
     Tripwire(String),
     SettingsWidening(String),
     EgressRequired,
+    /// A VM whose egress echo (RunMicrovm, else the first GetMicrovm) is not
+    /// exactly the connectors its egress requires (S5 echo gate). Boxed: it
+    /// would double the size of every `Result` that carries a `BridgeError`.
+    EgressMismatch(Box<EgressMismatch>),
     OutsideRoots(PathBuf),
     PayloadTooLarge(usize),
     MaxConcurrent(u32),
@@ -50,15 +54,38 @@ pub enum BridgeError {
     Busy(String),
 }
 
+/// What the S5 egress echo gate found: the VM `id` echoed `echoed` where its
+/// egress requires exactly `expected`; it was terminated when `terminated`,
+/// else it is still alive under `id` (the caller keeps it in its terminate guard).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressMismatch {
+    pub id: String,
+    pub expected: Vec<String>,
+    pub echoed: Vec<String>,
+    pub terminated: bool,
+}
+
+impl BridgeError {
+    /// [`BridgeError::EgressMismatch`] of these fields.
+    #[must_use]
+    pub fn egress_mismatch(id: &str, expected: Vec<String>, echoed: Vec<String>, terminated: bool) -> BridgeError {
+        BridgeError::EgressMismatch(Box::new(EgressMismatch { id: id.to_string(), expected, echoed, terminated }))
+    }
+}
+
 impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BridgeError::Sdk { op: op @ "run_microvm", message } => write!(f, "aws {op}: {message}{}", connector_hint(message)),
             BridgeError::Sdk { op, message } => write!(f, "aws {op}: {message}"),
             BridgeError::Quota(m) => write!(f, "aws quota: {m}"),
-            BridgeError::Validation(m) => write!(f, "aws validation: {m}"),
+            BridgeError::Validation(m) => write!(f, "aws validation: {m}{}", connector_hint(m)),
             BridgeError::Http { status, body } => write!(f, "endpoint HTTP {status}: {body}"),
             BridgeError::Conflict(m) => write!(f, "aws conflict: {m}"),
             BridgeError::Throttled(m) => write!(f, "aws throttled (after retries): {m}"),
+            BridgeError::AccessDenied(m) if m.contains("PassNetworkConnector") => {
+                write!(f, "aws access denied: {m} (the runtime policy must allow lambda:PassNetworkConnector for --egress vpc: make deploy)")
+            }
             BridgeError::AccessDenied(m) if m.contains("iam:PassRole") => {
                 write!(f, "aws access denied: {m} (the runtime policy must allow iam:PassRole on the execution role; or start the VM without one: vm run/vm smoke --no-execution-role)")
             }
@@ -83,6 +110,24 @@ impl fmt::Display for BridgeError {
             BridgeError::Tripwire(m) => write!(f, "tripwire: {m}"),
             BridgeError::SettingsWidening(m) => write!(f, "repo settings widen permissions: {m}"),
             BridgeError::EgressRequired => f.write_str("egress connector required ([egress].require=true) and none configured"),
+            BridgeError::EgressMismatch(m) => {
+                let EgressMismatch { id, expected, echoed, terminated } = m.as_ref();
+                let list = |l: &[String]| if l.is_empty() { "nothing".to_string() } else { l.join(", ") };
+                if expected.is_empty() {
+                    write!(f, "egress mismatch: {id} echoed egress {}, but its row records no egress connector (written before S5, or a vpc run without one): fail closed", list(echoed))?;
+                } else {
+                    write!(f, "egress mismatch: {id} echoed egress {} but its egress requires exactly {}", list(echoed), list(expected))?;
+                }
+                if *terminated {
+                    f.write_str("; terminated")?;
+                } else {
+                    write!(f, "; NOT confirmed terminated: run `ai-env vm terminate {id}`")?;
+                }
+                if let Some(seg) = id_form_echo(expected, echoed) {
+                    write!(f, " (if {seg} is the connector's Id, run `make infra-status WRITE=1` so state/infra.toml records connector_id)")?;
+                }
+                Ok(())
+            }
             BridgeError::OutsideRoots(p) => write!(f, "{} is outside [workspaces].roots", p.display()),
             BridgeError::PayloadTooLarge(n) => write!(f, "run-hook payload of {n} bytes exceeds {}", RunHookPayload::MAX_BYTES),
             BridgeError::MaxConcurrent(n) => write!(f, "[vm].max_concurrent={n} reached"),
@@ -123,6 +168,7 @@ impl From<BridgeError> for CliError {
             BridgeError::Tripwire(_)
             | BridgeError::SettingsWidening(_)
             | BridgeError::EgressRequired
+            | BridgeError::EgressMismatch(_)
             | BridgeError::OutsideRoots(_)
             | BridgeError::PayloadTooLarge(_)
             | BridgeError::MaxConcurrent(_)
@@ -131,6 +177,31 @@ impl From<BridgeError> for CliError {
             BridgeError::Io(io) => CliError::from(io),
         }
     }
+}
+
+/// The hint a RunMicrovm failure that names a network connector gets: a
+/// connector must be ACTIVE before a VM may use it (S5). Empty otherwise.
+fn connector_hint(message: &str) -> &'static str {
+    if message.to_ascii_lowercase().contains("connector") && !message.contains("PassNetworkConnector") {
+        " (is the egress connector ACTIVE? make connector-status)"
+    } else {
+        ""
+    }
+}
+
+/// The last ARN segment of an echoed customer connector that differs from
+/// every expected one in that segment only: possibly the connector's Id form
+/// (the echo form is measured in S5 part B).
+fn id_form_echo<'a>(expected: &[String], echoed: &'a [String]) -> Option<&'a str> {
+    let split = |a: &str| a.rsplit_once(":network-connector:").map(|(p, s)| (p.to_string(), s.split(':').next().unwrap_or(s).to_string()));
+    echoed.iter().find_map(|e| {
+        let (prefix, seg) = split(e)?;
+        if prefix.ends_with(":aws") {
+            return None;
+        }
+        let other = expected.iter().filter_map(|x| split(x)).any(|(p, s)| p == prefix && s != seg);
+        other.then(|| e.rsplit_once(":network-connector:").map_or(e.as_str(), |(_, s)| s.split(':').next().unwrap_or(s)))
+    })
 }
 
 /// The MicroVM operations whose `ResourceNotFound` means "this VM is gone"
@@ -245,6 +316,7 @@ mod tests {
             (BridgeError::VmNotFound("microvm-x".into()), 8),
             (BridgeError::Tripwire("AKIA".into()), 9),
             (BridgeError::EgressRequired, 9),
+            (BridgeError::egress_mismatch("microvm-x", vec![], vec![], true), 9),
             (BridgeError::MaxConcurrent(3), 9),
             (BridgeError::Policy("port 9000".into()), 9),
             (BridgeError::Config("bad".into()), 1),
@@ -367,5 +439,35 @@ mod tests {
         assert!(BridgeError::AccessDenied("get_microvm: no".into()).to_string().contains("runtime policy"));
         let pass = BridgeError::AccessDenied("run_microvm: ... not authorized to perform: iam:PassRole on resource: ...".into()).to_string();
         assert!(pass.contains("iam:PassRole on the execution role") && pass.contains("--no-execution-role") && !pass.contains("aws.env"), "{pass}");
+        let pnc = BridgeError::AccessDenied("run_microvm: ... not authorized to perform: lambda:PassNetworkConnector on resource: ...".into()).to_string();
+        assert!(pnc.contains("must allow lambda:PassNetworkConnector") && !pnc.contains("aws.env") && !pnc.contains("make connector-status"), "{pnc}");
+    }
+
+    #[test]
+    fn connector_failures_of_run_microvm_ask_whether_it_is_active() {
+        let v = BridgeError::Validation("Network connector arn:aws:lambda:eu-central-1:123456789012:network-connector:x is not ACTIVE".into()).to_string();
+        assert!(v.ends_with("(is the egress connector ACTIVE? make connector-status)"), "{v}");
+        let s = classify_service("run_microvm", Some("ResourceNotFoundException"), "Network connector arn:aws:lambda:eu-central-1:123456789012:network-connector:x not found".into()).to_string();
+        assert!(s.contains("network-connector:x not found") && s.contains("make connector-status"), "{s}");
+        let other = classify_service("get_microvm_image", Some("SomethingException"), "connector".into()).to_string();
+        assert!(!other.contains("connector-status"), "only RunMicrovm: {other}");
+        assert!(!BridgeError::Validation("runHookPayload too long".into()).to_string().contains("connector-status"));
+    }
+
+    #[test]
+    fn egress_mismatch_names_both_lists_and_what_is_left() {
+        let conn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress".to_string();
+        let internet = "arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS".to_string();
+        let e = BridgeError::egress_mismatch("microvm-x", vec![conn.clone()], vec![internet.clone()], true).to_string();
+        assert!(e.contains("echoed egress arn:") && e.contains("INTERNET_EGRESS") && e.contains("exactly arn:") && e.ends_with("; terminated"), "{e}");
+        let alive = BridgeError::egress_mismatch("microvm-x", vec![conn.clone()], vec![], false).to_string();
+        assert!(alive.contains("echoed egress nothing") && alive.contains("ai-env vm terminate microvm-x"), "{alive}");
+        let legacy = BridgeError::egress_mismatch("microvm-x", vec![], vec![conn.clone()], true).to_string();
+        assert!(legacy.contains("records no egress connector") && !legacy.contains("requires exactly"), "{legacy}");
+        let id_form = BridgeError::egress_mismatch("microvm-x", vec![conn], vec!["arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0a1b2c:1".into()], true).to_string();
+        assert!(id_form.contains("if nc-0a1b2c is the connector's Id") && id_form.contains("make infra-status WRITE=1"), "{id_form}");
+        let e2 = BridgeError::egress_mismatch("microvm-x", vec![internet.clone()], vec![internet], true).to_string();
+        assert!(std::mem::size_of::<BridgeError>() <= 48, "boxed: {}", std::mem::size_of::<BridgeError>());
+        assert!(!e2.contains("connector's Id"), "{e2}");
     }
 }

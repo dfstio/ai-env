@@ -1,0 +1,34 @@
+{
+    "Reservations": [
+        {
+            "ReservationId": "r-0123456789abcdef0",
+            "OwnerId": "123456789012",
+            "Groups": [],
+            "Instances": [
+                {
+                    "Architecture": "arm64",
+                    "ImageId": "ami-0123456789abcdef0",
+                    "InstanceId": "i-0123456789abcdef0",
+                    "InstanceType": "t4g.nano",
+                    "State": {
+                        "Code": 16,
+                        "Name": "running"
+                    },
+                    "PrivateIpAddress": "10.42.0.10",
+                    "SubnetId": "subnet-0ccc2222dddd3333e",
+                    "VpcId": "vpc-0123456789abcdef0",
+                    "SecurityGroups": [
+                        {
+                            "GroupId": "sg-0fff5555aaaa6666b",
+                            "GroupName": "ai-env-proxy"
+                        }
+                    ],
+                    "MetadataOptions": {
+                        "HttpTokens": "required",
+                        "HttpPutResponseHopLimit": 1
+                    }
+                }
+            ]
+        }
+    ]
+}

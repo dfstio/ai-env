@@ -1,0 +1,8 @@
+{
+    "FirewallConfig": {
+        "Id": "rslvr-fc-0123456789abcdef",
+        "ResourceId": "vpc-0123456789abcdef0",
+        "OwnerId": "123456789012",
+        "FirewallFailOpen": "DISABLED"
+    }
+}

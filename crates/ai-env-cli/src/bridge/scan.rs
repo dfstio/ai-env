@@ -91,7 +91,9 @@ pub const DEFAULT_RULES: [(&str, &str); 9] = [
     ("anthropic-key", "sk-ant-[a-z]{2,8}[0-9]{2}-[A-Za-z0-9_-]{20}"),
     ("aws-access-key-id", "AKIA[0-9A-Z]{16}"),
     ("private-key-block", "-----BEGIN .*PRIVATE\\ KEY"),
-    ("age-identity", "AGE-SECRET-KEY-1[0-9A-Z]{20}"),
+    // age's bech32 data charset in upper case (no 1, B, I or O): HTTP method names that follow the
+    // literal in a binary's rodata (`GETTRACEPUTPATCHOPTIONS…`) are not a key.
+    ("age-identity", "AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{20}"),
     ("mysql-pwd", "MYSQL_PWD\\="),
     ("github-pat", "ghp_[A-Za-z0-9]{20}"),
     ("slack-token", "xox[bp]-[A-Za-z0-9-]{10}"),
@@ -1572,6 +1574,8 @@ mod tests {
             format!("{}BEGIN PRIVATE KEY", "-".repeat(4)),
             format!("{}{}", "AGE-SECRET-KEY-1", "Q".repeat(19)),
             format!("{}{}", "AGE-SECRET-KEY-1", "q".repeat(20)),
+            format!("{}{}", "AGE-SECRET-KEY-1", "GETTRACEPUTPATCHOPTIONS"),
+            format!("{}{}", "AGE-SECRET-KEY-1", "B".repeat(20)),
             format!("{}_PWD", "MYSQL"),
             format!("{}_PWD =x", "MYSQL"),
             format!("{}{}", "ghp_", "q".repeat(19)),

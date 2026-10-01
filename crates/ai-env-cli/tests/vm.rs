@@ -4,7 +4,9 @@
 //! `FakeMicrovmApi` (control plane and endpoint) and a temp bridge root.
 //! As processes: `ai-env vm …` (`vm/cli.rs`) and `ai-env lab …`
 //! (`vm/lab.rs`) against the file-backed fake of the debug-build knob
-//! `AI_ENV_BRIDGE_LAB_FAKE_API`.
+//! `AI_ENV_BRIDGE_LAB_FAKE_API`. S5: the egress echo gate in-process
+//! (`vm/egress.rs`) and `ai-env egress|proxy …` as processes over the fake
+//! aws CLI (`vm/egress_cli.rs`).
 //! Each area lives in its own file under tests/vm/ (declared with `#[path]`,
 //! so the undeclared-test lint only sees this root). Nothing here touches
 //! AWS, the real bridge directory or the process environment; polls are
@@ -22,3 +24,7 @@ mod cli;
 mod lab;
 #[path = "vm/shell.rs"]
 mod shell;
+#[path = "vm/egress.rs"]
+mod egress;
+#[path = "vm/egress_cli.rs"]
+mod egress_cli;

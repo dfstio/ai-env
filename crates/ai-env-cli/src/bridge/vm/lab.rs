@@ -2,10 +2,12 @@
 //! its own short VMs (max duration 900 s, audited internet egress, label
 //! `probe:<name>`), measures, and terminates every VM it started on every
 //! path — success, failure or error — before the verdict is recorded.
-use crate::bridge::api::{EndpointClient, IdleSpec, MicrovmApi, VmInfo, APP_PORT};
+use crate::bridge::api::{EndpointClient, IdleSpec, MicrovmApi, VmInfo, VmState, APP_PORT};
+use crate::bridge::awscli;
 use crate::bridge::errors::BridgeError;
+use crate::bridge::transport::ShellAuth;
 use crate::bridge::vm::cmd::Ctx;
-use crate::bridge::vm::{health, run};
+use crate::bridge::vm::{health, run, shell};
 use crate::wire::frame::RunHookPayload;
 use crate::wire::time::unix_now;
 use std::time::{Duration, Instant};
@@ -20,14 +22,17 @@ pub struct ProbeOutcome {
     pub image_version: Option<String>,
 }
 
-/// Run the live probe `name`.
-pub async fn run_probe<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str) -> Result<ProbeOutcome, BridgeError> {
+/// Run the live probe `name`; `arg` is its positional argument (the
+/// connector ARN of `connector-pending`, already validated by `lab run`).
+pub async fn run_probe<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str, arg: Option<&str>) -> Result<ProbeOutcome, BridgeError> {
     let mut started: Vec<String> = Vec::new();
     let result = match name {
         "payload-size" => payload_size(ctx, api, ep, &mut started).await,
         "no-traffic-before-run" => no_traffic_before_run(ctx, api, ep, &mut started).await,
         "snapshot-uniqueness" => snapshot_uniqueness(ctx, api, ep, &mut started).await,
         "idle-policy-limits" => idle_policy_limits(ctx, api, ep, &mut started).await,
+        "connector-pending" => connector_pending(ctx, api, ep, arg, &mut started).await,
+        "dns-path" => dns_path(ctx, api, ep, &mut started).await,
         other => Err(BridgeError::Config(format!("{other} is not a live probe"))),
     };
     // The terminate guard: every VM this probe started, whatever happened.
@@ -82,8 +87,11 @@ async fn guard_failure<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep:
         started.push(id.clone());
     }
     if let Some(pending) = &f.kept_pending {
-        if let Ok(run::Adoption::Adopted(id)) = run::adopt_after_ambiguous(api, ep, &ctx.paths, pending, since, run::Poll::RUNNING.scaled(ctx.knobs.backoff_ms)).await {
-            started.push(id);
+        match run::adopt_after_ambiguous_for(api, ep, &ctx.paths, pending, since, run::Poll::RUNNING.scaled(ctx.knobs.backoff_ms), "probe").await {
+            Ok(run::Adoption::Adopted(id)) => started.push(id),
+            // The egress gate could not terminate the run's VM: the terminate guard tries again.
+            Err(BridgeError::EgressMismatch(m)) if !m.terminated => started.push(m.id.clone()),
+            _ => {}
         }
     }
 }
@@ -263,4 +271,152 @@ async fn idle_policy_limits<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
         }
     }
     Ok(ProbeOutcome { verdict: parts.join(" "), note: format!("max duration 900 s, max idle 300 s; {}", notes.join("; ")), ..ProbeOutcome::default() })
+}
+
+/// connector-pending (S5): RunMicrovm against a connector that is not ACTIVE
+/// yet (`make connector-probe` creates a throw-away one). First the
+/// operator's view (the aws CLI, after the operator-account check): the
+/// connector must be PENDING now, else nothing is recorded. The probe VM's
+/// plan is `vpc` with exactly that ARN, so the echo gate compares with the
+/// probe's own list; RunMicrovm's answer is what is measured, so the run does
+/// not wait for RUNNING. Verdicts: `rejected:<Code>` for a refusal
+/// (`probes::verdict_connector_rejected`; throttling, a quota or an access
+/// denial is an error, nothing recorded); `accepted` when the VM echoed the
+/// connector, at RunMicrovm and in its RUNNING answer; `accepted:internet`
+/// when either echoed `INTERNET_EGRESS` instead and `accepted:echo-mismatch`
+/// when either echoed anything else (at RunMicrovm the gate rejected the VM;
+/// the gate knows only the configured connector's Id alias, so an Id-form
+/// echo of the throw-away connector lands here);
+/// `accepted:terminated` when the service ended the VM right after. The note
+/// carries the echo and the connector's state before and after. Every VM it
+/// started is ended by the terminate guard (or was by the gate). A failure
+/// before RunMicrovm (the image version, the count) or an ambiguous one is
+/// an error: nothing is recorded.
+async fn connector_pending<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, arn: Option<&str>, started: &mut Vec<String>) -> Result<ProbeOutcome, BridgeError> {
+    let arn = arn.map(str::trim).filter(|a| crate::bridge::config::is_connector_arn(a)).ok_or_else(|| BridgeError::Config("connector-pending needs the ARN of a connector that is not ACTIVE yet".into()))?;
+    awscli::require_operator_account(arn).map_err(|e| BridgeError::Config(format!("connector-pending: {e}")))?;
+    let (state, before) = connector_state(arn).map_err(|message| BridgeError::Sdk { op: "get_network_connector", message })?;
+    if state != "PENDING" {
+        return Err(BridgeError::Config(format!(
+            "connector-pending: {arn} is {before}, not PENDING: nothing recorded (the probe measures RunMicrovm against a connector that is not ACTIVE yet; make connector-probe CONFIRM=create-probe-connector creates a fresh one)"
+        )));
+    }
+    // Planned as internet (no configured connector needed), then given exactly the probe's connector.
+    let mut f = flags("connector-pending", None, None, false);
+    f.egress = Some(run::Egress::Internet);
+    let mut p = plan(ctx, &f)?;
+    p.egress = run::Egress::Vpc;
+    p.egress_connectors = vec![arn.to_string()];
+    let since = unix_now();
+    let shown = |l: &[String]| if l.is_empty() { "nothing".to_string() } else { l.join(", ") };
+    let selected = run::select_vm_detailed(api, &ctx.paths, &p, run::Poll::RUNNING.scaled(ctx.knobs.backoff_ms)).await;
+    let states = || {
+        let after = connector_state(arn).map_or_else(|e| format!("unknown ({e})"), |(_, s)| s);
+        format!("connector {before} before RunMicrovm, {after} after")
+    };
+    let accepted = |verdict: &str, note: String| ProbeOutcome { verdict: verdict.to_string(), note: format!("{note}; {}", states()), ..ProbeOutcome::default() };
+    match selected {
+        Ok(run::Selected::Started { vm, .. }) => {
+            started.push(vm.id.clone());
+            let t = Instant::now();
+            // The RUNNING answer is judged as select judges it: its egress, when it reports one, must still be the ARN.
+            let (verdict, after) = match run::wait_for_state(api, &vm.id, &VmState::Running, run::Poll::SETTLE.scaled(ctx.knobs.backoff_ms)).await {
+                Ok(running) if !running.egress.is_empty() && !echoes_only(&running.egress, arn) => {
+                    (echo_verdict(&running.egress), format!("RUNNING {} ms later, echoing egress {} (not this ARN)", t.elapsed().as_millis(), shown(&running.egress)))
+                }
+                Ok(_) => ("accepted", format!("RUNNING {} ms later", t.elapsed().as_millis())),
+                Err(e) => ("accepted", format!("not RUNNING: {e}")),
+            };
+            let out = accepted(verdict, format!("RunMicrovm accepted {arn} as {}: echoed egress {}; {after}", vm.id, shown(&vm.egress)));
+            Ok(ProbeOutcome { image_version: Some(vm.image_version.clone()), ..out })
+        }
+        Ok(run::Selected::Reused { vm, .. }) => Err(BridgeError::Config(format!("the probe reused {} (internal)", vm.id))),
+        Err(fail) => {
+            guard_failure(ctx, api, ep, &fail, since, started).await;
+            match fail.error {
+                BridgeError::EgressMismatch(m) => {
+                    let verdict = echo_verdict(&m.echoed);
+                    let ended = if m.terminated { "terminated by the egress gate" } else { "left to the terminate guard" };
+                    Ok(accepted(verdict, format!("RunMicrovm accepted {arn} as {}, which echoed egress {} (not this ARN in its name form: the gate rejected it; {ended})", m.id, shown(&m.echoed))))
+                }
+                // The service answered TERMINATING/TERMINATED (or never found the VM) after RunMicrovm returned it.
+                BridgeError::Terminated(m) => Ok(accepted("accepted:terminated", format!("RunMicrovm accepted {arn}, then: {m}"))),
+                // Before RunMicrovm (no pending row), or a failure the VM may outlive: not RunMicrovm's verdict.
+                e if fail.client_token.is_none() || fail.started.is_some() || fail.kept_pending.is_some() => Err(e),
+                e => match crate::bridge::probes::verdict_connector_rejected(&e) {
+                    Some((verdict, note)) => Ok(ProbeOutcome { verdict, note: format!("{note}; {}", states()), ..ProbeOutcome::default() }),
+                    // Throttling, a quota, the runtime policy, credentials: no verdict on the connector.
+                    None => Err(e),
+                },
+            }
+        }
+    }
+}
+
+/// Is `echoed` exactly the probe's connector (name form, `:N` stripped)?
+fn echoes_only(echoed: &[String], arn: &str) -> bool {
+    crate::bridge::egress::ExpectedEcho::for_plan(run::Egress::Vpc, &[arn.to_string()]).is_some_and(|e| e.matches(echoed, None))
+}
+
+/// The verdict of an accepted run whose echo is not the probe's connector:
+/// `accepted:internet` when it echoes `INTERNET_EGRESS`, else
+/// `accepted:echo-mismatch`.
+fn echo_verdict(echoed: &[String]) -> &'static str {
+    let internet = crate::bridge::egress::normalize_connector(&crate::bridge::egress::internet_egress_arn());
+    if echoed.iter().any(|e| crate::bridge::egress::normalize_connector(e) == internet) {
+        "accepted:internet"
+    } else {
+        "accepted:echo-mismatch"
+    }
+}
+
+/// The connector's `State` as the operator's aws CLI reads it (`aws
+/// lambda-core get-network-connector`, region and endpoint pinned), and
+/// that state with its reason for the note.
+fn connector_state(arn: &str) -> Result<(String, String), String> {
+    let doc = awscli::aws_json("lambda-core", &["get-network-connector", "--identifier", arn])?;
+    let state = doc.get("State").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    if state.is_empty() {
+        return Err(format!("aws lambda-core get-network-connector: no State for {arn}"));
+    }
+    let reason: Vec<&str> = ["StateReasonCode", "StateReason"].iter().filter_map(|k| doc.get(*k).and_then(|v| v.as_str())).map(str::trim).filter(|s| !s.is_empty()).collect();
+    let shown = if reason.is_empty() { state.clone() } else { format!("{state} ({})", reason.join(": ")) };
+    Ok((state, shown))
+}
+
+/// dns-path (S5): from a `--egress vpc --shell` VM, which DNS server (if any)
+/// answers: `no-dns`; `platform-dns:<nameserver>` (a platform resolver
+/// answered without resolving: DNS Firewall); `platform-dns-resolves:
+/// <nameserver>` (a platform resolver resolved names: a failing verdict);
+/// `open-dns:<nameserver>` (a public one, or any other, replied: a failing
+/// verdict). Once the VM's `/health` answered, through the scripted shell:
+/// `/etc/resolv.conf`'s nameserver, 1.1.1.1 (and OpenDNS on UDP 443), the
+/// link-local resolver (169.254.169.253, `fd00:ec2::253`), the VPC's and the
+/// VM subnet's +2 are asked for a well-known name over UDP and TCP, between
+/// two `allowed` cases through the proxy that must both answer 401 (a VM
+/// without working networking would read as `no-dns`); the note carries
+/// `resolves=yes|no` and the resolv.conf nameserver
+/// (`egress::check::dns_path_outcome`). Under the file-backed fake it
+/// refuses (exit 9) after starting its VM and before any shell token or
+/// dial; the terminate guard ends the VM.
+async fn dns_path<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, started: &mut Vec<String>) -> Result<ProbeOutcome, BridgeError> {
+    use crate::bridge::egress::check;
+    if ctx.cfg.aws.egress_connector_arn.as_deref().is_none_or(|a| a.trim().is_empty()) {
+        return Err(BridgeError::Config("dns-path needs [aws].egress_connector_arn (a vpc VM): run `make infra-status WRITE=1`".into()));
+    }
+    let mut f = flags("dns-path", None, None, true);
+    f.egress = Some(run::Egress::Vpc);
+    f.shell = true;
+    let p = plan(ctx, &f)?;
+    let vm = start(ctx, api, ep, &p, started).await?;
+    health::read_health(api, ep, &ctx.paths, &vm.id, health::Backoff::HEALTH.scaled(ctx.knobs.backoff_ms)).await?;
+    if ctx.knobs.fake_api.is_some() {
+        return Err(shell::fake_backend_refusal("dns-path"));
+    }
+    let nonce = check::new_nonce();
+    let script = check::render_dns_script(&nonce, &check::proxy_ip(&ctx.cfg, &ctx.paths));
+    let output = shell::run_script(api, &vm.id, &script, check::script_budget(check::DNS_PATH_CASES.len()), ShellAuth::Header).await?;
+    let markers = check::parse_markers(&output, &nonce).map_err(|e| BridgeError::Protocol(format!("dns-path: the shell transcript: {e}")))?;
+    let (verdict, note) = check::dns_path_outcome(&markers).map_err(|message| BridgeError::Sdk { op: "probe", message: format!("dns-path on {}: {message}", vm.id) })?;
+    Ok(ProbeOutcome { verdict, note: format!("{note} ({})", vm.id), image_version: Some(vm.image_version.clone()), ..ProbeOutcome::default() })
 }

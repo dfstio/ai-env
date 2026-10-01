@@ -1,39 +1,81 @@
 #!/usr/bin/env bash
-# make preview-scratch [NEGATIVE=no-logging|no-logging-cast|region]: a full `pulumi preview` of a scratch COPY of
-# infra/ against the real account, with a throwaway backend, passphrase and stack (D17; T3.2, T3.5).
+# make preview-scratch [NEGATIVE=...] [EGRESS_MODE=none|firewall]: a full `pulumi preview` of a scratch COPY of infra/
+# against the real account, with a throwaway backend, passphrase and stack (D17; T3.2, T3.5; S5).
 #
 # Why a copy: the agent must never touch Mike's backend, the dev stack or its passphrase, and the negatives edit
 # the program. Everything lives under target/image/pulumi-scratch (rebuilt on every run); node_modules is
 # symlinked, PULUMI_HOME is private to the scratch dir, and its plugins directory is a real one holding symlinks
 # to exactly the two pinned provider plugins (so nothing, not even a .lastused stamp or a plugin install, reaches
-# the real ~/.pulumi). A preview creates nothing in AWS (it only reads the caller identity). Nothing is written to
-# a log file: the preview's outputs carry the account id, so they go to the terminal only.
+# the real ~/.pulumi). A preview creates nothing in AWS (it only reads the caller identity and the AL2023 AMI's
+# public SSM parameter). Nothing is written to a log file: the preview's outputs carry the account id, so they go
+# to the terminal only (the --json plan is held in a shell variable and fed to the plan check on stdin).
 #
-# The normal run must succeed and list the expected creates: 16 in total, among them the Budget and the
-# MicrovmImage. Each negative succeeds only when its expected failure happens, and prints the diagnostic that fired:
+# The normal run must succeed, then the plan check (scripts/check-plan.sh, the same one `make deploy` runs; always
+# the repo's copy, never the edited scratch copy) must accept the --json plan: exactly the stack inventory per type
+# and name (53 in dnsMode none: S3's 16 and S5's 37; EGRESS_MODE=firewall previews the copy with dnsMode firewall:
+# 58), the pinned providers, every egress input and reference, every IAM document (for the caller's account, read
+# once from `aws sts get-caller-identity` into a shell variable) and no update of the parameters `ai-env egress`
+# owns. A --json plan has no stack outputs, so the 14
+# egress outputs `ai-env infra status` reads are checked in the text preview, squidConfSha256 and allowSha256
+# against the SHA-256 of the planned parameter values. The layers a negative goes through, each one alone (the
+# earlier ones disabled in the scratch copy through their scratch:* markers):
+#   spec   assertEgressSpec, before any resource is registered;
+#   guard  the resource transform (egress.ts guardEgress), at registration;
+#   plan   the plan check over `pulumi preview --json`, after every transform.
+# Each negative succeeds only when every expected refusal happens, and prints the diagnostic that fired:
 #   no-logging       the `logging` input removed: the typecheck must fail naming it
 #   no-logging-cast  removed behind an `as any` cast: the typecheck passes and the SDK's generated constructor
 #                    refuses it; then the SDK guard is bypassed too (a raw CustomResource of the same type) and the
 #                    provider's Check must refuse it
 #   region           aws-native:region eu-west-3 in the scratch stack: the program must throw the pin message
+#   vm-sg-open       an egress rule TCP 443 to 0.0.0.0/0 added to the VM security group's spec: spec, guard, plan
+#   private-route    a route 0.0.0.0/0 to the IGW added to the VM route table's spec: spec, guard, plan
+#   nacl-open        an allow rule added to the VM subnet's NACL in the spec: spec, guard, plan
+#   dns-support-on-in-none-mode
+#                    enableDnsSupport true in the spec (spec), then in egress.ts's VPC arguments with the spec
+#                    intact (guard, plan)
+#   stray-rule       resources appended to index.ts: a VPC SG rule (22 from anywhere on the VM group), a legacy
+#                    aws.ec2.SecurityGroupRule and an aws.ec2.Route: guard (each), plan (all three)
+#   stray-type       resources of types outside the inventory appended to index.ts: a CloudFormation stack (an
+#                    AWS::EC2::SecurityGroupEgress template), a Cloud Control resource (an AWS::EC2::Route), an
+#                    aws-native ExtensionResource, an SSM association on the proxy, an extra aws provider and a
+#                    component resource: guard (each), plan (all)
+#   late-transform   a route-adding transform registered at the end of index.ts: refused at registration
+#   early-transform  a route-adding transform registered before the guard (the engine does not order transforms):
+#                    three runs with the guard, each refused by the guard or the plan; then the plan alone
+#   dns-firewall-qtype
+#                    dnsMode firewall with qType "A" on the block-all rule (it would block A records only): guard, plan
+#   miswired         references the guard cannot compare in a preview (unknown ids): the route tables' associations
+#                    swapped, every rule attached to the proxy group, the proxy's ingress referencing itself: plan
+#   iam-widen        AdministratorAccess in the exec role's managedPolicyArns (guard); then also an inline policy on
+#                    the operator role, a Widen statement in MacRuntimePolicy and ssm:* in the proxy's policy: plan
+#   owned-param-reset
+#                    the --json plan with an update step on the suspended parameter and a replace step on the extras
+#                    one (what any change of theirs but tags would plan): plan (a fresh stack only creates, so the
+#                    steps are rewritten in the plan held in memory)
 #
-# Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, IMAGE_JSON (absolute), SCRATCH, NEGATIVE.
+# Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, IMAGE_JSON (absolute), SCRATCH, NEGATIVE, EGRESS_MODE.
 set -euo pipefail
 
 root=${AI_ENV_REPO_ROOT:?}
 : "${REGION:?}"
 scratch=${SCRATCH:?}
 negative=${NEGATIVE:-}
+mode=${EGRESS_MODE:-}
 real_image_json=${IMAGE_JSON:?}
 
-case "$negative" in "" | no-logging | no-logging-cast | region) ;; *) echo "preview-scratch: unknown NEGATIVE=$negative (no-logging, no-logging-cast, region)" >&2; exit 2 ;; esac
+negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset"
+case " $negatives " in *" $negative "*) ;; *) test -z "$negative" || { echo "preview-scratch: unknown NEGATIVE=$negative ($negatives)" >&2; exit 2; } ;; esac
+case "$mode" in "" | none | firewall) ;; *) echo "preview-scratch: unknown EGRESS_MODE=$mode (none, firewall)" >&2; exit 2 ;; esac
+if [ "$mode" = firewall ] && [ -n "$negative" ]; then echo "preview-scratch: EGRESS_MODE=firewall is a positive preview; run the negatives without it" >&2; exit 2; fi
 test -d "$root/infra/node_modules" || { echo "preview-scratch: $root/infra/node_modules missing: make infra-install" >&2; exit 1; }
 command -v pulumi >/dev/null || { echo "preview-scratch: pulumi not on PATH" >&2; exit 1; }
 
-fail() { echo "preview-scratch${negative:+ NEGATIVE=$negative}: $*" >&2; exit 1; }
+label="preview-scratch${negative:+ NEGATIVE=$negative}${mode:+ EGRESS_MODE=$mode}"
+fail() { echo "$label: $*" >&2; exit 1; }
 
 # ---- the scratch copy ----
-rm -rf "$scratch"
+rm -rf "${scratch:?}"
 mkdir -p "$scratch/state" "$scratch/home"
 rsync -a --exclude node_modules --exclude 'Pulumi.*.yaml' --exclude 'config/*.env' --exclude .DS_Store --exclude bin "$root/infra/" "$scratch/infra/"
 ln -s "$root/infra/node_modules" "$scratch/infra/node_modules"
@@ -74,25 +116,101 @@ cd "$scratch/infra"
 out=$(pulumi stack init scratch --non-interactive 2>&1) || { echo "$out"; fail "pulumi stack init scratch failed"; }
 pulumi config set --path 'pulumi:disable-default-providers[0]' '*' --stack scratch
 
-# edit <sed expression>...: apply to image.ts (the scratch copy) through its scratch:* markers.
-edit() {
-    local args=() e
+# edit_file <file> <sed expression>...: edit a file of the scratch copy (through its scratch:* markers).
+edit_file() {
+    local file=$1 args=() e
+    shift
     for e in "$@"; do args+=(-e "$e"); done
-    sed -i.orig "${args[@]}" image.ts && rm image.ts.orig
+    sed -i.orig "${args[@]}" "$file" && rm "$file.orig"
 }
+edit() { edit_file image.ts "$@"; }
+# restore <file>...: the scratch copy's files back to the repo's.
+restore() { local f; for f in "$@"; do cp "$root/infra/$f" "$f"; done; }
+# append <code>: a line of TypeScript at the end of the scratch index.ts (everything it declares is in scope there).
+append() { printf '\n// preview-scratch NEGATIVE=%s\n%s\n' "$negative" "$1" >>index.ts; }
 preview() { pulumi preview --non-interactive --diff --color never --stack scratch "$@"; }
+typecheck() { node_modules/.bin/tsc --noEmit --pretty false 2>&1; }
+dns_mode() { sed -n 's/.*"dnsMode": *"\([^"]*\)".*/\1/p' egress-config.json; }
+# The plan check of the repo (never the edited copy's), over the scratch copy's config, the plan on stdin. The
+# account id only lives in this shell variable (the IAM documents are compared for it).
+acct=$(aws sts get-caller-identity --region "$REGION" --query Account --output text)
+[[ "$acct" =~ ^[0-9]{12}$ ]] || fail "aws sts get-caller-identity did not answer an account id"
+plan_check() {
+    PLAN_CHECK_OUT="$scratch/plan-check" "$root/infra/scripts/check-plan.sh" --mode "$(dns_mode)" --account-id "$acct" \
+        --egress-config "$scratch/infra/egress-config.json" --image-config "$scratch/infra/image-config.json"
+}
+# json_plan: the --json plan on stdout (a shell variable for the caller, never a file); the text preview's tail when it fails.
+json_plan() {
+    local plan
+    if plan=$(pulumi preview --non-interactive --json --show-sames --show-reads --stack scratch 2>/dev/null); then printf '%s' "$plan"; return 0; fi
+    preview 2>&1 | grep -E 'error|Error' | head -5 >&2 || true
+    return 1
+}
+# Disable a layer in the scratch copy, so the next one alone must refuse.
+no_spec() {
+    edit_file index.ts '/scratch:assert/s/assertEgressSpec(egress);/void assertEgressSpec;/'
+    grep -qF 'void assertEgressSpec; // scratch:assert' index.ts || fail "the scratch:assert marker no longer disables assertEgressSpec"
+}
+no_guard() {
+    edit_file egress.ts '/scratch:guard/s/pulumi.runtime.registerResourceTransform(guard);/void guard;/'
+    grep -qF 'void guard; // scratch:guard' egress.ts || fail "the scratch:guard marker no longer disables the resource transform"
+}
+# first_line <text> <output>: the output from the first occurrence of the text to the end of its line.
+first_line() { awk -v t="$1" '{ i = index($0, t); if (i) { print substr($0, i); exit } }' <<<"$2"; }
+
+# expect_refusal <layer> <fixed text>: the typecheck passes (so the refusal is the program's, not tsc's), the
+# preview fails, and its output names the expected guard; prints the diagnostic.
+expect_refusal() {
+    local what=$1 text=$2 out diag
+    out=$(typecheck) || { echo "$out"; fail "$what: the typecheck failed (the edit, not the guard, broke the program)"; }
+    if out=$(preview 2>&1); then echo "$out"; fail "$what: the preview passed"; fi
+    diag=$(first_line "$text" "$out")
+    test -n "$diag" || { echo "$out"; fail "$what: the preview failed, but not with \"$text\""; }
+    echo "$what: $diag"
+}
+# expect_plan_refusal <fixed text>...: the typecheck and the preview pass (the earlier layers are disabled or cannot
+# see the fault), and the plan check refuses the plan naming every text; prints the diagnostics.
+expect_plan_refusal() {
+    local out plan t diag
+    out=$(typecheck) || { echo "$out"; fail "plan: the typecheck failed"; }
+    plan=$(json_plan) || fail "plan: the preview failed, so the plan check was not reached"
+    if out=$(plan_check <<<"$plan" 2>&1); then echo "$out"; fail "plan: the plan check passed"; fi
+    for t in "$@"; do
+        diag=$(first_line "$t" "$out")
+        test -n "$diag" || { echo "$out"; fail "plan: the plan check refused, but not with \"$t\""; }
+        echo "plan: $diag"
+    done
+}
 
 case "$negative" in
 "")
-    # Captured (terminal only, never a file) so the creates can be checked; printed in full either way.
+    if [ "$mode" = firewall ]; then
+        edit_file egress-config.json 's/"dnsMode": "none"/"dnsMode": "firewall"/'
+        test "$(dns_mode)" = firewall || fail "the scratch egress-config.json does not say dnsMode firewall"
+    fi
+    # The human diff first (terminal only), then the --json plan (a shell variable, never a file) for the plan check.
     out=$(preview 2>&1) || { echo "$out"; fail "the preview failed"; }
     echo "$out"
-    for t in 'aws:budgets/budget:Budget' 'aws-native:lambda:MicrovmImage'; do
-        grep -qE "^ *\+ $t: \(create\)" <<<"$out" || fail "the preview lists no create of $t"
+    plan=$(json_plan) || fail "pulumi preview --json failed (the text preview above passed)"
+    plan_check <<<"$plan" || fail "the plan check refused the plan (above)"
+    # A --json plan has no stack outputs: the egress outputs `ai-env infra status` reads, from the text preview, and
+    # the two parameter hashes against the SHA-256 of the planned values.
+    outputs=$(sed -n '/--outputs:--/,/^Resources:/p' <<<"$out")
+    for k in connectorArn connectorName proxyPrivateIp proxyInstanceId egressVpcId vmSubnetId vmEgressSecurityGroupId proxySecurityGroupId \
+        operatorRoleArn egressLogGroup dnsMode parameterPrefix squidConfSha256 allowSha256; do
+        grep -qE "^ +$k +: " <<<"$outputs" || fail "the preview plans no stack output $k"
     done
-    creates=$(sed -n 's/^ *+ \([0-9][0-9]*\) to create$/\1/p' <<<"$out")
-    test "$creates" = 16 || fail "the preview plans ${creates:-no} creates, expected 16"
-    echo "preview-scratch: ok (16 creates, among them the Budget and the MicrovmImage)"
+    for p in squid.conf allow; do
+        k=$([ "$p" = allow ] && echo allowSha256 || echo squidConfSha256)
+        got=$(sed -n "s/^ *$k *: \"\([0-9a-f]\{64\}\)\"\$/\1/p" <<<"$outputs")
+        want=$(node -e '
+const plan = JSON.parse(require("fs").readFileSync(0, "utf-8"));
+const s = plan.steps.find((x) => x.newState && x.newState.type === "aws:ssm/parameter:Parameter" && x.urn.endsWith("::" + process.argv[1]));
+process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newState.inputs.insecureValue, "utf-8").digest("hex") : "");
+' "ai-env-proxy-$p" <<<"$plan")
+        test -n "$got" && test "$got" = "$want" || fail "output $k (${got:-none}) is not the SHA-256 of the planned $p parameter value (${want:-none})"
+    done
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 14 egress outputs passed)"
     ;;
 no-logging)
     edit '/scratch:logging/d'
@@ -131,5 +249,197 @@ region)
     test -n "$diag" || { echo "$out"; fail "the preview failed, but not with the region pin message"; }
     echo "$diag"
     echo "preview-scratch NEGATIVE=region: ok (the program refused aws-native:region eu-west-3)"
+    ;;
+vm-sg-open)
+    edit_file egress-spec.ts 's|^\( *\)], // scratch:vm-rules$|\1{ direction: "egress", protocol: "tcp", port: 443, peer: { cidr: "0.0.0.0/0" }, description: "open" }], // scratch:vm-rules|'
+    grep -qF 'description: "open" }], // scratch:vm-rules' egress-spec.ts || fail "the scratch:vm-rules marker no longer adds a rule to the VM security group"
+    expect_refusal spec "the VM security group allows exactly one rule, egress TCP 3128 to 10.42.0.10/32"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:vpc/securityGroupEgressRule:SecurityGroupEgressRule ai-env-vm-egress-to-0.0.0.0-0-tcp-443"
+    no_guard
+    expect_plan_refusal "not in the stack inventory: ai-env-vm-egress-to-0.0.0.0-0-tcp-443" \
+        "ai-env-vm-egress-to-0.0.0.0-0-tcp-443: ai-env-vm-egress egress tcp 443 0.0.0.0/0: the VM security group allows exactly one rule"
+    echo "$label: ok (spec, guard and plan each refused an open VM security group)"
+    ;;
+private-route)
+    edit_file egress-spec.ts '/scratch:vms-routes/s|routes: \[\]|routes: [{ cidr: "0.0.0.0/0", target: "igw" }]|'
+    grep -qF 'routes: [{ cidr: "0.0.0.0/0", target: "igw" }] }, // scratch:vms-routes' egress-spec.ts || fail "the scratch:vms-routes marker no longer adds a route to the VM route table"
+    expect_refusal spec "the VM route table must have no route"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/routeTable:RouteTable ai-env-egress-vms: the VM route table must have no route"
+    no_guard
+    expect_plan_refusal "route table ai-env-egress-vms: the VM route table must have no route" \
+        "aws:ec2/routeTable:RouteTable ai-env-egress-vms: routes depends on aws:ec2/internetGateway:InternetGateway::ai-env-egress, expected"
+    echo "$label: ok (spec, guard and plan each refused a route on the VM route table)"
+    ;;
+nacl-open)
+    edit_file egress-spec.ts 's|^\( *\)], // scratch:nacl-egress$|\1{ ruleNo: 200, protocol: "tcp", action: "allow", cidr: "0.0.0.0/0", fromPort: 443, toPort: 443 }], // scratch:nacl-egress|'
+    grep -qF 'fromPort: 443, toPort: 443 }], // scratch:nacl-egress' egress-spec.ts || fail "the scratch:nacl-egress marker no longer adds a rule to the VM subnet's NACL"
+    expect_refusal spec "the VM subnet's network ACL must allow exactly one egress rule"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/networkAcl:NetworkAcl ai-env-egress-vms: the VM subnet's network ACL must allow exactly one egress rule"
+    no_guard
+    expect_plan_refusal "network ACL ai-env-egress-vms: the VM subnet's network ACL must allow exactly one egress rule"
+    echo "$label: ok (spec, guard and plan each refused an extra allow rule on the VM subnet's NACL)"
+    ;;
+dns-support-on-in-none-mode)
+    test "$(dns_mode)" = none || fail "egress-config.json is not in dnsMode none"
+    edit_file egress-spec.ts '/scratch:vpc/s|enableDnsSupport: cfg.dnsMode === "firewall"|enableDnsSupport: true|'
+    grep -qF 'enableDnsSupport: true, enableDnsHostnames: false }, // scratch:vpc' egress-spec.ts || fail "the scratch:vpc marker no longer turns DNS support on in the spec"
+    expect_refusal spec "enableDnsSupport must be false in dnsMode none"
+    # The spec intact, the VPC's own argument changed.
+    restore egress-spec.ts
+    edit_file egress.ts '/scratch:dns/s|enableDnsSupport: spec.vpc.enableDnsSupport|enableDnsSupport: true|'
+    grep -qF 'enableDnsSupport: true, // scratch:dns' egress.ts || fail "the scratch:dns marker no longer turns DNS support on in egress.ts"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/vpc:Vpc ai-env-egress: enableDnsSupport must be false in dnsMode none"
+    no_guard
+    expect_plan_refusal "VPC: enableDnsSupport must be false in dnsMode none"
+    echo "$label: ok (spec, guard and plan each refused DNS support in dnsMode none)"
+    ;;
+stray-rule)
+    sg_rule='new aws.vpc.SecurityGroupIngressRule("stray-rule", { securityGroupId: net.vmSecurityGroup.id, ipProtocol: "tcp", fromPort: 22, toPort: 22, cidrIpv4: "0.0.0.0/0" }, { provider: awsProvider });'
+    legacy='new aws.ec2.SecurityGroupRule("stray-legacy-rule", { type: "egress", securityGroupId: net.vmSecurityGroup.id, protocol: "-1", fromPort: 0, toPort: 0, cidrBlocks: ["0.0.0.0/0"] }, { provider: awsProvider });'
+    route='new aws.ec2.Route("stray-route", { routeTableId: net.vpc.mainRouteTableId, destinationCidrBlock: "0.0.0.0/0", gatewayId: net.vpc.id }, { provider: awsProvider });'
+    append "$sg_rule"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule stray-rule: not in the stack inventory"
+    restore index.ts
+    append "$legacy"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/securityGroupRule:SecurityGroupRule stray-legacy-rule: not in the stack inventory"
+    restore index.ts
+    append "$route"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/route:Route stray-route: not in the stack inventory"
+    restore index.ts
+    append "$sg_rule"
+    append "$legacy"
+    append "$route"
+    no_guard
+    expect_plan_refusal "aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule: not in the stack inventory: stray-rule" \
+        "aws:ec2/securityGroupRule:SecurityGroupRule: not in the stack inventory: stray-legacy-rule" \
+        "aws:ec2/route:Route: not in the stack inventory: stray-route"
+    echo "$label: ok (the guard refused each stray network resource added outside egress.ts; the plan check refused all three)"
+    ;;
+stray-type)
+    cfn='new aws.cloudformation.Stack("stray-cfn", { name: "ai-env-stray", templateBody: JSON.stringify({ Resources: { Open: { Type: "AWS::EC2::SecurityGroupEgress", Properties: { GroupId: "sg-00000000000000000", IpProtocol: "-1", CidrIp: "0.0.0.0/0" } } } }) }, { provider: awsProvider });'
+    cc='new aws.cloudcontrol.Resource("stray-cloudcontrol", { typeName: "AWS::EC2::Route", desiredState: JSON.stringify({ RouteTableId: "rtb-00000000000000000", DestinationCidrBlock: "0.0.0.0/0", GatewayId: "igw-00000000000000000" }) }, { provider: awsProvider });'
+    ext='new awsnative.ExtensionResource("stray-extension", { type: "AWS::EC2::Route", properties: { RouteTableId: "rtb-00000000000000000", DestinationCidrBlock: "0.0.0.0/0", GatewayId: "igw-00000000000000000" } }, { provider: nativeProvider });'
+    ssm='new aws.ssm.Association("stray-association", { name: "AWS-RunShellScript", targets: [{ key: "InstanceIds", values: [net.instance.id] }], parameters: { commands: "true" } }, { provider: awsProvider });'
+    prov='new aws.Provider("stray-provider", { region: "us-east-1" });'
+    comp='new pulumi.ComponentResource("stray:index:Component", "stray-component");'
+    for pair in "aws:cloudformation/stack:Stack stray-cfn|$cfn" "aws:cloudcontrol/resource:Resource stray-cloudcontrol|$cc" \
+        "aws-native:index:ExtensionResource stray-extension|$ext" "aws:ssm/association:Association stray-association|$ssm" "pulumi:providers:aws stray-provider|$prov" \
+        "stray:index:Component stray-component|$comp"; do
+        restore index.ts
+        append "${pair#*|}"
+        case "$pair" in stray:*) want="component resources are refused" ;; *) want="not in the stack inventory" ;; esac
+        expect_refusal guard "egress guard (infra/egress.ts) refused ${pair%%|*}: $want"
+    done
+    restore index.ts
+    for code in "$cfn" "$cc" "$ext" "$ssm" "$prov" "$comp"; do append "$code"; done
+    no_guard
+    expect_plan_refusal "aws:cloudformation/stack:Stack: not in the stack inventory: stray-cfn" \
+        "aws:cloudcontrol/resource:Resource: not in the stack inventory: stray-cloudcontrol" \
+        "aws-native:index:ExtensionResource: not in the stack inventory: stray-extension" \
+        "aws:ssm/association:Association: not in the stack inventory: stray-association" \
+        "pulumi:providers:aws: not in the stack inventory: stray-provider" \
+        "stray:index:Component: not in the stack inventory: stray-component" "stray:index:Component stray-component: a component resource"
+    echo "$label: ok (the guard refused each resource of a type outside the inventory and a component; the plan check refused all six)"
+    ;;
+late-transform)
+    append 'pulumi.runtime.registerResourceTransform((a) => (a.name === "ai-env-egress-vms" && a.type === "aws:ec2/routeTable:RouteTable" ? { props: { ...a.props, routes: [{ cidrBlock: "0.0.0.0/0", gatewayId: "igw-00000000000000000" }] }, opts: a.opts } : undefined));'
+    expect_refusal seal "egress guard (infra/egress.ts): registerResourceTransform after the guard is refused"
+    restore index.ts
+    append 'pulumi.runtime.registerStackTransformation((a) => undefined);'
+    expect_refusal seal "egress guard (infra/egress.ts): registerStackTransformation after the guard is refused"
+    echo "$label: ok (transform registrations after the guard throw)"
+    ;;
+early-transform)
+    # Before the guard, right after the imports: copy the proxy table's IGW route into the VM table.
+    node -e '
+const fs = require("fs");
+const anchor = "import { Names, PROJECT, REGION } from \"./policies\";\n";
+const s = fs.readFileSync("index.ts", "utf-8");
+if (!s.includes(anchor)) process.exit(1);
+const inject = "let strayIgw: unknown;\npulumi.runtime.registerResourceTransform((a) => { const routes = a.props.routes as { gatewayId?: unknown }[] | undefined; if (a.type === \"aws:ec2/routeTable:RouteTable\" && a.name === \"ai-env-egress-proxy\" && routes?.length) strayIgw = routes[0].gatewayId; return a.type === \"aws:ec2/routeTable:RouteTable\" && a.name === \"ai-env-egress-vms\" ? { props: { ...a.props, routes: [{ cidrBlock: \"0.0.0.0/0\", gatewayId: strayIgw ?? \"igw-00000000000000000\" }] }, opts: a.opts } : undefined; });\n";
+fs.writeFileSync("index.ts", s.replace(anchor, anchor + inject));
+' || fail "the early-transform anchor (the policies import) is no longer in index.ts"
+    # One --json preview per run decides (the guard's verdict varies from run to run): its plan goes to the plan
+    # check, or its diagnostics must carry the guard's refusal.
+    out=$(typecheck) || { echo "$out"; fail "the typecheck failed"; }
+    for run in 1 2 3; do
+        if plan=$(pulumi preview --non-interactive --json --show-sames --show-reads --stack scratch 2>/dev/null); then
+            if out=$(plan_check <<<"$plan" 2>&1); then echo "$out"; fail "run $run: the guard and the plan check both passed a route on the VM route table"; fi
+            diag=$(first_line "the VM route table must have no route" "$out")
+            test -n "$diag" || { echo "$out"; fail "run $run: the plan check refused, but not the VM route"; }
+            echo "run $run: the guard passed it; plan: $diag"
+        else
+            diag=$(first_line "egress guard (infra/egress.ts) refused aws:ec2/routeTable:RouteTable ai-env-egress-vms" "$plan")
+            test -n "$diag" || { grep -oE '"message": *"[^"]{0,300}' <<<"$plan" | head -5; fail "run $run: the preview failed, but not on the guard's refusal of the VM route table"; }
+            echo "run $run: guard: ${diag%%\\n*}"
+        fi
+    done
+    no_guard
+    expect_plan_refusal "route table ai-env-egress-vms: the VM route table must have no route"
+    echo "$label: ok (a transform registered before the guard was refused in every run; the plan check alone refuses it)"
+    ;;
+dns-firewall-qtype)
+    edit_file egress-config.json 's/"dnsMode": "none"/"dnsMode": "firewall"/'
+    test "$(dns_mode)" = firewall || fail "the scratch egress-config.json does not say dnsMode firewall"
+    edit_file egress.ts '/scratch:fw-rule/s|action: "BLOCK", |action: "BLOCK", qType: "A", |'
+    grep -qF 'qType: "A", ' egress.ts || fail "the scratch:fw-rule marker no longer adds a qType to the DNS Firewall rule"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:route53/resolverFirewallRule:ResolverFirewallRule ai-env-egress-block-all: input qType is outside the stack spec"
+    no_guard
+    expect_plan_refusal "aws:route53/resolverFirewallRule:ResolverFirewallRule ai-env-egress-block-all: input qType must be unset"
+    echo "$label: ok (guard and plan each refused a DNS Firewall rule limited to one record type)"
+    ;;
+miswired)
+    # The guard runs: in a preview the ids are unknown, so only the plan check (by URN) can see these.
+    edit_file egress.ts '/scratch:assoc/s|\[table("proxy", proxySubnet), table("vms", vmSubnet)\]|[table("proxy", vmSubnet), table("vms", proxySubnet)]|'
+    grep -qF '[table("proxy", vmSubnet), table("vms", proxySubnet)]' egress.ts || fail "the scratch:assoc marker no longer swaps the route table associations"
+    expect_plan_refusal "aws:ec2/routeTableAssociation:RouteTableAssociation ai-env-egress-proxy: subnetId depends on aws:ec2/subnet:Subnet::ai-env-egress-vms" \
+        "aws:ec2/routeTableAssociation:RouteTableAssociation ai-env-egress-vms: subnetId depends on aws:ec2/subnet:Subnet::ai-env-egress-proxy"
+    restore egress.ts
+    edit_file egress.ts '/scratch:rule-sg/s|securityGroupId: sgs\[k\].id,|securityGroupId: sgs.proxy.id,|'
+    grep -qF 'securityGroupId: sgs.proxy.id,' egress.ts || fail "the scratch:rule-sg marker no longer attaches the rules to another group"
+    expect_plan_refusal "ai-env-vm-egress-to-10.42.0.10-32-tcp-3128: securityGroupId depends on aws:ec2/securityGroup:SecurityGroup::ai-env-proxy"
+    restore egress.ts
+    edit_file egress.ts '/scratch:rule-peer/s|referencedSecurityGroupId: sgs\[rule.peer.sg\].id|referencedSecurityGroupId: sgs[k].id|'
+    grep -qF 'referencedSecurityGroupId: sgs[k].id' egress.ts || fail "the scratch:rule-peer marker no longer makes a rule reference its own group"
+    expect_plan_refusal "ai-env-proxy-from-ai-env-vm-egress-tcp-3128: referencedSecurityGroupId depends on aws:ec2/securityGroup:SecurityGroup::ai-env-proxy"
+    echo "$label: ok (the plan check refused swapped route table associations, rules on the wrong group and a self-referencing rule)"
+    ;;
+iam-widen)
+    edit_file iam.ts '/scratch:exec-role/s|assumeRolePolicy: trust, tags,|assumeRolePolicy: trust, tags, managedPolicyArns: ["arn:aws:iam::aws:policy/AdministratorAccess"],|'
+    grep -qF 'managedPolicyArns: ["arn:aws:iam::aws:policy/AdministratorAccess"],' iam.ts || fail "the scratch:exec-role marker no longer widens the execution role"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:iam/role:Role ai-env-vm-exec: input managedPolicyArns is outside the stack spec"
+    edit_file egress.ts '/scratch:operator-role/s|assumeRolePolicy: JSON.stringify(operatorTrustPolicy()), tags,|assumeRolePolicy: JSON.stringify(operatorTrustPolicy()), tags, inlinePolicies: [{ name: "widen", policy: JSON.stringify({ Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: "iam:*", Resource: "*" }] }) }],|'
+    grep -qF 'inlinePolicies: [{ name: "widen"' egress.ts || fail "the scratch:operator-role marker no longer adds an inline policy"
+    edit_file policies.ts '/scratch:runtime/s|^\(.*\)}, // scratch:runtime$|\1}, { Sid: "Widen", Effect: "Allow", Action: ["*"], Resource: ["*"] }, // scratch:runtime|'
+    grep -qF '{ Sid: "Widen", Effect: "Allow", Action: ["*"], Resource: ["*"] }, // scratch:runtime' policies.ts || fail "the scratch:runtime marker no longer widens MacRuntimePolicy"
+    edit_file policies.ts '/scratch:proxy-policy/s|Action: \["ssm:GetParameter", "ssm:GetParameters"\]|Action: ["ssm:*"]|'
+    grep -qF 'Action: ["ssm:*"], Resource: [proxyParameterArn(n)] }, // scratch:proxy-policy' policies.ts || fail "the scratch:proxy-policy marker no longer widens the proxy's policy"
+    no_guard
+    expect_plan_refusal "aws:iam/role:Role ai-env-vm-exec: managedPolicyArns must be unset" \
+        "aws:iam/role:Role ai-env-egress-operator: inlinePolicies must be unset" \
+        "aws:iam/userPolicy:UserPolicy MacRuntimePolicy: policy is not policies.ts runtimePolicy(); extra statements Widen" \
+        "aws:iam/rolePolicy:RolePolicy ai-env-egress-proxy: policy is not policies.ts proxyRolePolicy(); a statement differs"
+    echo "$label: ok (the guard refused a managed policy on a role; the plan check refused it, an operator inline policy and two widened documents)"
+    ;;
+owned-param-reset)
+    plan=$(json_plan) || fail "the preview failed, so the plan check was not reached"
+    # What the plan of an existing stack would hold if either owned parameter changed in anything but its tags.
+    plan=$(node -e '
+const plan = JSON.parse(require("fs").readFileSync(0, "utf-8"));
+const ops = { "ai-env-proxy-suspended": "update", "ai-env-proxy-extras": "replace" };
+for (const s of plan.steps) { const op = ops[s.urn.split("::").pop()]; if (op && s.newState && s.newState.type === "aws:ssm/parameter:Parameter") s.op = op; }
+process.stdout.write(JSON.stringify(plan));
+' <<<"$plan")
+    if out=$(plan_check <<<"$plan" 2>&1); then echo "$out"; fail "plan: the plan check passed an update of the owned parameters"; fi
+    for t in "aws:ssm/parameter:Parameter ai-env-proxy-suspended: a update step would reset the parameter to its initial header, wiping every host" \
+        "aws:ssm/parameter:Parameter ai-env-proxy-extras: a replace step would reset the parameter to its initial header, wiping every extra"; do
+        diag=$(first_line "$t" "$out")
+        test -n "$diag" || { echo "$out"; fail "plan: the plan check refused, but not with \"$t\""; }
+        echo "plan: $diag"
+    done
+    echo "$label: ok (the plan check refused an update and a replace of the parameters ai-env egress owns)"
     ;;
 esac

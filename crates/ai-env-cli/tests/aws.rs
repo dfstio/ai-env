@@ -577,10 +577,15 @@ async fn start(api: &ai_env_cli::bridge::vm::client::SdkMicrovmApi, ep: &HttpsEn
                 guard.add(id);
             }
             if let Some(p) = &f.kept_pending {
-                match vmrun::adopt_after_ambiguous(api, ep, &live.paths, p, since, Poll::RUNNING).await {
+                match vmrun::adopt_after_ambiguous_for(api, ep, &live.paths, p, since, Poll::RUNNING, "test").await {
                     Ok(vmrun::Adoption::Adopted(id)) => guard.add(&id),
                     Ok(vmrun::Adoption::Unresolved(ids)) => eprintln!("start: VMs that may be this test's could not be asked: {} — check with ai-env vm gc; ai-env vm terminate <id> --yes", ids.join(", ")),
                     Ok(vmrun::Adoption::NoMatch) => eprintln!("start: no VM of this test's ambiguous run is visible"),
+                    // The S5 egress gate rejected the adopted VM but could not terminate it: the guard tries again.
+                    Err(BridgeError::EgressMismatch(m)) if !m.terminated => {
+                        eprintln!("start: the ambiguous run's VM {} failed the egress gate and is not confirmed terminated", m.id);
+                        guard.add(&m.id);
+                    }
                     Err(e) => eprintln!("start: the adoption sweep failed: {}", no_account(&e.to_string())),
                 }
             }
@@ -694,4 +699,264 @@ async fn live_vm_token_expiry() {
     let stale = ep.get_health(&vm.endpoint, &token, 8080).await.unwrap();
     eprintln!("live_vm_token_expiry: 5-minute token after 370 s → HTTP {} x-aws-proxy-error={:?}", stale.status, stale.proxy_error);
     assert!(matches!(stale.status, 401 | 403), "{}", stale.status);
+}
+
+// ---- S5: the live egress tests (part B: Mike's terminal, `make test-egress`) ---------------
+//
+// Each test starts its own `--egress vpc --shell` VM (the stack's connector, 900 s) in a
+// temp copy of the bridge root, runs the `ai-env egress check` script — or the cases it
+// needs — through the platform shell and judges it as the command does; nothing is
+// recorded in egress-verified.toml (the markers are the VM's own word; squid's log is
+// read where it matters). The transcript is parsed, never printed. The tests run one at a
+// time (`egress_serial`): each holds a VM, and [vm].max_concurrent is small.
+// `live_egress_extra_and_removal` edits the proxy's extras through the operator's real
+// bridge root, so it shares `state/egress.lock` and the audit with every other command.
+
+use ai_env_cli::bridge::egress::check::{self, Judgement, Markers, Verdict};
+use ai_env_cli::bridge::egress::{ConnectorAlias, ExpectedEcho};
+use ai_env_cli::bridge::transport::ShellAuth;
+use ai_env_cli::bridge::vm::client::SdkMicrovmApi;
+use ai_env_cli::bridge::vm::health::{read_health, Backoff};
+use ai_env_cli::bridge::vm::shell::run_script;
+
+/// Gate for the live egress tests: they need both `AI_ENV_AWS_TESTS=1` and `AI_ENV_EGRESS_TESTS=1`.
+fn live_egress() -> bool {
+    if std::env::var("AI_ENV_AWS_TESTS").as_deref() == Ok("1") && std::env::var("AI_ENV_EGRESS_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_AWS_TESTS=1 and AI_ENV_EGRESS_TESTS=1 to run the live egress tests (make test-egress)");
+    false
+}
+
+/// `body` on its own current-thread runtime, one live egress test at a time.
+fn egress_serial(body: impl std::future::Future<Output = ()>) {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body);
+}
+
+/// `vm run --egress vpc --shell` for a test (900 s, idle from bridge.toml).
+fn egress_plan(live: &Live) -> RunPlan {
+    let flags = RunFlags { max_duration_s: Some(900), label: Some("test-egress".into()), egress: Some(vmrun::Egress::Vpc), shell: true, purpose: "test", ..RunFlags::default() };
+    RunPlan::from_cfg(&live.cfg, &flags).unwrap_or_else(|e| panic!("egress run plan: {e} (make infra-status WRITE=1 records [aws].egress_connector_arn)"))
+}
+
+/// What a scripted run through the platform shell returned: the parsed
+/// markers, the run's nonce, and when the script was sent and came back
+/// (the squid log's window).
+struct Shelled {
+    markers: Markers,
+    nonce: String,
+    started_s: u64,
+    ended_s: u64,
+}
+
+/// The VM booted (its /health answers), then the named cases through the
+/// platform shell.
+async fn shell_cases(api: &SdkMicrovmApi, ep: &HttpsEndpoint, live: &Live, id: &str, names: &[&str]) -> Shelled {
+    read_health(api, ep, &live.paths, id, Backoff::HEALTH).await.unwrap_or_else(|e| panic!("/health of {id}: {}", no_account(&e.to_string())));
+    let nonce = check::new_nonce();
+    let script = check::render_cases(&nonce, &check::proxy_ip(&live.cfg, &live.paths), names);
+    let started_s = ai_env_cli::wire::time::unix_now();
+    let out = run_script(api, id, &script, check::script_budget(names.len()), ShellAuth::Header).await.unwrap_or_else(|e| panic!("the scripted shell on {id}: {}", no_account(&e.to_string())));
+    let ended_s = ai_env_cli::wire::time::unix_now();
+    let markers = check::parse_markers(&out, &nonce).unwrap_or_else(|e| panic!("the transcript of {id}: {e}"));
+    Shelled { markers, nonce, started_s, ended_s }
+}
+
+fn all_cases() -> Vec<&'static str> {
+    check::CASES.iter().map(|c| c.name).collect()
+}
+
+fn show(test: &str, id: &str, j: &Judgement) {
+    eprintln!("{test}: {id}, script finished: {}, dns {}", j.finished, j.dns);
+    for c in &j.cases {
+        eprintln!("  {:<9} {:<19} {}", c.verdict.as_str(), c.name, c.reason);
+    }
+}
+
+#[test]
+#[ignore = "live, starts a vpc MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 make test-egress"]
+fn live_egress_direct_closed() {
+    if !live_egress() {
+        return;
+    }
+    egress_serial(async {
+        let live = live_world();
+        let guard = VmGuard::new(&live);
+        let api = connect(&live.creds).await;
+        let ep = HttpsEndpoint::new().unwrap();
+        let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
+        let j = check::judge(&shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers);
+        show("live_egress_direct_closed", &vm.id, &j);
+        assert!(j.finished, "the script did not finish");
+        // Direct egress (name, IPv4 on 443 and 80, IPv6), every DNS path and the proxy's other ports closed (nothing
+        // connected) — counted only because `allowed` passed first and last on the same VM.
+        for c in j.cases.iter().filter(|c| matches!(c.group, "direct" | "dns" | "other") || check::ALLOWED_CASES.contains(&c.name)) {
+            assert_ne!(c.verdict, Verdict::Fail, "{}: {}", c.name, c.reason);
+        }
+    });
+}
+
+#[test]
+#[ignore = "live, starts a vpc MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 make test-egress"]
+fn live_egress_proxy_allowlist() {
+    if !live_egress() {
+        return;
+    }
+    egress_serial(async {
+        let live = live_world();
+        let guard = VmGuard::new(&live);
+        let api = connect(&live.creds).await;
+        let ep = HttpsEndpoint::new().unwrap();
+        let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
+        let run = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await;
+        let j = check::judge(&run.markers);
+        show("live_egress_proxy_allowlist", &vm.id, &j);
+        // allowed (first and last) → 401 in a tunnel; denied (the nonce host), an IP literal, CONNECT :8443,
+        // github.com → the proxy's CONNECT 403; plain http :8080 → squid's 403.
+        for c in j.cases.iter().filter(|c| c.group == "proxy") {
+            assert_eq!(c.verdict, Verdict::Pass, "{}: {}", c.name, c.reason);
+        }
+        // squid's log in CloudWatch (the operator's aws CLI), from the run's client in its window: both tunnels,
+        // a denial for every refused request, no tunnel to a refused host.
+        let squid = check::squid_poll(&run.nonce, run.started_s, run.ended_s, check::SQUID_LOG_BUDGET, check::SQUID_LOG_STEP).await;
+        eprintln!("live_egress_proxy_allowlist: squid log: {}", no_account(&format!("{squid:?}")));
+        assert!(squid.is_ok(), "{}", no_account(&format!("{squid:?}")));
+    });
+}
+
+/// `ai-env egress allow ai-env-test github.com [--remove]` (the operator's aws CLI) on the
+/// operator's real bridge root (its `state/egress.lock` and audit, shared with any other
+/// `ai-env egress` command), killed after 300 s.
+fn egress_allow(remove: bool) -> std::process::Output {
+    let root = Paths::resolve().expect("the real bridge root").root;
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env"));
+    c.args(["egress", "allow", "ai-env-test", "github.com"]);
+    if remove {
+        c.arg("--remove");
+    }
+    let child = c
+        .env("AI_ENV_BRIDGE_DIR", root)
+        .env_remove("AI_ENV_BRIDGE_CONFIG")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ai-env");
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(out) => out.expect("ai-env output"),
+        Err(_) => {
+            let _ = std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+            panic!("ai-env egress allow did not finish within 300 s");
+        }
+    }
+}
+
+/// The test's github.com extra: removed on drop unless `remove` already did it
+/// (`make test-egress` also removes it on every exit).
+struct GithubExtra {
+    armed: bool,
+}
+
+impl GithubExtra {
+    fn add() -> GithubExtra {
+        let o = egress_allow(false);
+        let extra = GithubExtra { armed: true };
+        assert!(o.status.success(), "egress allow: {}", no_account(&String::from_utf8_lossy(&o.stderr)));
+        extra
+    }
+
+    fn remove(&mut self) {
+        let o = egress_allow(true);
+        self.armed = !o.status.success();
+        assert!(o.status.success(), "egress allow --remove: {}", no_account(&String::from_utf8_lossy(&o.stderr)));
+    }
+}
+
+impl Drop for GithubExtra {
+    fn drop(&mut self) {
+        if self.armed {
+            let o = egress_allow(true);
+            eprintln!("guard: egress allow ai-env-test github.com --remove: exit {:?} — check with ai-env egress status", o.status.code());
+        }
+    }
+}
+
+#[test]
+#[ignore = "live, starts a vpc MicroVM and changes the proxy's extras (Mike's account): AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 make test-egress"]
+fn live_egress_extra_and_removal() {
+    if !live_egress() {
+        return;
+    }
+    egress_serial(async {
+        let live = live_world();
+        let guard = VmGuard::new(&live);
+        let api = connect(&live.creds).await;
+        let ep = HttpsEndpoint::new().unwrap();
+        let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
+        let github = |m: &Markers| m.get("proxy-github").cloned().expect("a proxy-github marker");
+        let m = shell_cases(&api, &ep, &live, &vm.id, &["allowed", "proxy-github"]).await.markers;
+        assert_eq!(m.get("allowed").map(|r| (r.code, r.hc)), Some((Some(401), Some(200))), "the VM reaches the proxy");
+        assert_eq!((github(&m).hc, github(&m).t403), (Some(403), Some(true)), "github.com is denied before the test adds it (is it among the extras already? ai-env egress status)");
+        // Added for the workspace ai-env-test: the tunnel opens.
+        let mut extra = GithubExtra::add();
+        let added = std::time::Instant::now();
+        loop {
+            let g = github(&shell_cases(&api, &ep, &live, &vm.id, &["proxy-github"]).await.markers);
+            if g.hc == Some(200) && g.code.unwrap_or(0) != 0 {
+                eprintln!("live_egress_extra_and_removal: github.com allowed {} ms after egress allow returned (HTTP {:?})", added.elapsed().as_millis(), g.code);
+                break;
+            }
+            assert!(added.elapsed() < std::time::Duration::from_secs(30), "github.com still not allowed 30 s after egress allow: {g:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        // Removed: denied again within 5 s (the reload restarts squid, so open tunnels close too).
+        extra.remove();
+        let removed = std::time::Instant::now();
+        loop {
+            let asked = removed.elapsed();
+            let g = github(&shell_cases(&api, &ep, &live, &vm.id, &["proxy-github"]).await.markers);
+            if g.hc == Some(403) && g.t403 == Some(true) {
+                eprintln!("live_egress_extra_and_removal: github.com denied again: asked {} ms after --remove returned", asked.as_millis());
+                assert!(asked <= std::time::Duration::from_secs(5), "{asked:?}");
+                break;
+            }
+            assert!(removed.elapsed() < std::time::Duration::from_secs(5), "github.com still allowed 5 s after --remove: {g:?}");
+        }
+    });
+}
+
+#[test]
+#[ignore = "live, starts a vpc MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 make test-egress"]
+fn live_egress_after_resume() {
+    if !live_egress() {
+        return;
+    }
+    egress_serial(async {
+        let live = live_world();
+        let guard = VmGuard::new(&live);
+        let api = connect(&live.creds).await;
+        let ep = HttpsEndpoint::new().unwrap();
+        let plan = egress_plan(&live);
+        let (_, vm, _) = start(&api, &ep, &live, &guard, &plan).await;
+        read_health(&api, &ep, &live.paths, &vm.id, Backoff::HEALTH).await.unwrap_or_else(|e| panic!("{}", no_account(&e.to_string())));
+        api.suspend(&vm.id).await.unwrap();
+        vmrun::wait_for_state(&api, &vm.id, &VmState::Suspended, Poll::SETTLE).await.unwrap();
+        api.resume(&vm.id).await.unwrap();
+        let after = vmrun::wait_for_state(&api, &vm.id, &VmState::Running, Poll::SETTLE).await.unwrap();
+        // The resumed VM still echoes exactly the connector.
+        let expected = ExpectedEcho::for_plan(vmrun::Egress::Vpc, &plan.egress_connectors).expect("a vpc plan has its connector");
+        let alias = ConnectorAlias::load(&live.paths, &plan.egress_connectors[0]);
+        assert!(expected.matches(&after.egress, alias.as_ref()), "after resume {} echoes {:?}", vm.id, after.egress);
+        // And egress is as closed, and the allowlist as open, as before the suspend.
+        let j = check::judge(&shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers);
+        show("live_egress_after_resume", &vm.id, &j);
+        assert!(j.passed(), "{:?}", j.failures());
+    });
 }

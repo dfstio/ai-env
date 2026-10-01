@@ -2,11 +2,15 @@
 //! (`AI_ENV_BRIDGE_LAB_FAKE_API`, debug builds; plan S4 D23, D25): T4.4 —
 //! three concurrent `vm run --workspace` → exactly one RunMicrovm; the
 //! cross-workspace `max_concurrent`; gc classes and actions — plus the CLI
-//! contract of §6 (exit codes, hidden tokens, audit rows) and the container
-//! unseal path with the fake age. Every process gets its own bridge root,
+//! contract of §6 (exit codes, hidden tokens, audit rows), the container
+//! unseal path with the fake age, and S5's `vm smoke --egress` echo
+//! assertions and the `vm run --egress vpc` connector-state line. Every
+//! process gets its own bridge root,
 //! keystore and HOME under one temp tree; polls are scaled to milliseconds
 //! (`AI_ENV_BRIDGE_LAB_BACKOFF_MS=1`).
+use crate::common::CONNECTOR;
 use ai_env_cli::bridge::api::{FakeState, IdleSpec, VmInfo, VmState, FAKE_IMAGE_ARN, ENDPOINT_SUFFIX};
+use ai_env_cli::bridge::infra::InfraState;
 use ai_env_cli::wire::frame::{Health, HealthStatus};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -702,4 +706,320 @@ fn cli_run_refuses_an_image_that_is_not_a_canonical_arn() {
     let o = w.run(&["vm", "run", "--image", "ai-env-agent", "--egress", "internet"]);
     assert_eq!(code(&o), 9, "{}", stderr(&o));
     assert_eq!(w.runs(), 0);
+}
+
+// ---- S5: the egress echo gate ---------------------------------------------------------------------
+
+/// `[aws].egress_connector_arn = CONNECTOR` in this world's bridge.toml.
+fn with_connector(w: &World) {
+    let path = w.bridge().join("bridge.toml");
+    let text = fs::read_to_string(&path).unwrap().replacen("[aws]\n", &format!("[aws]\negress_connector_arn = \"{CONNECTOR}\"\n"), 1);
+    fs::write(&path, text).unwrap();
+}
+
+/// `state/infra.toml` recording the configured connector in `state` (none: no `connector_state`).
+fn write_connector_state(w: &World, state: Option<&str>) {
+    let s = InfraState { stack: "dev".into(), connector_arn: Some(CONNECTOR.into()), connector_state: state.map(str::to_string), ..InfraState::default() };
+    let dir = w.bridge().join("state");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("infra.toml"), s.render().unwrap()).unwrap();
+}
+
+/// `bin/` of stubs that fail loudly (exit 99) should anything call the real `aws` or `claude`.
+fn stub_bin(w: &World) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = w.root().join("stub-bin");
+    if !bin.exists() {
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["aws", "claude"] {
+            fs::write(bin.join(name), format!("#!/bin/sh\necho \"stub {name}: must never run in this test\" >&2\nexit 99\n")).unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    bin
+}
+
+/// [`World::run`] with `PATH` pinned: the stubs first, then the system directories.
+fn run_pinned(w: &World, args: &[&str]) -> Output {
+    let mut c = w.cmd(args);
+    c.env("PATH", format!("{}:/usr/bin:/bin", stub_bin(w).display()));
+    let child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("spawn ai-env");
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    // Every S5 process test is bounded: a gate regression must fail, never hang `make test`.
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(out) => out.expect("ai-env output"),
+        Err(_) => {
+            let _ = std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+            panic!("ai-env {args:?} did not finish within 120 s");
+        }
+    }
+}
+
+fn internet() -> String {
+    ai_env_cli::bridge::egress::internet_egress_arn()
+}
+
+fn fake_failure(kind: &str, on: &str, after_effect: bool) -> ai_env_cli::bridge::api::FakeFailure {
+    ai_env_cli::bridge::api::FakeFailure { kind: kind.into(), message: format!("{kind} (test)"), on: Some(on.into()), after_effect }
+}
+
+/// The audit rows of `event`, parsed.
+fn events(w: &World, event: &str) -> Vec<serde_json::Value> {
+    w.audit().lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["event"] == event).collect()
+}
+
+/// `by` of every `vm_terminate` audit row.
+fn terminated_by(w: &World) -> Vec<String> {
+    events(w, "vm_terminate").iter().map(|r| r["detail"]["by"].as_str().unwrap().to_string()).collect()
+}
+
+/// No VM of the fake is left non-terminal.
+fn none_alive(w: &World, why: &str) {
+    let alive: Vec<String> = w.state().vms.values().filter(|v| !v.state.is_terminal()).map(|v| v.id.clone()).collect();
+    assert!(alive.is_empty(), "left running ({why}): {alive:?}");
+}
+
+#[test]
+fn cli_smoke_egress_vpc_asserts_exactly_the_connector() {
+    let w = World::new("");
+    with_connector(&w);
+    for args in [vec!["vm", "smoke", "--egress", "vpc", "--json"], vec!["vm", "smoke", "--json"]] {
+        let o = run_pinned(&w, &args);
+        assert_eq!(code(&o), 0, "{args:?}\n{}\n{}", stdout(&o), stderr(&o));
+        let rec = json(&o);
+        assert_eq!((rec["egress_ok"].clone(), rec["egress_expected"].clone(), rec["egress"].clone()), (serde_json::json!(true), serde_json::json!([CONNECTOR]), serde_json::json!([CONNECTOR])), "{args:?}: a configured connector means vpc");
+        assert!(stderr(&o).contains(&format!("smoke: egress {CONNECTOR} (vpc egress: exactly as required)")), "{}", stderr(&o));
+        assert!(w.state().vms[rec["id"].as_str().unwrap()].state.is_terminal());
+    }
+    assert_eq!(w.state().specs.iter().map(|s| s.egress_connectors.clone()).collect::<Vec<_>>(), [vec![CONNECTOR.to_string()], vec![CONNECTOR.to_string()]]);
+    assert!(!w.audit().contains("vm_egress_mismatch") && !w.audit().contains("vm_egress_internet"), "{}", w.audit());
+}
+
+#[test]
+fn cli_smoke_egress_internet_expects_internet_egress() {
+    let w = World::new("");
+    with_connector(&w);
+    let o = run_pinned(&w, &["vm", "smoke", "--egress", "internet", "--json"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let rec = json(&o);
+    assert_eq!((rec["egress_ok"].clone(), rec["egress_expected"].clone(), rec["egress"].clone()), (serde_json::json!(true), serde_json::json!([internet()]), serde_json::json!([internet()])));
+    assert!(w.state().specs[0].egress_connectors.is_empty(), "internet sends no connector");
+    assert!(w.audit().contains("\"vm_egress_internet\""));
+    // Without a connector and without --egress, the smoke implies internet (audited), as before.
+    let w = World::new("");
+    let o = run_pinned(&w, &["vm", "smoke", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(json(&o)["egress_expected"], serde_json::json!([internet()]));
+    // --egress vpc without a connector is refused before any call.
+    let o = run_pinned(&w, &["vm", "smoke", "--egress", "vpc"]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert_eq!(w.runs(), 1);
+}
+
+#[test]
+fn cli_smoke_with_the_wrong_egress_echo_exits_9_and_leaves_no_vm() {
+    for (terminate_fails, keep) in [(false, false), (true, false), (true, true)] {
+        let w = World::new("");
+        with_connector(&w);
+        w.update(|s| {
+            s.egress_echo = Some(vec![internet()]);
+            if terminate_fails {
+                s.failures.push_back(fake_failure("throttled", "terminate", false));
+            }
+        });
+        let mut args = vec!["vm", "smoke", "--egress", "vpc", "--json"];
+        if keep {
+            args.push("--keep");
+        }
+        let o = run_pinned(&w, &args);
+        let case = format!("terminate_fails={terminate_fails} keep={keep}");
+        assert_eq!(code(&o), 9, "{case}\n{}\n{}", stdout(&o), stderr(&o));
+        assert!(stdout(&o).trim().is_empty(), "no record for a failed smoke: {}", stdout(&o));
+        assert!(stderr(&o).contains("egress mismatch"), "{}", stderr(&o));
+        assert_eq!(w.state().vms.len(), 1);
+        none_alive(&w, &case);
+        let mismatch = events(&w, "vm_egress_mismatch");
+        assert_eq!(mismatch.len(), 1, "{case}: {}", w.audit());
+        assert_eq!(mismatch[0]["detail"]["terminated"], (!terminate_fails).to_string());
+        assert_eq!(terminated_by(&w), ["policy"], "{case}: exactly one termination, by the egress policy (the smoke's own when the gate's was refused), --keep or not");
+    }
+}
+
+#[test]
+fn cli_smoke_never_keeps_a_vm_whose_running_answer_fails_the_gate() {
+    // RunMicrovm echoes the connector, the RUNNING answer echoes nothing: the smoke's own assertion fails.
+    for terminate_fails in [false, true] {
+        let w = World::new("");
+        with_connector(&w);
+        w.update(|s| {
+            s.get_egress_echo = Some(vec![]);
+            if terminate_fails {
+                s.failures.push_back(fake_failure("throttled", "terminate", false));
+            }
+        });
+        let o = run_pinned(&w, &["vm", "smoke", "--egress", "vpc", "--keep", "--json"]);
+        assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("smoke: egress (none echoed) (vpc egress: NOT exactly"), "{}", stderr(&o));
+        none_alive(&w, "--keep never keeps a VM that failed the gate");
+        let mismatch = events(&w, "vm_egress_mismatch");
+        assert_eq!(mismatch.len(), 1, "{}", w.audit());
+        let d = &mismatch[0]["detail"];
+        assert_eq!((d["via"].as_str(), d["purpose"].as_str(), d["echoed"].as_str()), (Some("run"), Some("smoke"), Some("")));
+        assert_eq!(terminated_by(&w), ["policy"]);
+        let row = w.bridge().join("state/vms").join(format!("{}.toml", w.state().vms.keys().next().unwrap()));
+        let row: toml::Value = toml::from_str(&fs::read_to_string(row).unwrap()).unwrap();
+        assert_eq!((row["terminated_by"].as_str(), row["egress_gate"].as_str()), (Some("policy"), Some("mismatch")));
+    }
+}
+
+/// Two ambiguous RunMicrovm failures (the first creates the VM), a VM that echoes INTERNET_EGRESS, and
+/// one refused TerminateMicrovm: the adoption sweep finds the VM, its gate rejects it and cannot terminate it.
+fn swept_mismatch_world() -> World {
+    let w = World::new("");
+    with_connector(&w);
+    w.update(|s| {
+        s.failures.push_back(fake_failure("ambiguous", "run", true));
+        s.failures.push_back(fake_failure("ambiguous", "run", false));
+        s.failures.push_back(fake_failure("throttled", "terminate", false));
+        s.egress_echo = Some(vec![internet()]);
+    });
+    w
+}
+
+#[test]
+fn cli_smoke_terminates_a_swept_vm_its_gate_could_not() {
+    let w = swept_mismatch_world();
+    let o = run_pinned(&w, &["vm", "smoke", "--egress", "vpc"]);
+    assert_eq!(code(&o), 7, "the run's own failure (ambiguous) is reported: {}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(w.state().vms.len(), 1);
+    none_alive(&w, "smoke adopt(): a mismatch the gate could not terminate goes to the smoke's terminate");
+    let mismatch = events(&w, "vm_egress_mismatch");
+    assert_eq!(mismatch.len(), 1, "{}", w.audit());
+    let d = &mismatch[0]["detail"];
+    assert_eq!((d["via"].as_str(), d["purpose"].as_str(), d["terminated"].as_str()), (Some("sweep"), Some("smoke"), Some("false")));
+    assert_eq!(terminated_by(&w), ["policy"]);
+}
+
+#[test]
+fn cli_lab_probe_terminates_a_swept_vm_its_gate_could_not() {
+    let w = swept_mismatch_world();
+    let o = run_pinned(&w, &["lab", "run", "no-traffic-before-run"]);
+    assert_eq!(code(&o), 7, "{}\n{}", stdout(&o), stderr(&o));
+    assert_eq!(w.state().vms.len(), 1);
+    none_alive(&w, "lab guard_failure: a mismatch the gate could not terminate goes to the probe's terminate guard");
+    let mismatch = events(&w, "vm_egress_mismatch");
+    assert_eq!(mismatch.len(), 1, "{}", w.audit());
+    let d = &mismatch[0]["detail"];
+    assert_eq!((d["via"].as_str(), d["purpose"].as_str(), d["terminated"].as_str()), (Some("sweep"), Some("probe"), Some("false")));
+    assert_eq!(terminated_by(&w), ["probe"]);
+}
+
+#[test]
+fn cli_run_retries_the_terminate_of_a_vm_that_failed_the_gate() {
+    // Both TerminateMicrovm refused: exit 9 naming the VM; the row says mismatch, and `vm gc --yes` finishes it.
+    let w = World::new("");
+    with_connector(&w);
+    w.update(|s| {
+        s.egress_echo = Some(vec![internet()]);
+        s.failures.push_back(fake_failure("throttled", "terminate", false));
+        s.failures.push_back(fake_failure("throttled", "terminate", false));
+    });
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    let id = w.state().vms.keys().next().unwrap().clone();
+    assert!(stderr(&o).contains(&format!("{id} may still be running: ai-env vm terminate {id}")), "{}", stderr(&o));
+    assert!(stderr(&o).contains("failed again") && stderr(&o).contains("NOT confirmed terminated"), "{}", stderr(&o));
+    assert_eq!(w.state().vms[&id].state, VmState::Pending, "alive");
+    let g = run_pinned(&w, &["vm", "gc", "--yes"]);
+    assert_eq!(code(&g), 0, "{}\n{}", stdout(&g), stderr(&g));
+    none_alive(&w, "gc terminates a mismatch row");
+    assert_eq!(terminated_by(&w), ["policy"]);
+    // One refused: the run's second try terminates it; still exit 9, and nothing left to terminate by hand.
+    let w = World::new("");
+    with_connector(&w);
+    w.update(|s| {
+        s.egress_echo = Some(vec![internet()]);
+        s.failures.push_back(fake_failure("throttled", "terminate", false));
+    });
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    let id = w.state().vms.keys().next().unwrap().clone();
+    assert!(stderr(&o).contains(&format!("terminated {id} on the second try")) && stderr(&o).contains("; terminated"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("may still be running"), "{}", stderr(&o));
+    none_alive(&w, "the run's retry");
+    assert_eq!(terminated_by(&w), ["policy"]);
+}
+
+#[test]
+fn cli_gc_exits_9_when_a_vm_fails_the_egress_gate() {
+    let w = World::new("");
+    with_connector(&w);
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let id = json(&o)["id"].as_str().unwrap().to_string();
+    // As if ai-env had died between RunMicrovm and the gate, and the VM echoes internet egress.
+    let path = w.bridge().join("state/vms").join(format!("{id}.toml"));
+    let mut row: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(row["egress_gate"].as_str(), Some("passed"));
+    row["egress_gate"] = toml::Value::String("pending".into());
+    fs::write(&path, toml::to_string(&row).unwrap()).unwrap();
+    w.update(|s| s.egress_echo = Some(vec![internet()]));
+    let g = run_pinned(&w, &["vm", "gc", "--yes"]);
+    assert_eq!(code(&g), 9, "{}\n{}", stdout(&g), stderr(&g));
+    assert!(stderr(&g).contains("failed the egress gate") && stderr(&g).contains(&id), "{}", stderr(&g));
+    none_alive(&w, "gc");
+    assert_eq!(events(&w, "vm_egress_mismatch")[0]["detail"]["via"], "gc");
+}
+
+#[test]
+fn cli_run_vpc_warns_unless_the_connector_is_active() {
+    let warning = "RunMicrovm needs an ACTIVE connector; make connector-status";
+    let hint = "connector state unknown";
+    // No state/infra.toml: a hint to record it.
+    let w = World::new("max_concurrent = 10");
+    with_connector(&w);
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(hint) && stderr(&o).contains("make infra-status WRITE=1"), "{}", stderr(&o));
+    assert_eq!(stderr(&o).matches(hint).count(), 1, "one line: {}", stderr(&o));
+    // A state file without connector_state: the same hint.
+    write_connector_state(&w, None);
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert!(stderr(&o).contains(hint) && !stderr(&o).contains(warning), "{}", stderr(&o));
+    // PENDING: one warning naming the state; the run goes ahead (never a failure).
+    write_connector_state(&w, Some("PENDING"));
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let err = stderr(&o);
+    let lines: Vec<&str> = err.lines().filter(|l| l.contains(warning)).map(str::trim).collect();
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(lines[0].starts_with("ai-env: warning: the egress connector is PENDING"), "{}", lines[0]);
+    assert!(!stderr(&o).contains(hint));
+    // ACTIVE: silent.
+    write_connector_state(&w, Some("ACTIVE"));
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stderr(&o).contains(warning) && !stderr(&o).contains(hint), "{}", stderr(&o));
+    // The state of another connector (even PENDING) says nothing about this one: the hint.
+    let other = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-other";
+    let s = InfraState { stack: "dev".into(), connector_arn: Some(other.into()), connector_state: Some("PENDING".into()), ..InfraState::default() };
+    fs::write(w.bridge().join("state").join("infra.toml"), s.render().unwrap()).unwrap();
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(hint) && stderr(&o).contains(&format!("records the connector {other}")) && !stderr(&o).contains(warning), "{}", stderr(&o));
+    // An unreadable state file: the hint, naming why; never a failure.
+    fs::write(w.bridge().join("state").join("infra.toml"), "connector_state = [unclosed\n").unwrap();
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(hint) && stderr(&o).contains("infra.toml"), "{}", stderr(&o));
+    // internet egress never asks.
+    fs::remove_file(w.bridge().join("state").join("infra.toml")).unwrap();
+    let o = run_pinned(&w, &["vm", "run", "--egress", "internet"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stderr(&o).contains(warning) && !stderr(&o).contains(hint), "{}", stderr(&o));
+    assert_eq!(w.runs(), 7);
 }

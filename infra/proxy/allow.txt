@@ -1,0 +1,6 @@
+# ai-env egress base allowlist (S5): exact hosts, one per line, lowercase.
+# `ai-env egress allow <slug> <host>` adds per-workspace extras on top.
+api.anthropic.com
+platform.claude.com
+index.crates.io
+static.crates.io

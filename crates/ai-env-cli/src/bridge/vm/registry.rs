@@ -24,6 +24,13 @@ use std::path::PathBuf;
 /// Schema version written into every row's `v`.
 pub const VM_SCHEMA_V: u8 = 1;
 
+/// [`VmRow::egress_gate`] until the echo gate ran.
+pub const GATE_PENDING: &str = "pending";
+/// [`VmRow::egress_gate`] once the VM echoed exactly its required egress.
+pub const GATE_PASSED: &str = "passed";
+/// [`VmRow::egress_gate`] of a VM that echoed anything else (terminate it).
+pub const GATE_MISMATCH: &str = "mismatch";
+
 /// File-name prefix of a pending row.
 pub const PENDING_PREFIX: &str = "pending-";
 
@@ -112,6 +119,17 @@ pub struct VmRow {
     pub egress: String,
     /// The ingress connector ARNs as echoed (the platform default when none was sent).
     pub ingress: Vec<String>,
+    /// The egress connector ARNs (S5): as planned in a pending row (empty for
+    /// `internet`: nothing is sent), as echoed once the egress echo gate
+    /// passed. A `vpc` row without them (written before S5) fails the gate.
+    pub egress_connectors: Vec<String>,
+    /// The S5 egress echo gate's verdict on this VM: [`GATE_PENDING`] from
+    /// the pending row until the gate ran, [`GATE_PASSED`], or
+    /// [`GATE_MISMATCH`] (written before the terminate is tried). `None` in a
+    /// row written before S5. gc gates again every live id row that is not
+    /// [`GATE_PASSED`], so a VM whose terminate failed, or whose `ai-env`
+    /// died between RunMicrovm and the gate, cannot outlive the next gc.
+    pub egress_gate: Option<String>,
     /// Whether `SHELL_INGRESS` was requested (`vm run --shell`).
     pub shell: bool,
     pub execution_role: Option<String>,
@@ -128,7 +146,7 @@ pub struct VmRow {
     /// S6.
     pub spawns: Vec<toml::Value>,
     pub terminated_at: Option<u64>,
-    /// `operator` | `gc-expired` | `gc-orphan` | `smoke` | `test` | `probe` | `timeout` | `platform`.
+    /// `operator` | `gc-expired` | `gc-orphan` | `smoke` | `test` | `probe` | `timeout` | `platform` | `policy` (the S5 egress gate).
     pub terminated_by: Option<String>,
 }
 

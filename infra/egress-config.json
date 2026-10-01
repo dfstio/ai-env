@@ -1,0 +1,21 @@
+{
+  "vpcCidr": "10.42.0.0/16",
+  "proxySubnetCidr": "10.42.0.0/24",
+  "vmSubnetCidr": "10.42.1.0/24",
+  "azId": "euc1-az1",
+  "proxyIp": "10.42.0.10",
+  "proxyPort": 3128,
+  "instanceType": "t4g.nano",
+  "resolvers": ["1.1.1.1", "9.9.9.9"],
+  "dnsMode": "none",
+  "enableDnsQueryLog": false,
+  "logGroup": "/ai-env/egress/squid",
+  "logRetentionDays": 14,
+  "parameterPrefix": "/ai-env/proxy",
+  "connectorName": "ai-env-egress",
+  "proxyRoleName": "ai-env-egress-proxy",
+  "operatorRoleName": "ai-env-egress-operator",
+  "proxyInstanceProfileName": "ai-env-egress-proxy",
+  "vmSecurityGroupName": "ai-env-vm-egress",
+  "proxySecurityGroupName": "ai-env-proxy"
+}

@@ -11,7 +11,9 @@
 //! runtime key is unsealed, so a usage error never costs a Touch ID.
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::audit::{self, AuditRow};
+use crate::bridge::awscli;
 use crate::bridge::config::{BridgeConfig, CredentialsSource, Paths, REGION};
+use crate::bridge::egress::ExpectedEcho;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::lab::{vm_knobs, VmKnobs};
 use crate::bridge::probes;
@@ -24,7 +26,7 @@ use crate::errors::{CliError, Result};
 use crate::outln;
 use crate::store::Keystore;
 use crate::wire::time::{rfc3339_utc, unix_now};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// What every `vm`/`lab` command works from.
 pub struct Ctx {
@@ -35,12 +37,13 @@ pub struct Ctx {
 
 impl Ctx {
     /// `bridge.toml` must exist and pass the `vm` checks (`[vm]` ranges,
-    /// `[aws].credentials`); the lab knobs are read and, when active,
+    /// the S5 egress keys, `[aws].credentials`); the lab knobs are read and, when active,
     /// announced; the CLI log is opened (best effort).
     pub fn load() -> Result<Ctx> {
         let paths = Paths::resolve()?;
         let cfg = BridgeConfig::load(&paths)?.ok_or_else(|| CliError::Msg(format!("{} not found: run `make infra-status WRITE=1` (it writes [aws])", paths.config.display())))?;
         cfg.vm.validate()?;
+        cfg.aws.validate_egress()?;
         CredentialsSource::parse(&cfg.aws.credentials)?;
         let knobs = vm_knobs();
         announce(&knobs);
@@ -110,19 +113,21 @@ pub async fn backend(store: &Keystore, ctx: &Ctx) -> Result<Backend> {
 macro_rules! with_backend {
     ($b:expr, |$api:ident, $ep:ident| $body:expr) => {
         match $b {
-            Backend::Sdk(a, e) => {
+            $crate::bridge::vm::cmd::Backend::Sdk(a, e) => {
                 let ($api, $ep) = (a, e);
                 $body
             }
-            Backend::Fake(f) => {
+            $crate::bridge::vm::cmd::Backend::Fake(f) => {
                 let ($api, $ep) = (f, f);
                 $body
             }
         }
     };
 }
+pub(crate) use with_backend;
 
-fn runtime() -> Result<tokio::runtime::Runtime> {
+/// The current-thread runtime every `vm`/`lab`/`egress check` command runs on.
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| CliError::Msg(format!("cannot start the async runtime: {e}")))
 }
 
@@ -237,10 +242,7 @@ impl Pre {
                     idle_s: *idle,
                     suspended_s: *suspended,
                     no_auto_resume: *no_auto_resume,
-                    egress: egress.map(|e| match e {
-                        EgressArg::Internet => run::Egress::Internet,
-                        EgressArg::Vpc => run::Egress::Vpc,
-                    }),
+                    egress: egress.map(EgressArg::egress),
                     workspace: workspace.clone(),
                     new: *new,
                     label: label.clone(),
@@ -258,8 +260,8 @@ impl Pre {
                 }
                 Pre::Run(Box::new(run::RunPlan::from_cfg(&ctx.cfg, &flags)?))
             }
-            VmCmd::Smoke { max_duration, no_execution_role, .. } => {
-                let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &smoke_flags(*max_duration, *no_execution_role))?;
+            VmCmd::Smoke { max_duration, no_execution_role, egress, .. } => {
+                let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &smoke_flags(*max_duration, *no_execution_role, egress.map(EgressArg::egress)))?;
                 // The smoke's own client token: its failure paths terminate exactly this run's VM.
                 plan.client_token = Some(uuid::Uuid::now_v7().to_string());
                 Pre::Run(Box::new(plan))
@@ -297,8 +299,10 @@ impl Pre {
     }
 }
 
-fn smoke_flags(max_duration: u32, no_execution_role: bool) -> run::RunFlags {
-    run::RunFlags { max_duration_s: Some(max_duration), label: Some("smoke".into()), no_execution_role, wait: true, purpose: "smoke", imply_internet: true, ..run::RunFlags::default() }
+/// `vm smoke`: `--egress` as given; without it a configured connector means
+/// `vpc`, else the (audited) internet egress.
+fn smoke_flags(max_duration: u32, no_execution_role: bool, egress: Option<run::Egress>) -> run::RunFlags {
+    run::RunFlags { max_duration_s: Some(max_duration), label: Some("smoke".into()), no_execution_role, egress, wait: true, purpose: "smoke", imply_internet: true, ..run::RunFlags::default() }
 }
 
 async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, cmd: VmCmd, pre: Pre) -> Result<()> {
@@ -387,9 +391,73 @@ fn started_line(row: &VmRow, vm: &VmInfo, run_ms: u64, running_ms: u64) -> Strin
     )
 }
 
+/// `vm run --egress vpc` (S5): RunMicrovm needs an ACTIVE connector. One
+/// line from `state/infra.toml` (the live state `ai-env infra status`
+/// records), never a failure: `Some((true, warning))` naming any state but
+/// ACTIVE, `None` for ACTIVE, `Some((false, hint))` when no state is
+/// recorded for the configured connector (no file, no `connector_state`, the
+/// state of another connector, an unreadable file).
+fn connector_state_line(paths: &Paths, configured: Option<&str>) -> Option<(bool, String)> {
+    let hint = |why: String| Some((false, format!("connector state unknown ({why}): run `make infra-status WRITE=1` to record it (RunMicrovm needs an ACTIVE connector)")));
+    let state = match crate::bridge::infra::read_infra_state(paths) {
+        Ok(Some(s)) => s,
+        Ok(None) => return hint("no state/infra.toml".into()),
+        Err(e) => return hint(e.to_string()),
+    };
+    let norm = crate::bridge::egress::normalize_connector;
+    if let (Some(recorded), Some(configured)) = (state.connector_arn.as_deref(), configured) {
+        if norm(recorded) != norm(configured) {
+            return hint(format!("state/infra.toml records the connector {recorded}, not [aws].egress_connector_arn"));
+        }
+    }
+    match state.connector_state.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => hint("state/infra.toml has no connector_state".into()),
+        Some(s) if s.eq_ignore_ascii_case("ACTIVE") => None,
+        Some(s) => Some((true, format!("the egress connector is {s} (state/infra.toml): RunMicrovm needs an ACTIVE connector; make connector-status"))),
+    }
+}
+
+/// `vm run`: a VM the S5 egress gate rejected but could not terminate gets
+/// one more TerminateMicrovm (by `policy`; TERMINATED waited for, best
+/// effort) before the command exits 9. Accepted, the failure says
+/// terminated and names no VM to terminate; refused again, it is left as it
+/// is (the row says `mismatch`: `ai-env vm gc --yes` terminates it).
+async fn retry_gate_terminate<A: MicrovmApi>(ctx: &Ctx, api: &A, mut f: run::SelectFailure) -> run::SelectFailure {
+    let alive = match &f.error {
+        BridgeError::EgressMismatch(m) if !m.terminated => (**m).clone(),
+        _ => return f,
+    };
+    match run::request_terminate(api, &ctx.paths, &alive.id, "policy").await {
+        Ok(recorded) => {
+            if let Err(e) = recorded {
+                eprintln!("ai-env: warning: vm row {}: terminated, but the row was not updated: {e}", alive.id);
+            }
+            if let Err(e) = run::wait_for_state(api, &alive.id, &VmState::Terminated, ctx.poll(run::Poll::SETTLE)).await {
+                eprintln!("ai-env: warning: {} not seen TERMINATED: {e}", alive.id);
+            }
+            eprintln!("ai-env: terminated {} on the second try", alive.id);
+            f.error = BridgeError::egress_mismatch(&alive.id, alive.expected, alive.echoed, true);
+            f.started = None;
+        }
+        Err(e) => eprintln!("ai-env: warning: terminating {} failed again: {e} (its row says egress mismatch: `ai-env vm gc --yes` terminates it)", alive.id),
+    }
+    f
+}
+
 async fn run_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: bool) -> Result<()> {
     warn_plan(plan);
-    let selected = run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)).await.map_err(|f| {
+    if plan.egress == run::Egress::Vpc {
+        match connector_state_line(&ctx.paths, plan.egress_connectors.first().map(String::as_str)) {
+            Some((true, w)) => eprintln!("ai-env: warning: {w}"),
+            Some((false, h)) => eprintln!("ai-env: {h}"),
+            None => {}
+        }
+    }
+    let selected = match run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)).await {
+        Ok(s) => Ok(s),
+        Err(f) => Err(retry_gate_terminate(ctx, api, f).await),
+    };
+    let selected = selected.map_err(|f| {
         let hint = match (&f.started, &f.kept_pending) {
             (Some(id), _) => format!("{id} may still be running: ai-env vm terminate {id}"),
             (None, Some(p)) => format!("the pending row {} is kept: ai-env vm gc", p.stem()),
@@ -642,7 +710,7 @@ async fn gc_cmd<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, op
             .collect();
         json_out(&serde_json::json!({
             "backend": ctx.backend_name(), "yes": opts.yes, "items": items, "terminated": report.terminated, "adopted": report.adopted,
-            "removed": report.removed, "marked": report.marked, "errors": report.errors,
+            "removed": report.removed, "marked": report.marked, "errors": report.errors, "egress_mismatches": report.mismatches,
         }))?;
     } else {
         for i in &report.items {
@@ -669,6 +737,10 @@ async fn gc_cmd<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, op
     } else {
         for e in &report.errors {
             eprintln!("ai-env: vm gc: {e}");
+        }
+        if report.mismatches > 0 {
+            // A VM that failed the S5 egress gate is a policy finding (exit 9), whatever else failed.
+            return Err(CliError::Policy(format!("vm gc: {} VM(s) failed the egress gate; {} action(s) failed", report.mismatches, report.errors.len())));
         }
         Err(CliError::Aws(format!("vm gc: {} action(s) failed", report.errors.len())))
     }
@@ -717,7 +789,7 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
     let flow = smoke_flow(ctx, api, ep, plan, &steps);
     let outcome = tokio::select! {
         r = flow => r,
-        _ = tokio::signal::ctrl_c() => Err(SmokeFail { id: None, kept_pending: None, error: CliError::Cancelled }),
+        _ = tokio::signal::ctrl_c() => Err(SmokeFail { id: None, kept_pending: None, gate: false, error: CliError::Cancelled }),
     };
     // The rows this smoke may have written carry its own client token, never another run's.
     let own_token = plan.client_token.as_deref().unwrap_or_default();
@@ -726,13 +798,18 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
         Err(fail) => {
             // Terminate whatever this smoke started (plan S4 D26), then report the failure.
             let id = match (fail.id.clone(), &fail.kept_pending) {
-                (Some(id), _) => Some(id),
+                (Some(id), _) => Some((id, fail.gate)),
                 (None, Some(pending)) => adopt(ctx, api, ep, pending, t0_unix).await,
                 (None, None) => sweep_own(ctx, api, ep, own_token, t0_unix).await,
             };
             match id {
-                Some(id) if keep => eprintln!("smoke: --keep: {id} left running (ai-env vm terminate {id})"),
-                Some(id) => match run::terminate_and_record(api, &ctx.paths, &id, "smoke", Some(ctx.poll(run::Poll::SETTLE))).await {
+                // A VM that failed the S5 egress gate is never kept, --keep or not.
+                Some((id, true)) => match run::terminate_and_record(api, &ctx.paths, &id, "policy", Some(ctx.poll(run::Poll::SETTLE))).await {
+                    Ok(_) => eprintln!("smoke: terminated {id}: it failed the egress gate{}", if keep { " (--keep never keeps such a VM)" } else { "" }),
+                    Err(e) => eprintln!("smoke: could not terminate {id}, which failed the egress gate: {e} — run: ai-env vm terminate {id} (or ai-env vm gc --yes)"),
+                },
+                Some((id, false)) if keep => eprintln!("smoke: --keep: {id} left running (ai-env vm terminate {id})"),
+                Some((id, false)) => match run::terminate_and_record(api, &ctx.paths, &id, "smoke", Some(ctx.poll(run::Poll::SETTLE))).await {
                     Ok(_) => eprintln!("smoke: terminated {id} after the failure"),
                     Err(e) => eprintln!("smoke: could not terminate {id}: {e} — run: ai-env vm terminate {id}"),
                 },
@@ -785,31 +862,48 @@ struct SmokeFail {
     id: Option<String>,
     /// The pending row kept after two ambiguous RunMicrovm failures (adopt, then terminate).
     kept_pending: Option<Box<VmRow>>,
+    /// The VM failed the S5 egress gate: terminated (`policy`) whatever `--keep` says.
+    gate: bool,
     error: CliError,
 }
 
 impl From<BridgeError> for SmokeFail {
     fn from(e: BridgeError) -> Self {
-        SmokeFail { id: None, kept_pending: None, error: e.into() }
+        SmokeFail { id: None, kept_pending: None, gate: false, error: e.into() }
     }
 }
 
 fn fail_with(id: &str) -> impl FnOnce(BridgeError) -> SmokeFail + '_ {
-    move |e| SmokeFail { id: Some(id.to_string()), kept_pending: None, error: e.into() }
+    move |e| SmokeFail { id: Some(id.to_string()), kept_pending: None, gate: false, error: e.into() }
 }
 
 /// run → RUNNING → /health, with every assertion of T4.1; returns the VM id
-/// and the timing record (termination is the caller's).
+/// and the timing record (termination is the caller's). The RUNNING answer's
+/// egress is asserted first, before any request reaches the VM: anything but
+/// exactly what the egress requires goes through the gate's reject path
+/// (audit `vm_egress_mismatch` via `run`, terminated by `policy`, exit 9).
 async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, steps: &Steps) -> std::result::Result<(String, serde_json::Map<String, serde_json::Value>), SmokeFail> {
-    let selected = run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING))
-        .await
-        .map_err(|f| SmokeFail { id: f.started, kept_pending: f.kept_pending, error: f.error.into() })?;
+    let selected = run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)).await.map_err(|f| {
+        let gate = matches!(f.error, BridgeError::EgressMismatch(_));
+        SmokeFail { id: f.started, kept_pending: f.kept_pending, gate, error: f.error.into() }
+    })?;
     let run::Selected::Started { row, vm, run_ms, running_ms } = selected else {
-        return Err(SmokeFail { id: None, kept_pending: None, error: CliError::Msg("smoke reused a VM (internal)".into()) });
+        return Err(SmokeFail { id: None, kept_pending: None, gate: false, error: CliError::Msg("smoke reused a VM (internal)".into()) });
     };
     let id = vm.id.clone();
-    let say = |l: String| steps.say(&l).map_err(|e| SmokeFail { id: Some(id.clone()), kept_pending: None, error: e });
+    let say = |l: String| steps.say(&l).map_err(|e| SmokeFail { id: Some(id.clone()), kept_pending: None, gate: false, error: e });
     say(format!("run_microvm → {id} ({} ms); RUNNING after {}", run_ms, ms_s(running_ms)))?;
+    // The S5 echo gate passed at RunMicrovm; the RUNNING answer must still echo exactly the same.
+    let expected = ExpectedEcho::for_plan(plan.egress, &plan.egress_connectors);
+    let egress_expected: Vec<String> = expected.as_ref().map(|e| e.connectors().to_vec()).unwrap_or_default();
+    let egress_ok = expected.as_ref().is_some_and(|e| e.matches(&vm.egress, run::echo_alias(&ctx.paths, plan.egress, &plan.egress_connectors).as_ref()));
+    let shown = |l: &[String]| if l.is_empty() { "(none echoed)".to_string() } else { l.join(", ") };
+    say(format!("egress {} ({} egress: {})", shown(&vm.egress), plan.egress, if egress_ok { "exactly as required".to_string() } else { format!("NOT exactly {}", shown(&egress_expected)) }))?;
+    if !egress_ok {
+        let e = run::reject_echo(api, &ctx.paths, &id, expected.as_ref(), &vm.egress, "run", plan.purpose).await;
+        let alive = matches!(&e, BridgeError::EgressMismatch(m) if !m.terminated);
+        return Err(SmokeFail { id: alive.then(|| id.clone()), kept_pending: None, gate: true, error: e.into() });
+    }
     let mut problems = Vec::new();
     if vm.max_duration_s != plan.max_duration_s as i32 {
         problems.push(format!("max duration echoed {} (sent {})", vm.max_duration_s, plan.max_duration_s));
@@ -856,7 +950,7 @@ async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E
     }
     say(format!("ingress {}", if vm.ingress.is_empty() { "(none echoed)".to_string() } else { vm.ingress.join(", ") }))?;
     if !problems.is_empty() {
-        return Err(SmokeFail { id: Some(id.clone()), kept_pending: None, error: CliError::Msg(format!("smoke assertions failed: {}", problems.join("; "))) });
+        return Err(SmokeFail { id: Some(id.clone()), kept_pending: None, gate: false, error: CliError::Msg(format!("smoke assertions failed: {}", problems.join("; "))) });
     }
     let mut rec = serde_json::Map::new();
     rec.insert("backend".into(), ctx.backend_name().into());
@@ -870,6 +964,8 @@ async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E
     rec.insert("idle".into(), serde_json::to_value(vm.idle).unwrap_or_default());
     rec.insert("ingress".into(), vm.ingress.clone().into());
     rec.insert("egress".into(), vm.egress.clone().into());
+    rec.insert("egress_expected".into(), egress_expected.into());
+    rec.insert("egress_ok".into(), egress_ok.into());
     rec.insert("execution_role".into(), vm.execution_role_arn.is_some().into());
     rec.insert("run_call_ms".into(), run_ms.into());
     rec.insert("run_to_running_ms".into(), running_ms.into());
@@ -879,14 +975,25 @@ async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E
     Ok((id, rec))
 }
 
-/// The VM a kept pending row stands for, by the adoption sweep: `Adopted`
-/// is terminated by the caller; `NoMatch` and `Unresolved` leave the row for
-/// `ai-env vm gc` and never terminate anything (the VMs may be another run's).
-async fn adopt<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pending: &VmRow, since_unix: u64) -> Option<String> {
-    match run::adopt_after_ambiguous(api, ep, &ctx.paths, pending, since_unix, ctx.poll(run::Poll::RUNNING)).await {
+/// The VM a kept pending row stands for, by the adoption sweep, and whether
+/// it failed the S5 egress gate: `Adopted` is terminated by the caller, and
+/// so is a VM the sweep's egress gate rejected but could not terminate (by
+/// `policy`, `--keep` or not); `NoMatch` and `Unresolved` leave the row for
+/// `ai-env vm gc` and never terminate anything (the VMs may be another
+/// run's).
+async fn adopt<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pending: &VmRow, since_unix: u64) -> Option<(String, bool)> {
+    match run::adopt_after_ambiguous_for(api, ep, &ctx.paths, pending, since_unix, ctx.poll(run::Poll::RUNNING), "smoke").await {
         Ok(run::Adoption::Adopted(id)) => {
             eprintln!("smoke: the ambiguous RunMicrovm started {id} (adopted)");
-            Some(id)
+            Some((id, false))
+        }
+        Err(BridgeError::EgressMismatch(m)) if !m.terminated => {
+            eprintln!("smoke: the ambiguous RunMicrovm started {}, which failed the egress gate and is not confirmed terminated", m.id);
+            Some((m.id.clone(), true))
+        }
+        Err(e @ BridgeError::EgressMismatch(_)) => {
+            eprintln!("smoke: the ambiguous RunMicrovm's VM failed the egress gate: {e}");
+            None
         }
         Ok(run::Adoption::NoMatch) => {
             eprintln!("smoke: no VM of this run is visible; the pending row {} is kept for `ai-env vm gc`", pending.stem());
@@ -905,17 +1012,18 @@ async fn adopt<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pen
 
 /// After a failure without a VM id or kept row, and after Ctrl-C: the VM of
 /// THIS smoke, found only through the rows carrying its own client token
-/// (an id row → that VM; a pending row → the adoption sweep). Another run's
-/// rows never match, and a failure before the pending row was written
-/// (MaxConcurrent, a busy lock) finds nothing.
-async fn sweep_own<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, client_token: &str, since_unix: u64) -> Option<String> {
+/// (an id row → that VM, failed the egress gate when its row says
+/// `mismatch`; a pending row → the adoption sweep). Another run's rows never
+/// match, and a failure before the pending row was written (MaxConcurrent, a
+/// busy lock) finds nothing.
+async fn sweep_own<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, client_token: &str, since_unix: u64) -> Option<(String, bool)> {
     if client_token.is_empty() {
         return None;
     }
     let rows = registry::list_rows(&ctx.paths).ok()?;
     let mine: Vec<&VmRow> = rows.iter().filter(|r| r.client_token == client_token).collect();
     if let Some(r) = mine.iter().find(|r| !r.is_pending_row() && r.status != RowStatus::Terminated) {
-        return Some(r.id.clone());
+        return Some((r.id.clone(), r.egress_gate.as_deref() == Some(registry::GATE_MISMATCH)));
     }
     match mine.iter().find(|r| r.is_pending_row()) {
         Some(p) => adopt(ctx, api, ep, p, since_unix).await,
@@ -954,7 +1062,7 @@ fn with_note(derived: String, user: Option<&String>) -> Option<String> {
 
 fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::path::Path>, manual: Option<&str>, note: Option<String>) -> Result<()> {
     let spec = probes::spec(name).ok_or_else(|| CliError::Usage(format!("unknown probe {name:?} (ai-env lab list)")))?;
-    if spec.stage != "S4" {
+    if !matches!(spec.stage, "S4" | "S5") {
         return Err(CliError::Usage(format!("{name} is a {} probe, recorded by: {}", spec.stage, spec.recorded_by)));
     }
     let paths = Paths::resolve()?;
@@ -964,8 +1072,21 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     if log.is_some() && !takes_log {
         return Err(CliError::Usage(format!("{name} does not read a log (--log is for hooks-port, hooks-source-ip, runtime-env, disk-budget, snapshot-uniqueness and cloudtrail-payload)")));
     }
-    if id.is_some() && name != "cloudtrail-payload" {
-        return Err(CliError::Usage(format!("{name} takes no VM id (only cloudtrail-payload does)")));
+    if id.is_some() && !matches!(name, "cloudtrail-payload" | "connector-pending") {
+        return Err(CliError::Usage(format!("{name} takes no positional argument (cloudtrail-payload takes a VM id, connector-pending a connector ARN)")));
+    }
+    if name == "connector-pending" && manual.is_none() {
+        let Some(arn) = id else {
+            return Err(CliError::Usage("connector-pending needs the ARN of a connector that is not ACTIVE yet (make connector-probe CONFIRM=create-probe-connector creates one and runs this)".into()));
+        };
+        if !crate::bridge::config::is_connector_arn(arn) {
+            return Err(CliError::Usage(format!("connector-pending: {arn:?} is not arn:aws:lambda:{REGION}:<account>:network-connector:<name>[:<version>]")));
+        }
+    }
+    if manual.is_some() && name == "dns-path" {
+        // The credential gate trusts the newest dns-path row: only the live probe writes one
+        // ([egress].accept_platform_dns is the recorded acceptance of a platform resolver).
+        return Err(CliError::Usage("dns-path is recorded only by the live probe (accept a platform resolver with [egress].accept_platform_dns = true)".into()));
     }
     if let Some(v) = manual {
         if v.trim().is_empty() || v.len() > 200 || v.chars().any(char::is_control) {
@@ -1002,7 +1123,7 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     let rt = runtime()?;
     let outcome = rt.block_on(async {
         let b = backend(store, &ctx).await?;
-        with_backend!(&b, |api, ep| lab::run_probe(&ctx, api, ep, name).await.map_err(CliError::from))
+        with_backend!(&b, |api, ep| lab::run_probe(&ctx, api, ep, name, id).await.map_err(CliError::from))
     })?;
     let mut row = probes::stamped(&ctx.paths, spec, &outcome.verdict, with_note(outcome.note, note.as_ref()));
     if outcome.claude.is_some() {
@@ -1031,24 +1152,8 @@ fn snapshot_log_pass(paths: &Paths, spec: &probes::ProbeSpec, text: &str, src: &
     probes::record(paths, &probes::stamped(paths, spec, &verdict, with_note(format!("ids={} boot_ids {same} across snapshot clones: {pairs} ({src})", ids.join(",")), note)))
 }
 
-/// The eu-central-1 endpoints of the two services the probe reads, passed on
-/// every call: the flag overrides `AWS_ENDPOINT_URL[_<SERVICE>]` and a
-/// profile's `endpoint_url`, so a stub endpoint cannot answer "no trail" (the
-/// SDK pins its control plane the same way).
-const CLOUDTRAIL_URL: &str = "https://cloudtrail.eu-central-1.amazonaws.com";
-const LOGS_URL: &str = "https://logs.eu-central-1.amazonaws.com";
 /// A bound on `list-channels` pages (the CLI does not paginate that call).
 const MAX_CHANNEL_PAGES: usize = 50;
-
-/// `aws <service> <op> … --region eu-central-1 --endpoint-url … --output json`, parsed.
-fn aws_json(service: &str, endpoint: &str, args: &[&str]) -> std::result::Result<serde_json::Value, String> {
-    let mut argv = vec![service];
-    argv.extend_from_slice(args);
-    argv.extend_from_slice(&["--region", REGION, "--endpoint-url", endpoint, "--output", "json"]);
-    let what = format!("aws {service} {}", args[0]);
-    let out = crate::bridge::doctor::run_capture("aws", &argv, Duration::from_secs(30)).map_err(|e| format!("{what}: {e}"))?;
-    serde_json::from_str(&out).map_err(|e| format!("{what}: {e}"))
-}
 
 /// Where RunMicrovm records of this account may be kept.
 enum Keeper {
@@ -1078,8 +1183,8 @@ fn list_channel_arns() -> std::result::Result<Vec<String>, String> {
     let (mut arns, mut seen, mut token) = (Vec::new(), std::collections::BTreeSet::new(), None::<String>);
     for _ in 0..MAX_CHANNEL_PAGES {
         let page = match &token {
-            Some(t) => aws_json("cloudtrail", CLOUDTRAIL_URL, &["list-channels", "--next-token", t])?,
-            None => aws_json("cloudtrail", CLOUDTRAIL_URL, &["list-channels"])?,
+            Some(t) => awscli::aws_json("cloudtrail", &["list-channels", "--next-token", t])?,
+            None => awscli::aws_json("cloudtrail", &["list-channels"])?,
         };
         for c in page.get("Channels").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
             let arn = c.get("ChannelArn").and_then(|a| a.as_str()).ok_or_else(|| "aws cloudtrail list-channels: a channel without ChannelArn".to_string())?;
@@ -1096,7 +1201,7 @@ fn list_channel_arns() -> std::result::Result<Vec<String>, String> {
 
 fn microvm_data_event_coverage() -> std::result::Result<DataEventCoverage, String> {
     let mut cov = DataEventCoverage { trails: 0, channels: 0, stores_seen: Vec::new(), keepers: Vec::new(), unreadable: Vec::new() };
-    let trails = aws_json("cloudtrail", CLOUDTRAIL_URL, &["describe-trails"])?;
+    let trails = awscli::aws_json("cloudtrail", &["describe-trails"])?;
     for t in trails.get("trailList").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default() {
         let Some(arn) = t.get("TrailARN").and_then(|a| a.as_str()) else {
             cov.unreadable.push("a trail without TrailARN".into());
@@ -1104,7 +1209,7 @@ fn microvm_data_event_coverage() -> std::result::Result<DataEventCoverage, Strin
         };
         cov.trails += 1;
         let s = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        match aws_json("cloudtrail", CLOUDTRAIL_URL, &["get-event-selectors", "--trail-name", arn]) {
+        match awscli::aws_json("cloudtrail", &["get-event-selectors", "--trail-name", arn]) {
             Ok(doc) if probes::selectors_log_microvm_data(&doc) => {
                 let log_group_arn = t.get("CloudWatchLogsLogGroupArn").and_then(|v| v.as_str()).map(str::to_string);
                 let log_group = log_group_arn.as_deref().and_then(probes::log_group_from_arn);
@@ -1117,7 +1222,7 @@ fn microvm_data_event_coverage() -> std::result::Result<DataEventCoverage, Strin
     }
     for arn in list_channel_arns()? {
         cov.channels += 1;
-        match aws_json("cloudtrail", CLOUDTRAIL_URL, &["get-channel", "--channel", &arn]) {
+        match awscli::aws_json("cloudtrail", &["get-channel", "--channel", &arn]) {
             Ok(doc) => {
                 let view = probes::channel_cover(&doc);
                 match view.cover {
@@ -1145,7 +1250,7 @@ fn cloudtrail_log_groups() -> std::result::Result<Vec<(String, String)>, String>
         if let Some(c) = class {
             args.extend(["--log-group-class", c]);
         }
-        let doc = aws_json("logs", LOGS_URL, &args)?;
+        let doc = awscli::aws_json("logs", &args)?;
         Ok(doc.get("logGroups").and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default().iter().filter_map(|g| g.get("logGroupName").and_then(|v| v.as_str()).map(str::to_string)).collect())
     };
     let mut out: Vec<(String, String)> = Vec::new();
@@ -1178,7 +1283,8 @@ fn s3_day(row: &VmRow) -> String {
 /// a hit), then the probe over that file. Group names were checked to be shell-safe; the id is `[A-Za-z0-9-]`.
 fn filter_command(group: &str, id: &str, n: usize, start_ms: u64) -> String {
     format!(
-        "aws logs filter-log-events --region {REGION} --endpoint-url {LOGS_URL} --log-group-name '{group}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json"
+        "aws logs filter-log-events --region {REGION} --endpoint-url {} --log-group-name '{group}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json",
+        awscli::LOGS_URL
     )
 }
 

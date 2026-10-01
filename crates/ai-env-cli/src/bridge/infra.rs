@@ -1,13 +1,16 @@
 //! `ai-env infra status | base-image | versions-diff` (S3 step 11, plan D24,
 //! D29 and §8): the Mac side of the Pulumi stack.
 //!
-//! `status` turns `pulumi stack output --json` into the four `[aws]` keys of
+//! `status` turns `pulumi stack output --json` into the six `[aws]` keys of
 //! `bridge.toml` (`region`, `image_arn`, `execution_role_arn`,
-//! `budget_name`) and into `state/infra.toml` (every output, for doctor,
-//! with the image state, active and failed versions overlaid from one
-//! read-only `get-microvm-image` and their source recorded: the outputs only
-//! move on a successful `pulumi up`). A stack without outputs yet is named
-//! as such, with what to run. The
+//! `egress_connector_arn`, `proxy_private_ip`, `budget_name`) and into
+//! `state/infra.toml` (every output, for doctor, with the image state,
+//! active and failed versions overlaid from one read-only
+//! `get-microvm-image` and their source recorded: the outputs only move on a
+//! successful `pulumi up`; with S5's `connectorArn`, the connector's Arn, Id
+//! and state from one read-only `lambda-core get-network-connector` as the
+//! operator, their source recorded the same way). A stack without outputs
+//! yet is named as such, with what to run. The
 //! operator's `bridge.toml` carries hand-written comments and other tables,
 //! so the edit is a textual splice of the `[aws]` table only
 //! ([`splice_toml_table`]): values are replaced in place, missing keys are
@@ -17,8 +20,10 @@
 //! splice cannot edit safely (a dotted `aws.x = …`, an inline `aws = {…}`,
 //! `[[aws]]`, `[aws.sub]`, two `[aws]` headers) are refused, never guessed
 //! at. `image_version` and `credentials` are never touched, a region other
-//! than the pinned one is refused before anything is written, and the stack
-//! is read without `--show-secrets` (no passphrase needed, none printed).
+//! than the pinned one, a `connectorArn` that is not a customer network
+//! connector in it and a `proxyPrivateIp` outside RFC 1918 are refused
+//! before anything is read live or written, and the stack is read without
+//! `--show-secrets` (no passphrase needed, none printed).
 //!
 //! `base-image` is the preflight for the pinned managed base image version
 //! (AVAILABLE or exit 1); `versions-diff` compares two
@@ -26,7 +31,8 @@
 //! the `image-version-delete` probe: whether the update handler, which holds
 //! `lambda:DeleteMicrovmImageVersion`, removed any earlier version.
 use crate::bridge::audit::{self, AuditRow};
-use crate::bridge::config::{AwsCfg, BridgeConfig, Paths, REGION};
+use crate::bridge::awscli::{arn_account, aws_json};
+use crate::bridge::config::{is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, Paths, REGION};
 use crate::bridge::doctor::run_capture_cmd;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::logging::open_log_file;
@@ -118,6 +124,36 @@ pub struct StackOutputs {
     pub claude_version: Option<String>,
     #[serde(default, deserialize_with = "scalar")]
     pub shim_version: Option<String>,
+    // S5 egress (infra/egress.ts).
+    #[serde(default, deserialize_with = "scalar")]
+    pub connector_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub connector_name: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_private_ip: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_instance_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub egress_vpc_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub vm_subnet_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub vm_egress_security_group_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_security_group_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub operator_role_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub egress_log_group: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub dns_mode: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub parameter_prefix: Option<String>,
+    /// SHA-256 of the exact `squid.conf` and `allow` parameter values the stack rendered (S5): `egress status` compares the live parameters with them.
+    #[serde(default, deserialize_with = "scalar")]
+    pub squid_conf_sha256: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub allow_sha256: Option<String>,
 }
 
 /// What to do when the outputs lack the two keys every successful deploy
@@ -157,18 +193,41 @@ pub fn check_region(o: &StackOutputs) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The S5 pins, applied with [`check_region`] before anything is read live
+/// or written: a `connectorArn` must be a customer network connector in
+/// [`REGION`] ([`is_connector_arn`]: never a managed `aws` one, never another
+/// region) of the stack's own account (that of `imageArn`, and `accountId`
+/// when exported), a `proxyPrivateIp` an RFC 1918 address ([`is_rfc1918`]).
+/// Both land in `[aws]`: `ai-env vm` passes the first to `RunMicrovm`, and
+/// the VMs' proxy environment names the second. Absent outputs pass (an S3
+/// stack).
+pub fn check_egress(o: &StackOutputs) -> std::result::Result<(), String> {
+    if let Some(arn) = o.connector_arn.as_deref() {
+        if !is_connector_arn(arn) {
+            return Err(format!("stack output connectorArn {arn:?} is not a network connector of an account in {REGION} (arn:aws:lambda:{REGION}:<12-digit account>:network-connector:<name>); nothing written"));
+        }
+        let account = arn_account(arn).unwrap_or_default();
+        let stack_accounts = [("imageArn", arn_account(&o.image_arn)), ("accountId", o.account_id.as_deref())];
+        if let Some((key, other)) = stack_accounts.into_iter().filter_map(|(k, a)| a.map(|a| (k, a))).find(|(_, a)| *a != account) {
+            return Err(format!("stack output connectorArn {arn:?} is in account {account}, but the stack's {key} is in account {other}; nothing written"));
+        }
+    }
+    if let Some(ip) = o.proxy_private_ip.as_deref().filter(|ip| !is_rfc1918(ip)) {
+        return Err(format!("stack output proxyPrivateIp {ip:?} is not an RFC 1918 IPv4 address (10/8, 172.16/12, 192.168/16); nothing written"));
+    }
+    Ok(())
+}
+
 /// The `[aws]` entries the outputs supply, in the order they are written
-/// (§8): `region`, `image_arn`, then `execution_role_arn` and `budget_name`
-/// when present. `image_version` and `credentials` never appear.
+/// (§8): `region`, `image_arn`, then `execution_role_arn`,
+/// `egress_connector_arn` (`connectorArn`), `proxy_private_ip`
+/// (`proxyPrivateIp`) and `budget_name` when present. `image_version` and
+/// `credentials` never appear.
 #[must_use]
 pub fn aws_entries(o: &StackOutputs) -> Vec<(&'static str, String)> {
     let mut out = vec![("region", o.region.clone()), ("image_arn", o.image_arn.clone())];
-    if let Some(v) = &o.execution_role_arn {
-        out.push(("execution_role_arn", v.clone()));
-    }
-    if let Some(v) = &o.budget_name {
-        out.push(("budget_name", v.clone()));
-    }
+    let optional = [("execution_role_arn", &o.execution_role_arn), ("egress_connector_arn", &o.connector_arn), ("proxy_private_ip", &o.proxy_private_ip), ("budget_name", &o.budget_name)];
+    out.extend(optional.into_iter().filter_map(|(k, v)| v.clone().map(|v| (k, v))));
     out
 }
 
@@ -209,9 +268,9 @@ fn read_live_image(arn: &str) -> std::result::Result<LiveImage, String> {
     run_capture_cmd(live_image_cmd(arn), None, CALL_TIMEOUT).and_then(|json| parse_live_image(&json))
 }
 
-/// The four `[aws]` keys `status` may write (the ones the outputs can
-/// omit are listed as "left alone" when absent).
-const AWS_KEYS: [&str; 4] = ["region", "image_arn", "execution_role_arn", "budget_name"];
+/// The six `[aws]` keys `status` may write (the ones the outputs can
+/// omit are listed as "left alone" when absent), in [`aws_entries`] order.
+const AWS_KEYS: [&str; 6] = ["region", "image_arn", "execution_role_arn", "egress_connector_arn", "proxy_private_ip", "budget_name"];
 
 /// The typed value of a string-valued `[aws]` key, for the round-trip check.
 fn aws_value<'a>(aws: &'a AwsCfg, key: &str) -> Option<&'a str> {
@@ -228,11 +287,75 @@ fn aws_value<'a>(aws: &'a AwsCfg, key: &str) -> Option<&'a str> {
     }
 }
 
+// ---- live connector state ------------------------------------------------------------
+
+/// The connector fields of `aws lambda-core get-network-connector` (the CLI
+/// model's unwrapped PascalCase answer; other keys ignored): what the
+/// connector is now, where the stack outputs carry no state at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveConnector {
+    #[serde(deserialize_with = "required")]
+    pub arn: String,
+    #[serde(default, deserialize_with = "scalar")]
+    pub id: Option<String>,
+    /// `PENDING`, `ACTIVE`, `INACTIVE`, `FAILED`, `DELETING`, `DELETE_FAILED`.
+    #[serde(deserialize_with = "required")]
+    pub state: String,
+    /// Why the answer's `Id` was dropped ([`parse_live_connector`]); the state still counts.
+    #[serde(skip)]
+    pub id_refused: Option<String>,
+}
+
+/// A `get-network-connector` answer for `requested` (the stack's
+/// `connectorArn`): a non-empty `Arn` and `State`, and the `Arn` must be a
+/// customer connector in [`REGION`] naming the requested one (a `:N` version
+/// on either side ignored). An answer about any other connector is refused,
+/// so its Id never becomes an alias of the configured connector. An `Id`
+/// the echo gate would drop ([`ConnectorAlias::from_state`]: not
+/// `[A-Za-z0-9_-]{1,64}`, a managed connector's name, the connector's own
+/// name) is not recorded (`id_refused` says why), but the state still is:
+/// doctor and `vm run` keep seeing ACTIVE/PENDING.
+///
+/// [`ConnectorAlias::from_state`]: crate::bridge::egress::ConnectorAlias::from_state
+pub fn parse_live_connector(doc: serde_json::Value, requested: &str) -> std::result::Result<LiveConnector, String> {
+    let mut live: LiveConnector = serde_json::from_value(doc).map_err(|e| format!("get-network-connector printed unexpected output: {e}"))?;
+    let norm = crate::bridge::egress::normalize_connector;
+    if !is_connector_arn(&live.arn) || norm(&live.arn) != norm(requested) {
+        return Err(format!("get-network-connector answered for {:?}, not {requested}", live.arn));
+    }
+    if let Some(id) = &live.id {
+        let probe = InfraState { connector_arn: Some(live.arn.clone()), connector_id: Some(id.clone()), ..InfraState::default() };
+        if !crate::bridge::egress::ConnectorAlias::from_state(&probe, requested).is_some_and(|a| a.id == *id) {
+            live.id_refused = Some(format!("get-network-connector answered with the Id {id:?}, which is not usable as an alias: Id-form echoes will be refused"));
+            live.id = None;
+        }
+    }
+    Ok(live)
+}
+
+/// `aws lambda-core <these>`: the read-only connector lookup.
+fn live_connector_args(arn: &str) -> [&str; 3] {
+    ["get-network-connector", "--identifier", arn]
+}
+
+/// The live state of the connector `arn`: one `aws lambda-core
+/// get-network-connector` as the operator ([`aws_json`]: region, pinned
+/// endpoint, no pager, no OAuth token); `Err` names why it could not be read.
+fn read_live_connector(arn: &str) -> std::result::Result<LiveConnector, String> {
+    aws_json("lambda-core", &live_connector_args(arn)).and_then(|doc| parse_live_connector(doc, arn))
+}
+
+/// `connector_state_source` when the outputs name no connector but `[aws]`
+/// still does (doctor's egress row then says to remove the key).
+pub const CONNECTOR_NOT_IN_OUTPUTS: &str = "not in the stack outputs";
+
 // ---- state/infra.toml ------------------------------------------------------------------
 
 /// `state/infra.toml`: every stack output (snake_case), when it was written
-/// and from which stack. Doctor reads it for "image claude vs bundle" and
-/// the image state; unknown keys are ignored so later stages can add some.
+/// and from which stack. Doctor reads it for "image claude vs bundle", the
+/// image state, the egress connector's state and the proxy instance; unknown
+/// keys are ignored so later stages can add some.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InfraState {
@@ -281,6 +404,51 @@ pub struct InfraState {
     pub claude_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shim_version: Option<String>,
+    // S5 egress: the stack outputs above, then what a live `lambda-core
+    // get-network-connector` reported (`connector_arn` overwritten by its Arn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_private_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_vpc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_subnet_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_egress_security_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_security_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_role_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_log_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_prefix: Option<String>,
+    /// SHA-256 of the `squid.conf` and `allow` values the stack rendered (outputs `squidConfSha256`, `allowSha256`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub squid_conf_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_sha256: Option<String>,
+    /// The connector's Id, from the live read (the echo gate accepts the Id
+    /// form only when `connector_arn` equals `[aws].egress_connector_arn`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    /// `ACTIVE`, `PENDING`, … from the live read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_state: Option<String>,
+    /// Where the three connector fields above come from, as
+    /// `image_state_source`: `live <RFC 3339>` (a `get-network-connector` at
+    /// that time, [`InfraState::overlay_connector`]) or `pulumi outputs (live
+    /// read failed: …)` (`connector_arn` from the outputs, no Id, no state);
+    /// [`CONNECTOR_NOT_IN_OUTPUTS`] when the outputs name none but `[aws]` does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_state_source: Option<String>,
 }
 
 impl InfraState {
@@ -309,6 +477,23 @@ impl InfraState {
             log_group: o.log_group.clone(),
             claude_version: o.claude_version.clone(),
             shim_version: o.shim_version.clone(),
+            connector_arn: o.connector_arn.clone(),
+            connector_name: o.connector_name.clone(),
+            proxy_private_ip: o.proxy_private_ip.clone(),
+            proxy_instance_id: o.proxy_instance_id.clone(),
+            egress_vpc_id: o.egress_vpc_id.clone(),
+            vm_subnet_id: o.vm_subnet_id.clone(),
+            vm_egress_security_group_id: o.vm_egress_security_group_id.clone(),
+            proxy_security_group_id: o.proxy_security_group_id.clone(),
+            operator_role_arn: o.operator_role_arn.clone(),
+            egress_log_group: o.egress_log_group.clone(),
+            dns_mode: o.dns_mode.clone(),
+            parameter_prefix: o.parameter_prefix.clone(),
+            squid_conf_sha256: o.squid_conf_sha256.clone(),
+            allow_sha256: o.allow_sha256.clone(),
+            connector_id: None,
+            connector_state: None,
+            connector_state_source: None,
         }
     }
 
@@ -328,10 +513,34 @@ impl InfraState {
         }
     }
 
+    /// Put the live connector over the stack outputs' `connectorArn` and
+    /// record the source: `Ok` sets `connector_arn` to the live Arn and
+    /// `connector_id`/`connector_state` to what the read reported, and
+    /// records `live <at>`; `Err(reason)` keeps the outputs' ARN, leaves the
+    /// Id and state unknown (the outputs carry neither) and records why.
+    pub fn overlay_connector(&mut self, live: std::result::Result<LiveConnector, String>, at: &str) {
+        match live {
+            Ok(l) => {
+                self.connector_arn = Some(l.arn);
+                self.connector_id = l.id;
+                self.connector_state = Some(l.state);
+                self.connector_state_source = Some(match l.id_refused {
+                    Some(why) => format!("live {at} (Id not recorded: {why})"),
+                    None => format!("live {at}"),
+                });
+            }
+            Err(reason) => {
+                self.connector_id = None;
+                self.connector_state = None;
+                self.connector_state_source = Some(format!("pulumi outputs (live read failed: {reason})"));
+            }
+        }
+    }
+
     /// The file text: a header comment, then the TOML.
     pub fn render(&self) -> std::result::Result<String, String> {
         let body = toml::to_string_pretty(self).map_err(|e| format!("state/infra.toml: {e}"))?;
-        Ok(format!("# Written by `ai-env infra status --write` from `pulumi stack output --json` and a live `get-microvm-image`; read by `ai-env doctor`.\n{body}"))
+        Ok(format!("# Written by `ai-env infra status --write` from `pulumi stack output --json`, a live `get-microvm-image` and a live `get-network-connector`; read by `ai-env doctor`.\n{body}"))
     }
 }
 
@@ -919,10 +1128,12 @@ fn aws_snippet(entries: &[(&str, String)]) -> String {
 }
 
 /// `ai-env infra status [--write] [--json-in FILE] [--stack S] [--cwd DIR]`
-/// (D24): read the outputs, refuse a foreign region, read the image's live
+/// (D24): read the outputs, refuse a foreign region, connector or proxy
+/// address ([`check_region`], [`check_egress`]), read the image's live
 /// state (`get-microvm-image`, also with `--json-in`; a failed read keeps
-/// the outputs' copy and says so), show current vs proposed `[aws]` values
-/// and the `state/infra.toml` text; with `--write` write
+/// the outputs' copy and says so) and, when the outputs name a connector,
+/// its live state (`get-network-connector`, likewise), show current vs
+/// proposed `[aws]` values and the `state/infra.toml` text; with `--write` write
 /// `state/infra.toml`, splice `bridge.toml` (backup first; when absent
 /// created 0600 with only `[aws]`, in the bridge root made 0700 or in the
 /// operator's `AI_ENV_BRIDGE_CONFIG` directory, which is created 0700 when
@@ -937,6 +1148,7 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
     };
     let outputs = parse_outputs(&json).map_err(|e| CliError::Aws(format!("stack {stack}: {e}")))?;
     check_region(&outputs).map_err(CliError::Aws)?;
+    check_egress(&outputs).map_err(CliError::Aws)?;
     let entries = aws_entries(&outputs);
 
     let paths = Paths::resolve()?;
@@ -967,7 +1179,7 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
         .unwrap_or_default();
     let changed: Vec<&str> = entries.iter().filter(|(k, v)| current.get(*k) != Some(v)).map(|(k, _)| *k).collect();
 
-    // The one live read (after every refusal above): the image fields of the
+    // The live reads (after every refusal above): the image fields of the
     // outputs are those of the last successful `pulumi up`.
     let live = read_live_image(&outputs.image_arn);
     let now = rfc3339_utc(unix_now());
@@ -977,11 +1189,36 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
         Err(e) => format!("{} from the stack outputs; the live get-microvm-image failed: {e}", outputs.image_state.as_deref().unwrap_or("?")),
     };
     state.overlay(live, &now);
+    // S5: the connector's Id and state exist only live (the outputs carry
+    // neither); a failed read is recorded, never a reason not to write.
+    let connector_note = outputs.connector_arn.as_deref().map(|arn| {
+        let live = read_live_connector(arn);
+        let note = match &live {
+            Ok(l) => format!("{} {} (live get-network-connector){}", l.arn, l.state, l.id_refused.as_deref().map(|w| format!("; Id not recorded: {w}")).unwrap_or_default()),
+            Err(e) => format!("{arn}, state unknown: the live get-network-connector failed: {e}"),
+        };
+        state.overlay_connector(live, &now);
+        note
+    });
+    // The outputs name no connector, but `[aws]` still does (a stack without
+    // S5, or one whose egress was destroyed): never removed silently, but
+    // recorded, so doctor names the stale key instead of "no state recorded".
+    let stale_connector = outputs.connector_arn.is_none() && current.get("egress_connector_arn").is_some_and(|a| !a.trim().is_empty());
+    if stale_connector {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "ai-env: warning: the stack exports no egress connector; [aws].egress_connector_arn (and proxy_private_ip) are left as they are: remove them by hand if the stack really has none"
+        );
+        state.connector_state_source = Some(CONNECTOR_NOT_IN_OUTPUTS.to_string());
+    }
     let state_text = state.render().map_err(CliError::Msg)?;
     let state_path = paths.infra_state();
 
     outln!("stack {stack}: image {}", outputs.image_arn);
     outln!("image state: {live_note}");
+    if let Some(note) = connector_note {
+        outln!("egress connector: {note}");
+    }
     outln!("bridge.toml: {}{}", path.display(), if meta.is_some() { "" } else { " (will be created)" });
     outln!("[aws]");
     for key in AWS_KEYS {
@@ -1297,6 +1534,7 @@ mod tests {
     use super::*;
 
     const ARN: &str = "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent";
+    const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
 
     fn e(pairs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
         pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect()
@@ -1552,6 +1790,196 @@ mod tests {
         assert_eq!(toml::from_str::<InfraState>(old).unwrap().image_state_source, None);
     }
 
+    /// The S5 outputs of `infra/egress.ts` on top of the S3 ones.
+    fn s5_outputs_json() -> serde_json::Value {
+        let mut j = outputs_json();
+        for (k, v) in [
+            ("connectorArn", CONNECTOR),
+            ("connectorName", "ai-env-egress"),
+            ("proxyPrivateIp", "10.42.0.10"),
+            ("proxyInstanceId", "i-0123456789abcdef0"),
+            ("egressVpcId", "vpc-0123456789abcdef0"),
+            ("vmSubnetId", "subnet-0aaa1111bbbb2222c"),
+            ("vmEgressSecurityGroupId", "sg-0ddd3333eeee4444f"),
+            ("proxySecurityGroupId", "sg-0fff5555aaaa6666b"),
+            ("operatorRoleArn", "arn:aws:iam::123456789012:role/ai-env-egress-operator"),
+            ("egressLogGroup", "/ai-env/egress/squid"),
+            ("dnsMode", "none"),
+            ("parameterPrefix", "/ai-env/proxy"),
+        ] {
+            j[k] = serde_json::json!(v);
+        }
+        j
+    }
+
+    #[test]
+    fn s5_outputs_map_to_the_two_egress_keys_in_section_8_order() {
+        let o = parse_outputs(&s5_outputs_json().to_string()).unwrap();
+        check_region(&o).unwrap();
+        check_egress(&o).unwrap();
+        assert_eq!(
+            aws_entries(&o),
+            e(&[
+                ("region", "eu-central-1"),
+                ("image_arn", ARN),
+                ("execution_role_arn", "arn:aws:iam::123456789012:role/ai-env-exec"),
+                ("egress_connector_arn", CONNECTOR),
+                ("proxy_private_ip", "10.42.0.10"),
+                ("budget_name", "ai-env-monthly")
+            ])
+        );
+        assert_eq!(aws_entries(&o).iter().map(|(k, _)| *k).collect::<Vec<_>>(), AWS_KEYS, "AWS_KEYS lists every key in the same order");
+        // The splice writes both, and BridgeConfig reads them back as the egress seam expects.
+        let out = splice_toml_table("", "aws", &aws_entries(&o)).unwrap();
+        let a = cfg(&out);
+        assert_eq!((a.egress_connector_arn.as_deref(), a.proxy_private_ip.as_deref()), (Some(CONNECTOR), Some("10.42.0.10")));
+        a.validate_egress().unwrap();
+        // One without the other: only the one present; empty strings are absent.
+        let mut j = s5_outputs_json();
+        j["proxyPrivateIp"] = serde_json::json!("");
+        let o = parse_outputs(&j.to_string()).unwrap();
+        assert!(aws_entries(&o).iter().any(|(k, _)| *k == "egress_connector_arn") && !aws_entries(&o).iter().any(|(k, _)| *k == "proxy_private_ip"));
+        // The state carries every S5 output.
+        let s = InfraState::from_outputs(&parse_outputs(&s5_outputs_json().to_string()).unwrap(), "dev", "2026-10-01T10:00:00Z".into());
+        assert_eq!((s.connector_arn.as_deref(), s.connector_name.as_deref(), s.proxy_private_ip.as_deref(), s.proxy_instance_id.as_deref()), (Some(CONNECTOR), Some("ai-env-egress"), Some("10.42.0.10"), Some("i-0123456789abcdef0")));
+        assert_eq!((s.egress_vpc_id.as_deref(), s.vm_subnet_id.as_deref(), s.vm_egress_security_group_id.as_deref(), s.proxy_security_group_id.as_deref()), (Some("vpc-0123456789abcdef0"), Some("subnet-0aaa1111bbbb2222c"), Some("sg-0ddd3333eeee4444f"), Some("sg-0fff5555aaaa6666b")));
+        assert_eq!((s.operator_role_arn.as_deref(), s.egress_log_group.as_deref(), s.dns_mode.as_deref(), s.parameter_prefix.as_deref()), (Some("arn:aws:iam::123456789012:role/ai-env-egress-operator"), Some("/ai-env/egress/squid"), Some("none"), Some("/ai-env/proxy")));
+        assert_eq!((s.connector_id.as_deref(), s.connector_state.as_deref(), s.connector_state_source.as_deref()), (None, None, None), "only a live read knows them");
+    }
+
+    #[test]
+    fn check_egress_refuses_a_managed_foreign_or_malformed_connector_and_a_public_proxy_ip() {
+        let with = |k: &str, v: &str| {
+            let mut j = s5_outputs_json();
+            j[k] = serde_json::json!(v);
+            parse_outputs(&j.to_string()).unwrap()
+        };
+        let managed = crate::bridge::egress::internet_egress_arn();
+        for bad in [
+            managed.as_str(),
+            "arn:aws:lambda:eu-west-3:123456789012:network-connector:ai-env-egress",
+            "arn:aws:lambda:eu-central-1:12345678901:network-connector:ai-env-egress",
+            "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-egress",
+            "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress:v1",
+            "ai-env-egress",
+            " arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress",
+        ] {
+            let err = check_egress(&with("connectorArn", bad)).unwrap_err();
+            assert!(err.starts_with(&format!("stack output connectorArn {bad:?} is not a network connector")) && err.ends_with("; nothing written"), "{bad}: {err}");
+        }
+        check_egress(&with("connectorArn", &format!("{CONNECTOR}:3"))).unwrap();
+        // Another account's connector: refused against imageArn's account, and against accountId when exported.
+        let foreign = "arn:aws:lambda:eu-central-1:999999999999:network-connector:ai-env-egress";
+        assert_eq!(check_egress(&with("connectorArn", foreign)).unwrap_err(), format!("stack output connectorArn {foreign:?} is in account 999999999999, but the stack's imageArn is in account 123456789012; nothing written"));
+        let mut j = s5_outputs_json();
+        j["connectorArn"] = serde_json::json!(foreign);
+        j["imageArn"] = serde_json::json!("arn:aws:lambda:eu-central-1:999999999999:microvm-image:ai-env-agent");
+        assert_eq!(check_egress(&parse_outputs(&j.to_string()).unwrap()).unwrap_err(), format!("stack output connectorArn {foreign:?} is in account 999999999999, but the stack's accountId is in account 123456789012; nothing written"));
+        j.as_object_mut().unwrap().remove("accountId");
+        check_egress(&parse_outputs(&j.to_string()).unwrap()).unwrap();
+        let mut j = s5_outputs_json();
+        j.as_object_mut().unwrap().remove("accountId");
+        check_egress(&parse_outputs(&j.to_string()).unwrap()).unwrap();
+        j["connectorArn"] = serde_json::json!(foreign);
+        assert!(check_egress(&parse_outputs(&j.to_string()).unwrap()).unwrap_err().contains("imageArn is in account 123456789012"), "without accountId the image's account still binds");
+        for bad in ["8.8.8.8", "100.64.0.10", "169.254.169.254", "10.42.0.10/32", "010.42.0.10", "fd00::10", "proxy"] {
+            let err = check_egress(&with("proxyPrivateIp", bad)).unwrap_err();
+            assert!(err.starts_with(&format!("stack output proxyPrivateIp {bad:?} is not an RFC 1918")), "{bad}: {err}");
+        }
+        for good in ["10.42.0.10", "172.16.0.1", "192.168.1.1"] {
+            check_egress(&with("proxyPrivateIp", good)).unwrap();
+        }
+        check_egress(&parse_outputs(&outputs_json().to_string()).unwrap()).unwrap();
+    }
+
+    fn golden_connector() -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/egress/lambda-core.get-network-connector.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_live_connector_overlays_the_outputs_and_names_its_source() {
+        let live = parse_live_connector(golden_connector(), CONNECTOR).unwrap();
+        assert_eq!(live, LiveConnector { arn: CONNECTOR.into(), id: Some("nc-0a1b2c3d4e5f60718".into()), state: "ACTIVE".into(), id_refused: None });
+        // A versioned ARN on either side is the same connector.
+        assert_eq!(parse_live_connector(golden_connector(), &format!("{CONNECTOR}:1")).unwrap().state, "ACTIVE");
+        let mut v = golden_connector();
+        v["Arn"] = serde_json::json!(format!("{CONNECTOR}:2"));
+        assert_eq!(parse_live_connector(v, CONNECTOR).unwrap().arn, format!("{CONNECTOR}:2"));
+
+        let o = parse_outputs(&s5_outputs_json().to_string()).unwrap();
+        let from_outputs = InfraState::from_outputs(&o, "dev", "2026-10-01T10:00:00Z".into());
+        let mut s = from_outputs.clone();
+        s.overlay_connector(Ok(live), "2026-10-01T10:00:05Z");
+        assert_eq!((s.connector_arn.as_deref(), s.connector_id.as_deref(), s.connector_state.as_deref()), (Some(CONNECTOR), Some("nc-0a1b2c3d4e5f60718"), Some("ACTIVE")));
+        assert_eq!(s.connector_state_source.as_deref(), Some("live 2026-10-01T10:00:05Z"));
+        let text = s.render().unwrap();
+        assert!(text.contains("connector_id = \"nc-0a1b2c3d4e5f60718\"\nconnector_state = \"ACTIVE\"\nconnector_state_source = \"live 2026-10-01T10:00:05Z\"\n"), "{text}");
+        assert_eq!(toml::from_str::<InfraState>(&text).unwrap(), s, "round trip");
+        // The echo gate trusts the recorded Id for the configured connector.
+        assert!(crate::bridge::egress::ConnectorAlias::from_state(&s, CONNECTOR).is_some_and(|a| a.id == "nc-0a1b2c3d4e5f60718"));
+
+        // A failed read keeps the outputs' ARN, knows no Id or state, and says why (also over an earlier success).
+        s.overlay_connector(Err("aws lambda-core get-network-connector: An error occurred (AccessDeniedException)".into()), "2026-10-01T10:01:00Z");
+        assert_eq!((s.connector_id.as_deref(), s.connector_state.as_deref()), (None, None));
+        assert_eq!(s.connector_state_source.as_deref(), Some("pulumi outputs (live read failed: aws lambda-core get-network-connector: An error occurred (AccessDeniedException))"));
+        let mut s = from_outputs;
+        s.overlay_connector(Err("x".into()), "2026-10-01T10:00:05Z");
+        assert_eq!(s.connector_arn.as_deref(), Some(CONNECTOR));
+        // A file written before S5 still reads.
+        assert_eq!(toml::from_str::<InfraState>("stack = \"dev\"\nregion = \"eu-central-1\"\n").unwrap().connector_state_source, None);
+    }
+
+    #[test]
+    fn a_live_connector_answer_about_another_connector_or_without_a_state_is_refused() {
+        let other = "arn:aws:lambda:eu-central-1:123456789012:network-connector:someone-else";
+        let mut v = golden_connector();
+        v["Arn"] = serde_json::json!(other);
+        assert_eq!(parse_live_connector(v, CONNECTOR).unwrap_err(), format!("get-network-connector answered for {other:?}, not {CONNECTOR}"));
+        let mut v = golden_connector();
+        v["Arn"] = serde_json::json!(crate::bridge::egress::internet_egress_arn());
+        assert!(parse_live_connector(v, CONNECTOR).unwrap_err().contains("answered for"), "a managed connector is never ours");
+        // Arns that normalise to ours but are no connector ARN: only the is_connector_arn guard refuses them.
+        for arn in [format!(" {CONNECTOR}"), format!("{CONNECTOR}:12345678901")] {
+            assert_eq!(crate::bridge::egress::normalize_connector(&arn), CONNECTOR, "{arn:?}");
+            let mut v = golden_connector();
+            v["Arn"] = serde_json::json!(arn);
+            assert_eq!(parse_live_connector(v, CONNECTOR).unwrap_err(), format!("get-network-connector answered for {arn:?}, not {CONNECTOR}"));
+        }
+        for (k, bad) in [("State", serde_json::json!("")), ("State", serde_json::Value::Null), ("Arn", serde_json::json!("")), ("Arn", serde_json::json!(["x"]))] {
+            let mut v = golden_connector();
+            v[k] = bad.clone();
+            let err = parse_live_connector(v, CONNECTOR).unwrap_err();
+            assert!(err.starts_with("get-network-connector printed unexpected output"), "{k} = {bad}: {err}");
+        }
+        assert!(parse_live_connector(serde_json::Value::Null, CONNECTOR).unwrap_err().starts_with("get-network-connector printed unexpected output"), "an empty answer");
+        let mut v = golden_connector();
+        v.as_object_mut().unwrap().remove("Id");
+        assert_eq!(parse_live_connector(v, CONNECTOR).unwrap().id, None, "no Id is no alias");
+    }
+
+    /// An Id the echo gate would drop (`ConnectorAlias::from_state`) is not
+    /// recorded (and the source says why), but the live state still is.
+    #[test]
+    fn a_live_connector_id_that_cannot_be_an_alias_is_refused() {
+        let long = "n".repeat(65);
+        for id in ["bad id", "nc/1", " nc-1", "nc-1 ", long.as_str(), "INTERNET_EGRESS", "shell_ingress", "HTTP_INGRESS", "aws-network-connector", "x-aws-network-connector-y", "ai-env-egress"] {
+            let mut v = golden_connector();
+            v["Id"] = serde_json::json!(id);
+            let live = parse_live_connector(v, CONNECTOR).unwrap();
+            assert_eq!(live.id, None, "{id}");
+            assert_eq!(live.id_refused.as_deref(), Some(format!("get-network-connector answered with the Id {id:?}, which is not usable as an alias: Id-form echoes will be refused").as_str()));
+            let mut s = InfraState::default();
+            s.overlay_connector(Ok(live), "2026-10-01T10:00:05Z");
+            assert!(s.connector_state_source.as_deref().is_some_and(|src| src.starts_with("live 2026-10-01T10:00:05Z (Id not recorded: ") && src.contains("is not usable as an alias: Id-form echoes will be refused")), "{s:?}");
+            assert_eq!((s.connector_id.as_deref(), s.connector_state.as_deref()), (None, Some("ACTIVE")), "{id}: the state still counts");
+        }
+        for id in ["nc-0a1b2c3d4e5f60718", "a", &"n".repeat(64), "ai-env-egress-2"] {
+            let mut v = golden_connector();
+            v["Id"] = serde_json::json!(id);
+            assert_eq!(parse_live_connector(v, CONNECTOR).unwrap().id.as_deref(), Some(id), "{id}");
+        }
+    }
+
     #[test]
     fn infra_state_read_refuses_a_fifo_without_blocking_and_a_symlink() {
         use std::os::unix::ffi::OsStrExt;
@@ -1611,6 +2039,9 @@ mod tests {
         let l = live_image_cmd(ARN);
         assert_eq!(args(&l), ["lambda-microvms", "get-microvm-image", "--image-identifier", ARN, "--region", "eu-central-1", "--output", "json"]);
         assert!(l.get_envs().any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.is_none()), "no OAuth token for aws");
+        let c = crate::bridge::awscli::aws_cmd("lambda-core", &live_connector_args(CONNECTOR)).unwrap();
+        assert_eq!(args(&c), ["lambda-core", "get-network-connector", "--identifier", CONNECTOR, "--region", "eu-central-1", "--endpoint-url", "https://lambda.eu-central-1.amazonaws.com", "--output", "json"]);
+        assert!(c.get_envs().any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.is_none()), "no OAuth token for aws");
         assert!(safe_name("dev") && safe_name("org/ai-env/dev") && !safe_name("-x") && !safe_name("a b") && !safe_name(""));
     }
 

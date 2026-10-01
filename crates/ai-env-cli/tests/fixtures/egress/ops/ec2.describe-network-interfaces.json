@@ -1,0 +1,70 @@
+{
+    "NetworkInterfaces": [
+        {
+            "AvailabilityZone": "eu-central-1a",
+            "AvailabilityZoneId": "euc1-az1",
+            "Description": "Lambda network connector ai-env-egress",
+            "Groups": [
+                {
+                    "GroupId": "sg-0ddd3333eeee4444f",
+                    "GroupName": "ai-env-vm-egress"
+                }
+            ],
+            "InterfaceType": "lambda",
+            "Ipv6Addresses": [],
+            "MacAddress": "02:00:00:00:00:01",
+            "NetworkInterfaceId": "eni-0aaa00000000000a1",
+            "OwnerId": "123456789012",
+            "PrivateIpAddress": "10.42.1.17",
+            "PrivateIpAddresses": [
+                {
+                    "Primary": true,
+                    "PrivateIpAddress": "10.42.1.17"
+                }
+            ],
+            "RequesterManaged": true,
+            "SourceDestCheck": true,
+            "Status": "in-use",
+            "SubnetId": "subnet-0aaa1111bbbb2222c",
+            "TagSet": [],
+            "VpcId": "vpc-0123456789abcdef0",
+            "Operator": {
+                "Managed": true,
+                "Principal": "lambda.amazonaws.com"
+            }
+        },
+        {
+            "AvailabilityZone": "eu-central-1a",
+            "AvailabilityZoneId": "euc1-az1",
+            "Description": "Lambda network connector ai-env-egress",
+            "Groups": [
+                {
+                    "GroupId": "sg-0ddd3333eeee4444f",
+                    "GroupName": "ai-env-vm-egress"
+                }
+            ],
+            "InterfaceType": "lambda",
+            "Ipv6Addresses": [],
+            "MacAddress": "02:00:00:00:00:02",
+            "NetworkInterfaceId": "eni-0aaa00000000000a2",
+            "OwnerId": "123456789012",
+            "PrivateIpAddress": "10.42.1.18",
+            "PrivateIpAddresses": [
+                {
+                    "Primary": true,
+                    "PrivateIpAddress": "10.42.1.18"
+                }
+            ],
+            "RequesterManaged": true,
+            "SourceDestCheck": true,
+            "Status": "in-use",
+            "SubnetId": "subnet-0aaa1111bbbb2222c",
+            "TagSet": [],
+            "VpcId": "vpc-0123456789abcdef0",
+            "Operator": {
+                "Managed": true,
+                "Principal": "lambda.amazonaws.com"
+            }
+        }
+    ]
+}

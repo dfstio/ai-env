@@ -1,0 +1,24 @@
+{
+    "Arn": "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress",
+    "Name": "ai-env-egress",
+    "Id": "nc-0a1b2c3d4e5f60718",
+    "Version": 1,
+    "Configuration": {
+        "VpcEgressConfiguration": {
+            "SubnetIds": [
+                "subnet-0aaa1111bbbb2222c"
+            ],
+            "SecurityGroupIds": [
+                "sg-0ddd3333eeee4444f"
+            ],
+            "NetworkProtocol": "IPv4",
+            "AssociatedComputeResourceTypes": [
+                "MicroVm"
+            ]
+        }
+    },
+    "OperatorRole": "arn:aws:iam::123456789012:role/ai-env-egress-operator",
+    "State": "ACTIVE",
+    "LastUpdateStatus": "Successful",
+    "LastModified": "2026-10-01T10:00:00+00:00"
+}

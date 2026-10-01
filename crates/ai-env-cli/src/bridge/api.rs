@@ -426,6 +426,19 @@ pub struct FakeState {
     /// Per VM id: the pre-`/run` answers served so far.
     #[serde(default)]
     pub pre_run_served: BTreeMap<String, u32>,
+    /// The egress every `RunMicrovm` and `GetMicrovm` answer echoes instead
+    /// of what was sent (S5 echo gate tests: a VPC run that comes back with
+    /// `INTERNET_EGRESS`, an extra connector, the Id form).
+    #[serde(default)]
+    pub egress_echo: Option<Vec<String>>,
+    /// `RunMicrovm` answers with an empty egress list (the gate must then ask
+    /// `GetMicrovm`); `GetMicrovm` is unaffected.
+    #[serde(default)]
+    pub run_echo_empty: bool,
+    /// The egress `GetMicrovm` answers echo, over [`FakeState::egress_echo`]
+    /// (RunMicrovm unaffected): the Run and the Get answer disagree.
+    #[serde(default)]
+    pub get_egress_echo: Option<Vec<String>>,
     pub image: Option<ImageInfo>,
     pub versions: Vec<ImageVersion>,
 }
@@ -507,7 +520,7 @@ impl FakeState {
             if let Some((e, true)) = failure {
                 return Err(e);
             }
-            return Ok(self.vms[&id].clone());
+            return Ok(self.run_answer(self.vms[&id].clone()));
         }
         // The API model's constraint (the prose says 16 KB; the schema says 4096).
         if spec.run_hook_payload.len() > RunHookPayload::MAX_BYTES {
@@ -536,8 +549,26 @@ impl FakeState {
         self.specs.push(spec.clone());
         match failure {
             Some((e, true)) => Err(e),
-            _ => Ok(vm),
+            _ => Ok(self.run_answer(vm)),
         }
+    }
+
+    /// What `RunMicrovm` returns for `vm`: [`FakeState::egress_echo`] in place
+    /// of its egress, which [`FakeState::run_echo_empty`] clears.
+    fn run_answer(&self, vm: VmInfo) -> VmInfo {
+        let mut vm = self.echoed(vm);
+        if self.run_echo_empty {
+            vm.egress.clear();
+        }
+        vm
+    }
+
+    /// `vm` with [`FakeState::egress_echo`] in place of its egress (the stored VM keeps what was sent).
+    fn echoed(&self, mut vm: VmInfo) -> VmInfo {
+        if let Some(e) = &self.egress_echo {
+            vm.egress.clone_from(e);
+        }
+        vm
     }
 
     pub fn get(&mut self, id: &str) -> Result<VmInfo, BridgeError> {
@@ -549,7 +580,12 @@ impl FakeState {
         if auto && vm.state == VmState::Pending {
             vm.state = VmState::Running;
         }
-        Ok(vm.clone())
+        let vm = vm.clone();
+        let mut vm = self.echoed(vm);
+        if let Some(e) = &self.get_egress_echo {
+            vm.egress.clone_from(e);
+        }
+        Ok(vm)
     }
 
     pub fn suspend(&mut self, id: &str) -> Result<(), BridgeError> {
@@ -799,6 +835,21 @@ impl FakeMicrovmApi {
     pub fn set_health(&self, id: &str, health: Health) {
         self.state().health_override.insert(id.to_string(), health);
     }
+
+    /// Every `RunMicrovm`/`GetMicrovm` answer echoes this egress (`None`: what was sent).
+    pub fn set_egress_echo(&self, echo: Option<Vec<String>>) {
+        self.state().egress_echo = echo;
+    }
+
+    /// `RunMicrovm` answers with an empty egress list.
+    pub fn set_run_echo_empty(&self, on: bool) {
+        self.state().run_echo_empty = on;
+    }
+
+    /// Every `GetMicrovm` answer echoes this egress (`None`: as [`FakeMicrovmApi::set_egress_echo`]).
+    pub fn set_get_egress_echo(&self, echo: Option<Vec<String>>) {
+        self.state().get_egress_echo = echo;
+    }
 }
 
 impl MicrovmApi for FakeMicrovmApi {
@@ -890,6 +941,40 @@ mod tests {
             assert_eq!(t.expose().len(), 223);
             assert_eq!(FakeState::parse_token(t.expose()), Some((id.to_string(), port, 1_789_804_800)), "{id}");
         }
+    }
+
+    #[test]
+    fn the_egress_echo_knobs() {
+        let mut s = FakeState::new();
+        let spec = |token: &str, egress: Vec<String>| RunSpec {
+            image_arn: FAKE_IMAGE_ARN.into(),
+            image_version: "1.0".into(),
+            execution_role_arn: None,
+            ingress_connectors: vec![],
+            egress_connectors: egress,
+            idle: IdleSpec { max_idle_s: 300, suspended_s: 900, auto_resume: true },
+            max_duration_s: 900,
+            run_hook_payload: "{}".into(),
+            client_token: token.into(),
+        };
+        let conn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress".to_string();
+        let a = s.run(&spec("t1", vec![conn.clone()])).unwrap();
+        assert_eq!(a.egress, vec![conn.clone()], "what was sent");
+        assert_eq!(s.run(&spec("t2", vec![])).unwrap().egress, vec![managed_connector_arn("INTERNET_EGRESS")], "the platform default");
+        s.run_echo_empty = true;
+        let b = s.run(&spec("t3", vec![conn.clone()])).unwrap();
+        assert!(b.egress.is_empty(), "RunMicrovm answers nothing");
+        assert_eq!(s.get(&b.id).unwrap().egress, vec![conn.clone()], "GetMicrovm still knows");
+        assert!(s.run(&spec("t3", vec![conn.clone()])).unwrap().egress.is_empty(), "an idempotent replay answers the same way");
+        s.run_echo_empty = false;
+        s.egress_echo = Some(vec![managed_connector_arn("INTERNET_EGRESS")]);
+        assert_eq!(s.get(&a.id).unwrap().egress, vec![managed_connector_arn("INTERNET_EGRESS")], "the override reaches existing VMs");
+        assert_eq!(s.run(&spec("t4", vec![conn.clone()])).unwrap().egress, vec![managed_connector_arn("INTERNET_EGRESS")]);
+        s.egress_echo = None;
+        assert_eq!(s.get(&a.id).unwrap().egress, vec![conn.clone()], "the stored VM kept what was sent");
+        s.get_egress_echo = Some(vec![managed_connector_arn("INTERNET_EGRESS")]);
+        assert_eq!(s.get(&a.id).unwrap().egress, vec![managed_connector_arn("INTERNET_EGRESS")], "Get only");
+        assert_eq!(s.run(&spec("t5", vec![conn.clone()])).unwrap().egress, vec![conn], "Run unaffected");
     }
 
     #[test]

@@ -1,11 +1,11 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws test-aws-readonly s4-smoke perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
+.PHONY: help build check-bins test test-aws test-aws-readonly s4-smoke s5-smoke test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
         claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
 
 SHELL        := /bin/bash
 # The switches that delete, rotate, write, pick a version, skip a gate or widen a live run (YES, KEEP, VERSION, ROTATE,
-# WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES) count only when given on the make command line (`make image-prune YES=1`;
+# WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES, SYSTEMD) count only when given on the make command line (`make image-prune YES=1`;
 # a sub-make inherits them): the same name exported in the environment is ignored. $(call cmdline,NAME) is the value, or empty.
 cmdline       = $(if $(filter command line,$(origin $(1))),$($(1)))
 STACK        ?= dev
@@ -88,6 +88,8 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	@target/matrix/none/debug/ai-env infra --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'infra' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env creds --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'creds' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env lab --help >/dev/null 2>&1;   test $$? -eq 2 || { echo "expected exit 2 for 'lab' without bridge"; exit 1; }
+	@target/matrix/none/debug/ai-env egress --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'egress' without bridge"; exit 1; }
+	@target/matrix/none/debug/ai-env proxy --help >/dev/null 2>&1;  test $$? -eq 2 || { echo "expected exit 2 for 'proxy' without bridge"; exit 1; }
 	@out=$$($(CARGO) build -p $(PKG) --bin ai-env-claude --no-default-features --features shim 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-claude built without bridge"; exit 1; }; \
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
@@ -99,8 +101,9 @@ test: ## Unit + integration tests in all four feature sets
 	$(CARGO) test -p $(PKG) --no-default-features --features shim
 	$(CARGO) test -p $(PKG) --no-default-features --features bridge
 
-# Live targets never run against a fake: every lab knob of the developer's shell is dropped.
-LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS
+# Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
+# AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend).
+LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
 # cargo hides for passing tests; one thread keeps each test's lines together.
@@ -120,6 +123,30 @@ s4-smoke: ## T4.1 gate: three `ai-env vm smoke --max-duration 900 --json` passes
 	  grep -q '"backend":"sdk"' <<<"$$out" || { echo "$$out"; echo "s4-smoke: pass $$i did not use the SDK backend"; exit 1; }; \
 	  echo "s4-smoke: pass $$i ok"; \
 	done; echo "s4-smoke: 3/3 ok (target/s4/smoke.jsonl)"
+
+s5-smoke: ## T5.1 gate: three `ai-env vm smoke --egress vpc --max-duration 900 --json` passes (live, one Touch ID each; backend sdk and egress_ok true: the VM echoed exactly the connector); records appended to target/s5/smoke.jsonl
+	@mkdir -p target/s5
+	@for i in 1 2 3; do \
+	  out=$$($(LAB_UNSET) $(AI_ENV) vm smoke --egress vpc --max-duration 900 --json) || { echo "$$out"; echo "s5-smoke: pass $$i failed"; exit 1; }; \
+	  printf '%s\n' "$$out" >> target/s5/smoke.jsonl; \
+	  grep -q '"backend":"sdk"' <<<"$$out" || { echo "$$out"; echo "s5-smoke: pass $$i did not use the SDK backend"; exit 1; }; \
+	  grep -q '"egress_ok":true' <<<"$$out" || { echo "$$out"; echo "s5-smoke: pass $$i: egress_ok is not true (the VM did not echo exactly the connector)"; exit 1; }; \
+	  echo "s5-smoke: pass $$i ok"; \
+	done; echo "s5-smoke: 3/3 ok (target/s5/smoke.jsonl)"
+
+# The live tests may allow github.com for workspace ai-env-test (live_egress_extra_and_removal): on every exit of the
+# recipe (success, failure, Ctrl-C) the entry is removed again, a no-op when it is absent, so a killed test never leaves
+# github.com allowed for every vpc VM. INT, TERM and HUP are trapped too: bash 3.2 kills itself without running the
+# EXIT trap when its foreground child dies of an untrapped SIGINT. A removal that fails fails the target.
+test-egress: ## S5 T5.2-T5.4: the live egress tests (#[ignore]d; AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1; a vpc VM, the proxy, Touch ID), measurements shown; every exit removes the test's github.com entry
+	@trap 'echo "test-egress: removing the test allowlist entry (ai-env egress allow ai-env-test github.com --remove)"; $(LAB_UNSET) $(AI_ENV) egress allow ai-env-test github.com --remove || { echo "test-egress: the removal FAILED: github.com may still be allowed for every vpc VM: run ai-env egress allow ai-env-test github.com --remove"; exit 1; }' EXIT; \
+	  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
+	  $(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture
+
+# The systemd case boots the proxy's user-data under a real systemd as PID 1 in a privileged container (Docker Desktop
+# allows it); SYSTEMD=0 on the command line leaves it out.
+test-proxy: ## S5: the proxy host in Docker (squid of AL2023 pinned by digest, the reload script, user-data; AI_ENV_PROXY_TESTS=1); SYSTEMD=0 skips the privileged systemd boot
+	AI_ENV_PROXY_TESTS=1 $(if $(filter 0,$(call cmdline,SYSTEMD)),,AI_ENV_PROXY_SYSTEMD=1 )$(CARGO) test -p $(PKG) --features bridge --test proxy_docker -- --include-ignored --test-threads=1
 
 perf-wrapper: ## T1.2 overhead: ai-env-claude (release) vs a bare exec of the fake, 100 interleaved runs, median delta <= 10 ms
 	AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test wrapper -- --ignored overhead --nocapture --test-threads=1
@@ -308,11 +335,17 @@ check-base-image: ## T3.5: the pinned managed base image (baseImage in $(IMAGE_C
 	@$(BASE_CHECK) || { echo "check-base-image: $(BASE_MISSING)"; exit 1; }
 	$(AI_ENV) infra base-image --name $(BASE_NAME) --version $(BASE_VERSION)
 
-s3-preflight: ## S3 preconditions P1-P12 (PHASE=a: build + read-only checks; PHASE=b: also the deploy ones); one row each, exit 1 on any [NO ]
+# P13-P16 (S5, read-only, both phases): the aws CLI's lambda-core (connector-wait and the probe use it), VPC Block
+# Public Access off, or the egress VPC (tag Project=ai-env, its CIDR) excluded with allow-egress or allow-bidirectional
+# (the proxy reaches the internet through its IGW, which ingress-only blocks as well: only NAT gateway and egress-only
+# IGW traffic leaves), room for the egress VPC under the VPC quota, and whether the service-linked role the
+# connector's first create makes exists (recorded only). Under
+# pipefail no row pipes a tool into `grep -q`: grep stops at the first match and the writer's SIGPIPE would fail it.
+s3-preflight: ## S3/S5 preconditions P1-P16 (PHASE=a: build + read-only checks; PHASE=b: also the deploy ones); one row each, exit 1 on any [NO ]
 	@set -uo pipefail; phase="$(or $(PHASE),a)"; bad=0; \
 	  row() { printf '%s %s\n' "$$1" "$$2"; [ "$$1" = "[NO ]" ] && bad=1; true; }; \
 	  if out=$$($(SUBMAKE) -s --no-print-directory vm-build-pick 2>&1); then row "[ok ]" "P1 cargo-lambda: $$out"; else row "[NO ]" "P1 cargo-lambda: $$out"; fi; \
-	  if rustup +$(TOOLCHAIN) target list --installed | grep -qx '$(TARGET)' && test -x $(LLVM_BIN)/llvm-nm; then row "[ok ]" "P2 $(TARGET) target, llvm tools"; else row "[NO ]" "P2 rustup target add $(TARGET) --toolchain $(TOOLCHAIN); brew install llvm"; fi; \
+	  if targets=$$(rustup +$(TOOLCHAIN) target list --installed) && grep -qx '$(TARGET)' <<<"$$targets" && test -x $(LLVM_BIN)/llvm-nm; then row "[ok ]" "P2 $(TARGET) target, llvm tools"; else row "[NO ]" "P2 rustup target add $(TARGET) --toolchain $(TOOLCHAIN); brew install llvm"; fi; \
 	  if v=$$(docker version --format '{{.Server.Version}} {{.Server.Arch}}' 2>/dev/null); then \
 	    case "$${v##* }" in \
 	    arm64|aarch64) \
@@ -331,7 +364,7 @@ s3-preflight: ## S3 preconditions P1-P12 (PHASE=a: build + read-only checks; PHA
 	    code=$$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$$u" 2>/dev/null || echo 000); \
 	    case "$$code" in 2*|3*|401) row "[ok ]" "P5 reachable ($$code) $$u";; *) row "[NO ]" "P5 unreachable ($$code) $$u";; esac; done; \
 	  if [ "$$phase" = b ]; then \
-	    if (cd infra && pulumi stack ls --json 2>/dev/null) | grep -q '"name": *"$(STACK)"'; then row "[ok ]" "P6 pulumi stack $(STACK) ($$(pulumi whoami -v 2>/dev/null | sed -n 's/^Backend URL: *//p'))"; else row "[NO ]" "P6 pulumi stack $(STACK) missing: cd infra && pulumi stack init $(STACK)"; fi; fi; \
+	    if stacks=$$(cd infra && pulumi stack ls --json 2>/dev/null) && grep -q '"name": *"$(STACK)"' <<<"$$stacks"; then row "[ok ]" "P6 pulumi stack $(STACK) ($$(pulumi whoami -v 2>/dev/null | sed -n 's/^Backend URL: *//p'))"; else row "[NO ]" "P6 pulumi stack $(STACK) missing: cd infra && pulumi stack init $(STACK)"; fi; fi; \
 	  if pulumi plugin ls --json 2>/dev/null | node -e 'const p=JSON.parse(require("fs").readFileSync(0,"utf8"));const has=(n,v)=>p.some(x=>x.name===n&&x.kind==="resource"&&x.version===v);process.exit(has("aws","7.10.0")&&has("aws-native","1.79.0")?0:1)'; then row "[ok ]" "P7 pulumi plugins aws 7.10.0, aws-native 1.79.0"; else row "[NO ]" "P7 pulumi plugin install resource aws 7.10.0; pulumi plugin install resource aws-native 1.79.0"; fi; \
 	  if arn=$$(aws sts get-caller-identity --region $(REGION) --query Arn --output text 2>/dev/null); then row "[ok ]" "P8 deploy identity $${arn##*:}"; else row "[NO ]" "P8 no AWS credentials for the deploy identity"; fi; \
 	  if [ "$$phase" = b ]; then \
@@ -343,6 +376,33 @@ s3-preflight: ## S3 preconditions P1-P12 (PHASE=a: build + read-only checks; PHA
 	    zsha=$$(test -f "$(IMAGE_ZIP)" && shasum -a 256 "$(IMAGE_ZIP)" | cut -d' ' -f1); \
 	    if [ "$(call cmdline,EXPECT_BUILD_FAILURE)" = 1 ]; then row "[-  ]" "P12 NOT CHECKED: EXPECT_BUILD_FAILURE=1 on the command line (the T3.4 negative): this zip is deployed whether or not make test-docker passed for it"; \
 	    elif [ -n "$$zsha" ] && [ "$$(cat "$(DOCKER_STAMP)" 2>/dev/null)" = "$$zsha" ]; then row "[ok ]" "P12 make test-docker passed for this zip"; else row "[NO ]" "P12 make test-docker has not passed for the current $(IMAGE_ZIP)"; fi; fi; \
+	  if out=$$(aws lambda-core list-network-connectors --region $(REGION) --endpoint-url $(LAMBDA_CORE_URL) --output json 2>&1); then row "[ok ]" "P13 aws lambda-core list-network-connectors answers"; \
+	  else case "$$out" in \
+	    *"Invalid choice"*) row "[NO ]" "P13 this aws CLI has no lambda-core service (botocore lambda-core/2026-04-30): update it";; \
+	    *) row "[NO ]" "P13 aws lambda-core list-network-connectors failed: $$(grep -m1 -i error <<<"$$out" | cut -c1-160)";; \
+	  esac; fi; \
+	  if m=$$(aws ec2 describe-vpc-block-public-access-options --region $(REGION) --endpoint-url $(EC2_URL) --query VpcBlockPublicAccessOptions.InternetGatewayBlockMode --output text 2>/dev/null); then \
+	    if [ "$$m" = off ]; then row "[ok ]" "P14 VPC Block Public Access off"; \
+	    elif ! vpcs=$$(aws ec2 describe-vpcs --filters Name=tag:Project,Values=ai-env --region $(REGION) --endpoint-url $(EC2_URL) --query 'Vpcs[].[VpcId,CidrBlock]' --output text 2>/dev/null) \
+	      || ! ex=$$(aws ec2 describe-vpc-block-public-access-exclusions --region $(REGION) --endpoint-url $(EC2_URL) --query 'VpcBlockPublicAccessExclusions[].[ResourceArn,InternetGatewayExclusionMode,State]' --output text 2>/dev/null); then \
+	      row "[NO ]" "P14 VPC Block Public Access is $$m, and its exclusions or the egress VPC cannot be read (ec2 describe-vpc-block-public-access-exclusions, describe-vpcs)"; \
+	    else evpc=$$(awk -v c="$(EGRESS_VPC_CIDR)" 'c != "" && $$2 == c { v = $$1 } END { print v }' <<<"$$vpcs"); \
+	      if [ -n "$$evpc" ] && awk -v s=":vpc/$$evpc" 'length($$1) >= length(s) && substr($$1, length($$1) - length(s) + 1) == s && ($$2 == "allow-egress" || $$2 == "allow-bidirectional") && ($$3 == "create-complete" || $$3 == "update-complete") { f = 1 } END { exit !f }' <<<"$$ex"; then \
+	        row "[ok ]" "P14 VPC Block Public Access is $$m, and the egress VPC $$evpc is excluded (allow-egress or allow-bidirectional)"; \
+	      else row "[NO ]" "P14 VPC Block Public Access is $$m: it blocks the proxy's internet gateway (ingress-only lets only NAT gateway and egress-only IGW traffic out): turn it off, or exclude the egress VPC$${evpc:+ $$evpc} (allow-egress; it must exist first)"; fi; \
+	    fi; \
+	  else row "[NO ]" "P14 cannot read the VPC Block Public Access options (ec2 describe-vpc-block-public-access-options)"; fi; \
+	  if vpcs=$$(aws ec2 describe-vpcs --region $(REGION) --endpoint-url $(EC2_URL) --query 'Vpcs[].[VpcId,CidrBlock]' --output text 2>/dev/null); then \
+	    n=$$(grep -c . <<<"$$vpcs"); \
+	    q=$$(aws service-quotas get-service-quota --service-code vpc --quota-code L-F678F1CE --region $(REGION) --query Quota.Value --output text 2>/dev/null); q=$${q%%.*}; qn=""; \
+	    case "$$q" in ''|*[!0-9]*) q=5; qn=" (quota L-F678F1CE unreadable: the default 5)";; esac; \
+	    if awk -v c="$(EGRESS_VPC_CIDR)" 'c != "" && $$2 == c { f = 1 } END { exit !f }' <<<"$$vpcs"; then row "[ok ]" "P15 $$n of $$q VPCs$$qn, one of them $(EGRESS_VPC_CIDR) (the egress VPC exists)"; \
+	    elif [ "$$n" -lt "$$q" ]; then row "[ok ]" "P15 $$n of $$q VPCs$$qn: room for the egress VPC"; \
+	    else row "[NO ]" "P15 $$n of $$q VPCs$$qn: the egress VPC needs one more (delete an unused VPC, or raise quota L-F678F1CE)"; fi; \
+	  else row "[NO ]" "P15 cannot count the VPCs (ec2 describe-vpcs)"; fi; \
+	  if out=$$(aws iam get-role --role-name AWSServiceRoleForLambda --region $(REGION) --query Role.Arn --output text 2>&1); then row "[ok ]" "P16 AWSServiceRoleForLambda present"; \
+	  elif grep -q NoSuchEntity <<<"$$out"; then row "[ok ]" "P16 AWSServiceRoleForLambda absent: the connector's first create makes it (the deploy policy allows iam:CreateServiceLinkedRole for lambda.amazonaws.com)"; \
+	  else row "[-  ]" "P16 AWSServiceRoleForLambda not determined (iam get-role: $$(tail -1 <<<"$$out" | cut -c1-120))"; fi; \
 	  exit $$bad
 
 # Internal: print the cargo-lambda vm-build would use (s3-preflight P1).

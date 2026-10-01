@@ -1,0 +1,61 @@
+{
+    "NetworkAcls": [
+        {
+            "Associations": [
+                {
+                    "NetworkAclAssociationId": "aclassoc-0123456789abcdef0",
+                    "NetworkAclId": "acl-0123456789abcdef0",
+                    "SubnetId": "subnet-0aaa1111bbbb2222c"
+                }
+            ],
+            "Entries": [
+                {
+                    "CidrBlock": "10.42.0.10/32",
+                    "Egress": true,
+                    "PortRange": {
+                        "From": 3128,
+                        "To": 3128
+                    },
+                    "Protocol": "6",
+                    "RuleAction": "allow",
+                    "RuleNumber": 100
+                },
+                {
+                    "CidrBlock": "0.0.0.0/0",
+                    "Egress": true,
+                    "Protocol": "-1",
+                    "RuleAction": "deny",
+                    "RuleNumber": 32767
+                },
+                {
+                    "CidrBlock": "10.42.0.10/32",
+                    "Egress": false,
+                    "PortRange": {
+                        "From": 1024,
+                        "To": 65535
+                    },
+                    "Protocol": "6",
+                    "RuleAction": "allow",
+                    "RuleNumber": 100
+                },
+                {
+                    "CidrBlock": "0.0.0.0/0",
+                    "Egress": false,
+                    "Protocol": "-1",
+                    "RuleAction": "deny",
+                    "RuleNumber": 32767
+                }
+            ],
+            "IsDefault": false,
+            "NetworkAclId": "acl-0123456789abcdef0",
+            "Tags": [
+                {
+                    "Key": "Name",
+                    "Value": "ai-env-egress-vms"
+                }
+            ],
+            "VpcId": "vpc-0123456789abcdef0",
+            "OwnerId": "123456789012"
+        }
+    ]
+}

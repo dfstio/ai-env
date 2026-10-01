@@ -1,0 +1,19 @@
+{
+    "Command": {
+        "CommandId": "0b1c2d3e-0000-4000-8000-000000000001",
+        "DocumentName": "AWS-RunShellScript",
+        "DocumentVersion": "$DEFAULT",
+        "Comment": "ai-env",
+        "InstanceIds": [
+            "i-0123456789abcdef0"
+        ],
+        "Targets": [],
+        "Status": "Pending",
+        "StatusDetails": "Pending",
+        "TargetCount": 1,
+        "CompletedCount": 0,
+        "ErrorCount": 0,
+        "DeliveryTimedOutCount": 0,
+        "TimeoutSeconds": 60
+    }
+}

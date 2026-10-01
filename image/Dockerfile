@@ -10,9 +10,10 @@
 # public.ecr.aws/lambda/microvms:al2023-minimal.2026.07.01.14
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:05cb9b38d841e7ff1b693dc9e894909612f340bf99ec97d426e8000a5bbe96c3
 
-# Packages the agent needs (git, archives, ps, useradd, find); no weak deps,
-# so no systemd. No chrony and no nftables in v0 (the shim measures the clock).
-RUN microdnf -y --setopt=install_weak_deps=0 install tar gzip unzip git-core procps-ng shadow-utils findutils \
+# Packages the agent needs (git, archives, ps, useradd, find; dig for the S5
+# egress check and dns-path probe); no weak deps, so no systemd. No chrony
+# and no nftables in v0 (the shim measures the clock).
+RUN microdnf -y --setopt=install_weak_deps=0 install tar gzip unzip git-core procps-ng shadow-utils findutils bind-utils \
  && microdnf clean all \
  && rm -rf /var/cache/dnf /var/cache/yum /var/lib/dnf/history* /var/log/dnf* /var/log/hawkey.log \
  && rm -f /etc/machine-id /var/lib/systemd/random-seed

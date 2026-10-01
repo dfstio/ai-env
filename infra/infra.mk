@@ -1,12 +1,15 @@
-# S3 infra targets (Pulumi program in infra/, deploy and image lifecycle).
+# S3/S5 infra targets (Pulumi program in infra/, deploy, image lifecycle, egress connector and proxy).
 # Included by the top-level Makefile; shares its variables (REGION, STACK,
-# AI_ENV, IMAGE_OUT, IMAGE_JSON, IMAGE_CONFIG, IMAGE_NAME) and its cmdline function.
+# AI_ENV, LAB_UNSET, IMAGE_OUT, IMAGE_JSON, IMAGE_CONFIG, IMAGE_NAME) and its cmdline function.
 #
 # Part A (the agent; read-only against AWS): infra-install, infra-typecheck, check-policies, preview-scratch.
-# Part B (Mike; creates or changes AWS resources): preview, deploy, image-*, logs, infra-status, runtime-key, destroy.
-# Every aws call carries --region $(REGION); nothing here runs `pulumi login`, sets the dev stack's passphrase or
-# uses --yes / --show-secrets (D17). The image lifecycle logic lives in infra/scripts/ops.sh (bash 3.2).
-.PHONY: infra-install infra-typecheck check-policies preview-scratch preview deploy image-wait image-status image-versions image-builds image-deactivate image-activate image-prune image-delete logs infra-status runtime-key destroy
+# Part B (Mike; creates or changes AWS resources): preview, deploy, image-*, logs, infra-status, runtime-key, destroy,
+# connector-*, egress-logs, allowlist-reload, proxy-*.
+# Every aws call carries --region $(REGION), and the lambda-core, ec2 and logs ones the pinned --endpoint-url; nothing
+# here runs `pulumi login`, sets the dev stack's passphrase or uses --yes / --show-secrets (D17; `ai-env proxy stop
+# --yes` is the operator CLI's own switch). The image lifecycle and egress logic lives in infra/scripts/ops.sh (bash 3.2).
+.PHONY: infra-install infra-typecheck check-policies preview-scratch preview deploy image-wait image-status image-versions image-builds image-deactivate image-activate image-prune image-delete logs infra-status runtime-key destroy \
+        connector-status connector-wait connector-probe connector-delete egress-logs allowlist-reload proxy-stop proxy-start proxy-patch
 
 INFRA              := infra
 # The program reads image.json and resolves the paths inside it from the repo root, also from a scratch copy.
@@ -26,9 +29,23 @@ SINCE              ?= 1h
 # RECORD_PROBE, FOLLOW) count only when given on the make command line: $(call cmdline,NAME), defined in the
 # top-level Makefile (s3-preflight's EXPECT_BUILD_FAILURE uses it too).
 KEEP_N              = $(or $(call cmdline,KEEP),3)
+# S5: the egress parameter file (contract 1, one scalar per line, read like IMAGE_CONFIG; ops.sh reads the names it
+# needs from it the same way). A missing file or key leaves the value empty (tests plant repos without it) and the
+# target using it fails loudly.
+EGRESS_CONFIG      := $(INFRA)/egress-config.json
+EGRESS_LOG_GROUP   := $(shell sed -n 's/.*"logGroup": *"\([^"]*\)".*/\1/p' $(EGRESS_CONFIG) 2>/dev/null)
+EGRESS_VPC_CIDR    := $(shell sed -n 's/.*"vpcCidr": *"\([^"]*\)".*/\1/p' $(EGRESS_CONFIG) 2>/dev/null)
+# The endpoints the S5 operator calls pin (bridge::awscli; ops.sh derives the same from REGION): never taken from the
+# command line or the environment.
+override LAMBDA_CORE_URL := https://lambda.$(REGION).amazonaws.com
+override EC2_URL         := https://ec2.$(REGION).amazonaws.com
+override LOGS_URL        := https://logs.$(REGION).amazonaws.com
+CONNECTOR_WAIT_TIMEOUT ?= 600
+CONNECTOR_WAIT_POLL    ?= 10
 OPS                 = REGION=$(REGION) IMAGE_NAME=$(IMAGE_NAME) IMAGE_OUT="$(abspath $(IMAGE_OUT))" STACK=$(STACK) \
                       IMAGE_WAIT_TIMEOUT=$(IMAGE_WAIT_TIMEOUT) IMAGE_WAIT_POLL=$(IMAGE_WAIT_POLL) VERSIONS_WARN=$(VERSIONS_WARN) \
-                      VERSIONS_QUOTA=$(VERSIONS_QUOTA) $(SHELL) $(INFRA)/scripts/ops.sh
+                      VERSIONS_QUOTA=$(VERSIONS_QUOTA) CONNECTOR_WAIT_TIMEOUT=$(CONNECTOR_WAIT_TIMEOUT) CONNECTOR_WAIT_POLL=$(CONNECTOR_WAIT_POLL) \
+                      $(SHELL) $(INFRA)/scripts/ops.sh
 # D29, shared by image-wait and deploy: poll the build, then always record the post-deploy snapshot and run
 # versions-diff (also after a failed build or a failed `pulumi up`: T3.4 records both). A subshell whose status is
 # the wait's, or 1 when the snapshot or the diff fails.
@@ -54,8 +71,8 @@ infra-typecheck: ## S3: typecheck the Pulumi program and its scripts (tsc --noEm
 check-policies: ## S3 T3.6: Access Analyzer on every IAM document + simulate-custom-policy of the runtime policy (§9); read-only
 	AI_ENV_REPO_ROOT="$(CURDIR)" REGION=$(REGION) POLICIES_OUT="$(CURDIR)/target/infra-policies" $(SHELL) $(INFRA)/scripts/check-policies.sh
 
-preview-scratch: ## S3 T3.2/T3.5: pulumi preview of a scratch copy (throwaway backend, stack, passphrase); NEGATIVE=no-logging|no-logging-cast|region
-	@$(PULUMI_ENV) REGION=$(REGION) SCRATCH="$(SCRATCH)" NEGATIVE="$(NEGATIVE)" $(SHELL) $(INFRA)/scripts/preview-scratch.sh
+preview-scratch: ## S3 T3.2/T3.5, S5: pulumi preview of a scratch copy (throwaway backend, stack, passphrase) + the plan check; NEGATIVE=no-logging|no-logging-cast|region|vm-sg-open|private-route|nacl-open|dns-support-on-in-none-mode|stray-rule|stray-type|late-transform|early-transform|dns-firewall-qtype|miswired|iam-widen|owned-param-reset; EGRESS_MODE=none|firewall
+	@$(PULUMI_ENV) REGION=$(REGION) SCRATCH="$(SCRATCH)" NEGATIVE="$(NEGATIVE)" EGRESS_MODE="$(EGRESS_MODE)" $(SHELL) $(INFRA)/scripts/preview-scratch.sh
 
 preview: ## S3 part B: image-zip, then pulumi preview --diff of the real stack $(STACK)
 	$(MAKE) --no-print-directory image-zip
@@ -67,13 +84,33 @@ preview: ## S3 part B: image-zip, then pulumi preview --diff of the real stack $
 # names MAKE literally even under -n, so `make -n deploy` stays a dry parse. `make deploy EXPECT_BUILD_FAILURE=1`
 # (command line only; the sub-make inherits it) turns preflight P12 into a loud [-  ] row and keeps every other gate:
 # the T3.4 `RUN false` negative deploys a zip that make test-docker cannot pass, with its snapshots, wait and diff.
-deploy: ## S3 part B: image-zip, s3-preflight PHASE=b, pre-deploy snapshots, pulumi up $(STACK) (interactive confirmation), image-wait; EXPECT_BUILD_FAILURE=1 skips P12 (T3.4)
+# S5, before anything is recorded or changed: check-policies (read-only Access Analyzer and simulations of every IAM
+# document), then ONE `pulumi preview --json` of the real stack, held in a shell variable (never written or echoed: it
+# carries the account id), on stdin to ops.sh plan-gate: the plan check (scripts/check-plan.sh, the final word on the
+# inventory and the egress spec) and the replacement guard (nothing the connector's ENIs pin is replaced, and the VPC's
+# Amazon DNS is not turned on, while a connector exists); either refusal stops the deploy before `pulumi up`. The
+# preview is --non-interactive (its stdout is captured, so it could not prompt): a passphrase stack needs
+# PULUMI_CONFIG_PASSPHRASE_FILE in the environment. Once `pulumi up` has started, ops.sh post-deploy runs on every
+# exit: after image-wait and connector-wait succeeded the whole of it (egress reload --if-changed when the proxy runs,
+# the vpc VM warning, the egress-check line on a new image version, egress status as the out-of-band drift check:
+# `pulumi up` does not refresh; drift fails the deploy at the end), after any failure the reload and the warnings
+# (`--after-failure`: Pulumi may already have written a proxy parameter); the exit status is the first failure's.
+deploy: ## S3/S5 part B: image-zip, s3-preflight PHASE=b, check-policies, plan check + replacement guard (pulumi preview --json), pre-deploy snapshots, pulumi up $(STACK) (interactive confirmation), image-wait, connector-wait, egress reload/status; EXPECT_BUILD_FAILURE=1 skips P12 (T3.4)
 	$(MAKE) --no-print-directory image-zip
 	$(MAKE) --no-print-directory s3-preflight PHASE=b
+	$(MAKE) --no-print-directory check-policies
+	@echo "cd $(INFRA) && pulumi preview --json --stack $(STACK): the plan check and the replacement guard"; \
+	  plan=$$(cd $(INFRA) && $(PULUMI_ENV) pulumi preview --json --show-sames --show-reads --non-interactive --stack $(STACK)) \
+	    || { st=$$?; printf '%s' "$$plan" | $(OPS) plan-errors; echo "deploy: pulumi preview --json failed (exit $$st): nothing deployed (a passphrase stack needs PULUMI_CONFIG_PASSPHRASE_FILE: --non-interactive cannot prompt)"; exit 1; }; \
+	  printf '%s' "$$plan" | $(OPS) plan-gate
 	@$(OPS) snapshot pre-deploy
-	@echo "cd $(INFRA) && pulumi up --stack $(STACK), then image-wait"; \
+	@echo "cd $(INFRA) && pulumi up --stack $(STACK), then image-wait, connector-wait and the egress steps"; \
 	  st=0; (cd $(INFRA) && $(PULUMI_ENV) pulumi up --stack $(STACK)) || st=$$?; \
-	  $(IMAGE_WAIT_SH); w=$$?; exit $$(( st ? st : w ))
+	  $(IMAGE_WAIT_SH); w=$$?; st=$$(( st ? st : w )); \
+	  if [ $$st -eq 0 ]; then $(OPS) connector-wait || st=$$?; fi; \
+	  if [ $$st -eq 0 ]; then after=""; else after=--after-failure; fi; \
+	  $(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' $(OPS) post-deploy $$after; p=$$?; \
+	  exit $$(( st ? st : p ))
 
 # D29: the wait decides from the versions against the pre-deploy snapshot; the post-deploy snapshot and
 # versions-diff run even after a failed build (T3.4 records both).
@@ -98,7 +135,7 @@ image-activate: ## S3 part B rollback: mark VERSION=<n> ACTIVE
 image-prune: ## S3 part B: delete all but the newest KEEP=3 versions (never an ACTIVE one, one in progress or one a VM runs); dry run unless YES=1
 	@$(OPS) prune "$(KEEP_N)" "$(call cmdline,YES)"
 
-image-delete: ## S3 part B recovery (e.g. a first build left CREATE_FAILED): delete the image outside Pulumi; CONFIRM=delete-image
+image-delete: ## S3 part B recovery (e.g. a first build left CREATE_FAILED): delete the image outside Pulumi (vm-guard first); CONFIRM=delete-image
 	@test "$(call cmdline,CONFIRM)" = delete-image || { echo "image-delete: deletes $(IMAGE_NAME) and its versions outside Pulumi; set CONFIRM=delete-image on the command line"; exit 1; }
 	@$(OPS) vm-guard
 	@$(OPS) delete-image
@@ -109,7 +146,7 @@ logs: ## S3 part B: list log groups under /aws/lambda-microvms and /aws/lambda/m
 	  aws logs describe-log-groups --log-group-name-prefix $$p --region $(REGION) --query 'logGroups[].[logGroupName,retentionInDays,storedBytes]' --output text | sed 's/^/  /'; done
 	aws logs tail $(LOG_GROUP) --since $(SINCE) --format short $(if $(filter 1,$(call cmdline,FOLLOW)),--follow) --region $(REGION)
 
-infra-status: ## S3 part B: ai-env infra status (stack outputs + one live read-only get-microvm-image vs bridge.toml [aws]); WRITE=1 edits [aws] and writes state/infra.toml
+infra-status: ## S3/S5 part B: ai-env infra status (stack outputs + live read-only get-microvm-image and get-network-connector vs bridge.toml [aws]); WRITE=1 edits [aws] and writes state/infra.toml
 	$(AI_ENV) infra status --stack $(STACK) $(if $(filter 1,$(call cmdline,WRITE)),--write)
 
 # D23: runtime credentials never enter Pulumi. The secret crosses exactly one pipe, from create-access-key into
@@ -181,8 +218,43 @@ runtime-key: ## S3 part B (D23): create an access key for ai-env-runtime, seal i
 	  if [ "$$rotate" = 1 ]; then aws iam delete-access-key --user-name $$user --access-key-id $$old --region $(REGION) || exit 1; \
 	    echo "runtime-key: rotated; deleted the old key $$old"; fi
 
-destroy: ## S3 part B: pulumi destroy of $(STACK) (CONFIRM=destroy-$(STACK); refuses while a VM of the image is not TERMINATED), then the post-destroy checklist
-	@test "$(call cmdline,CONFIRM)" = "destroy-$(STACK)" || { echo "destroy: removes the image and its versions, roles, runtime user and its keys, bucket, log group and budget of stack $(STACK); set CONFIRM=destroy-$(STACK) on the command line"; exit 1; }
+destroy: ## S3 part B: pulumi destroy of $(STACK) (CONFIRM=destroy-$(STACK); refuses while a VM of the image is not TERMINATED or a connector other than the stack's exists), then the post-destroy checklist
+	@test "$(call cmdline,CONFIRM)" = "destroy-$(STACK)" || { echo "destroy: removes the image and its versions, roles, runtime user and its keys, bucket, log group and budget, the egress VPC, proxy and connector of stack $(STACK); set CONFIRM=destroy-$(STACK) on the command line"; exit 1; }
 	@$(OPS) vm-guard
 	cd $(INFRA) && $(PULUMI_ENV) pulumi destroy --stack $(STACK)
 	@$(OPS) checklist
+
+# ---- S5 egress: the connector and the proxy (plans/s5-plan.md "Makefile / ops") ----
+
+connector-status: ## S5 part B: the egress connector (get-network-connector), any other connector, and the ENIs in the VM subnet (describe-network-interfaces --include-managed-resources: count, IPs, SGs; the subnet from the stack outputs)
+	@$(OPS) connector-status
+
+connector-wait: ## S5 part B: poll get-network-connector until ACTIVE (CONNECTOR_WAIT_TIMEOUT=600 s); FAILED or INACTIVE stop with the service's reason (make deploy runs it)
+	@$(OPS) connector-wait
+
+# T5.1: a Pulumi create returns only once the connector is ACTIVE, so the PENDING window is measured on a throw-away
+# second connector; ops.sh deletes it in a `trap ... EXIT` on every path, also when the probe or the wait fails.
+connector-probe: ## S5 part B T5.1: a throw-away connector on the stack connector's subnet/SG/role, `ai-env lab run connector-pending` while it is PENDING, then its activation time; deleted on every path; CONFIRM=create-probe-connector
+	@test "$(call cmdline,CONFIRM)" = create-probe-connector || { echo "connector-probe: creates a throw-away egress connector on the VM subnet (deleted at the end) and runs a MicroVM against it (one Touch ID); set CONFIRM=create-probe-connector on the command line"; exit 1; }
+	@$(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' $(OPS) connector-probe
+
+connector-delete: ## S5 part B recovery: delete the stack's egress connector outside Pulumi (before a replacement of the VPC, a subnet or an SG: the deploy's replacement guard says so); vm-guard first; CONFIRM=delete-connector
+	@test "$(call cmdline,CONFIRM)" = delete-connector || { echo "connector-delete: deletes the egress connector outside Pulumi (vpc VMs cannot start until make deploy creates it again); set CONFIRM=delete-connector on the command line"; exit 1; }
+	@$(OPS) vm-guard
+	@$(OPS) connector-delete
+
+egress-logs: ## S5 part B: tail the squid access log $(EGRESS_LOG_GROUP) (host names only, no paths; SINCE=1h, FOLLOW=1)
+	@test -n "$(EGRESS_LOG_GROUP)" || { echo "egress-logs: no logGroup in $(EGRESS_CONFIG)"; exit 1; }
+	aws logs tail $(EGRESS_LOG_GROUP) --since $(SINCE) --format short $(if $(filter 1,$(call cmdline,FOLLOW)),--follow) --region $(REGION) --endpoint-url $(LOGS_URL)
+
+allowlist-reload: ## S5 part B: ai-env egress reload (the proxy re-reads its parameters; squid -k parse first, the old config kept on any error)
+	$(LAB_UNSET) $(AI_ENV) egress reload
+
+proxy-stop: ## S5 part B: ai-env proxy stop (egress fails closed; a stopped proxy costs cents a day); refused while vpc VMs run unless YES=1
+	$(LAB_UNSET) $(AI_ENV) proxy stop $(if $(filter 1,$(call cmdline,YES)),--yes)
+
+proxy-start: ## S5 part B: ai-env proxy start (waits for running, SSM online and squid serving the current parameters)
+	$(LAB_UNSET) $(AI_ENV) proxy start
+
+proxy-patch: ## S5 part B: ai-env proxy patch (dnf upgrade --security through SSM, then squid restarted and proven to serve)
+	$(LAB_UNSET) $(AI_ENV) proxy patch

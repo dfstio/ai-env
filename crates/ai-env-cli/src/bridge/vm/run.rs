@@ -6,18 +6,26 @@
 //! poll, reuse of a workspace VM, termination with the row updated, and the
 //! adoption sweep after an ambiguous `RunMicrovm`.
 //!
+//! The S5 egress echo gate runs at all three places a VM becomes this
+//! bridge's: after `RunMicrovm` ([`select_vm_detailed`]), before a reuse
+//! (`try_reuse`) and before an adoption (the sweep and gc's `adopt`). A VM
+//! that does not echo exactly the connectors its egress requires is
+//! terminated (`terminated_by = policy`), audited `vm_egress_mismatch`, and
+//! the caller gets [`BridgeError::EgressMismatch`] (exit 9).
+//!
 //! The session token lives in the VM row only (0600, plan §2.4); the payload
 //! carries `sha256(token)`, and no audit row, log line or error text ever
 //! carries the token (it is registered with the scrubber as well).
 use crate::bridge::api::{self, EndpointClient, ImageVersion, IdleSpec, MicrovmApi, RunSpec, VmInfo, VmState, VmSummary};
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::config::{BridgeConfig, Paths};
+use crate::bridge::egress::{ConnectorAlias, ExpectedEcho};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::route::cwd_under_roots;
 use crate::bridge::vm::gc::EXPIRY_MARGIN_S;
 use crate::bridge::vm::lock::lock_exclusive;
 use crate::bridge::vm::owner;
-use crate::bridge::vm::registry::{self, IdleRow, RowStatus, VmRow, PENDING_STALE_S};
+use crate::bridge::vm::registry::{self, IdleRow, RowStatus, VmRow, GATE_MISMATCH, GATE_PASSED, GATE_PENDING, PENDING_STALE_S};
 use crate::wire::frame::{commitment_hex, Health, RunHookPayload, WireError};
 use crate::wire::redact::{register_secret, Secret};
 use crate::wire::slug::project_dir_name;
@@ -706,6 +714,144 @@ fn update_or_warn(paths: &Paths, row: &VmRow, f: impl Fn(&mut VmRow)) -> VmRow {
     }
 }
 
+// ---- the S5 egress echo gate -----------------------------------------------------------
+
+/// The configured connector's Id alias for a `vpc` run of `connectors`
+/// ([`ConnectorAlias::load`]: only when `state/infra.toml` records the Id of
+/// exactly that connector), so an echo naming it by Id passes; `None` for
+/// `internet`.
+pub(crate) fn echo_alias(paths: &Paths, egress: Egress, connectors: &[String]) -> Option<ConnectorAlias> {
+    if egress != Egress::Vpc {
+        return None;
+    }
+    connectors.iter().find_map(|c| ConnectorAlias::load(paths, c))
+}
+
+/// What the gate holds a VM row to: [`ExpectedEcho::for_row`] (`None` — a
+/// mismatch — for a `vpc` row without connectors, written before S5, or an
+/// unknown egress) and the alias of its connectors.
+pub(crate) fn row_gate(paths: &Paths, row: &VmRow) -> (Option<ExpectedEcho>, Option<ConnectorAlias>) {
+    let alias = row.egress.parse::<Egress>().ok().and_then(|e| echo_alias(paths, e, &row.egress_connectors));
+    (ExpectedEcho::for_row(row), alias)
+}
+
+/// Does `echoed` pass the gate for `expected` (`None`: never)?
+pub(crate) fn echo_passes(expected: Option<&ExpectedEcho>, echoed: &[String], alias: Option<&ConnectorAlias>) -> bool {
+    expected.is_some_and(|e| e.matches(echoed, alias))
+}
+
+/// The egress the gate judges right after `RunMicrovm`: its answer's, or —
+/// only when that is empty — `GetMicrovm`'s, asked every `step` until
+/// `deadline` (the budget the RUNNING wait shares). An answer with egress is
+/// judged; a PENDING one without egress is asked again; one in any other
+/// live state without egress, a failure other than a transient one
+/// ([`transient_get`], or `ResourceNotFound`: read-after-create), or the
+/// deadline leaves nothing echoed: a mismatch (fail closed). `Err(reason)`
+/// when `GetMicrovm` says the VM ended (TERMINATING/TERMINATED) or still
+/// does not know it at the deadline: the S4 `Terminated` path, not a
+/// mismatch.
+async fn run_echo<A: MicrovmApi>(api: &A, answer: &VmInfo, step: Duration, deadline: Instant) -> Result<Vec<String>, String> {
+    if !answer.egress.is_empty() {
+        return Ok(answer.egress.clone());
+    }
+    let id = answer.id.as_str();
+    loop {
+        let mut not_found = false;
+        match api.get(id).await {
+            Ok(vm) if vm.state.is_terminal() => {
+                let reason = vm.state_reason.unwrap_or_else(|| "no stateReason".to_string());
+                return Err(format!("{id} is {} before its egress was echoed: {reason}", vm.state.as_str()));
+            }
+            Ok(vm) if !vm.egress.is_empty() => return Ok(vm.egress),
+            Ok(vm) if vm.state == VmState::Pending => tracing::debug!("egress gate: {id} PENDING without egress; asking again"),
+            Ok(vm) => {
+                tracing::warn!("egress gate: {id} is {} and echoes no egress (fail closed)", vm.state.as_str());
+                return Ok(Vec::new());
+            }
+            Err(BridgeError::VmNotFound(_)) => not_found = true,
+            Err(e) if transient_get(&e) => tracing::debug!("egress gate: GetMicrovm {id} again after: {e}"),
+            Err(e) => {
+                tracing::warn!("egress gate: GetMicrovm {id}: {e}; nothing echoed (fail closed)");
+                return Ok(Vec::new());
+            }
+        }
+        if Instant::now() >= deadline {
+            if not_found {
+                return Err(format!("{id}: GetMicrovm still did not find it when the RUNNING budget ran out (RunMicrovm had answered)"));
+            }
+            tracing::warn!("egress gate: {id} echoed no egress within the budget (fail closed)");
+            return Ok(Vec::new());
+        }
+        tokio::time::sleep(step).await;
+    }
+}
+
+/// Record a pass on `row` (rows lock): `egress_gate = passed`, and the echo
+/// as the gate compared it — normalised, an Id form as its name: exactly
+/// `expected`'s set (so a row written before S5 gets its connectors). A
+/// failed write is a warning: the row keeps its old verdict, which the next
+/// `ai-env vm gc` gates again.
+fn record_pass(paths: &Paths, row: &VmRow, expected: &ExpectedEcho) -> VmRow {
+    let echo = expected.connectors().to_vec();
+    update_or_warn(paths, row, |r| {
+        r.egress_connectors.clone_from(&echo);
+        r.egress_gate = Some(GATE_PASSED.to_string());
+    })
+}
+
+/// A VM whose echo failed the gate. First the verdict, `egress_gate =
+/// mismatch`, on its row (when there is one; rows lock), so a failed
+/// terminate — or this process dying — leaves gc a row to finish; then
+/// `TerminateMicrovm` ([`request_terminate`]: the row terminated by
+/// `policy`; no wait); then audit `vm_egress_mismatch {id, expected, echoed,
+/// via, purpose, terminated}` (lists joined with `,`; an empty expected list
+/// as `(none planned)`). `terminated` is whether `TerminateMicrovm` was
+/// accepted (a row write that failed after it does not count against it).
+/// Returns the error (exit 9); when not terminated, the caller keeps the id.
+pub(crate) async fn reject_echo<A: MicrovmApi>(api: &A, paths: &Paths, id: &str, expected: Option<&ExpectedEcho>, echoed: &[String], via: &str, purpose: &str) -> BridgeError {
+    if let Err(e) = registry::update_row(paths, id, |r| r.egress_gate = Some(GATE_MISMATCH.to_string())) {
+        tracing::warn!("vm row {id}: egress_gate mismatch not recorded: {e}");
+        eprintln!("ai-env: warning: vm row {id}: the egress mismatch not recorded: {e}");
+    }
+    let terminated = match request_terminate(api, paths, id, "policy").await {
+        Ok(recorded) => {
+            if let Err(e) = recorded {
+                tracing::warn!("vm row {id}: the policy termination not recorded: {e}");
+                eprintln!("ai-env: warning: vm row {id}: terminated, but the row was not updated: {e}");
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!("egress gate: terminating {id}: {e}");
+            eprintln!("ai-env: warning: egress mismatch: terminating {id} failed: {e}");
+            false
+        }
+    };
+    let expected: Vec<String> = expected.map(|e| e.connectors().to_vec()).unwrap_or_default();
+    audit_event(
+        paths,
+        "vm_egress_mismatch",
+        &[
+            ("id", id.to_string()),
+            ("expected", if expected.is_empty() { "(none planned)".to_string() } else { expected.join(",") }),
+            ("echoed", echoed.join(",")),
+            ("via", via.to_string()),
+            ("purpose", purpose.to_string()),
+            ("terminated", terminated.to_string()),
+        ],
+    );
+    tracing::warn!("vm egress mismatch {id} (via {via}): echoed [{}], expected [{}]; terminated {terminated}", echoed.join(", "), expected.join(", "));
+    BridgeError::egress_mismatch(id, expected, echoed.to_vec(), terminated)
+}
+
+/// The id of a VM the gate could not confirm terminated (`None` otherwise).
+fn still_alive(e: &BridgeError) -> Option<String> {
+    match e {
+        BridgeError::EgressMismatch(m) if !m.terminated => Some(m.id.clone()),
+        _ => None,
+    }
+}
+
 /// The warning line (without the `ai-env: warning:` prefix) when the
 /// resolved version's memory differs from `[vm].memory_mib`, the quota input
 /// (plan S4 D7); `None` when they agree or the version reports no memory.
@@ -805,8 +951,10 @@ pub struct SelectFailure {
     /// ambiguously twice (D16): hand it to [`adopt_after_ambiguous`].
     pub kept_pending: Option<Box<VmRow>>,
     /// The VM `RunMicrovm` started, when the failure came after it answered
-    /// and the VM may still be alive (the row could not be promoted, or the
-    /// RUNNING poll failed without terminating it).
+    /// and the VM may still be alive (the row could not be promoted, the
+    /// RUNNING poll failed without terminating it, or the egress gate could
+    /// not terminate it); also a reuse candidate the egress gate could not
+    /// terminate.
     pub started: Option<String>,
     /// The client token of the pending row this call wrote, set as soon as
     /// the row exists; `None` when the failure came before a pending row was
@@ -852,7 +1000,9 @@ pub async fn select_vm<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, po
 }
 
 /// SELECT_VM (plan S4 §7). The plan already passed POLICY
-/// ([`RunPlan::from_cfg`]). Steps: resolve the image version live (D6; a
+/// ([`RunPlan::from_cfg`]); a `vpc` plan without a connector is refused
+/// first (`EgressRequired`, exit 9: no VM boots without what the gate holds
+/// it to). Steps: resolve the image version live (D6; a
 /// version whose memory differs from `[vm].memory_mib` costs one warning
 /// line, D7); take `state/workspaces/<slug>.lock` (300 s) when a workspace
 /// is given and hold it to the end; reuse the workspace's VM when allowed
@@ -862,14 +1012,28 @@ pub async fn select_vm<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, po
 /// `RunMicrovm` (D16: an ambiguous failure is retried once with the same
 /// spec and client token; still failing, the pending row is kept for
 /// `ai-env vm gc` and returned in [`SelectFailure::kept_pending`]; a
-/// definite failure removes it); promote the row with the echoed fields;
-/// with `plan.wait`, poll RUNNING with `poll` (not RUNNING in budget,
-/// transient `GetMicrovm` failures included → TerminateMicrovm, row
-/// terminated by `timeout`, exit 7 naming the id; TERMINATING/TERMINATED
-/// while starting → exit 8). Audits `vm_run` once `RunMicrovm` answered,
-/// `vm_reuse` on reuse. Every failure after the pending row was written
-/// carries its client token ([`SelectFailure::client_token`]).
+/// definite failure removes it); promote the row with the echoed fields
+/// (`egress_gate` still `pending`); the S5 egress echo gate: the
+/// `RunMicrovm` answer's egress (or, when it is empty, `GetMicrovm`'s:
+/// `run_echo`) must be exactly the connectors the plan's egress requires
+/// ([`ExpectedEcho::for_plan`]; an Id-form echo only with the alias of
+/// `state/infra.toml`), else the row's verdict becomes `mismatch`,
+/// TerminateMicrovm (row terminated by `policy`), audit `vm_egress_mismatch`
+/// and [`BridgeError::EgressMismatch`] (exit 9; [`SelectFailure::started`]
+/// only when the terminate failed); a pass records `passed` and the echo
+/// (normalised) in the row's `egress_connectors`; with `plan.wait`, poll
+/// RUNNING with `poll` (one budget with the gate's `GetMicrovm`s; not
+/// RUNNING in budget, transient `GetMicrovm` failures included →
+/// TerminateMicrovm, row terminated by `timeout`, exit 7 naming the id;
+/// TERMINATING/TERMINATED while starting → exit 8), and the RUNNING answer,
+/// when it carries egress, passes the gate too. Audits `vm_run` once
+/// `RunMicrovm` answered, `vm_reuse` on reuse. Every failure after the
+/// pending row was written carries its client token
+/// ([`SelectFailure::client_token`]).
 pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, poll: Poll) -> Result<Selected, SelectFailure> {
+    let Some(expected) = ExpectedEcho::for_plan(plan.egress, &plan.egress_connectors) else {
+        return Err(BridgeError::EgressRequired.into());
+    };
     let (version, note) = resolve_image_version(api, &plan.image_arn, &plan.want_version).await?;
     if let Some(note) = note {
         eprintln!("ai-env: {note}");
@@ -884,7 +1048,7 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
     };
     if plan.reuse {
         if let Some((canonical, _)) = &plan.workspace {
-            if let Some(selected) = try_reuse(api, paths, plan, &workspace_key(canonical), &version.version, poll).await? {
+            if let Some(selected) = try_reuse(api, paths, plan, &expected, &workspace_key(canonical), &version.version, poll).await? {
                 return Ok(selected);
             }
         }
@@ -928,12 +1092,38 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
         ],
     );
     tracing::info!("vm run {} (image version {}, egress {}, purpose {})", row.id, row.image_version, plan.egress, plan.purpose);
+    // The S5 egress echo gate: exactly the connectors this egress requires, or the VM goes.
+    // Its GetMicrovm retries and the RUNNING wait share one budget (our own row writes are not charged to it).
+    let t1 = Instant::now();
+    let id = row.id.clone();
+    let alias = echo_alias(paths, plan.egress, &plan.egress_connectors);
+    let t_echo = Instant::now();
+    let echoed = match run_echo(api, &vm, poll.step, t_echo + poll.budget).await {
+        Ok(echoed) => echoed,
+        Err(m) => {
+            record_ended(paths, &row, &m);
+            return Err(fail(BridgeError::Terminated(m), None, None));
+        }
+    };
+    let left = poll.budget.saturating_sub(t_echo.elapsed());
+    if !expected.matches(&echoed, alias.as_ref()) {
+        let error = reject_echo(api, paths, &id, Some(&expected), &echoed, "run", plan.purpose).await;
+        let alive = still_alive(&error);
+        return Err(fail(error, None, alive));
+    }
+    row = record_pass(paths, &row, &expected);
+    // A RunMicrovm answer without egress reports what GetMicrovm echoed (`--no-wait` returns it).
+    let vm = if vm.egress.is_empty() { VmInfo { egress: echoed, ..vm } } else { vm };
     if !plan.wait {
         return Ok(Selected::Started { row, vm, run_ms, running_ms: 0 });
     }
-    let t1 = Instant::now();
-    let id = row.id.clone();
-    match wait_after_run(api, &id, poll).await {
+    match wait_after_run(api, &id, Poll { step: poll.step, budget: left }).await {
+        // The RUNNING answer is a GetMicrovm too: its egress, when it reports one, must still pass.
+        Ok(vm) if !vm.egress.is_empty() && !expected.matches(&vm.egress, alias.as_ref()) => {
+            let error = reject_echo(api, paths, &id, Some(&expected), &vm.egress, "run", plan.purpose).await;
+            let alive = still_alive(&error);
+            Err(fail(error, None, alive))
+        }
         Ok(vm) => {
             let now = unix_now();
             match update_or_write(paths, &row, |r| refresh(r, &vm, now)) {
@@ -943,11 +1133,7 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
         }
         // The service itself answered TERMINATING/TERMINATED: a confirmed end.
         Err(BridgeError::Terminated(m)) => {
-            let now = unix_now();
-            update_or_warn(paths, &row, |r| {
-                mark_terminated(r, "platform", now);
-                r.state_reason = Some(m.clone());
-            });
+            record_ended(paths, &row, &m);
             Err(fail(BridgeError::Terminated(m), None, None))
         }
         Err(BridgeError::Sdk { op: "wait", message }) => match terminate_and_record(api, paths, &id, "timeout", None).await {
@@ -962,12 +1148,25 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The S4 `Terminated` path after `RunMicrovm` (the service answered
+/// TERMINATING/TERMINATED, or never found the VM): the row terminated by
+/// `platform`, with `m` as its reason.
+fn record_ended(paths: &Paths, row: &VmRow, m: &str) {
+    let now = unix_now();
+    update_or_warn(paths, row, |r| {
+        mark_terminated(r, "platform", now);
+        r.state_reason = Some(m.to_string());
+    });
+}
+
 /// Placement under `state/vms.lock`: count (D15), then stamp `created` and
 /// write the pending row with a fresh session token (its client token is
 /// `plan.client_token` when set, else a fresh uuid v7; the payload is padded
-/// to `plan.pad_payload_to` when set) and, for internet egress, append
-/// `vm_egress_internet`; the lock is released on return. Returns the pending
-/// row and the payload for `RunMicrovm`.
+/// to `plan.pad_payload_to` when set; `egress_connectors` the planned list,
+/// `egress_gate` pending)
+/// and, for internet egress, append `vm_egress_internet`; the lock is
+/// released on return. Returns the pending row and the payload for
+/// `RunMicrovm`.
 async fn place<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, version: &str) -> Result<(VmRow, String), BridgeError> {
     let _placement = lock_exclusive(&paths.placement_lock(), PLACEMENT_LOCK_BUDGET, "placement lock").await?;
     let listing = api.list(Some(&plan.image_arn)).await?;
@@ -1006,6 +1205,9 @@ async fn place<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, version: &
         max_duration_s: plan.max_duration_s,
         idle: Some(idle_row(&plan.idle)),
         egress: plan.egress.to_string(),
+        // The planned connectors: what adoption holds the VM's echo to (the gate stores the echo once it passes).
+        egress_connectors: plan.egress_connectors.clone(),
+        egress_gate: Some(GATE_PENDING.to_string()),
         ingress: plan.ingress_connectors.clone(),
         shell: plan.shell,
         execution_role: plan.execution_role_arn.clone(),
@@ -1062,9 +1264,19 @@ async fn run_with_retry<A: MicrovmApi>(api: &A, paths: &Paths, row: &VmRow, spec
 /// service reports TERMINATING/TERMINATED (at once or while waiting) is
 /// marked terminated and the next candidate is tried; `ResourceNotFound`
 /// marks a running/suspended row terminated, while a pending/unknown row
-/// (possibly seconds old: read-after-create) is only skipped. Every row
-/// write goes through the rows lock.
-async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, workspace: &str, version: &str, poll: Poll) -> Result<Option<Selected>, BridgeError> {
+/// (possibly seconds old: read-after-create) is only skipped. A row of
+/// other connectors than the plan's `wanted` (the configuration changed) is
+/// not a candidate. The S5 egress echo gate, on that first `GetMicrovm`,
+/// before any resume: a VM whose egress is not exactly what its row requires
+/// ([`ExpectedEcho::for_row`]; a `vpc` row without connectors, written before
+/// S5, never passes), or whose row already says `mismatch` (a terminate that
+/// failed), is terminated (`policy`), audited `vm_egress_mismatch` (via
+/// `reuse`) and skipped; when the terminate fails the error is returned with
+/// the id in [`SelectFailure::started`]. A pass records `passed` and the echo
+/// (a row written before S5 gets its connectors), and the settled answer
+/// (after a wait or a resume), when it carries egress, must pass again.
+/// Every row write goes through the rows lock.
+async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted: &ExpectedEcho, workspace: &str, version: &str, poll: Poll) -> Result<Option<Selected>, SelectFailure> {
     let now = unix_now();
     let min_left = i64::from(plan.migrate_before_wall_s);
     let candidates: Vec<VmRow> = registry::list_rows(paths)?
@@ -1072,10 +1284,31 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, worksp
         .filter(|r| !r.is_pending_row() && r.workspace.as_deref() == Some(workspace) && r.status != RowStatus::Terminated)
         .filter(|r| r.wall_left(now).is_some_and(|left| left > min_left))
         .filter(|r| r.image_arn == plan.image_arn && r.image_version == version && r.egress == plan.egress.as_str() && r.shell == plan.shell)
+        // Another connector's VM is not this run's; a row without connectors (before S5) goes to the gate.
+        .filter(|r| ExpectedEcho::for_row(r).is_none_or(|e| &e == wanted))
         .collect();
+    // A VM that failed the gate: never reused; the run fails only when it could not be terminated.
+    let reject = |error: BridgeError, id: &str| match still_alive(&error) {
+        Some(alive) => Err(SelectFailure { error, kept_pending: None, started: Some(alive), client_token: None }),
+        None => {
+            eprintln!("ai-env: warning: not reusing {id}: {error}");
+            Ok(())
+        }
+    };
     for row in candidates {
+        let (expected, alias) = row_gate(paths, &row);
         let vm = match api.get(&row.id).await {
-            Ok(vm) if !vm.state.is_terminal() => vm,
+            Ok(vm) if !vm.state.is_terminal() => {
+                let judged = row.egress_gate.as_deref() != Some(GATE_MISMATCH) && echo_passes(expected.as_ref(), &vm.egress, alias.as_ref());
+                if !judged {
+                    reject(reject_echo(api, paths, &row.id, expected.as_ref(), &vm.egress, "reuse", plan.purpose).await, &row.id)?;
+                    continue;
+                }
+                if let Some(e) = &expected {
+                    record_pass(paths, &row, e);
+                }
+                vm
+            }
             Ok(vm) => {
                 let at = vm.terminated_at_unix.and_then(|t| u64::try_from(t).ok()).unwrap_or(now);
                 update_or_warn(paths, &row, |r| {
@@ -1093,7 +1326,7 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, worksp
                 tracing::info!("vm reuse: {} ({}) not found yet: skipped", row.id, row.status.as_str());
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let id = row.id.clone();
         let settled = async {
@@ -1133,8 +1366,13 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, worksp
                 eprintln!("ai-env: warning: not reusing {id}: {e} (ai-env vm terminate {id} if it is stuck)");
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
+        // The settled answer is a GetMicrovm too: its egress, when it reports one, must still pass.
+        if !vm.egress.is_empty() && !echo_passes(expected.as_ref(), &vm.egress, alias.as_ref()) {
+            reject(reject_echo(api, paths, &id, expected.as_ref(), &vm.egress, "reuse", plan.purpose).await, &id)?;
+            continue;
+        }
         let seen = unix_now();
         let row = update_or_write(paths, &row, |r| refresh(r, &vm, seen))?;
         audit_event(paths, "vm_reuse", &[("id", row.id.clone()), ("purpose", plan.purpose.to_string()), ("resumed", resumed.to_string())]);
@@ -1156,18 +1394,7 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, worksp
 /// for (`state_seen` updated) — a wait failure is returned as an error, the
 /// record stays. Without `wait` the result is `Ok(None)`.
 pub async fn terminate_and_record<A: MicrovmApi>(api: &A, paths: &Paths, id: &str, by: &str, wait: Option<Poll>) -> Result<Option<VmInfo>, BridgeError> {
-    if !registry::is_vm_id(id) {
-        return Err(BridgeError::Config(format!("not a microvm id: {id:?}")));
-    }
-    match api.terminate(id).await {
-        Ok(()) | Err(BridgeError::VmNotFound(_)) => {}
-        Err(e) => return Err(e),
-    }
-    let now = unix_now();
-    let recorded = registry::update_row(paths, id, |row| mark_terminated(row, by, now));
-    audit_event(paths, "vm_terminate", &[("id", id.to_string()), ("by", by.to_string())]);
-    tracing::info!("vm terminate {id} (by {by})");
-    recorded?;
+    request_terminate(api, paths, id, by).await??;
     let Some(poll) = wait else {
         return Ok(None);
     };
@@ -1180,6 +1407,27 @@ pub async fn terminate_and_record<A: MicrovmApi>(api: &A, paths: &Paths, id: &st
         tracing::warn!("vm row {id}: TERMINATED not recorded: {e}");
     }
     Ok(Some(vm))
+}
+
+/// The first half of [`terminate_and_record`]: `TerminateMicrovm(id)` (a
+/// `ResourceNotFound` counts as done), the row terminated by `by` and
+/// `vm_terminate {id, by}` audited. The outer `Err` means TerminateMicrovm
+/// was not accepted (or `id` is not a VM id): the VM may be alive; the inner
+/// one that it was, but the row write failed: the VM is terminating all the
+/// same (the egress gate must not count that as a failed terminate).
+pub(crate) async fn request_terminate<A: MicrovmApi>(api: &A, paths: &Paths, id: &str, by: &str) -> Result<Result<(), BridgeError>, BridgeError> {
+    if !registry::is_vm_id(id) {
+        return Err(BridgeError::Config(format!("not a microvm id: {id:?}")));
+    }
+    match api.terminate(id).await {
+        Ok(()) | Err(BridgeError::VmNotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    let now = unix_now();
+    let recorded = registry::update_row(paths, id, |row| mark_terminated(row, by, now));
+    audit_event(paths, "vm_terminate", &[("id", id.to_string()), ("by", by.to_string())]);
+    tracing::info!("vm terminate {id} (by {by})");
+    Ok(recorded.map(|_| ()))
 }
 
 // ---- adoption --------------------------------------------------------------------------
@@ -1241,10 +1489,21 @@ pub enum Adoption {
 /// polled to RUNNING within one shared `poll` budget, then probed. The VM
 /// whose `/health` (for its own `microvm_id`) answers the pending row's
 /// `owner` + `created` is the run's: the row is promoted (`<id>.toml`
-/// written, the pending row removed, audit `vm_adopt`). A candidate that
-/// ends while waiting is skipped; one that cannot be asked makes the result
-/// [`Adoption::Unresolved`] unless the match is found.
+/// written, the pending row removed, audit `vm_adopt`) once its egress
+/// passes the S5 echo gate; when it does not, the VM is terminated and the
+/// result is [`BridgeError::EgressMismatch`] (see `promote_adopted`: when
+/// `terminated` is false the caller keeps the id in its terminate guard). A
+/// candidate that ends while waiting is skipped; one that cannot be asked
+/// makes the result [`Adoption::Unresolved`] unless the match is found. The
+/// gate's audit names no purpose (`-`): callers that know theirs use
+/// [`adopt_after_ambiguous_for`].
 pub async fn adopt_after_ambiguous<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths, pending: &VmRow, since_unix: u64, poll: Poll) -> Result<Adoption, BridgeError> {
+    adopt_after_ambiguous_for(api, ep, paths, pending, since_unix, poll, "-").await
+}
+
+/// [`adopt_after_ambiguous`] for a caller of `purpose` (`smoke`, `probe`,
+/// `test`, …), which a `vm_egress_mismatch` audit row names.
+pub async fn adopt_after_ambiguous_for<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths, pending: &VmRow, since_unix: u64, poll: Poll, purpose: &str) -> Result<Adoption, BridgeError> {
     if !pending.is_pending_row() {
         return Err(BridgeError::Config(format!("adopt_after_ambiguous: {} is not a pending row", pending.stem())));
     }
@@ -1288,7 +1547,7 @@ pub async fn adopt_after_ambiguous<A: MicrovmApi, E: EndpointClient>(api: &A, ep
             continue;
         };
         if owner == pending.owner && created == pending.created {
-            let row = promote_adopted(paths, pending, &vm, "sweep")?;
+            let row = promote_adopted(api, paths, pending, &vm, "sweep", purpose).await?;
             tracing::info!("adopted {} for pending row {}", row.id, pending.stem());
             return Ok(Adoption::Adopted(row.id));
         }
@@ -1297,21 +1556,51 @@ pub async fn adopt_after_ambiguous<A: MicrovmApi, E: EndpointClient>(api: &A, ep
 }
 
 /// Adopt `pending` as the row of `vm` (gc's `adopt` class): the promoted row,
-/// written, the pending row removed, audit `vm_adopt`.
-pub(crate) fn adopt_pending(paths: &Paths, pending: &VmRow, vm: &VmInfo) -> Result<VmRow, BridgeError> {
-    promote_adopted(paths, pending, vm, "gc")
+/// written, the pending row removed, audit `vm_adopt` — or, when its egress
+/// fails the S5 echo gate, the VM terminated and `EgressMismatch` (see
+/// `promote_adopted`).
+pub(crate) async fn adopt_pending<A: MicrovmApi>(api: &A, paths: &Paths, pending: &VmRow, vm: &VmInfo) -> Result<VmRow, BridgeError> {
+    promote_adopted(api, paths, pending, vm, "gc", "gc").await
 }
 
-/// Promote the pending row of `pending.client_token` to the row of `vm`
-/// under the rows lock (`registry::adopt_pending_locked`: the on-disk pending
-/// row is the one promoted) and audit `vm_adopt {id, client_token, egress,
-/// via}`. When another process adopted it first (its id row carries the same
+/// The S5 egress echo gate, then promotion. `vm` (its `GetMicrovm` answer)
+/// must echo exactly the connectors the pending row planned
+/// ([`ExpectedEcho::for_row`]; a `vpc` pending row without connectors,
+/// written before S5, never passes). A pass promotes the pending row of
+/// `pending.client_token` to the row of `vm` under the rows lock
+/// (`registry::adopt_pending_locked`: the on-disk pending row is the one
+/// promoted), with `egress_gate = passed` and the echo (normalised) in
+/// `egress_connectors`, and audits `vm_adopt {id, client_token, egress,
+/// via}`; when another process adopted it first (its id row carries the same
 /// client token) that row is returned without a second audit row; when the
-/// pending row was removed instead, the result is a `Config` error.
-fn promote_adopted(paths: &Paths, pending: &VmRow, vm: &VmInfo, via: &str) -> Result<VmRow, BridgeError> {
+/// pending row was removed instead, the result is a `Config` error. A
+/// mismatch is never adopted: the pending row is promoted with `egress_gate
+/// = mismatch` (the record, and what gc finishes should the terminate fail),
+/// then TerminateMicrovm (the row terminated by `policy`, no wait, no
+/// `vm_adopt`) and audit `vm_egress_mismatch` (via `sweep` or `gc`, of
+/// `purpose`); the result is [`BridgeError::EgressMismatch`].
+async fn promote_adopted<A: MicrovmApi>(api: &A, paths: &Paths, pending: &VmRow, vm: &VmInfo, via: &str, purpose: &str) -> Result<VmRow, BridgeError> {
+    let (expected, alias) = row_gate(paths, pending);
     let now = unix_now();
     let fallback = created_unix(pending).unwrap_or(now);
-    let Some(row) = registry::adopt_pending_locked(paths, &pending.client_token, |r| apply_echo(r, vm, fallback, now))? else {
+    if !echo_passes(expected.as_ref(), &vm.egress, alias.as_ref()) {
+        // The verdict first, on the VM's own row: whatever happens next, gc finds a `mismatch` row to finish.
+        if let Err(e) = registry::adopt_pending_locked(paths, &pending.client_token, |r| {
+            apply_echo(r, vm, fallback, now);
+            r.egress_gate = Some(GATE_MISMATCH.to_string());
+        }) {
+            tracing::warn!("vm row {}: the egress mismatch not recorded: {e}", vm.id);
+            eprintln!("ai-env: warning: vm row {} not written (egress mismatch): {e}", vm.id);
+        }
+        return Err(reject_echo(api, paths, &vm.id, expected.as_ref(), &vm.egress, via, purpose).await);
+    }
+    let echo: Vec<String> = expected.as_ref().map(|e| e.connectors().to_vec()).unwrap_or_default();
+    let promoted = registry::adopt_pending_locked(paths, &pending.client_token, |r| {
+        apply_echo(r, vm, fallback, now);
+        r.egress_connectors.clone_from(&echo);
+        r.egress_gate = Some(GATE_PASSED.to_string());
+    })?;
+    let Some(row) = promoted else {
         return match registry::read_row(paths, &vm.id)? {
             Some(row) if row.client_token == pending.client_token => Ok(row),
             _ => Err(BridgeError::Config(format!("pending row {} is gone (removed by another process): {} not adopted", pending.stem(), vm.id))),

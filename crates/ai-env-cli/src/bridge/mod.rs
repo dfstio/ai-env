@@ -2,14 +2,18 @@
 //! TLS policy, scrubbed logging, config, the sibling-binary lookup, doctor
 //! rows, the pre-code gates, the S2 pump with its host-state recorder,
 //! transcript-mirror writer, session registry, resume seeder and audit log,
-//! and the S3 infrastructure helpers (image scan, claude pin, stack outputs,
-//! sealed AWS credentials). Nothing here is compiled into the VM image.
+//! the S3 infrastructure helpers (image scan, claude pin, stack outputs,
+//! sealed AWS credentials), the S4 MicroVM lifecycle (`vm`), and the S5
+//! egress allowlist (`egress`, with the operator's aws CLI calls in
+//! `awscli`). Nothing here is compiled into the VM image.
 pub mod api;
 pub mod audit;
+pub mod awscli;
 pub mod census;
 pub mod config;
 pub mod creds;
 pub mod doctor;
+pub mod egress;
 pub mod errors;
 pub mod gates;
 pub mod hoststate;

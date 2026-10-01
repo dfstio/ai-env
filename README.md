@@ -298,6 +298,62 @@ and endpoint shared by processes), `AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL=1` and
 says `"backend":"fake"` (the fake API) or `"backend":"sdk+knobs"` (the real service with another
 knob) instead of `"sdk"`. The live Makefile targets drop all three; `make s4-smoke` accepts only `"sdk"`.
 
+### Egress allowlist (stage S5)
+
+`--egress vpc` VMs get the stack's network connector `ai-env-egress` (the default once
+`make infra-status WRITE=1` wrote `[aws] egress_connector_arn`). Its subnet, 10.42.1.0/24 of a dedicated
+VPC, has no route but `local`; its security group allows only TCP 3128 to the proxy's address and its
+network ACL only that and the replies. The one way out is a squid proxy (t4g.nano, 10.42.0.10) that
+tunnels CONNECT to port 443 of exactly the allowlisted hosts — the stack's `allow` list plus
+per-workspace extras, minus suspended hosts — and refuses everything else: plain HTTP, other ports, IP
+literals, names that resolve to private, loopback or link-local addresses, clients outside the VM
+subnet. The VPC has no Amazon DNS (`enableDnsSupport` off; DHCP hands out public resolvers that only
+the proxy may reach), so a VM resolves nothing itself; its tools go through the proxy
+(`ai-env egress env` prints `https_proxy` and friends).
+
+- **Echo gate.** A VM must echo exactly the connectors its egress requires (`vpc`: the configured
+  connector; `internet`: exactly `INTERNET_EGRESS`) when RunMicrovm answers, when it is RUNNING, on
+  reuse and on adoption. Anything else is terminated, audited `vm_egress_mismatch` and exit 9. Rows
+  record the verdict (`egress_gate`); `vm gc --yes` gates again every live row not marked `passed`.
+- **Proxy config** lives in the SSM parameters `/ai-env/proxy/{squid.conf,allow,extras,suspended}`,
+  never in user data. `ai-env-proxy-reload` on the instance validates every line, `squid -k parse`s
+  the staged config, swaps it in with `squid.conf` last, restarts squid when a host leaves the set (open
+  tunnels close) and rolls back on any failure; squid never starts on the package's default config.
+- **Operator commands** (`ai-env egress …`, `ai-env proxy …`) are the operator's own `aws` CLI calls
+  (region and endpoint pinned; the account must be the connector's), reading the stack's ids from
+  `state/infra.toml`: `egress allow SLUG HOST [--remove]`, `egress suspend HOST [--restore]` (a concurrent
+  write is detected after the fact from the parameter's version, never prevented; any failure after a
+  removal says `STILL ALLOWED on the proxy` and exits 7), `egress reload [--if-changed]`, `egress status` (connector, ENIs, routes, security groups,
+  NACL, VPC DNS and DHCP, no endpoints, NAT, peering or IPv6, the proxy serving exactly the parameters
+  the stack rendered; any drift is exit 1), `egress env`, `proxy stop|start|patch`.
+- **`egress check`** starts its own `--egress vpc --shell` VM and runs, through the platform shell,
+  curl and dig cases: direct egress and DNS must be closed, the allowlist must answer (401 from the API)
+  and refuse the rest. The case markers are VM-reported, so a pass also needs the VM-independent
+  network verification of `egress status` and squid's own log lines (from CloudWatch) for the run's
+  tunnels and denials. A pass is recorded in `state/egress-verified.toml` for that image version and
+  connector and bound to the connector's live Id, Version, subnet and security group and to the image
+  build; any failing check of its own VM revokes the connector's records (`--vm ID` only reports).
+- **Credentials (S7)** may enter a VM only through `egress::credential_gate`: a `vpc` VM whose live
+  echo is exactly the connector, whose image version has a recorded passing check, and whose `dns-path`
+  verdict is `no-dns` (or a platform resolver with `[egress] accept_platform_dns = true`). Never an
+  `internet` VM.
+
+```sh
+make test-proxy                # squid on AL2023 in Docker: the allowlist, rebinding, reload, rollback (+ real systemd)
+make preview-scratch [EGRESS_MODE=firewall] [NEGATIVE=…]   # read-only Pulumi preview + the plan check and its negatives
+make deploy                    # (Mike) plan check + replacement guard, pulumi up, connector-wait, proxy reload, egress status
+                               # (its preview runs --non-interactive: export PULUMI_CONFIG_PASSPHRASE_FILE for a passphrase stack)
+make infra-status WRITE=1      # adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
+make s5-smoke                  # three `vm smoke --egress vpc --json` passes; the echo must be exactly the connector
+make test-egress               # the live egress tests (direct closed, allowlist, extra + removal, after resume)
+ai-env egress check            # the recorded proof the credential gate needs (re-run after every new image version)
+make egress-logs [FOLLOW=1]    # squid's access log (hosts only, never a path)
+make proxy-stop                # when idle: stops the proxy (no vpc VM has egress then); proxy-start brings it back
+```
+
+`ai-env doctor` shows `[NO ]` for the egress row while `[egress] require = true` (the default) and no
+connector is configured; a stopped proxy is `[-  ]`, never `[NO ]`.
+
 ### Access-control policies (`keygen --access-control`)
 
 `any-biometry-or-passcode` (default — Touch ID with password fallback; works in clamshell) ·
@@ -375,6 +431,9 @@ the diffs annoy you.
   spawned — no prompt is ever shown for a file your keys can't open.
 - Secrets never appear in argv; decrypted bytes for `run` live in a zeroized buffer and reach
   the child only through its environment.
+- A MicroVM whose egress echo is not exactly what its egress requires is terminated and never
+  returned, reused or adopted (S5); no credential enters a VM that `egress::credential_gate`
+  refuses.
 
 ## Workspace
 

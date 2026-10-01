@@ -1,12 +1,14 @@
 //! Bridge rows appended to `ai-env doctor`. Every row builder is a pure
 //! function of already-collected inputs so it is unit-testable without the
-//! subprocesses that `rows` runs (5 s timeout each).
+//! subprocesses that `rows` runs (5 s timeout each; 15 s for aws). Doctor
+//! never calls Pulumi: the stack's view comes from `state/infra.toml`.
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
-use crate::bridge::config::{env_region_warning, AwsCfg, BridgeConfig, Paths, VmCfg, REGION};
+use crate::bridge::awscli::aws_run;
+use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, EgressCfg, Paths, VmCfg, REGION};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
 use crate::bridge::errors::BridgeError;
-use crate::bridge::infra::{base_image_verdict, read_infra_state, InfraState};
+use crate::bridge::infra::{base_image_verdict, read_infra_state, InfraState, CONNECTOR_NOT_IN_OUTPUTS};
 use crate::bridge::sibling::{exists_exec, find_sibling, Sibling, INSTALL_HINT};
 use crate::bridge::vm::registry::{list_rows, RowStatus, VmRow, PENDING_STALE_S};
 use crate::commands::{DoctorLine, Tag};
@@ -644,18 +646,19 @@ pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
 }
 
 /// The rows that read `bridge.toml` itself — [`row_execution_role`],
-/// [`row_vm_config`], [`row_microvm_quota`] (`quota` as there) — only for a
-/// file that parsed: for an absent or unparseable one they would describe
-/// the built-in defaults as if configured, so one `[-  ]` line says they
-/// were not checked (the bridge.toml row already names the reason).
+/// [`row_vm_config`], [`row_microvm_quota`] (`quota` as there),
+/// [`row_egress`] (`state` as there) — only for a file that parsed: for an
+/// absent or unparseable one they would describe the built-in defaults as if
+/// configured, so one `[-  ]` line says they were not checked (the
+/// bridge.toml row already names the reason).
 #[must_use]
-pub fn rows_bridge_settings(loaded: &Result<Option<BridgeConfig>, BridgeError>, quota: Option<Result<&str, &str>>) -> Vec<DoctorLine> {
+pub fn rows_bridge_settings(loaded: &Result<Option<BridgeConfig>, BridgeError>, quota: Option<Result<&str, &str>>, state: &Result<Option<InfraState>, BridgeError>) -> Vec<DoctorLine> {
     let why = match loaded {
-        Ok(Some(cfg)) => return vec![row_execution_role(&cfg.aws), row_vm_config(&cfg.vm), row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib)],
+        Ok(Some(cfg)) => return vec![row_execution_role(&cfg.aws), row_vm_config(&cfg.vm), row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib), row_egress(&cfg.egress, &cfg.aws, state)],
         Ok(None) => "no bridge.toml",
         Err(_) => "bridge.toml unparseable",
     };
-    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm] and microvm memory quota not checked ({why})"))]
+    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota and egress connector not checked ({why})"))]
 }
 
 /// `state/vms`: the rows by status, and whether a pending row (a
@@ -693,6 +696,138 @@ pub fn row_execution_role(aws: &AwsCfg) -> DoctorLine {
     match aws.execution_role_arn.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         Some(arn) => DoctorLine::row(Tag::Ok, format!("execution role {arn}")),
         None => DoctorLine::row(Tag::Warn, "[aws].execution_role_arn unset: runtime logs and run reports need it  <- make infra-status WRITE=1"),
+    }
+}
+
+// ---- S5 rows ------------------------------------------------------------------------
+
+/// What writes the egress keys of `[aws]` and records the connector's state.
+const INFRA_STATUS_HINT: &str = "make infra-status WRITE=1";
+
+/// `[aws].egress_connector_arn` against `[egress].require`, and the state of
+/// that connector as the last `ai-env infra status` recorded it
+/// (`state/infra.toml` as [`read_infra_state`] returned it; no call).
+/// `[NO ]`, naming the key and `make infra-status WRITE=1`: a set ARN or
+/// `proxy_private_ip` that `ai-env vm` and `lab` refuse (the rules of
+/// [`AwsCfg::validate_egress`], whatever `require` says), or no ARN while
+/// `require` is on. No ARN with `require` off is `[-  ]`: flag-less runs use
+/// the platform's internet egress. A valid ARN is `[ok ]` when its recorded
+/// state is ACTIVE, `[!! ]` for any other state, when the state file records
+/// another connector, or when the stack exports none
+/// ([`CONNECTOR_NOT_IN_OUTPUTS`]: the key is stale), and `[-  ]` when no
+/// state is recorded for it (no file, an unreadable one — its error named —,
+/// no live read yet, or the read failed: the recorded source says why).
+#[must_use]
+pub fn row_egress(egress: &EgressCfg, aws: &AwsCfg, state: &Result<Option<InfraState>, BridgeError>) -> DoctorLine {
+    let arn = aws.egress_connector_arn.as_deref().filter(|a| !a.trim().is_empty());
+    if let Some(arn) = arn.filter(|a| !is_connector_arn(a)) {
+        return DoctorLine::row(Tag::No, format!("[aws].egress_connector_arn = {arn:?} is not a network connector of an account in {REGION} (ai-env vm and lab refuse it)  <- {INFRA_STATUS_HINT}"));
+    }
+    if let Some(ip) = aws.proxy_private_ip.as_deref().filter(|ip| !ip.trim().is_empty() && !is_rfc1918(ip)) {
+        return DoctorLine::row(Tag::No, format!("[aws].proxy_private_ip = {ip:?} is not an RFC 1918 address (ai-env vm and lab refuse it)  <- {INFRA_STATUS_HINT}"));
+    }
+    let Some(arn) = arn else {
+        return if egress.require {
+            DoctorLine::row(Tag::No, format!("[aws].egress_connector_arn unset, but [egress].require = true (ai-env vm run refuses without --egress internet)  <- {INFRA_STATUS_HINT} after the S5 deploy"))
+        } else {
+            DoctorLine::row(Tag::Skip, "[aws].egress_connector_arn unset ([egress].require = false: flag-less runs use the platform's internet egress)")
+        };
+    };
+    let name = format!("egress connector {arn}");
+    let s = match state {
+        Ok(Some(s)) => s,
+        Ok(None) => return DoctorLine::row(Tag::Skip, format!("{name}: no state recorded (no state/infra.toml)  <- {INFRA_STATUS_HINT}")),
+        Err(e) => return DoctorLine::row(Tag::Skip, format!("{name}: state unknown (state/infra.toml unreadable: {e})  <- {INFRA_STATUS_HINT}")),
+    };
+    if s.connector_state_source.as_deref() == Some(CONNECTOR_NOT_IN_OUTPUTS) {
+        return DoctorLine::row(Tag::Warn, format!("{name}: the stack exports no connector: remove [aws].egress_connector_arn (and proxy_private_ip) from bridge.toml"));
+    }
+    let norm = crate::bridge::egress::normalize_connector;
+    if let Some(recorded) = s.connector_arn.as_deref().filter(|r| norm(r) != norm(arn)) {
+        return DoctorLine::row(Tag::Warn, format!("{name}: state/infra.toml records the connector {recorded} instead  <- {INFRA_STATUS_HINT}"));
+    }
+    let source = s.connector_state_source.as_deref().unwrap_or("an unrecorded source");
+    match s.connector_state.as_deref().map(str::trim).filter(|st| !st.is_empty()) {
+        None => DoctorLine::row(Tag::Skip, format!("{name}: no state recorded ({})  <- {INFRA_STATUS_HINT}", s.connector_state_source.as_deref().map_or_else(|| "no live read yet".to_string(), |src| format!("state/infra.toml: {src}")))),
+        Some(st) if st.eq_ignore_ascii_case("ACTIVE") => {
+            let id = s.connector_id.as_deref().map(|id| format!("id {id}; ")).unwrap_or_default();
+            DoctorLine::row(Tag::Ok, format!("{name} ACTIVE ({id}state from {source})"))
+        }
+        Some(st) => DoctorLine::row(Tag::Warn, format!("{name} is {st} (state from {source}): ai-env vm run --egress vpc needs it ACTIVE  <- make connector-status, then {INFRA_STATUS_HINT}")),
+    }
+}
+
+/// An EC2 instance id: `i-` and 8 or 17 lowercase hex digits (the one value
+/// from `state/infra.toml` that [`rows`] puts on an aws command line).
+#[must_use]
+pub fn is_instance_id(id: &str) -> bool {
+    id.strip_prefix("i-").is_some_and(|h| matches!(h.len(), 8 | 17) && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+}
+
+/// Whether [`rows`] makes the proxy row's one call, and for which instance:
+/// only with an aws identity (`identity`, as for every other doctor call)
+/// and a recorded `proxy_instance_id` that is an instance id
+/// ([`is_instance_id`]); `None`: no call.
+#[must_use]
+pub fn proxy_call(identity: bool, state: Option<&InfraState>) -> Option<&str> {
+    identity.then_some(())?;
+    state?.proxy_instance_id.as_deref().filter(|id| is_instance_id(id))
+}
+
+/// The proxy address the VMs are told (shared with `ai-env egress env`).
+pub use crate::bridge::egress::effective_proxy_ip;
+
+/// `aws ec2 <these>` through [`aws_run`] (region, pinned endpoint, no
+/// pager, no OAuth token): the one operator call of the proxy row.
+fn proxy_describe_args(id: &str) -> [&str; 3] {
+    ["describe-instances", "--instance-ids", id]
+}
+
+/// The egress proxy (S5), from `state/infra.toml`'s `proxy_instance_id` (as
+/// [`read_infra_state`] returned it) and one `ec2 describe-instances` of it
+/// (`described`: `None` when not made — no aws identity, [`proxy_call`]).
+/// No id recorded is `[-  ]` (an unreadable file: its error named), an id
+/// that is not one `[!! ]` without a call. Running is `[ok ]` with its
+/// private IP (`[!! ]` when that is not the address the VMs are told,
+/// [`effective_proxy_ip`] of `configured_ip` = `[aws].proxy_private_ip`).
+/// Stopped, stopping or pending is `[-  ]`, never `[NO ]`: `make
+/// proxy-stop` when idle is the routine, and a vpc VM simply has no way out
+/// until `make proxy-start`. Terminated, shutting-down or an unknown state
+/// is `[!! ]`; a failed call is `[!! ] not checked`, no verdict.
+#[must_use]
+pub fn row_proxy(configured_ip: Option<&str>, state: &Result<Option<InfraState>, BridgeError>, described: Option<Result<&str, &str>>) -> DoctorLine {
+    let s = match state {
+        Ok(s) => s.as_ref(),
+        Err(e) => return DoctorLine::row(Tag::Skip, format!("egress proxy not checked (state/infra.toml unreadable: {e})  <- {INFRA_STATUS_HINT}")),
+    };
+    let Some(id) = s.and_then(|s| s.proxy_instance_id.as_deref()).filter(|id| !id.trim().is_empty()) else {
+        let why = if s.is_some() { "state/infra.toml has no proxy_instance_id" } else { "no state/infra.toml" };
+        return DoctorLine::row(Tag::Skip, format!("egress proxy: none recorded ({why})  <- {INFRA_STATUS_HINT} after the S5 deploy"));
+    };
+    if !is_instance_id(id) {
+        return DoctorLine::row(Tag::Warn, format!("egress proxy: proxy_instance_id {id:?} in state/infra.toml is not an instance id; not checked  <- {INFRA_STATUS_HINT}"));
+    }
+    let name = format!("egress proxy {id}");
+    let json = match described {
+        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked (no aws identity)")),
+        Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("{name} not checked: {e}")),
+        Some(Ok(json)) => json,
+    };
+    let doc = serde_json::from_str::<serde_json::Value>(json).ok();
+    let instance = doc.as_ref().and_then(|v| v.get("Reservations")?.as_array()).into_iter().flatten().filter_map(|r| r.get("Instances")?.as_array()).flatten().find(|i| i.get("InstanceId").and_then(|x| x.as_str()) == Some(id));
+    let Some(instance) = instance else {
+        return DoctorLine::row(Tag::Warn, format!("{name} not checked: the describe-instances output does not list it"));
+    };
+    let st = instance.get("State").and_then(|s| s.get("Name")).and_then(|n| n.as_str()).unwrap_or("in no state");
+    let ip = instance.get("PrivateIpAddress").and_then(|x| x.as_str());
+    match st {
+        "running" => match (ip, effective_proxy_ip(configured_ip, s)) {
+            (Some(ip), (want, from)) if ip != want => DoctorLine::row(Tag::Warn, format!("{name} running at {ip}, but the VMs' proxy address is {want} ({from})  <- {INFRA_STATUS_HINT}")),
+            (ip, _) => DoctorLine::row(Tag::Ok, format!("{name} running ({})", ip.unwrap_or("no private IP reported"))),
+        },
+        "stopped" | "stopping" => DoctorLine::row(Tag::Skip, format!("{name} {st}: make proxy-start (vpc VMs have no way out until it runs)")),
+        "pending" => DoctorLine::row(Tag::Skip, format!("{name} pending (starting)")),
+        other => DoctorLine::row(Tag::Warn, format!("{name} is {other}: vpc VMs have no way out  <- redeploy the stack's proxy, then {INFRA_STATUS_HINT}")),
     }
 }
 
@@ -882,8 +1017,13 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             lines.push(runtime_credentials(&paths.aws_env()));
             let state = read_infra_state(paths);
             lines.push(row_infra_state(&state, &paths.infra_state()));
+            let recorded = state.as_ref().ok().and_then(Option::as_ref);
             let loaded = loaded.as_ref().expect("loaded with the paths");
-            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state));
+            // S5: the egress row reads only the state file; the proxy row
+            // adds one operator call, for a recorded proxy and an identity.
+            let described = proxy_call(arn.is_some(), recorded).map(|id| aws_run("ec2", &proxy_describe_args(id), None, Duration::from_secs(15)));
+            lines.push(row_proxy(cfg.aws.proxy_private_ip.as_deref(), &state, described.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
             lines.push(match list_rows(paths) {
                 Ok(vms) => row_vm_registry(&vms, unix_now()),
                 Err(e) => DoctorLine::row(Tag::Warn, format!("vm registry unreadable: {e}")),
@@ -1199,20 +1339,287 @@ mod tests {
     #[test]
     fn rows_bridge_settings_only_for_a_parsed_bridge_toml() {
         let quota = quota_json("4");
+        let active = ok(active_state());
         for (loaded, why) in [(Ok(None), "no bridge.toml"), (Err(BridgeError::Config("[vm].max_concurrent: invalid type".into())), "bridge.toml unparseable")] {
-            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)));
+            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)), &active);
             let got: Vec<(Tag, String)> = rows.iter().map(text).collect();
-            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm] and microvm memory quota not checked ({why})"))]);
-            assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0);
+            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm], microvm memory quota and egress connector not checked ({why})"))]);
+            assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0, "the default [egress].require never fails a doctor without bridge.toml");
         }
         let cfg = BridgeConfig { vm: VmCfg { max_concurrent: 3, memory_mib: 2048, ..VmCfg::default() }, ..BridgeConfig::default() };
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), Some(Ok(&quota))).iter().map(text).collect();
-        assert_eq!(got.len(), 3, "{got:?}");
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), Some(Ok(&quota)), &active).iter().map(text).collect();
+        assert_eq!(got.len(), 4, "{got:?}");
         assert_eq!(got[0], text(&row_execution_role(&cfg.aws)));
         assert_eq!(got[1], text(&row_vm_config(&cfg.vm)));
         assert!(got[2].0 == Tag::Warn && got[2].1.contains(" 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB"), "{got:?}");
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg)), None).iter().map(text).collect();
+        assert_eq!(got[3], text(&row_egress(&cfg.egress, &cfg.aws, &active)));
+        assert_eq!(got[3].0, Tag::No, "the defaults: require on, no connector: {got:?}");
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), None, &Ok(None)).iter().map(text).collect();
         assert_eq!(got[2], (Tag::Skip, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)".to_string()));
+        // A configured connector with an ACTIVE recorded state: the row is [ok ].
+        let cfg = BridgeConfig { aws: AwsCfg { egress_connector_arn: Some(CONNECTOR.into()), proxy_private_ip: Some("10.42.0.10".into()), ..AwsCfg::default() }, ..cfg };
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg)), None, &active).iter().map(text).collect();
+        assert_eq!(got[3].0, Tag::Ok, "{got:?}");
+    }
+
+    const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
+    const PROXY_ID: &str = "i-0123456789abcdef0";
+
+    /// What `ai-env infra status --write` records after a live ACTIVE read.
+    fn active_state() -> InfraState {
+        InfraState {
+            stack: "dev".into(),
+            connector_arn: Some(CONNECTOR.into()),
+            connector_id: Some("nc-0a1b2c3d4e5f60718".into()),
+            connector_state: Some("ACTIVE".into()),
+            connector_state_source: Some("live 2026-10-01T10:00:00Z".into()),
+            proxy_instance_id: Some(PROXY_ID.into()),
+            proxy_private_ip: Some("10.42.0.10".into()),
+            ..InfraState::default()
+        }
+    }
+
+    /// `state` as `read_infra_state` returns a readable file.
+    fn ok(state: InfraState) -> Result<Option<InfraState>, BridgeError> {
+        Ok(Some(state))
+    }
+
+    fn unreadable() -> Result<Option<InfraState>, BridgeError> {
+        Err(BridgeError::Config("/r/state/infra.toml is a symlink; refusing to read it".into()))
+    }
+
+    fn egress_cfg(require: bool) -> EgressCfg {
+        EgressCfg { require, ..EgressCfg::default() }
+    }
+
+    fn aws_with(arn: Option<&str>, ip: Option<&str>) -> AwsCfg {
+        AwsCfg { egress_connector_arn: arn.map(str::to_string), proxy_private_ip: ip.map(str::to_string), ..AwsCfg::default() }
+    }
+
+    /// Whether `ai-env vm` and `lab` refuse these values (`AwsCfg::validate_egress`).
+    fn config_rejects(arn: &str, ip: Option<&str>) -> bool {
+        aws_with(Some(arn), ip).validate_egress().is_err()
+    }
+
+    /// `[egress].require` with no connector, or any connector `ai-env vm`
+    /// refuses, is `[NO ]` (doctor exit 1) naming the key and the fix.
+    #[test]
+    fn row_egress_fails_when_required_and_unset_or_invalid() {
+        for unset in [None, Some(""), Some("  ")] {
+            for state in [ok(active_state()), Ok(None), unreadable()] {
+                let row = row_egress(&egress_cfg(true), &aws_with(unset, None), &state);
+                let (tag, t) = text(&row);
+                assert_eq!(tag, Tag::No, "{unset:?}: {t}");
+                assert_eq!(t, "[aws].egress_connector_arn unset, but [egress].require = true (ai-env vm run refuses without --egress internet)  <- make infra-status WRITE=1 after the S5 deploy");
+                assert_eq!(crate::commands::doctor_exit_code(&[row], false), 1);
+            }
+            let (tag, t) = text(&row_egress(&egress_cfg(false), &aws_with(unset, None), &Ok(None)));
+            assert_eq!((tag, t.as_str()), (Tag::Skip, "[aws].egress_connector_arn unset ([egress].require = false: flag-less runs use the platform's internet egress)"), "{unset:?}");
+        }
+        let managed = crate::bridge::egress::internet_egress_arn();
+        for bad in [managed.as_str(), "arn:aws:lambda:eu-west-3:123456789012:network-connector:ai-env-egress", "ai-env-egress", " arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress", "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress:x"] {
+            for require in [true, false] {
+                let row = row_egress(&egress_cfg(require), &aws_with(Some(bad), Some("10.42.0.10")), &ok(active_state()));
+                let (tag, t) = text(&row);
+                assert_eq!(tag, Tag::No, "{bad} (require {require}): {t}");
+                assert!(t.starts_with(&format!("[aws].egress_connector_arn = {bad:?} is not a network connector")) && t.ends_with("  <- make infra-status WRITE=1"), "{t}");
+                assert!(config_rejects(bad, None), "vm and lab refuse it too: {bad}");
+            }
+        }
+        for bad in ["8.8.8.8", "100.64.0.10", "10.42.0.10/32"] {
+            let (tag, t) = text(&row_egress(&egress_cfg(true), &aws_with(Some(CONNECTOR), Some(bad)), &ok(active_state())));
+            assert_eq!(tag, Tag::No, "{bad}: {t}");
+            assert!(t.starts_with(&format!("[aws].proxy_private_ip = {bad:?} is not an RFC 1918 address")) && t.ends_with("  <- make infra-status WRITE=1"), "{t}");
+            assert!(config_rejects(CONNECTOR, Some(bad)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn row_egress_follows_the_recorded_connector_state() {
+        let aws = aws_with(Some(CONNECTOR), Some("10.42.0.10"));
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &ok(active_state())));
+        assert_eq!((tag, t.as_str()), (Tag::Ok, "egress connector arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress ACTIVE (id nc-0a1b2c3d4e5f60718; state from live 2026-10-01T10:00:00Z)"));
+        // A versioned ARN on either side is the same connector; require off changes nothing for a configured one.
+        let versioned = InfraState { connector_arn: Some(format!("{CONNECTOR}:1")), ..active_state() };
+        assert_eq!(text(&row_egress(&egress_cfg(false), &aws_with(Some(&format!("{CONNECTOR}:1")), None), &ok(versioned.clone()))).0, Tag::Ok);
+        assert_eq!(text(&row_egress(&egress_cfg(true), &aws, &ok(versioned))).0, Tag::Ok);
+
+        for st in ["PENDING", "INACTIVE", "FAILED", "DELETING", "DELETE_FAILED", "SOMETHING_NEW"] {
+            let row = row_egress(&egress_cfg(true), &aws, &ok(InfraState { connector_state: Some(st.into()), ..active_state() }));
+            let (tag, t) = text(&row);
+            assert_eq!(tag, Tag::Warn, "{st}: {t}");
+            assert!(t.contains(&format!("ai-env-egress is {st} (state from live 2026-10-01T10:00:00Z): ai-env vm run --egress vpc needs it ACTIVE  <- make connector-status")), "{t}");
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0, "{st}: a warning, not a failure");
+        }
+
+        // No state recorded for it: skip-style, with the hint (and the recorded reason when the live read failed).
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &Ok(None)));
+        assert_eq!((tag, t.as_str()), (Tag::Skip, "egress connector arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress: no state recorded (no state/infra.toml)  <- make infra-status WRITE=1"));
+        // An unreadable state file is named as such, with its error (never "no state/infra.toml").
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &unreadable()));
+        assert_eq!(tag, Tag::Skip, "{t}");
+        assert!(t.ends_with(": state unknown (state/infra.toml unreadable: config: /r/state/infra.toml is a symlink; refusing to read it)  <- make infra-status WRITE=1") && !t.contains("no state/infra.toml"), "{t}");
+        let s3_era = InfraState { stack: "dev".into(), ..InfraState::default() };
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &ok(s3_era.clone())));
+        assert!(tag == Tag::Skip && t.ends_with(": no state recorded (no live read yet)  <- make infra-status WRITE=1"), "{t}");
+        let failed = InfraState {
+            connector_id: None,
+            connector_state: None,
+            connector_state_source: Some("pulumi outputs (live read failed: aws lambda-core get-network-connector: An error occurred (AccessDeniedException))".into()),
+            ..active_state()
+        };
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &ok(failed)));
+        assert_eq!(tag, Tag::Skip, "{t}");
+        assert!(t.ends_with(": no state recorded (state/infra.toml: pulumi outputs (live read failed: aws lambda-core get-network-connector: An error occurred (AccessDeniedException)))  <- make infra-status WRITE=1"), "{t}");
+
+        // The stack exports no connector any more (infra-status recorded it): a warning naming the stale key, for any require.
+        let stale = InfraState { connector_state_source: Some(CONNECTOR_NOT_IN_OUTPUTS.into()), ..s3_era };
+        for require in [true, false] {
+            let row = row_egress(&egress_cfg(require), &aws, &ok(stale.clone()));
+            let (tag, t) = text(&row);
+            assert_eq!((tag, t.as_str()), (Tag::Warn, "egress connector arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress: the stack exports no connector: remove [aws].egress_connector_arn (and proxy_private_ip) from bridge.toml"));
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+        }
+
+        // The state file describes another connector: a warning, whatever its state.
+        let other = InfraState { connector_arn: Some("arn:aws:lambda:eu-central-1:123456789012:network-connector:old-egress".into()), ..active_state() };
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &ok(other)));
+        assert_eq!(tag, Tag::Warn, "{t}");
+        assert!(t.ends_with(": state/infra.toml records the connector arn:aws:lambda:eu-central-1:123456789012:network-connector:old-egress instead  <- make infra-status WRITE=1"), "{t}");
+        // A lower-case state (hand-written) and no Id still read.
+        let (tag, t) = text(&row_egress(&egress_cfg(true), &aws, &ok(InfraState { connector_state: Some("active".into()), connector_id: None, connector_state_source: None, ..active_state() })));
+        assert!(tag == Tag::Ok && t.ends_with("ai-env-egress ACTIVE (state from an unrecorded source)"), "{t}");
+    }
+
+    fn described(state: &str, ip: Option<&str>) -> String {
+        let mut i = serde_json::json!({"InstanceId": PROXY_ID, "InstanceType": "t4g.nano", "State": {"Code": 16, "Name": state}, "SubnetId": "subnet-0123456789abcdef0", "VpcId": "vpc-0123456789abcdef0"});
+        if let Some(ip) = ip {
+            i["PrivateIpAddress"] = serde_json::json!(ip);
+        }
+        serde_json::json!({"Reservations": [{"ReservationId": "r-0123456789abcdef0", "OwnerId": "123456789012", "Instances": [i]}]}).to_string()
+    }
+
+    #[test]
+    fn row_proxy_running_is_ok_and_a_stopped_proxy_is_never_a_failure() {
+        let s = ok(active_state());
+        let (tag, t) = text(&row_proxy(None, &s, Some(Ok(&described("running", Some("10.42.0.10"))))));
+        assert_eq!((tag, t.as_str()), (Tag::Ok, "egress proxy i-0123456789abcdef0 running (10.42.0.10)"));
+        let (tag, t) = text(&row_proxy(None, &s, Some(Ok(&described("running", Some("10.42.0.99"))))));
+        assert_eq!((tag, t.as_str()), (Tag::Warn, "egress proxy i-0123456789abcdef0 running at 10.42.0.99, but the VMs' proxy address is 10.42.0.10 (state/infra.toml)  <- make infra-status WRITE=1"));
+        assert_eq!(text(&row_proxy(None, &s, Some(Ok(&described("running", None))))).1, "egress proxy i-0123456789abcdef0 running (no private IP reported)");
+
+        // The address the VMs are told wins, as `ai-env egress env` picks it: [aws] first, then the state, then the default.
+        let at_99 = described("running", Some("10.42.0.99"));
+        let (tag, t) = text(&row_proxy(Some("10.42.0.99"), &s, Some(Ok(&at_99))));
+        assert_eq!((tag, t.as_str()), (Tag::Ok, "egress proxy i-0123456789abcdef0 running (10.42.0.99)"), "[aws].proxy_private_ip matches");
+        let (tag, t) = text(&row_proxy(Some("10.42.0.98"), &s, Some(Ok(&at_99))));
+        assert_eq!((tag, t.as_str()), (Tag::Warn, "egress proxy i-0123456789abcdef0 running at 10.42.0.99, but the VMs' proxy address is 10.42.0.98 ([aws].proxy_private_ip)  <- make infra-status WRITE=1"));
+        let (tag, t) = text(&row_proxy(Some("8.8.8.8"), &s, Some(Ok(&at_99))));
+        assert!(tag == Tag::Warn && t.ends_with("is 10.42.0.10 (state/infra.toml)  <- make infra-status WRITE=1"), "a public [aws] value is never the proxy: {t}");
+        let no_ip = ok(InfraState { proxy_private_ip: None, ..active_state() });
+        let (tag, t) = text(&row_proxy(None, &no_ip, Some(Ok(&at_99))));
+        assert!(tag == Tag::Warn && t.ends_with("is 10.42.0.10 (the default)  <- make infra-status WRITE=1"), "{t}");
+        assert_eq!(text(&row_proxy(None, &no_ip, Some(Ok(&described("running", Some(crate::bridge::egress::PROXY_IP)))))).0, Tag::Ok);
+        assert_eq!(effective_proxy_ip(Some(" 192.168.1.5 "), None), ("192.168.1.5", "[aws].proxy_private_ip"));
+
+        for st in ["stopped", "stopping"] {
+            let row = row_proxy(None, &s, Some(Ok(&described(st, Some("10.42.0.10")))));
+            let (tag, t) = text(&row);
+            assert_eq!((tag, t.as_str()), (Tag::Skip, format!("egress proxy i-0123456789abcdef0 {st}: make proxy-start (vpc VMs have no way out until it runs)").as_str()));
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0, "{st} is never [NO ]");
+        }
+        assert_eq!(text(&row_proxy(None, &s, Some(Ok(&described("pending", None))))), (Tag::Skip, "egress proxy i-0123456789abcdef0 pending (starting)".to_string()));
+        for st in ["terminated", "shutting-down", "rebooting-forever"] {
+            let row = row_proxy(None, &s, Some(Ok(&described(st, None))));
+            let (tag, t) = text(&row);
+            assert_eq!(tag, Tag::Warn, "{st}: {t}");
+            assert!(t.starts_with(&format!("egress proxy i-0123456789abcdef0 is {st}: vpc VMs have no way out  <- ")), "{t}");
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+        }
+    }
+
+    /// Whether `rows` makes the one call: an identity and a valid recorded id, nothing else.
+    #[test]
+    fn the_proxy_call_needs_an_identity_and_a_valid_recorded_id() {
+        let s = active_state();
+        assert_eq!(proxy_call(true, Some(&s)), Some(PROXY_ID));
+        assert_eq!(proxy_call(false, Some(&s)), None, "no aws identity: no call");
+        assert_eq!(proxy_call(true, None), None, "no state: no call");
+        for none in [None, Some(String::new())] {
+            assert_eq!(proxy_call(true, Some(&InfraState { proxy_instance_id: none.clone(), ..s.clone() })), None, "{none:?}");
+        }
+        for bad in ["--dry-run", "i-0123456789ABCDEF0", "i-012345", "i-0123456789abcdef0 --x", " i-0123456789abcdef0", "vpc-0123456789abcdef0", "i-0123456789abcdefg"] {
+            let st = InfraState { proxy_instance_id: Some(bad.into()), ..s.clone() };
+            assert_eq!(proxy_call(true, Some(&st)), None, "{bad}: never on the aws command line");
+            assert_eq!(proxy_call(false, Some(&st)), None, "{bad}");
+        }
+        assert!(is_instance_id("i-01234567") && is_instance_id(PROXY_ID));
+    }
+
+    #[test]
+    fn row_proxy_without_a_verdict() {
+        let s = active_state();
+        // Nothing recorded: a skip row (no call is made, see the_proxy_call_needs_an_identity_and_a_valid_recorded_id).
+        let (tag, t) = text(&row_proxy(None, &Ok(None), None));
+        assert_eq!((tag, t.as_str()), (Tag::Skip, "egress proxy: none recorded (no state/infra.toml)  <- make infra-status WRITE=1 after the S5 deploy"));
+        for none in [InfraState { proxy_instance_id: None, ..s.clone() }, InfraState { proxy_instance_id: Some(String::new()), ..s.clone() }] {
+            let (tag, t) = text(&row_proxy(None, &ok(none), None));
+            assert_eq!((tag, t.as_str()), (Tag::Skip, "egress proxy: none recorded (state/infra.toml has no proxy_instance_id)  <- make infra-status WRITE=1 after the S5 deploy"));
+        }
+        let (tag, t) = text(&row_proxy(None, &unreadable(), None));
+        assert_eq!((tag, t.as_str()), (Tag::Skip, "egress proxy not checked (state/infra.toml unreadable: config: /r/state/infra.toml is a symlink; refusing to read it)  <- make infra-status WRITE=1"));
+        for bad in ["--dry-run", "i-0123456789ABCDEF0", "vpc-0123456789abcdef0"] {
+            let (tag, t) = text(&row_proxy(None, &ok(InfraState { proxy_instance_id: Some(bad.into()), ..s.clone() }), None));
+            assert!(tag == Tag::Warn && t.contains(&format!("proxy_instance_id {bad:?} in state/infra.toml is not an instance id; not checked")), "{bad}: {t}");
+        }
+        let s = ok(s);
+        assert_eq!(text(&row_proxy(None, &s, None)), (Tag::Skip, "egress proxy i-0123456789abcdef0 not checked (no aws identity)".to_string()));
+        // A failed call names the error: no verdict, doctor exit 0.
+        let call = "aws ec2 describe-instances: An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: You are not authorized to perform this operation.";
+        let row = row_proxy(None, &s, Some(Err(call)));
+        assert_eq!(text(&row), (Tag::Warn, format!("egress proxy i-0123456789abcdef0 not checked: {call}")));
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+        for junk in ["not json", "{}", "{\"Reservations\": []}", "{\"Reservations\": [{\"Instances\": [{\"InstanceId\": \"i-0fedcba9876543210\"}]}]}", "{\"Reservations\": 3}"] {
+            let (tag, t) = text(&row_proxy(None, &s, Some(Ok(junk))));
+            assert!(tag == Tag::Warn && t.ends_with("not checked: the describe-instances output does not list it"), "{junk}: {t}");
+        }
+        let (tag, t) = text(&row_proxy(None, &s, Some(Ok("{\"Reservations\": [{\"Instances\": [{\"InstanceId\": \"i-0123456789abcdef0\"}]}]}"))));
+        assert!(tag == Tag::Warn && t.contains("is in no state"), "{t}");
+    }
+
+    /// The proxy row's call as `rows` makes it (awscli: region and the ec2
+    /// endpoint pinned), answered by tests/fakes/aws.sh from a
+    /// `FAKE_AWS_ANSWERS` directory; the fake refuses a call without the pins.
+    #[cfg(unix)]
+    #[test]
+    fn row_proxy_reads_the_fake_aws_answer_through_the_pinned_call() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/aws.sh");
+        let answers = tempfile::tempdir().unwrap();
+        let log = answers.path().join("calls.log");
+        let state = ok(active_state());
+        let id = proxy_call(true, state.as_ref().unwrap().as_ref()).unwrap();
+        let cmd = crate::bridge::awscli::aws_cmd("ec2", &proxy_describe_args(id)).unwrap();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["ec2", "describe-instances", "--instance-ids", PROXY_ID, "--region", "eu-central-1", "--endpoint-url", "https://ec2.eu-central-1.amazonaws.com", "--output", "json"]);
+        let call = |args: &[String]| {
+            let mut c = Command::new("/bin/sh");
+            c.arg(fake).args(args).env("FAKE_AWS_ANSWERS", answers.path()).env("FAKE_AWS_LOG", &log).env_remove("FAKE_AWS_FAIL").env_remove("FAKE_AWS_FAIL_OP").env_remove("FAKE_AWS_PIN_ALL");
+            run_capture_cmd(c, None, Duration::from_secs(10))
+        };
+        std::fs::write(answers.path().join("ec2.describe-instances.1.json"), described("stopped", Some("10.42.0.10"))).unwrap();
+        std::fs::write(answers.path().join("ec2.describe-instances.json"), described("running", Some("10.42.0.10"))).unwrap();
+        let out = call(&args);
+        assert_eq!(text(&row_proxy(None, &state, Some(out.as_deref().map_err(String::as_str)))).0, Tag::Skip, "first answer: stopped");
+        let out = call(&args);
+        assert_eq!(text(&row_proxy(None, &state, Some(out.as_deref().map_err(String::as_str)))), (Tag::Ok, "egress proxy i-0123456789abcdef0 running (10.42.0.10)".to_string()));
+        // Without the endpoint pin the fake refuses (exit 252): the row reports the error, no verdict.
+        let unpinned: Vec<String> = args.iter().filter(|a| !a.contains("amazonaws.com") && *a != "--endpoint-url").cloned().collect();
+        let err = call(&unpinned).unwrap_err();
+        assert!(err.contains("must carry --endpoint-url https://ec2.eu-central-1.amazonaws.com"), "{err}");
+        assert_eq!(text(&row_proxy(None, &state, Some(Err(&err)))).0, Tag::Warn);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), 3, "{calls}");
+        assert!(calls.lines().take(2).all(|l| l.ends_with("--region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com --output json")), "{calls}");
     }
 
     fn vm(id: &str, status: RowStatus, created: &str) -> VmRow {

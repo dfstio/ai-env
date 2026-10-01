@@ -3,7 +3,21 @@
 //! run-report formats behind `make logs` timestamps), the CloudTrail probe
 //! over the fake aws, manual rows, the catalog, and the four live probes
 //! against the file-backed fake — each of which must leave no VM running.
+//! S5: the two egress probes (`connector-pending ARN` over the fake's run
+//! failure and echo knobs and the operator's view of the connector;
+//! `dns-path`, which like `ai-env egress check` stops at the fake's refusal
+//! to carry a shell) and `egress check`: its checks before and around that
+//! refusal, and — with the debug transcript knob standing in for the shell,
+//! the fake aws serving a green network (tests/fixtures/egress) and squid's
+//! log — its decision: a pass records, any failure revokes, `--vm` does
+//! neither.
 use super::cli::{code, stderr, stdout, World};
+use crate::common::CONNECTOR;
+use ai_env_cli::bridge::api::{Call, FakeFailure};
+use ai_env_cli::bridge::egress::check::{denied_host, CASES, FAKE_SHELL_KNOB};
+use ai_env_cli::bridge::egress::{param_name, value_sha256, EgressVerified, VerifiedRecord, EXTRAS_HEADER, PARAMS, SUSPENDED_HEADER};
+use ai_env_cli::bridge::infra::InfraState;
+use ai_env_cli::wire::time::unix_now;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -482,7 +496,7 @@ fn probe_rows_of_the_old_schema_parse_in_lab_list() {
     let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entry = list.as_array().unwrap().iter().find(|r| r["probe"] == "entrypoint").unwrap();
     assert_eq!(entry["last_verdict"], "claude-vscode");
-    assert_eq!(list.as_array().unwrap().len(), 12);
+    assert_eq!(list.as_array().unwrap().len(), 14);
 }
 
 #[test]
@@ -522,4 +536,666 @@ fn lab_snapshot_log_pass_can_be_re_run_and_probes_are_audited() {
     assert_eq!(rows(&w, "snapshot-uniqueness").len(), 3);
     let audit = fs::read_to_string(w.bridge().join("audit.jsonl")).unwrap();
     assert_eq!(audit.matches("\"lab_probe\"").count(), 3, "{audit}");
+}
+
+// ---- S5: connector-pending, dns-path, egress check ----------------------------------------------
+
+/// The throw-away connector of `make connector-probe` (documentation account).
+const PROBE_CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress-probe";
+
+/// Wait for `c` (stdout and stderr captured), killing it after 120 s.
+fn bounded(mut c: std::process::Command) -> std::process::Output {
+    let child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("spawn ai-env");
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(out) => out.expect("ai-env output"),
+        Err(_) => {
+            let _ = std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+            panic!("ai-env did not finish within 120 s");
+        }
+    }
+}
+
+/// The fake aws of `w`: `bin/aws` and the `answers/` directory (seeded with a PENDING probe connector).
+fn fake_aws(w: &World) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (bin, answers) = (w.root().join("bin"), w.root().join("answers"));
+    if !bin.join("aws").exists() {
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&answers).unwrap();
+        fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/aws.sh"), bin.join("aws")).unwrap();
+        fs::set_permissions(bin.join("aws"), fs::Permissions::from_mode(0o755)).unwrap();
+        probe_connector_state(w, "PENDING");
+    }
+    (bin, answers)
+}
+
+/// `ai-env <args>` in `w` with the fake aws first on a pinned PATH (each
+/// call logged to `aws.log`; sts must carry its endpoint too), its answers,
+/// a Parameter Store, and `env`.
+fn s5_run_env(w: &World, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
+    let (bin, answers) = fake_aws(w);
+    // Every run starts the per-operation call counters (`<op>.N.json` answers) afresh.
+    for e in fs::read_dir(&answers).unwrap().flatten() {
+        if e.file_name().to_string_lossy().starts_with(".count.") {
+            fs::remove_file(e.path()).unwrap();
+        }
+    }
+    let mut c = w.cmd(args);
+    c.env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("FAKE_AWS_LOG", w.root().join("aws.log")).env("FAKE_AWS_PIN_ALL", "1").env("FAKE_AWS_ANSWERS", &answers).env("FAKE_AWS_SSM_DIR", w.root().join("ssm"));
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    bounded(c)
+}
+
+fn s5_run(w: &World, args: &[&str]) -> std::process::Output {
+    s5_run_env(w, args, &[])
+}
+
+fn aws_calls(w: &World) -> String {
+    fs::read_to_string(w.root().join("aws.log")).unwrap_or_default()
+}
+
+/// The probe connector's `get-network-connector` answer: the golden one, renamed, in `state`.
+fn probe_connector_state(w: &World, state: &str) {
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(golden).unwrap()).unwrap();
+    doc["Arn"] = serde_json::json!(PROBE_CONNECTOR);
+    doc["Name"] = serde_json::json!("ai-env-egress-probe");
+    doc["State"] = serde_json::json!(state);
+    doc["StateReason"] = serde_json::json!(if state == "PENDING" { "creating ENIs" } else { "" });
+    fs::write(w.root().join("answers").join("lambda-core.get-network-connector.json"), doc.to_string()).unwrap();
+}
+
+/// `[aws].egress_connector_arn = arn` in this world's bridge.toml.
+fn connect(w: &World, arn: &str) {
+    let path = w.bridge().join("bridge.toml");
+    let text = fs::read_to_string(&path).unwrap().replacen("[aws]\n", &format!("[aws]\negress_connector_arn = \"{arn}\"\n"), 1);
+    fs::write(&path, text).unwrap();
+}
+
+fn alive(w: &World) -> Vec<String> {
+    w.state().vms.values().filter(|v| !v.state.is_terminal()).map(|v| v.id.clone()).collect()
+}
+
+fn audit_rows(w: &World) -> Vec<serde_json::Value> {
+    w.audit().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+fn shell_tokens(w: &World) -> usize {
+    w.state().calls.iter().filter(|c| matches!(c, Call::ShellToken { .. })).count()
+}
+
+fn vm_row(w: &World, id: &str) -> toml::Value {
+    toml::from_str(&fs::read_to_string(w.bridge().join("state/vms").join(format!("{id}.toml"))).unwrap()).unwrap()
+}
+
+#[test]
+fn lab_connector_pending_records_what_run_microvm_did() {
+    let w = World::new("");
+    // Accepted: RunMicrovm takes the throw-away connector (no configured one needed) and echoes it.
+    let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let row = rows(&w, "connector-pending").pop().unwrap();
+    assert_eq!((row["verdict"].as_str(), row["expected"].as_str(), row["stage"].as_str()), (Some("accepted"), Some("recorded"), Some("S5")), "{row}");
+    let note = row["note"].as_str().unwrap();
+    assert!(note.contains(&format!("echoed egress {PROBE_CONNECTOR}")) && note.contains("RUNNING"), "{note}");
+    assert!(note.ends_with("connector PENDING (creating ENIs) before RunMicrovm, PENDING (creating ENIs) after"), "the operator's view before and after: {note}");
+    let spec = w.state().specs.last().unwrap().clone();
+    assert_eq!(spec.egress_connectors, [PROBE_CONNECTOR], "the probe's plan: vpc with exactly that ARN");
+    assert!(spec.ingress_connectors.is_empty());
+    no_vm_left(&w);
+    assert!(!w.audit().contains("vm_egress_internet"), "a vpc run is never audited as internet egress");
+    // The operator's calls: the account check, then the connector before and after, pinned.
+    let calls: Vec<String> = aws_calls(&w).lines().map(str::to_string).collect();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[0].starts_with("sts get-caller-identity --region eu-central-1 --endpoint-url https://sts.eu-central-1.amazonaws.com"), "{calls:?}");
+    for c in &calls[1..] {
+        assert!(c.starts_with(&format!("lambda-core get-network-connector --identifier {PROBE_CONNECTOR} --region eu-central-1 --endpoint-url https://lambda.eu-central-1.amazonaws.com")), "{c}");
+    }
+    // Refused: the code of RunMicrovm's error, the message in the note; no VM was created.
+    for (kind, message, verdict) in [
+        ("validation", "Network connector ai-env-egress-probe is not ACTIVE", "rejected:ValidationException"),
+        ("sdk", "ResourceConflictException: the connector is PENDING", "rejected:ResourceConflictException"),
+        ("sdk", "the connector is still being created", "rejected:unknown"),
+    ] {
+        let runs = w.runs();
+        w.update(|s| s.failures.push_back(FakeFailure { kind: kind.into(), message: message.into(), on: Some("run".into()), after_effect: false }));
+        let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+        assert_eq!(code(&o), 0, "{message}: {}\n{}", stdout(&o), stderr(&o));
+        let row = rows(&w, "connector-pending").pop().unwrap();
+        assert_eq!(row["verdict"], verdict, "{row}");
+        assert!(row["note"].as_str().unwrap().contains(message.rsplit(": ").next().unwrap()) && row["note"].as_str().unwrap().contains("before RunMicrovm"), "{row}");
+        assert_eq!(w.runs(), runs + 1);
+        no_vm_left(&w);
+    }
+    assert_eq!(w.state().vms.len(), 1, "a refused RunMicrovm created nothing");
+    // Throttling, a quota, the runtime policy: no verdict on the connector — an error, nothing recorded.
+    for (kind, message) in [("throttled", "Rate exceeded"), ("quota", "Max allocated ARM_64 MicroVM memory"), ("access_denied", "run_microvm: not authorized to perform lambda:PassNetworkConnector")] {
+        let n = rows(&w, "connector-pending").len();
+        w.update(|s| s.failures.push_back(FakeFailure { kind: kind.into(), message: message.into(), on: Some("run".into()), after_effect: false }));
+        let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+        assert_eq!(code(&o), 7, "{kind}: {}", stderr(&o));
+        assert!(stderr(&o).contains(message), "the error is named: {}", stderr(&o));
+        assert_eq!(rows(&w, "connector-pending").len(), n, "{kind}: nothing recorded");
+    }
+    // Accepted, but echoed in the Id form: the gate (which knows only the configured connector's alias) rejects
+    // and terminates it; RunMicrovm still accepted the connector.
+    let id_form = "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0a1b2c3d";
+    w.update(|s| s.egress_echo = Some(vec![id_form.into()]));
+    let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let row = rows(&w, "connector-pending").pop().unwrap();
+    assert_eq!(row["verdict"], "accepted:echo-mismatch", "{row}");
+    let note = row["note"].as_str().unwrap();
+    assert!(note.contains(&format!("echoed egress {id_form}")) && note.contains("terminated by the egress gate"), "{note}");
+    no_vm_left(&w);
+    let mismatch = audit_rows(&w).into_iter().filter(|r| r["event"] == "vm_egress_mismatch").collect::<Vec<_>>();
+    assert_eq!(mismatch.len(), 1);
+    assert_eq!((mismatch[0]["detail"]["purpose"].as_str(), mismatch[0]["detail"]["terminated"].as_str()), (Some("probe"), Some("true")), "{}", mismatch[0]);
+    // Echoed INTERNET_EGRESS instead: its own verdict.
+    w.update(|s| s.egress_echo = Some(vec!["arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS".into()]));
+    assert_eq!(code(&s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR])), 0);
+    assert_eq!(rows(&w, "connector-pending").pop().unwrap()["verdict"], "accepted:internet");
+    no_vm_left(&w);
+    // The gate's terminate fails: the probe's terminate guard ends the VM.
+    w.update(|s| {
+        s.egress_echo = Some(vec![id_form.into()]);
+        s.failures.push_back(FakeFailure { kind: "sdk".into(), message: "InternalError: try again".into(), on: Some("terminate".into()), after_effect: false });
+    });
+    let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(rows(&w, "connector-pending").pop().unwrap()["note"].as_str().unwrap().contains("left to the terminate guard"));
+    assert!(stderr(&o).contains("lab: terminated"), "{}", stderr(&o));
+    no_vm_left(&w);
+    // The service never finds the VM RunMicrovm returned (the RUNNING budget runs out): accepted, then gone.
+    w.update(|s| {
+        s.egress_echo = None;
+        s.run_echo_empty = true;
+        for _ in 0..400 {
+            s.failures.push_back(FakeFailure { kind: "not_found".into(), message: "MicroVM not found".into(), on: Some("get".into()), after_effect: false });
+        }
+    });
+    let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let row = rows(&w, "connector-pending").pop().unwrap();
+    assert_eq!(row["verdict"], "accepted:terminated", "{row}");
+    w.update(|s| {
+        s.failures.clear();
+        s.run_echo_empty = false;
+    });
+}
+
+#[test]
+fn lab_connector_pending_needs_a_pending_connector_and_a_good_arn() {
+    let w = World::new("");
+    fake_aws(&w);
+    probe_connector_state(&w, "ACTIVE");
+    let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("is ACTIVE, not PENDING: nothing recorded"), "{}", stderr(&o));
+    assert_eq!(w.runs(), 0, "no RunMicrovm against an ACTIVE connector");
+    assert!(rows(&w, "connector-pending").is_empty());
+    let before = w.state().calls.len();
+    for args in [
+        vec!["lab", "run", "connector-pending"],
+        vec!["lab", "run", "connector-pending", "not-an-arn"],
+        vec!["lab", "run", "connector-pending", "arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS"],
+        vec!["lab", "run", "connector-pending", "arn:aws:lambda:us-east-1:123456789012:network-connector:x"],
+    ] {
+        let o = s5_run(&w, &args);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
+    }
+    assert_eq!(w.state().calls.len(), before, "no call at all");
+    assert!(w.state().vms.is_empty() && rows(&w, "connector-pending").is_empty());
+}
+
+#[test]
+fn lab_dns_path_stops_at_the_fakes_refusal_and_ends_its_vm() {
+    let w = World::new("");
+    let o = s5_run(&w, &["lab", "run", "dns-path"]);
+    assert_eq!(code(&o), 1, "a vpc probe needs the connector: {}", stderr(&o));
+    assert!(stderr(&o).contains("egress_connector_arn"), "{}", stderr(&o));
+    assert_eq!(w.runs(), 0);
+    connect(&w, CONNECTOR);
+    let o = s5_run(&w, &["lab", "run", "dns-path"]);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("dns-path: the file-backed fake cannot carry a shell"), "{}", stderr(&o));
+    assert!(rows(&w, "dns-path").is_empty(), "nothing recorded");
+    no_vm_left(&w);
+    let st = w.state();
+    let spec = st.specs.last().unwrap();
+    assert_eq!(spec.egress_connectors, [CONNECTOR]);
+    assert!(spec.ingress_connectors.iter().any(|c| c.ends_with(":SHELL_INGRESS")), "{:?}", spec.ingress_connectors);
+    assert!(st.calls.iter().any(|c| matches!(c, Call::Health { .. })), "the VM's /health first");
+    assert_eq!(shell_tokens(&w), 0, "refused before any shell token or dial");
+    assert!(st.calls.iter().any(|c| matches!(c, Call::Terminate(_))));
+    assert!(aws_calls(&w).is_empty());
+}
+
+#[test]
+fn egress_check_under_the_fake_ends_its_vm_and_records_nothing() {
+    let w = World::new("");
+    let o = s5_run(&w, &["egress", "check"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("[aws].egress_connector_arn is not set"), "{}", stderr(&o));
+    assert!(aws_calls(&w).is_empty() && w.runs() == 0, "refused before any call");
+    connect(&w, CONNECTOR);
+    // Exit 9: the fake cannot carry a shell; the VM the check started is ended first.
+    let o = s5_run(&w, &["egress", "check", "--json"]);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("egress check: the file-backed fake cannot carry a shell"), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "no report: nothing was judged");
+    no_vm_left(&w);
+    assert_eq!(shell_tokens(&w), 0, "refused before any shell token or dial");
+    let st = w.state();
+    let spec = st.specs.last().unwrap();
+    assert_eq!((spec.egress_connectors.clone(), spec.max_duration_s), (vec![CONNECTOR.to_string()], 900));
+    assert!(spec.ingress_connectors.iter().any(|c| c.ends_with(":SHELL_INGRESS")));
+    assert!(st.calls.iter().any(|c| matches!(c, Call::Health { .. })), "the VM's /health first");
+    let id = st.vms.values().next().unwrap().id.clone();
+    let row = vm_row(&w, &id);
+    assert_eq!((row["label"].as_str(), row["terminated_by"].as_str(), row["egress"].as_str(), row["egress_gate"].as_str()), (Some("egress-check"), Some("test"), Some("vpc"), Some("passed")), "{row}");
+    assert!(row.get("workspace").is_none(), "no workspace: {row}");
+    let audit = audit_rows(&w);
+    assert!(audit.iter().any(|r| r["event"] == "vm_run" && r["detail"]["purpose"] == "test" && r["detail"]["shell"] == "true"), "{audit:?}");
+    assert!(audit.iter().any(|r| r["event"] == "vm_terminate" && r["detail"]["by"] == "test"), "{audit:?}");
+    // A check of its own VM that fails before its transcript is judged still revokes, and is audited as a failed check.
+    let checks: Vec<&serde_json::Value> = audit.iter().filter(|r| r["event"] == "egress_check").collect();
+    assert_eq!(checks.len(), 1, "{audit:?}");
+    let d = &checks[0]["detail"];
+    assert_eq!((d["id"].as_str(), d["image_version"].as_str(), d["verdict"].as_str(), d["revoked"].as_str()), (Some(id.as_str()), Some("1.0"), Some("fail"), Some("0")), "{}", checks[0]);
+    assert!(d["reason"].as_str().unwrap().contains("cannot carry a shell"), "{}", checks[0]);
+    assert!(stderr(&o).contains("egress check FAILED: revoked 0 earlier passes of this connector"), "{}", stderr(&o));
+    assert!(verified(&w).records.is_empty(), "nothing recorded");
+    // The operator account was checked first, pinned like every operator call.
+    assert_eq!(aws_calls(&w).trim(), "sts get-caller-identity --region eu-central-1 --endpoint-url https://sts.eu-central-1.amazonaws.com --output json");
+    // --keep leaves the check's VM running, on the refusal path too.
+    let o = s5_run(&w, &["egress", "check", "--keep"]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--keep:") && stderr(&o).contains("left running"), "{}", stderr(&o));
+    assert_eq!(alive(&w).len(), 1);
+}
+
+#[test]
+fn egress_check_refuses_another_account_and_unsuitable_vms() {
+    let w = World::new("");
+    connect(&w, "arn:aws:lambda:eu-central-1:999999999999:network-connector:ai-env-egress");
+    let o = s5_run(&w, &["egress", "check"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("account 123456789012") && stderr(&o).contains("account 999999999999"), "{}", stderr(&o));
+    assert_eq!(w.runs(), 0, "before any VM");
+    let w = World::new("");
+    connect(&w, CONNECTOR);
+    let started = |args: &[&str]| -> String {
+        let o = s5_run(&w, args);
+        assert_eq!(code(&o), 0, "{args:?}: {}", stderr(&o));
+        serde_json::from_str::<serde_json::Value>(&stdout(&o)).unwrap()["id"].as_str().unwrap().to_string()
+    };
+    let internet = started(&["vm", "run", "--egress", "internet", "--json"]);
+    let no_shell = started(&["vm", "run", "--egress", "vpc", "--json"]);
+    let ok = started(&["vm", "run", "--egress", "vpc", "--shell", "--json"]);
+    assert_eq!(code(&s5_run(&w, &["egress", "check", "--vm", "../x"])), 2, "not a VM id");
+    for (id, why) in [("microvm-00000000-0000-4000-8000-0000000000ff", "no row"), (internet.as_str(), "not vpc"), (no_shell.as_str(), "without --shell")] {
+        let o = s5_run(&w, &["egress", "check", "--vm", id]);
+        assert_eq!(code(&o), 1, "{why}: {}", stderr(&o));
+        assert!(stderr(&o).contains(why) && stderr(&o).contains("vm run --egress vpc --shell"), "{}", stderr(&o));
+    }
+    assert_eq!(shell_tokens(&w), 0);
+    // A suitable VM: checked live, then the fake's refusal; the operator's VM is not the check's to end.
+    let o = s5_run(&w, &["egress", "check", "--vm", &ok]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("cannot carry a shell") && !stderr(&o).contains("terminated"), "{}", stderr(&o));
+    assert!(alive(&w).contains(&ok));
+    // Its live echo no longer what its row requires: the gate's reject path (terminated by policy), exit 9.
+    w.update(|s| s.egress_echo = Some(vec!["arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS".into()]));
+    let o = s5_run(&w, &["egress", "check", "--vm", &ok]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("egress mismatch"), "{}", stderr(&o));
+    assert!(!alive(&w).contains(&ok));
+    assert_eq!(vm_row(&w, &ok)["terminated_by"].as_str(), Some("policy"));
+    assert!(audit_rows(&w).iter().any(|r| r["event"] == "vm_egress_mismatch" && r["detail"]["via"] == "check" && r["detail"]["id"] == ok.as_str()));
+    // Its row says terminated now.
+    let o = s5_run(&w, &["egress", "check", "--vm", &ok]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert_eq!(shell_tokens(&w), 0);
+}
+
+// ---- egress check's decision, through the transcript knob and a green network -------------------
+
+/// The stack's ids, as in tests/fixtures/egress/ops (a network without drift).
+const NET_SQUID_CONF: &str = "http_port 10.42.0.10:3128\n";
+const NET_ALLOW: &str = "api.anthropic.com\nplatform.claude.com\nindex.crates.io\nstatic.crates.io\n";
+const RUN_NONCE: &str = "5eed5eed5eed5eed";
+
+/// A world whose network verification is green: `[aws].egress_connector_arn`, `state/infra.toml` of the
+/// fixtures' stack, the fixtures as aws answers, the proxy's parameters and its `--status` answer.
+fn green_network() -> World {
+    let w = World::new("");
+    connect(&w, CONNECTOR);
+    let (_, answers) = fake_aws(&w);
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress");
+    fs::copy(fixtures.join("lambda-core.get-network-connector.json"), answers.join("lambda-core.get-network-connector.json")).unwrap();
+    for e in fs::read_dir(fixtures.join("ops")).unwrap().flatten() {
+        fs::copy(e.path(), answers.join(e.file_name())).unwrap();
+    }
+    let ssm = w.root().join("ssm");
+    let mut values = Vec::new();
+    for (p, v) in [("squid.conf", NET_SQUID_CONF), ("allow", NET_ALLOW), ("extras", EXTRAS_HEADER), ("suspended", SUSPENDED_HEADER)] {
+        let f = ssm.join(param_name(p).trim_start_matches('/'));
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(&f, v).unwrap();
+        fs::write(format!("{}.version", f.display()), "1\n").unwrap();
+        values.push((p, v));
+    }
+    let sums: Vec<String> = PARAMS.iter().map(|p| format!("sha256_{p}={}", value_sha256(values.iter().find(|(q, _)| q == p).unwrap().1))).collect();
+    let status = format!("squid-6.13-1.amzn2023.0.1.aarch64\nsquid=active allowed=4 extras=0 suspended=0 {} parse=ok applied=yes\n", sums.join(" "));
+    let invocation = serde_json::json!({
+        "CommandId": "0b1c2d3e-0000-4000-8000-000000000001", "InstanceId": "i-0123456789abcdef0", "Comment": "ai-env", "DocumentName": "AWS-RunShellScript",
+        "DocumentVersion": "$DEFAULT", "PluginName": "aws:runShellScript", "ResponseCode": 0, "ExecutionStartDateTime": "2026-10-01T10:00:00.100Z",
+        "ExecutionElapsedTime": "PT0.4S", "ExecutionEndDateTime": "2026-10-01T10:00:00.500Z", "Status": "Success", "StatusDetails": "Success",
+        "StandardOutputContent": status, "StandardOutputUrl": "", "StandardErrorContent": "", "StandardErrorUrl": "",
+        "CloudWatchOutputConfig": {"CloudWatchLogGroupName": "", "CloudWatchOutputEnabled": false}
+    });
+    fs::write(answers.join("ssm.get-command-invocation.json"), invocation.to_string()).unwrap();
+    let state = InfraState {
+        stack: "dev".into(),
+        written: "2026-10-01T10:00:00Z".into(),
+        region: "eu-central-1".into(),
+        image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(),
+        connector_arn: Some(CONNECTOR.into()),
+        connector_name: Some("ai-env-egress".into()),
+        proxy_private_ip: Some("10.42.0.10".into()),
+        proxy_instance_id: Some("i-0123456789abcdef0".into()),
+        egress_vpc_id: Some("vpc-0123456789abcdef0".into()),
+        vm_subnet_id: Some("subnet-0aaa1111bbbb2222c".into()),
+        vm_egress_security_group_id: Some("sg-0ddd3333eeee4444f".into()),
+        proxy_security_group_id: Some("sg-0fff5555aaaa6666b".into()),
+        dns_mode: Some("none".into()),
+        parameter_prefix: Some("/ai-env/proxy".into()),
+        connector_id: Some("nc-0a1b2c3d4e5f60718".into()),
+        connector_state: Some("ACTIVE".into()),
+        squid_conf_sha256: Some(value_sha256(NET_SQUID_CONF)),
+        allow_sha256: Some(value_sha256(NET_ALLOW)),
+        ..InfraState::default()
+    };
+    fs::create_dir_all(w.bridge().join("state")).unwrap();
+    fs::write(w.bridge().join("state").join("infra.toml"), toml::to_string(&state).unwrap()).unwrap();
+    w
+}
+
+/// A transcript in which every case of a closed VPC printed its marker (`case`'s line replaced by `line`).
+fn transcript_file(w: &World, replace: Option<(&str, &str)>) -> PathBuf {
+    let mut out = String::from("bash-5.2# aienv_c allowed https://api.anthropic.com/v1/models\r\n");
+    for c in &CASES {
+        let line = match c.name {
+            "allowed" | "allowed-last" => "rc=0 code=401 size=86 conn=1 hc=200 t403=no sq=no".to_string(),
+            "direct-name" => "rc=6 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
+            "direct-ipv6" => "rc=7 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
+            "direct-ipv4" | "direct-http" | "proxy-other-port" => "rc=28 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
+            "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
+            "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
+            n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
+            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
+            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no".to_string(),
+            _ => "rc=9 ns=10.42.0.2 res=no".to_string(),
+        };
+        let line = match replace {
+            Some((name, other)) if name == c.name => other.to_string(),
+            _ => line,
+        };
+        out.push_str(&format!("@@AIENV{RUN_NONCE} {} {line}\r\n", c.name));
+    }
+    out.push_str(&format!("@@AIENV{RUN_NONCE} end\r\nbash-5.2# exit\r\n"));
+    let p = w.root().join("transcript.txt");
+    fs::write(&p, out).unwrap();
+    p
+}
+
+/// squid's log of the run in CloudWatch (`logs filter-log-events`), stamped now, from client `client`.
+fn squid_log(w: &World, client: &str, skip: Option<&str>) {
+    let t = unix_now();
+    let host = denied_host(RUN_NONCE);
+    let lines = [
+        "TCP_TUNNEL/200 1 CONNECT api.anthropic.com:443".to_string(),
+        "TCP_DENIED/403 3900 CONNECT 1.1.1.1:443".to_string(),
+        "TCP_DENIED/403 3900 GET api.anthropic.com:8080".to_string(),
+        "TCP_DENIED/403 3900 CONNECT api.anthropic.com:8443".to_string(),
+        "TCP_DENIED/403 3900 CONNECT github.com:443".to_string(),
+        format!("TCP_DENIED/403 3900 CONNECT {host}:443"),
+        "TCP_TUNNEL/200 1 CONNECT api.anthropic.com:443".to_string(),
+    ];
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .filter(|l| skip.is_none_or(|s| !l.contains(s)))
+        .enumerate()
+        .map(|(i, l)| serde_json::json!({"logStreamName": "i-0123456789abcdef0", "timestamp": t * 1000, "message": format!("aienv {t}.{i:03} 5 {client} {l}"), "ingestionTime": t * 1000, "eventId": format!("e{i}")}))
+        .collect();
+    fs::write(w.root().join("answers").join("logs.filter-log-events.json"), serde_json::json!({"events": events, "searchedLogStreams": []}).to_string()).unwrap();
+}
+
+fn check_with(w: &World, args: &[&str], transcript: &Path) -> std::process::Output {
+    s5_run_env(w, args, &[(FAKE_SHELL_KNOB, transcript)])
+}
+
+fn verified(w: &World) -> EgressVerified {
+    toml::from_str(&fs::read_to_string(w.bridge().join("state/egress-verified.toml")).unwrap_or_default()).unwrap()
+}
+
+fn seed_verified(w: &World) {
+    let rec = |image_version: &str, connector: &str| VerifiedRecord { image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(), image_version: image_version.into(), connector: connector.into(), vm_id: "microvm-old".into(), at: "2026-09-30T10:00:00Z".into(), dns: "no-dns".into(), ..VerifiedRecord::default() };
+    let v = EgressVerified { records: vec![rec("0.9", CONNECTOR), rec("1.0", CONNECTOR), rec("1.0", "arn:aws:lambda:eu-central-1:123456789012:network-connector:other")], ..EgressVerified::default() };
+    fs::create_dir_all(w.bridge().join("state")).unwrap();
+    fs::write(w.bridge().join("state/egress-verified.toml"), toml::to_string(&v).unwrap()).unwrap();
+}
+
+fn check_audit(w: &World) -> Vec<serde_json::Value> {
+    audit_rows(w).into_iter().filter(|r| r["event"] == "egress_check").collect()
+}
+
+#[test]
+fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
+    let w = green_network();
+    squid_log(&w, "10.42.1.17", None);
+    let t = transcript_file(&w, None);
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("note: the case results are reported by the VM itself; a record rests on the network verification and squid's log"), "{out}");
+    assert!(out.contains("network: 19 checks ok: connector, connector-enis") && out.contains("squid log: from 10.42.1.17: 2 tunnels"), "{out}");
+    assert!(out.contains("egress check passed: recorded for image version 1.0"), "{out}");
+    let v = verified(&w);
+    assert_eq!(v.records.len(), 1, "{v:?}");
+    let rec = &v.records[0];
+    assert_eq!((rec.image_arn.as_str(), rec.image_version.as_str(), rec.connector.as_str(), rec.dns.as_str()), (ai_env_cli::bridge::api::FAKE_IMAGE_ARN, "1.0", CONNECTOR, "no-dns"));
+    assert!(rec.network.starts_with("19 checks ok: connector") && rec.squid_log.contains("TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443") && rec.cases.contains("allowed-last=pass"), "{rec:?}");
+    // Bound to the connector's live facts (the golden get-network-connector) and the image version's created_at (the fake's 1.0).
+    assert_eq!(
+        (rec.connector_facts.id.as_str(), rec.connector_facts.version.as_str(), rec.connector_facts.subnet_ids.clone(), rec.connector_facts.security_group_ids.clone(), rec.image_created_at),
+        ("nc-0a1b2c3d4e5f60718", "1", vec!["subnet-0aaa1111bbbb2222c".to_string()], vec!["sg-0ddd3333eeee4444f".to_string()], Some(1_789_804_800))
+    );
+    let audit = check_audit(&w);
+    assert_eq!(audit.len(), 1);
+    assert_eq!((audit[0]["detail"]["verdict"].as_str(), audit[0]["detail"]["image_version"].as_str()), (Some("pass"), Some("1.0")), "{}", audit[0]);
+    no_vm_left(&w);
+    // The evidence: every network call and the squid query, pinned; the window and the quoted pattern.
+    let calls = aws_calls(&w);
+    assert!(calls.lines().all(|l| l.contains(" --region eu-central-1 ") && l.contains(" --endpoint-url https://")), "{calls}");
+    let logs: Vec<&str> = calls.lines().filter(|l| l.starts_with("logs filter-log-events")).collect();
+    assert_eq!(logs.len(), 1, "complete at the first poll: {calls}");
+    assert!(logs[0].contains("--log-group-name /ai-env/egress/squid --filter-pattern \"aienv\" --start-time ") && logs[0].contains(" --end-time "), "{}", logs[0]);
+    for op in ["ec2 describe-route-tables", "ec2 describe-security-groups", "ec2 describe-network-acls", "ssm send-command", "lambda-core get-network-connector"] {
+        assert!(calls.lines().any(|l| l.starts_with(op)), "{op}: {calls}");
+    }
+    assert_eq!(calls.lines().filter(|l| l.starts_with(&format!("lambda-core get-network-connector --identifier {CONNECTOR} "))).count(), 2, "the network verification's, then the binding's: {calls}");
+    // --json: one document with every case, the evidence and the decision.
+    let o = check_with(&w, &["egress", "check", "--json"], &t);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!((doc["verdict"].as_str(), doc["recorded"].as_bool(), doc["report_only"].as_bool()), (Some("pass"), Some(true), Some(false)));
+    assert_eq!(doc["cases"].as_array().unwrap().len(), CASES.len());
+    assert_eq!((doc["network"]["ok"].as_bool(), doc["squid_log"]["ok"].as_bool()), (Some(true), Some(true)));
+}
+
+#[test]
+fn egress_check_revokes_on_any_failure_and_vm_is_report_only() {
+    let w = green_network();
+    let other = "arn:aws:lambda:eu-central-1:123456789012:network-connector:other";
+    let fail = |o: &std::process::Output, why: &str| {
+        assert_eq!(code(o), 9, "{why}: {}\n{}", stdout(o), stderr(o));
+        assert!(stderr(o).contains(why), "{why}: {}", stderr(o));
+        let v = verified(&w);
+        assert!(v.records.iter().all(|r| r.connector == other), "{why}: every record of the connector revoked: {v:?}");
+        assert_eq!(v.records.len(), 1, "{why}: another connector's record stays");
+        let last = check_audit(&w).pop().unwrap();
+        assert_eq!((last["detail"]["verdict"].as_str(), last["detail"]["revoked"].as_str()), (Some("fail"), Some("2")), "{why}: {last}");
+        no_vm_left(&w);
+    };
+    // A case fails (direct egress answered): the VM's word is enough to fail.
+    squid_log(&w, "10.42.1.17", None);
+    seed_verified(&w);
+    let o = check_with(&w, &["egress", "check"], &transcript_file(&w, Some(("direct-ipv4", "rc=0 code=200 size=9 conn=1 hc=000 t403=no sq=no"))));
+    fail(&o, "direct-ipv4: OPEN");
+    assert!(stdout(&o).contains("revoked 2 earlier passes of this connector"), "{}", stdout(&o));
+    // Every case passes, but squid's log lacks the run's GET :8080 denial (budget scaled to milliseconds).
+    seed_verified(&w);
+    squid_log(&w, "10.42.1.17", Some("GET api.anthropic.com:8080"));
+    fail(&check_with(&w, &["egress", "check"], &transcript_file(&w, None)), "TCP_DENIED/403 GET api.anthropic.com:8080 from 10.42.1.17");
+    // squid's log shows the run from outside the VM subnet.
+    seed_verified(&w);
+    squid_log(&w, "10.42.0.99", None);
+    fail(&check_with(&w, &["egress", "check"], &transcript_file(&w, None)), "outside the VM subnet");
+    // The network drifted (a VPC endpoint appeared): squid's log is not even asked.
+    seed_verified(&w);
+    squid_log(&w, "10.42.1.17", None);
+    let endpoints = w.root().join("answers").join("ec2.describe-vpc-endpoints.json");
+    let green = fs::read_to_string(&endpoints).unwrap();
+    fs::write(&endpoints, serde_json::json!({"VpcEndpoints": [{"VpcEndpointId": "vpce-0123456789abcdef0", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "available"}]}).to_string()).unwrap();
+    let _ = fs::remove_file(w.root().join("aws.log"));
+    fail(&check_with(&w, &["egress", "check"], &transcript_file(&w, None)), "network verification: DRIFT vpc-endpoints");
+    assert!(!aws_calls(&w).contains("logs filter-log-events"), "{}", aws_calls(&w));
+    fs::write(&endpoints, green).unwrap();
+    // --vm: report only — a pass is not recorded, a failure revokes nothing.
+    let started = s5_run(&w, &["vm", "run", "--egress", "vpc", "--shell", "--json"]);
+    assert_eq!(code(&started), 0, "{}", stderr(&started));
+    let id = serde_json::from_str::<serde_json::Value>(&stdout(&started)).unwrap()["id"].as_str().unwrap().to_string();
+    seed_verified(&w);
+    let before = verified(&w);
+    let o = check_with(&w, &["egress", "check", "--vm", &id], &transcript_file(&w, None));
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("report only: `--vm` never records a pass and never revokes one"), "{}", stdout(&o));
+    assert_eq!(verified(&w), before, "nothing recorded");
+    let o = check_with(&w, &["egress", "check", "--vm", &id], &transcript_file(&w, Some(("denied", "rc=0 code=200 size=9 conn=1 hc=200 t403=no sq=no"))));
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert_eq!(verified(&w), before, "nothing revoked");
+    let last = check_audit(&w).pop().unwrap();
+    assert_eq!((last["detail"]["verdict"].as_str(), last["detail"]["report_only"].as_str(), last["detail"].get("revoked")), (Some("fail"), Some("true"), None), "{last}");
+    assert!(alive(&w).contains(&id), "the operator's VM is not the check's to end");
+}
+
+#[test]
+fn egress_check_revokes_and_records_nothing_when_a_network_row_is_unknown() {
+    let w = green_network();
+    squid_log(&w, "10.42.1.17", None);
+    seed_verified(&w);
+    let t = transcript_file(&w, None);
+    let o = s5_run_env(&w, &["egress", "check"], &[(FAKE_SHELL_KNOB, t.as_path()), ("FAKE_AWS_FAIL_OP", Path::new("ec2 describe-nat-gateways"))]);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("network verification: unknown nat-gateways"), "{}", stderr(&o));
+    let v = verified(&w);
+    assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "revoked, nothing recorded: {v:?}");
+    let last = check_audit(&w).pop().unwrap();
+    assert_eq!((last["detail"]["verdict"].as_str(), last["detail"]["revoked"].as_str()), (Some("fail"), Some("2")), "{last}");
+    assert!(!aws_calls(&w).contains("logs filter-log-events"), "squid's log is not asked once the network failed");
+    no_vm_left(&w);
+}
+
+#[test]
+fn egress_check_ends_its_gate_rejected_vm_even_with_keep_and_revokes() {
+    for keep in [false, true] {
+        let w = World::new("");
+        connect(&w, CONNECTOR);
+        seed_verified(&w);
+        // The VM echoes INTERNET_EGRESS: the gate rejects it, and its terminate is throttled once.
+        w.update(|s| {
+            s.egress_echo = Some(vec!["arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS".into()]);
+            s.failures.push_back(FakeFailure { kind: "throttled".into(), message: "Rate exceeded".into(), on: Some("terminate".into()), after_effect: false });
+        });
+        let args: &[&str] = if keep { &["egress", "check", "--keep"] } else { &["egress", "check"] };
+        let o = s5_run(&w, args);
+        assert_eq!(code(&o), 9, "keep {keep}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("egress mismatch") && stderr(&o).contains("its egress gate did not pass"), "keep {keep}: {}", stderr(&o));
+        assert!(alive(&w).is_empty(), "keep {keep}: a gate-rejected VM is never left running: {:?}", alive(&w));
+        let id = w.state().vms.values().next().unwrap().id.clone();
+        assert_eq!(vm_row(&w, &id)["terminated_by"].as_str(), Some("policy"), "keep {keep}");
+        assert_eq!(shell_tokens(&w), 0);
+        // A failure before the transcript is judged: revoked and audited all the same.
+        let v = verified(&w);
+        assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "keep {keep}: {v:?}");
+        let last = check_audit(&w).pop().unwrap();
+        assert_eq!((last["detail"]["id"].as_str(), last["detail"]["verdict"].as_str(), last["detail"]["revoked"].as_str()), (Some(id.as_str()), Some("fail"), Some("2")), "keep {keep}: {last}");
+        assert!(last["detail"]["reason"].as_str().unwrap().contains("egress mismatch"), "keep {keep}: {last}");
+        assert!(stderr(&o).contains("revoked 2 earlier passes of this connector"), "keep {keep}: {}", stderr(&o));
+    }
+}
+
+#[test]
+fn egress_check_vm_refuses_a_row_whose_gate_did_not_pass() {
+    let w = World::new("");
+    connect(&w, CONNECTOR);
+    let o = s5_run(&w, &["vm", "run", "--egress", "vpc", "--shell", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let id = serde_json::from_str::<serde_json::Value>(&stdout(&o)).unwrap()["id"].as_str().unwrap().to_string();
+    let path = w.bridge().join("state/vms").join(format!("{id}.toml"));
+    let passed = fs::read_to_string(&path).unwrap();
+    assert!(passed.contains("egress_gate = \"passed\""), "{passed}");
+    for gate in ["pending", "mismatch"] {
+        fs::write(&path, passed.replace("egress_gate = \"passed\"", &format!("egress_gate = \"{gate}\""))).unwrap();
+        let o = s5_run(&w, &["egress", "check", "--vm", &id]);
+        assert_eq!(code(&o), 1, "{gate}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&format!("its egress gate is {gate}, not passed")), "{gate}: {}", stderr(&o));
+    }
+    assert_eq!(shell_tokens(&w), 0);
+    assert!(check_audit(&w).is_empty(), "refused before anything ran");
+}
+
+#[test]
+fn lab_connector_pending_judges_the_running_answer_too() {
+    let w = World::new("");
+    for (echo, verdict) in [
+        ("arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS", "accepted:internet"),
+        ("arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0a1b2c3d", "accepted:echo-mismatch"),
+    ] {
+        // RunMicrovm echoes the probe's connector; the RUNNING answer (GetMicrovm) echoes something else.
+        w.update(|s| s.get_egress_echo = Some(vec![echo.into()]));
+        let o = s5_run(&w, &["lab", "run", "connector-pending", PROBE_CONNECTOR]);
+        assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+        let row = rows(&w, "connector-pending").pop().unwrap();
+        assert_eq!(row["verdict"], verdict, "{row}");
+        assert!(row["note"].as_str().unwrap().contains(&format!("echoing egress {echo} (not this ARN)")), "{row}");
+        no_vm_left(&w);
+    }
+}
+
+#[test]
+fn egress_check_never_claims_a_pass_whose_record_a_newer_revocation_refused() {
+    let w = green_network();
+    squid_log(&w, "10.42.1.17", None);
+    // A failing check revoked the connector after this check began (an hour from now: later than any start).
+    let v = EgressVerified { records: vec![], revocations: std::collections::BTreeMap::from([(CONNECTOR.to_string(), unix_now() + 3600)]) };
+    fs::create_dir_all(w.bridge().join("state")).unwrap();
+    fs::write(w.bridge().join("state/egress-verified.toml"), toml::to_string(&v).unwrap()).unwrap();
+    let o = check_with(&w, &["egress", "check"], &transcript_file(&w, None));
+    assert_eq!(code(&o), 9, "a refused record is no pass: {}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("a failing check revoked this connector's passes after this check began"), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("egress check passed"), "{}", stdout(&o));
+    assert!(verified(&w).records.is_empty(), "nothing recorded");
+    let last = check_audit(&w).pop().unwrap();
+    assert_eq!(last["detail"]["verdict"].as_str(), Some("fail"), "{last}");
+    no_vm_left(&w);
 }

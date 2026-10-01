@@ -194,7 +194,7 @@ pub struct ProbeSpec {
 
 /// Every probe the stages record (plan §7), S1 and S3 included so `lab list`
 /// shows the whole picture.
-pub const CATALOG: [ProbeSpec; 12] = [
+pub const CATALOG: [ProbeSpec; 14] = [
     ProbeSpec { name: "entrypoint", stage: "S1", source: Source::Census, expect: Expect::Exact("claude-vscode"), recorded_by: "ai-env wrapper census --record-probes", what: "CLAUDE_CODE_ENTRYPOINT the extension sets for the wrapper" },
     ProbeSpec { name: "stock-ext-oauth", stage: "S1", source: Source::Census, expect: Expect::Exact("absent"), recorded_by: "ai-env wrapper census --record-probes", what: "whether the stock extension advertises OAuth refresh" },
     ProbeSpec { name: "image-version-delete", stage: "S3", source: Source::Deploy, expect: Expect::Exact("kept"), recorded_by: "make deploy RECORD_PROBE=1", what: "whether an image update deletes earlier versions" },
@@ -210,6 +210,8 @@ pub const CATALOG: [ProbeSpec; 12] = [
     ProbeSpec { name: "disk-budget", stage: "S4", source: Source::Log, expect: Expect::Recorded, recorded_by: "ai-env lab run disk-budget --log FILE", what: "disk used by the image in a fresh VM" },
     ProbeSpec { name: "snapshot-uniqueness", stage: "S4", source: Source::LiveThenLog, expect: Expect::Exact("nonce-differs"), recorded_by: "ai-env lab run snapshot-uniqueness [--log FILE]", what: "per-VM boot nonces (boot_id is shared by snapshot clones)" },
     ProbeSpec { name: "idle-policy-limits", stage: "S4", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run idle-policy-limits", what: "which suspended durations the service accepts" },
+    ProbeSpec { name: "connector-pending", stage: "S5", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run connector-pending ARN (make connector-probe CONFIRM=create-probe-connector)", what: "what RunMicrovm does with an egress connector that is still PENDING (rejected:<code>, or accepted[:echo-mismatch|:internet|:terminated])" },
+    ProbeSpec { name: "dns-path", stage: "S5", source: Source::Live, expect: Expect::Exact("no-dns"), recorded_by: "ai-env lab run dns-path", what: "whether a vpc VM reaches any DNS server (no-dns; platform-dns:<nameserver> for the platform's resolver; open-dns:<ip> for any other; resolves=yes|no in the note)" },
 ];
 
 /// The catalog entry of `name`.
@@ -716,6 +718,119 @@ pub fn verdict_cloudtrail(doc_json: &str, id: &str, client_token: &str, session_
     Ok(Some((first.to_string(), found.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(", "))))
 }
 
+// ---- S5: dns-path and connector-pending -----------------------------------------------------
+
+/// One `dig` of the dns-path probe (and of `ai-env egress check`'s DNS cases):
+/// which server, over which transport, dig's exit code (`None`: not asked —
+/// `/etc/resolv.conf` named no nameserver), and whether the reply carried an
+/// address for the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsReply {
+    pub server: String,
+    /// `udp` | `tcp`.
+    pub transport: &'static str,
+    pub rc: Option<i32>,
+    pub resolves: bool,
+}
+
+/// The dns-path verdict when a resolver that is not the platform's replies
+/// (`open-dns:<ip>`): a failing verdict, never accepted
+/// (`egress::dns_verdict_ok` refuses it).
+pub const DNS_OPEN_PREFIX: &str = "open-dns:";
+/// The dns-path verdict when a platform resolver resolves names (its
+/// lookups reach authoritative servers: a path out):
+/// `platform-dns-resolves:<ip>`, never accepted (`egress::dns_verdict_ok`
+/// takes only `platform-dns:<ip>`, a resolver that answers without
+/// resolving — DNS Firewall).
+pub const DNS_PLATFORM_RESOLVES_PREFIX: &str = "platform-dns-resolves:";
+
+/// A platform resolver address (a private or link-local IPv4, or
+/// `fd00:ec2::/32`): exactly what `egress::dns_verdict_ok` accepts in a
+/// `platform-dns:<ip>` verdict. Anything else that replies is open DNS.
+#[must_use]
+pub fn is_platform_resolver(ip: &str) -> bool {
+    crate::bridge::egress::dns_verdict_ok(&format!("{}{ip}", crate::bridge::egress::DNS_PLATFORM_PREFIX), true)
+}
+
+/// dns-path from the digs of one VM, the worst first: `open-dns:<ip>` when
+/// a server that is not a platform resolver ([`is_platform_resolver`]: a
+/// public one, a local stub) replied; `platform-dns-resolves:<ip>` when a
+/// platform resolver replied with an address; `platform-dns:<ip>` when one
+/// replied without resolving anything (DNS Firewall); `no-dns` when no
+/// server replied (dig exit 9 everywhere). The IP is the first such server.
+/// The note says `resolves=yes|no` (did any reply carry an address), the
+/// resolv.conf nameserver, and each server's answer. Any other dig exit code
+/// is an error (nothing proven: a missing dig must never read as `no-dns`),
+/// as is a probe that asked nothing.
+pub fn verdict_dns_path(resolv_ns: Option<&str>, replies: &[DnsReply]) -> std::result::Result<(String, String), String> {
+    if replies.iter().all(|r| r.rc.is_none()) {
+        return Err("no DNS server was asked".into());
+    }
+    let mut servers: Vec<(String, Vec<String>)> = Vec::new();
+    let mut first: Option<&str> = None;
+    let mut resolving: Option<&str> = None;
+    let mut open: Option<&str> = None;
+    for r in replies {
+        let said = match r.rc {
+            None => continue,
+            Some(0) => {
+                if !is_platform_resolver(&r.server) {
+                    open.get_or_insert(r.server.as_str());
+                } else if r.resolves {
+                    resolving.get_or_insert(r.server.as_str());
+                } else {
+                    first.get_or_insert(r.server.as_str());
+                }
+                if r.resolves { "resolved" } else { "replied" }
+            }
+            Some(9) => "no reply",
+            Some(rc) => return Err(format!("dig exited {rc} asking {} over {}: no verdict (is dig in the image?)", r.server, r.transport)),
+        };
+        let part = format!("{} {said}", r.transport);
+        match servers.iter_mut().find(|(s, _)| *s == r.server) {
+            Some((_, parts)) => parts.push(part),
+            None => servers.push((r.server.clone(), vec![part])),
+        }
+    }
+    let resolves = replies.iter().any(|r| r.rc == Some(0) && r.resolves);
+    let verdict = match (open, resolving, first) {
+        (Some(s), _, _) => format!("{DNS_OPEN_PREFIX}{s}"),
+        (None, Some(s), _) => format!("{DNS_PLATFORM_RESOLVES_PREFIX}{s}"),
+        (None, None, Some(s)) => format!("{}{s}", crate::bridge::egress::DNS_PLATFORM_PREFIX),
+        (None, None, None) => crate::bridge::egress::DNS_NONE.to_string(),
+    };
+    let asked = servers.iter().map(|(s, parts)| format!("{s} {}", parts.join(", "))).collect::<Vec<_>>().join("; ");
+    Ok((verdict, format!("resolves={} resolv.conf nameserver {}; {asked}", if resolves { "yes" } else { "no" }, resolv_ns.unwrap_or("none"))))
+}
+
+/// An AWS error code: `Validation…Exception`-shaped (a capital first, then
+/// letters and digits, ending in `Exception`, `Error` or `Fault`).
+fn is_error_code(s: &str) -> bool {
+    s.len() <= 64 && s.starts_with(|c: char| c.is_ascii_uppercase()) && s.bytes().all(|c| c.is_ascii_alphanumeric()) && ["Exception", "Error", "Fault"].iter().any(|t| s.ends_with(t))
+}
+
+/// connector-pending, refused: `rejected:<Code>` with the error code of
+/// RunMicrovm's refusal — `ValidationException` or `ConflictException` for
+/// those error classes, or the `Code:` an SDK error's message starts with —
+/// else `rejected:unknown`; the note is the error text (at most 300
+/// characters). `None` for a failure that is no verdict on the connector:
+/// throttling, a quota, an access denial (the runtime policy), missing
+/// credentials, an ambiguous call — the caller reports it and records
+/// nothing.
+#[must_use]
+pub fn verdict_connector_rejected(e: &crate::bridge::errors::BridgeError) -> Option<(String, String)> {
+    use crate::bridge::errors::BridgeError;
+    let code = match e {
+        BridgeError::Throttled(_) | BridgeError::Quota(_) | BridgeError::AccessDenied(_) | BridgeError::CredentialsUnavailable(_) | BridgeError::Ambiguous { .. } => return None,
+        BridgeError::Validation(_) => Some("ValidationException".to_string()),
+        BridgeError::Conflict(_) => Some("ConflictException".to_string()),
+        BridgeError::Sdk { message, .. } => message.split_once(':').map(|(c, _)| c.trim()).filter(|c| is_error_code(c)).map(str::to_string),
+        _ => None,
+    };
+    let text: String = e.to_string().chars().take(300).collect();
+    Some((format!("rejected:{}", code.as_deref().unwrap_or("unknown")), format!("RunMicrovm refused the connector: {text}")))
+}
+
 // ---- `ai-env lab list|show` ---------------------------------------------------------------
 
 /// `ai-env lab list [--json]`: every probe with its last recorded verdict.
@@ -793,10 +908,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_names_are_unique_and_cover_the_nine_s4_probes() {
+    fn catalog_names_are_unique_and_cover_the_nine_s4_and_two_s5_probes() {
         let names: std::collections::BTreeSet<&str> = CATALOG.iter().map(|p| p.name).collect();
         assert_eq!(names.len(), CATALOG.len());
         assert_eq!(CATALOG.iter().filter(|p| p.stage == "S4").count(), 9);
+        assert_eq!(CATALOG.iter().filter(|p| p.stage == "S5").map(|p| p.name).collect::<Vec<_>>(), ["connector-pending", "dns-path"]);
+        assert_eq!(spec("dns-path").unwrap().expect.expectation().render(), crate::bridge::egress::DNS_NONE);
         assert_eq!(spec("cloudtrail-payload").unwrap().expect.expectation().render(), "any-of:not-logged|hidden|absent|commitment-only");
     }
 
@@ -1055,6 +1172,99 @@ mod tests {
         assert_eq!(g("arn:aws:s3:::bucket"), None);
         assert_eq!(g("garbage"), None);
         assert!(is_safe_log_group_name("aws/cloudtrail/data-events") && !is_safe_log_group_name("") && !is_safe_log_group_name("a'b"));
+    }
+
+    fn reply(server: &str, transport: &'static str, rc: Option<i32>, resolves: bool) -> DnsReply {
+        DnsReply { server: server.into(), transport, rc, resolves }
+    }
+
+    #[test]
+    fn dns_path_verdicts() {
+        let closed = [
+            reply("10.42.0.2", "udp", Some(9), false),
+            reply("10.42.0.2", "tcp", Some(9), false),
+            reply("169.254.169.253", "udp", Some(9), false),
+            reply("169.254.169.253", "tcp", Some(9), false),
+        ];
+        let (v, note) = verdict_dns_path(Some("10.42.0.2"), &closed).unwrap();
+        assert_eq!(v, crate::bridge::egress::DNS_NONE);
+        assert_eq!(note, "resolves=no resolv.conf nameserver 10.42.0.2; 10.42.0.2 udp no reply, tcp no reply; 169.254.169.253 udp no reply, tcp no reply");
+        assert_eq!(spec("dns-path").unwrap().expect.expectation().render(), v, "the expectation");
+        // DNS Firewall (dnsMode firewall): the platform resolver replies and resolves nothing.
+        let firewall = [reply("", "udp", None, false), reply("169.254.169.253", "udp", Some(0), false), reply("10.42.1.2", "udp", Some(9), false)];
+        let (v, note) = verdict_dns_path(None, &firewall).unwrap();
+        assert_eq!(v, "platform-dns:169.254.169.253");
+        assert!(note.starts_with("resolves=no resolv.conf nameserver none;") && note.contains("169.254.169.253 udp replied"), "{note}");
+        // A platform resolver that resolves names (its lookups leave): its own verdict, never accepted — and it wins
+        // over one that only replies; resolves=yes when any reply carried an address.
+        let open = [reply("10.42.0.2", "udp", Some(9), false), reply("169.254.169.253", "udp", Some(0), false), reply("10.42.1.2", "tcp", Some(0), true)];
+        let (v, note) = verdict_dns_path(Some("10.42.0.2"), &open).unwrap();
+        assert_eq!(v, "platform-dns-resolves:10.42.1.2");
+        assert!(note.starts_with("resolves=yes") && note.contains("10.42.1.2 tcp resolved") && note.contains("169.254.169.253 udp replied"), "{note}");
+        assert!(!crate::bridge::egress::dns_verdict_ok(&v, true) && !crate::bridge::egress::dns_verdict_ok(&v, false), "never accepted");
+        assert!(!expectation_holds("no-dns", &v));
+        // A platform resolver that answers without resolving (DNS Firewall): platform-dns, accepted only with the operator's acceptance.
+        let (v, _) = verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(0), false), reply("10.42.1.2", "udp", Some(9), false)]).unwrap();
+        assert_eq!(v, "platform-dns:169.254.169.253");
+        assert!(crate::bridge::egress::dns_verdict_ok(&v, true) && !crate::bridge::egress::dns_verdict_ok(&v, false));
+        // A resolver that is not the platform's (public, a local stub) replying is open DNS, whatever else replied.
+        for (ns, server) in [("1.1.1.1", "1.1.1.1"), ("10.42.0.2", "9.9.9.9"), ("127.0.0.53", "127.0.0.53")] {
+            let open = [reply("169.254.169.253", "udp", Some(0), false), reply(server, "udp", Some(0), false), reply("10.42.1.2", "tcp", Some(9), false)];
+            let (v, note) = verdict_dns_path(Some(ns), &open).unwrap();
+            assert_eq!(v, format!("open-dns:{server}"), "{note}");
+            assert!(!crate::bridge::egress::dns_verdict_ok(&v, true), "never accepted");
+            assert!(expectation_holds(&spec("dns-path").unwrap().expect.expectation().render(), "no-dns") && !expectation_holds("no-dns", &v));
+        }
+        assert_eq!(verdict_dns_path(None, &[reply("fd00:ec2::253", "udp", Some(0), false)]).unwrap().0, "platform-dns:fd00:ec2::253");
+        assert_eq!(verdict_dns_path(None, &[reply("fd00:ec2::253", "udp", Some(0), true)]).unwrap().0, "platform-dns-resolves:fd00:ec2::253");
+        assert_eq!(verdict_dns_path(None, &[reply("10.42.1.2", "udp", Some(0), true), reply("9.9.9.9", "tcp", Some(0), false)]).unwrap().0, "open-dns:9.9.9.9", "open DNS is worse");
+        assert_eq!(verdict_dns_path(None, &[reply("2606:4700:4700::1111", "tcp", Some(0), false)]).unwrap().0, "open-dns:2606:4700:4700::1111");
+        for platform in ["10.42.0.2", "10.42.1.2", "169.254.169.253", "fd00:ec2::253", "172.16.0.2", "192.168.0.2"] {
+            assert!(is_platform_resolver(platform), "{platform}");
+        }
+        for public in ["1.1.1.1", "9.9.9.9", "208.67.222.222", "127.0.0.53", "2606:4700:4700::1111", "::1", "100.64.0.2", "resolver", ""] {
+            assert!(!is_platform_resolver(public), "{public}");
+        }
+        // Nothing proven: a dig that did not run (127: not in the image) or failed, or nothing asked.
+        assert!(verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(127), false)]).unwrap_err().contains("exited 127"));
+        assert!(verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(10), false)]).is_err());
+        assert!(verdict_dns_path(None, &[reply("", "udp", None, false)]).is_err());
+        assert!(verdict_dns_path(None, &[]).is_err());
+    }
+
+    #[test]
+    fn connector_pending_rejections_name_the_code() {
+        use crate::bridge::errors::BridgeError;
+        let msg = "Network connector arn:aws:lambda:eu-central-1:123456789012:network-connector:probe is not ACTIVE";
+        let (v, note) = verdict_connector_rejected(&BridgeError::Validation(msg.into())).unwrap();
+        assert_eq!(v, "rejected:ValidationException");
+        assert!(note.starts_with("RunMicrovm refused the connector: aws validation: Network connector") && note.contains("is not ACTIVE"), "{note}");
+        for (e, code) in [
+            (BridgeError::Conflict("x".into()), "ConflictException"),
+            (BridgeError::Sdk { op: "run_microvm", message: "ResourceNotFoundException: Network connector x not found".into() }, "ResourceNotFoundException"),
+            (BridgeError::Sdk { op: "run_microvm", message: "InvalidParameterValueError: x".into() }, "InvalidParameterValueError"),
+        ] {
+            assert_eq!(verdict_connector_rejected(&e).unwrap().0, format!("rejected:{code}"), "{e}");
+        }
+        // No code in the text: unknown, the message kept in the note.
+        for message in ["the connector is pending", "timeout: no answer", "lowercaseException: x", ""] {
+            let (v, note) = verdict_connector_rejected(&BridgeError::Sdk { op: "run_microvm", message: message.into() }).unwrap();
+            assert_eq!(v, "rejected:unknown", "{message:?}");
+            assert!(note.contains(message), "{note}");
+        }
+        assert_eq!(verdict_connector_rejected(&BridgeError::Endpoint("x".into())).unwrap().0, "rejected:unknown");
+        let long = verdict_connector_rejected(&BridgeError::Validation("y".repeat(1000))).unwrap().1;
+        assert!(long.chars().count() <= 300 + "RunMicrovm refused the connector: ".len(), "{}", long.len());
+        // Throttling, a quota, the runtime policy, credentials, an ambiguous call: no verdict on the connector.
+        for e in [
+            BridgeError::Throttled("Rate exceeded".into()),
+            BridgeError::Quota("Max allocated ARM_64 MicroVM memory".into()),
+            BridgeError::AccessDenied("run_microvm: not authorized to perform lambda:PassNetworkConnector".into()),
+            BridgeError::CredentialsUnavailable("expired".into()),
+            BridgeError::Ambiguous { op: "run_microvm", message: "timeout".into() },
+        ] {
+            assert!(verdict_connector_rejected(&e).is_none(), "{e}");
+        }
     }
 
     #[test]

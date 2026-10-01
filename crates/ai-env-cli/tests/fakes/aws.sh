@@ -57,6 +57,27 @@
 #                          CloudTrail and CloudWatch Logs JSON documents (see above)
 #   FAKE_AWS_FAIL_OP       "<service> <operation>" (e.g. "cloudtrail describe-trails"):
 #                          that call fails with AccessDeniedException, exit 254
+# S5 additions:
+#   Endpoint pins: a lambda-core, ec2, ssm, logs, cloudtrail or route53resolver call must carry
+#   `--endpoint-url https://<lambda|ec2|ssm|logs|cloudtrail|route53resolver>.eu-central-1.amazonaws.com`
+#   (lambda-core's endpoint prefix is lambda), else exit 252. sts: a wrong
+#   --endpoint-url is exit 252; a missing one too with FAKE_AWS_PIN_ALL=1 (the
+#   S5 operator commands pin sts; doctor and gates do not).
+#   FAKE_AWS_ANSWERS=<dir>  generic answers, checked before the built-in ones:
+#                          the call's Nth time (N counted per "<service>.<op>" in
+#                          <dir>/.count.<service>.<op>) prints <dir>/<service>.<op>.N.json
+#                          when it exists, else <dir>/<service>.<op>.json; a sibling
+#                          .N.rc / .rc file sets the exit code and .N.stderr / .stderr
+#                          is printed to stderr. No file: the built-in answer.
+#   FAKE_AWS_SSM_DIR=<dir>  a stateful Parameter Store: parameter /a/b is the file
+#                          <dir>/a/b holding its exact value, /a/b.version its
+#                          version. put-parameter --name N --value V|file://PATH
+#                          [--overwrite] writes it (a value over 4096 bytes is
+#                          ValidationException, exit 254; an existing name
+#                          without --overwrite is ParameterAlreadyExists);
+#                          get-parameter --name N and get-parameters --names N…
+#                          answer the real JSON shape (missing names under
+#                          InvalidParameters).
 set -u
 if [ -n "${FAKE_AWS_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
@@ -74,9 +95,30 @@ next_token=
 channel=
 pattern=
 log_class=
+endpoint=
+param_name=
+param_value=
+param_value_set=0
+overwrite=0
+names=
+in_names=0
 prev=
 for a in "$@"; do
+  if [ "$in_names" = 1 ]; then
+    case "$a" in
+      --*) in_names=0 ;;
+      *) names="$names
+$a"; prev=$a; continue ;;
+    esac
+  fi
+  case "$a" in
+    --overwrite) overwrite=1 ;;
+    --names) in_names=1 ;;
+  esac
   case "$prev" in
+    --endpoint-url) endpoint=$a ;;
+    --name) param_name=$a ;;
+    --value) param_value=$a; param_value_set=1 ;;
     --region) region=$a ;;
     --user-name) user=$a ;;
     --image-identifier) image=$a ;;
@@ -92,6 +134,17 @@ done
 if [ "$region" != eu-central-1 ]; then
   echo 'fake aws: every call must carry --region eu-central-1' >&2
   exit 252
+fi
+want_endpoint=
+case "${1:-}" in
+  lambda-core) want_endpoint=https://lambda.eu-central-1.amazonaws.com ;;
+  ec2|ssm|logs|cloudtrail|sts|route53resolver) want_endpoint="https://$1.eu-central-1.amazonaws.com" ;;
+esac
+if [ -n "$want_endpoint" ] && [ "$endpoint" != "$want_endpoint" ]; then
+  if [ -n "$endpoint" ] || [ "${1:-}" != sts ] || [ "${FAKE_AWS_PIN_ALL:-0}" = 1 ]; then
+    echo "fake aws: $1 calls must carry --endpoint-url $want_endpoint (got '${endpoint}')" >&2
+    exit 252
+  fi
 fi
 if [ "${FAKE_AWS_FAIL:-0}" = 1 ]; then
   echo 'An error occurred (ExpiredToken) when calling the operation: the fake session expired' >&2
@@ -114,6 +167,48 @@ if [ -n "${FAKE_AWS_FAIL_OP:-}" ] && [ "${1:-} ${2:-}" = "$FAKE_AWS_FAIL_OP" ]; 
   printf '\nAn error occurred (AccessDeniedException) when calling the %s operation: fake denial\n' "${2:-}" >&2
   exit 254
 fi
+if [ -n "${FAKE_AWS_ANSWERS:-}" ] && [ -n "${2:-}" ]; then
+  op="${1:-}.${2:-}"
+  case "$op" in
+    */*|.*) echo "fake aws: bad operation $op" >&2; exit 252 ;;
+  esac
+  countf="$FAKE_AWS_ANSWERS/.count.$op"
+  n=$(( $(cat "$countf" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$countf"
+  base="$FAKE_AWS_ANSWERS/$op"
+  if [ -e "$base.$n.json" ] || [ -e "$base.$n.rc" ]; then base="$base.$n"; fi
+  if [ -e "$base.json" ] || [ -e "$base.rc" ]; then
+    [ -e "$base.stderr" ] && cat "$base.stderr" >&2
+    [ -e "$base.json" ] && cat "$base.json"
+    exit "$(cat "$base.rc" 2>/dev/null || echo 0)"
+  fi
+fi
+
+# The exact bytes of file $1 as a JSON string (od + awk: no python, no jq).
+json_str() {
+  od -An -v -tx1 "$1" | LC_ALL=C awk 'BEGIN { for (i = 0; i < 256; i++) hx[sprintf("%02x", i)] = i; printf "\"" }
+    { for (i = 1; i <= NF; i++) { b = hx[$i]
+        if ($i == "0a") printf "\\n"; else if ($i == "09") printf "\\t"; else if ($i == "0d") printf "\\r";
+        else if ($i == "22") printf "\\\""; else if ($i == "5c") printf "\\\\";
+        else if (b < 32) printf "\\u%04x", b; else printf "%c", b } }
+    END { printf "\"" }'
+}
+ssm_file() {
+  case "$1" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *..*|*//*) return 1 ;;
+  esac
+  printf '%s%s' "$FAKE_AWS_SSM_DIR" "$1"
+}
+ssm_param_json() {
+  f=$(ssm_file "$1") || return 1
+  [ -f "$f" ] || return 1
+  printf '{"Name": "%s", "Type": "String", "Value": %s, "Version": %s, "DataType": "text"}' "$1" "$(json_str "$f")" "$(cat "$f.version" 2>/dev/null || echo 1)"
+}
+
 keys=${FAKE_AWS_KEYS:-0}
 key_id() { printf 'AKIAFAKE%012d' "$1"; }
 created='2026-09-29T10:00:00+00:00'
@@ -195,6 +290,51 @@ case "${1:-} ${2:-}" in
       file=${FAKE_AWS_LOG_GROUPS_FILE:-}
     fi
     if [ -n "$file" ]; then cat "$file"; else printf '{\n    "logGroups": []\n}\n'; fi ;;
+  "ssm put-parameter")
+    if [ -z "${FAKE_AWS_SSM_DIR:-}" ]; then echo "fake aws: FAKE_AWS_SSM_DIR is not set" >&2; exit 2; fi
+    f=$(ssm_file "$param_name") || { printf '\nAn error occurred (ValidationException) when calling the PutParameter operation: bad name %s\n' "$param_name" >&2; exit 254; }
+    if [ "$param_value_set" != 1 ]; then echo "fake aws: put-parameter needs --value" >&2; exit 252; fi
+    tmp="$f.new.$$"
+    mkdir -p "$(dirname "$f")"
+    case "$param_value" in
+      file://*) cat "${param_value#file://}" > "$tmp" || exit 255 ;;
+      *) printf '%s' "$param_value" > "$tmp" ;;
+    esac
+    size=$(wc -c < "$tmp" | tr -d ' ')
+    if [ "$size" -gt 4096 ]; then
+      rm -f "$tmp"
+      printf '\nAn error occurred (ValidationException) when calling the PutParameter operation: Standard tier parameters support a maximum parameter value of 4096 characters. Parameter %s has %s.\n' "$param_name" "$size" >&2
+      exit 254
+    fi
+    if [ -f "$f" ] && [ "$overwrite" != 1 ]; then
+      rm -f "$tmp"
+      printf '\nAn error occurred (ParameterAlreadyExists) when calling the PutParameter operation: The parameter already exists. To overwrite this value, set the overwrite option in the request to true.\n' >&2
+      exit 254
+    fi
+    v=$(( $(cat "$f.version" 2>/dev/null || echo 0) + 1 ))
+    mv "$tmp" "$f"
+    echo "$v" > "$f.version"
+    printf '{\n    "Version": %s,\n    "Tier": "Standard"\n}\n' "$v" ;;
+  "ssm get-parameter")
+    if [ -z "${FAKE_AWS_SSM_DIR:-}" ]; then echo "fake aws: FAKE_AWS_SSM_DIR is not set" >&2; exit 2; fi
+    if doc=$(ssm_param_json "$param_name"); then
+      printf '{\n    "Parameter": %s\n}\n' "$doc"
+    else
+      printf '\nAn error occurred (ParameterNotFound) when calling the GetParameter operation: \n' >&2
+      exit 254
+    fi ;;
+  "ssm get-parameters")
+    if [ -z "${FAKE_AWS_SSM_DIR:-}" ]; then echo "fake aws: FAKE_AWS_SSM_DIR is not set" >&2; exit 2; fi
+    found=
+    missing=
+    for n in $(printf '%s\n' "$names" | sed '/^$/d'); do
+      if doc=$(ssm_param_json "$n"); then
+        found="${found:+$found, }$doc"
+      else
+        missing="${missing:+$missing, }\"$n\""
+      fi
+    done
+    printf '{\n    "Parameters": [%s],\n    "InvalidParameters": [%s]\n}\n' "$found" "$missing" ;;
   *)
     echo "fake aws: unsupported command: $*" >&2
     exit 2 ;;

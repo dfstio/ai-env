@@ -1,0 +1,116 @@
+{
+    "SecurityGroups": [
+        {
+            "GroupId": "sg-0ddd3333eeee4444f",
+            "IpPermissionsEgress": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 3128,
+                    "ToPort": 3128,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "to the egress proxy only",
+                            "CidrIp": "10.42.0.10/32"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                }
+            ],
+            "VpcId": "vpc-0123456789abcdef0",
+            "SecurityGroupArn": "arn:aws:ec2:eu-central-1:123456789012:security-group/sg-0ddd3333eeee4444f",
+            "OwnerId": "123456789012",
+            "GroupName": "ai-env-vm-egress",
+            "Description": "ai-env MicroVM egress connector: TCP 3128 to the proxy only",
+            "IpPermissions": []
+        },
+        {
+            "GroupId": "sg-0fff5555aaaa6666b",
+            "IpPermissionsEgress": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "CONNECT targets, SSM, CloudWatch, dnf",
+                            "CidrIp": "0.0.0.0/0"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                },
+                {
+                    "IpProtocol": "udp",
+                    "FromPort": 53,
+                    "ToPort": 53,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "DNS to resolver 1.1.1.1",
+                            "CidrIp": "1.1.1.1/32"
+                        },
+                        {
+                            "Description": "DNS to resolver 9.9.9.9",
+                            "CidrIp": "9.9.9.9/32"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                },
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 53,
+                    "ToPort": 53,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "DNS to resolver 1.1.1.1",
+                            "CidrIp": "1.1.1.1/32"
+                        },
+                        {
+                            "Description": "DNS to resolver 9.9.9.9",
+                            "CidrIp": "9.9.9.9/32"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                }
+            ],
+            "VpcId": "vpc-0123456789abcdef0",
+            "SecurityGroupArn": "arn:aws:ec2:eu-central-1:123456789012:security-group/sg-0fff5555aaaa6666b",
+            "OwnerId": "123456789012",
+            "GroupName": "ai-env-proxy",
+            "Description": "ai-env egress proxy: 3128 from the MicroVM ENIs; 443 out; DNS to the resolvers",
+            "IpPermissions": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 3128,
+                    "ToPort": 3128,
+                    "UserIdGroupPairs": [
+                        {
+                            "Description": "from the MicroVM egress ENIs",
+                            "UserId": "123456789012",
+                            "GroupId": "sg-0ddd3333eeee4444f"
+                        }
+                    ],
+                    "IpRanges": [],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                }
+            ]
+        },
+        {
+            "GroupId": "sg-0bbb7777cccc8888d",
+            "IpPermissionsEgress": [],
+            "VpcId": "vpc-0123456789abcdef0",
+            "SecurityGroupArn": "arn:aws:ec2:eu-central-1:123456789012:security-group/sg-0bbb7777cccc8888d",
+            "OwnerId": "123456789012",
+            "GroupName": "default",
+            "Description": "default VPC security group",
+            "IpPermissions": []
+        }
+    ]
+}
