@@ -19,10 +19,11 @@
 //! (purpose `test`, label `egress-check`, no workspace) can record; `--vm`
 //! is report-only (it never records and never revokes). A record is bound
 //! to what the credential gate reads live again: the connector's facts
-//! (Id, Version, subnet, security group: `get-network-connector` as the
-//! operator) and the image version's `created_at`; without them nothing is
-//! recorded. It is refused when a failing check revoked the connector after
-//! this check began.
+//! (Id, network protocol, subnet, security group, and Version when the
+//! answer carries one) from the very `get-network-connector` answer the
+//! network verification judged, and the image version's `created_at`;
+//! without them nothing is recorded. It is refused when a failing check
+//! revoked the connector after this check began.
 //!
 //! **Revocation.** Once a check has asked for its own VM, any failure but
 //! Ctrl-C revokes every record of the connector (all images) and is audited
@@ -94,6 +95,13 @@ pub const CONNECT_403: &str = "CONNECT tunnel failed, response 403";
 pub const CASE_BUDGET: Duration = Duration::from_secs(12);
 /// The check's own VM: `vm run --egress vpc --shell --max-duration 900`.
 pub const CHECK_MAX_DURATION_S: u32 = 900;
+/// How long the script waits, before its first case, for the VM to reach
+/// the proxy's port at all (a plain TCP connection, retried every 2 s):
+/// measured 1 Oct 2026, a VM's VPC egress may come up after its shell — the
+/// first `allowed` failed with rc 7 and no connection, every later proxied
+/// case of the same run passed. The wait only delays the cases: `allowed`
+/// and `allowed-last` must still both pass.
+pub const READY_WAIT_S: u64 = 60;
 /// How long squid's log may take to reach CloudWatch (the agent ships every
 /// few seconds); polled every [`SQUID_LOG_STEP`]. Scaled by the lab's poll knob.
 pub const SQUID_LOG_BUDGET: Duration = Duration::from_secs(120);
@@ -238,10 +246,11 @@ fn case(name: &str) -> Option<&'static Case> {
     CASES.iter().find(|c| c.name == name)
 }
 
-/// The whole script's budget: [`CASE_BUDGET`] per case, plus 30 s.
+/// The whole script's budget: [`CASE_BUDGET`] per case, the wait for the
+/// proxy ([`READY_WAIT_S`] and one more attempt), plus 30 s.
 #[must_use]
 pub fn script_budget(cases: usize) -> Duration {
-    CASE_BUDGET * u32::try_from(cases).unwrap_or(u32::MAX) + Duration::from_secs(30)
+    CASE_BUDGET * u32::try_from(cases).unwrap_or(u32::MAX) + Duration::from_secs(READY_WAIT_S + 5 + 30)
 }
 
 // ---- the script -------------------------------------------------------------------------------
@@ -295,18 +304,24 @@ pub fn proxy_ip(cfg: &BridgeConfig, paths: &Paths) -> String {
 
 /// The shell helpers: `aienv_c NAME CURL-ARGS…` and `aienv_d NAME SERVER
 /// [DIG-OPTS…]` each run one case and print its marker; nothing else they
-/// see is printed (squid's error header is reduced to yes/no in the VM).
-/// `R` is `AIENV<nonce>`, `S` the first resolv.conf nameserver.
-const HELPERS: [&str; 2] = [
+/// see is printed (squid's error header is reduced to yes/no in the VM; of
+/// dig's reply only its status, the recursion-available flag and whether it
+/// carried an address; `TRUNCATED` when a UDP reply came truncated and dig's
+/// TCP retry got nothing). `aienv_r IP:PORT` waits for a TCP connection to
+/// the proxy (at most [`READY_WAIT_S`], 30 attempts; a dot per failed one, so
+/// the shell is never silent for long) and prints the `ready` marker. `R`
+/// is `AIENV<nonce>`, `S` the first resolv.conf nameserver.
+const HELPERS: [&str; 3] = [
     r#"aienv_c() { local n=$1 e rc o=000 s=0 c=- h=000 t=no q=no; shift; e=$(command curl -q -sS -o /dev/null -w 'W=%{http_code},%{size_download},%{num_connects},%{http_connect}=W X=%header{x-squid-error}=X' --connect-timeout 5 --max-time 10 "$@" 2>&1 </dev/null); rc=$?; [[ $e =~ W=([0-9]+),([0-9]+),([0-9]+),([0-9]+)=W ]] && o=${BASH_REMATCH[1]} s=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} h=${BASH_REMATCH[4]}; [[ $e == *'CONNECT tunnel failed, response 403'* ]] && t=yes; [[ $e == *'X=ERR_ACCESS_DENIED'* ]] && q=yes; printf '%s%s %s rc=%s code=%s size=%s conn=%s hc=%s t403=%s sq=%s\n' '@@' "$R" "$n" "$rc" "$o" "$s" "$c" "$h" "$t" "$q"; }"#,
-    r#"aienv_d() { local n=$1 s=$2 o rc r=no l; shift 2; if [ -z "$s" ]; then printf '%s%s %s rc=none ns=none res=no\n' '@@' "$R" "$n"; return; fi; o=$(command dig -r +short +time=2 +tries=1 "$@" "@$s" example.com A 2>&1 </dev/null); rc=$?; while IFS= read -r l; do [[ $l =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && r=yes; done <<<"$o"; printf '%s%s %s rc=%s ns=%s res=%s\n' '@@' "$R" "$n" "$rc" "$s" "$r"; }"#,
+    r#"aienv_d() { local n=$1 s=$2 o rc r=no t=none a=none l x='status: ([A-Z]+)' y='^;; flags:([a-z ]*);' z='[[:space:]]A[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; shift 2; if [ -z "$s" ]; then printf '%s%s %s rc=none ns=none res=no st=none ra=none\n' '@@' "$R" "$n"; return; fi; o=$(command dig -r +noall +comments +answer +time=2 +tries=1 "$@" "@$s" example.com A 2>&1 </dev/null); rc=$?; while IFS= read -r l; do [[ $l == ';; Truncated'* ]] && t=TRUNCATED; [[ $l =~ $x ]] && t=${BASH_REMATCH[1]}; [[ $l =~ $y ]] && { a=no; [[ " ${BASH_REMATCH[1]} " == *' ra '* ]] && a=yes; }; [[ $l =~ $z ]] && r=yes; done <<<"$o"; printf '%s%s %s rc=%s ns=%s res=%s st=%s ra=%s\n' '@@' "$R" "$n" "$rc" "$s" "$r" "$t" "$a"; }"#,
+    r#"aienv_r() { local i=0 c=0 t=$SECONDS; while [ $i -lt 30 ] && [ $((SECONDS-t)) -lt 60 ]; do i=$((i+1)); c=$(command curl -q -s -o /dev/null -w '%{num_connects}' --noproxy '*' --connect-timeout 2 --max-time 4 "http://$1/" 2>/dev/null </dev/null); [ "${c:-0}" = 0 ] || break; printf .; command sleep 2; done; [ "${c:-0}" = 0 ] && c=no || c=yes; printf '%s%s ready try=%s s=%s ok=%s\n' '@@' "$R" "$i" "$((SECONDS-t))" "$c"; }"#,
 ];
 
 /// The script of `cases` for one run: no alias, no function named like a
 /// tool it calls, a fresh command hash, no history file, no `!` expansion;
-/// `R` and `S`; the helpers; one short line per case (the proxy exports
-/// before the first proxied case); the `end` marker; `exit`. No tab, no
-/// `!`, under 4 KB (a terminal's line buffer).
+/// `R` and `S`; the helpers; one short line per case (the proxy exports and
+/// the wait for the proxy before the first proxied case); the `end` marker;
+/// `exit`. No tab, no `!`, under 4 KB (a terminal's line buffer).
 fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
     let fill = |args: &str| {
         args.replace("@P@", proxy_ip).replace("@V@", &cidr_plus_two(VPC_CIDR).unwrap_or_default()).replace("@S@", &cidr_plus_two(VM_SUBNET_CIDR).unwrap_or_default()).replace("@H@", &denied_host(nonce))
@@ -321,6 +336,7 @@ fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
         if c.proxied() && !exported {
             let pairs: Vec<String> = proxy_env(proxy_ip, PROXY_PORT).into_iter().map(|(k, v)| format!("{k}='{v}'")).collect();
             lines.push(format!("export {}", pairs.join(" ")));
+            lines.push(format!("aienv_r {proxy_ip}:{PROXY_PORT}"));
             exported = true;
         }
         lines.push(format!("{} {} {}", if c.is_dns() { "aienv_d" } else { "aienv_c" }, c.name, fill(c.args)));
@@ -376,13 +392,30 @@ pub struct CaseResult {
     pub ns: Option<String>,
     /// dig: whether the reply carried an address.
     pub resolves: Option<bool>,
+    /// dig: the reply's status (`NOERROR`, `REFUSED`, `SERVFAIL`, …; `None`:
+    /// no reply, or none printed).
+    pub status: Option<String>,
+    /// dig: whether the reply's flags said recursion available (`ra`; `None`:
+    /// no reply, or no flags printed).
+    pub ra: Option<bool>,
 }
 
-/// What a transcript said: the case markers, and whether the script's
-/// `end` marker came (the script ran to its end).
+/// The script's wait for the proxy before its first case (`aienv_r`): the
+/// attempts it took, the seconds it waited, and whether a TCP connection to
+/// the proxy's port opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ready {
+    pub tries: u32,
+    pub secs: u32,
+    pub ok: bool,
+}
+
+/// What a transcript said: the case markers, the wait for the proxy, and
+/// whether the script's `end` marker came (the script ran to its end).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Markers {
     pub cases: Vec<CaseResult>,
+    pub ready: Option<Ready>,
     pub finished: bool,
 }
 
@@ -406,15 +439,16 @@ fn is_server(s: &str) -> bool {
 }
 
 const CURL_FIELDS: [&str; 7] = ["rc", "code", "size", "conn", "hc", "t403", "sq"];
-const DIG_FIELDS: [&str; 3] = ["rc", "ns", "res"];
+const DIG_FIELDS: [&str; 5] = ["rc", "ns", "res", "st", "ra"];
+const READY_FIELDS: [&str; 3] = ["try", "s", "ok"];
 
 /// The marker lines of run `nonce` in `output` (the remote's transcript:
 /// the shell's echo of the script, prompts, the markers). A line holds a
 /// marker when it contains `@@AIENV`; the echoed script never does (its
 /// markers are built at run time). Each case may appear once; `Err` for a
 /// marker of another nonce, an unknown case, a case twice, a missing,
-/// repeated or malformed field, `end` twice. Missing cases are [`judge`]'s
-/// to name.
+/// repeated or malformed field, `end` or `ready` twice. Missing cases are
+/// [`judge`]'s to name.
 pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, String> {
     if !is_nonce(nonce) {
         return Err(format!("{:?} is not a run nonce", shown(nonce)));
@@ -440,6 +474,13 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
                 return Err(format!("the end marker carries {:?}", shown(w)));
             }
             m.finished = true;
+            continue;
+        }
+        if name == "ready" {
+            if m.ready.is_some() {
+                return Err("the ready marker twice".into());
+            }
+            m.ready = Some(parse_ready(words)?);
             continue;
         }
         let spec = case(name).ok_or_else(|| format!("unknown case {:?}", shown(name)))?;
@@ -479,6 +520,10 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
                 "ns" if v == "none" => r.ns = None,
                 "ns" if is_server(v) => r.ns = Some(v.to_string()),
                 "res" => r.resolves = Some(yes_no()?),
+                "st" if v == "none" => r.status = None,
+                "st" if (1..=16).contains(&v.len()) && v.bytes().all(|c| c.is_ascii_uppercase()) => r.status = Some(v.to_string()),
+                "ra" if v == "none" => r.ra = None,
+                "ra" => r.ra = Some(yes_no()?),
                 _ => return Err(bad()),
             }
         }
@@ -488,9 +533,44 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
         if spec.is_dns() && (r.rc.is_none() != r.ns.is_none()) {
             return Err(format!("{name}: rc and ns disagree on whether a server was asked"));
         }
+        if spec.is_dns() && r.rc.is_none() && (r.status.is_some() || r.ra.is_some()) {
+            return Err(format!("{name}: a status or flags, but no server was asked"));
+        }
         m.cases.push(r);
     }
     Ok(m)
+}
+
+/// The fields of the `ready` marker: `try=<n> s=<seconds> ok=yes|no`, each once.
+fn parse_ready<'a>(words: impl Iterator<Item = &'a str>) -> std::result::Result<Ready, String> {
+    let mut r = Ready::default();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for w in words {
+        let (k, v) = w.split_once('=').ok_or_else(|| format!("ready: {:?} is not key=value", shown(w)))?;
+        let Some(key) = READY_FIELDS.iter().copied().find(|f| *f == k) else {
+            return Err(format!("ready: unexpected field {:?}", shown(k)));
+        };
+        if !seen.insert(key) {
+            return Err(format!("ready: {k} twice"));
+        }
+        let bad = || format!("ready: bad {k}={:?}", shown(v));
+        let number = || -> std::result::Result<u32, String> { if !v.is_empty() && v.len() <= 6 && v.bytes().all(|c| c.is_ascii_digit()) { v.parse().map_err(|_| bad()) } else { Err(bad()) } };
+        match key {
+            "try" => r.tries = number()?,
+            "s" => r.secs = number()?,
+            _ => {
+                r.ok = match v {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err(bad()),
+                }
+            }
+        }
+    }
+    if let Some(missing) = READY_FIELDS.iter().find(|f| !seen.contains(*f)) {
+        return Err(format!("ready: the {missing} field is missing"));
+    }
+    Ok(r)
 }
 
 // ---- the judgement ----------------------------------------------------------------------------
@@ -530,6 +610,8 @@ pub struct CaseVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Judgement {
     pub cases: Vec<CaseVerdict>,
+    /// The script's wait for the proxy, when its marker came.
+    pub ready: Option<Ready>,
     /// The script's `end` marker came.
     pub finished: bool,
     /// The run's DNS verdict by the dns-path rule (`no-dns` |
@@ -594,6 +676,17 @@ fn curl_seen(r: &CaseResult) -> String {
     }
 }
 
+/// What a DNS reply said beyond its address, for the reasons: ` (status
+/// REFUSED, no recursion)`; empty when dig printed neither.
+fn dns_said(r: &CaseResult) -> String {
+    let parts: Vec<String> = [r.status.as_deref().map(|s| format!("status {s}")), r.ra.map(|a| (if a { "recursion available" } else { "no recursion" }).to_string())].into_iter().flatten().collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 /// Does the `allowed` case `r` show a working path through the proxy (its
 /// tunnel opened, the API answered 401)?
 fn allowed_passed(r: Option<&CaseResult>) -> bool {
@@ -623,10 +716,13 @@ fn judge_case(c: &Case, r: &CaseResult) -> (Verdict, String) {
             };
             match r.rc {
                 None => (Verdict::Pass, "not asked: /etc/resolv.conf names no nameserver".into()),
+                // A truncated UDP reply whose TCP retry failed: the UDP path answered.
+                Some(9) if r.status.is_some() && public => (Verdict::Fail, format!("OPEN: {ns}, not a platform resolver, replied over UDP (truncated; dig's TCP retry got nothing)")),
+                Some(9) if r.status.is_some() => (Verdict::Fail, format!("not proven closed: {ns} sent a truncated UDP reply and dig's TCP retry got nothing")),
                 Some(9) => (Verdict::Pass, format!("closed: no reply from {ns}")),
-                Some(0) if r.resolves == Some(true) => (Verdict::Fail, format!("OPEN: {ns} resolved {DNS_NAME}")),
-                Some(0) if public => (Verdict::Fail, format!("OPEN: {ns}, not a platform resolver, replied (it resolved nothing, but the path is open)")),
-                Some(0) => (Verdict::Pass, format!("{ns} replied and resolved nothing (platform DNS: `ai-env lab run dns-path` records it)")),
+                Some(0) if r.resolves == Some(true) => (Verdict::Fail, format!("OPEN: {ns} resolved {DNS_NAME}{}", dns_said(r))),
+                Some(0) if public => (Verdict::Fail, format!("OPEN: {ns}, not a platform resolver, replied{} (it resolved nothing, but the path is open)", dns_said(r))),
+                Some(0) => (Verdict::Pass, format!("{ns} replied{} and resolved nothing (platform DNS: `ai-env lab run dns-path` records it)", dns_said(r))),
                 Some(rc) => (Verdict::Fail, format!("not proven closed: dig exited {rc} asking {ns}{}", if rc == 127 { " (dig is not in the image)" } else { "" })),
             }
         }
@@ -652,7 +748,14 @@ fn dns_replies(m: &Markers) -> (Option<String>, Vec<DnsReply>) {
     let mut out = Vec::new();
     for c in CASES.iter().filter(|c| c.is_dns()) {
         if let Some(r) = m.get(c.name) {
-            out.push(DnsReply { server: r.ns.clone().unwrap_or_default(), transport: if c.name.ends_with("-tcp") { "tcp" } else { "udp" }, rc: r.rc, resolves: r.resolves == Some(true) });
+            out.push(DnsReply {
+                server: r.ns.clone().unwrap_or_default(),
+                transport: if c.name.ends_with("-tcp") { "tcp" } else { "udp" },
+                rc: r.rc,
+                resolves: r.resolves == Some(true),
+                status: r.status.clone(),
+                ra: r.ra,
+            });
         }
     }
     let resolv = m.get("dns-resolv-udp").or_else(|| m.get("dns-resolv-tcp")).and_then(|r| r.ns.clone());
@@ -662,7 +765,8 @@ fn dns_replies(m: &Markers) -> (Option<String>, Vec<DnsReply>) {
 /// Judge every case of [`CASES`] (pure). A missing case fails; a direct,
 /// DNS or other-port case that passed on its own still fails unless both
 /// `allowed` cases of the same run passed (a VM whose networking is dead,
-/// or died midway, proves nothing closed). `dns` is the run's dns-path
+/// or died midway, proves nothing closed); a failing `allowed` says when
+/// the script's wait never reached the proxy. `dns` is the run's dns-path
 /// verdict.
 #[must_use]
 pub fn judge(m: &Markers) -> Judgement {
@@ -674,6 +778,9 @@ pub fn judge(m: &Markers) -> Judgement {
                 return CaseVerdict { name: c.name, group: c.group, verdict: Verdict::Fail, reason: "no result: the script did not reach it".into(), result: None };
             };
             let (mut verdict, mut reason) = judge_case(c, r);
+            if let Some(w) = m.ready.filter(|w| c.name == "allowed" && verdict == Verdict::Fail && !w.ok) {
+                reason = format!("{reason} — the script waited {} s ({} attempts) and never opened a connection to the proxy's port", w.secs, w.tries);
+            }
             if verdict == Verdict::Pass && c.needs_allowed() && !allowed_ok {
                 verdict = Verdict::Fail;
                 reason = format!("{reason} — not counted: `allowed` and `allowed-last` did not both pass in this run, so this VM's networking proved nothing");
@@ -686,7 +793,7 @@ pub fn judge(m: &Markers) -> Judgement {
         Ok((v, _)) => v,
         Err(e) => format!("unknown ({e})"),
     };
-    Judgement { cases, finished: m.finished, dns }
+    Judgement { cases, ready: m.ready, finished: m.finished, dns }
 }
 
 /// The dns-path probe's verdict and note from its transcript's markers: the
@@ -710,7 +817,8 @@ pub fn dns_path_outcome(m: &Markers) -> std::result::Result<(String, String), St
     }
     let (resolv, replies) = dns_replies(m);
     let (verdict, note) = verdict_dns_path(resolv.as_deref(), &replies)?;
-    Ok((verdict, format!("{note}; the proxy answered before and after (allowed, allowed-last: HTTP 401)")))
+    let ready = m.ready.map(|w| format!(", reached {} s after the script began", w.secs)).unwrap_or_default();
+    Ok((verdict, format!("{note}; the proxy answered before and after (allowed, allowed-last: HTTP 401){ready}")))
 }
 
 // ---- squid's log ------------------------------------------------------------------------------
@@ -830,17 +938,23 @@ pub async fn squid_poll(nonce: &str, started_s: u64, ended_s: u64, budget: Durat
 
 /// The network verification for the record: `Ok(summary)` when every row
 /// of `egress status`'s checks is `ok`, else `Err` naming each row that
-/// drifted or could not be verified (or why none could run).
-fn network_verdict() -> std::result::Result<String, String> {
-    let rows = super::cli::network_verification().map_err(|e| format!("not run: {e}"))?;
+/// drifted or could not be verified (or why none could run); and the facts
+/// of the connector answer it judged ok (a pass binds exactly those: a
+/// configuration change after the verification then shows at the credential
+/// gate as live facts that differ from the record's).
+fn network_verdict() -> (std::result::Result<String, String>, Option<ConnectorFacts>) {
+    let (rows, facts) = match super::cli::network_verification() {
+        Ok(v) => v,
+        Err(e) => return (Err(format!("not run: {e}")), None),
+    };
     let bad: Vec<String> = rows.iter().filter(|r| r.status != "ok").map(|r| format!("{} {}: {}", r.status, r.check, r.detail)).collect();
     if rows.is_empty() {
-        return Err("no check ran".into());
+        return (Err("no check ran".into()), None);
     }
     if bad.is_empty() {
-        Ok(format!("{} checks ok: {}", rows.len(), rows.iter().map(|r| r.check).collect::<Vec<_>>().join(", ")))
+        (Ok(format!("{} checks ok: {}", rows.len(), rows.iter().map(|r| r.check).collect::<Vec<_>>().join(", "))), facts)
     } else {
-        Err(bad.join("; "))
+        (Err(bad.join("; ")), None)
     }
 }
 
@@ -924,7 +1038,7 @@ pub fn decide(ev: &Evidence, connector: &str, at: &str) -> Decision {
     if ev.own && failures.is_empty() {
         match &ev.connector_facts {
             Some(Ok(f)) if f.complete() => facts = f.clone(),
-            Some(Ok(_)) => failures.push("the connector's facts are incomplete (Id, Version, subnet, security group): nothing to bind the record to".into()),
+            Some(Ok(_)) => failures.push("the connector's facts are incomplete (Id, network protocol, subnet, security group): nothing to bind the record to".into()),
             Some(Err(e)) => failures.push(format!("the connector's facts could not be read: {e}")),
             None => failures.push("the connector's facts were not read".into()),
         }
@@ -1148,7 +1262,7 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
         Err(e) => (judge(&Markers::default()), Err(e)),
     };
     eprintln!("egress check: verifying the network (every check of `ai-env egress status`)");
-    let network = tokio::task::spawn_blocking(network_verdict).await.unwrap_or_else(|e| Err(format!("internal: {e}")));
+    let (network, verified_facts) = tokio::task::spawn_blocking(network_verdict).await.unwrap_or_else(|e| (Err(format!("internal: {e}")), None));
     let squid = if transcript.is_ok() && judgement.passed() && network.is_ok() {
         let (budget, step) = (scaled(SQUID_LOG_BUDGET, ctx.knobs.backoff_ms), scaled(SQUID_LOG_STEP, ctx.knobs.backoff_ms));
         eprintln!("egress check: every case passed; reading squid's log in CloudWatch (at most {} s)", budget.as_secs());
@@ -1156,10 +1270,11 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
     } else {
         None
     };
-    // What a record of its own VM is bound to, read only when it could record.
+    // What a record of its own VM is bound to, only when it could record: the connector answer the network
+    // verification judged (never a later read, which a change in between would make the record's), and the image
+    // version's created_at.
     let (connector_facts, image_created_at) = if own && matches!(squid, Some(Ok(_))) {
-        let arn = connector.to_string();
-        let facts = tokio::task::spawn_blocking(move || read_connector_facts(&arn)).await.unwrap_or_else(|e| Err(format!("internal: {e}")));
+        let facts = verified_facts.ok_or_else(|| format!("the get-network-connector answer for {connector} that the network verification judged has no Id, network protocol, subnet or security group"));
         (Some(facts), Some(image_created_at(api, &row.image_arn, &vm.image_version).await))
     } else {
         (None, None)
@@ -1182,18 +1297,20 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
     })
 }
 
-/// The configured connector's facts as the operator's aws CLI reads them
-/// now (`aws lambda-core get-network-connector`, region and endpoint pinned).
-fn read_connector_facts(arn: &str) -> std::result::Result<ConnectorFacts, String> {
-    let doc = awscli::aws_json("lambda-core", &["get-network-connector", "--identifier", arn])?;
-    ConnectorFacts::from_get(&doc).ok_or_else(|| format!("aws lambda-core get-network-connector {arn}: no Id, Version, subnet or security group in the answer"))
-}
-
 /// The `created_at` of `version` of `image_arn` (`ListMicrovmImageVersions`).
 async fn image_created_at<A: MicrovmApi>(api: &A, image_arn: &str, version: &str) -> std::result::Result<i64, String> {
     let versions = api.list_image_versions(image_arn).await.map_err(|e| e.to_string())?;
     let v = versions.iter().find(|v| v.version == version).ok_or_else(|| format!("version {version} of {image_arn} is not listed"))?;
     v.created_at_unix.ok_or_else(|| format!("version {version} of {image_arn} reports no created_at"))
+}
+
+/// The report's line about the script's wait for the proxy.
+fn ready_text(ready: Option<Ready>) -> String {
+    match ready {
+        Some(w) if w.ok => format!("ready: the VM reached the proxy's port {} s after the script began ({} attempt{})", w.secs, w.tries, if w.tries == 1 { "" } else { "s" }),
+        Some(w) => format!("ready: the VM did NOT reach the proxy's port in {} s ({} attempts)", w.secs, w.tries),
+        None => "ready: no marker (the script did not get that far)".to_string(),
+    }
 }
 
 /// A poll duration under the lab's `AI_ENV_BRIDGE_LAB_BACKOFF_MS` (1 s → n ms).
@@ -1349,6 +1466,9 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
         Some(Err(_)) => pairs.push(("revoked", "error".to_string())),
         None => {}
     }
+    if let Some(w) = ev.judgement.ready {
+        pairs.push(("ready", format!("{}s/{}/{}", w.secs, w.tries, if w.ok { "ok" } else { "never" })));
+    }
     if !ev.own {
         pairs.push(("report_only", "true".to_string()));
     }
@@ -1375,6 +1495,7 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
                 serde_json::json!({
                     "name": c.name, "group": c.group, "verdict": c.verdict.as_str(), "reason": c.reason, "rc": r.rc, "code": r.code, "size": r.size,
                     "connects": r.conn, "connect_code": r.hc, "t403": r.t403, "squid_error": r.sq, "ns": r.ns, "resolves": r.resolves,
+                    "dns_status": r.status, "recursion_available": r.ra,
                 })
             })
             .collect();
@@ -1382,6 +1503,7 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
             "backend": ctx.backend_name(), "id": ev.id, "report_only": !ev.own, "image_arn": ev.row_image_arn, "image_version": ev.vm_image_version,
             "echoed_image_arn": ev.vm_image_arn, "row_image_version": ev.row_image_version, "connector": normalize_connector(connector),
             "denied_host": ev.denied_host, "finished": ev.judgement.finished, "transcript_error": ev.transcript.as_ref().err(), "cases": cases,
+            "ready": ev.judgement.ready.map(|w| serde_json::json!({"tries": w.tries, "secs": w.secs, "ok": w.ok})),
             "dns": ev.judgement.dns, "network": { "ok": network_ok, "detail": network_text }, "squid_log": { "ok": squid_ok, "detail": squid_text },
             "evidence": EVIDENCE_NOTE, "verdict": verdict, "recorded": d.record.is_some(),
             "revoked": revoked.as_ref().map(|r| r.as_ref().map_or_else(|e| serde_json::json!({"error": e}), |n| serde_json::json!(n))), "failures": d.failures,
@@ -1390,6 +1512,7 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
     } else {
         outln!("egress check of {} (image version {}; connector {}){}", ev.id, ev.vm_image_version, normalize_connector(connector), if ev.own { "" } else { " — report only (--vm)" });
         outln!("note: {EVIDENCE_NOTE}");
+        outln!("{}", ready_text(ev.judgement.ready));
         for c in &ev.judgement.cases {
             let tag = match c.verdict {
                 Verdict::Pass => "pass",
@@ -1433,7 +1556,7 @@ mod tests {
     }
 
     fn dig(name: &str, rc: &str, ns: &str, res: bool) -> String {
-        format!("@@AIENV{NONCE} {name} rc={rc} ns={ns} res={}", if res { "yes" } else { "no" })
+        format!("@@AIENV{NONCE} {name} rc={rc} ns={ns} res={} st=none ra=none", if res { "yes" } else { "no" })
     }
 
     /// Every case's marker in a closed, working VPC.
@@ -1508,7 +1631,9 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         let export = lines.iter().position(|l| l.starts_with("export ")).unwrap();
         assert_eq!(lines[export], "export https_proxy='http://10.42.0.10:3128' HTTPS_PROXY='http://10.42.0.10:3128' http_proxy='http://10.42.0.10:3128' HTTP_PROXY='http://10.42.0.10:3128' no_proxy='localhost,127.0.0.1,::1' NO_PROXY='localhost,127.0.0.1,::1'");
-        assert!(lines[export + 1].starts_with("aienv_c allowed ") && lines[export - 1].starts_with("aienv_d() "), "{s}");
+        assert!(lines[export + 1] == "aienv_r 10.42.0.10:3128" && lines[export + 2].starts_with("aienv_c allowed ") && lines[export - 1].starts_with("aienv_r() "), "{s}");
+        assert_eq!(s.matches("aienv_r 10.42.0.10:3128\n").count(), 1, "one wait, right before the first case");
+        assert!(s.contains("command sleep 2") && s.contains("--noproxy '*' --connect-timeout 2 --max-time 4 \"http://$1/\""), "a plain TCP connection to the proxy, without the proxy: {s}");
         assert_eq!(s.matches("export ").count(), 1);
         assert!(lines[lines.len() - 3].starts_with("aienv_c allowed-last "), "allowed is the last case too");
         assert!(render_script(NONCE, "10.42.0.99").contains("http://10.42.0.99:3128"), "the configured proxy address");
@@ -1519,7 +1644,8 @@ mod tests {
         assert_eq!(names, want);
         assert_eq!((names.first(), names.last()), (Some(&"allowed"), Some(&"allowed-last")));
         assert!(d.len() < 4096 && d.ends_with("\nexit\n") && d.contains("export https_proxy="));
-        assert_eq!(script_budget(CASES.len()), Duration::from_secs(27 * 12 + 30));
+        assert_eq!(script_budget(CASES.len()), Duration::from_secs(27 * 12 + 60 + 5 + 30), "the cases, the wait for the proxy, slack");
+        assert!(d.contains("aienv_r 10.42.0.10:3128\naienv_c allowed "), "the dns-path script waits too: {d}");
     }
 
     #[test]
@@ -1565,6 +1691,54 @@ mod tests {
         assert_eq!(parse_markers("", NONCE).unwrap(), Markers::default());
     }
 
+    /// The wait for the proxy (`ready`) and dig's status and recursion flag,
+    /// as measured live 1 Oct 2026: the first `allowed` could not connect at
+    /// all (rc 7), every later proxied case passed, and `fd00:ec2::253`
+    /// replied without an address.
+    #[test]
+    fn the_wait_for_the_proxy_and_the_dns_status_are_parsed_and_reported() {
+        let ready = |line: &str| -> Vec<(String, String)> {
+            let mut v = passing();
+            v.insert(0, ("ready".to_string(), format!("@@AIENV{NONCE} ready {line}")));
+            v
+        };
+        let m = parse_markers(&transcript(&ready("try=4 s=6 ok=yes")), NONCE).unwrap();
+        assert_eq!(m.ready, Some(Ready { tries: 4, secs: 6, ok: true }));
+        let j = judge(&m);
+        assert!(j.passed() && j.ready == m.ready, "{:?}", j.failures());
+        assert_eq!(ready_text(j.ready), "ready: the VM reached the proxy's port 6 s after the script began (4 attempts)");
+        assert_eq!(ready_text(Some(Ready { tries: 1, secs: 0, ok: true })), "ready: the VM reached the proxy's port 0 s after the script began (1 attempt)");
+        assert!(ready_text(None).contains("no marker"));
+        // The live failure: no connection at first. With the wait it says the proxy never came up; without it, it does not.
+        let dead = curl("allowed", 7, "000", "0", "000", false, false);
+        let mut lines = ready("try=30 s=60 ok=no");
+        lines = lines.into_iter().map(|(k, l)| if k == "allowed" { (k, dead.clone()) } else { (k, l) }).collect();
+        let j = judged(&lines);
+        let allowed = verdict_of(&j, "allowed");
+        assert!(allowed.reason.contains("did not answer") && allowed.reason.contains("waited 60 s (30 attempts) and never opened a connection"), "{}", allowed.reason);
+        assert!(ready_text(j.ready).contains("did NOT reach the proxy's port in 60 s"));
+        assert!(verdict_of(&judged(&with("allowed", dead.clone())), "allowed").reason.contains("did not answer") && !verdict_of(&judged(&with("allowed", dead)), "allowed").reason.contains("waited"));
+        // dig's status and flags reach the reasons and the dns-path note.
+        let platform6 = format!("@@AIENV{NONCE} dns-platform6-udp rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no");
+        let m = parse_markers(&transcript(&with("dns-platform6-udp", platform6)), NONCE).unwrap();
+        let r = m.get("dns-platform6-udp").unwrap();
+        assert_eq!((r.status.as_deref(), r.ra), (Some("REFUSED"), Some(false)));
+        let j = judge(&m);
+        assert!(j.passed(), "{:?}", j.failures());
+        assert_eq!(verdict_of(&j, "dns-platform6-udp").reason, "fd00:ec2::253 replied (status REFUSED, no recursion) and resolved nothing (platform DNS: `ai-env lab run dns-path` records it)");
+        assert_eq!(j.dns, "platform-dns:fd00:ec2::253");
+        // A truncated UDP reply whose TCP retry got nothing (dig exit 9, `st=TRUNCATED`): open for a public resolver, unproven for the platform's.
+        let j = judged(&with("dns-public-udp", format!("@@AIENV{NONCE} dns-public-udp rc=9 ns=1.1.1.1 res=no st=TRUNCATED ra=none")));
+        assert!(verdict_of(&j, "dns-public-udp").verdict == Verdict::Fail && verdict_of(&j, "dns-public-udp").reason.starts_with("OPEN: 1.1.1.1"), "{:?}", verdict_of(&j, "dns-public-udp"));
+        assert_eq!(j.dns, "open-dns:1.1.1.1");
+        let j = judged(&with("dns-platform6-udp", format!("@@AIENV{NONCE} dns-platform6-udp rc=9 ns=fd00:ec2::253 res=no st=TRUNCATED ra=none")));
+        assert!(verdict_of(&j, "dns-platform6-udp").reason.starts_with("not proven closed: fd00:ec2::253 sent a truncated UDP reply") && !j.passed() && j.dns.starts_with("unknown ("), "{}", j.dns);
+        let servfail = format!("@@AIENV{NONCE} dns-public-udp rc=0 ns=1.1.1.1 res=no st=SERVFAIL ra=yes");
+        assert!(verdict_of(&judged(&with("dns-public-udp", servfail)), "dns-public-udp").reason.contains("replied (status SERVFAIL, recursion available) (it resolved nothing"));
+        let (_, note) = dns_path_outcome(&parse_markers(&transcript(&ready("try=1 s=0 ok=yes").into_iter().map(|(k, l)| if k == "dns-platform6-tcp" { (k, format!("@@AIENV{NONCE} dns-platform6-tcp rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no")) } else { (k, l) }).collect::<Vec<_>>()), NONCE).unwrap()).unwrap();
+        assert!(note.contains("fd00:ec2::253 udp no reply, tcp replied (REFUSED, no recursion)") && note.ends_with("(allowed, allowed-last: HTTP 401), reached 0 s after the script began"), "{note}");
+    }
+
     #[test]
     fn malformed_markers_are_refused() {
         let other = "fedcba9876543210";
@@ -1594,7 +1768,21 @@ mod tests {
             (dig("dns-platform-udp", "none", "169.254.169.253", false), "disagree"),
             (dig("dns-platform-udp", "9", "none", false), "disagree"),
             (format!("{ok} {}", curl("denied", 56, "000", "1", "403", true, false)), "two markers"),
+            (dig("dns-platform-udp", "0", "169.254.169.253", false).replace("st=none", "st=refused"), "bad st"),
+            (dig("dns-platform-udp", "0", "169.254.169.253", false).replace("st=none", "st=NO_ERROR"), "bad st"),
+            (dig("dns-platform-udp", "0", "169.254.169.253", false).replace("ra=none", "ra=maybe"), "yes|no"),
+            (dig("dns-platform-udp", "0", "169.254.169.253", false).replace(" st=none", ""), "st field is missing"),
+            (dig("dns-resolv-udp", "none", "none", false).replace("st=none", "st=REFUSED"), "no server was asked"),
+            (format!("@@AIENV{NONCE} ready try=1 s=0 ok=yes\n@@AIENV{NONCE} ready try=1 s=0 ok=yes"), "ready marker twice"),
+            (format!("@@AIENV{NONCE} ready try=1 s=0"), "ok field is missing"),
+            (format!("@@AIENV{NONCE} ready try=1 s=0 ok=yes x=1"), "unexpected field"),
+            (format!("@@AIENV{NONCE} ready try=1 s=-1 ok=yes"), "bad s"),
+            (format!("@@AIENV{NONCE} ready try=1 s=0 ok=sure"), "bad ok"),
+            (format!("@@AIENV{NONCE} ready try=1 try=2 s=0 ok=yes"), "try twice"),
+            (format!("@@AIENV{NONCE} ready junk"), "not key=value"),
         ];
+        // The wait's keepalive dots before a marker are harmless.
+        assert_eq!(parse_markers(&format!("...@@AIENV{NONCE} ready try=4 s=6 ok=yes"), NONCE).unwrap().ready, Some(Ready { tries: 4, secs: 6, ok: true }));
         for (text, why) in bad {
             let e = parse_markers(&text, NONCE).unwrap_err();
             assert!(e.contains(why), "{text:?}: {e}");
@@ -1830,7 +2018,7 @@ mod tests {
     }
 
     fn facts() -> ConnectorFacts {
-        ConnectorFacts { id: "nc-0a1b2c3d4e5f60718".into(), version: "1".into(), subnet_ids: vec!["subnet-0aaa1111bbbb2222c".into()], security_group_ids: vec!["sg-0ddd3333eeee4444f".into()] }
+        ConnectorFacts { id: "nc-0a1b2c3d4e5f60718".into(), version: "1".into(), network_protocol: "IPv4".into(), subnet_ids: vec!["subnet-0aaa1111bbbb2222c".into()], security_group_ids: vec!["sg-0ddd3333eeee4444f".into()] }
     }
 
     const CONN: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";

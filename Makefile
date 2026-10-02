@@ -38,6 +38,9 @@ ifneq ($(origin AI_ENV),command line)
 AI_ENV       := $(CARGO) run -q -p $(PKG) --bin ai-env --
 endif
 unexport AI_ENV
+# The aws CLI pages its output through less on a terminal (measured 1 Oct 2026: `make image-status` stopped in the
+# pager); no recipe wants that.
+export AWS_PAGER :=
 # Image sources (tests point IMAGE_DIR at a planted copy) and build outputs.
 IMAGE_DIR    ?= image
 IMAGE_OUT    ?= target/image

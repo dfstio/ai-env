@@ -11,7 +11,8 @@
 // transforms, and a preview of new resources cannot compare ids. This check sees what the engine will create: every
 // resource of the plan must be one of the stack inventory (egress-spec.ts stackInventory), by type and name, with
 // exact counts; each egress resource's inputs must satisfy the spec's predicates; every reference is checked by
-// URN (property dependencies) and, where the ids are known, by value; every IAM document (trust, inline, user and
+// URN (property dependencies) and, where the ids are known (a resource the plan keeps: its oldState id), by value;
+// every IAM document (trust, inline, user and
 // managed policy) must be the policies.ts function's output for that resource, for the account given (the caller
 // reads it from `aws sts get-caller-identity`; it is only ever an argument); the parameters `ai-env egress` owns
 // may only be created, never updated or replaced (that would reset them). It runs in `make preview-scratch` and in
@@ -28,7 +29,7 @@ import {
 } from "../egress-spec";
 import {
     BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_POLICY_NAME, EXECUTION_ROLE_NAME, Names,
-    PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, buildRolePolicy, deployDnsPolicy, deployEgressPolicy, deployPolicy,
+    PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, buildRolePolicy, deployDnsPolicy, deployEgressPolicy, deployPolicy, roleArn,
     executionRolePolicy, lambdaTrustPolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy, runtimePolicy,
 } from "../policies";
 
@@ -130,8 +131,11 @@ for (const s of plan.steps ?? []) {
     if (GONE.has(s.op)) continue;
     const st = s.newState ?? s.oldState;
     if (st === undefined) { bad(`step ${s.op} ${s.urn} has no state`); continue; }
+    // A preview's newState carries no id on any step (measured with pulumi 3.266, 1 Oct 2026): a resource the step
+    // keeps (same, update) has its id in oldState only; a replaced or created one has none yet.
+    const id = st.id || (s.op === "same" || s.op === "update" ? s.oldState?.id : undefined) || "";
     byUrn.set(st.urn, {
-        op: s.op, urn: st.urn, type: st.type, name: st.urn.split("::").pop() ?? "", custom: st.custom !== false, id: st.id ?? "", parent: st.parent ?? "",
+        op: s.op, urn: st.urn, type: st.type, name: st.urn.split("::").pop() ?? "", custom: st.custom !== false, id, parent: st.parent ?? "",
         provider: st.provider ?? "", protect: st.protect === true, i: st.inputs ?? {}, deps: st.propertyDependencies ?? {},
     });
 }
@@ -441,6 +445,13 @@ if (known(subnets.vms.id) && (vec.subnetIds as unknown[] | undefined)?.some((x) 
 if (known(sgs.vm.id) && (vec.securityGroupIds as unknown[] | undefined)?.some((x) => known(x) && x !== sgs.vm.id)) bad("connector: securityGroupIds is not the VM security group");
 present(conn, "operatorRole");
 ref(conn, "operatorRole", [operatorRole, operatorAttachment]);
+// The role the connector's service assumes to create its ENIs: exactly the stack's operator role (ref() cannot compare
+// an ARN by value). Unknown only while the role or its attachment is being created.
+const operatorArn = roleArn(names, cfg.operatorRoleName);
+if (known(conn.i.operatorRole) && conn.i.operatorRole !== operatorArn) bad(`connector: operatorRole ${conn.i.operatorRole} is not ${operatorArn}`);
+if (conn !== EMPTY && !known(conn.i.operatorRole) && !CREATING.has(conn.op) && ![operatorRole, operatorAttachment].some((r) => CREATING.has(r.op))) {
+    bad("connector: operatorRole is unknown on a plan in which neither it nor the operator role is created");
+}
 
 // ---- dnsMode firewall: the block-all DNS Firewall ----
 if (cfg.dnsMode === "firewall") {

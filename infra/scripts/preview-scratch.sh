@@ -17,7 +17,13 @@
 # once from `aws sts get-caller-identity` into a shell variable) and no update of the parameters `ai-env egress`
 # owns. A --json plan has no stack outputs, so the 14
 # egress outputs `ai-env infra status` reads are checked in the text preview, squidConfSha256 and allowSha256
-# against the SHA-256 of the planned parameter values. The layers a negative goes through, each one alone (the
+# against the SHA-256 of the planned parameter values. Then the same plan, rewritten in memory into the shape
+# `pulumi preview --json` gives for the stack once it exists (every step same, or the VM subnet, VM security group
+# and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must pass
+# too, and four tampered copies of it (the deploy policy's CreateNetworkConnector condition naming the proxy
+# subnet, the connector on the proxy subnet or the proxy's security group, the connector passed another role) must
+# be refused: a fresh scratch stack only creates, and a check that saw only creates once refused every deploy after
+# the first. The layers a negative goes through, each one alone (the
 # earlier ones disabled in the scratch copy through their scratch:* markers):
 #   spec   assertEgressSpec, before any resource is registered;
 #   guard  the resource transform (egress.ts guardEgress), at registration;
@@ -182,6 +188,95 @@ expect_plan_refusal() {
     done
 }
 
+# existing_plan <variant>: the --json plan on stdin, rewritten into the shape of the same stack once it exists
+# (pulumi 3.266: one step per resource, op same; newState without an id, oldState with it): an id per resource
+# (a role's, user's or instance profile's is its name, the bucket's its name, a subnet's subnet-…, a group's
+# sg-…), every unknown input resolved through its property dependencies, the IAM documents rendered by policies.ts
+# for those ids (the compiled copy plan_check left in $scratch/plan-check). <variant>: none | updated (the VM subnet,
+# the VM security group and the VPC are update steps: their ids, too, come from oldState) | deploy-proxy-subnet (the
+# deploy policy names the proxy subnet) | connector-proxy-subnet (the connector's subnet is the proxy subnet) |
+# connector-proxy-sg (its security group is the proxy's) | connector-operator-role (it is passed another role).
+existing_plan() {
+    ACCOUNT_ID="$acct" node -e '
+const fs = require("fs");
+const [out, egressConfig, imageConfig, variant] = process.argv.slice(1);
+const pol = require(`${out}/policies.js`);
+const spec = require(`${out}/egress-spec.js`);
+const cfg = spec.loadEgressConfig(egressConfig);
+const img = JSON.parse(fs.readFileSync(imageConfig, "utf-8"));
+const plan = JSON.parse(fs.readFileSync(0, "utf-8"));
+const UNKNOWN = "04da6b54-80e4-46f7-96ec-b56ff0331ba9";
+const name = (s) => s.urn.split("::").pop();
+const type = (s) => (s.newState || s.oldState).type;
+const ids = new Map();
+let n = 0;
+for (const s of plan.steps) {
+    const t = type(s), i = (s.newState || {}).inputs || {}, k = n++;
+    const hex = (p) => `${p}-0${k.toString(16).padStart(16, "0")}`;
+    ids.set(s.urn, t === "aws:iam/role:Role" || t === "aws:iam/user:User" || t === "aws:iam/instanceProfile:InstanceProfile" ? i.name
+        : t === "aws:s3/bucket:Bucket" ? i.bucket
+        : t === "aws:ec2/subnet:Subnet" ? hex("subnet") : t === "aws:ec2/securityGroup:SecurityGroup" ? hex("sg") : t === "aws:ec2/vpc:Vpc" ? hex("vpc")
+        : t.startsWith("pulumi:providers:") ? `00000000-0000-4000-8000-${k.toString(16).padStart(12, "0")}` : hex("id"));
+}
+const byName = (t, nm) => plan.steps.find((s) => type(s) === t && name(s) === nm);
+const vmSubnet = ids.get(byName("aws:ec2/subnet:Subnet", "ai-env-egress-vms").urn);
+const proxySubnet = ids.get(byName("aws:ec2/subnet:Subnet", "ai-env-egress-proxy").urn);
+const vmSg = ids.get(byName("aws:ec2/securityGroup:SecurityGroup", cfg.vmSecurityGroupName).urn);
+const proxySg = ids.get(byName("aws:ec2/securityGroup:SecurityGroup", cfg.proxySecurityGroupName).urn);
+const updated = new Set([byName("aws:ec2/subnet:Subnet", "ai-env-egress-vms").urn, byName("aws:ec2/securityGroup:SecurityGroup", cfg.vmSecurityGroupName).urn, byName("aws:ec2/vpc:Vpc", "ai-env-egress").urn]);
+const bucket = ids.get(plan.steps.find((s) => type(s) === "aws:s3/bucket:Bucket").urn);
+const names = (subnet) => ({ accountId: process.env.ACCOUNT_ID, region: pol.REGION, bucket, imageName: img.imageName, logGroup: img.logGroup,
+    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg } });
+const docs = (subnet) => new Map(pol.allPolicies(names(subnet)).map((d) => [d.name, JSON.stringify(d.document)]));
+const good = docs(vmSubnet), bad = docs(proxySubnet);
+// Which document each IAM input is (print-policies names).
+const doc = { "aws:iam/role:Role": { "ai-env-image-build": "build-trust", "ai-env-vm-exec": "execution-trust", [cfg.proxyRoleName]: "proxy-trust", [cfg.operatorRoleName]: "operator-trust" },
+    "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy" },
+    "aws:iam/userPolicy:UserPolicy": { MacRuntimePolicy: "runtime" },
+    "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns" } };
+// resolve(value, deps, key): every unknown in value, the id of its one dependency (under a connector list key, the
+// dependency of that kind); with several, a placeholder (a by-value check against it can only refuse, never pass).
+const resolve = (v, deps, key) => {
+    if (Array.isArray(v)) return v.map((x) => resolve(x, deps, key));
+    if (v !== null && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, resolve(x, deps, k)]));
+    if (v !== UNKNOWN) return v;
+    const want = key === "subnetIds" ? "aws:ec2/subnet:Subnet" : key === "securityGroupIds" ? "aws:ec2/securityGroup:SecurityGroup" : undefined;
+    const d = want ? deps.filter((u) => u.split("::").slice(-2, -1)[0] === want) : deps;
+    return d.length === 1 ? ids.get(d[0]) : `resolved-${key}`;
+};
+for (const s of plan.steps) {
+    const st = s.newState;
+    if (!st) continue;
+    const inputs = {};
+    for (const [k, v] of Object.entries(st.inputs || {})) {
+        const which = (doc[st.type] || {})[name(s)];
+        const iamKey = st.type === "aws:iam/role:Role" ? "assumeRolePolicy" : "policy";
+        inputs[k] = which && k === iamKey ? ((variant === "deploy-proxy-subnet" && which === "deploy" ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
+    }
+    if (st.type === "aws-native:lambda:NetworkConnector") {
+        // An ARN cannot be resolved from its two dependencies (the role and its attachment): it is the ARN of the operator role.
+        inputs.operatorRole = pol.roleArn(names(vmSubnet), variant === "connector-operator-role" ? "ai-env-vm-exec" : cfg.operatorRoleName);
+        if (variant === "connector-proxy-subnet") inputs.configuration.vpcEgressConfiguration.subnetIds = [proxySubnet];
+        if (variant === "connector-proxy-sg") inputs.configuration.vpcEgressConfiguration.securityGroupIds = [proxySg];
+    }
+    const kept = { ...st, inputs };
+    delete kept.id;
+    s.op = variant === "updated" && updated.has(s.urn) ? "update" : "same";
+    s.newState = kept;
+    s.oldState = st.type === "pulumi:pulumi:Stack" ? { ...kept } : { ...kept, id: ids.get(s.urn), outputs: { ...inputs, id: ids.get(s.urn) } };
+    if (st.provider) {
+        const purn = st.provider.slice(0, st.provider.lastIndexOf("::"));
+        s.provider = s.newState.provider = s.oldState.provider = `${purn}::${ids.get(purn)}`;
+    }
+}
+const left = [];
+const walk = (v, at) => { if (v === UNKNOWN || (typeof v === "string" && v.includes(UNKNOWN))) left.push(at); else if (v !== null && typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, `${at}.${k}`); };
+plan.steps.forEach((s) => walk(s, name(s)));
+if (left.length > 0) throw new Error(`existing_plan: unknown values left at ${left.slice(0, 8).join(", ")}`);
+process.stdout.write(JSON.stringify(plan));
+' "$scratch/plan-check" "$scratch/infra/egress-config.json" "$scratch/infra/image-config.json" "$1"
+}
+
 case "$negative" in
 "")
     if [ "$mode" = firewall ]; then
@@ -210,7 +305,27 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
 ' "ai-env-proxy-$p" <<<"$plan")
         test -n "$got" && test "$got" = "$want" || fail "output $k (${got:-none}) is not the SHA-256 of the planned $p parameter value (${want:-none})"
     done
-    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 14 egress outputs passed)"
+    # The same stack once it exists: the plan check must accept it (ids from oldState, for same and update steps) and
+    # refuse it tampered.
+    for v in none updated; do
+        existing=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
+        out=$(plan_check <<<"$existing" 2>&1) || { echo "$out"; fail "existing stack, $v: the plan check refused the plan of the deployed stack (ids in oldState)"; }
+        echo "existing stack, $v: $(first_line "check-plan: ok" "$out")"
+    done
+    for v in deploy-proxy-subnet connector-proxy-subnet connector-proxy-sg connector-operator-role; do
+        case "$v" in
+        deploy-proxy-subnet) t="aws:iam/policy:Policy ai-env-deploy: policy is not policies.ts deployPolicy()" ;;
+        connector-proxy-subnet) t="connector: subnetIds is not the VM subnet" ;;
+        connector-proxy-sg) t="connector: securityGroupIds is not the VM security group" ;;
+        *) t="connector: operatorRole arn:aws:iam::" ;;
+        esac
+        tampered=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
+        if out=$(plan_check <<<"$tampered" 2>&1); then echo "$out"; fail "existing stack, $v: the plan check passed"; fi
+        diag=$(first_line "$t" "$out")
+        test -n "$diag" || { echo "$out"; fail "existing stack, $v: the plan check refused, but not with \"$t\""; }
+        echo "existing stack, $v: $diag"
+    done
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 14 egress outputs passed; the existing-stack plans (same, update) passed, their four tampered copies were refused)"
     ;;
 no-logging)
     edit '/scratch:logging/d'

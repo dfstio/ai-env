@@ -190,8 +190,10 @@ fn connector_hint(message: &str) -> &'static str {
 }
 
 /// The last ARN segment of an echoed customer connector that differs from
-/// every expected one in that segment only: possibly the connector's Id form
-/// (the echo form is measured in S5 part B).
+/// every expected one in that segment only: possibly the connector's Id form.
+/// Never when the expected ARN is itself in the Id form (`nc-…`, as measured
+/// 1 Oct 2026: a connector Pulumi creates): no alias can apply, so the hint
+/// to record the Id would only repeat.
 fn id_form_echo<'a>(expected: &[String], echoed: &'a [String]) -> Option<&'a str> {
     let split = |a: &str| a.rsplit_once(":network-connector:").map(|(p, s)| (p.to_string(), s.split(':').next().unwrap_or(s).to_string()));
     echoed.iter().find_map(|e| {
@@ -199,7 +201,7 @@ fn id_form_echo<'a>(expected: &[String], echoed: &'a [String]) -> Option<&'a str
         if prefix.ends_with(":aws") {
             return None;
         }
-        let other = expected.iter().filter_map(|x| split(x)).any(|(p, s)| p == prefix && s != seg);
+        let other = expected.iter().filter_map(|x| split(x)).any(|(p, s)| p == prefix && s != seg && !s.starts_with("nc-"));
         other.then(|| e.rsplit_once(":network-connector:").map_or(e.as_str(), |(_, s)| s.split(':').next().unwrap_or(s)))
     })
 }
@@ -466,6 +468,10 @@ mod tests {
         assert!(legacy.contains("records no egress connector") && !legacy.contains("requires exactly"), "{legacy}");
         let id_form = BridgeError::egress_mismatch("microvm-x", vec![conn], vec!["arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0a1b2c:1".into()], true).to_string();
         assert!(id_form.contains("if nc-0a1b2c is the connector's Id") && id_form.contains("make infra-status WRITE=1"), "{id_form}");
+        // The configured ARN already in the Id form (measured live): recording the Id cannot help, so no such hint.
+        let id_conn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-f0b942fe-0612-44a7-9183-16942c532410".to_string();
+        let named = BridgeError::egress_mismatch("microvm-x", vec![id_conn], vec!["arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress".into()], true).to_string();
+        assert!(named.contains("echoed egress arn:") && !named.contains("connector's Id") && !named.contains("infra-status"), "{named}");
         let e2 = BridgeError::egress_mismatch("microvm-x", vec![internet.clone()], vec![internet], true).to_string();
         assert!(std::mem::size_of::<BridgeError>() <= 48, "boxed: {}", std::mem::size_of::<BridgeError>());
         assert!(!e2.contains("connector's Id"), "{e2}");

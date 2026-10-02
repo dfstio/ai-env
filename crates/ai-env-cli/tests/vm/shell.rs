@@ -164,9 +164,9 @@ fn passing_markers() -> String {
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
             n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
-            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
-            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no".to_string(),
-            n if n.starts_with("dns-") => "rc=9 ns=10.42.0.2 res=no".to_string(),
+            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
+            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none".to_string(),
+            n if n.starts_with("dns-") => "rc=9 ns=10.42.0.2 res=no st=none ra=none".to_string(),
             other => panic!("no marker for {other}"),
         };
         out.push_str(&format!("@@AIENV{NONCE} {} {line}\r\n", c.name));
@@ -228,12 +228,15 @@ async fn a_close_ends_the_session_and_the_output_is_capped() {
 
 /// A fake `curl` for the rendered script: no network, the `-w` variables
 /// filled. Without the proxy, names do not resolve, IPv6 is unreachable,
-/// IMDS answers 401, everything else times out without a connection
+/// IMDS answers 401, the proxy's own port answers squid's 400 (the script's
+/// wait for the proxy), everything else times out without a connection
 /// (`FAKE_WORLD=leaky`: 1.1.1.1:443 answers; `hang`: it connects, then
 /// times out); through the proxy, the allowlisted API answers 401 in a
 /// tunnel (CONNECT 200), a plain-http request gets squid's 403 page with
 /// `X-Squid-Error`, any other CONNECT the proxy's 403 and curl's text
-/// (`dead`: the proxy refuses connections; `dies`: after the first request).
+/// (`dead`: the proxy refuses connections; `dies`: after the first request;
+/// `late`: the VM reaches nothing for its first 3 connection attempts, as
+/// measured live 1 Oct 2026).
 const FAKE_CURL: &str = r#"#!/bin/sh
 fmt=; url=; noproxy=0; prev=
 for a in "$@"; do
@@ -245,8 +248,19 @@ case "$url" in https://*) proxy=${https_proxy:-} ;; *) proxy=${http_proxy:-} ;; 
 [ "$noproxy" = 1 ] && proxy=
 code=000; size=0; conn=0; hc=000; xse=; rc=0; err=
 world=${FAKE_WORLD:-closed}
+if [ "$world" = late ]; then
+  tries=$(( $(cat "$HOME/net-tries" 2>/dev/null || echo 0) + 1 ))
+  echo "$tries" > "$HOME/net-tries"
+  if [ "$tries" -le 3 ]; then
+    printf '%s' "$fmt" | sed -e "s/%{http_code}/000/" -e "s/%{size_download}/0/" -e "s/%{num_connects}/0/" -e "s/%{http_connect}/000/" -e "s/%header{x-squid-error}//"
+    printf 'curl: (7) Failed to connect: Network is unreachable\n' >&2
+    exit 7
+  fi
+fi
 if [ -z "$proxy" ]; then
   case "$url" in
+    http://10.42.0.10:3128/)
+      if [ "$world" = dead ]; then rc=7; err="Failed to connect to 10.42.0.10 port 3128: Connection refused"; else code=400; size=3500; conn=1; fi ;;
     https://api.anthropic.com/*) rc=6; err="Could not resolve host: api.anthropic.com" ;;
     https://1.1.1.1/)
       case "$world" in
@@ -277,14 +291,30 @@ printf '%s' "$fmt" | sed -e "s/%{http_code}/$code/" -e "s/%{size_download}/$size
 exit "$rc"
 "#;
 
-/// A fake `dig`: no server replies (dig's own error lines, which name the
-/// server, then exit 9) unless `FAKE_DNS_REPLY` names it (exit 0; with
-/// `FAKE_DNS_RESOLVES=1` the reply carries an address).
+/// A fake `dig` printing what `+noall +comments +answer` prints: no server
+/// replies (dig's own error lines, which name the server, then exit 9)
+/// unless `FAKE_DNS_REPLY` names it (exit 0: a header with its status, the
+/// flags line, `ra` among them with `FAKE_DNS_RA=1`; with
+/// `FAKE_DNS_RESOLVES=1` status NOERROR and an answer, else
+/// `FAKE_DNS_STATUS`, REFUSED by default); `FAKE_DNS_TRUNCATE` names a
+/// server whose UDP reply comes truncated and whose TCP retry fails (exit 9).
 const FAKE_DIG: &str = r#"#!/bin/sh
 server=
 for a in "$@"; do case "$a" in @*) server=${a#@} ;; esac; done
+if [ -n "${FAKE_DNS_TRUNCATE:-}" ] && [ "$server" = "$FAKE_DNS_TRUNCATE" ]; then
+  echo ";; Truncated, retrying in TCP mode."
+  echo ";; Connection to $server#53($server) for example.com failed: connection refused."
+  echo ";; no servers could be reached"
+  exit 9
+fi
 if [ -n "${FAKE_DNS_REPLY:-}" ] && [ "$server" = "$FAKE_DNS_REPLY" ]; then
-  [ "${FAKE_DNS_RESOLVES:-0}" = 1 ] && echo 93.184.215.14
+  st=${FAKE_DNS_STATUS:-REFUSED}; [ "${FAKE_DNS_RESOLVES:-0}" = 1 ] && st=NOERROR
+  ra=; [ "${FAKE_DNS_RA:-0}" = 1 ] && ra=' ra'
+  echo ";; Got answer:"
+  echo ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 4242"
+  echo ";; flags: qr rd$ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1"
+  echo
+  [ "${FAKE_DNS_RESOLVES:-0}" = 1 ] && printf 'example.com.\t\t300\tIN\tA\t93.184.215.14\n'
   exit 0
 fi
 echo ";; communications error to $server#53: timed out"
@@ -299,7 +329,7 @@ fn run_bash(dir: &Path, script: &[u8], resolv: &str, env: &[(&str, &str)]) -> St
     use std::os::unix::fs::PermissionsExt as _;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for (name, body) in [("curl", FAKE_CURL), ("dig", FAKE_DIG)] {
+    for (name, body) in [("curl", FAKE_CURL), ("dig", FAKE_DIG), ("sleep", "#!/bin/sh\nexit 0\n")] {
         std::fs::write(bin.join(name), body).unwrap();
         std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -379,7 +409,8 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_WORLD", "dead")]).await, NONCE).unwrap());
     assert!(!j.passed());
     let f = |j: &ai_env_cli::bridge::egress::check::Judgement, n: &str| j.cases.iter().find(|c| c.name == n).unwrap().clone();
-    assert!(f(&j, "allowed").reason.contains("did not answer"), "{}", f(&j, "allowed").reason);
+    assert!(f(&j, "allowed").reason.contains("did not answer") && f(&j, "allowed").reason.contains("never opened a connection to the proxy's port"), "{}", f(&j, "allowed").reason);
+    assert_eq!(j.ready.map(|w| (w.tries, w.ok)), Some((30, false)), "the wait gave up after its attempts");
     assert!(f(&j, "direct-name").reason.contains("not counted") && f(&j, "dns-platform-udp").reason.contains("not counted"));
     assert!(f(&j, "denied").reason.contains("no 403"), "{}", f(&j, "denied").reason);
     assert_eq!(f(&j, "imds").verdict, Verdict::Recorded);
@@ -388,6 +419,15 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
     assert_eq!(f(&j, "allowed").verdict, Verdict::Pass);
     assert_eq!(f(&j, "allowed-last").verdict, Verdict::Fail);
     assert!(f(&j, "direct-ipv6").reason.contains("not counted"), "{}", f(&j, "direct-ipv6").reason);
+    // The VM's network comes up late (measured live 1 Oct 2026: the first allowed could not connect at all): the
+    // script waits for the proxy's port, then every case passes and the run says how long it waited.
+    let j = judge(&parse_markers(&run(resolv, &[("FAKE_WORLD", "late")]).await, NONCE).unwrap());
+    assert!(j.passed(), "{:?}", j.failures());
+    assert_eq!(j.ready.map(|w| (w.tries, w.ok)), Some((4, true)), "three attempts reached nothing, the fourth the proxy");
+    // Without the wait the same world fails the way the live run did.
+    let unwaited = render_script(NONCE, PROXY_IP).replace("aienv_r 10.42.0.10:3128\n", "");
+    let j = judge(&parse_markers(&through_bash(unwaited, resolv, &[("FAKE_WORLD", "late")]).await, NONCE).unwrap());
+    assert!(f(&j, "allowed").reason.contains("did not answer") && f(&j, "direct-name").reason.contains("not counted") && f(&j, "allowed-last").verdict == Verdict::Pass, "{:?}", j.failures());
     // The platform resolver resolves: those cases fail; DNS Firewall (a reply, no address) passes.
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "169.254.169.253"), ("FAKE_DNS_RESOLVES", "1")]).await, NONCE).unwrap());
     assert_eq!(failing(&j), ["dns-platform-udp", "dns-platform-tcp"], "{:?}", j.failures());
@@ -395,6 +435,21 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "169.254.169.253")]).await, NONCE).unwrap());
     assert!(j.passed(), "{:?}", j.failures());
     assert_eq!(j.dns, "platform-dns:169.254.169.253");
+    assert!(f(&j, "dns-platform-udp").reason.starts_with("169.254.169.253 replied (status REFUSED, no recursion) and resolved nothing"), "{}", f(&j, "dns-platform-udp").reason);
+    // A truncated UDP reply whose TCP retry fails comes through as TRUNCATED: a public resolver that did so is open.
+    let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_TRUNCATE", "1.1.1.1")]).await, NONCE).unwrap());
+    assert_eq!(failing(&j), ["dns-public-udp", "dns-public-tcp"], "{:?}", j.failures());
+    assert_eq!(j.dns, "open-dns:1.1.1.1");
+    // The dead world's wait printed a dot per failed attempt before its marker (the shell is never silent for a minute).
+    assert!(run(resolv, &[("FAKE_WORLD", "dead")]).await.contains(&format!("{}@@AIENV{NONCE} ready try=30", ".".repeat(30))));
+    // dig's status and the recursion flag come through the VM's shell variables.
+    let m = parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_STATUS", "SERVFAIL"), ("FAKE_DNS_RA", "1")]).await, NONCE).unwrap();
+    let r = m.get("dns-platform6-tcp").unwrap();
+    assert_eq!((r.rc, r.resolves, r.status.as_deref(), r.ra), (Some(0), Some(false), Some("SERVFAIL"), Some(true)));
+    assert_eq!(m.get("dns-platform-udp").unwrap().status, None, "no reply, no status");
+    let m = parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "169.254.169.253"), ("FAKE_DNS_RESOLVES", "1"), ("FAKE_DNS_RA", "1")]).await, NONCE).unwrap();
+    let r = m.get("dns-platform-udp").unwrap();
+    assert_eq!((r.resolves, r.status.as_deref(), r.ra), (Some(true), Some("NOERROR"), Some(true)), "an answer line is an address");
     // OpenDNS answering on UDP 443: open.
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "208.67.222.222")]).await, NONCE).unwrap());
     assert_eq!(failing(&j), ["dns-public-port"], "{:?}", j.failures());
@@ -442,7 +497,7 @@ async fn the_dns_path_script_runs_in_bash() {
     let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "10.42.1.2")]).await, NONCE).unwrap();
     let (v, note) = dns_path_outcome(&m).unwrap();
     assert_eq!(v, "platform-dns:10.42.1.2");
-    assert!(note.starts_with("resolves=no") && note.contains("10.42.1.2 udp replied, tcp replied"), "{note}");
+    assert!(note.starts_with("resolves=no") && note.contains("10.42.1.2 udp replied (REFUSED, no recursion), tcp replied (REFUSED, no recursion)"), "{note}");
     let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "10.42.1.2"), ("FAKE_DNS_RESOLVES", "1")]).await, NONCE).unwrap();
     assert_eq!(dns_path_outcome(&m).unwrap().0, "platform-dns-resolves:10.42.1.2", "names resolve through the platform: never plain platform-dns");
     let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "1.1.1.1")]).await, NONCE).unwrap();

@@ -921,6 +921,9 @@ struct Row {
 #[derive(Default)]
 struct Report {
     rows: Vec<Row>,
+    /// The facts of the `get-network-connector` answer the `connector` row
+    /// judged ok (what `egress check` binds a pass to); `None` otherwise.
+    connector_facts: Option<super::ConnectorFacts>,
 }
 
 impl Report {
@@ -1520,11 +1523,12 @@ pub(crate) struct NetworkRow {
     pub detail: String,
 }
 
-/// Every check of `ai-env egress status` (the operator-account check first, the same calls, no output), for `ai-env egress check`, which requires every row `ok`.
-pub(crate) fn network_verification() -> Result<Vec<NetworkRow>> {
+/// Every check of `ai-env egress status` (the operator-account check first, the same calls, no output), for `ai-env egress check`, which requires every row `ok`; and the facts of the connector answer the `connector` row judged ok, which a pass is bound to (the configuration verified, not a later read).
+pub(crate) fn network_verification() -> Result<(Vec<NetworkRow>, Option<super::ConnectorFacts>)> {
     let ctx = Ctx::load()?;
     let (_, r) = verify(&ctx, "egress check")?;
-    Ok(r.rows.into_iter().map(|row| NetworkRow { check: row.check, status: row.verdict.label(), detail: row.detail }).collect())
+    let facts = r.connector_facts;
+    Ok((r.rows.into_iter().map(|row| NetworkRow { check: row.check, status: row.verdict.label(), detail: row.detail }).collect(), facts))
 }
 
 fn status(json: bool) -> Result<()> {
@@ -1573,7 +1577,16 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
     let mut r = Report::default();
     let connector = ops::get_connector(&ctx.connector);
     let active = connector.as_ref().is_ok_and(|d| text(d, "State") == "ACTIVE");
-    r.call("connector", connector, |doc| judge_connector(&doc, &ctx.connector, ctx.state.connector_arn.as_deref(), subnet, vm_sg));
+    match connector {
+        Ok(doc) => {
+            let judged = judge_connector(&doc, &ctx.connector, ctx.state.connector_arn.as_deref(), subnet, vm_sg);
+            if judged.0 == Verdict::Ok {
+                r.connector_facts = super::ConnectorFacts::from_get(&doc);
+            }
+            r.push("connector", judged);
+        }
+        Err(e) => r.push("connector", unknown(e)),
+    }
     let live_vm = live_vpc_vm(&ctx.paths);
     r.call("connector-enis", ops::subnet_enis(subnet), |doc| judge_enis(&doc, vm_sg, active, &live_vm));
     let vpc_doc = ops::vpc(vpc);

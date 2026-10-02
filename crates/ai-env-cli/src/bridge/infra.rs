@@ -313,9 +313,11 @@ pub struct LiveConnector {
 /// on either side ignored). An answer about any other connector is refused,
 /// so its Id never becomes an alias of the configured connector. An `Id`
 /// the echo gate would drop ([`ConnectorAlias::from_state`]: not
-/// `[A-Za-z0-9_-]{1,64}`, a managed connector's name, the connector's own
-/// name) is not recorded (`id_refused` says why), but the state still is:
-/// doctor and `vm run` keep seeing ACTIVE/PENDING.
+/// `[A-Za-z0-9_-]{1,64}`, a managed connector's name) is not recorded
+/// (`id_refused` says why), but the state still is: doctor and `vm run`
+/// keep seeing ACTIVE/PENDING. An `Id` that is the ARN's own resource name
+/// (the ARN in the Id form, measured 1 Oct 2026) is recorded: the echo
+/// carries the ARN itself, and `from_state` never makes it an alias.
 ///
 /// [`ConnectorAlias::from_state`]: crate::bridge::egress::ConnectorAlias::from_state
 pub fn parse_live_connector(doc: serde_json::Value, requested: &str) -> std::result::Result<LiveConnector, String> {
@@ -325,8 +327,11 @@ pub fn parse_live_connector(doc: serde_json::Value, requested: &str) -> std::res
         return Err(format!("get-network-connector answered for {:?}, not {requested}", live.arn));
     }
     if let Some(id) = &live.id {
+        // The ARN may name the connector by its Id (measured 1 Oct 2026: a connector Pulumi creates is
+        // `…:network-connector:nc-<uuid>`): the echo then carries the ARN itself, no alias is needed, and the Id is kept.
+        let own = norm(&live.arn).rsplit_once(":network-connector:").is_some_and(|(_, n)| n == id);
         let probe = InfraState { connector_arn: Some(live.arn.clone()), connector_id: Some(id.clone()), ..InfraState::default() };
-        if !crate::bridge::egress::ConnectorAlias::from_state(&probe, requested).is_some_and(|a| a.id == *id) {
+        if !own && !crate::bridge::egress::ConnectorAlias::from_state(&probe, requested).is_some_and(|a| a.id == *id) {
             live.id_refused = Some(format!("get-network-connector answered with the Id {id:?}, which is not usable as an alias: Id-form echoes will be refused"));
             live.id = None;
         }
@@ -1962,7 +1967,7 @@ mod tests {
     #[test]
     fn a_live_connector_id_that_cannot_be_an_alias_is_refused() {
         let long = "n".repeat(65);
-        for id in ["bad id", "nc/1", " nc-1", "nc-1 ", long.as_str(), "INTERNET_EGRESS", "shell_ingress", "HTTP_INGRESS", "aws-network-connector", "x-aws-network-connector-y", "ai-env-egress"] {
+        for id in ["bad id", "nc/1", " nc-1", "nc-1 ", long.as_str(), "INTERNET_EGRESS", "shell_ingress", "HTTP_INGRESS", "aws-network-connector", "x-aws-network-connector-y"] {
             let mut v = golden_connector();
             v["Id"] = serde_json::json!(id);
             let live = parse_live_connector(v, CONNECTOR).unwrap();
@@ -1977,6 +1982,21 @@ mod tests {
             let mut v = golden_connector();
             v["Id"] = serde_json::json!(id);
             assert_eq!(parse_live_connector(v, CONNECTOR).unwrap().id.as_deref(), Some(id), "{id}");
+        }
+        // The Id is the ARN's own resource name (the connector's ARN in the Id form, measured 1 Oct 2026): the echo
+        // carries the ARN itself, so no alias is needed and nothing is refused; the Id is recorded.
+        let id_arn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-f0b942fe-0612-44a7-9183-16942c532410";
+        for (arn, id) in [(id_arn, "nc-f0b942fe-0612-44a7-9183-16942c532410"), (CONNECTOR, "ai-env-egress")] {
+            let mut v = golden_connector();
+            v["Arn"] = serde_json::json!(arn);
+            v["Id"] = serde_json::json!(id);
+            v.as_object_mut().unwrap().remove("Version");
+            let live = parse_live_connector(v, arn).unwrap();
+            assert_eq!((live.id.as_deref(), live.id_refused.as_deref()), (Some(id), None), "{arn}");
+            let mut s = InfraState::default();
+            s.overlay_connector(Ok(live), "2026-10-01T10:00:05Z");
+            assert_eq!((s.connector_id.as_deref(), s.connector_state_source.as_deref()), (Some(id), Some("live 2026-10-01T10:00:05Z")), "{arn}");
+            assert!(crate::bridge::egress::ConnectorAlias::from_state(&s, arn).is_none(), "{arn}: its own name is never an alias");
         }
     }
 

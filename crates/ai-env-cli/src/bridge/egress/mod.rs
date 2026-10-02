@@ -474,14 +474,21 @@ pub fn parse_reload_status(line: &str) -> Result<BTreeMap<String, String>, Strin
 
 /// The configured connector as a live `lambda-core get-network-connector`
 /// answered: what a passing check is bound to. A recreated connector (same
-/// name, same ARN) has another Id; an `UpdateNetworkConnector` bumps the
-/// Version; either way an earlier pass no longer applies.
+/// name, same ARN) has another Id; an `UpdateNetworkConnector` that changes
+/// what the VMs' traffic meets (subnets, security groups, the protocol)
+/// changes these facts, as it bumps a `Version` when the answer carries one;
+/// either way an earlier pass no longer applies.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConnectorFacts {
     pub id: String,
-    /// `Version` as answered (a number, kept as text).
+    /// `Version` as answered (a number, kept as text); empty when the answer
+    /// carries none (measured 1 Oct 2026: the connector Pulumi created
+    /// answers without one, unlike the CLI model).
     pub version: String,
+    /// `Configuration.VpcEgressConfiguration.NetworkProtocol` (`IPv4`): a
+    /// switch to dual stack must void a pass.
+    pub network_protocol: String,
     /// `Configuration.VpcEgressConfiguration.SubnetIds`, sorted.
     pub subnet_ids: Vec<String>,
     /// `Configuration.VpcEgressConfiguration.SecurityGroupIds`, sorted.
@@ -490,14 +497,27 @@ pub struct ConnectorFacts {
 
 impl ConnectorFacts {
     /// The facts of a `get-network-connector` answer; `None` when any is
-    /// missing or malformed (a non-string id, no subnet, no security group).
+    /// missing or malformed (a non-string id or protocol, no subnet, no
+    /// security group, a `Version` that is neither a number nor text), or the
+    /// connector is not ACTIVE or has an update that did not succeed
+    /// (`LastUpdateStatus` other than `Successful`: the configuration answered
+    /// may not be the one in force). A missing or null `Version` is empty.
     #[must_use]
     pub fn from_get(doc: &serde_json::Value) -> Option<ConnectorFacts> {
+        if doc.get("State").and_then(serde_json::Value::as_str) != Some("ACTIVE") {
+            return None;
+        }
+        match doc.get("LastUpdateStatus") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(s)) if s == "Successful" => {}
+            Some(_) => return None,
+        }
         let id = doc.get("Id")?.as_str()?.trim().to_string();
-        let version = match doc.get("Version")? {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => return None,
+        let version = match doc.get("Version") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            Some(_) => return None,
         };
         let vpc = doc.get("Configuration")?.get("VpcEgressConfiguration")?;
         let list = |k: &str| -> Option<Vec<String>> {
@@ -505,14 +525,16 @@ impl ConnectorFacts {
             v.sort();
             (!v.is_empty()).then_some(v)
         };
-        let facts = ConnectorFacts { id, version, subnet_ids: list("SubnetIds")?, security_group_ids: list("SecurityGroupIds")? };
-        (!facts.id.is_empty()).then_some(facts)
+        let network_protocol = vpc.get("NetworkProtocol")?.as_str()?.trim().to_string();
+        let facts = ConnectorFacts { id, version, network_protocol, subnet_ids: list("SubnetIds")?, security_group_ids: list("SecurityGroupIds")? };
+        facts.complete().then_some(facts)
     }
 
-    /// Every fact present.
+    /// Every fact a pass is bound to present (`version` may be empty: the
+    /// service does not always answer one).
     #[must_use]
     pub fn complete(&self) -> bool {
-        !self.id.is_empty() && !self.version.is_empty() && !self.subnet_ids.is_empty() && !self.security_group_ids.is_empty()
+        !self.id.is_empty() && !self.network_protocol.is_empty() && !self.subnet_ids.is_empty() && !self.security_group_ids.is_empty()
     }
 }
 
@@ -681,8 +703,8 @@ pub struct LiveEcho<'a> {
 /// configured; the row's egress is `vpc` (credentials never enter an
 /// `internet` VM); the live echo is exactly that connector; a passing
 /// `ai-env egress check` is recorded for the row's image, image version and
-/// that connector, for the same live connector facts (Id, Version, subnet,
-/// security group) and the same image build (`created_at`); its DNS verdict
+/// that connector, for the same live connector facts (Id, Version when
+/// answered, network protocol, subnet, security group) and the same image build (`created_at`); its DNS verdict
 /// and `dns_ok` ([`dns_ok`]) pass. `Err(Policy)` (exit 9) names the first
 /// condition that failed and what to run.
 pub fn credential_gate(cfg: &BridgeConfig, row: &VmRow, live: &LiveEcho<'_>, verified: &EgressVerified, dns_ok: bool) -> Result<(), BridgeError> {
@@ -706,7 +728,7 @@ pub fn credential_gate(cfg: &BridgeConfig, row: &VmRow, live: &LiveEcho<'_>, ver
     };
     match live.connector {
         Some(now) if now.complete() && record.connector_facts.complete() && *now == record.connector_facts => {}
-        Some(_) => return refuse(format!("{configured} is not the connector the recorded check verified (its Id, Version, subnet or security group changed): run `ai-env egress check`")),
+        Some(_) => return refuse(format!("{configured} is not the connector the recorded check verified (its Id, Version, network protocol, subnet or security group changed): run `ai-env egress check`")),
         None => return refuse("the connector's live facts were not read (get-network-connector)".into()),
     }
     if record.image_created_at.is_none() || live.image_created_at != record.image_created_at {
@@ -969,7 +991,7 @@ mod tests {
     }
 
     fn facts() -> ConnectorFacts {
-        ConnectorFacts { id: "nc-1".into(), version: "1".into(), subnet_ids: s(&["subnet-0aaa1111bbbb2222c"]), security_group_ids: s(&["sg-0ddd3333eeee4444f"]) }
+        ConnectorFacts { id: "nc-1".into(), version: "1".into(), network_protocol: "IPv4".into(), subnet_ids: s(&["subnet-0aaa1111bbbb2222c"]), security_group_ids: s(&["sg-0ddd3333eeee4444f"]) }
     }
 
     fn rec(version: &str, connector: &str) -> VerifiedRecord {
@@ -990,7 +1012,7 @@ mod tests {
     fn connector_facts_from_the_golden_answer() {
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json")).unwrap()).unwrap();
         let f = ConnectorFacts::from_get(&doc).unwrap();
-        assert_eq!(f, ConnectorFacts { id: "nc-0a1b2c3d4e5f60718".into(), version: "1".into(), subnet_ids: s(&["subnet-0aaa1111bbbb2222c"]), security_group_ids: s(&["sg-0ddd3333eeee4444f"]) });
+        assert_eq!(f, ConnectorFacts { id: "nc-0a1b2c3d4e5f60718".into(), version: "1".into(), network_protocol: "IPv4".into(), subnet_ids: s(&["subnet-0aaa1111bbbb2222c"]), security_group_ids: s(&["sg-0ddd3333eeee4444f"]) });
         assert!(f.complete());
         let mut broken = doc.clone();
         broken["Configuration"]["VpcEgressConfiguration"]["SubnetIds"] = serde_json::json!([]);
@@ -998,9 +1020,34 @@ mod tests {
         let mut no_id = doc.clone();
         no_id["Id"] = serde_json::json!("");
         assert!(ConnectorFacts::from_get(&no_id).is_none());
-        let mut text_version = doc;
+        for (k, v) in [("NetworkProtocol", serde_json::json!("")), ("NetworkProtocol", serde_json::json!(4)), ("NetworkProtocol", serde_json::Value::Null)] {
+            let mut bad = doc.clone();
+            bad["Configuration"]["VpcEgressConfiguration"][k] = v.clone();
+            assert!(ConnectorFacts::from_get(&bad).is_none(), "{k}={v}");
+        }
+        let mut text_version = doc.clone();
         text_version["Version"] = serde_json::json!("7");
         assert_eq!(ConnectorFacts::from_get(&text_version).unwrap().version, "7");
+        let mut odd_version = doc.clone();
+        odd_version["Version"] = serde_json::json!({"n": 1});
+        assert!(ConnectorFacts::from_get(&odd_version).is_none(), "a Version that is neither a number nor text");
+        // Only an ACTIVE connector whose last update (if any) succeeded: the configuration answered is the one in force.
+        for (k, v) in [("State", serde_json::json!("PENDING")), ("State", serde_json::json!("FAILED")), ("State", serde_json::Value::Null), ("LastUpdateStatus", serde_json::json!("InProgress")), ("LastUpdateStatus", serde_json::json!("Failed"))] {
+            let mut not_in_force = doc.clone();
+            not_in_force[k] = v.clone();
+            assert!(ConnectorFacts::from_get(&not_in_force).is_none(), "{k}={v}");
+        }
+        let mut no_update = doc.clone();
+        no_update.as_object_mut().unwrap().remove("LastUpdateStatus");
+        assert!(ConnectorFacts::from_get(&no_update).is_some(), "no update yet");
+        // As measured live (1 Oct 2026): no Version at all, the ARN in the Id form; a null one reads the same.
+        let mut live = doc;
+        live.as_object_mut().unwrap().remove("Version");
+        live["Arn"] = serde_json::json!("arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0a1b2c3d4e5f60718");
+        let f = ConnectorFacts::from_get(&live).unwrap();
+        assert_eq!((f.version.as_str(), f.network_protocol.as_str(), f.complete()), ("", "IPv4", true));
+        live["Version"] = serde_json::Value::Null;
+        assert_eq!(ConnectorFacts::from_get(&live).unwrap(), f);
     }
 
     #[test]
@@ -1112,10 +1159,13 @@ mod tests {
         let mut leaky = EgressVerified::default();
         leaky.record(VerifiedRecord { dns: "platform-dns:9.9.9.9".into(), ..rec("2.0", CONN) }, 100);
         assert!(why(credential_gate(&cfg, &row, &live, &leaky, true)).contains("saw DNS"), "the check's own DNS verdict counts too");
-        // Bound to the connector's live facts: a recreated connector (another Id), an update (Version), another subnet or SG.
+        // Bound to the connector's live facts: a recreated connector (another Id), an update (Version, also one appearing
+        // where none was answered), dual stack, another subnet or SG.
         for changed in [
             ConnectorFacts { id: "nc-2".into(), ..facts() },
             ConnectorFacts { version: "2".into(), ..facts() },
+            ConnectorFacts { version: String::new(), ..facts() },
+            ConnectorFacts { network_protocol: "DualStack".into(), ..facts() },
             ConnectorFacts { subnet_ids: s(&["subnet-0bbb"]), ..facts() },
             ConnectorFacts { security_group_ids: s(&["sg-0bbb", "sg-0ddd3333eeee4444f"]), ..facts() },
             ConnectorFacts::default(),
@@ -1138,5 +1188,14 @@ mod tests {
         let alias = ConnectorAlias { arn: CONN.into(), id: "nc-1".into() };
         credential_gate(&cfg, &row, &LiveEcho { connectors: &id_echo, alias: Some(&alias), ..live }, &verified, true).unwrap();
         assert!(credential_gate(&cfg, &row, &LiveEcho { connectors: &id_echo, alias: None, ..live }, &verified, true).is_err());
+        // As measured live (1 Oct 2026): the connector's ARN is in the Id form and its answer carries no Version.
+        let id_conn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-f0b942fe-0612-44a7-9183-16942c532410";
+        let id_cfg = BridgeConfig::parse(&format!("[aws]\negress_connector_arn = \"{id_conn}\"\n")).unwrap();
+        let id_row = VmRow { egress_connectors: s(&[id_conn]), ..row.clone() };
+        let no_version = ConnectorFacts { version: String::new(), ..facts() };
+        let mut measured = EgressVerified::default();
+        measured.record(VerifiedRecord { connector_facts: no_version.clone(), ..rec("2.0", id_conn) }, 100);
+        let id_live = s(&[id_conn]);
+        credential_gate(&id_cfg, &id_row, &LiveEcho { connectors: &id_live, alias: None, connector: Some(&no_version), ..live }, &measured, true).unwrap();
     }
 }

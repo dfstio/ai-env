@@ -331,8 +331,11 @@ the proxy may reach), so a VM resolves nothing itself; its tools go through the 
   and refuse the rest. The case markers are VM-reported, so a pass also needs the VM-independent
   network verification of `egress status` and squid's own log lines (from CloudWatch) for the run's
   tunnels and denials. A pass is recorded in `state/egress-verified.toml` for that image version and
-  connector and bound to the connector's live Id, Version, subnet and security group and to the image
+  connector and bound to the connector as the network verification judged it (its Id, network
+  protocol, subnet and security group, and its Version when the service answers one) and to the image
   build; any failing check of its own VM revokes the connector's records (`--vm ID` only reports).
+  The check first waits (up to 60 s) for the VM to reach the proxy's port: a VM's VPC networking may
+  come up after its shell.
 - **Credentials (S7)** may enter a VM only through `egress::credential_gate`: a `vpc` VM whose live
   echo is exactly the connector, whose image version has a recorded passing check, and whose `dns-path`
   verdict is `no-dns` (or a platform resolver with `[egress] accept_platform_dns = true`). Never an

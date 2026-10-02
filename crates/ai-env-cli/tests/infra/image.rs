@@ -1214,14 +1214,19 @@ fn the_replacement_guard_refuses_what_the_connector_pins_and_names_a_new_proxy()
         }
     }
 
-    // A replaced proxy instance (a file embedded in its user-data changed) is
-    // allowed and named once for its three steps; nothing else is listed.
+    // A replaced proxy instance is allowed and named once for its three steps,
+    // with the plan's own reasons (none here); nothing else is listed.
     std::fs::remove_file(t.path().join("calls.log")).unwrap();
     let proxy: Vec<(&str, &str, &str)> = ["create-replacement", "replace", "delete-replaced"].iter().map(|op| (*op, PROXY_INSTANCE.0, PROXY_INSTANCE.1)).collect();
     let out = guard(t.path(), &bin, &plan(&proxy).to_string(), &[]);
     let text = all(&out);
-    assert!(out.status.success() && text.contains("replacement guard: aws:ec2/instance:Instance ai-env-egress-proxy will be replaced (a file embedded in its user-data changed)"), "{text}");
+    assert!(out.status.success() && text.contains("replacement guard: aws:ec2/instance:Instance ai-env-egress-proxy will be replaced (the plan names no reason; a change to a file embedded in its user-data is one)"), "{text}");
     assert_eq!(text.matches("will be replaced").count(), 1, "{text}");
+    // A real replace step (pulumi 3.266: one step, op replace) carries replaceReasons: the guard names them.
+    let mut why = plan(&[("replace", PROXY_INSTANCE.0, PROXY_INSTANCE.1)]);
+    why["steps"][0]["replaceReasons"] = json!(["subnetId", "userData"]);
+    let text = all(&guard(t.path(), &bin, &why.to_string(), &[]));
+    assert!(text.contains("ai-env-egress-proxy will be replaced (subnetId, userData; a change to a file embedded in its user-data is one)"), "{text}");
     assert!(text.contains("nothing the connector's ENIs pin is replaced"), "{text}");
     assert_eq!(calls(t.path()), Vec::<String>::new(), "nothing guarded, nothing listed");
 
@@ -1652,7 +1657,7 @@ fn post_deploy_skips_what_a_stale_state_or_a_stopped_proxy_cannot_do() {
     // (what, recorded state, proxy, envs, exit 0, reload called, status called, a line)
     let cases: &[Case] = &[
         ("a replaced proxy", Some(&replaced), "running", &[], true, false, false, "predates this deploy (proxy_instance_id differ from the stack outputs)"),
-        ("no state/infra.toml", None, "running", &[], true, false, false, "state/infra.toml: make infra-status WRITE=1, then ai-env egress status"),
+        ("no state/infra.toml", None, "running", &[], true, false, false, "state/infra.toml: make infra-status WRITE=1, then make proxy-start (it waits for a new proxy's first boot: SSM online, squid serving the parameters), then ai-env egress status"),
         ("a new allowlist", Some(&new_allow), "running", &[], true, true, false, "(allow_sha256 differ from the stack outputs): make infra-status WRITE=1"),
         ("a stopped proxy", Some(&outputs()), "stopped", &[], true, false, true, "is stopped: it reads its parameters when it starts (make proxy-start); egress reload skipped"),
         ("a failed reload", Some(&outputs()), "running", &[("FAKE_AIENV_RELOAD_RC", "7")], false, true, true, "deploy: egress reload failed (exit 7, above)"),
@@ -1702,6 +1707,16 @@ fn post_deploy_after_a_failure_still_reloads_and_warns_but_checks_no_drift() {
         assert!(text.contains("new image version: run `ai-env egress check`"), "{what}: {text}");
         assert!(text.contains("deploy: egress status skipped: the deploy failed") && !c.iter().any(|l| l.starts_with("egress status")), "{what}: no drift check on a half-applied stack: {text}");
     }
+    // The first S5 pulumi up failed: the outputs are still S4's and name no proxy. Nothing served anything before, so
+    // no reload is asked for (it would only loop on make infra-status WRITE=1).
+    let mut s4 = outputs();
+    s4.as_object_mut().unwrap().retain(|k, _| !["proxyInstanceId", "proxyPrivateIp", "connectorArn", "connectorName", "egressVpcId", "vmSubnetId"].contains(&k.as_str()));
+    let (t, bin) = post_deploy_tree(None, "running", "2", "2");
+    write_outputs(t.path(), &s4);
+    let out = ops5(t.path(), &bin, &["post-deploy", "--after-failure"]).bounded();
+    let text = all(&out);
+    assert!(out.status.success() && !text.contains(loud), "{text}");
+    assert!(text.contains("deploy: stack dev exports no proxyInstanceId: egress reload skipped") && text.contains("deploy: the stack outputs name no proxy yet (no S5 pulumi up has completed): nothing can be reloaded now"), "{text}");
     let (t, bin) = post_deploy_tree(Some(&outputs()), "running", "2", "2");
     let out = ops5(t.path(), &bin, &["post-deploy", "--bogus"]).bounded();
     assert!(!out.status.success() && all(&out).contains("usage: ops.sh post-deploy [--after-failure]"), "{}", all(&out));

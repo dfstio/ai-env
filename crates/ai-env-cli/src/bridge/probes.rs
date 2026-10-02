@@ -722,8 +722,11 @@ pub fn verdict_cloudtrail(doc_json: &str, id: &str, client_token: &str, session_
 
 /// One `dig` of the dns-path probe (and of `ai-env egress check`'s DNS cases):
 /// which server, over which transport, dig's exit code (`None`: not asked —
-/// `/etc/resolv.conf` named no nameserver), and whether the reply carried an
-/// address for the name.
+/// `/etc/resolv.conf` named no nameserver), whether the reply carried an
+/// address for the name, and the reply's status and recursion-available
+/// flag when dig printed them (what a platform resolver that "resolves
+/// nothing" does with a query: `REFUSED` without recursion is not a
+/// recursive path out; `SERVFAIL` with recursion available may be one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsReply {
     pub server: String,
@@ -731,6 +734,8 @@ pub struct DnsReply {
     pub transport: &'static str,
     pub rc: Option<i32>,
     pub resolves: bool,
+    pub status: Option<String>,
+    pub ra: Option<bool>,
 }
 
 /// The dns-path verdict when a resolver that is not the platform's replies
@@ -759,7 +764,8 @@ pub fn is_platform_resolver(ip: &str) -> bool {
 /// replied without resolving anything (DNS Firewall); `no-dns` when no
 /// server replied (dig exit 9 everywhere). The IP is the first such server.
 /// The note says `resolves=yes|no` (did any reply carry an address), the
-/// resolv.conf nameserver, and each server's answer. Any other dig exit code
+/// resolv.conf nameserver, and each server's answer (with its status and
+/// whether it offered recursion). Any other dig exit code
 /// is an error (nothing proven: a missing dig must never read as `no-dns`),
 /// as is a probe that asked nothing.
 pub fn verdict_dns_path(resolv_ns: Option<&str>, replies: &[DnsReply]) -> std::result::Result<(String, String), String> {
@@ -781,9 +787,17 @@ pub fn verdict_dns_path(resolv_ns: Option<&str>, replies: &[DnsReply]) -> std::r
                 } else {
                     first.get_or_insert(r.server.as_str());
                 }
-                if r.resolves { "resolved" } else { "replied" }
+                let detail: Vec<String> = [r.status.clone(), r.ra.map(|a| (if a { "recursion available" } else { "no recursion" }).to_string())].into_iter().flatten().collect();
+                let what = if r.resolves { "resolved" } else { "replied" };
+                if detail.is_empty() { what.to_string() } else { format!("{what} ({})", detail.join(", ")) }
             }
-            Some(9) => "no reply",
+            // A truncated UDP reply whose TCP retry failed (dig exit 9 with a status): the UDP path answered.
+            Some(9) if r.status.is_some() && !is_platform_resolver(&r.server) => {
+                open.get_or_insert(r.server.as_str());
+                "replied (truncated; the TCP retry got nothing)".to_string()
+            }
+            Some(9) if r.status.is_some() => return Err(format!("{} sent a truncated reply over {} and dig's TCP retry got nothing: no verdict", r.server, r.transport)),
+            Some(9) => "no reply".to_string(),
             Some(rc) => return Err(format!("dig exited {rc} asking {} over {}: no verdict (is dig in the image?)", r.server, r.transport)),
         };
         let part = format!("{} {said}", r.transport);
@@ -1175,7 +1189,7 @@ mod tests {
     }
 
     fn reply(server: &str, transport: &'static str, rc: Option<i32>, resolves: bool) -> DnsReply {
-        DnsReply { server: server.into(), transport, rc, resolves }
+        DnsReply { server: server.into(), transport, rc, resolves, status: None, ra: None }
     }
 
     #[test]
@@ -1229,6 +1243,14 @@ mod tests {
         assert!(verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(127), false)]).unwrap_err().contains("exited 127"));
         assert!(verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(10), false)]).is_err());
         assert!(verdict_dns_path(None, &[reply("", "udp", None, false)]).is_err());
+        // A truncated UDP reply whose TCP retry got nothing (dig exit 9 with a status): never "no reply".
+        let truncated = |server: &str| DnsReply { status: Some("TRUNCATED".into()), ..reply(server, "udp", Some(9), false) };
+        let (v, note) = verdict_dns_path(None, &[truncated("1.1.1.1")]).unwrap();
+        assert!(v == "open-dns:1.1.1.1" && note.contains("1.1.1.1 udp replied (truncated; the TCP retry got nothing)"), "{v}: {note}");
+        assert!(verdict_dns_path(None, &[truncated("fd00:ec2::253")]).unwrap_err().contains("truncated reply over udp"));
+        // The status and the recursion flag reach the note.
+        let refused = DnsReply { status: Some("REFUSED".into()), ra: Some(false), ..reply("fd00:ec2::253", "tcp", Some(0), false) };
+        assert!(verdict_dns_path(None, &[refused]).unwrap().1.ends_with("fd00:ec2::253 tcp replied (REFUSED, no recursion)"));
         assert!(verdict_dns_path(None, &[]).is_err());
     }
 

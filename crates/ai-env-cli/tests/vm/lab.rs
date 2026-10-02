@@ -941,9 +941,9 @@ fn transcript_file(w: &World, replace: Option<(&str, &str)>) -> PathBuf {
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
             n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
-            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
-            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no".to_string(),
-            _ => "rc=9 ns=10.42.0.2 res=no".to_string(),
+            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
+            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none".to_string(),
+            _ => "rc=9 ns=10.42.0.2 res=no st=none ra=none".to_string(),
         };
         let line = match replace {
             Some((name, other)) if name == c.name => other.to_string(),
@@ -1032,7 +1032,7 @@ fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
     for op in ["ec2 describe-route-tables", "ec2 describe-security-groups", "ec2 describe-network-acls", "ssm send-command", "lambda-core get-network-connector"] {
         assert!(calls.lines().any(|l| l.starts_with(op)), "{op}: {calls}");
     }
-    assert_eq!(calls.lines().filter(|l| l.starts_with(&format!("lambda-core get-network-connector --identifier {CONNECTOR} "))).count(), 2, "the network verification's, then the binding's: {calls}");
+    assert_eq!(calls.lines().filter(|l| l.starts_with(&format!("lambda-core get-network-connector --identifier {CONNECTOR} "))).count(), 1, "one read: the record binds the answer the network verification judged: {calls}");
     // --json: one document with every case, the evidence and the decision.
     let o = check_with(&w, &["egress", "check", "--json"], &t);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -1040,6 +1040,36 @@ fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
     assert_eq!((doc["verdict"].as_str(), doc["recorded"].as_bool(), doc["report_only"].as_bool()), (Some("pass"), Some(true), Some(false)));
     assert_eq!(doc["cases"].as_array().unwrap().len(), CASES.len());
     assert_eq!((doc["network"]["ok"].as_bool(), doc["squid_log"]["ok"].as_bool()), (Some(true), Some(true)));
+}
+
+/// What the first live check met (1 Oct 2026): a `get-network-connector` answer without `Version`, a script that
+/// waited for the proxy before its first case, and `fd00:ec2::253` replying without an address. The pass is
+/// recorded (bound to the facts the answer has), the wait and dig's status are reported, and the run's DNS verdict
+/// is the platform resolver's.
+#[test]
+fn egress_check_records_a_pass_for_the_live_connector_shape_and_reports_the_wait() {
+    let w = green_network();
+    let answer = w.root().join("answers").join("lambda-core.get-network-connector.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&answer).unwrap()).unwrap();
+    doc.as_object_mut().unwrap().remove("Version");
+    doc["StateReason"] = serde_json::json!("Initial creation");
+    fs::write(&answer, doc.to_string()).unwrap();
+    squid_log(&w, "10.42.1.158", None);
+    let t = transcript_file(&w, Some(("dns-platform6-udp", "rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no")));
+    let text = fs::read_to_string(&t).unwrap().replacen("@@AIENV", &format!("@@AIENV{RUN_NONCE} ready try=4 s=6 ok=yes\r\n@@AIENV"), 1);
+    fs::write(&t, text).unwrap();
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("ready: the VM reached the proxy's port 6 s after the script began (4 attempts)"), "{out}");
+    assert!(out.contains("dns-platform6-udp   fd00:ec2::253 replied (status REFUSED, no recursion) and resolved nothing") && out.contains("dns: platform-dns:fd00:ec2::253"), "{out}");
+    assert!(out.contains("egress check passed: recorded for image version 1.0"), "{out}");
+    let rec = &verified(&w).records[0];
+    assert_eq!((rec.connector_facts.id.as_str(), rec.connector_facts.version.as_str(), rec.connector_facts.network_protocol.as_str()), ("nc-0a1b2c3d4e5f60718", "", "IPv4"), "no Version answered: bound to the rest");
+    assert_eq!(rec.dns, "platform-dns:fd00:ec2::253");
+    let audit = check_audit(&w);
+    assert_eq!((audit[0]["detail"]["verdict"].as_str(), audit[0]["detail"]["ready"].as_str()), (Some("pass"), Some("6s/4/ok")), "{}", audit[0]);
+    no_vm_left(&w);
 }
 
 #[test]

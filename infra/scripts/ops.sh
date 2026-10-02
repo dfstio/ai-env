@@ -20,6 +20,9 @@
 # VERSIONS_WARN, VERSIONS_QUOTA, CONNECTOR_WAIT_TIMEOUT, CONNECTOR_WAIT_POLL; AI_ENV_CLI (connector-probe and
 # post-deploy only: the make target's $(AI_ENV), split on blanks and not passed on to any child).
 set -euo pipefail
+# The aws CLI pages its output through less on a terminal (measured 1 Oct 2026: `make image-status` stopped in the
+# pager): never here.
+export AWS_PAGER=""
 
 region=${REGION:?}
 name=${IMAGE_NAME:?IMAGE_NAME is empty: no imageName in infra/image-config.json}
@@ -464,8 +467,8 @@ cmd_connector_status() {
     list=$(connectors) || exit 1
     if has_connector "$list" "$connector"; then
         doc=$(aws lambda-core get-network-connector --identifier "$connector" --region "$region" --endpoint-url "$lambda_url" --output json) || exit 1
-        printf '%s' "$doc" | jsq '(() => { const v = (j.Configuration || {}).VpcEgressConfiguration || {}; return [
-  `connector ${j.Name}: ${j.State}${j.StateReasonCode || j.StateReason ? ` (${j.StateReasonCode || "no code"}: ${j.StateReason || "no reason"})` : ""}, version ${j.Version}, last modified ${j.LastModified}`,
+        printf '%s' "$doc" | jsq '(() => { const v = (j.Configuration || {}).VpcEgressConfiguration || {}; const why = [j.StateReasonCode, j.StateReason].filter(Boolean).join(": "); return [
+  `connector ${j.Name}: ${j.State}${why ? ` (${why})` : ""}${j.Version === undefined || j.Version === null ? "" : `, version ${j.Version}`}, last modified ${j.LastModified}`,
   `  arn ${j.Arn}`, `  id ${j.Id}`,
   `  subnets ${(v.SubnetIds || []).join(",")}, security groups ${(v.SecurityGroupIds || []).join(",")}, ${v.NetworkProtocol} for ${(v.AssociatedComputeResourceTypes || []).join(",")}`,
   `  operator role ${j.OperatorRole}`]; })()' || exit 1
@@ -678,15 +681,15 @@ for (const s of plan.steps) {
     if (!replacing.has(s.op) || seen.has(s.urn)) continue;
     seen.add(s.urn);
     if (guarded.has(type)) console.log(`guarded\t${what}`);
-    else if (type === "aws:ec2/instance:Instance") console.log(`proxy\t${what}`);
+    else if (type === "aws:ec2/instance:Instance") console.log(`proxy\t${what}\t${(s.replaceReasons || []).join(", ")}`);
 }
 ') || { echo "replacement guard: cannot read the plan: refusing"; exit 1; }
-    proxies=$(awk -F'\t' '$1 == "proxy" { print $2 }' <<<"$verdict")
+    proxies=$(awk -F'\t' '$1 == "proxy" { print $2 "\t" $3 }' <<<"$verdict")
     guarded=$(awk -F'\t' '$1 == "guarded" { printf "%s%s", (n++ ? ", " : ""), $2 }' <<<"$verdict")
     dns=$(awk -F'\t' '$1 == "dns" { printf "%s%s", (n++ ? " and " : ""), $2 }' <<<"$verdict")
     if [ -n "$proxies" ]; then
-        while IFS= read -r p; do
-            echo "replacement guard: $p will be replaced (a file embedded in its user-data changed): vpc VMs have no egress until the new instance serves; it reads its parameters at boot"
+        while IFS=$'\t' read -r p why; do
+            echo "replacement guard: $p will be replaced (${why:-the plan names no reason}; a change to a file embedded in its user-data is one): vpc VMs have no egress until the new instance serves; it reads its parameters at boot"
         done <<<"$proxies"
     fi
     if [ -z "$guarded" ] && [ -z "$dns" ]; then
@@ -782,12 +785,15 @@ vpc_rows() {
 #      fails the deploy at the very end; anything it could not verify (exit 7) is a warning.
 # --after-failure (pulumi up, image-wait or connector-wait failed): steps 1-3 as above (Pulumi may already have written
 # a proxy parameter), and when the reload did not run on a running proxy, a loud line that the proxy may still serve
-# the pre-deploy parameters; no step 4 (a half-applied stack drifts by definition).
+# the pre-deploy parameters — unless the stack outputs name no proxy at all (no S5 `pulumi up` has completed: a
+# proxy an S5 update created read squid.conf and allow at its own boot, and one an earlier failed deploy created may
+# serve what it booted with; nothing can name it until a deploy completes); no step 4 (a half-applied stack drifts by
+# definition).
 # The ai-env egress commands read the stack's ids from state/infra.toml; the outputs tell whether it is current: the
 # reload needs the same proxy instance, the status every egress id and hash (else a note says to run make
 # infra-status WRITE=1 first). Exit 1 when the reload failed, the proxy's state could not be read, or status found drift.
 cmd_post_deploy() {
-    local after=0 reloaded=0 bridge infra_toml outputs lag proxy doc st rc=0 vms pre="$out/pre-deploy-image.json" post="$out/post-deploy-image.json" a b s report drift
+    local after=0 reloaded=0 have_outputs=1 bridge infra_toml outputs lag proxy doc st rc=0 vms pre="$out/pre-deploy-image.json" post="$out/post-deploy-image.json" a b s report drift
     case "${1:-}" in
     "") ;;
     --after-failure) after=1 ;;
@@ -799,13 +805,14 @@ cmd_post_deploy() {
     if ! outputs=$(stack_outputs); then
         test "$after" = 1 || exit 1
         outputs='{}'
+        have_outputs=0
     fi
     lag=$(infra_state_lag "$outputs" "$infra_toml") || exit 1
     proxy=$(printf '%s' "$outputs" | jsq 'j.proxyInstanceId') || exit 1
     if [ -z "$proxy" ]; then
         echo "deploy: stack $stack exports no proxyInstanceId: egress reload skipped"
     elif [ "$lag" = - ] || in_words proxy_instance_id "$lag"; then
-        echo "deploy: $infra_toml does not name the proxy instance $proxy yet (a new instance reads its parameters at boot): egress reload skipped; make infra-status WRITE=1, then make allowlist-reload if a parameter changed"
+        echo "deploy: $infra_toml does not name the proxy instance $proxy yet (a new instance reads its parameters at boot): egress reload skipped; make infra-status WRITE=1, then make allowlist-reload if a parameter changed since the proxy booted (an earlier failed deploy counts)"
     elif doc=$(aws ec2 describe-instances --instance-ids "$proxy" --region "$region" --endpoint-url "$ec2_url" --output json) \
         && st=$(printf '%s' "$doc" | jsq '(j.Reservations || []).flatMap((r) => r.Instances || []).map((i) => (i.State || {}).Name)'); then
         case "$st" in
@@ -827,7 +834,11 @@ cmd_post_deploy() {
         rc=1
     fi
     if [ "$after" = 1 ] && [ "$reloaded" = 0 ]; then
-        echo "deploy: THE DEPLOY FAILED AFTER pulumi up STARTED, AND THE PROXY WAS NOT RELOADED: it may still serve the pre-deploy parameters: make allowlist-reload (make infra-status WRITE=1 first when state/infra.toml does not name the proxy instance)"
+        if [ "$have_outputs" = 1 ] && [ -z "$proxy" ]; then
+            echo "deploy: the stack outputs name no proxy yet (no S5 pulumi up has completed): nothing can be reloaded now. A proxy an S5 update created read squid.conf and allow at its own boot; if an earlier failed deploy created it and they changed since, run make infra-status WRITE=1 and make allowlist-reload after the next deploy that completes (make proxy-start and ai-env egress status refuse a proxy serving an older config). Fix the failure above and run make deploy again"
+        else
+            echo "deploy: THE DEPLOY FAILED AFTER pulumi up STARTED, AND THE PROXY WAS NOT RELOADED: it may still serve the pre-deploy parameters: make allowlist-reload (make infra-status WRITE=1 first when state/infra.toml does not name the proxy instance)"
+        fi
     fi
     vms=$(vpc_rows "$bridge/state/vms")
     if [ -n "$vms" ]; then
@@ -843,9 +854,9 @@ cmd_post_deploy() {
     if [ "$after" = 1 ]; then
         echo "deploy: egress status skipped: the deploy failed (above); ai-env egress status once it is fixed"
     elif [ "$lag" = - ]; then
-        echo "deploy: no $infra_toml: make infra-status WRITE=1, then ai-env egress status (the out-of-band drift check)"
+        echo "deploy: no $infra_toml: make infra-status WRITE=1, then make proxy-start (it waits for a new proxy's first boot: SSM online, squid serving the parameters), then ai-env egress status (the out-of-band drift check)"
     elif [ -n "$lag" ]; then
-        echo "deploy: $infra_toml predates this deploy ($lag differ from the stack outputs): make infra-status WRITE=1, then ai-env egress status (the out-of-band drift check)"
+        echo "deploy: $infra_toml predates this deploy ($lag differ from the stack outputs): make infra-status WRITE=1, then make proxy-start (it waits for a new proxy's first boot: SSM online, squid serving the parameters), then ai-env egress status (the out-of-band drift check)"
     else
         echo "deploy: ai-env egress status (the out-of-band drift check: pulumi up does not refresh)"
         if report=$("${ai_env[@]}" egress status 2>&1); then s=0; else s=$?; fi
