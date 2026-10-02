@@ -15,7 +15,9 @@
 //! or unknown — and squid's own log in CloudWatch, from the VM subnet within
 //! the script's window: the run's two `allowed` tunnels and a `TCP_DENIED`
 //! line for every request the proxy had to refuse, and no tunnel to any of
-//! those hosts ([`squid_evidence`]). Only a VM the check started itself
+//! those hosts that can be the run's (every VM shares the connector's
+//! address: a tunnel to github.com that squid logged before the run's own
+//! refusal is an earlier run's) ([`squid_evidence`]). Only a VM the check started itself
 //! (purpose `test`, label `egress-check`, no workspace) can record; `--vm`
 //! is report-only (it never records and never revokes). A record is bound
 //! to what the credential gate reads live again: the connector's facts
@@ -70,7 +72,7 @@
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::awscli;
 use crate::bridge::config::{is_rfc1918, BridgeConfig, Paths};
-use crate::bridge::egress::{normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
+use crate::bridge::egress::{is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::read_infra_state;
 use crate::bridge::probes::{is_platform_resolver, verdict_dns_path, DnsReply};
@@ -834,6 +836,14 @@ pub fn squid_lines(doc: &serde_json::Value) -> std::result::Result<Vec<SquidLine
     Ok(events.iter().filter_map(|e| e.get("message").and_then(|m| m.as_str())).filter_map(parse_squid_line).collect())
 }
 
+/// When squid logged `l` (`%ts.%03tu`: a transaction is logged when it ends), in milliseconds; `None` when the time
+/// does not parse (squid always writes `<seconds>.<3 digits>`).
+fn squid_ms(l: &SquidLine) -> Option<u64> {
+    let (secs, frac) = l.ts.split_once('.').unwrap_or((l.ts.as_str(), ""));
+    let ms: String = frac.chars().chain(std::iter::repeat('0')).take(3).collect();
+    secs.parse::<u64>().ok()?.checked_mul(1000)?.checked_add(ms.parse().ok()?)
+}
+
 fn line_text(l: &SquidLine) -> String {
     format!("{}/{} {} {}:{} from {}", l.code, l.status, l.method, l.host, l.port.map_or_else(|| "-".to_string(), |p| p.to_string()), l.client)
 }
@@ -872,31 +882,71 @@ pub enum SquidEvidence {
 /// from outside the subnet, is a violation. From that client: at least
 /// `tunnels` `TCP_TUNNEL/200 CONNECT api.anthropic.com:443` lines (the run's
 /// `allowed` cases), a `TCP_DENIED/403` line for every other refused request
-/// ([`refused_requests`]), and no `TCP_TUNNEL` to any of them.
+/// ([`refused_requests`]), and no `TCP_TUNNEL` to any of them that can be
+/// this run's: every VM shares the connector's address, so a tunnel to a host
+/// an operator may allowlist for a while (github.com) that squid logged
+/// before the run's own refusal of that host is an earlier run's (see below).
 #[must_use]
 pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, tunnels: usize) -> SquidEvidence {
     let at = |l: &SquidLine| l.ts.split('.').next().and_then(|s| s.parse::<u64>().ok());
     let window: Vec<&SquidLine> = lines.iter().filter(|l| at(l).is_some_and(|t| (from_s..=to_s).contains(&t))).collect();
     let host = denied_host(nonce);
     let mine: Vec<&&SquidLine> = window.iter().filter(|l| l.host == host).collect();
-    if let Some(l) = mine.iter().find(|l| l.code == "TCP_TUNNEL" || (200..300).contains(&l.status)) {
+    if let Some(l) = mine.iter().find(|l| l.code.starts_with("TCP_TUNNEL") || (200..300).contains(&l.status)) {
         return SquidEvidence::Violation(format!("squid let the run's denied host through: {}", line_text(l)));
     }
     if let Some(l) = mine.iter().find(|l| !in_cidr(&l.client, VM_SUBNET_CIDR)) {
         return SquidEvidence::Violation(format!("the run's request came from {}, outside the VM subnet {VM_SUBNET_CIDR}: {}", l.client, line_text(l)));
     }
-    let Some(client) = mine.iter().find(|l| l.code == "TCP_DENIED" && l.status == 403 && l.method == "CONNECT" && l.port == Some(443)).map(|l| l.client.clone()) else {
+    let Some(anchor) = mine.iter().find(|l| l.code == "TCP_DENIED" && l.status == 403 && l.method == "CONNECT" && l.port == Some(443)) else {
         return SquidEvidence::Missing(vec![format!("TCP_DENIED/403 CONNECT {host}:443 from {VM_SUBNET_CIDR}")]);
     };
+    let (client, nonce_ms) = (anchor.client.clone(), squid_ms(anchor));
     let from: Vec<&&SquidLine> = window.iter().filter(|l| l.client == client).collect();
     let refused = refused_requests(nonce);
     // A refused host, on any port — but the allowlisted API host only on the ports it was refused on.
     let refused_tunnel = |l: &SquidLine| refused.iter().any(|(_, h, p)| l.host == *h && (h != ALLOWED_HOST || l.port == Some(*p)));
-    let bad: Vec<String> = from.iter().filter(|l| l.code == "TCP_TUNNEL" && refused_tunnel(l)).map(|l| line_text(l)).collect();
+    // Every VM reaches squid from the connector's one address (measured 2 Oct 2026: two VMs at once, both
+    // 10.42.1.158), so `from` holds other runs' lines too. A tunnel squid must never open (an IP literal, a port other
+    // than 443) is a violation whoever opened it. A host an operator may allowlist for a while (`ai-env egress allow`:
+    // github.com; the API host is refused only on other ports, and a tunnel to the nonce host returned above) may have
+    // been tunnelled by an earlier run while it was allowed (`make test-egress` does it). Removing a host restarts
+    // squid (reload.sh), which ends and logs every tunnel, so such a tunnel is logged before squid refuses the host
+    // again: a tunnel to it counts unless squid logged it before this run's own refusal of the host — the run's
+    // CONNECT 403 from its client within one case's budget before its nonce line (the case just before; the earliest
+    // there, should another run's refusal fall in the slot too: a tunnel logged after it was open while squid refused
+    // the host). While no such refusal is in the log (CloudWatch may deliver it after the nonce line), the evidence is
+    // missing.
+    let allowlistable = |l: &SquidLine| l.port == Some(443) && is_valid_host(&l.host);
+    let slot_ms = u64::try_from(CASE_BUDGET.as_millis()).unwrap_or(u64::MAX);
+    let run_refusal = |h: &str| {
+        from.iter()
+            .filter(|l| l.code == "TCP_DENIED" && l.status == 403 && l.method == "CONNECT" && l.host == h && l.port == Some(443))
+            .filter_map(|l| squid_ms(l))
+            .filter(|t| nonce_ms.and_then(|n| n.checked_sub(*t)).is_some_and(|before| before <= slot_ms))
+            .min()
+    };
+    let (mut bad, mut unplaced, mut earlier) = (Vec::new(), Vec::<String>::new(), Vec::<String>::new());
+    for l in from.iter().filter(|l| l.code.starts_with("TCP_TUNNEL") && refused_tunnel(l)) {
+        if !allowlistable(l) {
+            bad.push(line_text(l));
+            continue;
+        }
+        match run_refusal(&l.host) {
+            Some(refusal) if squid_ms(l).is_some_and(|end| end < refusal) => earlier.push(l.host.clone()),
+            Some(_) => bad.push(line_text(l)),
+            None => unplaced.push(l.host.clone()),
+        }
+    }
     if !bad.is_empty() {
         return SquidEvidence::Violation(format!("squid opened tunnels to hosts this run was refused: {}", bad.join("; ")));
     }
-    let mut missing = Vec::new();
+    unplaced.sort();
+    unplaced.dedup();
+    let mut missing: Vec<String> = unplaced
+        .iter()
+        .map(|h| format!("TCP_DENIED/403 CONNECT {h}:443 from {client} within {} s before the run's nonce line (a tunnel to {h} is logged: squid's own refusal of it in this run places it)", CASE_BUDGET.as_secs()))
+        .collect();
     let opened = from.iter().filter(|l| l.code == "TCP_TUNNEL" && l.status == 200 && l.method == "CONNECT" && l.host == ALLOWED_HOST && l.port == Some(443)).count();
     if opened < tunnels {
         missing.push(format!("{tunnels} × TCP_TUNNEL/200 CONNECT api.anthropic.com:443 from {client} ({opened} found)"));
@@ -909,8 +959,14 @@ pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, 
     if !missing.is_empty() {
         return SquidEvidence::Missing(missing);
     }
+    earlier.sort();
+    earlier.dedup_by(|a, b| a == b);
+    let not_ours = match earlier.len() {
+        0 => String::new(),
+        _ => format!(" (tunnels to {} logged before this run refused it: an earlier run's, not counted)", earlier.join(", ")),
+    };
     SquidEvidence::Complete(format!(
-        "from {client}: {opened} tunnels to api.anthropic.com:443; TCP_DENIED/403 for {}; no tunnel to a refused host",
+        "from {client}: {opened} tunnels to api.anthropic.com:443; TCP_DENIED/403 for {}; no tunnel to a refused host{not_ours}",
         refused.iter().map(|(m, h, p)| format!("{m} {h}:{p}")).collect::<Vec<_>>().join(", ")
     ))
 }
@@ -2096,6 +2152,64 @@ mod tests {
             let method = if scheme == "https" { "CONNECT" } else { "GET" };
             assert!(refused.iter().any(|(m, rh, rp)| *m == method && rh == h && *rp == p), "{}: {method} {h}:{p}", c.name);
         }
+    }
+
+    /// Every VM shares the connector's address (measured live on 2 Oct 2026). Removing a host restarts squid, which ends
+    /// and logs every tunnel, so a tunnel to github.com that squid logged before this run refused it is an earlier run's,
+    /// opened while an operator allowed it: `make test-egress` failed its next test on exactly that
+    /// (live_egress_extra_and_removal's tunnel). One logged at or after the refusal (open while the run was refused) is
+    /// a violation, and so is any tunnel squid must never open (an IP literal, a refused port), whenever it was logged.
+    /// The refusal that decides is the run's own, within one case's budget before its nonce line; while it is not in the
+    /// log, the evidence is missing.
+    #[test]
+    fn squid_evidence_attributes_the_shared_address_by_squids_clock() {
+        let t = 1_790_000_000;
+        let c = "10.42.1.158";
+        let ev = |msgs: &[String]| squid_evidence(&lines_of(msgs), NONCE, t - 60, t + 60, 2);
+        let at = |secs: u64, ms: u64, dur: u64, code: &str, dest: &str| format!("aienv {secs}.{ms:03} {dur} {c} {code} 4000 CONNECT {dest}");
+        let with = |extra: &[String]| squid_run(c, t).into_iter().chain(extra.iter().cloned()).collect::<Vec<_>>();
+        // live_egress_extra_and_removal 35 s earlier: refused, allowed (a tunnel of 0.9 s), refused again.
+        let earlier = [at(t - 40, 0, 1, "TCP_DENIED/403", "github.com:443"), at(t - 35, 400, 900, "TCP_TUNNEL/200", "github.com:443"), at(t - 34, 0, 1, "TCP_DENIED/403", "github.com:443")];
+        match ev(&with(&earlier)) {
+            SquidEvidence::Complete(found) => assert!(found.ends_with("no tunnel to a refused host (tunnels to github.com logged before this run refused it: an earlier run's, not counted)"), "{found}"),
+            other => panic!("{other:?}"),
+        }
+        // Logged at or after this run's refusal (t.123): open while the run was refused, or opened after: this run's.
+        for (secs, ms, dur) in [(t, 123, 0), (t, 900, 9), (t, 500, 70_000), (t + 30, 0, 1000)] {
+            assert!(matches!(ev(&with(&[at(secs, ms, dur, "TCP_TUNNEL/200", "github.com:443")])), SquidEvidence::Violation(v) if v.contains("github.com")), "{secs}.{ms} {dur}");
+        }
+        // A refusal logged after the run's nonce line is a later run's: it never places a tunnel logged after the run's.
+        let later = with(&[at(t + 5, 0, 900, "TCP_TUNNEL/200", "github.com:443"), at(t + 10, 0, 1, "TCP_DENIED/403", "github.com:443")]);
+        assert!(matches!(ev(&later), SquidEvidence::Violation(v) if v.contains("github.com")), "{:?}", ev(&later));
+        // Without the run's own refusal in the log (an earlier run's, more than a case's budget before the nonce line,
+        // is not it), a tunnel to github.com cannot be placed: missing, so the poll goes on and its budget fails closed.
+        let without_own = |extra: &[String]| with(extra).into_iter().filter(|l| !(l.contains(&format!("{t}.123")) && l.contains("github.com"))).collect::<Vec<_>>();
+        for msgs in [without_own(&earlier), without_own(&[at(t - 35, 400, 900, "TCP_TUNNEL/200", "github.com:443")])] {
+            assert!(matches!(ev(&msgs), SquidEvidence::Missing(m) if m.iter().any(|x| x.contains("github.com:443 from 10.42.1.158 within 12 s before the run's nonce line"))), "{:?}", ev(&msgs));
+        }
+        // Two refusals in the run's slot (another run's too): a tunnel logged between them was open while squid refused it.
+        let slot = without_own(&[at(t - 10, 0, 1, "TCP_DENIED/403", "github.com:443"), at(t - 5, 0, 900, "TCP_TUNNEL/200", "github.com:443"), at(t - 1, 0, 1, "TCP_DENIED/403", "github.com:443")]);
+        assert!(matches!(ev(&slot), SquidEvidence::Violation(v) if v.contains("github.com")), "{:?}", ev(&slot));
+        // Only a refusal like the run's own (CONNECT github.com:443, 403, from the run's client) places a tunnel: a
+        // plain-http one, one on another port, with another status or from another client, in the run's slot, does not.
+        for other in [format!("{c} TCP_DENIED/403 4000 GET github.com:443"), format!("{c} TCP_DENIED/403 4000 CONNECT github.com:8443"), format!("{c} TCP_DENIED/407 4000 CONNECT github.com:443"), "10.42.1.30 TCP_DENIED/403 4000 CONNECT github.com:443".to_string()] {
+            let msgs = without_own(&[at(t - 10, 0, 1, "TCP_DENIED/403", "github.com:443"), at(t - 4, 100, 900, "TCP_TUNNEL/200", "github.com:443"), format!("aienv {}.000 1 {other}", t - 3)]);
+            assert!(matches!(ev(&msgs), SquidEvidence::Violation(v) if v.contains("github.com:443")), "{other}: {:?}", ev(&msgs));
+        }
+        // Tunnels squid must never open count whenever they were logged, as does github.com on another port and a
+        // tunnel tag with a suffix.
+        for dest in ["1.1.1.1:443", "api.anthropic.com:8443", "github.com:8443"] {
+            assert!(matches!(ev(&with(&[at(t - 50, 0, 900, "TCP_TUNNEL/200", dest)])), SquidEvidence::Violation(v) if v.contains(dest)), "{dest}");
+        }
+        assert!(matches!(ev(&with(&[at(t - 50, 0, 900, "TCP_TUNNEL_ABORTED/200", "1.1.1.1:443")])), SquidEvidence::Violation(_)));
+        // A tunnel whose squid time does not parse counts (fail closed); without the nonce line's time nothing places one.
+        assert!(matches!(ev(&with(&[format!("aienv {t}.9x9 9 {c} TCP_TUNNEL/200 4000 CONNECT github.com:443")])), SquidEvidence::Violation(v) if v.contains("github.com")));
+        let garbled_nonce: Vec<String> = with(&earlier).into_iter().map(|l| if l.contains(&denied_host(NONCE)) { l.replace(&format!("{t}.123"), &format!("{t}.1x3")) } else { l }).collect();
+        assert!(matches!(ev(&garbled_nonce), SquidEvidence::Missing(_)), "{:?}", ev(&garbled_nonce));
+        // squid writes milliseconds; a missing or short fraction still reads as milliseconds.
+        assert_eq!(squid_ms(&lines_of(&[at(t, 7, 0, "TCP_DENIED/403", "github.com:443")])[0]), Some(t * 1000 + 7));
+        assert_eq!(squid_ms(&lines_of(&[format!("aienv {t} 0 {c} TCP_DENIED/403 4000 CONNECT github.com:443")])[0]), Some(t * 1000));
+        assert_eq!(squid_ms(&lines_of(&[format!("aienv {t}.5 0 {c} TCP_DENIED/403 4000 CONNECT github.com:443")])[0]), Some(t * 1000 + 500));
     }
 
     fn evidence(lines: &[(String, String)]) -> Evidence {

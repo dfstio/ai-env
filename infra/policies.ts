@@ -48,7 +48,12 @@ export function internetEgressConnectorArn(region: string): string {
 
 /** The services that assume the egress roles (S5). */
 export const EC2_SERVICE = "ec2.amazonaws.com";
-/** The connector's operator role: both principals are trusted until T5.1's CloudTrail AssumeRole events say which one is used. */
+/**
+ * Not trusted: the other candidate principal of the connector's operator role, never seen assuming it (T5.1's CloudTrail
+ * AssumeRole events, 1 and 2 Oct 2026, both connector creations: lambda.amazonaws.com only). The deploy policy's
+ * PassOperatorRole still accepts it as iam:PassedToService, that value being unmeasured (the root deploy identity
+ * bypasses the deploy policy).
+ */
 export const NETWORK_CONNECTORS_SERVICE = "network-connectors.lambda.amazonaws.com";
 /** The SSM agent's actions (without ssm:GetParameter on "*"), for the proxy instance. */
 export const SSM_INSTANCE_POLICY_ARN = "arn:aws:iam::aws:policy/AmazonSSMManagedEC2InstanceDefaultPolicy";
@@ -191,13 +196,14 @@ export function proxyRolePolicy(n: Names): PolicyDocument {
 }
 
 /**
- * Trust of the connector's operator role ai-env-egress-operator (S5): both candidate principals, narrowed after T5.1
- * (CloudTrail AssumeRole events). An aws:SourceAccount condition (confused deputy) goes in once T5.1 shows the
- * service sends the key: added blind, it could refuse every AssumeRole and leave the connector without ENIs.
+ * Trust of the connector's operator role ai-env-egress-operator (S5): lambda.amazonaws.com, the principal T5.1's
+ * CloudTrail AssumeRole events show (every one of them, at both connector creations; network-connectors.lambda was
+ * never seen). An aws:SourceAccount condition (confused deputy) still waits for a measurement that the service sends
+ * the key: added blind, it could refuse every AssumeRole and leave the connector without ENIs.
  */
 export function operatorTrustPolicy(): PolicyDocument {
     return doc({
-        Sid: "LambdaNetworkConnectors", Effect: "Allow", Principal: { Service: [NETWORK_CONNECTORS_SERVICE, LAMBDA_SERVICE] }, Action: ["sts:AssumeRole", "sts:TagSession"],
+        Sid: "LambdaNetworkConnectors", Effect: "Allow", Principal: { Service: LAMBDA_SERVICE }, Action: ["sts:AssumeRole", "sts:TagSession"],
     });
 }
 
