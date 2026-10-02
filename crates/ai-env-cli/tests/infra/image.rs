@@ -1356,6 +1356,23 @@ fn probe_name(calls: &[String]) -> String {
     name
 }
 
+/// The wait for the probe connector takes minutes (255 and 265 s live, 2 Oct 2026) and once looked like a hang: it
+/// names its limit and says it is still waiting every PROBE_PROGRESS_S (60 s; 1 s here).
+#[test]
+fn connector_probe_says_it_is_still_waiting() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = s5_bin(t.path());
+    seed_connector(t.path(), CONNECTOR, "ACTIVE");
+    std::fs::write(t.path().join("aws/create-states"), "PENDING PENDING PENDING PENDING PENDING ACTIVE\n").unwrap();
+    let out = probe(t.path(), &bin, &[("PROBE_PROGRESS_S", "1"), ("CONNECTOR_WAIT_TIMEOUT", "60")]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("(polled every 1s since the create, at most 60s;") && text.contains("connector-probe: still waiting after "), "{text}");
+    assert!(text.find("still waiting after ").unwrap() < text.find("became ACTIVE ").unwrap(), "{text}");
+    let name = probe_name(&calls(t.path()));
+    assert!(text.contains(&format!("connector-probe: deleted {name}")), "{text}");
+}
+
 #[test]
 fn connector_probe_measures_a_pending_connector_and_deletes_it_on_every_path() {
     let setup = |create_states: &str| {

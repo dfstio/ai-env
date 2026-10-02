@@ -500,6 +500,8 @@ cmd_connector_status() {
 # refuses while one exists. INT, TERM and HUP are trapped as exits: bash 3.2 kills itself without running the EXIT trap
 # when its foreground child dies of an untrapped SIGINT.
 PROBE_DELETE_TRIES=6
+# A progress line every PROBE_PROGRESS_S while the probe waits for its connector (minutes: 255 and 265 s live).
+PROBE_PROGRESS_S=${PROBE_PROGRESS_S:-60}
 probe=""
 poller=""
 watch=""
@@ -559,7 +561,7 @@ probe_poll() {
 }
 
 cmd_connector_probe() {
-    local doc cfg role arn state t0 rc secs detail
+    local doc cfg role arn state t0 rc secs detail next
     need_connector
     need_ai_env
     doc=$(aws lambda-core get-network-connector --identifier "$connector" --region "$region" --endpoint-url "$lambda_url" --output json) \
@@ -588,7 +590,18 @@ cmd_connector_probe() {
         echo "connector-probe: ai-env lab run connector-pending failed (exit $rc, above); the probe connector is deleted"
         exit 1
     fi
-    echo "connector-probe: waiting for $probe to leave PENDING (polled every ${CONNECTOR_WAIT_POLL}s since the create)"
+    echo "connector-probe: waiting for $probe to leave PENDING (polled every ${CONNECTOR_WAIT_POLL}s since the create, at most ${CONNECTOR_WAIT_TIMEOUT}s; a connector took 255-265 s on 2 Oct 2026)"
+    # The poll writes its one line when it ends: until then a line every PROBE_PROGRESS_S (a silent wait of minutes
+    # looked like a hang).
+    next=$PROBE_PROGRESS_S
+    while [ ! -s "$watch/state" ] && kill -0 "$poller" 2>/dev/null; do
+        sleep 1
+        secs=$(($(date +%s) - t0))
+        if [ "$secs" -ge "$next" ]; then
+            echo "connector-probe: still waiting after ${secs}s"
+            next=$((secs + PROBE_PROGRESS_S))
+        fi
+    done
     wait "$poller" || true
     poller=""
     state="" secs="" detail=""
