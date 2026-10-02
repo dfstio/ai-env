@@ -308,13 +308,31 @@ pub fn row_keystore_key(exists: bool, key: &str) -> DoctorLine {
     }
 }
 
-/// Highest `anthropic.claude-code-<semver>-darwin-arm64` directory name.
+/// Highest `anthropic.claude-code-<semver>-darwin-arm64` directory name; on
+/// equal versions a release beats a suffixed name, then the name decides (never
+/// the directory's listing order).
 #[must_use]
 pub fn pick_bundle(dirs: &[String]) -> Option<(String, String)> {
     dirs.iter()
         .filter_map(|d| bundle_version(d).and_then(|ver| semver(&ver).map(|t| (t, ver, d.clone()))))
-        .max_by_key(|(t, _, _)| *t)
+        .max_by_key(|(t, ver, d)| (*t, !ver.contains('-'), d.clone()))
         .map(|(_, ver, dir)| (ver, dir))
+}
+
+/// The extension directory names Cursor counts as installed in `dir`: real
+/// directories only (a file or a symlink is no installed extension), without
+/// those `dir/.obsolete` lists — after installing an older version, the newer
+/// one stays on disk, listed there, until Cursor's next start deletes it.
+#[must_use]
+pub fn installed_extension_names(dir: &Path) -> Vec<String> {
+    let obsolete: std::collections::BTreeSet<String> = std::fs::read_to_string(dir.join(".obsolete"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&t).ok())
+        .map(|m| m.into_iter().filter(|(_, v)| v.as_bool() != Some(false)).map(|(k, _)| k).collect())
+        .unwrap_or_default();
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !obsolete.contains(n)).collect())
+        .unwrap_or_default()
 }
 
 /// The version inside a bundle directory name
@@ -325,6 +343,21 @@ pub fn bundle_version(dir_name: &str) -> Option<String> {
     let rest = dir_name.strip_prefix("anthropic.claude-code-")?;
     let ver = rest.strip_suffix("-darwin-arm64")?;
     semver(ver).map(|_| ver.to_string())
+}
+
+/// doctor's Cursor rows from the extensions directory `ext_dir`: the installed bundle (the selection P10, gate G4 and
+/// `make claude-update` share), the fixture drift and the image's claude against that bundle; and what the bundled
+/// claude's `--version` printed (`version_of` runs it), which the PATH row compares with.
+#[must_use]
+pub fn cursor_bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>) -> (Vec<DoctorLine>, Option<String>) {
+    let dirs = installed_extension_names(ext_dir);
+    let bundle = pick_bundle(&dirs);
+    let bundled_out = bundle.as_ref().and_then(|(_, dir)| version_of(&ext_dir.join(dir).join("resources").join("native-binary").join("claude")));
+    let ver = bundle.as_ref().map(|(v, _)| v.as_str());
+    let mut lines = vec![row_cursor_bundle(&dirs, bundled_out.as_deref())];
+    lines.extend(row_fixture_drift(ver));
+    lines.extend(row_image_claude(image_claude, ver));
+    (lines, bundled_out)
 }
 
 #[must_use]
@@ -507,7 +540,7 @@ pub fn row_image_claude(image_claude: Option<&str>, bundle: Option<&str>) -> Opt
     Some(if img == bun {
         DoctorLine::row(Tag::Ok, format!("image claude {img} = Cursor bundle"))
     } else {
-        DoctorLine::row(Tag::Warn, format!("image claude {img} != Cursor bundle {bun}  <- make claude-pin CLAUDE_VERSION={bun} && make deploy (or install the wrapper to freeze the bundle)"))
+        DoctorLine::row(Tag::Warn, format!("image claude {img} != Cursor bundle {bun}  <- make claude-update (pins {bun}, make test-docker, make deploy, egress check; or turn off Auto Update for the Claude Code extension in Cursor to update on your own schedule)"))
     })
 }
 
@@ -1035,22 +1068,9 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
         Err(_) => None,
     };
 
-    let ext_dir = home().join(".cursor").join("extensions");
-    let dirs: Vec<String> = std::fs::read_dir(&ext_dir)
-        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
-        .unwrap_or_default();
-    let bundle = pick_bundle(&dirs);
-    let bundled_out = bundle.as_ref().and_then(|(_, dir)| {
-        let bin = ext_dir.join(dir).join("resources").join("native-binary").join("claude");
-        run_capture(&bin.to_string_lossy(), &["--version"], t).ok()
-    });
-    lines.push(row_cursor_bundle(&dirs, bundled_out.as_deref()));
-    if let Some(row) = row_fixture_drift(bundle.as_ref().map(|(ver, _)| ver.as_str())) {
-        lines.push(row);
-    }
-    if let Some(row) = row_image_claude(infra_state.as_ref().and_then(|s| s.claude_version.as_deref()), bundle.as_ref().map(|(ver, _)| ver.as_str())) {
-        lines.push(row);
-    }
+    let image_claude = infra_state.as_ref().and_then(|s| s.claude_version.as_deref());
+    let (cursor, bundled_out) = cursor_bundle_rows(&home().join(".cursor").join("extensions"), image_claude, &|bin: &Path| run_capture(&bin.to_string_lossy(), &["--version"], t).ok());
+    lines.extend(cursor);
     let path_claude = find_in_path("claude", &effective_path());
     let path_out = path_claude.as_ref().and_then(|p| run_capture(&p.to_string_lossy(), &["--version"], t).ok());
     lines.push(row_path_claude(path_claude.as_deref().zip(path_out.as_deref()), bundled_out.as_deref()));
@@ -1188,7 +1208,7 @@ mod tests {
         assert!(row_image_claude(None, Some("2.1.283")).is_none());
         assert_eq!(text(&row_image_claude(Some("2.1.283"), Some("2.1.283")).unwrap()).0, Tag::Ok);
         let (tag, t) = text(&row_image_claude(Some("2.1.283"), Some("2.1.284")).unwrap());
-        assert!(tag == Tag::Warn && t.contains("make claude-pin CLAUDE_VERSION=2.1.284"), "{t}");
+        assert!(tag == Tag::Warn && t.contains("make claude-update (pins 2.1.284, make test-docker, make deploy"), "{t}");
 
         let (tw, pol) = (Path::new("/r/tripwires.txt"), Path::new("/r/settings-policy.txt"));
         assert_eq!(text(&row_review_files(tw, false, pol, false)).0, Tag::Skip);
@@ -1825,6 +1845,63 @@ mod tests {
         assert_eq!(text(&row_bridge_config(&p, &Err(BridgeError::Config("bad".into())))).0, Tag::No);
         assert_eq!(text(&row_keystore_key(false, "ai-env-bridge")).0, Tag::Skip);
         assert_eq!(text(&row_keystore_key(true, "ai-env-bridge")).0, Tag::Ok);
+    }
+
+    /// The selection P10, doctor, gate G4 and `make claude-update` share: a version `.obsolete` lists (left on disk
+    /// after installing an older one), a plain file or a symlink named like a bundle is none; a malformed `.obsolete`
+    /// hides nothing; a release beats a suffixed name of the same version.
+    #[test]
+    fn installed_extension_names_skip_obsolete_files_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bundle = |v: &str| format!("anthropic.claude-code-{v}-darwin-arm64");
+        for v in ["2.1.287", "2.1.288"] {
+            std::fs::create_dir(dir.join(bundle(v))).unwrap();
+        }
+        std::fs::write(dir.join(bundle("2.1.300")), "").unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join(bundle("2.1.299"))).unwrap();
+        std::os::unix::fs::symlink(dir.join(bundle("2.1.287")), dir.join(bundle("2.1.298"))).unwrap();
+        let picked = || pick_bundle(&installed_extension_names(dir)).map(|(v, _)| v);
+        assert_eq!(picked().as_deref(), Some("2.1.288"), "files and symlinks are no installed extension");
+        std::fs::write(dir.join(".obsolete"), r#"{"anthropic.claude-code-2.1.288-darwin-arm64": true, "other.ext-1.0.0": true}"#).unwrap();
+        assert_eq!(picked().as_deref(), Some("2.1.287"), "the obsolete newer one is skipped");
+        let (_, t) = text(&row_cursor_bundle(&installed_extension_names(dir), Some("2.1.287 (Claude Code)")));
+        assert!(t.contains("cursor extension 2.1.287") && !t.contains("versions installed"), "doctor counts only what is installed: {t}");
+        std::fs::write(dir.join(".obsolete"), "not json").unwrap();
+        assert_eq!(picked().as_deref(), Some("2.1.288"), "a malformed .obsolete hides nothing");
+        std::fs::create_dir(dir.join(bundle("2.1.289-rc1"))).unwrap();
+        std::fs::create_dir(dir.join(bundle("2.1.289"))).unwrap();
+        assert_eq!(picked().as_deref(), Some("2.1.289"), "the release beats the suffixed name, whatever the listing order");
+        assert!(installed_extension_names(&dir.join("absent")).is_empty());
+    }
+
+    /// doctor's own call (B3 of the claude-update review): its rows rest on the installed selection (an obsolete newer
+    /// bundle is not the Cursor bundle), the claude it asks is the selected bundle's, and the image row compares with it.
+    #[test]
+    fn cursor_bundle_rows_use_the_installed_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bundle = |v: &str| format!("anthropic.claude-code-{v}-darwin-arm64");
+        for v in ["2.1.287", "2.1.288"] {
+            std::fs::create_dir(dir.join(bundle(v))).unwrap();
+        }
+        std::fs::write(dir.join(bundle("2.1.300")), "").unwrap();
+        std::fs::write(dir.join(".obsolete"), r#"{"anthropic.claude-code-2.1.288-darwin-arm64": true}"#).unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let (lines, out) = cursor_bundle_rows(dir, Some("2.1.287"), &|bin: &Path| {
+            asked.borrow_mut().push(bin.to_path_buf());
+            Some("2.1.287 (Claude Code)".to_string())
+        });
+        assert_eq!(*asked.borrow(), vec![dir.join(bundle("2.1.287")).join("resources").join("native-binary").join("claude")]);
+        assert_eq!(out.as_deref(), Some("2.1.287 (Claude Code)"));
+        let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
+        assert!(texts[0].contains("cursor extension 2.1.287, bundled claude 2.1.287") && !texts[0].contains("versions installed"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("image claude 2.1.287 = Cursor bundle")), "{texts:?}");
+        let (lines, _) = cursor_bundle_rows(dir, Some("2.1.286"), &|_: &Path| None);
+        let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
+        assert!(texts.iter().any(|t| t.contains("image claude 2.1.286 != Cursor bundle 2.1.287  <- make claude-update")), "{texts:?}");
+        let (lines, out) = cursor_bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") });
+        assert_eq!((lines.len(), text(&lines[0]).0, out), (1, Tag::Skip, None));
     }
 
     #[test]

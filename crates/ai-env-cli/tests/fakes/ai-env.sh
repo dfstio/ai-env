@@ -34,6 +34,9 @@
 #                                   a connector the stateful aws fake holds
 #                                   PENDING (create-hold)
 #   proxy ...                       one line, exit FAKE_AIENV_PROXY_RC (0)
+#   infra pin --bundle-version      prints FAKE_AIENV_BUNDLE, exit 0; unset or
+#                                   empty: ai-env's no-bundle error, exit 1
+#   egress check ...                one line, exit FAKE_AIENV_CHECK_RC (0)
 #   anything else                   (infra pin, infra base-image, ...) prints
 #                                   one line, exit 0
 # Environment:
@@ -86,6 +89,18 @@ case "${1:-} ${2:-}" in
   "proxy "*)
     echo "fake ai-env: $*"
     exit "${FAKE_AIENV_PROXY_RC:-0}" ;;
+  "infra pin")
+    case " $* " in
+      *" --bundle-version "*)
+        if [ -n "${FAKE_AIENV_BUNDLE:-}" ]; then echo "$FAKE_AIENV_BUNDLE"; exit 0; fi
+        echo "ai-env: pin: no anthropic.claude-code-<version>-darwin-arm64 bundle under the extensions directory" >&2
+        exit 1 ;;
+    esac
+    echo "fake ai-env: $*"
+    exit 0 ;;
+  "egress check")
+    echo "fake ai-env: $*"
+    exit "${FAKE_AIENV_CHECK_RC:-0}" ;;
   "creds aws-set")
     case " $* " in *" --check "*) echo "[ok ] fake aws-set --check"; exit 0 ;; esac
     if [ "${FAKE_AIENV_SEAL:-}" = early ]; then

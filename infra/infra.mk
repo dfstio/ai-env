@@ -4,12 +4,12 @@
 #
 # Part A (the agent; read-only against AWS): infra-install, infra-typecheck, check-policies, preview-scratch.
 # Part B (Mike; creates or changes AWS resources): preview, deploy, image-*, logs, infra-status, runtime-key, destroy,
-# connector-*, egress-logs, allowlist-reload, proxy-*.
+# connector-*, egress-logs, allowlist-reload, proxy-*, claude-update.
 # Every aws call carries --region $(REGION), and the lambda-core, ec2 and logs ones the pinned --endpoint-url; nothing
 # here runs `pulumi login`, sets the dev stack's passphrase or uses --yes / --show-secrets (D17; `ai-env proxy stop
 # --yes` is the operator CLI's own switch). The image lifecycle and egress logic lives in infra/scripts/ops.sh (bash 3.2).
 .PHONY: infra-install infra-typecheck check-policies preview-scratch preview deploy image-wait image-status image-versions image-builds image-deactivate image-activate image-prune image-delete logs infra-status runtime-key destroy \
-        connector-status connector-wait connector-probe connector-delete egress-logs allowlist-reload proxy-stop proxy-start proxy-patch
+        connector-status connector-wait connector-probe connector-delete egress-logs allowlist-reload proxy-stop proxy-start proxy-patch claude-update
 
 INFRA              := infra
 # The program reads image.json and resolves the paths inside it from the repo root, also from a scratch copy.
@@ -111,6 +111,12 @@ deploy: ## S3/S5 part B: image-zip, s3-preflight PHASE=b, check-policies, plan c
 	  if [ $$st -eq 0 ]; then after=""; else after=--after-failure; fi; \
 	  $(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' $(OPS) post-deploy $$after; p=$$?; \
 	  exit $$(( st ? st : p ))
+
+# The daily Claude Code update (ops.sh claude-update): every step is its own make run started by ops.sh, never a
+# $(MAKE) on this line (GNU make runs such a line even under -n), so `make -n claude-update` stays a dry parse. Its
+# make deploy is the ordinary one: the plan gate, then Pulumi's own confirmation.
+claude-update: ## S3/S5 part B (interactive: Pulumi's confirmation, one Touch ID): follow the Cursor extension's Claude Code: make claude-pin (its version), make test-docker, make deploy, make infra-status WRITE=1, make proxy-start, ai-env egress check --if-needed; when already pinned and deployed only the status and the check; run again to resume after a failure
+	@$(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' LOCK='$(IMAGE_DIR)/claude.lock' CLAUDE_RELEASES='$(CLAUDE_RELEASES)' CLAUDE_GPG_FPR='$(CLAUDE_GPG_FPR)' $(OPS) claude-update
 
 # D29: the wait decides from the versions against the pre-deploy snapshot; the post-deploy snapshot and
 # versions-diff run even after a failed build (T3.4 records both).

@@ -876,7 +876,12 @@ const RUN_NONCE: &str = "5eed5eed5eed5eed";
 /// A world whose network verification is green: `[aws].egress_connector_arn`, `state/infra.toml` of the
 /// fixtures' stack, the fixtures as aws answers, the proxy's parameters and its `--status` answer.
 fn green_network() -> World {
-    let w = World::new("");
+    green_network_with("")
+}
+
+/// [`green_network`] with `vm_toml` as the `[vm]` section.
+fn green_network_with(vm_toml: &str) -> World {
+    let w = World::new(vm_toml);
     connect(&w, CONNECTOR);
     let (_, answers) = fake_aws(&w);
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress");
@@ -1228,4 +1233,223 @@ fn egress_check_never_claims_a_pass_whose_record_a_newer_revocation_refused() {
     let last = check_audit(&w).pop().unwrap();
     assert_eq!(last["detail"]["verdict"].as_str(), Some("fail"), "{last}");
     no_vm_left(&w);
+}
+
+/// `egress check --if-needed` (what `make claude-update` runs after a deploy): no VM when the image version a new VM
+/// runs — read live as the operator — already has a pass bound to that very build and to the connector's live facts;
+/// the full check when the build, the connector or the version differ, or the live read fails. A DNS verdict the gate
+/// does not accept is said, and starts nothing (another check would see the same).
+#[test]
+fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
+    let w = green_network();
+    let answers = w.root().join("answers");
+    let live_image = |active: &str| fs::write(answers.join("lambda-microvms.get-microvm-image.json"), serde_json::json!({"imageArn": ai_env_cli::bridge::api::FAKE_IMAGE_ARN, "state": "UPDATED", "latestActiveImageVersion": active}).to_string()).unwrap();
+    let versions = |items: serde_json::Value| fs::write(answers.join("lambda-microvms.list-microvm-image-versions.json"), serde_json::json!({"items": items}).to_string()).unwrap();
+    // The record's build: 1_789_804_800 = 2026-09-19T08:00:00Z, as the aws CLI prints createdAt (an offset, microseconds).
+    const BUILD: &str = "2026-09-19T11:00:00.059000+03:00";
+    let v10 = |created: &str| serde_json::json!({"imageVersion": "1.0", "state": "SUCCESSFUL", "status": "ACTIVE", "createdAt": created});
+    live_image("1.0");
+    versions(serde_json::json!([v10(BUILD)]));
+    let golden: serde_json::Value = serde_json::from_str(&fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json")).unwrap()).unwrap();
+    let facts = ai_env_cli::bridge::egress::ConnectorFacts::from_get(&golden).unwrap();
+    let rec = VerifiedRecord { image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(), image_version: "1.0".into(), connector: CONNECTOR.into(), vm_id: "microvm-earlier".into(), at: "2026-10-02T06:10:00Z".into(), dns: "no-dns".into(), connector_facts: facts, image_created_at: Some(1_789_804_800), ..VerifiedRecord::default() };
+    let seed = |records: Vec<VerifiedRecord>| fs::write(w.bridge().join("state/egress-verified.toml"), toml::to_string(&EgressVerified { records, ..EgressVerified::default() }).unwrap()).unwrap();
+    seed(vec![rec.clone()]);
+    let t = transcript_file(&w, None);
+    squid_log(&w, "10.42.1.158", None);
+    let skipped = |o: &std::process::Output| code(o) == 0 && stdout(o).contains("nothing started");
+
+    // The pass of the version new VMs run, this build, these connector facts: nothing started, three operator reads.
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(skipped(&o), "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("egress check: image version 1.0, the one a new VM runs, already has a passing check with") && stdout(&o).contains("(VM microvm-earlier, 2026-10-02T06:10:00Z), bound to this build and to the connector's live facts"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("note:"), "no-dns needs no acceptance: {}", stdout(&o));
+    assert!(w.state().vms.is_empty() && shell_tokens(&w) == 0, "no VM, no shell");
+    let calls = aws_calls(&w);
+    for (op, n) in [("lambda-microvms get-microvm-image ", 1), ("lambda-microvms list-microvm-image-versions ", 1), ("lambda-core get-network-connector ", 1)] {
+        assert_eq!(calls.lines().filter(|l| l.starts_with(op)).count(), n, "{op}: {calls}");
+    }
+    assert!(calls.lines().all(|l| l.contains(" --region eu-central-1")), "{calls}");
+    assert!(check_audit(&w).is_empty(), "a skip is no check");
+    let o = check_with(&w, &["egress", "check", "--if-needed", "--json"], &t);
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!((doc["skipped"].as_bool(), doc["image_version"].as_str(), doc["recorded_vm"].as_str(), doc["dns_accepted"].as_bool()), (Some(true), Some("1.0"), Some("microvm-earlier"), Some(true)), "{doc}");
+    for extra in [&["--vm", "microvm-x"][..], &["--keep"][..]] {
+        let mut args = vec!["egress", "check", "--if-needed"];
+        args.extend_from_slice(extra);
+        assert_eq!(code(&check_with(&w, &args, &t)), 2, "{extra:?}");
+    }
+
+    // A pass whose DNS verdict the gate does not accept yet: still nothing started, and it says so.
+    seed(vec![VerifiedRecord { dns: "platform-dns:fd00:ec2::253".into(), ..rec.clone() }]);
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(skipped(&o) && stdout(&o).contains("egress check: note: its DNS verdict platform-dns:fd00:ec2::253 is not accepted ([egress].accept_platform_dns = false): the credential gate refuses this pass until it is"), "{}", stdout(&o));
+    seed(vec![rec.clone()]);
+
+    // Each difference runs the full check: another build of 1.0 (created 5 s later, the image created again), the
+    // connector changed, a new active version without a pass, the live read failing.
+    let runs = |what: &str| {
+        let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+        assert!(!stdout(&o).contains("nothing started") && stdout(&o).contains("egress check of microvm-"), "{what}: {}\n{}", stdout(&o), stderr(&o));
+        seed(vec![rec.clone()]);
+    };
+    versions(serde_json::json!([v10("2026-09-19T11:00:05+03:00")]));
+    runs("another build");
+    versions(serde_json::json!([v10(BUILD)]));
+    let answer = answers.join("lambda-core.get-network-connector.json");
+    let mut changed = golden.clone();
+    changed["Configuration"]["VpcEgressConfiguration"]["SecurityGroupIds"] = serde_json::json!(["sg-0eee9999aaaa8888b"]);
+    fs::write(&answer, changed.to_string()).unwrap();
+    runs("the connector changed");
+    fs::write(&answer, golden.to_string()).unwrap();
+    live_image("2.0");
+    versions(serde_json::json!([v10(BUILD), {"imageVersion": "2.0", "state": "SUCCESSFUL", "status": "ACTIVE", "createdAt": "2026-10-02T09:00:00+03:00"}]));
+    runs("a new version");
+    live_image("1.0");
+    fs::write(answers.join("lambda-microvms.get-microvm-image.rc"), "254\n").unwrap();
+    runs("the live read failing");
+    no_vm_left(&w);
+}
+
+/// A check through a stopped proxy can only fail, and a failing check of its own VM revokes every pass of the
+/// connector: it is refused before any VM, revoking nothing.
+#[test]
+fn egress_check_refuses_a_stopped_proxy_before_any_vm_and_revokes_nothing() {
+    let w = green_network();
+    let instances = w.root().join("answers").join("ec2.describe-instances.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&instances).unwrap()).unwrap();
+    doc["Reservations"][0]["Instances"][0]["State"] = serde_json::json!({"Code": 80, "Name": "stopped"});
+    fs::write(&instances, doc.to_string()).unwrap();
+    seed_verified(&w);
+    let before = verified(&w);
+    let t = transcript_file(&w, None);
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("egress check: the egress proxy i-0123456789abcdef0 is stopped: make proxy-start, then run the check again (nothing started, nothing revoked)"), "{}", stderr(&o));
+    assert!(w.state().vms.is_empty(), "no VM");
+    assert_eq!(verified(&w), before, "nothing revoked");
+    assert!(check_audit(&w).is_empty());
+}
+
+/// A refusal before RunMicrovm ([vm].max_concurrent reached: one VM of another owner runs) proves nothing about egress:
+/// the check fails without revoking the connector's passes.
+#[test]
+fn egress_check_refused_before_runmicrovm_revokes_nothing() {
+    let w = green_network_with("max_concurrent = 1");
+    let (vm, _) = super::cli::foreign_vm(9, Some("someone@elsewhere"), ai_env_cli::bridge::api::VmState::Running, 60);
+    w.update(|s| s.insert_vm(vm));
+    seed_verified(&w);
+    let before = verified(&w);
+    let t = transcript_file(&w, None);
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("max_concurrent"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("revoked"), "{}", stderr(&o));
+    assert_eq!(verified(&w), before, "nothing revoked");
+    assert_eq!(w.runs(), 0, "no RunMicrovm");
+}
+
+/// Once RunMicrovm made the check's own VM, a failure revokes the connector's passes even when nothing of the VM is
+/// left alive to name: the egress gate rejected it and its terminate went through at once, or it never reached
+/// RUNNING and was terminated. The audit row names the VM all the same.
+#[test]
+fn egress_check_revokes_once_runmicrovm_made_its_vm_even_when_it_is_gone() {
+    let internet = "arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS";
+    for (what, why) in [("echo", "egress mismatch"), ("never running", "terminated it")] {
+        let w = World::new("");
+        connect(&w, CONNECTOR);
+        seed_verified(&w);
+        match what {
+            "echo" => w.update(|s| s.egress_echo = Some(vec![internet.into()])),
+            _ => w.update(|s| s.auto_advance = false),
+        }
+        let o = s5_run(&w, &["egress", "check"]);
+        assert_ne!(code(&o), 0, "{what}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains(why), "{what}: {}", stderr(&o));
+        assert!(alive(&w).is_empty(), "{what}: {:?}", alive(&w));
+        let id = w.state().vms.values().next().unwrap().id.clone();
+        let v = verified(&w);
+        assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "{what}: revoked: {v:?}");
+        let last = check_audit(&w).pop().unwrap_or_else(|| panic!("{what}: no egress_check audit row"));
+        assert_eq!((last["detail"]["id"].as_str(), last["detail"]["verdict"].as_str(), last["detail"]["revoked"].as_str()), (Some(id.as_str()), Some("fail"), Some("2")), "{what}: {last}");
+        assert!(stderr(&o).contains("revoked 2 earlier passes of this connector"), "{what}: {}", stderr(&o));
+    }
+}
+
+/// A definite RunMicrovm refusal made no VM: it proves nothing about egress, and revokes nothing.
+#[test]
+fn egress_check_refused_by_runmicrovm_revokes_nothing() {
+    let w = World::new("");
+    connect(&w, CONNECTOR);
+    seed_verified(&w);
+    let before = verified(&w);
+    w.update(|s| s.failures.push_back(FakeFailure { kind: "validation".into(), message: "fake refusal of the run".into(), on: Some("run".into()), after_effect: false }));
+    let o = s5_run(&w, &["egress", "check"]);
+    assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("fake refusal of the run"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("revoked"), "{}", stderr(&o));
+    assert!(w.state().vms.is_empty(), "no VM");
+    assert_eq!(verified(&w), before, "nothing revoked");
+    assert!(check_audit(&w).is_empty(), "{:?}", check_audit(&w));
+}
+
+/// `--if-needed` resolves the version from exactly what the check's own RunMicrovm would get: an `[aws].image_version`
+/// with a blank around it (RunMicrovm refuses it) never matches the recorded pass of the trimmed version.
+#[test]
+fn egress_check_if_needed_never_skips_for_a_padded_image_version() {
+    let w = green_network();
+    let path = w.bridge().join("bridge.toml");
+    let text = fs::read_to_string(&path).unwrap().replacen("[aws]\n", "[aws]\nimage_version = \" 1.0\"\n", 1);
+    fs::write(&path, text).unwrap();
+    let answers = w.root().join("answers");
+    fs::write(answers.join("lambda-microvms.get-microvm-image.json"), serde_json::json!({"imageArn": ai_env_cli::bridge::api::FAKE_IMAGE_ARN, "state": "UPDATED", "latestActiveImageVersion": "1.0"}).to_string()).unwrap();
+    fs::write(answers.join("lambda-microvms.list-microvm-image-versions.json"), serde_json::json!({"items": [{"imageVersion": "1.0", "state": "SUCCESSFUL", "status": "ACTIVE", "createdAt": "2026-09-19T08:00:00Z"}]}).to_string()).unwrap();
+    let golden: serde_json::Value = serde_json::from_str(&fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json")).unwrap()).unwrap();
+    let rec = VerifiedRecord {
+        image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(),
+        image_version: "1.0".into(),
+        connector: CONNECTOR.into(),
+        vm_id: "microvm-earlier".into(),
+        at: "2026-10-02T06:10:00Z".into(),
+        dns: "no-dns".into(),
+        connector_facts: ai_env_cli::bridge::egress::ConnectorFacts::from_get(&golden).unwrap(),
+        image_created_at: Some(1_789_804_800),
+        ..VerifiedRecord::default()
+    };
+    let seeded = EgressVerified { records: vec![rec], ..EgressVerified::default() };
+    fs::write(w.bridge().join("state/egress-verified.toml"), toml::to_string(&seeded).unwrap()).unwrap();
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &transcript_file(&w, None));
+    assert_ne!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("nothing started"), "{}", stdout(&o));
+    assert!(stderr(&o).contains("\" 1.0\""), "RunMicrovm's own refusal names the value: {}", stderr(&o));
+    assert!(w.state().vms.is_empty(), "refused before any VM");
+    assert_eq!(verified(&w), seeded, "nothing revoked");
+}
+
+/// A proxy id in state/infra.toml that EC2 no longer has (terminated, shutting down, unknown): refused before any VM
+/// with the state file's hint, revoking nothing.
+#[test]
+fn egress_check_refuses_a_gone_proxy_before_any_vm_and_revokes_nothing() {
+    for gone in ["terminated", "shutting-down", "unknown"] {
+        let w = green_network();
+        let instances = w.root().join("answers").join("ec2.describe-instances.json");
+        if gone == "unknown" {
+            fs::remove_file(&instances).unwrap();
+            fs::write(w.root().join("answers").join("ec2.describe-instances.rc"), "254\n").unwrap();
+            fs::write(w.root().join("answers").join("ec2.describe-instances.stderr"), "\nAn error occurred (InvalidInstanceID.NotFound) when calling the DescribeInstances operation: The instance ID 'i-0123456789abcdef0' does not exist\n").unwrap();
+        } else {
+            let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&instances).unwrap()).unwrap();
+            doc["Reservations"][0]["Instances"][0]["State"] = serde_json::json!({"Code": 48, "Name": gone});
+            fs::write(&instances, doc.to_string()).unwrap();
+        }
+        seed_verified(&w);
+        let before = verified(&w);
+        let o = check_with(&w, &["egress", "check"], &transcript_file(&w, None));
+        assert_eq!(code(&o), 1, "{gone}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("egress check: state/infra.toml names a proxy that no longer exists (i-0123456789abcdef0)"), "{gone}: {}", stderr(&o));
+        assert!(stderr(&o).contains("then make proxy-start if it is stopped, and run the check again (nothing started, nothing revoked)"), "{gone}: {}", stderr(&o));
+        assert!(w.state().vms.is_empty(), "{gone}: no VM");
+        assert_eq!(verified(&w), before, "{gone}: nothing revoked");
+        assert!(check_audit(&w).is_empty(), "{gone}");
+    }
 }

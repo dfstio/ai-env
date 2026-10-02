@@ -961,11 +961,18 @@ pub struct SelectFailure {
     /// written (version resolution, the workspace lock, reuse, `MaxConcurrent`,
     /// `Busy`, a failed pending write).
     pub client_token: Option<String>,
+    /// The VM `RunMicrovm` made, on every failure after it answered — alive
+    /// or not (the egress gate terminated it, the RUNNING wait timed out and
+    /// terminated it, it went TERMINATED, GetMicrovm never found it). `None`
+    /// before RunMicrovm answered: no VM was made (a refusal, or `kept_pending`
+    /// when it may have been). Boxed: it keeps this `Err` under clippy's
+    /// large-error threshold.
+    pub ran: Option<Box<str>>,
 }
 
 impl SelectFailure {
     fn plain(error: BridgeError) -> SelectFailure {
-        SelectFailure { error, kept_pending: None, started: None, client_token: None }
+        SelectFailure { error, kept_pending: None, started: None, client_token: None, ran: None }
     }
 }
 
@@ -983,7 +990,7 @@ impl From<SelectFailure> for BridgeError {
 
 impl fmt::Debug for SelectFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SelectFailure").field("error", &self.error).field("kept_pending", &self.kept_pending.as_deref().map(VmRow::stem)).field("started", &self.started).field("client_token", &self.client_token).finish()
+        f.debug_struct("SelectFailure").field("error", &self.error).field("kept_pending", &self.kept_pending.as_deref().map(VmRow::stem)).field("started", &self.started).field("client_token", &self.client_token).field("ran", &self.ran).finish()
     }
 }
 
@@ -1056,7 +1063,7 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
     let max_duration_s = to_i32(plan.max_duration_s, "--max-duration")?;
     let (mut row, payload) = place(api, paths, plan, &version.version).await?;
     let token = Some(row.client_token.clone());
-    let fail = |error: BridgeError, kept_pending: Option<Box<VmRow>>, started: Option<String>| SelectFailure { error, kept_pending, started, client_token: token.clone() };
+    let fail = |error: BridgeError, kept_pending: Option<Box<VmRow>>, started: Option<String>| SelectFailure { error, kept_pending, started, client_token: token.clone(), ran: None };
     let spec = RunSpec {
         image_arn: plan.image_arn.clone(),
         image_version: version.version.clone(),
@@ -1074,6 +1081,9 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
         Ok(vm) => vm,
         Err((error, kept)) => return Err(fail(error, kept.then(|| Box::new(row.clone())), None)),
     };
+    // From here on RunMicrovm made the VM: every failure names it (`ran`), whether it is still alive or not.
+    let ran: Option<Box<str>> = Some(vm.id.as_str().into());
+    let fail = |error: BridgeError, kept_pending: Option<Box<VmRow>>, started: Option<String>| SelectFailure { ran: ran.clone(), ..fail(error, kept_pending, started) };
     let run_ms = millis(t0.elapsed());
     apply_echo(&mut row, &vm, run_unix, unix_now());
     if let Err(error) = registry::promote_pending(paths, &row) {
@@ -1289,7 +1299,7 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted
         .collect();
     // A VM that failed the gate: never reused; the run fails only when it could not be terminated.
     let reject = |error: BridgeError, id: &str| match still_alive(&error) {
-        Some(alive) => Err(SelectFailure { error, kept_pending: None, started: Some(alive), client_token: None }),
+        Some(alive) => Err(SelectFailure { error, kept_pending: None, started: Some(alive), client_token: None, ran: None }),
         None => {
             eprintln!("ai-env: warning: not reusing {id}: {error}");
             Ok(())

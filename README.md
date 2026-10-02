@@ -139,7 +139,7 @@ ai-env wrapper install [--write] [--permission-mode M]    # point Cursor's claud
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env session list [--json] | show UUID [--json] | forget UUID   # sessions the S2 pump registered (bridge feature)
 ai-env infra  scan DIR [--profile image|repo] [--json]    # secrets + unsafe-settings scan of an image tree; exit 9 on a finding
-ai-env infra  pin [--manifest FILE | --check-bundle] [--lock FILE]  # image/claude.lock from a release manifest; lock vs Cursor bundle
+ai-env infra  pin [--manifest FILE | --check-bundle | --bundle-version] [--lock FILE]  # image/claude.lock from a release manifest; lock vs Cursor bundle; the bundle's version
 ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi outputs + a live image read → bridge.toml [aws] + state/infra.toml
 ai-env infra  base-image [--name al2023-1] [--version 1]  # the pinned managed base image is AVAILABLE
 ai-env infra  versions-diff --before F --after F [--record-probe]   # image versions around a deploy (bridge feature)
@@ -216,7 +216,9 @@ entries, no secret-named `env` keys; exit 9 names file, line and rule, never the
 writes a deterministic zip plus `target/image/image.json` (its sha256 and S3 key). The image pins
 Claude Code by version, size and SHA-256 (`image/claude.lock`; `make claude-pin CLAUDE_VERSION=<v>`
 refreshes it from the release manifest, verifying its signature when the release key is in gpg)
-and bakes a fresh, reviewed config subset — never the Mac's own `~/.claude`.
+and bakes a fresh, reviewed config subset — never the Mac's own `~/.claude`. The image carries the
+version the Mac's Cursor extension bundles (the deploy's preflight P10 refuses any other), and the
+extension updates itself, often daily: `make claude-update` follows it in one command.
 
 `ai-env shim` is the image's ENTRYPOINT. As PID 1 it is a small init (child subreaper, signal
 forwarding, orphan reaping) that runs the same binary as its worker; the worker serves the
@@ -234,7 +236,30 @@ make check-policies preview-scratch   # IAM Access Analyzer + a throwaway-backen
 make deploy                    # (Mike) Pulumi up of infra/ in eu-central-1, then waits for the image build
 make infra-status WRITE=1      # stack outputs (+ the image's live state) → bridge.toml [aws] (comments kept) + state/infra.toml
 make runtime-key               # seal a key of the ai-env-runtime user under the bridge keystore key
+make claude-update             # (Mike, at a terminal) follow the Cursor extension's Claude Code: claude-pin, test-docker,
+                               #   deploy, infra-status WRITE=1, proxy-start, egress check --if-needed (only what is
+                               #   not current; rerun resumes)
 ```
+
+`make claude-update` reads the version of the installed Cursor bundle (`ai-env infra pin
+--bundle-version`: a real directory Cursor has not marked obsolete), the lock and the deployed
+image's (the stack output `claudeVersion`), and shows the release site's `latest` for comparison
+only (and says when the bundle is behind it, ahead of it, or older than the deployed version). When
+all three agree it runs `make infra-status WRITE=1`, checks that new VMs start the deployed image
+version (a rollback with `make image-deactivate`/`image-activate` stops it, and so does an
+`[aws].image_version` that pins another version or is written in a form the script does not read)
+and runs `ai-env egress check --if-needed`, which starts no VM once the version new VMs run has a
+pass bound to its build and to the connector's live facts. Otherwise
+it checks the preconditions first (not under `make -i`/`-k`, a terminal, the Pulumi passphrase in
+the environment, Docker and the AWS identity answering), then pins, runs `make test-docker` (unless
+it already passed for the current zip), `make deploy` (the plan gate, then Pulumi's own
+confirmation), `make infra-status WRITE=1`, the same active-version check, `make proxy-start` (the
+check needs squid serving) and the egress check for the new image version (one Touch ID). The first
+failure stops it naming the step; running it again resumes (once it has started a deploy, a marker
+in `target/image` makes the rerun finish every remaining step, `make proxy-start` included). Near
+the image-version quota it lists old versions to deactivate, never one a VM still runs. It cannot
+run unattended (Pulumi's confirmation and the Touch ID are the point); Cursor updates the extension
+on its own unless its Auto Update is off. The new `image/claude.lock` is left for review and commit.
 
 Pulumi state stays in the operator's local backend; `infra/Pulumi.dev.yaml` and
 `infra/config/dev.env` (budget email and limit) are not committed — copy the `.example` files. No
@@ -349,7 +374,7 @@ make deploy                    # (Mike) plan check + replacement guard, pulumi u
 make infra-status WRITE=1      # adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
 make s5-smoke                  # three `vm smoke --egress vpc --json` passes; the echo must be exactly the connector
 make test-egress               # the live egress tests (direct closed, allowlist, extra + removal, after resume)
-ai-env egress check            # the recorded proof the credential gate needs (re-run after every new image version)
+ai-env egress check            # the recorded proof the credential gate needs (re-run after every new image version; --if-needed: none when the version new VMs run has it)
 make egress-logs [FOLLOW=1]    # squid's access log (hosts only, never a path)
 make proxy-stop                # when idle: stops the proxy (no vpc VM has egress then); proxy-start brings it back
 ```

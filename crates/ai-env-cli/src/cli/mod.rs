@@ -520,6 +520,9 @@ pub enum EgressCmd {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Start nothing when the image version a new VM runs ([aws].image_version resolved live, as RunMicrovm does) already has a passing check with [aws].egress_connector_arn bound to that very build (createdAt) and to the connector's live facts; an unaccepted DNS verdict is named (`make claude-update` runs it after every deploy)
+        #[arg(long, conflicts_with_all = ["vm", "keep"])]
+        if_needed: bool,
     },
 }
 
@@ -560,19 +563,22 @@ pub enum InfraCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Write image/claude.lock from a release manifest.json, print it, or compare it with the installed Cursor bundle
+    /// Write image/claude.lock from a release manifest.json, print it, compare it with the installed Cursor bundle, or print the bundle's version
     Pin {
         /// Release manifest.json to pin from (downloaded and signature-checked by `make claude-pin`)
-        #[arg(long, value_name = "FILE", conflicts_with = "check_bundle")]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["check_bundle", "bundle_version"])]
         manifest: Option<PathBuf>,
         /// The lock file to write or read
         #[arg(long, value_name = "FILE", default_value = "image/claude.lock")]
         lock: PathBuf,
         /// Exit 1 unless the lock's version equals the installed Cursor extension bundle's
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bundle_version")]
         check_bundle: bool,
+        /// Print the installed Cursor extension bundle's Claude Code version (the one the image must carry) and nothing else; exit 1 without a bundle
+        #[arg(long)]
+        bundle_version: bool,
         /// With --manifest: refuse a manifest whose version is not this one (lock not written)
-        #[arg(long, value_name = "V", requires = "manifest")]
+        #[arg(long, value_name = "V", requires = "manifest", conflicts_with_all = ["check_bundle", "bundle_version"])]
         expect_version: Option<String>,
     },
     /// Read the Pulumi stack outputs plus live read-only get-microvm-image and (S5) get-network-connector, and show (or --write) the bridge.toml [aws] table and state/infra.toml
@@ -845,7 +851,7 @@ pub fn run(cli: Cli) -> Result<()> {
             InfraCmd::Scan { dir, profile, tripwires, settings_policy, json } => {
                 crate::bridge::scan::cmd_scan(&dir, profile, tripwires.as_deref(), settings_policy.as_deref(), json)
             }
-            InfraCmd::Pin { manifest, lock, check_bundle, expect_version } => crate::bridge::imagepin::cmd_pin(manifest.as_deref(), &lock, check_bundle, expect_version.as_deref()),
+            InfraCmd::Pin { manifest, lock, check_bundle, bundle_version, expect_version } => crate::bridge::imagepin::cmd_pin(manifest.as_deref(), &lock, check_bundle, bundle_version, expect_version.as_deref()),
             InfraCmd::Status { write, json_in, stack, cwd } => crate::bridge::infra::cmd_status(write, json_in.as_deref(), &stack, &cwd),
             InfraCmd::BaseImage { name, version, json_in } => crate::bridge::infra::cmd_base_image(&name, &version, json_in.as_deref()),
             InfraCmd::VersionsDiff { before, after, record_probe } => crate::bridge::infra::cmd_versions_diff(&before, &after, record_probe),

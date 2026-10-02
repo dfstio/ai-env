@@ -106,7 +106,7 @@ test: ## Unit + integration tests in all four feature sets
 
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
 # AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend).
-LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL
+LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
 # cargo hides for passing tests; one thread keeps each test's lines together.
@@ -260,7 +260,7 @@ lint-negative: ## T0.5: clippy must REJECT examples/tls_lint_negative.rs with on
 # primary-key fingerprint (a subkey signature names its subkey in the first), is CLAUDE_GPG_FPR: a good signature
 # by any other key in the keyring does not count. `infra pin --expect-version` refuses a manifest of another version.
 claude-pin: ## Pin Claude Code CLAUDE_VERSION=<v> into image/claude.lock from its release manifest (gpg-verified, fail-closed, when the release key is in the keyring)
-	@test -n "$(CLAUDE_VERSION)" || { echo "usage: make claude-pin CLAUDE_VERSION=<version>   (ai-env infra pin --check-bundle shows the installed bundle)"; exit 2; }
+	@test -n "$(CLAUDE_VERSION)" || { echo "usage: make claude-pin CLAUDE_VERSION=<version>   (ai-env infra pin --bundle-version prints the installed Cursor bundle; make claude-update follows it)"; exit 2; }
 	@set -euo pipefail; d="$(IMAGE_OUT)/claude-pin/$(CLAUDE_VERSION)"; mkdir -p "$$d"; rm -f "$$d/manifest.json" "$$d/manifest.json.sig"; \
 	  curl --proto '=https' --tlsv1.2 -fsSL -o "$$d/manifest.json" "$(CLAUDE_RELEASES)/$(CLAUDE_VERSION)/manifest.json"; \
 	  if command -v gpg >/dev/null && gpg --list-keys "$(CLAUDE_GPG_FPR)" >/dev/null 2>&1; then \

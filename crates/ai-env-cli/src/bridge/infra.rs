@@ -264,8 +264,44 @@ fn live_image_cmd(arn: &str) -> Command {
 
 /// The live image state of `arn`; `Err` names why it could not be read
 /// (the aws error's first line, a timeout, a missing CLI, a bad response).
-fn read_live_image(arn: &str) -> std::result::Result<LiveImage, String> {
+pub(crate) fn read_live_image(arn: &str) -> std::result::Result<LiveImage, String> {
     run_capture_cmd(live_image_cmd(arn), None, CALL_TIMEOUT).and_then(|json| parse_live_image(&json))
+}
+
+/// One version of `aws lambda-microvms list-microvm-image-versions` (the
+/// fields `ai-env egress check --if-needed` compares; others ignored).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveImageVersion {
+    #[serde(default, deserialize_with = "scalar")]
+    pub image_version: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub state: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub status: Option<String>,
+    /// As the CLI prints it (`2026-10-01T14:29:09.636000+03:00`).
+    #[serde(default, deserialize_with = "scalar")]
+    pub created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LiveImageVersions {
+    items: Vec<LiveImageVersion>,
+}
+
+/// Parse a `list-microvm-image-versions` response (`items`, the CLI's
+/// paginated pages joined).
+pub fn parse_live_image_versions(json: &str) -> std::result::Result<Vec<LiveImageVersion>, String> {
+    serde_json::from_str::<LiveImageVersions>(json).map(|d| d.items).map_err(|e| format!("list-microvm-image-versions printed unexpected output: {e}"))
+}
+
+/// The live versions of `arn` (`aws lambda-microvms
+/// list-microvm-image-versions`, read-only, pinned to [`REGION`], no pager,
+/// without the OAuth token, as [`read_live_image`]).
+pub(crate) fn read_live_image_versions(arn: &str) -> std::result::Result<Vec<LiveImageVersion>, String> {
+    let mut cmd = Command::new("aws");
+    cmd.args(["lambda-microvms", "list-microvm-image-versions", "--image-identifier", arn, "--region", REGION, "--output", "json"]).env_remove("CLAUDE_CODE_OAUTH_TOKEN").env("AWS_PAGER", "");
+    run_capture_cmd(cmd, None, CALL_TIMEOUT).and_then(|json| parse_live_image_versions(&json))
 }
 
 /// The six `[aws]` keys `status` may write (the ones the outputs can
@@ -1537,6 +1573,19 @@ pub fn cmd_versions_diff(before: &Path, after: &Path, record_probe: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_image_versions_parse_the_cli_shape() {
+        let json = r#"{"items": [{"imageArn": "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent", "imageVersion": "3.0", "state": "SUCCESSFUL", "status": "ACTIVE", "createdAt": "2026-10-01T14:29:09.636000+03:00", "memoryMib": 2048}, {"imageVersion": 2, "state": "SUCCESSFUL", "status": "INACTIVE"}]}"#;
+        let v = parse_live_image_versions(json).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].image_version.as_deref(), v[0].state.as_deref(), v[0].status.as_deref(), v[0].created_at.as_deref()), (Some("3.0"), Some("SUCCESSFUL"), Some("ACTIVE"), Some("2026-10-01T14:29:09.636000+03:00")));
+        assert_eq!((v[1].image_version.as_deref(), v[1].created_at.as_deref()), (Some("2"), None), "a number is text, a missing time none");
+        assert_eq!(parse_live_image_versions(r#"{"items": []}"#).unwrap(), vec![]);
+        for bad in ["", "[]", "{}", r#"{"items": "x"}"#] {
+            assert!(parse_live_image_versions(bad).is_err(), "{bad:?}");
+        }
+    }
 
     const ARN: &str = "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent";
     const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";

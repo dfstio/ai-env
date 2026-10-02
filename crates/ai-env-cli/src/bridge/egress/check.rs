@@ -23,16 +23,20 @@
 //! answer carries one) from the very `get-network-connector` answer the
 //! network verification judged, and the image version's `created_at`;
 //! without them nothing is recorded. It is refused when a failing check
-//! revoked the connector after this check began.
+//! revoked the connector after this check began. `--if-needed` starts
+//! nothing when the version a new VM runs (`[aws].image_version` resolved
+//! live, as RunMicrovm does) already has such a pass, bound to that build and
+//! to the connector's live facts (`make claude-update`).
 //!
-//! **Revocation.** Once a check has asked for its own VM, any failure but
-//! Ctrl-C revokes every record of the connector (all images) and is audited
-//! `egress_check {id, image_version, verdict=fail, reason, revoked}`: a
-//! failing case, the network or squid's log, a missing binding, and also a
-//! failure before the transcript is judged — the VM's start or its egress
-//! gate, `/health`, the shell token or dial, the fake's refusal. A failure
-//! before that (the configuration, the operator's account, the backend)
-//! revokes nothing.
+//! **Revocation.** Once a check has asked for its own VM — RunMicrovm made
+//! one, or may have (a pending row) — any failure but Ctrl-C revokes every
+//! record of the connector (all images) and is audited `egress_check {id,
+//! image_version, verdict=fail, reason, revoked}`: a failing case, the
+//! network or squid's log, a missing binding, and also a failure before the
+//! transcript is judged — the VM's egress gate, `/health`, the shell token or
+//! dial, the fake's refusal. A failure before that (the configuration, the
+//! operator's account, a proxy that is not running, the backend, a refusal
+//! before RunMicrovm such as `[vm].max_concurrent`) revokes nothing.
 //!
 //! The script ([`render_script`]) is rendered on the Mac, the proxy exports
 //! of [`proxy_env`] included (the VM's `ai-env` has no `egress` command),
@@ -1079,7 +1083,8 @@ enum Target {
 
 /// The VMs to end after the check: its own (unless `--keep`), and VMs the
 /// egress gate rejected but could not terminate (always); and whether the
-/// check asked for a VM of its own (from then on any failure revokes).
+/// check asked for a VM of its own — RunMicrovm made one or may have (from
+/// then on any failure revokes).
 #[derive(Default)]
 struct Guard {
     since: u64,
@@ -1087,6 +1092,8 @@ struct Guard {
     gate: Vec<String>,
     asked: bool,
     image_version: Option<String>,
+    /// The VM RunMicrovm made for this check, also when it is gone already (the audit row names it).
+    ran: Option<String>,
 }
 
 /// A check that ended before its transcript was judged: the error, and the
@@ -1096,6 +1103,69 @@ struct Early {
     asked: bool,
     id: Option<String>,
     image_version: Option<String>,
+}
+
+/// `--if-needed`: the image version a new VM runs now and its recorded pass,
+/// when the credential gate would take that pass as it stands — `None` (run
+/// the check) unless all of these hold, read live as the operator (the aws
+/// CLI, no Touch ID): the version is the check's own plan's (`[aws].image_arn`
+/// and `[aws].image_version` exactly as RunMicrovm gets them) resolved the way
+/// RunMicrovm resolves it (`active`: `get-microvm-image`'s
+/// latestActiveImageVersion; `N`: `N` or `N.0`; `N.M`) and is runnable
+/// (`list-microvm-image-versions`: SUCCESSFUL, ACTIVE); a pass is recorded
+/// for it with `connector`; the pass is bound to this very build (its
+/// `created_at` the version's `createdAt`, to the second) and to the
+/// connector's live facts (`get-network-connector`). The third value notes a
+/// DNS verdict the gate does not accept (`[egress].accept_platform_dns`),
+/// which another check would not change.
+fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(String, VerifiedRecord, Option<String>)> {
+    let image_arn = plan.image_arn.as_str();
+    let versions = crate::bridge::infra::read_live_image_versions(image_arn).ok()?;
+    let listed = |v: &str| versions.iter().any(|x| x.image_version.as_deref() == Some(v));
+    let want = plan.want_version.as_str();
+    let version = match want {
+        "active" => crate::bridge::infra::read_live_image(image_arn).ok()?.latest_active_image_version.filter(|v| !v.trim().is_empty())?,
+        w if w.contains('.') || listed(w) => w.to_string(),
+        w => format!("{w}.0"),
+    };
+    let live = versions.iter().find(|x| x.image_version.as_deref() == Some(version.as_str()))?;
+    if live.state.as_deref() != Some("SUCCESSFUL") || live.status.as_deref() != Some("ACTIVE") {
+        return None;
+    }
+    let created = crate::wire::time::parse_rfc3339(live.created_at.as_deref()?)?;
+    let rec = EgressVerified::load(&ctx.paths).ok()?.find(image_arn, &version, connector)?.clone();
+    if rec.image_created_at.is_none_or(|t| (t - created).abs() > 1) {
+        return None;
+    }
+    let doc = awscli::aws_json("lambda-core", &["get-network-connector", "--identifier", connector]).ok()?;
+    let facts = ConnectorFacts::from_get(&doc)?;
+    if !rec.connector_facts.complete() || facts != rec.connector_facts {
+        return None;
+    }
+    let note = (!crate::bridge::egress::dns_verdict_ok(&rec.dns, ctx.cfg.egress.accept_platform_dns))
+        .then(|| format!("its DNS verdict {} is not accepted ([egress].accept_platform_dns = false): the credential gate refuses this pass until it is (another check would see the same)", rec.dns));
+    Some((version, rec, note))
+}
+
+/// Before the check asks for a VM: the egress proxy (state/infra.toml's
+/// proxy_instance_id, as the operator) must be running — a check through a
+/// stopped proxy can only fail, and a failure of the check's own VM revokes
+/// every pass of the connector. `Err` when it is in another state (gone —
+/// terminated, shutting down, unknown to EC2 — means the state file is stale,
+/// as `proxy start` says); an unreadable state lets the check go on (its
+/// network verification reads it again).
+fn proxy_running(ctx: &Ctx) -> Result<()> {
+    let Some(id) = read_infra_state(&ctx.paths).ok().flatten().and_then(|s| s.proxy_instance_id).filter(|id| !id.trim().is_empty()) else {
+        return Ok(());
+    };
+    let id = id.trim();
+    match super::cli::proxy_state(id) {
+        Ok(super::cli::ProxyState::Live(state)) if state != "running" => {
+            Err(CliError::Msg(format!("egress check: the egress proxy {id} is {state}: make proxy-start, then run the check again (nothing started, nothing revoked)")))
+        }
+        Ok(super::cli::ProxyState::Gone) => Err(CliError::Msg(format!("egress check: {}; then make proxy-start if it is stopped, and run the check again (nothing started, nothing revoked)", super::cli::proxy_gone(id)))),
+        _ => Ok(()),
+    }
 }
 
 /// `[aws].egress_connector_arn` (`Ctx::load` validated its form), or exit 1.
@@ -1155,15 +1225,35 @@ fn check_plan(ctx: &Ctx) -> Result<run::RunPlan> {
     Ok(plan)
 }
 
-/// `ai-env egress check [--vm ID] [--keep] [--json]` (see the module doc).
-pub fn cmd_check(store: &Keystore, vm: Option<&str>, keep: bool, json: bool) -> Result<()> {
+/// `ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]` (see the module doc).
+pub fn cmd_check(store: &Keystore, vm: Option<&str>, keep: bool, json: bool, if_needed: bool) -> Result<()> {
     let ctx = Ctx::load()?;
     let connector = configured_connector(&ctx.cfg)?;
+    if if_needed {
+        // Resolved from exactly what the check's own RunMicrovm would get (a value it refuses never skips).
+        let plan = check_plan(&ctx)?;
+        if let Some((version, rec, dns_note)) = already_verified(&ctx, &plan, &connector) {
+            if json {
+                let doc = serde_json::json!({
+                    "skipped": true, "image_version": version, "connector": normalize_connector(&connector), "recorded_vm": rec.vm_id, "recorded_at": rec.at, "dns": rec.dns,
+                    "dns_accepted": dns_note.is_none(),
+                });
+                outln!("{}", serde_json::to_string_pretty(&doc).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))?);
+            } else {
+                outln!("egress check: image version {version}, the one a new VM runs, already has a passing check with {} (VM {}, {}), bound to this build and to the connector's live facts: nothing started (without --if-needed it checks again)", normalize_connector(&connector), rec.vm_id, rec.at);
+                if let Some(note) = dns_note {
+                    outln!("egress check: note: {note}");
+                }
+            }
+            return Ok(());
+        }
+    }
     let target = match vm {
         Some(id) => Target::Existing(Box::new(existing_vm(&ctx, id, &connector)?)),
         None => Target::Start(Box::new(check_plan(&ctx)?)),
     };
     awscli::require_operator_account(&connector).map_err(|e| CliError::Msg(format!("egress check: {e}")))?;
+    proxy_running(&ctx)?;
     let rt = runtime()?;
     let outcome = rt.block_on(async {
         let b = backend(store, &ctx).await?;
@@ -1198,7 +1288,7 @@ async fn run_check<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E,
         }
     }
     cleanup(ctx, api, &guard, keep).await;
-    outcome.map_err(|error| Early { error, asked: guard.asked, id: guard.gate.first().or(guard.ours.first()).cloned(), image_version: guard.image_version.clone() })
+    outcome.map_err(|error| Early { error, asked: guard.asked, id: guard.gate.first().or(guard.ours.first()).or(guard.ran.as_ref()).cloned(), image_version: guard.image_version.clone() })
 }
 
 /// A check of its own VM that failed before its transcript was judged (the
@@ -1238,7 +1328,6 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
     let (row, vm, own) = match target {
         Target::Existing(row) => ((**row).clone(), live_vm(ctx, api, row).await?, false),
         Target::Start(plan) => {
-            guard.asked = true;
             let (row, vm) = start_vm(ctx, api, ep, plan, guard).await?;
             guard.image_version = Some(vm.image_version.clone());
             (row, vm, true)
@@ -1366,12 +1455,23 @@ async fn start_vm<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
     let poll = run::Poll::RUNNING.scaled(ctx.knobs.backoff_ms);
     match run::select_vm_detailed(api, &ctx.paths, plan, poll).await {
         Ok(run::Selected::Started { row, vm, .. }) => {
+            guard.asked = true;
             guard.ours.push(vm.id.clone());
             eprintln!("egress check: started {} (egress {})", vm.id, vm.egress.join(", "));
             Ok((row, vm))
         }
         Ok(run::Selected::Reused { vm, .. }) => Err(CliError::Msg(format!("egress check reused {} (internal)", vm.id))),
         Err(f) => {
+            // The check has asked for its VM once RunMicrovm made one — alive or not: the egress gate may have
+            // rejected and terminated it — or may have (a kept pending row). A refusal before that (the
+            // [vm].max_concurrent placement, a bad image version, a definite RunMicrovm refusal) proves nothing about
+            // egress and revokes nothing.
+            if f.ran.is_some() || f.started.is_some() || f.kept_pending.is_some() {
+                guard.asked = true;
+            }
+            if guard.ran.is_none() {
+                guard.ran = f.ran.as_deref().map(str::to_string);
+            }
             let gate_failed = matches!(f.error, BridgeError::EgressMismatch(_));
             if let Some(id) = &f.started {
                 if gate_failed { guard.gate.push(id.clone()) } else { guard.ours.push(id.clone()) }

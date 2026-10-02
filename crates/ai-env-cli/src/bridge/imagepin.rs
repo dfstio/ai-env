@@ -10,8 +10,10 @@
 //! and rewrites the lock atomically. `--check-bundle` is the part B
 //! preflight: the lock must name the version of the highest installed
 //! `anthropic.claude-code-<v>-darwin-arm64` bundle, else the deploy would
-//! ship a claude the Mac does not run. Nothing here downloads anything.
-use crate::bridge::doctor::pick_bundle;
+//! ship a claude the Mac does not run. `--bundle-version` prints that
+//! bundle's version alone (`make claude-update` follows it). Nothing here
+//! downloads anything.
+use crate::bridge::doctor::{installed_extension_names, pick_bundle};
 use crate::bridge::infra::write_atomic_mode;
 use crate::errors::{CliError, Result};
 use crate::outln;
@@ -82,10 +84,25 @@ fn print_pin(pin: &ClaudePin) -> Result<()> {
     Ok(())
 }
 
-/// `ai-env infra pin [--manifest FILE | --check-bundle] [--lock FILE]`:
+/// The version of the highest installed Cursor extension bundle (a real
+/// directory, not listed in `.obsolete`); exit 1 naming the directory when
+/// there is none.
+fn installed_bundle() -> Result<String> {
+    let dir = extensions_dir()?;
+    pick_bundle(&installed_extension_names(&dir))
+        .map(|(bundle, _)| bundle)
+        .ok_or_else(|| CliError::Msg(format!("pin: no anthropic.claude-code-<version>-darwin-arm64 bundle under {} (is the Cursor Claude extension installed?)", dir.display())))
+}
+
+/// `ai-env infra pin [--manifest FILE | --check-bundle | --bundle-version] [--lock FILE]`:
 /// write the lock from a manifest, compare it with the installed Cursor
-/// bundle, or (neither flag) print it. clap keeps the two flags exclusive.
-pub fn cmd_pin(manifest: Option<&Path>, lock: &Path, check_bundle: bool, expect_version: Option<&str>) -> Result<()> {
+/// bundle, print the bundle's version, or (no flag) print the lock. clap
+/// keeps the three exclusive.
+pub fn cmd_pin(manifest: Option<&Path>, lock: &Path, check_bundle: bool, bundle_version: bool, expect_version: Option<&str>) -> Result<()> {
+    if bundle_version {
+        outln!("{}", installed_bundle()?);
+        return Ok(());
+    }
     if let Some(path) = manifest {
         let json = std::fs::read_to_string(path).map_err(|e| CliError::Msg(format!("cannot read {}: {e}", path.display())))?;
         let pin = pin_from_manifest(&json, PLATFORM).map_err(|e| CliError::Msg(format!("{}: {e}", path.display())))?;
@@ -112,16 +129,12 @@ pub fn cmd_pin(manifest: Option<&Path>, lock: &Path, check_bundle: bool, expect_
     if !check_bundle {
         return print_pin(&pin);
     }
-    let dir = extensions_dir()?;
-    let names: Vec<String> = std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-    let Some((bundle, _)) = pick_bundle(&names) else {
-        return Err(CliError::Msg(format!("pin: no anthropic.claude-code-<version>-darwin-arm64 bundle under {} (is the Cursor Claude extension installed?)", dir.display())));
-    };
+    let bundle = installed_bundle()?;
     if bundle == pin.version {
         outln!("pin: lock {} equals the Cursor bundle", pin.version);
         return Ok(());
     }
-    Err(CliError::Msg(format!("pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-pin CLAUDE_VERSION={bundle}", pin.version, lock.display())))
+    Err(CliError::Msg(format!("pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-update (or make claude-pin CLAUDE_VERSION={bundle} && make test-docker)", pin.version, lock.display())))
 }
 
 #[cfg(test)]

@@ -93,9 +93,53 @@ pub fn parse_rfc3339_utc(text: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3600 + m * 60 + s).ok()
 }
 
+/// Unix seconds for `YYYY-MM-DDTHH:MM:SS[.fff]` with `Z` or a `±HH:MM`
+/// offset (the aws CLI prints `createdAt` as `2026-10-01T14:29:09.636000+03:00`);
+/// the fraction is truncated. `None` for any other shape (the date and time
+/// as [`parse_rfc3339_utc`] takes them).
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    if !text.is_ascii() || text.len() < 20 {
+        return None;
+    }
+    let base = i64::try_from(parse_rfc3339_utc(&format!("{}Z", &text[..19]))?).ok()?;
+    let mut tail = &text[19..];
+    if let Some(rest) = tail.strip_prefix('.') {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        tail = &rest[digits..];
+    }
+    let offset = match tail.as_bytes() {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] if [h1, h2, m1, m2].iter().all(|c| c.is_ascii_digit()) => {
+            let (h, m) = (i64::from((h1 - b'0') * 10 + (h2 - b'0')), i64::from((m1 - b'0') * 10 + (m2 - b'0')));
+            if h > 23 || m > 59 {
+                return None;
+            }
+            (h * 3600 + m * 60) * if *sign == b'-' { -1 } else { 1 }
+        }
+        _ => return None,
+    };
+    Some(base - offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_with_an_offset() {
+        let utc = 1_789_804_800;
+        for text in ["2026-09-19T08:00:00Z", "2026-09-19T08:00:00.999999Z", "2026-09-19T11:00:00.000000+03:00", "2026-09-19T02:30:00-05:30", "2026-09-19T08:00:00+00:00"] {
+            assert_eq!(parse_rfc3339(text), Some(utc), "{text}");
+        }
+        assert_eq!(parse_rfc3339("2026-10-01T14:29:09.636000+03:00"), parse_rfc3339("2026-10-01T11:29:09Z"), "the aws CLI's createdAt");
+        for bad in ["", "2026-09-19T08:00:00", "2026-09-19T08:00:00+3:00", "2026-09-19T08:00:00+03", "2026-09-19T08:00:00.+03:00", "2026-09-19T08:00:00+24:00", "2026-09-19 08:00:00Z", "2026-09-19T08:00:00Zjunk", "2026-13-19T08:00:00Z", "2026-09-19T08:00:00\u{e9}Z"] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn rfc3339_kats() {

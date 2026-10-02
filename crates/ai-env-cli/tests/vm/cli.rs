@@ -142,7 +142,7 @@ fn json(o: &Output) -> serde_json::Value {
     serde_json::from_str(&stdout(o)).unwrap_or_else(|e| panic!("not JSON ({e}): {}\nstderr: {}", stdout(o), stderr(o)))
 }
 
-fn foreign_vm(n: u64, owner: Option<&str>, state: VmState, age_s: i64) -> (VmInfo, Option<Health>) {
+pub fn foreign_vm(n: u64, owner: Option<&str>, state: VmState, age_s: i64) -> (VmInfo, Option<Health>) {
     let id = format!("microvm-11111111-0000-4000-8000-{n:012x}");
     let now = ai_env_cli::wire::time::unix_now() as i64;
     let vm = VmInfo {

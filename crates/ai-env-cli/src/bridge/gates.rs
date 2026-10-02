@@ -332,7 +332,7 @@ fn g4() -> GateResult {
         return gate("G4", "--session-mirror on the bundled CLI", cmd, expected, "manual: set AI_ENV_CLAUDE_TESTS=1 and CLAUDE_CODE_OAUTH_TOKEN to automate".into(), GateStatus::Manual);
     };
     let ext_dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".cursor").join("extensions");
-    let dirs: Vec<String> = std::fs::read_dir(&ext_dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    let dirs = crate::bridge::doctor::installed_extension_names(&ext_dir);
     let Some((ver, dir)) = crate::bridge::doctor::pick_bundle(&dirs) else {
         return gate("G4", "--session-mirror on the bundled CLI", cmd, expected, "no Cursor Claude extension bundle found".into(), GateStatus::Fail);
     };

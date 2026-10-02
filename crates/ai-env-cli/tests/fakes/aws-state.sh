@@ -28,7 +28,12 @@
 #   lambda-microvms get-microvm-image        JSON of $S/image/{state,active,
 #       failed,updated}; with --query '[f1,f2,...]' --output text those fields
 #       tab-separated, None for a missing one
-#   lambda-microvms list-microvm-image-versions   {"items": []}
+#   lambda-microvms list-microvm-image-versions   the lines "<version> <status>" of
+#       $S/image/versions as items (state SUCCESSFUL); no file: {"items": []}
+#   lambda-microvms list-microvms   the lines "<id> <image version> <state>" of
+#       $S/vms as items (JSON only: no --query)
+#   lambda-microvms get-microvm-image-version --image-version V   {"imageVersion": V, "codeArtifact":
+#       {"uri": <$S/image/uri>}} (no uri file: no codeArtifact)
 # S5 (the egress ops of infra/scripts/ops.sh and the s3-preflight rows P13-P16).
 # A lambda-core, ec2, ssm or logs call must carry `--endpoint-url
 # https://<lambda|ec2|ssm|logs>.eu-central-1.amazonaws.com` (lambda-core's
@@ -106,6 +111,7 @@ filters=
 include_managed=0
 service=
 quota=
+image_version=
 prev=
 for a in "$@"; do
   case "$a" in
@@ -127,6 +133,7 @@ for a in "$@"; do
     --filters) filters=$a ;;
     --service-code) service=$a ;;
     --quota-code) quota=$a ;;
+    --image-version) image_version=$a ;;
   esac
   prev=$a
 done
@@ -292,7 +299,35 @@ case "${1:-} ${2:-}" in
     esac ;;
   "lambda-microvms list-microvm-image-versions")
     test -f "$S/image/state" || err ResourceNotFoundException ListMicrovmImageVersions "Image not found"
-    echo '{"items": []}' ;;
+    printf '{"items": ['
+    sep=
+    if [ -f "$S/image/versions" ]; then
+      while read -r v st; do
+        [ -n "$v" ] || continue
+        printf '%s{"imageVersion": "%s", "status": "%s", "state": "SUCCESSFUL"}' "$sep" "$v" "$st"
+        sep=', '
+      done < "$S/image/versions"
+    fi
+    printf ']}\n' ;;
+  "lambda-microvms list-microvms")
+    test -z "$query" || unsupported_query "$@"
+    printf '{"items": ['
+    sep=
+    if [ -f "$S/vms" ]; then
+      while read -r id v st; do
+        [ -n "$id" ] || continue
+        printf '%s{"microvmId": "%s", "imageVersion": "%s", "state": "%s"}' "$sep" "$id" "$v" "$st"
+        sep=', '
+      done < "$S/vms"
+    fi
+    printf ']}\n' ;;
+  "lambda-microvms get-microvm-image-version")
+    test -f "$S/image/state" || err ResourceNotFoundException GetMicrovmImageVersion "Image not found"
+    if [ -f "$S/image/uri" ]; then
+      printf '{"imageVersion": "%s", "codeArtifact": {"uri": "%s"}}\n' "$image_version" "$(cat "$S/image/uri")"
+    else
+      printf '{"imageVersion": "%s"}\n' "$image_version"
+    fi ;;
   "lambda-core list-network-connectors")
     printf '{\n    "NetworkConnectors": ['
     sep=

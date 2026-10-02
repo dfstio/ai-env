@@ -17,8 +17,9 @@
 # call failed. Each `x=$(aws ...)` therefore carries its own `|| exit 1`.
 #
 # Env (set by infra/infra.mk): REGION, IMAGE_NAME, IMAGE_OUT, STACK, IMAGE_WAIT_TIMEOUT, IMAGE_WAIT_POLL,
-# VERSIONS_WARN, VERSIONS_QUOTA, CONNECTOR_WAIT_TIMEOUT, CONNECTOR_WAIT_POLL; AI_ENV_CLI (connector-probe and
-# post-deploy only: the make target's $(AI_ENV), split on blanks and not passed on to any child).
+# VERSIONS_WARN, VERSIONS_QUOTA, CONNECTOR_WAIT_TIMEOUT, CONNECTOR_WAIT_POLL; AI_ENV_CLI (connector-probe,
+# post-deploy and claude-update only: the make target's $(AI_ENV), split on blanks and not passed on to any child);
+# LOCK and CLAUDE_RELEASES (claude-update only).
 set -euo pipefail
 # The aws CLI pages its output through less on a terminal (measured 1 Oct 2026: `make image-status` stopped in the
 # pager): never here.
@@ -311,6 +312,7 @@ cmd_delete_image() {
     echo "the Pulumi state of stack $stack still holds the image: remove it before the next deploy:"
     echo "  cd infra && pulumi stack --show-urns --stack $stack | grep MicrovmImage"
     echo "  cd infra && pulumi state delete '<that urn>' --stack $stack"
+    echo "state/egress-verified.toml (${AI_ENV_BRIDGE_DIR:-\$HOME/.config/ai-env/bridge}/state/egress-verified.toml): the image created again numbers its versions anew, and a pass of an old build is no pass (the credential gate and ai-env egress check --if-needed both compare the build, so it is never honoured, and the next check replaces it): remove it to tidy up"
 }
 
 cmd_checklist() {
@@ -874,6 +876,292 @@ cmd_post_deploy() {
     exit "$rc"
 }
 
+# update_step <n/total> <label> <command...>: one step of claude-update, announced by its label; the first failure
+# stops it, naming the step.
+update_step() {
+    local at=$1 label=$2 st
+    shift 2
+    echo "claude-update [$at] $label"
+    "$@" && return 0
+    st=$?
+    echo "claude-update: STOPPED at step $at ($label: exit $st): fix the cause above, then run make claude-update again (it resumes: every step is idempotent)"
+    exit "$st"
+}
+
+# is_version <text>: a release version as the release site and the extension name it (2.1.287; a pre-release suffix).
+is_version() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)+([-+][0-9A-Za-z.]+)?$ ]]; }
+
+# vercmp <a> <b>: older, same or newer — <a> against <b> on their numeric dot parts (a pre-release suffix ignored).
+vercmp() {
+    awk -v a="${1%%[-+]*}" -v b="${2%%[-+]*}" 'BEGIN { n = split(a, x, "."); m = split(b, y, "."); k = n > m ? n : m;
+        for (i = 1; i <= k; i++) { p = x[i] + 0; q = y[i] + 0; if (p < q) { print "older"; exit } if (p > q) { print "newer"; exit } } print "same" }'
+}
+
+# live_active: the image version new VMs start now (get-microvm-image, live); empty when it cannot be read.
+live_active() {
+    local arn doc
+    arn=$(image_arn 2>/dev/null) || return 0
+    doc=$(aws lambda-microvms get-microvm-image --image-identifier "$arn" --region "$region" --output json 2>/dev/null) || return 0
+    printf '%s' "$doc" | jsq 'j.latestActiveImageVersion' 2>/dev/null || true
+}
+
+# pinned_image_version: bridge.toml's [aws].image_version when it pins one (`N` or `N.M`; empty for `active` or none).
+# Fail-closed: an `[aws]` header spaced or quoted, a quoted key and both quote kinds are read; any other line naming
+# image_version outside a comment (a form this reader does not follow: a multi-line string, a dotted or inline key)
+# prints `?` and that line, which stops claude-update with what it saw.
+pinned_image_version() {
+    local f=${AI_ENV_BRIDGE_CONFIG:-${AI_ENV_BRIDGE_DIR:-$HOME/.config/ai-env/bridge}/bridge.toml}
+    awk '
+        { sub(/\r$/, ""); line = $0; code = $0; sub(/#.*$/, "", code) }
+        /^[[:space:]]*\[/ { s = ($0 ~ /^[[:space:]]*\[[[:space:]]*("aws"|\047aws\047|aws)[[:space:]]*\][[:space:]]*(#.*)?$/); next }
+        code !~ /image_version/ { next }
+        s && /^[[:space:]]*("image_version"|\047image_version\047|image_version)[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*(#.*)?$/, "")
+            if ($0 ~ /^("active"|\047active\047)$/) next
+            gsub(/["\047]/, ""); print ($0 == "" ? "?" line : $0); exit
+        }
+        { print "?" line; exit }' "$f" 2>/dev/null || true
+}
+
+# active_is_deployed: the image version new VMs start (live) is the one the stack deployed (its outputs, which only
+# `pulumi up` moves) and was built from the zip the stack deployed (the version's codeArtifact.uri is
+# s3://<bucket>/<zipKey>, the outputs naming both, whose claudeVersion is the deployed one): after a rollback with make
+# image-deactivate or image-activate, or a failed build the stack would have recorded as done, new VMs start a build
+# that does not carry the deployed Claude Code; nor do they while bridge.toml's [aws].image_version pins a version.
+# Sets `started` to the live version.
+started=""
+active_is_deployed() {
+    local outputs want pin bucket key arn doc uri
+    outputs=$(stack_outputs) || return 1
+    want=$(printf '%s' "$outputs" | jsq 'j.latestActiveImageVersion') || return 1
+    pin=$(pinned_image_version)
+    case "$pin" in
+    "") ;;
+    \?*)
+        echo "claude-update: bridge.toml names image_version in a form this script does not read (${pin#\?}): it may pin new VMs to one version; write image_version = \"active\" under [aws] (or remove it), then make claude-update again"
+        return 1
+        ;;
+    "$want" | "$want.0" | "${want%.0}") echo "claude-update: note: bridge.toml's [aws].image_version = \"$pin\" pins new VMs to the deployed $want today, but no later update will reach them: set it to \"active\" (or remove it)" ;;
+    *)
+        echo "claude-update: bridge.toml's [aws].image_version = \"$pin\" pins new VMs to that version: the deployed ${want:-(none)} does not reach them; set it to \"active\" (or remove it) to use the update"
+        return 1
+        ;;
+    esac
+    started=$(live_active)
+    test -n "$started" || { echo "claude-update: cannot read the image's live active version (aws lambda-microvms get-microvm-image)"; return 1; }
+    if [ "$started" != "$want" ]; then
+        echo "claude-update: new VMs start image version $started, not the deployed ${want:-(none)} (a rollback with make image-deactivate or image-activate?): it does not carry the Claude Code the stack deployed; make image-activate VERSION=$want returns to it"
+        return 1
+    fi
+    bucket=$(printf '%s' "$outputs" | jsq 'j.bucket') || return 1
+    key=$(printf '%s' "$outputs" | jsq 'j.zipKey') || return 1
+    arn=$(image_arn) || return 1
+    doc=$(aws lambda-microvms get-microvm-image-version --image-identifier "$arn" --image-version "$started" --region "$region" --output json) \
+        || { echo "claude-update: cannot read image version $started (aws lambda-microvms get-microvm-image-version, above)"; return 1; }
+    uri=$(printf '%s' "$doc" | jsq '(j.codeArtifact || {}).uri') || return 1
+    if [ -z "$bucket" ] || [ -z "$key" ] || [ "$uri" != "s3://$bucket/$key" ]; then
+        echo "claude-update: image version $started was built from ${uri:-an unnamed artifact}, not the zip the stack deployed (s3://${bucket:-?}/${key:-?}): it does not carry the deployed Claude Code; make deploy again"
+        return 1
+    fi
+    echo "claude-update: new VMs start image version $started, the deployed one, built from $key"
+    return 0
+}
+
+# versions_note: from VERSIONS_WARN image versions on, how many there are and the commands that free some (each
+# update adds one; a deploy fails at VERSIONS_QUOTA; make image-prune deletes only inactive ones and never one a VM
+# runs). Best effort: nothing when the versions cannot be listed.
+versions_note() {
+    local arn doc n vms running
+    arn=$(image_arn 2>/dev/null) || return 0
+    doc=$(aws lambda-microvms list-microvm-image-versions --image-identifier "$arn" --region "$region" --output json 2>/dev/null) || return 0
+    n=$(printf '%s' "$doc" | jsq '(j.items || []).length' 2>/dev/null) || return 0
+    case "$n" in '' | *[!0-9]*) return 0 ;; esac
+    test "$n" -ge "${VERSIONS_WARN:-40}" || return 0
+    echo "claude-update: $n of ${VERSIONS_QUOTA:-50} image versions (each update adds one; at ${VERSIONS_QUOTA:-50} a deploy fails): deactivate the old ones no VM runs, then prune them:"
+    # Never a version a VM still runs (as image-prune): the VMs listed live; when they cannot be, no deactivate command.
+    if vms=$(aws lambda-microvms list-microvms --image-identifier "$arn" --region "$region" --output json 2>/dev/null) \
+        && running=$(printf '%s' "$vms" | jsq '(j.items || []).filter((v) => v.state !== "TERMINATED").map((v) => String(v.imageVersion)).join(" ")' 2>/dev/null); then
+        printf '%s' "$doc" | jsq '(j.items || []).filter((v) => v.status === "ACTIVE").map((v) => String(v.imageVersion))
+            .sort((x, y) => { const a = x.split(".").map(Number), b = y.split(".").map(Number); for (let i = 0; i < Math.max(a.length, b.length); i++) { const d = (b[i] || 0) - (a[i] || 0); if (d) return d; } return 0; })
+            .slice(3).map((v) => a[0].split(" ").includes(v) ? `  (not ${v}: a VM runs it)` : `  make image-deactivate VERSION=${v}`)' "$running" 2>/dev/null || true
+    else
+        echo "  (the VMs could not be listed: make image-versions, then deactivate only an old version no VM runs)"
+    fi
+    echo "  make image-prune KEEP=3       (a dry run first; it never deletes a version a VM runs)"
+    echo "  make image-prune KEEP=3 YES=1"
+}
+
+# older_vms_note <version>: the state/vms rows that may still run another image version (and its claude).
+older_vms_note() {
+    local f st v rows="" dir="${AI_ENV_BRIDGE_DIR:-$HOME/.config/ai-env/bridge}/state/vms"
+    for f in "$dir"/*.toml; do
+        test -f "$f" || continue
+        st=$(sed -n 's/^status = "\([^"]*\)"$/\1/p' "$f" | head -1 || true)
+        v=$(sed -n 's/^image_version = "\([^"]*\)"$/\1/p' "$f" | head -1 || true)
+        if [ "$st" = terminated ] || [ -z "$v" ] || [ "$v" = "$1" ]; then continue; fi
+        rows="$rows $(basename "$f" .toml) ($v)"
+    done
+    test -z "$rows" || echo "claude-update: VMs still on another image version, and its claude:$rows; they keep it until ai-env vm terminate (ai-env vm list)"
+}
+
+# make_ignores_errors: the make that runs this recipe was given -i or -k (its MAKEFLAGS, as GNU make 3.81 and later
+# write it: a first word of option letters, or `-x` words after long options, then `--` and the variables; a variable
+# alone is the first word). Its children would inherit it and go on past a failed preflight or test. In a subshell:
+# no glob of a variable's value.
+make_ignores_errors() (
+    set -f
+    for w in ${MAKEFLAGS:-}; do
+        case "$w" in
+        --) exit 1 ;;
+        --*) ;;
+        *=*) exit 1 ;;
+        -*) case "${w#-}" in *[ik]*) exit 0 ;; esac ;;
+        *) case "$w" in *[ik]*) exit 0 ;; esac ;;
+        esac
+    done
+    exit 1
+)
+
+# claude-update (make claude-update): bring the image's Claude Code to the version the Cursor extension bundles (Cursor
+# updates the extension on its own, often daily; preflight P10 requires the image to carry exactly the version the Mac
+# runs), then rebuild, test, deploy and verify the egress again, each step its own make run (or the operator CLI):
+#   1. the versions: B the installed bundle (`ai-env infra pin --bundle-version`), L the lock, D the deployed image's
+#      (the stack output claudeVersion); the release site's `latest` for information only (newer, older: said so; a
+#      bundle older than D is said to be a downgrade);
+#   2. B = L = D: nothing to pin, build or deploy: `make infra-status WRITE=1`, the live active version must be the
+#      deployed one (a rollback stops it, and so does bridge.toml's [aws].image_version pinning another version or
+#      written in a form pinned_image_version does not read), `ai-env egress check --if-needed` (it starts nothing when
+#      that version has its pass; with a stopped proxy and no pass it stops asking for make proxy-start, revoking
+#      nothing): a run after a deploy whose check failed or was cancelled finishes it. When the marker
+#      $IMAGE_OUT/claude-update.pending names B (a deploy this command started, "B <proxy state before>", removed once
+#      a run is done), `make proxy-start` too, and the end notes of a deploy, the proxy's with the state that run found;
+#   3. else, after the preconditions (not under make -i or -k; a terminal for Pulumi's confirmation and the Touch ID;
+#      the Pulumi passphrase in the environment, as make deploy's preview runs --non-interactive; Docker answering;
+#      the AWS identity answering), so that nothing changes when they fail: `make claude-pin CLAUDE_VERSION=B` (when
+#      L != B), `make test-docker` (skipped when it already passed for the current zip of B: make deploy rebuilds the
+#      zip, and its P12 refuses one that differs), the marker, `make deploy EXPECT_BUILD_FAILURE=` (Pulumi asks before
+#      it changes anything; the T3.4 switch never reaches it), `make infra-status WRITE=1`, the live active version
+#      check, `make proxy-start` (the check needs squid serving; it also waits for a stopped proxy's boot), `ai-env
+#      egress check --if-needed`.
+# The first failure stops it naming the step; make claude-update again resumes (every step is idempotent). The lock
+# changes in the tree: Mike reviews and commits it.
+# Env (infra.mk): AI_ENV_CLI, LOCK, CLAUDE_RELEASES, CLAUDE_GPG_FPR; AI_ENV_BRIDGE_LAB_ASSUME_TTY=1 (the tests only:
+# LAB_UNSET clears it on every make run) skips the terminal check.
+cmd_claude_update() {
+    local lock=${LOCK:?} releases=${CLAUDE_RELEASES:-} bundle locked deployed active latest="" outputs steps s n=0 total st proxy proxy_before="" pinned=0 deploying=0 marker
+    local pending="$out/claude-update.pending"
+    need_ai_env
+    if make_ignores_errors; then echo "claude-update: not under make -i or -k (a failing preflight or test must stop the deploy): run make claude-update without them"; exit 2; fi
+    bundle=$("${ai_env[@]}" infra pin --bundle-version) || { st=$?; echo "claude-update: cannot read the Cursor bundle's version (ai-env infra pin --bundle-version: exit $st, above; exit 1 when no bundle is installed): nothing changed"; exit 1; }
+    is_version "$bundle" || { echo "claude-update: ai-env infra pin --bundle-version printed \"$bundle\", not a version: nothing changed"; exit 1; }
+    locked=$(sed -n 's/^CLAUDE_VERSION=//p' "$lock" 2>/dev/null | head -1 || true)
+    outputs=$(stack_outputs) || { echo "claude-update: cannot read the stack outputs of $stack (above): nothing changed"; exit 1; }
+    deployed=$(printf '%s' "$outputs" | jsq 'j.claudeVersion') || exit 1
+    active=$(printf '%s' "$outputs" | jsq 'j.latestActiveImageVersion') || exit 1
+    proxy=$(printf '%s' "$outputs" | jsq 'j.proxyInstanceId') || exit 1
+    if [ -n "$releases" ]; then
+        latest=$(curl --proto '=https' --tlsv1.2 -fsS -m 10 "$releases/latest" 2>/dev/null | head -c 64 | tr -d '[:space:]' || true)
+        is_version "$latest" || latest=""
+    fi
+    echo "claude-update: Cursor bundle $bundle; $lock ${locked:-(none)}; deployed ${deployed:-(none)} (image version ${active:-none}); the release site's latest ${latest:-unknown}"
+    if [ -n "$latest" ]; then
+        case $(vercmp "$latest" "$bundle") in
+        newer) echo "claude-update: the release site's latest $latest is newer than the Cursor bundle $bundle: the image follows the bundle, the version the Mac runs (preflight P10); once Cursor updates the extension, run make claude-update again" ;;
+        older) echo "claude-update: the Cursor bundle $bundle is ahead of the release site's latest $latest (a release not promoted yet, or pulled): the image follows the bundle" ;;
+        esac
+    fi
+    if is_version "$deployed" && [ "$(vercmp "$bundle" "$deployed")" = older ]; then
+        echo "claude-update: a DOWNGRADE: the Cursor bundle $bundle is older than the deployed $deployed (the extension went back): the image follows the bundle"
+    fi
+    if [ "$bundle" = "$locked" ] && [ "$bundle" = "$deployed" ]; then
+        marker=$(cat "$pending" 2>/dev/null || true)
+        case "$marker" in
+        "$bundle "?*)
+            # A deploy of this bundle that this command started did not finish its steps: resume them all.
+            proxy_before=${marker#* }
+            [ "$proxy_before" != unknown ] || proxy_before=""
+            echo "claude-update: $bundle is deployed, and the run that deployed it stopped before its end: its remaining steps (the status, the active version, the proxy, the egress check)"
+            steps="status active proxy check"
+            deploying=1
+            ;;
+        *)
+            rm -f "$pending"
+            echo "claude-update: $bundle is pinned and deployed: nothing to build or deploy; the status, then the egress check if the active image version has no pass"
+            steps="status active check"
+            ;;
+        esac
+    else
+        if [ "${AI_ENV_BRIDGE_LAB_ASSUME_TTY:-}" != 1 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+            echo "claude-update: needs a terminal (make deploy asks Pulumi's confirmation, the egress check one Touch ID: not from a pipe, cron or launchd): nothing changed"
+            exit 1
+        fi
+        test -n "${PULUMI_CONFIG_PASSPHRASE:-}${PULUMI_CONFIG_PASSPHRASE_FILE:-}" \
+            || { echo "claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the $stack stack's passphrase: make deploy's preview runs --non-interactive): nothing changed"; exit 1; }
+        docker info >/dev/null 2>&1 || { echo "claude-update: Docker does not answer (docker info), and make test-docker needs it: start Docker, then make claude-update: nothing changed"; exit 1; }
+        ( account_id ) >/dev/null || { echo "claude-update: the AWS identity does not answer (aws sts get-caller-identity, above): renew the session, then make claude-update: nothing changed"; exit 1; }
+        steps="deploy status active proxy check"
+        deploying=1
+        if [ "$bundle" != "$locked" ]; then
+            steps="pin test $steps"
+        elif [ -f "$out/test-docker.ok" ] && [ -f "$out/image.zip" ] && [ "$(cat "$out/test-docker.ok")" = "$(shasum -a 256 "$out/image.zip" | cut -d' ' -f1)" ] \
+            && [ "$(jsq 'j.claudeVersion' <"$out/image.json" 2>/dev/null)" = "$bundle" ]; then
+            echo "claude-update: make test-docker already passed for $out/image.zip (claude $bundle): not again (make deploy rebuilds the zip; its preflight P12 refuses one that differs)"
+        else
+            steps="test $steps"
+        fi
+        if [ -n "$proxy" ]; then
+            proxy_before=$(aws ec2 describe-instances --instance-ids "$proxy" --region "$region" --endpoint-url "$ec2_url" --output json 2>/dev/null \
+                | jsq '(j.Reservations || []).flatMap((r) => r.Instances || []).map((i) => (i.State || {}).Name)' 2>/dev/null || true)
+        fi
+    fi
+    total=$(wc -w <<<"$steps" | tr -d ' ')
+    for s in $steps; do
+        n=$((n + 1))
+        case "$s" in
+        pin) update_step "$n/$total" "make claude-pin CLAUDE_VERSION=$bundle" make --no-print-directory claude-pin CLAUDE_VERSION="$bundle"; pinned=1 ;;
+        test) update_step "$n/$total" "make test-docker" make --no-print-directory test-docker ;;
+        deploy)
+            # A deploy this command starts: a rerun after any failure from here on still owes the proxy step. An
+            # unfinished run's marker keeps the proxy state that run found first (it may have started the proxy since).
+            marker=$(cat "$pending" 2>/dev/null || true)
+            case "$marker" in *" "?*) [ "${marker#* }" = unknown ] || proxy_before=${marker#* } ;; esac
+            mkdir -p "$out" && printf '%s %s\n' "$bundle" "${proxy_before:-unknown}" >"$pending"
+            # EXPECT_BUILD_FAILURE= : the T3.4 switch typed on claude-update's command line must not reach the
+            # deploy (it would skip P12, which the test-docker skip relies on).
+            update_step "$n/$total" "make deploy" make --no-print-directory deploy EXPECT_BUILD_FAILURE=
+            ;;
+        status) update_step "$n/$total" "make infra-status WRITE=1" make --no-print-directory infra-status WRITE=1 ;;
+        active) update_step "$n/$total" "new VMs start the deployed image version" active_is_deployed ;;
+        proxy) update_step "$n/$total" "make proxy-start (squid serving the deployed parameters)" make --no-print-directory proxy-start ;;
+        check) update_step "$n/$total" "ai-env egress check --if-needed" "${ai_env[@]}" egress check --if-needed ;;
+        esac
+    done
+    if outputs=$(stack_outputs 2>/dev/null); then
+        deployed=$(printf '%s' "$outputs" | jsq 'j.claudeVersion') || deployed=""
+    fi
+    if [ "$deployed" != "$bundle" ]; then
+        echo "claude-update: the stack now reports Claude Code ${deployed:-(none)}, not the Cursor bundle's $bundle (did the extension update during the run?): run make claude-update again"
+        exit 1
+    fi
+    echo "claude-update: done: new VMs start image version ${started:-unknown} with Claude Code $deployed, the Cursor bundle's, and its egress check passed"
+    rm -f "$pending"
+    if [ "$pinned" = 1 ] && ! { command -v gpg >/dev/null && gpg --list-keys "${CLAUDE_GPG_FPR:-none}" >/dev/null 2>&1; }; then
+        echo "claude-update: the new pin rests on the release manifest over HTTPS only (its signature was not checked: the release key ${CLAUDE_GPG_FPR:-} is not in gpg); import it once, then make claude-pin verifies it, fail-closed"
+    fi
+    case "$proxy_before" in
+    "" | running) ;;
+    *) echo "claude-update: the proxy was $proxy_before before this run and runs now: make proxy-stop when idle" ;;
+    esac
+    test -z "$started" || older_vms_note "$started"
+    if [ "$deploying" = 1 ]; then
+        versions_note
+        echo "claude-update: make test-egress, the broader live test the deploy names, is not part of the daily update: run it when the egress side changes"
+    fi
+    if git ls-files --error-unmatch -- "$lock" >/dev/null 2>&1 && ! git diff --quiet -- "$lock" 2>/dev/null; then
+        echo "claude-update: $lock changed: review and commit it"
+    fi
+}
+
 cmd=${1:-}
 shift || true
 case "$cmd" in
@@ -895,5 +1183,6 @@ plan-gate) cmd_plan_gate ;;
 replace-guard) cmd_replace_guard ;;
 plan-errors) cmd_plan_errors ;;
 post-deploy) cmd_post_deploy "$@" ;;
-*) echo "usage: ops.sh snapshot <prefix> | wait | status | versions | builds [VERSION] | set-status ACTIVE|INACTIVE VERSION | prune KEEP [1] | vm-guard | delete-image | checklist | connector-wait | connector-status | connector-probe | connector-delete | plan-gate | replace-guard | plan-errors | post-deploy [--after-failure] (the plan on stdin for plan-gate, replace-guard, plan-errors)" >&2; exit 2 ;;
+claude-update) cmd_claude_update ;;
+*) echo "usage: ops.sh snapshot <prefix> | wait | status | versions | builds [VERSION] | set-status ACTIVE|INACTIVE VERSION | prune KEEP [1] | vm-guard | delete-image | checklist | connector-wait | connector-status | connector-probe | connector-delete | plan-gate | replace-guard | plan-errors | post-deploy [--after-failure] | claude-update (the plan on stdin for plan-gate, replace-guard, plan-errors)" >&2; exit 2 ;;
 esac

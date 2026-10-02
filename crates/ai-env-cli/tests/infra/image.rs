@@ -1068,7 +1068,7 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
         stdout(&out)
     };
     let ai_env = "cargo +1.98.1 run -q -p ai-env-cli --bin ai-env --";
-    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL";
+    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY";
     let probe_cli = format!("{lab_unset} AI_ENV_CLI='{ai_env}'");
     let cases: Vec<(&str, Vec<String>)> = vec![
         ("connector-status", vec!["/bin/bash infra/scripts/ops.sh connector-status".into()]),
@@ -1090,6 +1090,14 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
             ],
         ),
         ("test-proxy", vec!["AI_ENV_PROXY_TESTS=1 AI_ENV_PROXY_SYSTEMD=1 cargo +1.98.1 test -p ai-env-cli --features bridge --test proxy_docker -- --include-ignored --test-threads=1".into()]),
+        // No $(MAKE) on its line: GNU make would run it even under -n (ops.sh runs every step's make itself).
+        (
+            "claude-update",
+            vec![
+                format!("{probe_cli} LOCK='image/claude.lock' CLAUDE_RELEASES='https://downloads.claude.ai/claude-code-releases' CLAUDE_GPG_FPR='31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'"),
+                "/bin/bash infra/scripts/ops.sh claude-update".into(),
+            ],
+        ),
     ];
     for (target, wants) in &cases {
         let text = dry(&[*target], &[]);
@@ -1946,7 +1954,7 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
 
 #[test]
 fn the_live_s5_targets_drop_every_lab_knob() {
-    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1")];
+    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"), ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")];
     let t = tempfile::tempdir().unwrap();
     let w = planted_repo(t.path(), true);
     let bin = s5_bin(t.path());
@@ -1971,7 +1979,7 @@ fn the_live_s5_targets_drop_every_lab_knob() {
     let out = run(&["check-base-image"]);
     assert!(out.status.success(), "{}", all(&out));
     let last = calls(t.path()).pop().unwrap();
-    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL]"), "{last}");
+    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_ASSUME_TTY AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL]"), "{last}");
 }
 
 #[test]
@@ -2242,4 +2250,206 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
     assert!(!out.status.success() && text.contains("deploy: pulumi preview --json failed (exit 255): nothing deployed") && text.contains("the program threw: egress guard refused something"), "{text}");
     let c = calls(d.t.path());
     assert!(!c.iter().any(|l| l.starts_with("check-plan") || l.starts_with("pulumi up")), "{c:#?}");
+}
+
+/// `make claude-update` (ops.sh claude-update): it follows the installed Cursor bundle, does only what is not current
+/// (pin, test-docker unless it passed for the zip, deploy, infra-status, the live active version, proxy-start, the
+/// egress check --if-needed), stops at the first failure naming the step, refuses before changing anything without a
+/// terminal, the passphrase, Docker, the AWS identity, a bundle, or under make -i or -k, stops on a rollback or a pin
+/// it cannot follow, resumes all of a deploy's steps after a failure past it (the marker), and says what it found on
+/// the way (the release site, a downgrade, a proxy it started, VMs on another version, the version count and which old
+/// versions no VM runs).
+#[test]
+fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
+    const TTY: (&str, &str) = ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1");
+    const PASS: (&str, &str) = ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null");
+    const PIN288: &str = "make --no-print-directory claude-pin CLAUDE_VERSION=2.1.288";
+    const PIN286: &str = "make --no-print-directory claude-pin CLAUDE_VERSION=2.1.286";
+    let (test, deploy, status, proxy, check) = (
+        "make --no-print-directory test-docker",
+        "make --no-print-directory deploy EXPECT_BUILD_FAILURE=",
+        "make --no-print-directory infra-status WRITE=1",
+        "make --no-print-directory proxy-start",
+        "egress check --if-needed",
+    );
+    /// What a case changes in the default world (the image active at 3.0 as the outputs say, the proxy running).
+    #[derive(Clone, Copy, PartialEq)]
+    enum World {
+        Plain,
+        Rollback,
+        ProxyStopped,
+        Stamped,
+        StampedStale,
+        StampedOtherClaude,
+        OlderVm,
+        Pinned,
+        PinnedDeployed,
+        PinnedUnreadable,
+        OtherZip,
+        VersionsRun,
+        Pending,
+        PendingOther,
+        PendingDeploy,
+    }
+    struct Case<'a> {
+        what: &'a str,
+        bundle: &'a str,
+        locked: &'a str,
+        deployed: &'a str,
+        envs: Vec<(&'a str, &'a str)>,
+        world: World,
+        code: i32,
+        steps: Vec<&'a str>,
+        wants: Vec<&'a str>,
+    }
+    let full = vec![TTY, PASS];
+    let c = |what, bundle, locked, deployed, envs: Vec<(&'static str, &'static str)>, world, code, steps: Vec<&'static str>, wants: Vec<&'static str>| Case { what, bundle, locked, deployed, envs, world, code, steps, wants };
+    let cases: Vec<Case> = vec![
+        c("up to date", "2.1.287", "2.1.287", "2.1.287", vec![], World::Plain, 0, vec![status, check], vec!["claude-update: 2.1.287 is pinned and deployed: nothing to build or deploy", "claude-update [2/3] new VMs start the deployed image version", "claude-update: new VMs start image version 3.0, the deployed one, built from ai-env/image-0123456789abcdef.zip", "done: new VMs start image version 3.0 with Claude Code 2.1.287"]),
+        c("a new bundle", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "claude-update [6/7] make proxy-start (squid serving the deployed parameters)", "the new pin rests on the release manifest over HTTPS only", "make test-egress, the broader live test the deploy names, is not part of the daily update"]),
+        c("pinned, not deployed", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Plain, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker"]),
+        c("the zip already tested", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Stamped, 0, vec![deploy, status, proxy, check], vec!["make test-docker already passed for", "claude-update [1/5] make deploy"]),
+        c("a failed deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_MAKE_FAIL", "deploy")], World::Plain, 2, vec![PIN288, test, deploy], vec!["claude-update: STOPPED at step 3/7 (make deploy: exit 2)"]),
+        c("a failed check", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![status, check], vec!["STOPPED at step 3/3 (ai-env egress check --if-needed: exit 3)"]),
+        c("a rollback", "2.1.287", "2.1.287", "2.1.287", vec![], World::Rollback, 1, vec![status], vec!["new VMs start image version 3.0, not the deployed 4.0 (a rollback with make image-deactivate or image-activate?)", "make image-activate VERSION=4.0", "STOPPED at step 2/3"]),
+        c("no terminal", "2.1.288", "2.1.287", "2.1.287", vec![PASS], World::Plain, 1, vec![], vec!["claude-update: needs a terminal"]),
+        c("no passphrase", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Plain, 1, vec![], vec!["claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first"]),
+        c("Docker down", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DOCKER_RC", "1")], World::Plain, 1, vec![], vec!["claude-update: Docker does not answer (docker info)"]),
+        c("make -k", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -k")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
+        c("a variable is no flag", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
+        c("no bundle", "", "2.1.287", "2.1.287", full.clone(), World::Plain, 1, vec![], vec!["claude-update: cannot read the Cursor bundle's version (ai-env infra pin --bundle-version: exit 1, above; exit 1 when no bundle is installed): nothing changed"]),
+        c("not a version", "2.1.288;id", "2.1.287", "2.1.287", full.clone(), World::Plain, 1, vec![], vec!["printed \"2.1.288;id\", not a version: nothing changed"]),
+        c("no stack outputs", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_PULUMI_OUTPUTS", "/nonexistent/outputs.json")], World::Plain, 1, vec![], vec!["claude-update: cannot read the stack outputs of dev"]),
+        c("the release site ahead", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_LATEST", "2.1.289")], World::Plain, 0, vec![status, check], vec!["the release site's latest 2.1.289 is newer than the Cursor bundle 2.1.287", "once Cursor updates the extension, run make claude-update again"]),
+        c("the bundle ahead", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_LATEST", "2.1.286")], World::Plain, 0, vec![status, check], vec!["the Cursor bundle 2.1.287 is ahead of the release site's latest 2.1.286"]),
+        c("a downgrade", "2.1.286", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN286, test, deploy, status, proxy, check], vec!["a DOWNGRADE: the Cursor bundle 2.1.286 is older than the deployed 2.1.287"]),
+        c("no lock", "2.1.288", "", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["image/claude.lock (none)"]),
+        c("a stopped proxy", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::ProxyStopped, 0, vec![test, deploy, status, proxy, check], vec!["claude-update: the proxy was stopped before this run and runs now: make proxy-stop when idle"]),
+        c("a VM on another version", "2.1.287", "2.1.287", "2.1.287", vec![], World::OlderVm, 0, vec![status, check], vec!["VMs still on another image version, and its claude: microvm-older (2.0)"]),
+        c("the deploy left another version", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DEPLOYS", "2.1.287")], World::Plain, 1, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: the stack now reports Claude Code 2.1.287, not the Cursor bundle's 2.1.288 (did the extension update during the run?): run make claude-update again"]),
+        c("built from another zip", "2.1.287", "2.1.287", "2.1.287", vec![], World::OtherZip, 1, vec![status], vec!["image version 3.0 was built from s3://ai-env-artifacts-0000000/ai-env/image-fedcba9876543210.zip, not the zip the stack deployed (s3://ai-env-artifacts-0000000/ai-env/image-0123456789abcdef.zip)", "STOPPED at step 2/3"]),
+        c("a pinned image version", "2.1.287", "2.1.287", "2.1.287", vec![], World::Pinned, 1, vec![status], vec!["bridge.toml's [aws].image_version = \"1\" pins new VMs to that version: the deployed 3.0 does not reach them", "STOPPED at step 2/3"]),
+        c("many versions", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("VERSIONS_WARN", "0")], World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: 0 of 50 image versions (each update adds one; at 50 a deploy fails)", "make image-prune KEEP=3 YES=1"]),
+        c("old versions, one a VM runs", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("VERSIONS_WARN", "0")], World::VersionsRun, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: 6 of 50 image versions", "  (not 1.1: a VM runs it)", "  make image-deactivate VERSION=1.0", "!image-deactivate VERSION=1.1", "!image-deactivate VERSION=2.0", "!image-deactivate VERSION=2.1"]),
+        c("old versions, the VMs unlisted", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("VERSIONS_WARN", "0"), ("FAKE_AWS_FAIL_OP", "lambda-microvms list-microvms")], World::VersionsRun, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["  (the VMs could not be listed: make image-versions, then deactivate only an old version no VM runs)", "!make image-deactivate"]),
+        c("make -i", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", "i")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
+        c("make -k and a variable", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", "k -- AI_ENV=x")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
+        c("make -s -i", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -si")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
+        c("a long option and a variable", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", " --no-print-directory -- kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
+        c("make -j", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", " --jobserver-fds=3,4 -j")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
+        c("a stamp of another zip", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedStale, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "!already passed"]),
+        c("a stamp of another claude", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedOtherClaude, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "!already passed"]),
+        c("pinned to the deployed version", "2.1.287", "2.1.287", "2.1.287", vec![], World::PinnedDeployed, 0, vec![status, check], vec!["bridge.toml's [aws].image_version = \"3\" pins new VMs to the deployed 3.0 today, but no later update will reach them"]),
+        c("a pin it cannot read", "2.1.287", "2.1.287", "2.1.287", vec![], World::PinnedUnreadable, 1, vec![status], vec!["bridge.toml names image_version in a form this script does not read (aws = { image_version = \"1\" })", "STOPPED at step 2/3"]),
+        c("a failed check after a deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![PIN288, test, deploy, status, proxy, check], vec!["STOPPED at step 7/7 (ai-env egress check --if-needed: exit 3)"]),
+        c("a deploy's run resumed", "2.1.287", "2.1.287", "2.1.287", vec![], World::Pending, 0, vec![status, proxy, check], vec!["claude-update: 2.1.287 is deployed, and the run that deployed it stopped before its end", "claude-update [3/4] make proxy-start", "the proxy was stopped before this run and runs now", "make test-egress, the broader live test the deploy names"]),
+        c("another bundle's marker", "2.1.287", "2.1.287", "2.1.287", vec![], World::PendingOther, 0, vec![status, check], vec!["is pinned and deployed", "!stopped before its end", "!make test-egress"]),
+        c("a new bundle after an unfinished run", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::PendingDeploy, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["the proxy was stopped before this run and runs now: make proxy-stop when idle"]),
+    ];
+    for case in cases {
+        let what = case.what;
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bin = s5_bin(t);
+        // A deploy moves the stack outputs' claudeVersion to the version it deployed (FAKE_DEPLOYS).
+        script(
+            &bin.join("make"),
+            "echo \"make $*\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" ${FAKE_MAKE_FAIL:-none} \"*) exit 2 ;; esac\ncase \" $* \" in *\" deploy \"*) sed -i '' \"s/\\\"claudeVersion\\\":\\\"[^\\\"]*\\\"/\\\"claudeVersion\\\":\\\"$FAKE_DEPLOYS\\\"/\" \"$FAKE_PULUMI_OUTPUTS\" ;; esac\nexit 0",
+        );
+        script(&bin.join("docker"), "exit \"${FAKE_DOCKER_RC:-0}\"");
+        script(&bin.join("curl"), "test -n \"${FAKE_LATEST:-}\" || exit 6\necho \"$FAKE_LATEST\"");
+        std::fs::create_dir_all(t.join("image")).unwrap();
+        if !case.locked.is_empty() {
+            std::fs::write(t.join("image/claude.lock"), format!("CLAUDE_VERSION={}\nCLAUDE_PLATFORM=linux-arm64\n", case.locked)).unwrap();
+        }
+        let mut o = outputs();
+        o["claudeVersion"] = json!(case.deployed);
+        o["latestActiveImageVersion"] = json!(if case.world == World::Rollback { "4.0" } else { "3.0" });
+        o["bucket"] = json!("ai-env-artifacts-0000000");
+        o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
+        write_outputs(t, &o);
+        std::fs::create_dir_all(t.join("aws/image")).unwrap();
+        std::fs::write(t.join("aws/image/state"), "UPDATED").unwrap();
+        std::fs::write(t.join("aws/image/active"), "3.0").unwrap();
+        let built_from = if case.world == World::OtherZip { "fedcba9876543210" } else { "0123456789abcdef" };
+        std::fs::write(t.join("aws/image/uri"), format!("s3://ai-env-artifacts-0000000/ai-env/image-{built_from}.zip")).unwrap();
+        seed_proxy(t, if case.world == World::ProxyStopped { "stopped" } else { "running" });
+        if matches!(case.world, World::Stamped | World::StampedStale | World::StampedOtherClaude) {
+            std::fs::create_dir_all(t.join("out")).unwrap();
+            std::fs::write(t.join("out/image.zip"), "a zip").unwrap();
+            let claude = if case.world == World::StampedOtherClaude { "2.1.286" } else { case.bundle };
+            std::fs::write(t.join("out/image.json"), json!({"claudeVersion": claude}).to_string()).unwrap();
+            let sha = ai_env_cli::bridge::egress::value_sha256(if case.world == World::StampedStale { "another zip" } else { "a zip" });
+            std::fs::write(t.join("out/test-docker.ok"), format!("{sha}\n")).unwrap();
+        }
+        let toml = match case.world {
+            World::Pinned => Some("[aws]\nimage_version = \"1\"\n"),
+            World::PinnedDeployed => Some("[aws]\nimage_version = \"3\"\n"),
+            World::PinnedUnreadable => Some("aws = { image_version = \"1\" }\n"),
+            _ => None,
+        };
+        if let Some(toml) = toml {
+            std::fs::create_dir_all(t.join("bridge")).unwrap();
+            std::fs::write(t.join("bridge/bridge.toml"), toml).unwrap();
+        }
+        if case.world == World::VersionsRun {
+            std::fs::write(t.join("aws/image/versions"), "1.0 ACTIVE\n1.1 ACTIVE\n2.0 ACTIVE\n2.1 INACTIVE\n2.5 ACTIVE\n3.0 ACTIVE\n").unwrap();
+            std::fs::write(t.join("aws/vms"), "microvm-a 1.1 RUNNING\nmicrovm-b 1.0 TERMINATED\n").unwrap();
+        }
+        // The resume marker a deploy's run leaves until its last step passed.
+        let seeded = match case.world {
+            World::Pending | World::PendingDeploy => Some("2.1.287 stopped\n"),
+            World::PendingOther => Some("2.1.286 running\n"),
+            _ => None,
+        };
+        if let Some(m) = seeded {
+            std::fs::create_dir_all(t.join("out")).unwrap();
+            std::fs::write(t.join("out/claude-update.pending"), m).unwrap();
+        }
+        if case.world == World::OlderVm {
+            let rows = t.join("bridge/state/vms");
+            std::fs::create_dir_all(&rows).unwrap();
+            std::fs::write(rows.join("microvm-older.toml"), "v = 1\nstatus = \"running\"\nid = \"microvm-older\"\nimage_version = \"2.0\"\n").unwrap();
+            std::fs::write(rows.join("microvm-same.toml"), "v = 1\nstatus = \"running\"\nid = \"microvm-same\"\nimage_version = \"3.0\"\n").unwrap();
+            std::fs::write(rows.join("microvm-gone.toml"), "v = 1\nstatus = \"terminated\"\nid = \"microvm-gone\"\nimage_version = \"1.0\"\n").unwrap();
+        }
+        let out = ops5(t, &bin, &["claude-update"])
+            .current_dir(t)
+            .env("LOCK", "image/claude.lock")
+            .env("CLAUDE_RELEASES", "https://downloads.invalid/claude-code-releases")
+            .env("CLAUDE_GPG_FPR", "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
+            .env("FAKE_AIENV_BUNDLE", case.bundle)
+            .env("FAKE_DEPLOYS", case.bundle)
+            .envs(case.envs.iter().copied())
+            .bounded();
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(case.code), "{what}: {text}");
+        for want in &case.wants {
+            match want.strip_prefix('!') {
+                Some(no) => assert!(!text.contains(no), "{what}: want no {no:?}: {text}"),
+                None => assert!(text.contains(want), "{what}: want {want:?}: {text}"),
+            }
+        }
+        // Written before a deploy this run started, kept by any failure after it, gone once the run is done.
+        let marker = std::fs::read_to_string(t.join("out/claude-update.pending")).ok();
+        let want_marker = if case.code == 0 {
+            None
+        } else if case.steps.contains(&deploy) {
+            Some(format!("{} {}\n", case.bundle, if case.world == World::ProxyStopped { "stopped" } else { "running" }))
+        } else {
+            seeded.map(String::from)
+        };
+        assert_eq!(marker, want_marker, "{what}: the resume marker: {text}");
+        let ran: Vec<String> = calls(t).into_iter().filter(|l| l.starts_with("make ") || l.starts_with("egress check")).map(|l| l.split(" [AI_ENV=").next().unwrap().to_string()).collect();
+        assert_eq!(ran, case.steps, "{what}: {text}");
+        if case.code == 0 {
+            assert!(text.contains("claude-update: done: new VMs start image version 3.0 with Claude Code "), "{what}: {text}");
+            assert!(!text.contains("review and commit"), "{what}: the lock is outside any work tree here: {text}");
+        } else {
+            assert!(!text.contains("claude-update: done"), "{what}: {text}");
+        }
+        if case.steps.is_empty() {
+            assert!(text.contains("nothing changed") || text.contains("not under make -i or -k"), "{what}: a refusal says nothing changed: {text}");
+        }
+    }
 }

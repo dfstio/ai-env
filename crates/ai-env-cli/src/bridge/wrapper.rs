@@ -539,7 +539,7 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     outln!("claudeCode.disableLoginPrompt is left alone (set it only once the bridge delivers credentials, S7).");
     outln!("Wrapped setups start in Manual mode: the extension now passes --permission-mode {mode} on every spawn (choose with --permission-mode).");
     outln!("Reload the Cursor window for the setting to take effect.");
-    outln!("With a wrapper set the extension stops self-updating and stops following CLAUDE_CONFIG_DIR changes.");
+    outln!("With a wrapper set the extension stops following CLAUDE_CONFIG_DIR changes. Cursor still updates the extension and its bundled claude (turn off Auto Update for the Claude Code extension to keep a version); make claude-update brings the image to it.");
     outln!("AI_ENV_BRIDGE_LOCAL=1 is the kill switch: the wrapper execs the bundled binary directly, without a census.");
     Ok(())
 }

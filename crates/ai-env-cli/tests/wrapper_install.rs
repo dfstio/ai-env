@@ -220,7 +220,7 @@ fn install_dry_run_writes_nothing_and_prints_the_snippet() {
     assert_eq!(parse_settings(&snip).unwrap()[WRAPPER_SETTING], w, "the snippet is valid JSON");
     assert!(stdout.contains("re-run with --write"), "{stdout}");
     assert!(!stdout.contains("backup:") && !stdout.contains("wrote:"), "{stdout}");
-    for line in ["disableLoginPrompt", "Manual mode", "--permission-mode default", "Reload the Cursor window", "stops self-updating", "CLAUDE_CONFIG_DIR", "AI_ENV_BRIDGE_LOCAL=1"] {
+    for line in ["disableLoginPrompt", "Manual mode", "--permission-mode default", "Reload the Cursor window", "Cursor still updates the extension", "CLAUDE_CONFIG_DIR", "AI_ENV_BRIDGE_LOCAL=1"] {
         assert!(stdout.contains(line), "{line}: {stdout}");
     }
     assert_target_warning(&stderr);

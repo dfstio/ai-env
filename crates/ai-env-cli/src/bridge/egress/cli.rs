@@ -70,7 +70,7 @@ pub fn main(store: &Keystore, cmd: EgressCmd) -> Result<()> {
         EgressCmd::Suspend { host, restore } => suspend(&host, restore),
         EgressCmd::Reload { if_changed } => reload(if_changed),
         EgressCmd::Env { shell } => env(shell),
-        EgressCmd::Check { vm, keep, json } => super::check::cmd_check(store, vm.as_deref(), keep, json),
+        EgressCmd::Check { vm, keep, json, if_needed } => super::check::cmd_check(store, vm.as_deref(), keep, json, if_needed),
     }
 }
 
@@ -237,7 +237,7 @@ fn locked<T>(paths: &Paths, f: impl FnOnce() -> Result<T>) -> Result<T> {
 
 /// What `state/infra.toml`'s proxy id names now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ProxyState {
+pub(super) enum ProxyState {
     /// `pending`, `running`, `stopping`, `stopped`.
     Live(String),
     /// Terminated, shutting down, or unknown to EC2: the stack replaced it
@@ -246,7 +246,7 @@ enum ProxyState {
 }
 
 /// The proxy's state; `Err` when it could not be read.
-fn proxy_state(instance: &str) -> std::result::Result<ProxyState, String> {
+pub(super) fn proxy_state(instance: &str) -> std::result::Result<ProxyState, String> {
     match ops::instance_state(instance) {
         Ok(s) if matches!(s.as_str(), "terminated" | "shutting-down") => Ok(ProxyState::Gone),
         Ok(s) => Ok(ProxyState::Live(s)),
@@ -256,7 +256,7 @@ fn proxy_state(instance: &str) -> std::result::Result<ProxyState, String> {
 }
 
 /// What a command says about a proxy id that no longer exists.
-fn proxy_gone(instance: &str) -> String {
+pub(super) fn proxy_gone(instance: &str) -> String {
     format!("state/infra.toml names a proxy that no longer exists ({instance}): {HINT} (the stack's current proxy may still serve the old list)")
 }
 

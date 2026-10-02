@@ -197,7 +197,21 @@ fn pin_check_bundle_mismatch_exits_1() {
     assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
     let err = stderr(&o);
     assert!(err.contains("lock 2.1.283") && err.contains("Cursor bundle 2.1.290"), "the highest darwin-arm64 bundle wins: {err}");
-    assert!(err.contains("make claude-pin CLAUDE_VERSION=2.1.290"), "{err}");
+    assert!(err.contains("make claude-update (or make claude-pin CLAUDE_VERSION=2.1.290 && make test-docker)"), "{err}");
+    // --bundle-version prints that version and nothing else (make claude-update reads it), the lock untouched.
+    let before = std::fs::read(&lock).unwrap();
+    let o = run(&mut ai_env(t, &["infra", "pin", "--bundle-version"]));
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "2.1.290\n");
+    assert_eq!(std::fs::read(&lock).unwrap(), before);
+    // --check-bundle with --expect-version is a usage error too (else the version would be ignored silently).
+    assert_eq!(run(&mut ai_env(t, &["infra", "pin", "--check-bundle", "--lock", lock.to_str().unwrap(), "--expect-version", "2.1.290"])).status.code(), Some(2));
+    // It excludes the other modes (clap usage error), --expect-version included (else ignored silently).
+    for other in [&["--check-bundle"][..], &["--manifest", "m.json"][..], &["--expect-version", "2.1.290"][..]] {
+        let mut args = vec!["infra", "pin", "--bundle-version"];
+        args.extend_from_slice(other);
+        assert_eq!(run(&mut ai_env(t, &args)).status.code(), Some(2), "{other:?}");
+    }
 }
 
 #[test]
@@ -224,4 +238,36 @@ fn pin_check_bundle_without_a_bundle_exits_1() {
     let o = run(&mut ai_env(t, &["infra", "pin", "--check-bundle", "--lock", lock.to_str().unwrap()]));
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("no anthropic.claude-code-<version>-darwin-arm64 bundle"), "{}", stderr(&o));
+    let o = run(&mut ai_env(t, &["infra", "pin", "--bundle-version"]));
+    assert_eq!((o.status.code(), stdout(&o).as_str()), (Some(1), ""), "no bundle, no version: {}", stderr(&o));
+}
+
+/// What Cursor counts as installed: a version `.obsolete` lists (left on disk
+/// after installing an older one, until Cursor's next start), a plain file or
+/// a symlink named like a bundle is none; a release beats a suffixed name of
+/// the same version.
+#[test]
+fn pin_bundle_version_skips_obsolete_and_non_directory_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let dir = extensions(t, &["anthropic.claude-code-2.1.287-darwin-arm64", "anthropic.claude-code-2.1.288-darwin-arm64"]);
+    let version = || {
+        let o = run(&mut ai_env(t, &["infra", "pin", "--bundle-version"]));
+        assert!(o.status.success(), "{}", stderr(&o));
+        stdout(&o).trim().to_string()
+    };
+    assert_eq!(version(), "2.1.288");
+    std::fs::write(dir.join(".obsolete"), r#"{"anthropic.claude-code-2.1.288-darwin-arm64":true}"#).unwrap();
+    assert_eq!(version(), "2.1.287", "the downgraded-from version is obsolete");
+    std::fs::write(dir.join("anthropic.claude-code-2.1.300-darwin-arm64"), "").unwrap();
+    std::os::unix::fs::symlink(t.join("nowhere"), dir.join("anthropic.claude-code-2.1.299-darwin-arm64")).unwrap();
+    std::os::unix::fs::symlink(dir.join("anthropic.claude-code-2.1.287-darwin-arm64"), dir.join("anthropic.claude-code-2.1.298-darwin-arm64")).unwrap();
+    assert_eq!(version(), "2.1.287", "a file, a dangling and a live symlink are no installed extension");
+    std::fs::create_dir(dir.join("anthropic.claude-code-2.1.289-rc1-darwin-arm64")).unwrap();
+    std::fs::create_dir(dir.join("anthropic.claude-code-2.1.289-darwin-arm64")).unwrap();
+    assert_eq!(version(), "2.1.289", "the release beats the suffixed name");
+    // P10 sees the same.
+    let lock = lock_with(t, "2.1.289");
+    let o = run(&mut ai_env(t, &["infra", "pin", "--check-bundle", "--lock", lock.to_str().unwrap()]));
+    assert!(o.status.success(), "{}", stderr(&o));
 }
