@@ -30,7 +30,7 @@ import {
 import {
     BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_POLICY_NAME, EXECUTION_ROLE_NAME, Names,
     PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, buildRolePolicy, deployDnsPolicy, deployEgressPolicy, deployPolicy, roleArn,
-    executionRolePolicy, lambdaTrustPolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy, runtimePolicy,
+    executionRolePolicy, lambdaTrustPolicy, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy, runtimePolicy,
 } from "../policies";
 
 /** The budget's services, written out again (not imported from budget.ts): an edit there must show up here. */
@@ -234,14 +234,16 @@ const names: Names = {
     },
 };
 /**
- * `prop` of `r` is the document `fn` builds. An unknown value is accepted only while the resource, or a resource the
- * value depends on, is being created (a new role's ARN, the first deploy's VM subnet id); anywhere else it is refused.
+ * `prop` of `r` is the document `fn` builds. An unknown value is accepted only while a resource the value depends on
+ * is being created or replaced (the first deploy's bucket, VM subnet and VM security group); anywhere else it is
+ * refused. Never because `r` itself is created: a document never depends on its own resource, so it is known on the
+ * deploy that adds a policy to an existing stack, and accepting an unknown one there would pass it uncompared.
  */
 const iamDoc = (r: Res, prop: string, fn: string, want: () => PolicyDocument) => {
     const v = r.i[prop];
     if (r === EMPTY) return;
     if (!known_(v)) {
-        const creating = CREATING.has(r.op) || (r.deps[prop] ?? []).some((u) => CREATING.has(byUrn.get(u)?.op ?? ""));
+        const creating = (r.deps[prop] ?? []).some((u) => CREATING.has(byUrn.get(u)?.op ?? ""));
         if (!creating) bad(`${r.type} ${r.name}: ${prop} is unknown on a ${r.op} step whose inputs all exist: cannot prove it is ${fn}()`);
         return;
     }
@@ -270,14 +272,30 @@ for (const r of found.get("aws:iam/role:Role") ?? []) {
     if (trustFn !== undefined) iamDoc(r, "assumeRolePolicy", trustFn.name, trustFn);
 }
 const roleRes = (n: string) => (found.get("aws:iam/role:Role") ?? []).find((r) => r.name === n) ?? EMPTY;
+// The operator role's Deny names the VM subnet and security group: on an existing stack their ids come from oldState
+// (idOf) and the document is compared, on the deploy that creates the Deny too; it is unknown only while a resource
+// its document depends on (the bucket, the VM subnet or the VM security group) is being created or replaced, the one
+// case iamDoc accepts.
 const inline = new Map<string, [string, (n: Names) => PolicyDocument]>([
     [BUILD_ROLE_NAME, [BUILD_ROLE_NAME, buildRolePolicy]], [EXECUTION_ROLE_NAME, [EXECUTION_ROLE_NAME, executionRolePolicy]], [cfg.proxyRoleName, [cfg.proxyRoleName, proxyRolePolicy]],
+    [cfg.operatorRoleName, [cfg.operatorRoleName, operatorRolePolicy]],
 ]);
 for (const r of found.get("aws:iam/rolePolicy:RolePolicy") ?? []) {
     const entry = inline.get(r.name);
     if (entry === undefined) continue;
     ref(r, "role", [roleRes(entry[0])]);
     iamDoc(r, "policy", entry[1].name, () => entry[1](names));
+    if (r.name !== cfg.operatorRoleName) continue;
+    // Which ids the Deny is built from, by URN: in a fresh stack's preview its document is unknown (accepted above
+    // while the subnet and the group are created), and preview-scratch's existing-stack copies render it from
+    // policies.ts, so a program passing the proxy subnet's or group's id would pass both. A subset, not ref(): names
+    // brings the bucket too.
+    const deps = r.deps.policy ?? [];
+    const short = (x: Res) => x.urn.split("::").slice(-2).join("::");
+    const missing = [one(T.subnet, NET.vms), one(T.sg, cfg.vmSecurityGroupName)].filter((x) => x !== EMPTY && !deps.includes(x.urn));
+    const wrong = [one(T.subnet, NET.proxy), one(T.sg, cfg.proxySecurityGroupName)].filter((x) => x !== EMPTY && deps.includes(x.urn));
+    if (missing.length > 0) bad(`${r.type} ${r.name}: policy does not depend on ${missing.map(short).join(" or ")} (operatorRolePolicy's NotResource names the VM subnet and the VM security group)`);
+    if (wrong.length > 0) bad(`${r.type} ${r.name}: policy depends on ${wrong.map(short).join(" and ")} (operatorRolePolicy's NotResource names the VM subnet and the VM security group only)`);
 }
 for (const r of found.get("aws:iam/userPolicy:UserPolicy") ?? []) {
     if (r.name !== RUNTIME_POLICY_NAME) continue;

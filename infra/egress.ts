@@ -1,7 +1,8 @@
 // The S5 egress side of the stack (plans/s5-plan.md "Design → Infra", "W1 review, design changes"): a dedicated
 // VPC without Amazon DNS, the proxy subnet (0.0.0.0/0 → IGW) and the VM subnet (no route at all, its own NACL), the
 // two security groups, the squid proxy instance with its role, profile, SSM parameters and log group, the
-// connector's operator role and the aws-native NetworkConnector `ai-env-egress` whose ENIs sit in the VM subnet.
+// connector's operator role (with an inline Deny confining its ENIs to the VM subnet and the VM security group) and
+// the aws-native NetworkConnector `ai-env-egress` whose ENIs sit in the VM subnet.
 //
 // Why this shape: MicroVMs on the connector can only reach TCP 3128 on the proxy's address, which CONNECTs to an
 // allowlist. Every network resource is built from the spec in egress-spec.ts after assertEgressSpec accepted it.
@@ -23,7 +24,7 @@ import {
     checkVpcDns, dnsQueryLogGroup, inInventory, ruleName, ruleOwner, stackInventory,
 } from "./egress-spec";
 import {
-    CONNECTOR_OPERATOR_POLICY_ARN, Names, REGION, SSM_INSTANCE_POLICY_ARN, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy,
+    CONNECTOR_OPERATOR_POLICY_ARN, Names, REGION, SSM_INSTANCE_POLICY_ARN, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy,
 } from "./policies";
 
 /** The operator role must be assumable before CreateNetworkConnector (IAM is eventually consistent; image.ts waits 15 s). */
@@ -683,14 +684,21 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
     });
 
     // ---- the connector and its operator role ----
-    // Planned follow-up after T5.1 (part B measures connector activation first): an inline Deny on
-    // ec2:CreateNetworkInterface with NotResource [the VM subnet, the VM SG, network-interface/*], so the managed
-    // operator policy's any-subnet, any-SG grant cannot create an ENI anywhere else.
+    // The managed operator policy lets the role create ENIs in any subnet with any security group; its inline Deny
+    // (policies.ts operatorRolePolicy: ec2:CreateNetworkInterface outside [the VM subnet, the VM SG,
+    // network-interface/*]) confines them to the VM subnet and the VM security group. A RolePolicy of its own: the
+    // guard and the plan check refuse inline policies on a role.
     const operatorRole = new aws.iam.Role(cfg.operatorRoleName, {
         name: cfg.operatorRoleName, description: "Lambda network connector ai-env-egress: creates and tags its ENIs in the VM subnet", assumeRolePolicy: JSON.stringify(operatorTrustPolicy()), tags, // scratch:operator-role
     }, opts);
     const operatorPolicy = new aws.iam.RolePolicyAttachment(cfg.operatorRoleName, { role: operatorRole.name, policyArn: CONNECTOR_OPERATOR_POLICY_ARN }, opts);
-    // Only on real updates: a preview never waits (and never has a known ARN for a new role anyway).
+    const operatorDeny = new aws.iam.RolePolicy(cfg.operatorRoleName, {
+        name: cfg.operatorRoleName, role: operatorRole.id,
+        policy: pulumi.all([names, vmSubnet.id, sgs.vm.id]).apply(([n, vmSubnetId, vmSecurityGroupId]) => JSON.stringify(operatorRolePolicy({ ...n, egress: { ...n.egress, vmSubnetId, vmSecurityGroupId } }))), // scratch:operator-deny
+    }, opts);
+    // Only on real updates: a preview never waits (and never has a known ARN for a new role anyway). The Deny is not
+    // among these inputs (the connector depends on it instead): with it, the preview of the deploy that adds the Deny
+    // would show the connector's operatorRole unknown, which the plan check refuses, and the connector as changed.
     const operatorRoleArn = pulumi.all([operatorRole.arn, operatorPolicy.id]).apply(async ([arn]) => {
         if (!pulumi.runtime.isDryRun()) await new Promise((resolve) => setTimeout(resolve, CONNECTOR_IAM_PROPAGATION_MS));
         return arn;
@@ -734,8 +742,9 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
     }, {
         provider: providers.native,
         deleteBeforeReplace: true,
-        // The ENIs come up in a subnet that already has its route table, NACL, rule and DNS settings.
-        dependsOn: [vmRoutes, naclAssociation, dhcpAssociation, ...rules.vm, ...dnsFirewall],
+        // The ENIs come up in a subnet that already has its route table, NACL, rule and DNS settings, and through an
+        // operator role whose Deny exists.
+        dependsOn: [vmRoutes, naclAssociation, dhcpAssociation, ...rules.vm, ...dnsFirewall, operatorDeny],
     });
 
     const sha256 = (value: string) => crypto.createHash("sha256").update(value, "utf-8").digest("hex");

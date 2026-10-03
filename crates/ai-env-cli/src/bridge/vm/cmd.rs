@@ -12,7 +12,7 @@
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::awscli;
-use crate::bridge::config::{BridgeConfig, CredentialsSource, Paths, REGION};
+use crate::bridge::config::{BridgeConfig, CredentialsSource, Paths, REGION, TRUE_ACCEPTS_NOTHING};
 use crate::bridge::egress::ExpectedEcho;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::lab::{vm_knobs, VmKnobs};
@@ -37,13 +37,24 @@ pub struct Ctx {
 
 impl Ctx {
     /// `bridge.toml` must exist and pass the `vm` checks (`[vm]` ranges,
-    /// the S5 egress keys, `[aws].credentials`); the lab knobs are read and, when active,
+    /// the S5 egress keys and `[egress].accept_platform_dns`,
+    /// `[aws].credentials`); the legacy `accept_platform_dns = true` is said
+    /// (it accepts nothing) with the line to write; the lab knobs are read and, when active,
     /// announced; the CLI log is opened (best effort).
     pub fn load() -> Result<Ctx> {
         let paths = Paths::resolve()?;
         let cfg = BridgeConfig::load(&paths)?.ok_or_else(|| CliError::Msg(format!("{} not found: run `make infra-status WRITE=1` (it writes [aws])", paths.config.display())))?;
         cfg.vm.validate()?;
         cfg.aws.validate_egress()?;
+        cfg.egress.validate()?;
+        if cfg.egress.names_no_resolver() {
+            // Reported, never refused: S5's first form still parses, and only the credential gate depends on it.
+            let newest = crate::bridge::egress::newest_dns_path(&paths);
+            let fix = crate::bridge::egress::pin_suggestion(newest.as_ref().ok().and_then(Option::as_deref));
+            // Without the rows the suggestion can only be the placeholder: say why.
+            let unread = newest.err().map(|e| format!(" (the dns-path rows cannot be read: {e})")).unwrap_or_default();
+            eprintln!("ai-env: warning: {TRUE_ACCEPTS_NOTHING}; only no-dns passes the credential gate: in {}: {fix}{unread}", paths.config.display());
+        }
         CredentialsSource::parse(&cfg.aws.credentials)?;
         let knobs = vm_knobs();
         announce(&knobs);
@@ -1084,9 +1095,15 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
         }
     }
     if manual.is_some() && name == "dns-path" {
-        // The credential gate trusts the newest dns-path row: only the live probe writes one
-        // ([egress].accept_platform_dns is the recorded acceptance of a platform resolver).
-        return Err(CliError::Usage("dns-path is recorded only by the live probe (accept a platform resolver with [egress].accept_platform_dns = true)".into()));
+        // The credential gate trusts the newest dns-path row: only the live probe writes one. The operator's
+        // acceptance is a separate, recorded act: naming the platform resolver they tested in [egress].
+        return Err(CliError::Usage("dns-path is recorded only by the live probe (accept a platform resolver you tested by naming it: [egress].accept_platform_dns = \"<ip>\")".into()));
+    }
+    let knob_note = crate::bridge::egress::check::FAKE_SHELL_NOTE;
+    if name == "dns-path" && note.as_deref().is_some_and(|n| n.contains(knob_note)) {
+        // That text marks a row the transcript knob wrote, which the readers of the newest verdict skip: a live row
+        // carrying it would be skipped too.
+        return Err(CliError::Usage(format!("--note may not contain {knob_note:?}: it marks a dns-path row of the transcript knob, which the credential gate skips")));
     }
     if let Some(v) = manual {
         if v.trim().is_empty() || v.len() > 200 || v.chars().any(char::is_control) {
@@ -1132,6 +1149,11 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     }
     row.shim = outcome.shim.or(row.shim);
     row.image_version = outcome.image_version.or(row.image_version);
+    if name == "dns-path" {
+        // Said before the row is recorded: `record` fails the command (exit 1) on any verdict but the expected
+        // no-dns, and the operator needs to know whether the gate takes this one.
+        outln!("dns-path: {}", crate::bridge::egress::acceptance_line(&row.verdict, &ctx.cfg.egress));
+    }
     probes::record(&ctx.paths, &row)
 }
 

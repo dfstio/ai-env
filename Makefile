@@ -141,10 +141,13 @@ s5-smoke: ## T5.1 gate: three `ai-env vm smoke --egress vpc --max-duration 900 -
 # recipe (success, failure, Ctrl-C) the entry is removed again, a no-op when it is absent, so a killed test never leaves
 # github.com allowed for every vpc VM. INT, TERM and HUP are trapped too: bash 3.2 kills itself without running the
 # EXIT trap when its foreground child dies of an untrapped SIGINT. A removal that fails fails the target.
-test-egress: ## S5 T5.2-T5.4: the live egress tests (#[ignore]d; AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1; a vpc VM, the proxy, Touch ID), measurements shown; every exit removes the test's github.com entry
-	@trap 'echo "test-egress: removing the test allowlist entry (ai-env egress allow ai-env-test github.com --remove)"; $(LAB_UNSET) $(AI_ENV) egress allow ai-env-test github.com --remove || { echo "test-egress: the removal FAILED: github.com may still be allowed for every vpc VM: run ai-env egress allow ai-env-test github.com --remove"; exit 1; }' EXIT; \
+test-egress: ## S5 T5.2-T5.4: the live egress tests (#[ignore]d; AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1; a vpc VM, the proxy, Touch ID), measurements shown; every exit removes the test's github.com entry; a test that skips its proof fails the target
+	@log=$$(mktemp "$${TMPDIR:-/tmp}/ai-env-test-egress.XXXXXX") || exit 1; \
+	  trap 'rm -f "$$log"; echo "test-egress: removing the test allowlist entry (ai-env egress allow ai-env-test github.com --remove)"; $(LAB_UNSET) $(AI_ENV) egress allow ai-env-test github.com --remove || { echo "test-egress: the removal FAILED: github.com may still be allowed for every vpc VM: run ai-env egress allow ai-env-test github.com --remove"; exit 1; }' EXIT; \
 	  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
-	  $(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture
+	  set -o pipefail; \
+	  $(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture 2>&1 | tee "$$log" || exit $$?; \
+	  if grep -q 'skipped:' "$$log"; then echo "test-egress: a live egress test skipped its proof (its skipped: line above), so this is not a pass"; exit 1; fi
 
 # The systemd case boots the proxy's user-data under a real systemd as PID 1 in a privileged container (Docker Desktop
 # allows it); SYSTEMD=0 on the command line leaves it out.

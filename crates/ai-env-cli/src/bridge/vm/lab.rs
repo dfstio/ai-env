@@ -384,21 +384,39 @@ fn connector_state(arn: &str) -> Result<(String, String), String> {
     Ok((state, shown))
 }
 
+/// The dns-path row's note: the verdict's note, what the run asked, the VM, and, only for a transcript the knob
+/// supplied, `check::FAKE_SHELL_NOTE`, which keeps the row from ever deciding the newest dns-path verdict
+/// (`egress::newest_dns_path_row`).
+fn dns_path_note(derived: &str, nonce: &str, vm_id: &str, from_knob: bool) -> String {
+    use crate::bridge::egress::check;
+    let knob = if from_knob { format!("; {}", check::FAKE_SHELL_NOTE) } else { String::new() };
+    format!("{derived}; asked {} A, and example.com A of each server that replied ({vm_id}){knob}", check::dns_name(nonce))
+}
+
 /// dns-path (S5): from a `--egress vpc --shell` VM, which DNS server (if any)
-/// answers: `no-dns`; `platform-dns:<nameserver>` (a platform resolver
-/// answered without resolving: DNS Firewall); `platform-dns-resolves:
-/// <nameserver>` (a platform resolver resolved names: a failing verdict);
-/// `open-dns:<nameserver>` (a public one, or any other, replied: a failing
-/// verdict). Once the VM's `/health` answered, through the scripted shell:
-/// `/etc/resolv.conf`'s nameserver, 1.1.1.1 (and OpenDNS on UDP 443), the
-/// link-local resolver (169.254.169.253, `fd00:ec2::253`), the VPC's and the
-/// VM subnet's +2 are asked for a well-known name over UDP and TCP, between
-/// two `allowed` cases through the proxy that must both answer 401 (a VM
-/// without working networking would read as `no-dns`); the note carries
-/// `resolves=yes|no` and the resolv.conf nameserver
-/// (`egress::check::dns_path_outcome`). Under the file-backed fake it
-/// refuses (exit 9) after starting its VM and before any shell token or
-/// dial; the terminate guard ends the VM.
+/// answers a fresh name that exists nowhere (`egress::check::dns_name`):
+/// `no-dns`; `platform-dns:<ips>` (platform resolvers replied only with an
+/// empty NOERROR — no answer, no authority — and no address for
+/// example.com: the platform's stub, which `[egress].accept_platform_dns`
+/// may accept by name); `platform-dns-answered:<ips>` (any other platform
+/// reply: a failing verdict); `platform-dns-resolves:<ips>` (a platform
+/// resolver returned an address: a failing verdict); `open-dns:<ips>` (a
+/// public one, or any other, replied: a failing verdict) — every server of
+/// the worst class, in case order. Once the VM's `/health` answered, through
+/// the scripted shell: `/etc/resolv.conf`'s nameserver, 1.1.1.1 (and OpenDNS
+/// on UDP 443), the link-local resolver (169.254.169.253, `fd00:ec2::253`),
+/// the VPC's and the VM subnet's +2 are asked over UDP and TCP — the fresh
+/// name with dig's header, then example.com of each server that replied —
+/// between two `allowed` cases through the proxy that must both answer 401
+/// (a VM without working networking would read as `no-dns`); the note
+/// carries `resolves=yes|no`, the resolv.conf nameserver, each server's
+/// status and counts, and the name asked (`egress::check::dns_path_outcome`).
+/// Under the file-backed fake it refuses (exit 9) after starting its VM and
+/// before any shell token or dial, unless — debug builds — the transcript
+/// knob stands in for the shell, as for `egress check`
+/// (`egress::check::fake_transcript`): its row's note then ends with
+/// `check::FAKE_SHELL_NOTE`, so the readers of the newest dns-path verdict
+/// skip it; the terminate guard ends the VM.
 async fn dns_path<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, started: &mut Vec<String>) -> Result<ProbeOutcome, BridgeError> {
     use crate::bridge::egress::check;
     if ctx.cfg.aws.egress_connector_arn.as_deref().is_none_or(|a| a.trim().is_empty()) {
@@ -410,13 +428,39 @@ async fn dns_path<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
     let p = plan(ctx, &f)?;
     let vm = start(ctx, api, ep, &p, started).await?;
     health::read_health(api, ep, &ctx.paths, &vm.id, health::Backoff::HEALTH.scaled(ctx.knobs.backoff_ms)).await?;
-    if ctx.knobs.fake_api.is_some() {
-        return Err(shell::fake_backend_refusal("dns-path"));
-    }
-    let nonce = check::new_nonce();
-    let script = check::render_dns_script(&nonce, &check::proxy_ip(&ctx.cfg, &ctx.paths));
-    let output = shell::run_script(api, &vm.id, &script, check::script_budget(check::DNS_PATH_CASES.len()), ShellAuth::Header).await?;
+    // Where the transcript comes from, decided once: under the fake only the knob's file (debug builds) can supply one,
+    // and the same flag marks the row (`dns_path_note`).
+    let from_knob = ctx.knobs.fake_api.is_some();
+    let (nonce, output) = if from_knob {
+        check::fake_transcript("dns-path")?
+    } else {
+        let nonce = check::new_nonce();
+        let script = check::render_dns_script(&nonce, &check::proxy_ip(&ctx.cfg, &ctx.paths));
+        let output = shell::run_script(api, &vm.id, &script, check::script_budget(check::DNS_PATH_CASES.len()), ShellAuth::Header).await?;
+        (nonce, output)
+    };
     let markers = check::parse_markers(&output, &nonce).map_err(|e| BridgeError::Protocol(format!("dns-path: the shell transcript: {e}")))?;
     let (verdict, note) = check::dns_path_outcome(&markers).map_err(|message| BridgeError::Sdk { op: "probe", message: format!("dns-path on {}: {message}", vm.id) })?;
-    Ok(ProbeOutcome { verdict, note: format!("{note} ({})", vm.id), image_version: Some(vm.image_version.clone()), ..ProbeOutcome::default() })
+    Ok(ProbeOutcome {
+        verdict,
+        note: dns_path_note(&note, &nonce, &vm.id, from_knob),
+        image_version: Some(vm.image_version.clone()),
+        ..ProbeOutcome::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dns_path_note;
+    use crate::bridge::egress::check::FAKE_SHELL_NOTE;
+
+    /// A live run's note never carries the knob's mark (its row may decide the newest dns-path verdict); a knob run's
+    /// always does (its row never decides it).
+    #[test]
+    fn only_a_knob_transcript_marks_the_dns_path_note() {
+        let live = dns_path_note("resolves=no", "0123456789abcdef", "microvm-x", false);
+        let knob = dns_path_note("resolves=no", "0123456789abcdef", "microvm-x", true);
+        assert!(!live.contains(FAKE_SHELL_NOTE) && knob.ends_with(FAKE_SHELL_NOTE), "{live}\n{knob}");
+        assert_eq!(live, "resolves=no; asked d0123456789abcdef.example.com A, and example.com A of each server that replied (microvm-x)");
+    }
 }

@@ -68,7 +68,8 @@ const names: pulumi.Output<Names> = pulumi.all([accountId, artifacts.bucket.buck
     accountId: acct, region: REGION, bucket, imageName: imageConfig.imageName, logGroup: imageConfig.logGroup, egress: egressNames(egressConfig),
 }));
 const net = createEgress(egress, guard, names, tags, { aws: awsProvider, native: nativeProvider });
-// Only the (unattached) deploy policy waits for the VM subnet and security group: its CreateNetworkConnector condition.
+// The (unattached) deploy policy waits for the VM subnet and security group (its CreateNetworkConnector condition), as does
+// the operator role's Deny in egress.ts (its NotResource).
 const deployNames: pulumi.Output<Names> = pulumi.all([names, net.vmSubnet.id, net.vmSecurityGroup.id]).apply(([n, vmSubnetId, vmSecurityGroupId]) => ({
     ...n, egress: { ...n.egress, vmSubnetId, vmSecurityGroupId },
 }));

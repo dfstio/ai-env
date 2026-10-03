@@ -12,18 +12,22 @@
 #
 # The normal run must succeed, then the plan check (scripts/check-plan.sh, the same one `make deploy` runs; always
 # the repo's copy, never the edited scratch copy) must accept the --json plan: exactly the stack inventory per type
-# and name (53 in dnsMode none: S3's 16 and S5's 37; EGRESS_MODE=firewall previews the copy with dnsMode firewall:
-# 58), the pinned providers, every egress input and reference, every IAM document (for the caller's account, read
-# once from `aws sts get-caller-identity` into a shell variable) and no update of the parameters `ai-env egress`
-# owns. A --json plan has no stack outputs, so the 14
+# and name (54 in dnsMode none: S3's 16 and S5's 38, the operator role's Deny included; EGRESS_MODE=firewall
+# previews the copy with dnsMode firewall: 59), the pinned providers, every egress input and reference, every IAM
+# document (for the caller's account, read once from `aws sts get-caller-identity` into a shell variable) and no
+# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 14
 # egress outputs `ai-env infra status` reads are checked in the text preview, squidConfSha256 and allowSha256
 # against the SHA-256 of the planned parameter values. Then the same plan, rewritten in memory into the shape
 # `pulumi preview --json` gives for the stack once it exists (every step same, or the VM subnet, VM security group
 # and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must pass
-# too, and four tampered copies of it (the deploy policy's CreateNetworkConnector condition naming the proxy
-# subnet, the connector on the proxy subnet or the proxy's security group, the connector passed another role) must
-# be refused: a fresh scratch stack only creates, and a check that saw only creates once refused every deploy after
-# the first. The layers a negative goes through, each one alone (the
+# too, also as the deploy that adds the operator role's Deny to it (its create step, everything else same), and
+# seven tampered copies of it (the deploy policy's CreateNetworkConnector condition or the operator role's Deny
+# naming the proxy subnet, the Deny also on that create step, where its document left unknown is refused too; the
+# connector on the proxy subnet or the proxy's security group, the connector passed another role) must be refused: a
+# fresh scratch stack only creates, and a check that saw only creates once refused every deploy after the first. The
+# operator role's Deny is proven compared there only: in a fresh preview its document is unknown (the subnet and
+# group ids are), which the plan check accepts only while a resource it depends on is being created; the ids it is
+# built from are checked by URN (NEGATIVE=miswired). The layers a negative goes through, each one alone (the
 # earlier ones disabled in the scratch copy through their scratch:* markers):
 #   spec   assertEgressSpec, before any resource is registered;
 #   guard  the resource transform (egress.ts guardEgress), at registration;
@@ -52,7 +56,8 @@
 #   dns-firewall-qtype
 #                    dnsMode firewall with qType "A" on the block-all rule (it would block A records only): guard, plan
 #   miswired         references the guard cannot compare in a preview (unknown ids): the route tables' associations
-#                    swapped, every rule attached to the proxy group, the proxy's ingress referencing itself: plan
+#                    swapped, every rule attached to the proxy group, the proxy's ingress referencing itself, the
+#                    operator role's Deny built from the proxy subnet's id: plan
 #   iam-widen        AdministratorAccess in the exec role's managedPolicyArns (guard); then also an inline policy on
 #                    the operator role, a Widen statement in MacRuntimePolicy and ssm:* in the proxy's policy: plan
 #   owned-param-reset
@@ -193,8 +198,11 @@ expect_plan_refusal() {
 # (a role's, user's or instance profile's is its name, the bucket's its name, a subnet's subnet-…, a group's
 # sg-…), every unknown input resolved through its property dependencies, the IAM documents rendered by policies.ts
 # for those ids (the compiled copy plan_check left in $scratch/plan-check). <variant>: none | updated (the VM subnet,
-# the VM security group and the VPC are update steps: their ids, too, come from oldState) | deploy-proxy-subnet (the
-# deploy policy names the proxy subnet) | connector-proxy-subnet (the connector's subnet is the proxy subnet) |
+# the VM security group and the VPC are update steps: their ids, too, come from oldState) | operator-new (the deploy
+# that adds the operator role's Deny: its step is a create without oldState) | deploy-proxy-subnet (the deploy
+# policy names the proxy subnet) | operator-proxy-subnet (the operator role's Deny names the proxy subnet) |
+# operator-new-proxy-subnet (so does its create step) | operator-new-unknown (its create step's document is unknown,
+# everything it depends on same) | connector-proxy-subnet (the connector's subnet is the proxy subnet) |
 # connector-proxy-sg (its security group is the proxy's) | connector-operator-role (it is passed another role).
 existing_plan() {
     ACCOUNT_ID="$acct" node -e '
@@ -231,7 +239,7 @@ const docs = (subnet) => new Map(pol.allPolicies(names(subnet)).map((d) => [d.na
 const good = docs(vmSubnet), bad = docs(proxySubnet);
 // Which document each IAM input is (print-policies names).
 const doc = { "aws:iam/role:Role": { "ai-env-image-build": "build-trust", "ai-env-vm-exec": "execution-trust", [cfg.proxyRoleName]: "proxy-trust", [cfg.operatorRoleName]: "operator-trust" },
-    "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy" },
+    "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy", [cfg.operatorRoleName]: "operator" },
     "aws:iam/userPolicy:UserPolicy": { MacRuntimePolicy: "runtime" },
     "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns" } };
 // resolve(value, deps, key): every unknown in value, the id of its one dependency (under a connector list key, the
@@ -251,7 +259,8 @@ for (const s of plan.steps) {
     for (const [k, v] of Object.entries(st.inputs || {})) {
         const which = (doc[st.type] || {})[name(s)];
         const iamKey = st.type === "aws:iam/role:Role" ? "assumeRolePolicy" : "policy";
-        inputs[k] = which && k === iamKey ? ((variant === "deploy-proxy-subnet" && which === "deploy" ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
+        const tampered = (variant === "deploy-proxy-subnet" && which === "deploy") || ((variant === "operator-proxy-subnet" || variant === "operator-new-proxy-subnet") && which === "operator");
+        inputs[k] = which && k === iamKey ? ((tampered ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
     }
     if (st.type === "aws-native:lambda:NetworkConnector") {
         // An ARN cannot be resolved from its two dependencies (the role and its attachment): it is the ARN of the operator role.
@@ -268,11 +277,18 @@ for (const s of plan.steps) {
         const purn = st.provider.slice(0, st.provider.lastIndexOf("::"));
         s.provider = s.newState.provider = s.oldState.provider = `${purn}::${ids.get(purn)}`;
     }
+    // operator-new*: the stack exists, the Deny does not yet (the deploy that adds it): its step is a create.
+    if (variant.startsWith("operator-new") && st.type === "aws:iam/rolePolicy:RolePolicy" && name(s) === cfg.operatorRoleName) {
+        s.op = "create";
+        delete s.oldState;
+    }
 }
 const left = [];
 const walk = (v, at) => { if (v === UNKNOWN || (typeof v === "string" && v.includes(UNKNOWN))) left.push(at); else if (v !== null && typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, `${at}.${k}`); };
 plan.steps.forEach((s) => walk(s, name(s)));
 if (left.length > 0) throw new Error(`existing_plan: unknown values left at ${left.slice(0, 8).join(", ")}`);
+// operator-new-unknown: that create step with its document unknown, though nothing it depends on is created.
+if (variant === "operator-new-unknown") byName("aws:iam/rolePolicy:RolePolicy", cfg.operatorRoleName).newState.inputs.policy = UNKNOWN;
 process.stdout.write(JSON.stringify(plan));
 ' "$scratch/plan-check" "$scratch/infra/egress-config.json" "$scratch/infra/image-config.json" "$1"
 }
@@ -305,16 +321,18 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
 ' "ai-env-proxy-$p" <<<"$plan")
         test -n "$got" && test "$got" = "$want" || fail "output $k (${got:-none}) is not the SHA-256 of the planned $p parameter value (${want:-none})"
     done
-    # The same stack once it exists: the plan check must accept it (ids from oldState, for same and update steps) and
-    # refuse it tampered.
-    for v in none updated; do
+    # The same stack once it exists: the plan check must accept it (ids from oldState, for same and update steps; and
+    # the deploy that adds the Deny, whose document is known then) and refuse it tampered.
+    for v in none updated operator-new; do
         existing=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
         out=$(plan_check <<<"$existing" 2>&1) || { echo "$out"; fail "existing stack, $v: the plan check refused the plan of the deployed stack (ids in oldState)"; }
         echo "existing stack, $v: $(first_line "check-plan: ok" "$out")"
     done
-    for v in deploy-proxy-subnet connector-proxy-subnet connector-proxy-sg connector-operator-role; do
+    for v in deploy-proxy-subnet operator-proxy-subnet operator-new-proxy-subnet operator-new-unknown connector-proxy-subnet connector-proxy-sg connector-operator-role; do
         case "$v" in
         deploy-proxy-subnet) t="aws:iam/policy:Policy ai-env-deploy: policy is not policies.ts deployPolicy()" ;;
+        operator-proxy-subnet | operator-new-proxy-subnet) t="aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy is not policies.ts operatorRolePolicy()" ;;
+        operator-new-unknown) t="aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy is unknown on a create step whose inputs all exist" ;;
         connector-proxy-subnet) t="connector: subnetIds is not the VM subnet" ;;
         connector-proxy-sg) t="connector: securityGroupIds is not the VM security group" ;;
         *) t="connector: operatorRole arn:aws:iam::" ;;
@@ -325,7 +343,7 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
         test -n "$diag" || { echo "$out"; fail "existing stack, $v: the plan check refused, but not with \"$t\""; }
         echo "existing stack, $v: $diag"
     done
-    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 14 egress outputs passed; the existing-stack plans (same, update) passed, their four tampered copies were refused)"
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 14 egress outputs passed; the existing-stack plans (same, update, the Deny created) passed, their seven tampered copies were refused)"
     ;;
 no-logging)
     edit '/scratch:logging/d'
@@ -520,7 +538,13 @@ miswired)
     edit_file egress.ts '/scratch:rule-peer/s|referencedSecurityGroupId: sgs\[rule.peer.sg\].id|referencedSecurityGroupId: sgs[k].id|'
     grep -qF 'referencedSecurityGroupId: sgs[k].id' egress.ts || fail "the scratch:rule-peer marker no longer makes a rule reference its own group"
     expect_plan_refusal "ai-env-proxy-from-ai-env-vm-egress-tcp-3128: referencedSecurityGroupId depends on aws:ec2/securityGroup:SecurityGroup::ai-env-proxy"
-    echo "$label: ok (the plan check refused swapped route table associations, rules on the wrong group and a self-referencing rule)"
+    # The Deny's document is unknown in this preview (accepted while the subnet is created): only its URNs tell.
+    restore egress.ts
+    edit_file egress.ts '/scratch:operator-deny/s|pulumi.all(\[names, vmSubnet.id, sgs.vm.id\])|pulumi.all([names, proxySubnet.id, sgs.vm.id])|'
+    grep -qF 'pulumi.all([names, proxySubnet.id, sgs.vm.id])' egress.ts || fail "the scratch:operator-deny marker no longer builds the operator role's Deny from the proxy subnet"
+    expect_plan_refusal "aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy does not depend on aws:ec2/subnet:Subnet::ai-env-egress-vms" \
+        "aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy depends on aws:ec2/subnet:Subnet::ai-env-egress-proxy"
+    echo "$label: ok (the plan check refused swapped route table associations, rules on the wrong group, a self-referencing rule and an operator role Deny built from the proxy subnet)"
     ;;
 iam-widen)
     edit_file iam.ts '/scratch:exec-role/s|assumeRolePolicy: trust, tags,|assumeRolePolicy: trust, tags, managedPolicyArns: ["arn:aws:iam::aws:policy/AdministratorAccess"],|'

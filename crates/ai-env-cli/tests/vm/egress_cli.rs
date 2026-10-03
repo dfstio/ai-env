@@ -1017,6 +1017,12 @@ fn env_prints_the_proxy_environment_without_any_call() {
     fs::write(t.w.bridge().join("bridge.toml"), toml.replacen("[aws]\n", "[aws]\nproxy_private_ip = \"8.8.8.8\"\n", 1)).unwrap();
     let o = t.run(&["egress", "env"]);
     assert!(code(&o) == 1 && stderr(&o).contains("proxy_private_ip"), "{}", stderr(&o));
+    // `[egress].accept_platform_dns` is the credential gate's: env (like allow, suspend, status) never reads it, so an
+    // invalid pin refuses nothing here (`ai-env vm`, `lab` and `egress check` refuse it).
+    fs::write(t.w.bridge().join("bridge.toml"), format!("{toml}\n[egress]\naccept_platform_dns = \"8.8.8.8\"\n")).unwrap();
+    let o = t.run(&["egress", "env"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).starts_with("https_proxy=http://10.42.0.10:3128\n") && !stderr(&o).contains("accept_platform_dns"), "{}", stderr(&o));
 }
 
 fn vm_row(n: u64, egress: &str, status: RowStatus, wall_in: i64) -> VmRow {

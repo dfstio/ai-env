@@ -42,8 +42,8 @@
 //!   every command says so and names `make infra-status WRITE=1`.
 use super::ops::{self, arr, text, Invocation, Param, Wait, PATCH_EXEC_S, RELOAD, RELOAD_EXEC_S, STATUS_EXEC_S};
 use super::{
-    fits_parameter, is_valid_slug, normalize_connector, normalize_host, param_name, parse_extras, parse_hosts, parse_reload_status, proxy_env, render_extras, render_suspended, value_sha256, Extra, PARAMETER_PREFIX, PARAMS,
-    PARAM_MAX_BYTES, PROXY_PORT, RESOLVERS,
+    effective_hosts, fits_parameter, is_valid_slug, normalize_connector, normalize_host, param_name, parse_extras, parse_hosts, parse_reload_status, proxy_env, render_extras, render_suspended, value_sha256, Extra, PARAMETER_PREFIX,
+    PARAMS, PARAM_MAX_BYTES, PROXY_PORT, RESOLVERS,
 };
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::awscli::require_operator_account;
@@ -395,13 +395,21 @@ impl Lists {
         &self.raw[param]
     }
 
-    /// The hosts the proxy serves, (allow ∪ extras) − suspended, with `param`
+    /// The hosts the proxy serves ([`effective_hosts`]), with `param`
     /// (`extras` or `suspended`) holding `value` instead of what was read.
     fn effective_with(&self, param: &str, value: &str) -> std::result::Result<BTreeSet<String>, String> {
-        let extras: Vec<String> = if param == "extras" { parse_extras(value)?.into_iter().map(|e| e.host).collect() } else { self.extras.iter().map(|e| e.host.clone()).collect() };
+        let extras = if param == "extras" { parse_extras(value)? } else { self.extras.clone() };
         let suspended: BTreeSet<String> = if param == "suspended" { parse_hosts(value)?.into_iter().collect() } else { self.suspended.clone() };
-        Ok(self.allow.iter().chain(extras.iter()).filter(|h| !suspended.contains(*h)).cloned().collect())
+        Ok(effective_hosts(&self.allow, &extras, &suspended))
     }
+}
+
+/// The proxy's effective allowlist as SSM holds the three lists now (the read
+/// `egress allow|suspend` make, without their lock): `check::live_allowlist`,
+/// for the live tests. Nothing here proves the proxy serves it (no `--status`).
+pub(super) fn read_effective(what: &str) -> Result<BTreeSet<String>> {
+    let l = read_lists(what)?;
+    Ok(effective_hosts(&l.allow, &l.extras, &l.suspended))
 }
 
 /// The three lists in one `get-parameters`; any of them that does not parse
@@ -924,6 +932,11 @@ struct Report {
     /// The facts of the `get-network-connector` answer the `connector` row
     /// judged ok (what `egress check` binds a pass to); `None` otherwise.
     connector_facts: Option<super::ConnectorFacts>,
+    /// What squid serves ([`judge_served_parameters`]): the effective
+    /// allowlist `egress check` judges `proxy-github` by; `None` unless the
+    /// `parameters` row was ok against a status line saying squid serves
+    /// them ([`serving`]: active, parse ok, `applied=yes`).
+    allowlist: Option<BTreeSet<String>>,
 }
 
 impl Report {
@@ -1492,6 +1505,28 @@ fn judge_parameters(st: Option<&BTreeMap<String, String>>, values: &BTreeMap<Str
     verdict(&p, format!("{} parameters under {PARAMETER_PREFIX}, valid, {how}", PARAMS.len()))
 }
 
+/// The `parameters` row against the proxy's status line `st`, and what squid
+/// serves: (allow ∪ extras) − suspended ([`effective_hosts`]) of the very
+/// values that row judged — only when it is ok (the proxy fetched exactly
+/// these values for its `--status`) and `st` says squid serves them
+/// ([`serving`]: active, they parse, `applied=yes` — squid runs exactly
+/// them); else `None`, and `egress check` judges every case strictly.
+fn judge_served_parameters(st: &BTreeMap<String, String>, values: &BTreeMap<String, Param>, missing: &[String]) -> (Judged, Option<BTreeSet<String>>) {
+    let judged = judge_parameters(Some(st), values, missing);
+    let served = (judged.0 == Verdict::Ok && serving(st)).then(|| effective_of(values)).flatten();
+    (judged, served)
+}
+
+/// [`effective_hosts`] of the `allow`, `extras` and `suspended` values of a
+/// `get-parameters` answer; `None` when one is missing or does not parse.
+fn effective_of(values: &BTreeMap<String, Param>) -> Option<BTreeSet<String>> {
+    let list = |p: &str| values.get(&param_name(p)).map(|v| v.value.as_str());
+    let allow = parse_hosts(list("allow")?).ok()?;
+    let extras = parse_extras(list("extras")?).ok()?;
+    let suspended: BTreeSet<String> = parse_hosts(list("suspended")?).ok()?.into_iter().collect();
+    Some(effective_hosts(&allow, &extras, &suspended))
+}
+
 /// `squid.conf` and `allow` as SSM holds them are what the stack rendered
 /// (`squid_conf_sha256`, `allow_sha256` of `state/infra.toml`); without
 /// those hashes the content cannot be verified.
@@ -1523,12 +1558,25 @@ pub(crate) struct NetworkRow {
     pub detail: String,
 }
 
-/// Every check of `ai-env egress status` (the operator-account check first, the same calls, no output), for `ai-env egress check`, which requires every row `ok`; and the facts of the connector answer the `connector` row judged ok, which a pass is bound to (the configuration verified, not a later read).
-pub(crate) fn network_verification() -> Result<(Vec<NetworkRow>, Option<super::ConnectorFacts>)> {
+/// What `ai-env egress check` takes from the network verification.
+pub(crate) struct NetworkVerification {
+    /// Every row; the check requires each `ok`.
+    pub rows: Vec<NetworkRow>,
+    /// The facts of the connector answer the `connector` row judged ok, which a pass is bound to (the configuration
+    /// verified, not a later read).
+    pub connector_facts: Option<super::ConnectorFacts>,
+    /// What squid serves, from the parameter values the `parameters` row proved against the proxy's status line
+    /// ([`judge_served_parameters`]) — whatever the other rows say; `None` unless that row was ok against a status line
+    /// saying squid serves them ([`serving`]: active, parse ok, `applied=yes`).
+    pub allowlist: Option<BTreeSet<String>>,
+}
+
+/// Every check of `ai-env egress status` (the operator-account check first, the same calls, no output), for `ai-env egress check`.
+pub(crate) fn network_verification() -> Result<NetworkVerification> {
     let ctx = Ctx::load()?;
     let (_, r) = verify(&ctx, "egress check")?;
-    let facts = r.connector_facts;
-    Ok((r.rows.into_iter().map(|row| NetworkRow { check: row.check, status: row.verdict.label(), detail: row.detail }).collect(), facts))
+    let rows = r.rows.into_iter().map(|row| NetworkRow { check: row.check, status: row.verdict.label(), detail: row.detail }).collect();
+    Ok(NetworkVerification { rows, connector_facts: r.connector_facts, allowlist: r.allowlist })
 }
 
 fn status(json: bool) -> Result<()> {
@@ -1678,7 +1726,14 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
                     match line.map(parse_reload_status) {
                         Some(Ok(st)) => {
                             r.push("proxy-config", judge_proxy_config(&st));
-                            r.call("parameters", params.clone(), |(values, missing)| judge_parameters(Some(&st), &values, &missing));
+                            match params.clone() {
+                                Ok((values, missing)) => {
+                                    let (judged, served) = judge_served_parameters(&st, &values, &missing);
+                                    r.allowlist = served;
+                                    r.push("parameters", judged);
+                                }
+                                Err(e) => r.push("parameters", unknown(e)),
+                            }
                         }
                         Some(Err(e)) => {
                             r.push("proxy-config", unknown(e));
@@ -2034,6 +2089,46 @@ mod tests {
         assert!(judge_parameters(None, &bad, &[]).1.contains("allow: line 1"));
         assert!(judge_parameters(None, &vals, &[param_name("suspended")]).1.contains("missing /ai-env/proxy/suspended"));
         assert_eq!(judge_parameters(None, &vals, &[]).0, Verdict::Ok);
+    }
+
+    /// `egress check` judges `proxy-github` by what squid serves: (allow ∪ extras) − suspended of the very values the
+    /// `parameters` row proved against the proxy's status line — only when that row is ok and the line says squid serves
+    /// them (`serving`: active, parse ok, `applied=yes`); otherwise nothing is known, and every case is judged strictly.
+    #[test]
+    fn the_served_allowlist_needs_the_parameters_row_ok_and_squid_serving_them() {
+        let names = |l: Option<BTreeSet<String>>| l.map(|l| l.into_iter().collect::<Vec<_>>());
+        let served = |vals: &BTreeMap<String, Param>, line: &str, missing: &[String]| judge_served_parameters(&parse_reload_status(line).unwrap(), vals, missing);
+        let mut vals = values();
+        vals.insert(param_name("extras"), param(&format!("{}github.com\tsome-ws\n", super::super::EXTRAS_HEADER)));
+        let (judged, list) = served(&vals, &status_of(&vals, " applied=yes"), &[]);
+        assert_eq!((judged.0, names(list)), (Verdict::Ok, Some(vec!["api.anthropic.com".to_string(), "github.com".to_string()])));
+        assert_eq!(judged.1, judge_parameters(Some(&parse_reload_status(&status_of(&vals, " applied=yes")).unwrap()), &vals, &[]).1, "the row itself is unchanged");
+        // A suspended host is not served, wherever it is listed.
+        let mut suspended = vals.clone();
+        suspended.insert(param_name("suspended"), param(&format!("{}github.com\napi.anthropic.com\n", super::super::SUSPENDED_HEADER)));
+        assert_eq!(names(served(&suspended, &status_of(&suspended, " applied=yes"), &[]).1), Some(vec![]));
+        // The proxy read other values (a hash differs), or a parameter is missing: the row is not ok, nothing is known.
+        let (judged, list) = served(&vals, &status_of(&values(), " applied=yes"), &[]);
+        assert!(judged.0 == Verdict::Drift && list.is_none(), "{judged:?}");
+        let (judged, list) = served(&vals, &status_of(&vals, " applied=yes"), &[param_name("suspended")]);
+        assert!(judged.0 == Verdict::Drift && list.is_none(), "{judged:?}");
+        // squid does not run them (applied=no, or no applied= at all): nothing is known either, equal hashes or not.
+        for applied in [" applied=no", ""] {
+            let (judged, list) = served(&vals, &status_of(&vals, applied), &[]);
+            assert!(judged.0 == Verdict::Ok && list.is_none(), "{applied:?}: {judged:?}");
+        }
+        // Nor while squid is not active, or the values fail `squid -k parse`, whatever `applied=` says (`--status` asks
+        // squid's state twice, for squid= and for applied=, so a race can print `squid=inactive … applied=yes`).
+        for (from, to) in [("squid=active", "squid=inactive"), ("parse=ok", "parse=failed")] {
+            let line = status_of(&vals, " applied=yes").replacen(from, to, 1);
+            assert!(line.contains(to) && line.ends_with(" applied=yes"), "{line}");
+            let (judged, list) = served(&vals, &line, &[]);
+            assert!(judged.0 == Verdict::Ok && list.is_none(), "{to}: {judged:?}");
+        }
+        assert_eq!(names(effective_of(&values())), Some(vec!["api.anthropic.com".to_string()]));
+        let mut broken = values();
+        broken.remove(&param_name("extras"));
+        assert_eq!(effective_of(&broken), None, "a list missing from the answer");
     }
 
     #[test]

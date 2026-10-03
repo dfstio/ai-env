@@ -10,9 +10,12 @@
 //             ssm-instance-policy|operator-policy
 //       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach)
 //
-// The egress documents (S5) are the proxy role's trust and inline policy and the operator role's trust; the
-// deploy policy's CreateNetworkConnector condition names the VM subnet and security group, whose ids exist only
-// in a stack, so the printer uses well-formed placeholders unless they are given.
+// The egress documents (S5) are the proxy role's trust and inline policy and the operator role's trust and inline
+// Deny (`operator`); the deploy policy's CreateNetworkConnector condition and the operator role's Deny name the VM
+// subnet and security group, whose ids exist only in a stack, so the printer uses well-formed placeholders unless
+// they are given (check-policies passes other ids for its operator simulations, since it uses the placeholders' ARNs
+// as "another subnet" and "another group"). Deliberately no --arn kind for the VM subnet or group: the simulations
+// build those ARNs themselves, so a wrong ARN shape in policies.ts fails them.
 //
 // The account id is passed in by the caller (from `aws sts get-caller-identity`) and only ever printed to stdout.
 import * as fs from "fs";

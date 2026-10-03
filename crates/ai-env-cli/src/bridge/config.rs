@@ -173,6 +173,24 @@ pub fn is_rfc1918(ip: &str) -> bool {
     ip.parse::<std::net::Ipv4Addr>().is_ok_and(|a| a.is_private())
 }
 
+/// Is `ip` an address the platform's own resolver can have: a private (RFC
+/// 1918) or link-local IPv4, or an IPv6 address in the VPC's `fd00:ec2::/32`
+/// (`fd00:ec2::253`)? The address class only, never an acceptance: a public
+/// resolver that answers a `vpc` VM is open DNS. No zone (`%eth0`), no
+/// brackets, no surrounding spaces, no IPv4 leading zeros: exactly what
+/// `IpAddr` parses (zero-padded IPv6 groups, `fd00:0ec2::0253`, are fine).
+#[must_use]
+pub fn is_platform_address(ip: &str) -> bool {
+    ip.parse::<std::net::IpAddr>().is_ok_and(|a| is_platform_ip(&a))
+}
+
+fn is_platform_ip(a: &std::net::IpAddr) -> bool {
+    match a {
+        std::net::IpAddr::V4(a) => a.is_private() || a.is_link_local(),
+        std::net::IpAddr::V6(a) => a.segments()[0] == 0xfd00 && a.segments()[1] == 0x0ec2,
+    }
+}
+
 impl AwsCfg {
     /// The S5 keys `ai-env vm|lab|egress|proxy` and doctor rely on: a set
     /// `egress_connector_arn` must be [`is_connector_arn`], a set
@@ -394,15 +412,114 @@ impl Default for CredsCfg {
 pub struct EgressCfg {
     pub require: bool,
     pub disable_nonessential: bool,
-    /// The operator's recorded acceptance of a `platform-dns:<ip>` verdict of
-    /// the `dns-path` probe (S5): without it only `no-dns` lets
-    /// `egress::credential_gate` pass.
-    pub accept_platform_dns: bool,
+    /// The operator's recorded acceptance of the platform resolvers they
+    /// tested (S5): `egress::credential_gate` passes a `platform-dns:<ip>[,…]`
+    /// verdict only when it names these and nothing else; without a resolver
+    /// named only `no-dns` passes ([`EgressCfg::accepted_resolvers`]).
+    pub accept_platform_dns: AcceptPlatformDns,
 }
 
 impl Default for EgressCfg {
     fn default() -> Self {
-        EgressCfg { require: true, disable_nonessential: true, accept_platform_dns: false }
+        EgressCfg { require: true, disable_nonessential: true, accept_platform_dns: AcceptPlatformDns::default() }
+    }
+}
+
+/// `[egress].accept_platform_dns`: `false` (or absent), the resolver tested
+/// (`"fd00:ec2::253"`), or a list of them. `true` (S5's first form) still
+/// parses — the wrapper routes on bridge.toml, so the value already written
+/// must keep parsing (an older binary cannot read the string form: install
+/// before editing) — but names no resolver and so accepts nothing; doctor and
+/// every `vm`/`lab`/`egress check` command say so with the line to write. Any
+/// other type is a parse error naming the forms.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged, expecting = "a platform resolver address (\"fd00:ec2::253\"), a list of them, or false")]
+pub enum AcceptPlatformDns {
+    Flag(bool),
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for AcceptPlatformDns {
+    fn default() -> Self {
+        AcceptPlatformDns::Flag(false)
+    }
+}
+
+/// What the legacy `accept_platform_dns = true` means now, as every message
+/// about it starts.
+pub const TRUE_ACCEPTS_NOTHING: &str = "[egress].accept_platform_dns = true accepts no resolver (it names none)";
+
+impl EgressCfg {
+    /// The entries of `accept_platform_dns` as written (none for either flag).
+    fn pinned_entries(&self) -> &[String] {
+        match &self.accept_platform_dns {
+            AcceptPlatformDns::Flag(_) => &[],
+            AcceptPlatformDns::One(s) => std::slice::from_ref(s),
+            AcceptPlatformDns::Many(v) => v,
+        }
+    }
+
+    /// The first entry that is not a platform resolver's address, with why.
+    fn bad_entry(&self) -> Option<(&str, &'static str)> {
+        self.pinned_entries().iter().find_map(|e| match e.parse::<std::net::IpAddr>() {
+            Err(_) => Some((e.as_str(), "not an IP address (name the platform resolver you tested by its address, as `ai-env lab run dns-path` prints it: \"fd00:ec2::253\")")),
+            Ok(ip) if !is_platform_ip(&ip) => Some((e.as_str(), "not a platform resolver (a private or link-local IPv4, or fd00:ec2::/32; a public resolver that answers is open DNS, never acceptable)")),
+            Ok(_) => None,
+        })
+    }
+
+    /// The platform resolvers the operator named, parsed (so `FD00:0EC2::0253`
+    /// is `fd00:ec2::253`): empty for `false` and for `true`, and empty when
+    /// any entry is invalid — a half-applied list must never widen anything.
+    #[must_use]
+    pub fn accepted_resolvers(&self) -> Vec<std::net::IpAddr> {
+        if self.bad_entry().is_some() {
+            return Vec::new();
+        }
+        let mut out: Vec<std::net::IpAddr> = Vec::new();
+        for ip in self.pinned_entries().iter().filter_map(|e| e.parse::<std::net::IpAddr>().ok()) {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        out
+    }
+
+    /// Every entry an IP address of the platform's class
+    /// ([`is_platform_address`]). Checked by `ai-env vm|lab|egress check`
+    /// (`vm::cmd::Ctx::load`) and doctor, never by [`BridgeConfig::parse`]: the
+    /// wrapper routes on the file. A violation is exit 1 naming the key.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        match (self.bad_entry(), &self.accept_platform_dns) {
+            (None, _) => Ok(()),
+            (Some((e, why)), AcceptPlatformDns::Many(_)) => Err(BridgeError::Config(format!("[egress].accept_platform_dns lists {e:?}: {why}"))),
+            (Some((e, why)), _) => Err(BridgeError::Config(format!("[egress].accept_platform_dns = {e:?}: {why}"))),
+        }
+    }
+
+    /// The legacy `accept_platform_dns = true`: it parses, and accepts nothing.
+    #[must_use]
+    pub fn names_no_resolver(&self) -> bool {
+        self.accept_platform_dns == AcceptPlatformDns::Flag(true)
+    }
+
+    /// What the configuration in force accepts, for every message that
+    /// explains an acceptance or a refusal (the credential gate, `egress
+    /// check` and its `--if-needed` note, `lab run dns-path`, doctor).
+    #[must_use]
+    pub fn dns_acceptance(&self) -> String {
+        if let Some((e, why)) = self.bad_entry() {
+            return format!("[egress].accept_platform_dns is invalid and accepts nothing ({e:?}: {why})");
+        }
+        if self.names_no_resolver() {
+            return format!("{TRUE_ACCEPTS_NOTHING}: name the one you tested, accept_platform_dns = \"<ip>\"");
+        }
+        let accepted = self.accepted_resolvers();
+        if accepted.is_empty() {
+            return "[egress].accept_platform_dns accepts no platform resolver (only no-dns passes)".to_string();
+        }
+        format!("[egress].accept_platform_dns accepts only {}", accepted.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -586,8 +703,68 @@ mod tests {
         for ip in ["10.0.0.1", "172.16.5.4", "192.168.1.1"] {
             assert!(is_rfc1918(ip), "{ip}");
         }
-        assert!(BridgeConfig::parse("[egress]\naccept_platform_dns = true\n").unwrap().egress.accept_platform_dns);
-        assert!(!BridgeConfig::default().egress.accept_platform_dns);
+    }
+
+    /// `[egress].accept_platform_dns`: every form parses (the wrapper routes on the file), only a named platform
+    /// resolver is accepted, compared parsed; `true` accepts nothing and says so; an invalid entry is refused only
+    /// where it is validated, naming the key, and accepts nothing in the meantime.
+    #[test]
+    fn the_dns_acceptance_names_the_tested_resolver() {
+        let egress = |v: &str| BridgeConfig::parse(&format!("[egress]\naccept_platform_dns = {v}\n")).unwrap().egress;
+        let fd00: std::net::IpAddr = "fd00:ec2::253".parse().unwrap();
+        // The legacy `true`: parses and validates, accepts nothing, and says what to write instead.
+        let legacy = egress("true");
+        legacy.validate().unwrap();
+        assert!(legacy.names_no_resolver() && legacy.accepted_resolvers().is_empty());
+        assert_eq!(legacy.dns_acceptance(), "[egress].accept_platform_dns = true accepts no resolver (it names none): name the one you tested, accept_platform_dns = \"<ip>\"");
+        // Absent and false: nothing.
+        for cfg in [BridgeConfig::default().egress, BridgeConfig::parse("").unwrap().egress, egress("false"), egress("[]")] {
+            cfg.validate().unwrap();
+            assert!(!cfg.names_no_resolver() && cfg.accepted_resolvers().is_empty(), "{cfg:?}");
+            assert_eq!(cfg.dns_acceptance(), "[egress].accept_platform_dns accepts no platform resolver (only no-dns passes)");
+        }
+        assert_eq!(BridgeConfig::default().egress.accept_platform_dns, AcceptPlatformDns::Flag(false));
+        // The tested resolver, in any spelling IpAddr reads.
+        for v in ["\"fd00:ec2::253\"", "\"FD00:0EC2::0253\"", "[\"fd00:ec2::253\"]", "[\"fd00:ec2::253\", \"fd00:0ec2::253\"]"] {
+            let cfg = egress(v);
+            cfg.validate().unwrap();
+            assert_eq!(cfg.accepted_resolvers(), [fd00], "{v}");
+            assert_eq!(cfg.dns_acceptance(), "[egress].accept_platform_dns accepts only fd00:ec2::253", "{v}");
+        }
+        let two = egress("[\"169.254.169.253\", \"fd00:ec2::253\"]");
+        two.validate().unwrap();
+        assert_eq!(two.accepted_resolvers(), ["169.254.169.253".parse::<std::net::IpAddr>().unwrap(), fd00]);
+        assert_eq!(two.dns_acceptance(), "[egress].accept_platform_dns accepts only 169.254.169.253, fd00:ec2::253");
+        // Not a platform resolver, not an address, one bad entry in a list: refused naming the key, and nothing accepted.
+        for (v, why) in [
+            ("\"8.8.8.8\"", "[egress].accept_platform_dns = \"8.8.8.8\": not a platform resolver"),
+            ("\"resolver\"", "[egress].accept_platform_dns = \"resolver\": not an IP address"),
+            ("\"\"", "[egress].accept_platform_dns = \"\": not an IP address"),
+            ("\" fd00:ec2::253\"", "not an IP address"),
+            ("\"fd00:ec2::253%eth0\"", "not an IP address"),
+            ("[\"fd00:ec2::253\", \"1.1.1.1\"]", "[egress].accept_platform_dns lists \"1.1.1.1\": not a platform resolver"),
+        ] {
+            let cfg = egress(v);
+            let e = cfg.validate().unwrap_err().to_string();
+            assert!(e.contains(why) && e.contains("[egress].accept_platform_dns"), "{v}: {e}");
+            assert!(cfg.accepted_resolvers().is_empty() && !cfg.names_no_resolver(), "{v}: an invalid pin accepts nothing");
+            assert!(cfg.dns_acceptance().starts_with("[egress].accept_platform_dns is invalid and accepts nothing ("), "{v}: {}", cfg.dns_acceptance());
+        }
+        // A wrong type is a parse error, as for every key, naming the forms.
+        for v in ["3", "[1]", "{ ip = \"fd00:ec2::253\" }", "[\"fd00:ec2::253\", true]"] {
+            let e = BridgeConfig::parse(&format!("[egress]\naccept_platform_dns = {v}\n")).unwrap_err().to_string();
+            assert!(e.contains("a platform resolver address (\"fd00:ec2::253\"), a list of them, or false"), "{v}: {e}");
+        }
+    }
+
+    #[test]
+    fn platform_addresses_are_the_platform_resolvers_class_only() {
+        for ip in ["10.42.1.2", "10.42.0.2", "172.16.0.2", "192.168.0.2", "169.254.169.253", "fd00:ec2::253", "FD00:0EC2::0253"] {
+            assert!(is_platform_address(ip), "{ip}");
+        }
+        for ip in ["127.0.0.2", "1.1.1.1", "8.8.8.8", "::1", "fd00:ec3::253", "fd01:ec2::253", "fe80::1", "100.64.0.2", "", "x", "fd00:ec2::253%eth0", "[fd00:ec2::253]", " 10.42.1.2", "010.42.1.2"] {
+            assert!(!is_platform_address(ip), "{ip}");
+        }
     }
 
     #[test]

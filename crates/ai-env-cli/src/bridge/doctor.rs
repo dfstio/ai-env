@@ -5,7 +5,7 @@
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
 use crate::bridge::awscli::aws_run;
-use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, EgressCfg, Paths, VmCfg, REGION};
+use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, EgressCfg, Paths, VmCfg, REGION, TRUE_ACCEPTS_NOTHING};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::{base_image_verdict, read_infra_state, InfraState, CONNECTOR_NOT_IN_OUTPUTS};
@@ -680,18 +680,27 @@ pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
 
 /// The rows that read `bridge.toml` itself — [`row_execution_role`],
 /// [`row_vm_config`], [`row_microvm_quota`] (`quota` as there),
-/// [`row_egress`] (`state` as there) — only for a file that parsed: for an
-/// absent or unparseable one they would describe the built-in defaults as if
-/// configured, so one `[-  ]` line says they were not checked (the
-/// bridge.toml row already names the reason).
+/// [`row_egress`] (`state` as there), [`row_dns_acceptance`] (`dns_path` as
+/// there) — only for a file that parsed: for an absent or unparseable one
+/// they would describe the built-in defaults as if configured, so one `[-  ]`
+/// line says they were not checked (the bridge.toml row already names the
+/// reason).
 #[must_use]
-pub fn rows_bridge_settings(loaded: &Result<Option<BridgeConfig>, BridgeError>, quota: Option<Result<&str, &str>>, state: &Result<Option<InfraState>, BridgeError>) -> Vec<DoctorLine> {
+pub fn rows_bridge_settings(loaded: &Result<Option<BridgeConfig>, BridgeError>, quota: Option<Result<&str, &str>>, state: &Result<Option<InfraState>, BridgeError>, dns_path: &Result<Option<(String, String)>, String>) -> Vec<DoctorLine> {
     let why = match loaded {
-        Ok(Some(cfg)) => return vec![row_execution_role(&cfg.aws), row_vm_config(&cfg.vm), row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib), row_egress(&cfg.egress, &cfg.aws, state)],
+        Ok(Some(cfg)) => {
+            return vec![
+                row_execution_role(&cfg.aws),
+                row_vm_config(&cfg.vm),
+                row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib),
+                row_egress(&cfg.egress, &cfg.aws, state),
+                row_dns_acceptance(&cfg.egress, dns_path),
+            ]
+        }
         Ok(None) => "no bridge.toml",
         Err(_) => "bridge.toml unparseable",
     };
-    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota and egress connector not checked ({why})"))]
+    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector and DNS acceptance not checked ({why})"))]
 }
 
 /// `state/vms`: the rows by status, and whether a pending row (a
@@ -787,6 +796,35 @@ pub fn row_egress(egress: &EgressCfg, aws: &AwsCfg, state: &Result<Option<InfraS
             DoctorLine::row(Tag::Ok, format!("{name} ACTIVE ({id}state from {source})"))
         }
         Some(st) => DoctorLine::row(Tag::Warn, format!("{name} is {st} (state from {source}): ai-env vm run --egress vpc needs it ACTIVE  <- make connector-status, then {INFRA_STATUS_HINT}")),
+    }
+}
+
+/// `[egress].accept_platform_dns` against the newest `dns-path` row of
+/// `lab/probes.jsonl` (`newest`: its verdict and `ts`; `Err` names why the
+/// file could not be read), as the credential gate will judge it
+/// (`egress::dns_verdict_ok`). `[NO ]` (doctor exit 1) for a pin `ai-env
+/// vm`, `lab` and `egress check` refuse (`EgressCfg::validate`). The legacy
+/// `true` is `[!! ]` with the exact line to write (`egress::pin_suggestion`
+/// of the newest verdict: Mike's `platform-dns:fd00:ec2::253` gives
+/// `accept_platform_dns = "fd00:ec2::253"`). Otherwise `[-  ]` without a
+/// dns-path row, `[ok ]` when the newest verdict is accepted, and `[!! ]`
+/// when it is not or the file is unreadable (the gate refuses every
+/// credential then; nothing that runs today needs it, so never `[NO ]`).
+#[must_use]
+pub fn row_dns_acceptance(egress: &EgressCfg, newest: &Result<Option<(String, String)>, String>) -> DoctorLine {
+    if let Err(e) = egress.validate() {
+        return DoctorLine::row(Tag::No, format!("{e}  <- fix [egress].accept_platform_dns in bridge.toml (ai-env vm, lab and egress check refuse it)"));
+    }
+    let verdict = newest.as_ref().ok().and_then(Option::as_ref).map(|(v, _)| v.as_str());
+    if egress.names_no_resolver() {
+        return DoctorLine::row(Tag::Warn, format!("egress DNS: {TRUE_ACCEPTS_NOTHING}: only no-dns passes the credential gate  <- in bridge.toml: {}", crate::bridge::egress::pin_suggestion(verdict)));
+    }
+    let acceptance = egress.dns_acceptance();
+    match newest {
+        Err(e) => DoctorLine::row(Tag::Warn, format!("egress DNS: the dns-path rows are unreadable ({e}): the credential gate refuses every VM ({acceptance})")),
+        Ok(None) => DoctorLine::row(Tag::Skip, format!("egress DNS: no dns-path verdict recorded ({acceptance})  <- ai-env lab run dns-path")),
+        Ok(Some((v, ts))) if crate::bridge::egress::dns_accepted(v, egress) => DoctorLine::row(Tag::Ok, format!("egress DNS: the newest dns-path verdict {v} ({ts}) is accepted ({acceptance})")),
+        Ok(Some((v, ts))) => DoctorLine::row(Tag::Warn, format!("egress DNS: the newest dns-path verdict {v} ({ts}) is NOT accepted ({acceptance}): the credential gate refuses every VM  <- ai-env lab show dns-path (its note says what replied)")),
     }
 }
 
@@ -1052,7 +1090,10 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             lines.push(row_infra_state(&state, &paths.infra_state()));
             let recorded = state.as_ref().ok().and_then(Option::as_ref);
             let loaded = loaded.as_ref().expect("loaded with the paths");
-            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state));
+            // The newest dns-path row the credential gate will read (a row of the transcript knob never counts): its
+            // verdict and when it was recorded.
+            let dns_path = crate::bridge::egress::newest_dns_path_row(paths);
+            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state, &dns_path));
             // S5: the egress row reads only the state file; the proxy row
             // adds one operator call, for a recorded proxy and an identity.
             let described = proxy_call(arn.is_some(), recorded).map(|id| aws_run("ec2", &proxy_describe_args(id), None, Duration::from_secs(15)));
@@ -1360,26 +1401,82 @@ mod tests {
     fn rows_bridge_settings_only_for_a_parsed_bridge_toml() {
         let quota = quota_json("4");
         let active = ok(active_state());
+        let newest: Result<Option<(String, String)>, String> = Ok(Some(("no-dns".to_string(), "2026-10-02T10:00:00Z".to_string())));
         for (loaded, why) in [(Ok(None), "no bridge.toml"), (Err(BridgeError::Config("[vm].max_concurrent: invalid type".into())), "bridge.toml unparseable")] {
-            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)), &active);
+            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)), &active, &newest);
             let got: Vec<(Tag, String)> = rows.iter().map(text).collect();
-            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm], microvm memory quota and egress connector not checked ({why})"))]);
+            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector and DNS acceptance not checked ({why})"))]);
             assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0, "the default [egress].require never fails a doctor without bridge.toml");
         }
         let cfg = BridgeConfig { vm: VmCfg { max_concurrent: 3, memory_mib: 2048, ..VmCfg::default() }, ..BridgeConfig::default() };
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), Some(Ok(&quota)), &active).iter().map(text).collect();
-        assert_eq!(got.len(), 4, "{got:?}");
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), Some(Ok(&quota)), &active, &newest).iter().map(text).collect();
+        assert_eq!(got.len(), 5, "{got:?}");
         assert_eq!(got[0], text(&row_execution_role(&cfg.aws)));
         assert_eq!(got[1], text(&row_vm_config(&cfg.vm)));
         assert!(got[2].0 == Tag::Warn && got[2].1.contains(" 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB"), "{got:?}");
         assert_eq!(got[3], text(&row_egress(&cfg.egress, &cfg.aws, &active)));
         assert_eq!(got[3].0, Tag::No, "the defaults: require on, no connector: {got:?}");
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), None, &Ok(None)).iter().map(text).collect();
+        assert_eq!(got[4], text(&row_dns_acceptance(&cfg.egress, &newest)));
+        assert_eq!(got[4].0, Tag::Ok, "{got:?}");
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), None, &Ok(None), &Ok(None)).iter().map(text).collect();
         assert_eq!(got[2], (Tag::Skip, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)".to_string()));
+        assert_eq!(got[4].0, Tag::Skip, "no dns-path row: {got:?}");
         // A configured connector with an ACTIVE recorded state: the row is [ok ].
         let cfg = BridgeConfig { aws: AwsCfg { egress_connector_arn: Some(CONNECTOR.into()), proxy_private_ip: Some("10.42.0.10".into()), ..AwsCfg::default() }, ..cfg };
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg)), None, &active).iter().map(text).collect();
+        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg)), None, &active, &newest).iter().map(text).collect();
         assert_eq!(got[3].0, Tag::Ok, "{got:?}");
+    }
+
+    fn egress_toml(v: &str) -> EgressCfg {
+        BridgeConfig::parse(&format!("[egress]\naccept_platform_dns = {v}\n")).unwrap().egress
+    }
+
+    /// The DNS row, every case: an invalid pin is the only failure (exit 1, as `ai-env vm`, `lab` and `egress
+    /// check` refuse it); the legacy `true` says the exact line to write for the newest verdict; otherwise the newest
+    /// dns-path verdict as the credential gate will judge it.
+    #[test]
+    fn row_dns_acceptance_says_what_the_gate_accepts_and_what_to_write() {
+        let at = |v: &str| -> Result<Option<(String, String)>, String> { Ok(Some((v.to_string(), "2026-10-02T10:00:00Z".to_string()))) };
+        let mike = at("platform-dns:fd00:ec2::253");
+        // The legacy `true` with Mike's newest row: the exact line.
+        let row = row_dns_acceptance(&egress_toml("true"), &mike);
+        assert_eq!(
+            text(&row),
+            (Tag::Warn, "egress DNS: [egress].accept_platform_dns = true accepts no resolver (it names none): only no-dns passes the credential gate  <- in bridge.toml: accept_platform_dns = \"fd00:ec2::253\"".to_string())
+        );
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0, "reported, never refused");
+        for (newest, fix) in [(at("no-dns"), "remove the line"), (Ok(None), "accept_platform_dns = \"<the resolver you tested>\""), (at("platform-dns-answered:fd00:ec2::253"), "accept_platform_dns = \"<the resolver you tested>\""), (Err("x".to_string()), "accept_platform_dns = \"<the resolver you tested>\"")] {
+            let (tag, t) = text(&row_dns_acceptance(&egress_toml("true"), &newest));
+            assert!(tag == Tag::Warn && t.ends_with(&format!("  <- in bridge.toml: {fix}")) && !t.contains("is false"), "{newest:?}: {t}");
+        }
+        // The pin: Mike's newest row is accepted.
+        let pinned = egress_toml("\"fd00:ec2::253\"");
+        assert_eq!(
+            text(&row_dns_acceptance(&pinned, &mike)),
+            (Tag::Ok, "egress DNS: the newest dns-path verdict platform-dns:fd00:ec2::253 (2026-10-02T10:00:00Z) is accepted ([egress].accept_platform_dns accepts only fd00:ec2::253)".to_string())
+        );
+        assert_eq!(text(&row_dns_acceptance(&EgressCfg::default(), &at("no-dns"))).0, Tag::Ok, "no-dns needs no pin");
+        // Not accepted: another resolver, the never-accepted classes, or no pin at all.
+        for (egress, newest) in [(&pinned, at("platform-dns:169.254.169.253")), (&pinned, at("platform-dns-answered:fd00:ec2::253")), (&pinned, at("platform-dns-resolves:fd00:ec2::253")), (&pinned, at("open-dns:1.1.1.1")), (&EgressCfg::default(), mike.clone())] {
+            let row = row_dns_acceptance(egress, &newest);
+            let (tag, t) = text(&row);
+            let v = newest.as_ref().unwrap().as_ref().unwrap().0.clone();
+            assert_eq!(tag, Tag::Warn, "{t}");
+            assert!(t.starts_with(&format!("egress DNS: the newest dns-path verdict {v} (2026-10-02T10:00:00Z) is NOT accepted (")) && t.contains(&egress.dns_acceptance()) && t.ends_with("  <- ai-env lab show dns-path (its note says what replied)"), "{t}");
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0, "{t}");
+        }
+        // No dns-path row; an unreadable file.
+        assert_eq!(text(&row_dns_acceptance(&pinned, &Ok(None))), (Tag::Skip, "egress DNS: no dns-path verdict recorded ([egress].accept_platform_dns accepts only fd00:ec2::253)  <- ai-env lab run dns-path".to_string()));
+        let (tag, t) = text(&row_dns_acceptance(&pinned, &Err("lab/probes.jsonl: Permission denied".to_string())));
+        assert!(tag == Tag::Warn && t.starts_with("egress DNS: the dns-path rows are unreadable (lab/probes.jsonl: Permission denied)"), "{t}");
+        // An invalid pin: [NO ], doctor exit 1, the key and the fix named, whatever the newest row says.
+        for (v, why) in [("\"8.8.8.8\"", "not a platform resolver"), ("\"resolver\"", "not an IP address"), ("[\"fd00:ec2::253\", \"1.1.1.1\"]", "lists \"1.1.1.1\"")] {
+            let row = row_dns_acceptance(&egress_toml(v), &mike);
+            let (tag, t) = text(&row);
+            assert_eq!(tag, Tag::No, "{v}: {t}");
+            assert!(t.starts_with("config: [egress].accept_platform_dns") && t.contains(why) && t.ends_with("  <- fix [egress].accept_platform_dns in bridge.toml (ai-env vm, lab and egress check refuse it)"), "{v}: {t}");
+            assert_eq!(crate::commands::doctor_exit_code(&[row], false), 1, "{v}");
+        }
     }
 
     const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";

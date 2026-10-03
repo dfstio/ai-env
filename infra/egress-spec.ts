@@ -62,7 +62,10 @@ export function loadEgressConfig(file = path.join(__dirname, "egress-config.json
     return raw as EgressConfig;
 }
 
-/** What policies.ts needs (the IAM documents of the proxy and operator roles, and the deploy policy). */
+/**
+ * What policies.ts needs (the IAM documents of the proxy and operator roles, and the deploy policy); the VM subnet
+ * and security group ids, which the deploy policy and the operator role's Deny name, come from the stack.
+ */
 export function egressNames(cfg: EgressConfig): EgressNames {
     return {
         parameterPrefix: cfg.parameterPrefix, logGroup: cfg.logGroup, proxyRoleName: cfg.proxyRoleName, operatorRoleName: cfg.operatorRoleName,
@@ -213,6 +216,9 @@ export const EPHEMERAL_TO = 65535;
 /** DNS Firewall (dnsMode "firewall"): the block-all rule and its association. */
 export const FIREWALL_RULE_PRIORITY = 100;
 export const FIREWALL_ASSOCIATION_PRIORITY = 101;
+// Under the egress check's DNS rule 1 (crates/ai-env-cli/src/bridge/egress/mod.rs DNS_RULE) a firewall-mode VPC cannot
+// pass `ai-env egress check`: this NXDOMAIN is `platform-dns-answered`, never accepted. Before using the fallback,
+// measure DNS Firewall's NODATA block response and switch only if it is NOERROR with ANSWER 0 and AUTHORITY 0.
 export const FIREWALL_BLOCK_RESPONSE = "NXDOMAIN";
 /** Every name of a CNAME/DNAME chain is checked against the block-all list (the alternative trusts the redirects). */
 export const FIREWALL_REDIRECTION = "INSPECT_REDIRECTION_DOMAIN";
@@ -472,7 +478,9 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["aws:s3/bucketObjectv2:BucketObjectv2", ["image-zip"]],
         ["aws:cloudwatch/logGroup:LogGroup", ["image-log-group", NET.logGroup, ...(queryLog ? [NET.dnsLogGroup] : [])]],
         ["aws:iam/role:Role", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName]],
-        ["aws:iam/rolePolicy:RolePolicy", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName]],
+        // The operator role's is its Deny (policies.ts operatorRolePolicy): an inline policy on the role itself is
+        // refused by the guard and the plan check.
+        ["aws:iam/rolePolicy:RolePolicy", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName]],
         ["aws:iam/user:User", [RUNTIME_USER_NAME]],
         ["aws:iam/userPolicy:UserPolicy", [RUNTIME_POLICY_NAME]],
         ["aws:iam/policy:Policy", [DEPLOY_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_DNS_POLICY_NAME]],

@@ -1915,10 +1915,12 @@ fn egress_logs_and_the_proxy_targets_call_their_commands() {
 }
 
 /// A fake `cargo` for test-egress: logs its argv, the egress switches and any
-/// lab knob it sees, then exits FAKE_CARGO_RC, or (FAKE_CARGO_MARKER set)
-/// touches the marker and sleeps until a signal ends it.
+/// lab knob it sees, prints a live test's skip line to stderr when
+/// FAKE_CARGO_SKIP is set, then exits FAKE_CARGO_RC, or (FAKE_CARGO_MARKER
+/// set) touches the marker and sleeps until a signal ends it.
 const CARGO_FAKE: &str = r##"lab=$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | sort | tr '\n' ' ')
 printf 'cargo %s [AI_ENV_AWS_TESTS=%s AI_ENV_EGRESS_TESTS=%s]%s\n' "$*" "${AI_ENV_AWS_TESTS:-}" "${AI_ENV_EGRESS_TESTS:-}" "${lab:+ [LAB=${lab% }]}" >> "$FAKE_AIENV_LOG"
+if [ -n "${FAKE_CARGO_SKIP:-}" ]; then echo "live_egress_extra_and_removal: skipped: github.com is allowlisted outside this test" >&2; fi
 if [ -n "${FAKE_CARGO_MARKER:-}" ]; then touch "$FAKE_CARGO_MARKER"; exec sleep 60; fi
 exit "${FAKE_CARGO_RC:-0}""##;
 
@@ -1948,6 +1950,14 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
         assert!(c[0].starts_with("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture [AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1]"), "{c:#?}");
         assert_eq!(c[1], removal);
     }
+    // A live test that skipped its proof (github.com allowlisted outside it) is no pass, though cargo exits 0; the
+    // removal runs all the same, and the output's copy is gone.
+    let (t, bin) = setup();
+    let out = test_egress(t.path(), &bin).env("FAKE_CARGO_SKIP", "1").env("TMPDIR", t.path()).bounded();
+    let text = all(&out);
+    assert!(!out.status.success() && text.contains("live_egress_extra_and_removal: skipped:") && text.contains("test-egress: a live egress test skipped its proof (its skipped: line above), so this is not a pass"), "{text}");
+    assert_eq!(calls(t.path()).last().map(String::as_str), Some(removal), "{text}");
+    assert!(std::fs::read_dir(t.path()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("ai-env-test-egress.")), "the log is removed on exit");
     // A removal that fails is loud and fails the target.
     let (t, bin) = setup();
     let out = test_egress(t.path(), &bin).env("FAKE_AIENV_ALLOW_RC", "7").bounded();

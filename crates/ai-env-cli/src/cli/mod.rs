@@ -520,7 +520,7 @@ pub enum EgressCmd {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
-        /// Start nothing when the image version a new VM runs ([aws].image_version resolved live, as RunMicrovm does) already has a passing check with [aws].egress_connector_arn bound to that very build (createdAt) and to the connector's live facts; an unaccepted DNS verdict is named (`make claude-update` runs it after every deploy)
+        /// Start nothing when the image version a new VM runs ([aws].image_version resolved live, as RunMicrovm does) already has a passing check with [aws].egress_connector_arn bound to that very build (createdAt) and to the connector's live facts, judged by the current DNS rule (a pass recorded before rule 1 never counts); an unaccepted DNS verdict is named (`make claude-update` runs it after every deploy)
         #[arg(long, conflicts_with_all = ["vm", "keep"])]
         if_needed: bool,
     },

@@ -68,7 +68,7 @@ infra-typecheck: ## S3: typecheck the Pulumi program and its scripts (tsc --noEm
 	cd $(INFRA) && npx tsc --noEmit
 	@echo "infra-typecheck: ok"
 
-check-policies: ## S3 T3.6: Access Analyzer on every IAM document + simulate-custom-policy of the runtime policy (§9); read-only
+check-policies: ## S3 T3.6, S5: Access Analyzer on every IAM document; simulate-custom-policy of the runtime policy (§9), the proxy role and the operator role (its Deny with the AWS managed policy); the operator policy's (action, resource) pin and the Deny's shape; read-only
 	AI_ENV_REPO_ROOT="$(CURDIR)" REGION=$(REGION) POLICIES_OUT="$(CURDIR)/target/infra-policies" $(SHELL) $(INFRA)/scripts/check-policies.sh
 
 preview-scratch: ## S3 T3.2/T3.5, S5: pulumi preview of a scratch copy (throwaway backend, stack, passphrase) + the plan check; NEGATIVE=no-logging|no-logging-cast|region|vm-sg-open|private-route|nacl-open|dns-support-on-in-none-mode|stray-rule|stray-type|late-transform|early-transform|dns-firewall-qtype|miswired|iam-widen|owned-param-reset; EGRESS_MODE=none|firewall

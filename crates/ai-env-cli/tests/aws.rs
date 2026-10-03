@@ -711,6 +711,9 @@ async fn live_vm_token_expiry() {
 // time (`egress_serial`): each holds a VM, and [vm].max_concurrent is small.
 // `live_egress_extra_and_removal` edits the proxy's extras through the operator's real
 // bridge root, so it shares `state/egress.lock` and the audit with every other command.
+// Like the command, the tests judge github.com by the effective allowlist, read after the
+// cases ran (`live_allowlisted`: SSM's lists, a lighter read than the command's proved one):
+// while an operator allows it for a workspace, its case is recorded, not judged.
 
 use ai_env_cli::bridge::egress::check::{self, Judgement, Markers, Verdict};
 use ai_env_cli::bridge::egress::{ConnectorAlias, ExpectedEcho};
@@ -768,6 +771,12 @@ fn all_cases() -> Vec<&'static str> {
     check::CASES.iter().map(|c| c.name).collect()
 }
 
+/// The hosts `check::judge_with` records, not judges: those of `check::ALLOWLISTABLE` on the
+/// effective allowlist as SSM holds it now (`check::live_allowlist`, the operator's aws CLI).
+fn live_allowlisted() -> std::collections::BTreeSet<String> {
+    check::allowlisted_hosts(&check::live_allowlist().unwrap_or_else(|e| panic!("the live allowlist: {}", no_account(&e))))
+}
+
 fn show(test: &str, id: &str, j: &Judgement) {
     eprintln!("{test}: {id}, script finished: {}, dns {}", j.finished, j.dns);
     for c in &j.cases {
@@ -787,7 +796,8 @@ fn live_egress_direct_closed() {
         let api = connect(&live.creds).await;
         let ep = HttpsEndpoint::new().unwrap();
         let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
-        let j = check::judge(&shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers);
+        let m = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers;
+        let j = check::judge_with(&m, &live_allowlisted());
         show("live_egress_direct_closed", &vm.id, &j);
         assert!(j.finished, "the script did not finish");
         // Direct egress (name, IPv4 on 443 and 80, IPv6), every DNS path and the proxy's other ports closed (nothing
@@ -811,16 +821,19 @@ fn live_egress_proxy_allowlist() {
         let ep = HttpsEndpoint::new().unwrap();
         let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
         let run = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await;
-        let j = check::judge(&run.markers);
+        let skip = live_allowlisted();
+        let j = check::judge_with(&run.markers, &skip);
         show("live_egress_proxy_allowlist", &vm.id, &j);
         // allowed (first and last) → 401 in a tunnel; denied (the nonce host), an IP literal, CONNECT :8443,
-        // github.com → the proxy's CONNECT 403; plain http :8080 → squid's 403.
+        // github.com → the proxy's CONNECT 403; plain http :8080 → squid's 403 — but github.com is recorded, not
+        // judged, exactly while it is allowlisted.
         for c in j.cases.iter().filter(|c| c.group == "proxy") {
-            assert_eq!(c.verdict, Verdict::Pass, "{}: {}", c.name, c.reason);
+            let allowlisted = check::ALLOWLISTABLE.iter().any(|(name, host)| *name == c.name && skip.contains(*host));
+            assert_eq!(c.verdict, if allowlisted { Verdict::Recorded } else { Verdict::Pass }, "{}: {}", c.name, c.reason);
         }
         // squid's log in CloudWatch (the operator's aws CLI), from the run's client in its window: both tunnels,
-        // a denial for every refused request, no tunnel to a refused host.
-        let squid = check::squid_poll(&run.nonce, run.started_s, run.ended_s, check::SQUID_LOG_BUDGET, check::SQUID_LOG_STEP).await;
+        // a denial for every refused request, no tunnel to a refused host (an allowlisted one's aside).
+        let squid = check::squid_poll(&run.nonce, run.started_s, run.ended_s, check::SQUID_LOG_BUDGET, check::SQUID_LOG_STEP, &skip).await;
         eprintln!("live_egress_proxy_allowlist: squid log: {}", no_account(&format!("{squid:?}")));
         assert!(squid.is_ok(), "{}", no_account(&format!("{squid:?}")));
     });
@@ -895,6 +908,16 @@ fn live_egress_extra_and_removal() {
         return;
     }
     egress_serial(async {
+        // github.com allowlisted already: this test's own leftover (a run killed before its guard) is removed; any
+        // other entry is not this test's to change, and with it the test cannot show github.com refused.
+        if live_allowlisted().contains("github.com") {
+            let o = egress_allow(true);
+            assert!(o.status.success(), "egress allow --remove of this test's leftover: {}", no_account(&String::from_utf8_lossy(&o.stderr)));
+            if live_allowlisted().contains("github.com") {
+                eprintln!("live_egress_extra_and_removal: skipped: github.com is allowlisted outside this test (another workspace or the base list: ai-env egress status)");
+                return;
+            }
+        }
         let live = live_world();
         let guard = VmGuard::new(&live);
         let api = connect(&live.creds).await;
@@ -955,7 +978,8 @@ fn live_egress_after_resume() {
         let alias = ConnectorAlias::load(&live.paths, &plan.egress_connectors[0]);
         assert!(expected.matches(&after.egress, alias.as_ref()), "after resume {} echoes {:?}", vm.id, after.egress);
         // And egress is as closed, and the allowlist as open, as before the suspend.
-        let j = check::judge(&shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers);
+        let m = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers;
+        let j = check::judge_with(&m, &live_allowlisted());
         show("live_egress_after_resume", &vm.id, &j);
         assert!(j.passed(), "{:?}", j.failures());
     });

@@ -211,7 +211,7 @@ pub const CATALOG: [ProbeSpec; 14] = [
     ProbeSpec { name: "snapshot-uniqueness", stage: "S4", source: Source::LiveThenLog, expect: Expect::Exact("nonce-differs"), recorded_by: "ai-env lab run snapshot-uniqueness [--log FILE]", what: "per-VM boot nonces (boot_id is shared by snapshot clones)" },
     ProbeSpec { name: "idle-policy-limits", stage: "S4", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run idle-policy-limits", what: "which suspended durations the service accepts" },
     ProbeSpec { name: "connector-pending", stage: "S5", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run connector-pending ARN (make connector-probe CONFIRM=create-probe-connector)", what: "what RunMicrovm does with an egress connector that is still PENDING (rejected:<code>, or accepted[:echo-mismatch|:internet|:terminated])" },
-    ProbeSpec { name: "dns-path", stage: "S5", source: Source::Live, expect: Expect::Exact("no-dns"), recorded_by: "ai-env lab run dns-path", what: "whether a vpc VM reaches any DNS server (no-dns; platform-dns:<nameserver> for the platform's resolver; open-dns:<ip> for any other; resolves=yes|no in the note)" },
+    ProbeSpec { name: "dns-path", stage: "S5", source: Source::Live, expect: Expect::Exact("no-dns"), recorded_by: "ai-env lab run dns-path", what: "whether a vpc VM reaches any DNS server, asked a fresh name d<nonce>.example.com A (and example.com A of each server that replied): no-dns; platform-dns:<ip>[,<ip>…] when platform resolvers replied only with an empty NOERROR (no answer, no authority); platform-dns-answered:<ip>[,…] for any other platform reply; platform-dns-resolves:<ip>[,…] when one returned an address; open-dns:<ip>[,…] for any other server; resolves=yes|no in the note" },
 ];
 
 /// The catalog entry of `name`.
@@ -720,13 +720,16 @@ pub fn verdict_cloudtrail(doc_json: &str, id: &str, client_token: &str, session_
 
 // ---- S5: dns-path and connector-pending -----------------------------------------------------
 
-/// One `dig` of the dns-path probe (and of `ai-env egress check`'s DNS cases):
-/// which server, over which transport, dig's exit code (`None`: not asked —
-/// `/etc/resolv.conf` named no nameserver), whether the reply carried an
-/// address for the name, and the reply's status and recursion-available
-/// flag when dig printed them (what a platform resolver that "resolves
-/// nothing" does with a query: `REFUSED` without recursion is not a
-/// recursive path out; `SERVFAIL` with recursion available may be one).
+/// One `dig` of the dns-path probe (and of `ai-env egress check`'s DNS cases),
+/// which asks a fresh name that exists nowhere (`d<nonce>.example.com A`)
+/// and, of a server that replied, `example.com A`: which server, over which
+/// transport, dig's exit code (`None`: not asked — `/etc/resolv.conf` named
+/// no nameserver), whether either reply carried an address, and the fresh
+/// name's reply as dig's header printed it — its status, the
+/// recursion-available flag, and the ANSWER and AUTHORITY counts (`None`:
+/// not printed). Only NOERROR with 0 and 0 is the reply the platform's stub
+/// gives and the operator tested ([`is_empty_noerror`]): a validating
+/// recursor answers the fresh name NOERROR with the zone's SOA in AUTHORITY.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsReply {
     pub server: String,
@@ -736,84 +739,167 @@ pub struct DnsReply {
     pub resolves: bool,
     pub status: Option<String>,
     pub ra: Option<bool>,
+    /// The header's `ANSWER:` count.
+    pub answers: Option<u16>,
+    /// The header's `AUTHORITY:` count.
+    pub authority: Option<u16>,
 }
+
+/// The one reply of a platform resolver that may be accepted: status
+/// NOERROR with no answer and no authority section. Anything else — another
+/// status ([`DNS_NO_EXAMPLE`] included), a record, an SOA, a count dig did
+/// not print — is "answered" (fail closed: a parsing slip can only fail a
+/// check).
+#[must_use]
+pub fn is_empty_noerror(status: Option<&str>, answers: Option<u16>, authority: Option<u16>) -> bool {
+    status == Some("NOERROR") && answers == Some(0) && authority == Some(0)
+}
+
+/// The status the check script reports in place of the fresh name's
+/// (`st=NOEXAMPLE`) when the server replied to the fresh name but dig got no
+/// reply asking it `example.com A`: the platform's stub answers both at once
+/// (2 Oct 2026: 0 ms), so this is never the reply that was tested — a
+/// forwarder whose upstream does not answer in time looks so
+/// ([`is_empty_noerror`] refuses it: answered).
+pub const DNS_NO_EXAMPLE: &str = "NOEXAMPLE";
+/// How the reasons and the dns-path note say [`DNS_NO_EXAMPLE`].
+pub const DNS_NO_EXAMPLE_SAID: &str = "example.com A unanswered";
 
 /// The dns-path verdict when a resolver that is not the platform's replies
-/// (`open-dns:<ip>`): a failing verdict, never accepted
+/// (`open-dns:<ip>[,<ip>…]`): a failing verdict, never accepted
 /// (`egress::dns_verdict_ok` refuses it).
 pub const DNS_OPEN_PREFIX: &str = "open-dns:";
-/// The dns-path verdict when a platform resolver resolves names (its
-/// lookups reach authoritative servers: a path out):
-/// `platform-dns-resolves:<ip>`, never accepted (`egress::dns_verdict_ok`
-/// takes only `platform-dns:<ip>`, a resolver that answers without
-/// resolving — DNS Firewall).
+/// The dns-path verdict when a platform resolver returned an address — for
+/// the fresh name, which exists nowhere, or for example.com (a forwarder
+/// that drops the authority section still hands out example.com's): its
+/// lookups reach authoritative servers, a path out.
+/// `platform-dns-resolves:<ip>[,<ip>…]`, never accepted.
 pub const DNS_PLATFORM_RESOLVES_PREFIX: &str = "platform-dns-resolves:";
+/// The dns-path verdict when a platform resolver replied with anything but
+/// an empty NOERROR ([`is_empty_noerror`]): NXDOMAIN, SERVFAIL, REFUSED,
+/// NOTIMP, an SOA in AUTHORITY, records without an address, no header dig
+/// could print, a truncated UDP reply whose TCP retry got nothing, or no
+/// reply to example.com ([`DNS_NO_EXAMPLE`]).
+/// `platform-dns-answered:<ip>[,<ip>…]`, never accepted: the
+/// operator accepted the reply they tested and nothing else (a different
+/// reply from the same address means the platform changed, and the canary
+/// tests must be repeated; a forwarder can pass on its upstream's REFUSED).
+pub const DNS_PLATFORM_ANSWERED_PREFIX: &str = "platform-dns-answered:";
 
-/// A platform resolver address (a private or link-local IPv4, or
-/// `fd00:ec2::/32`): exactly what `egress::dns_verdict_ok` accepts in a
-/// `platform-dns:<ip>` verdict. Anything else that replies is open DNS.
+/// An address of the platform resolver's class (`config::is_platform_address`:
+/// a private or link-local IPv4, or `fd00:ec2::/32`) — the address class
+/// only, never the acceptance (`[egress].accept_platform_dns`). Anything
+/// else that replies is open DNS.
 #[must_use]
 pub fn is_platform_resolver(ip: &str) -> bool {
-    crate::bridge::egress::dns_verdict_ok(&format!("{}{ip}", crate::bridge::egress::DNS_PLATFORM_PREFIX), true)
+    crate::bridge::config::is_platform_address(ip)
 }
 
-/// dns-path from the digs of one VM, the worst first: `open-dns:<ip>` when
-/// a server that is not a platform resolver ([`is_platform_resolver`]: a
-/// public one, a local stub) replied; `platform-dns-resolves:<ip>` when a
-/// platform resolver replied with an address; `platform-dns:<ip>` when one
-/// replied without resolving anything (DNS Firewall); `no-dns` when no
-/// server replied (dig exit 9 everywhere). The IP is the first such server.
-/// The note says `resolves=yes|no` (did any reply carry an address), the
-/// resolv.conf nameserver, and each server's answer (with its status and
-/// whether it offered recursion). Any other dig exit code
-/// is an error (nothing proven: a missing dig must never read as `no-dns`),
-/// as is a probe that asked nothing.
+/// How bad one reply (or a server's worst reply) is, the worst last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DnsClass {
+    /// dig exit 9: nothing came back.
+    Silent,
+    /// A platform resolver's empty NOERROR (`platform-dns:`).
+    Empty,
+    /// A platform resolver's other reply (`platform-dns-answered:`).
+    Answered,
+    /// A platform resolver's address (`platform-dns-resolves:`).
+    Resolves,
+    /// Any reply of another server (`open-dns:`).
+    Open,
+}
+
+/// dns-path from the digs of one VM. Each server is ranked by its worst
+/// reply: `open-dns` when it is not a platform resolver
+/// ([`is_platform_resolver`]: a public one, a local stub) and replied;
+/// `platform-dns-resolves` when a platform resolver returned an address;
+/// `platform-dns-answered` when one replied otherwise than with an empty
+/// NOERROR ([`is_empty_noerror`]); `platform-dns` for an empty NOERROR; no
+/// reply (dig exit 9) ranks lowest. A truncated UDP reply whose TCP retry got
+/// nothing (exit 9 with a status) is a reply: open for a server that is not
+/// the platform's, answered for one that is (never the empty NOERROR tested,
+/// and the check's judge fails it). The verdict is the worst class, followed
+/// by every server of that class in case order, comma-separated (so
+/// acceptance never depends on which server was asked first); `no-dns` when
+/// no server replied. The note says `resolves=yes|no` (did any reply carry
+/// an address), the resolv.conf nameserver, and each server's replies (their
+/// status, ANSWER and AUTHORITY counts, and whether recursion was offered).
+/// Any other dig exit code proves nothing about its server: an error (a
+/// missing dig must never read as `no-dns`, nor hide behind `platform-dns`),
+/// unless another server already gives a failing verdict (answered, resolves
+/// or open: it stands, and the note names the exit code). A probe that asked
+/// nothing is an error too.
 pub fn verdict_dns_path(resolv_ns: Option<&str>, replies: &[DnsReply]) -> std::result::Result<(String, String), String> {
     if replies.iter().all(|r| r.rc.is_none()) {
         return Err("no DNS server was asked".into());
     }
-    let mut servers: Vec<(String, Vec<String>)> = Vec::new();
-    let mut first: Option<&str> = None;
-    let mut resolving: Option<&str> = None;
-    let mut open: Option<&str> = None;
+    let mut servers: Vec<(String, Vec<String>, DnsClass)> = Vec::new();
+    // The first dig that proved nothing (an exit code other than 0 and 9): the error, unless the verdict fails anyway.
+    let mut unproven: Option<String> = None;
     for r in replies {
-        let said = match r.rc {
+        let (class, said) = match r.rc {
             None => continue,
             Some(0) => {
-                if !is_platform_resolver(&r.server) {
-                    open.get_or_insert(r.server.as_str());
+                let class = if !is_platform_resolver(&r.server) {
+                    DnsClass::Open
                 } else if r.resolves {
-                    resolving.get_or_insert(r.server.as_str());
+                    DnsClass::Resolves
+                } else if !is_empty_noerror(r.status.as_deref(), r.answers, r.authority) {
+                    DnsClass::Answered
                 } else {
-                    first.get_or_insert(r.server.as_str());
-                }
-                let detail: Vec<String> = [r.status.clone(), r.ra.map(|a| (if a { "recursion available" } else { "no recursion" }).to_string())].into_iter().flatten().collect();
+                    DnsClass::Empty
+                };
+                let detail: Vec<String> = [
+                    r.status.as_deref().map(|s| (if s == DNS_NO_EXAMPLE { DNS_NO_EXAMPLE_SAID } else { s }).to_string()),
+                    r.answers.map(|n| format!("answer {n}")),
+                    r.authority.map(|n| format!("authority {n}")),
+                    r.ra.map(|a| (if a { "recursion available" } else { "no recursion" }).to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 let what = if r.resolves { "resolved" } else { "replied" };
-                if detail.is_empty() { what.to_string() } else { format!("{what} ({})", detail.join(", ")) }
+                (class, if detail.is_empty() { what.to_string() } else { format!("{what} ({})", detail.join(", ")) })
             }
-            // A truncated UDP reply whose TCP retry failed (dig exit 9 with a status): the UDP path answered.
-            Some(9) if r.status.is_some() && !is_platform_resolver(&r.server) => {
-                open.get_or_insert(r.server.as_str());
-                "replied (truncated; the TCP retry got nothing)".to_string()
+            // A truncated UDP reply whose TCP retry failed (dig exit 9 with a status): the UDP path answered — open for
+            // a server that is not the platform's; for a platform resolver a reply other than the empty NOERROR tested
+            // (answered, as the check's judge fails it).
+            Some(9) if r.status.is_some() => {
+                let class = if is_platform_resolver(&r.server) { DnsClass::Answered } else { DnsClass::Open };
+                (class, "replied (truncated; the TCP retry got nothing)".to_string())
             }
-            Some(9) if r.status.is_some() => return Err(format!("{} sent a truncated reply over {} and dig's TCP retry got nothing: no verdict", r.server, r.transport)),
-            Some(9) => "no reply".to_string(),
-            Some(rc) => return Err(format!("dig exited {rc} asking {} over {}: no verdict (is dig in the image?)", r.server, r.transport)),
+            Some(9) => (DnsClass::Silent, "no reply".to_string()),
+            Some(rc) => {
+                unproven.get_or_insert_with(|| format!("dig exited {rc} asking {} over {}: no verdict (is dig in the image?)", r.server, r.transport));
+                (DnsClass::Silent, format!("dig exited {rc}"))
+            }
         };
         let part = format!("{} {said}", r.transport);
-        match servers.iter_mut().find(|(s, _)| *s == r.server) {
-            Some((_, parts)) => parts.push(part),
-            None => servers.push((r.server.clone(), vec![part])),
+        match servers.iter_mut().find(|(s, _, _)| *s == r.server) {
+            Some((_, parts, worst)) => {
+                parts.push(part);
+                *worst = (*worst).max(class);
+            }
+            None => servers.push((r.server.clone(), vec![part], class)),
         }
     }
     let resolves = replies.iter().any(|r| r.rc == Some(0) && r.resolves);
-    let verdict = match (open, resolving, first) {
-        (Some(s), _, _) => format!("{DNS_OPEN_PREFIX}{s}"),
-        (None, Some(s), _) => format!("{DNS_PLATFORM_RESOLVES_PREFIX}{s}"),
-        (None, None, Some(s)) => format!("{}{s}", crate::bridge::egress::DNS_PLATFORM_PREFIX),
-        (None, None, None) => crate::bridge::egress::DNS_NONE.to_string(),
+    let worst = servers.iter().map(|(_, _, c)| *c).max().unwrap_or(DnsClass::Silent);
+    // A dig that proved nothing may only stand beside a failing verdict: `no-dns` or `platform-dns` would claim what
+    // that server was never shown to do.
+    if let Some(e) = unproven.filter(|_| worst < DnsClass::Answered) {
+        return Err(e);
+    }
+    let of = |class: DnsClass| servers.iter().filter(|(_, _, c)| *c == class).map(|(s, _, _)| s.as_str()).collect::<Vec<_>>().join(",");
+    let verdict = match worst {
+        DnsClass::Open => format!("{DNS_OPEN_PREFIX}{}", of(worst)),
+        DnsClass::Resolves => format!("{DNS_PLATFORM_RESOLVES_PREFIX}{}", of(worst)),
+        DnsClass::Answered => format!("{DNS_PLATFORM_ANSWERED_PREFIX}{}", of(worst)),
+        DnsClass::Empty => format!("{}{}", crate::bridge::egress::DNS_PLATFORM_PREFIX, of(worst)),
+        DnsClass::Silent => crate::bridge::egress::DNS_NONE.to_string(),
     };
-    let asked = servers.iter().map(|(s, parts)| format!("{s} {}", parts.join(", "))).collect::<Vec<_>>().join("; ");
+    let asked = servers.iter().map(|(s, parts, _)| format!("{s} {}", parts.join(", "))).collect::<Vec<_>>().join("; ");
     Ok((verdict, format!("resolves={} resolv.conf nameserver {}; {asked}", if resolves { "yes" } else { "no" }, resolv_ns.unwrap_or("none"))))
 }
 
@@ -1189,11 +1275,17 @@ mod tests {
     }
 
     fn reply(server: &str, transport: &'static str, rc: Option<i32>, resolves: bool) -> DnsReply {
-        DnsReply { server: server.into(), transport, rc, resolves, status: None, ra: None }
+        DnsReply { server: server.into(), transport, rc, resolves, status: None, ra: None, answers: None, authority: None }
+    }
+
+    /// What the platform's stub gave on 2 Oct 2026: NOERROR, no answer, no authority, recursion offered.
+    fn empty(server: &str, transport: &'static str) -> DnsReply {
+        DnsReply { status: Some("NOERROR".into()), ra: Some(true), answers: Some(0), authority: Some(0), ..reply(server, transport, Some(0), false) }
     }
 
     #[test]
     fn dns_path_verdicts() {
+        let pin = |s: &str| [s.parse::<std::net::IpAddr>().unwrap()];
         let closed = [
             reply("10.42.0.2", "udp", Some(9), false),
             reply("10.42.0.2", "tcp", Some(9), false),
@@ -1204,35 +1296,73 @@ mod tests {
         assert_eq!(v, crate::bridge::egress::DNS_NONE);
         assert_eq!(note, "resolves=no resolv.conf nameserver 10.42.0.2; 10.42.0.2 udp no reply, tcp no reply; 169.254.169.253 udp no reply, tcp no reply");
         assert_eq!(spec("dns-path").unwrap().expect.expectation().render(), v, "the expectation");
-        // DNS Firewall (dnsMode firewall): the platform resolver replies and resolves nothing.
-        let firewall = [reply("", "udp", None, false), reply("169.254.169.253", "udp", Some(0), false), reply("10.42.1.2", "udp", Some(9), false)];
-        let (v, note) = verdict_dns_path(None, &firewall).unwrap();
+        // The platform's empty NOERROR: platform-dns, accepted only for a pinned resolver; the counts reach the note.
+        let stub = [reply("", "udp", None, false), empty("169.254.169.253", "udp"), reply("10.42.1.2", "udp", Some(9), false)];
+        let (v, note) = verdict_dns_path(None, &stub).unwrap();
         assert_eq!(v, "platform-dns:169.254.169.253");
-        assert!(note.starts_with("resolves=no resolv.conf nameserver none;") && note.contains("169.254.169.253 udp replied"), "{note}");
-        // A platform resolver that resolves names (its lookups leave): its own verdict, never accepted — and it wins
-        // over one that only replies; resolves=yes when any reply carried an address.
-        let open = [reply("10.42.0.2", "udp", Some(9), false), reply("169.254.169.253", "udp", Some(0), false), reply("10.42.1.2", "tcp", Some(0), true)];
-        let (v, note) = verdict_dns_path(Some("10.42.0.2"), &open).unwrap();
+        assert!(note.starts_with("resolves=no resolv.conf nameserver none;") && note.contains("169.254.169.253 udp replied (NOERROR, answer 0, authority 0, recursion available)"), "{note}");
+        assert!(crate::bridge::egress::dns_verdict_ok(&v, &pin("169.254.169.253")) && !crate::bridge::egress::dns_verdict_ok(&v, &[]) && !crate::bridge::egress::dns_verdict_ok(&v, &pin("fd00:ec2::253")));
+        // Every server of the worst class, in case order: acceptance never depends on which was asked first.
+        let three = [empty("169.254.169.253", "udp"), reply("10.42.0.2", "udp", Some(9), false), empty("fd00:ec2::253", "udp"), empty("fd00:ec2::253", "tcp"), empty("10.42.1.2", "tcp")];
+        assert_eq!(verdict_dns_path(None, &three).unwrap().0, "platform-dns:169.254.169.253,fd00:ec2::253,10.42.1.2");
+        let (v, _) = verdict_dns_path(None, &[empty("fd00:ec2::253", "udp"), empty("10.42.1.2", "udp")]).unwrap();
+        assert!(!crate::bridge::egress::dns_verdict_ok(&v, &pin("fd00:ec2::253")), "an unpinned empty reply asked after the pinned one is not hidden: {v}");
+        // Anything but an empty NOERROR from a platform resolver is answered, never accepted: an SOA (the black lie of a
+        // validating recursor), a record, another status, no status at all, no counts.
+        let answered = |r: DnsReply| verdict_dns_path(None, &[r]).unwrap().0;
+        let fd = || empty("fd00:ec2::253", "udp");
+        for (what, r) in [
+            ("authority 1", DnsReply { authority: Some(1), ..fd() }),
+            ("answer 1", DnsReply { answers: Some(1), ..fd() }),
+            ("NXDOMAIN", DnsReply { status: Some("NXDOMAIN".into()), authority: Some(1), ..fd() }),
+            ("SERVFAIL", DnsReply { status: Some("SERVFAIL".into()), ..fd() }),
+            ("REFUSED", DnsReply { status: Some("REFUSED".into()), ra: Some(false), ..fd() }),
+            ("no status", DnsReply { status: None, ..fd() }),
+            ("no counts", DnsReply { answers: None, authority: None, ..fd() }),
+            ("no answer count", DnsReply { answers: None, ..fd() }),
+            ("no authority count", DnsReply { authority: None, ..fd() }),
+            ("nothing printed", reply("fd00:ec2::253", "udp", Some(0), false)),
+        ] {
+            let v = answered(r);
+            assert_eq!(v, "platform-dns-answered:fd00:ec2::253", "{what}");
+            assert!(!crate::bridge::egress::dns_verdict_ok(&v, &pin("fd00:ec2::253")), "{what}: never accepted");
+        }
+        // A server takes its worst reply: empty over UDP, NXDOMAIN over TCP.
+        let (v, note) = verdict_dns_path(None, &[empty("fd00:ec2::253", "udp"), DnsReply { status: Some("NXDOMAIN".into()), authority: Some(1), ..empty("fd00:ec2::253", "tcp") }]).unwrap();
+        assert_eq!(v, "platform-dns-answered:fd00:ec2::253");
+        assert!(note.ends_with("fd00:ec2::253 udp replied (NOERROR, answer 0, authority 0, recursion available), tcp replied (NXDOMAIN, answer 0, authority 1, recursion available)"), "{note}");
+        assert_eq!(verdict_dns_path(None, &[DnsReply { status: Some("REFUSED".into()), ..reply("fd00:ec2::253", "tcp", Some(0), false) }]).unwrap().1, "resolves=no resolv.conf nameserver none; fd00:ec2::253 tcp replied (REFUSED)", "counts omitted when absent");
+        // A platform resolver that resolves names (its lookups leave): its own verdict, never accepted; resolves=yes when any
+        // reply carried an address.
+        let leaving = [reply("10.42.0.2", "udp", Some(9), false), empty("169.254.169.253", "udp"), DnsReply { resolves: true, answers: Some(1), ..empty("10.42.1.2", "tcp") }];
+        let (v, note) = verdict_dns_path(Some("10.42.0.2"), &leaving).unwrap();
         assert_eq!(v, "platform-dns-resolves:10.42.1.2");
-        assert!(note.starts_with("resolves=yes") && note.contains("10.42.1.2 tcp resolved") && note.contains("169.254.169.253 udp replied"), "{note}");
-        assert!(!crate::bridge::egress::dns_verdict_ok(&v, true) && !crate::bridge::egress::dns_verdict_ok(&v, false), "never accepted");
+        assert!(note.starts_with("resolves=yes") && note.contains("10.42.1.2 tcp resolved (NOERROR, answer 1, authority 0, recursion available)") && note.contains("169.254.169.253 udp replied"), "{note}");
+        assert!(!crate::bridge::egress::dns_verdict_ok(&v, &pin("10.42.1.2")), "never accepted");
         assert!(!expectation_holds("no-dns", &v));
-        // A platform resolver that answers without resolving (DNS Firewall): platform-dns, accepted only with the operator's acceptance.
-        let (v, _) = verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(0), false), reply("10.42.1.2", "udp", Some(9), false)]).unwrap();
-        assert_eq!(v, "platform-dns:169.254.169.253");
-        assert!(crate::bridge::egress::dns_verdict_ok(&v, true) && !crate::bridge::egress::dns_verdict_ok(&v, false));
+        // Precedence: empty < answered < resolves < open, whatever the case order.
+        let answered_r = DnsReply { status: Some("SERVFAIL".into()), ..empty("10.42.0.2", "udp") };
+        let resolves_r = DnsReply { resolves: true, ..empty("10.42.1.2", "udp") };
+        let open_r = reply("9.9.9.9", "udp", Some(0), false);
+        assert_eq!(verdict_dns_path(None, &[answered_r.clone(), empty("fd00:ec2::253", "udp")]).unwrap().0, "platform-dns-answered:10.42.0.2");
+        assert_eq!(verdict_dns_path(None, &[empty("fd00:ec2::253", "udp"), answered_r.clone()]).unwrap().0, "platform-dns-answered:10.42.0.2");
+        assert_eq!(verdict_dns_path(None, &[resolves_r.clone(), answered_r.clone(), empty("fd00:ec2::253", "udp")]).unwrap().0, "platform-dns-resolves:10.42.1.2");
+        assert_eq!(verdict_dns_path(None, &[answered_r.clone(), resolves_r.clone()]).unwrap().0, "platform-dns-resolves:10.42.1.2");
+        assert_eq!(verdict_dns_path(None, &[resolves_r.clone(), open_r.clone(), answered_r.clone()]).unwrap().0, "open-dns:9.9.9.9", "open DNS is worse");
+        assert_eq!(verdict_dns_path(None, &[open_r, resolves_r]).unwrap().0, "open-dns:9.9.9.9");
         // A resolver that is not the platform's (public, a local stub) replying is open DNS, whatever else replied.
         for (ns, server) in [("1.1.1.1", "1.1.1.1"), ("10.42.0.2", "9.9.9.9"), ("127.0.0.53", "127.0.0.53")] {
-            let open = [reply("169.254.169.253", "udp", Some(0), false), reply(server, "udp", Some(0), false), reply("10.42.1.2", "tcp", Some(9), false)];
+            let open = [empty("169.254.169.253", "udp"), empty(server, "udp"), reply("10.42.1.2", "tcp", Some(9), false)];
             let (v, note) = verdict_dns_path(Some(ns), &open).unwrap();
             assert_eq!(v, format!("open-dns:{server}"), "{note}");
-            assert!(!crate::bridge::egress::dns_verdict_ok(&v, true), "never accepted");
+            assert!(!crate::bridge::egress::dns_verdict_ok(&v, &pin(server)), "never accepted");
             assert!(expectation_holds(&spec("dns-path").unwrap().expect.expectation().render(), "no-dns") && !expectation_holds("no-dns", &v));
         }
-        assert_eq!(verdict_dns_path(None, &[reply("fd00:ec2::253", "udp", Some(0), false)]).unwrap().0, "platform-dns:fd00:ec2::253");
-        assert_eq!(verdict_dns_path(None, &[reply("fd00:ec2::253", "udp", Some(0), true)]).unwrap().0, "platform-dns-resolves:fd00:ec2::253");
-        assert_eq!(verdict_dns_path(None, &[reply("10.42.1.2", "udp", Some(0), true), reply("9.9.9.9", "tcp", Some(0), false)]).unwrap().0, "open-dns:9.9.9.9", "open DNS is worse");
+        assert_eq!(verdict_dns_path(None, &[empty("fd00:ec2::253", "udp")]).unwrap().0, "platform-dns:fd00:ec2::253");
+        assert_eq!(verdict_dns_path(None, &[DnsReply { resolves: true, ..empty("fd00:ec2::253", "udp") }]).unwrap().0, "platform-dns-resolves:fd00:ec2::253");
         assert_eq!(verdict_dns_path(None, &[reply("2606:4700:4700::1111", "tcp", Some(0), false)]).unwrap().0, "open-dns:2606:4700:4700::1111");
+        assert_eq!(verdict_dns_path(None, &[empty("1.1.1.1", "udp"), empty("9.9.9.9", "tcp")]).unwrap().0, "open-dns:1.1.1.1,9.9.9.9");
+        // The address class only, never the acceptance: no pin is consulted.
         for platform in ["10.42.0.2", "10.42.1.2", "169.254.169.253", "fd00:ec2::253", "172.16.0.2", "192.168.0.2"] {
             assert!(is_platform_resolver(platform), "{platform}");
         }
@@ -1243,15 +1373,35 @@ mod tests {
         assert!(verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(127), false)]).unwrap_err().contains("exited 127"));
         assert!(verdict_dns_path(None, &[reply("169.254.169.253", "udp", Some(10), false)]).is_err());
         assert!(verdict_dns_path(None, &[reply("", "udp", None, false)]).is_err());
-        // A truncated UDP reply whose TCP retry got nothing (dig exit 9 with a status): never "no reply".
+        // A dig that proved nothing never lets a verdict that could pass stand (no-dns, or an empty reply elsewhere)…
+        let silent = |server: &str, transport: &'static str| reply(server, transport, Some(9), false);
+        assert!(verdict_dns_path(None, &[silent("10.42.0.2", "udp"), silent("fd00:ec2::253", "udp"), reply("10.42.1.2", "tcp", Some(10), false)]).unwrap_err().contains("dig exited 10 asking 10.42.1.2 over tcp"));
+        assert!(verdict_dns_path(None, &[empty("fd00:ec2::253", "udp"), reply("10.42.1.2", "udp", Some(10), false)]).unwrap_err().contains("dig exited 10"), "never platform-dns beside an unproven server");
+        // …but cannot hide a failing one: an answered, resolving or open server is a definite verdict, and the note says
+        // what the other dig did.
+        let (v, note) = verdict_dns_path(None, &[reply("10.42.0.2", "udp", Some(127), false), DnsReply { status: Some("SERVFAIL".into()), ..empty("fd00:ec2::253", "udp") }]).unwrap();
+        assert!(v == "platform-dns-answered:fd00:ec2::253" && note.contains("10.42.0.2 udp dig exited 127"), "{v}: {note}");
+        assert_eq!(verdict_dns_path(None, &[empty("1.1.1.1", "udp"), reply("10.42.0.2", "udp", Some(10), false)]).unwrap().0, "open-dns:1.1.1.1");
+        assert_eq!(verdict_dns_path(None, &[reply("10.42.0.2", "udp", Some(10), false), DnsReply { resolves: true, ..empty("10.42.1.2", "udp") }]).unwrap().0, "platform-dns-resolves:10.42.1.2");
+        // A truncated UDP reply whose TCP retry got nothing (dig exit 9 with a status): never "no reply" — open for a
+        // public resolver, answered for a platform one (the reply tested is the empty NOERROR, never a truncated one).
         let truncated = |server: &str| DnsReply { status: Some("TRUNCATED".into()), ..reply(server, "udp", Some(9), false) };
         let (v, note) = verdict_dns_path(None, &[truncated("1.1.1.1")]).unwrap();
         assert!(v == "open-dns:1.1.1.1" && note.contains("1.1.1.1 udp replied (truncated; the TCP retry got nothing)"), "{v}: {note}");
-        assert!(verdict_dns_path(None, &[truncated("fd00:ec2::253")]).unwrap_err().contains("truncated reply over udp"));
-        // The status and the recursion flag reach the note.
-        let refused = DnsReply { status: Some("REFUSED".into()), ra: Some(false), ..reply("fd00:ec2::253", "tcp", Some(0), false) };
-        assert!(verdict_dns_path(None, &[refused]).unwrap().1.ends_with("fd00:ec2::253 tcp replied (REFUSED, no recursion)"));
+        let (v, note) = verdict_dns_path(None, &[truncated("fd00:ec2::253")]).unwrap();
+        assert!(v == "platform-dns-answered:fd00:ec2::253" && note.contains("fd00:ec2::253 udp replied (truncated; the TCP retry got nothing)"), "{v}: {note}");
+        assert!(!crate::bridge::egress::dns_verdict_ok(&v, &pin("fd00:ec2::253")), "never accepted");
+        assert_eq!(verdict_dns_path(None, &[empty("1.1.1.1", "udp"), truncated("fd00:ec2::253")]).unwrap().0, "open-dns:1.1.1.1", "open DNS is still worse");
+        assert_eq!(verdict_dns_path(None, &[empty("fd00:ec2::253", "tcp"), truncated("fd00:ec2::253")]).unwrap().0, "platform-dns-answered:fd00:ec2::253", "its worst reply");
+        // The fresh name answered, example.com not at all (`st=NOEXAMPLE`): answered, and the note says so in words.
+        let (v, note) = verdict_dns_path(None, &[DnsReply { status: Some(DNS_NO_EXAMPLE.into()), ..empty("fd00:ec2::253", "udp") }]).unwrap();
+        assert!(v == "platform-dns-answered:fd00:ec2::253" && note.ends_with("fd00:ec2::253 udp replied (example.com A unanswered, answer 0, authority 0, recursion available)"), "{v}: {note}");
         assert!(verdict_dns_path(None, &[]).is_err());
+        // Only NOERROR, 0, 0.
+        assert!(is_empty_noerror(Some("NOERROR"), Some(0), Some(0)));
+        for (st, an, au) in [(Some("NOERROR"), Some(0), Some(1)), (Some("NOERROR"), Some(1), Some(0)), (Some("NXDOMAIN"), Some(0), Some(0)), (None, Some(0), Some(0)), (Some("NOERROR"), None, Some(0)), (Some("NOERROR"), Some(0), None), (Some("noerror"), Some(0), Some(0)), (Some(DNS_NO_EXAMPLE), Some(0), Some(0))] {
+            assert!(!is_empty_noerror(st, an, au), "{st:?} {an:?} {au:?}");
+        }
     }
 
     #[test]

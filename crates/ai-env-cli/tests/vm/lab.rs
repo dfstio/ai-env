@@ -6,16 +6,23 @@
 //! S5: the two egress probes (`connector-pending ARN` over the fake's run
 //! failure and echo knobs and the operator's view of the connector;
 //! `dns-path`, which like `ai-env egress check` stops at the fake's refusal
-//! to carry a shell) and `egress check`: its checks before and around that
-//! refusal, and — with the debug transcript knob standing in for the shell,
-//! the fake aws serving a green network (tests/fixtures/egress) and squid's
-//! log — its decision: a pass records, any failure revokes, `--vm` does
-//! neither.
+//! to carry a shell unless the transcript knob stands in for it, and then
+//! says whether the credential gate accepts its verdict, marking its row so
+//! that it never counts as the newest verdict) and `egress check`:
+//! its checks before and around that refusal, and — with the debug
+//! transcript knob standing in for the shell, the fake aws serving a green
+//! network (tests/fixtures/egress) and squid's log — its decision: a pass
+//! records (with the DNS rule it was judged by), any failure revokes (a
+//! platform reply other than the stub's empty NOERROR included), `--vm` does
+//! neither; `--if-needed` never honours a pass of an earlier DNS rule;
+//! github.com on the effective allowlist the network verification proved is
+//! recorded, not judged, and said so — suspended, or not proved, it is
+//! judged, and OPEN.
 use super::cli::{code, stderr, stdout, World};
 use crate::common::CONNECTOR;
 use ai_env_cli::bridge::api::{Call, FakeFailure};
-use ai_env_cli::bridge::egress::check::{denied_host, CASES, FAKE_SHELL_KNOB};
-use ai_env_cli::bridge::egress::{param_name, value_sha256, EgressVerified, VerifiedRecord, EXTRAS_HEADER, PARAMS, SUSPENDED_HEADER};
+use ai_env_cli::bridge::egress::check::{denied_host, CASES, FAKE_SHELL_KNOB, FAKE_SHELL_NOTE};
+use ai_env_cli::bridge::egress::{param_name, parse_extras, parse_hosts, value_sha256, EgressVerified, VerifiedRecord, DNS_RULE, EXTRAS_HEADER, PARAMS, SUSPENDED_HEADER};
 use ai_env_cli::bridge::infra::InfraState;
 use ai_env_cli::wire::time::unix_now;
 use std::fs;
@@ -876,11 +883,13 @@ const RUN_NONCE: &str = "5eed5eed5eed5eed";
 /// A world whose network verification is green: `[aws].egress_connector_arn`, `state/infra.toml` of the
 /// fixtures' stack, the fixtures as aws answers, the proxy's parameters and its `--status` answer.
 fn green_network() -> World {
-    green_network_with("")
+    green_network_with("", "", "")
 }
 
-/// [`green_network`] with `vm_toml` as the `[vm]` section.
-fn green_network_with(vm_toml: &str) -> World {
+/// [`green_network`] with `vm_toml` as the `[vm]` section, and `extras` and `suspended` (the lines after each
+/// parameter's header) in the Parameter Store: the proxy's `--status` line carries their hashes and counts, as a proxy
+/// serving exactly them prints it.
+fn green_network_with(vm_toml: &str, extras: &str, suspended: &str) -> World {
     let w = World::new(vm_toml);
     connect(&w, CONNECTOR);
     let (_, answers) = fake_aws(&w);
@@ -890,8 +899,9 @@ fn green_network_with(vm_toml: &str) -> World {
         fs::copy(e.path(), answers.join(e.file_name())).unwrap();
     }
     let ssm = w.root().join("ssm");
+    let (extras, suspended) = (format!("{EXTRAS_HEADER}{extras}"), format!("{SUSPENDED_HEADER}{suspended}"));
     let mut values = Vec::new();
-    for (p, v) in [("squid.conf", NET_SQUID_CONF), ("allow", NET_ALLOW), ("extras", EXTRAS_HEADER), ("suspended", SUSPENDED_HEADER)] {
+    for (p, v) in [("squid.conf", NET_SQUID_CONF), ("allow", NET_ALLOW), ("extras", extras.as_str()), ("suspended", suspended.as_str())] {
         let f = ssm.join(param_name(p).trim_start_matches('/'));
         fs::create_dir_all(f.parent().unwrap()).unwrap();
         fs::write(&f, v).unwrap();
@@ -899,7 +909,8 @@ fn green_network_with(vm_toml: &str) -> World {
         values.push((p, v));
     }
     let sums: Vec<String> = PARAMS.iter().map(|p| format!("sha256_{p}={}", value_sha256(values.iter().find(|(q, _)| q == p).unwrap().1))).collect();
-    let status = format!("squid-6.13-1.amzn2023.0.1.aarch64\nsquid=active allowed=4 extras=0 suspended=0 {} parse=ok applied=yes\n", sums.join(" "));
+    let counts = format!("allowed={} extras={} suspended={}", parse_hosts(NET_ALLOW).unwrap().len(), parse_extras(&extras).unwrap().len(), parse_hosts(&suspended).unwrap().len());
+    let status = format!("squid-6.13-1.amzn2023.0.1.aarch64\nsquid=active {counts} {} parse=ok applied=yes\n", sums.join(" "));
     let invocation = serde_json::json!({
         "CommandId": "0b1c2d3e-0000-4000-8000-000000000001", "InstanceId": "i-0123456789abcdef0", "Comment": "ai-env", "DocumentName": "AWS-RunShellScript",
         "DocumentVersion": "$DEFAULT", "PluginName": "aws:runShellScript", "ResponseCode": 0, "ExecutionStartDateTime": "2026-10-01T10:00:00.100Z",
@@ -936,6 +947,11 @@ fn green_network_with(vm_toml: &str) -> World {
 
 /// A transcript in which every case of a closed VPC printed its marker (`case`'s line replaced by `line`).
 fn transcript_file(w: &World, replace: Option<(&str, &str)>) -> PathBuf {
+    transcript_with(w, replace.as_slice())
+}
+
+/// [`transcript_file`] with each `(case, line)` of `replace` in place of that case's line.
+fn transcript_with(w: &World, replace: &[(&str, &str)]) -> PathBuf {
     let mut out = String::from("bash-5.2# aienv_c allowed https://api.anthropic.com/v1/models\r\n");
     for c in &CASES {
         let line = match c.name {
@@ -946,13 +962,13 @@ fn transcript_file(w: &World, replace: Option<(&str, &str)>) -> PathBuf {
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
             n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
-            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
-            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none".to_string(),
-            _ => "rc=9 ns=10.42.0.2 res=no st=none ra=none".to_string(),
+            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none an=none au=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
+            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none an=none au=none".to_string(),
+            _ => "rc=9 ns=10.42.0.2 res=no st=none ra=none an=none au=none".to_string(),
         };
-        let line = match replace {
-            Some((name, other)) if name == c.name => other.to_string(),
-            _ => line,
+        let line = match replace.iter().find(|(name, _)| *name == c.name) {
+            Some((_, other)) => (*other).to_string(),
+            None => line,
         };
         out.push_str(&format!("@@AIENV{RUN_NONCE} {} {line}\r\n", c.name));
     }
@@ -962,8 +978,10 @@ fn transcript_file(w: &World, replace: Option<(&str, &str)>) -> PathBuf {
     p
 }
 
-/// squid's log of the run in CloudWatch (`logs filter-log-events`), stamped now, from client `client`.
-fn squid_log(w: &World, client: &str, skip: Option<&str>) {
+/// squid's log of the run in CloudWatch (`logs filter-log-events`), stamped now, from client `client`: a passing run's
+/// lines but the one containing `skip`, then `extra` (`<code>/<status> <bytes> <method> <host:port>`, later in the
+/// same second).
+fn squid_log(w: &World, client: &str, skip: Option<&str>, extra: &[&str]) {
     let t = unix_now();
     let host = denied_host(RUN_NONCE);
     let lines = [
@@ -976,8 +994,9 @@ fn squid_log(w: &World, client: &str, skip: Option<&str>) {
         "TCP_TUNNEL/200 1 CONNECT api.anthropic.com:443".to_string(),
     ];
     let events: Vec<serde_json::Value> = lines
-        .iter()
+        .into_iter()
         .filter(|l| skip.is_none_or(|s| !l.contains(s)))
+        .chain(extra.iter().map(|l| (*l).to_string()))
         .enumerate()
         .map(|(i, l)| serde_json::json!({"logStreamName": "i-0123456789abcdef0", "timestamp": t * 1000, "message": format!("aienv {t}.{i:03} 5 {client} {l}"), "ingestionTime": t * 1000, "eventId": format!("e{i}")}))
         .collect();
@@ -1006,7 +1025,7 @@ fn check_audit(w: &World) -> Vec<serde_json::Value> {
 #[test]
 fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
     let w = green_network();
-    squid_log(&w, "10.42.1.17", None);
+    squid_log(&w, "10.42.1.17", None, &[]);
     let t = transcript_file(&w, None);
     let o = check_with(&w, &["egress", "check"], &t);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
@@ -1017,7 +1036,8 @@ fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
     let v = verified(&w);
     assert_eq!(v.records.len(), 1, "{v:?}");
     let rec = &v.records[0];
-    assert_eq!((rec.image_arn.as_str(), rec.image_version.as_str(), rec.connector.as_str(), rec.dns.as_str()), (ai_env_cli::bridge::api::FAKE_IMAGE_ARN, "1.0", CONNECTOR, "no-dns"));
+    assert_eq!((rec.image_arn.as_str(), rec.image_version.as_str(), rec.connector.as_str(), rec.dns.as_str(), rec.dns_rule), (ai_env_cli::bridge::api::FAKE_IMAGE_ARN, "1.0", CONNECTOR, "no-dns", DNS_RULE));
+    assert!(out.contains("dns: no-dns (asked d5eed5eed5eed5eed.example.com A; the credential gate accepts it: [egress].accept_platform_dns accepts no platform resolver (only no-dns passes))"), "{out}");
     assert!(rec.network.starts_with("19 checks ok: connector") && rec.squid_log.contains("TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443") && rec.cases.contains("allowed-last=pass"), "{rec:?}");
     // Bound to the connector's live facts (the golden get-network-connector) and the image version's created_at (the fake's 1.0).
     assert_eq!(
@@ -1047,10 +1067,21 @@ fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
     assert_eq!((doc["network"]["ok"].as_bool(), doc["squid_log"]["ok"].as_bool()), (Some(true), Some(true)));
 }
 
-/// What the first live check met (1 Oct 2026): a `get-network-connector` answer without `Version`, a script that
-/// waited for the proxy before its first case, and `fd00:ec2::253` replying without an address. The pass is
-/// recorded (bound to the facts the answer has), the wait and dig's status are reported, and the run's DNS verdict
-/// is the platform resolver's.
+/// The platform stub's reply as the VMs gave it on 2 Oct 2026: NOERROR, no answer, no authority, recursion offered.
+const STUB_REPLY: &str = "rc=0 ns=fd00:ec2::253 res=no st=NOERROR ra=yes an=0 au=0";
+
+/// `[egress] accept_platform_dns = <value>` appended to this world's bridge.toml (its last section is `[vm]`).
+fn accept_platform_dns(w: &World, value: &str) {
+    let path = w.bridge().join("bridge.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{text}\n[egress]\naccept_platform_dns = {value}\n")).unwrap();
+}
+
+/// What the first live checks met (1 and 2 Oct 2026): a `get-network-connector` answer without `Version`, a script
+/// that waited for the proxy before its first case, and `fd00:ec2::253` replying with the stub's empty NOERROR to the
+/// fresh name. The pass is recorded (bound to the facts the answer has, judged by the current DNS rule), the wait and
+/// dig's reply are reported, and the run's DNS verdict is the platform resolver's, which the credential gate accepts
+/// only once the operator names it.
 #[test]
 fn egress_check_records_a_pass_for_the_live_connector_shape_and_reports_the_wait() {
     let w = green_network();
@@ -1059,21 +1090,142 @@ fn egress_check_records_a_pass_for_the_live_connector_shape_and_reports_the_wait
     doc.as_object_mut().unwrap().remove("Version");
     doc["StateReason"] = serde_json::json!("Initial creation");
     fs::write(&answer, doc.to_string()).unwrap();
-    squid_log(&w, "10.42.1.158", None);
-    let t = transcript_file(&w, Some(("dns-platform6-udp", "rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no")));
+    squid_log(&w, "10.42.1.158", None, &[]);
+    let t = transcript_with(&w, &[("dns-platform6-udp", STUB_REPLY), ("dns-platform6-tcp", STUB_REPLY)]);
     let text = fs::read_to_string(&t).unwrap().replacen("@@AIENV", &format!("@@AIENV{RUN_NONCE} ready try=4 s=6 ok=yes\r\n@@AIENV"), 1);
     fs::write(&t, text).unwrap();
     let o = check_with(&w, &["egress", "check"], &t);
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("ready: the VM reached the proxy's port 6 s after the script began (4 attempts)"), "{out}");
-    assert!(out.contains("dns-platform6-udp   fd00:ec2::253 replied (status REFUSED, no recursion) and resolved nothing") && out.contains("dns: platform-dns:fd00:ec2::253"), "{out}");
+    assert!(out.contains("dns-platform6-udp   fd00:ec2::253 replied with an empty NOERROR (status NOERROR, answer 0, authority 0, recursion available) and no address for example.com"), "{out}");
+    assert!(
+        out.contains("dns: platform-dns:fd00:ec2::253 (asked d5eed5eed5eed5eed.example.com A; the credential gate does NOT accept it: [egress].accept_platform_dns accepts no platform resolver (only no-dns passes))"),
+        "recorded, and said not accepted: {out}"
+    );
     assert!(out.contains("egress check passed: recorded for image version 1.0"), "{out}");
     let rec = &verified(&w).records[0];
     assert_eq!((rec.connector_facts.id.as_str(), rec.connector_facts.version.as_str(), rec.connector_facts.network_protocol.as_str()), ("nc-0a1b2c3d4e5f60718", "", "IPv4"), "no Version answered: bound to the rest");
-    assert_eq!(rec.dns, "platform-dns:fd00:ec2::253");
+    assert_eq!((rec.dns.as_str(), rec.dns_rule), ("platform-dns:fd00:ec2::253", DNS_RULE));
     let audit = check_audit(&w);
     assert_eq!((audit[0]["detail"]["verdict"].as_str(), audit[0]["detail"]["ready"].as_str()), (Some("pass"), Some("6s/4/ok")), "{}", audit[0]);
+    let o = check_with(&w, &["egress", "check", "--json"], &t);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!((doc["dns"].as_str(), doc["dns_name"].as_str(), doc["dns_accepted"].as_bool()), (Some("platform-dns:fd00:ec2::253"), Some("d5eed5eed5eed5eed.example.com"), Some(false)), "{doc}");
+    let case = doc["cases"].as_array().unwrap().iter().find(|c| c["name"] == "dns-platform6-tcp").unwrap().clone();
+    assert_eq!((case["dns_status"].as_str(), case["dns_answers"].as_u64(), case["dns_authority"].as_u64(), case["verdict"].as_str()), (Some("NOERROR"), Some(0), Some(0), Some("pass")), "{case}");
+    // The operator names the resolver they tested: the same evidence is accepted.
+    accept_platform_dns(&w, "\"fd00:ec2::253\"");
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("dns: platform-dns:fd00:ec2::253 (asked d5eed5eed5eed5eed.example.com A; the credential gate accepts it: [egress].accept_platform_dns accepts only fd00:ec2::253)"), "{}", stdout(&o));
+    assert!(!stderr(&o).contains("accepts no resolver"), "a pin draws no warning: {}", stderr(&o));
+    let o = check_with(&w, &["egress", "check", "--json"], &t);
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(doc["dns_accepted"].as_bool(), Some(true), "{doc}");
+    no_vm_left(&w);
+}
+
+/// Any platform reply but the stub's empty NOERROR fails the check of its own VM: exit 9, the case named, the run's
+/// verdict `platform-dns-answered`, every earlier pass of the connector revoked — whatever the pin.
+#[test]
+fn egress_check_revokes_on_any_platform_reply_but_the_empty_noerror() {
+    let w = green_network();
+    accept_platform_dns(&w, "\"fd00:ec2::253\"");
+    squid_log(&w, "10.42.1.17", None, &[]);
+    for reply in [
+        "rc=0 ns=fd00:ec2::253 res=no st=NXDOMAIN ra=yes an=0 au=1",
+        "rc=0 ns=fd00:ec2::253 res=no st=SERVFAIL ra=yes an=0 au=0",
+        "rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no an=0 au=0",
+        "rc=0 ns=fd00:ec2::253 res=no st=NOERROR ra=yes an=0 au=1",
+    ] {
+        seed_verified(&w);
+        let o = check_with(&w, &["egress", "check"], &transcript_with(&w, &[("dns-platform6-udp", reply), ("dns-platform6-tcp", STUB_REPLY)]));
+        assert_eq!(code(&o), 9, "{reply}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stdout(&o).contains("FAIL      dns-platform6-udp") && !stdout(&o).contains("FAIL      dns-platform6-tcp"), "{reply}: {}", stdout(&o));
+        assert!(stdout(&o).contains("dns: platform-dns-answered:fd00:ec2::253 (asked d5eed5eed5eed5eed.example.com A; the credential gate does NOT accept it"), "{reply}: {}", stdout(&o));
+        let v = verified(&w);
+        assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "{reply}: revoked, nothing recorded: {v:?}");
+        assert!(stdout(&o).contains("revoked 2 earlier passes of this connector"), "{reply}: {}", stdout(&o));
+        assert_eq!(check_audit(&w).pop().unwrap()["detail"]["revoked"].as_str(), Some("2"), "{reply}");
+        no_vm_left(&w);
+    }
+}
+
+/// `lab run dns-path` through the transcript knob (debug builds, under the fake): the verdict of the stub's reply is
+/// recorded with the fresh name in its note, the acceptance is said before the row, and the probe exits 1 as for any
+/// verdict but the expected `no-dns`; a pin makes the same verdict accepted. `--manual` never writes a dns-path row
+/// and names the line to write (never `= true`). The knob's rows say so in their note and never decide the newest
+/// dns-path verdict: this test sees that through the `true` warning; doctor's row and the gate's kill switch read the
+/// same `egress::newest_dns_path_row`, whose skip the egress unit tests pin. `--note` cannot forge that mark.
+#[test]
+fn lab_dns_path_through_the_transcript_knob_says_what_the_gate_accepts() {
+    let w = green_network();
+    let t = transcript_with(&w, &[("dns-platform6-udp", STUB_REPLY), ("dns-platform6-tcp", STUB_REPLY)]);
+    let o = check_with(&w, &["lab", "run", "dns-path"], &t);
+    assert_eq!(code(&o), 1, "probe verdict differs from the expectation: {}\n{}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("dns-path: the credential gate does NOT accept platform-dns:fd00:ec2::253 ([egress].accept_platform_dns accepts no platform resolver (only no-dns passes))"), "{out}");
+    assert!(out.contains("recorded dns-path=platform-dns:fd00:ec2::253 (expected no-dns)"), "{out}");
+    assert!(stderr(&o).contains("probe verdict differs from the expectation"), "{}", stderr(&o));
+    let row = rows(&w, "dns-path").pop().unwrap();
+    assert_eq!(row["verdict"], "platform-dns:fd00:ec2::253", "{row}");
+    let note = row["note"].as_str().unwrap();
+    assert!(note.contains("fd00:ec2::253 udp replied (NOERROR, answer 0, authority 0, recursion available), tcp replied (NOERROR, answer 0, authority 0, recursion available)"), "{note}");
+    assert!(note.contains("; asked d5eed5eed5eed5eed.example.com A, and example.com A of each server that replied (microvm-"), "{note}");
+    assert!(note.ends_with(&format!("); {FAKE_SHELL_NOTE}")), "a file stood in for the VM's shell, and the row says so: {note}");
+    assert_eq!(shell_tokens(&w), 0, "the knob stands in for the shell");
+    no_vm_left(&w);
+    // The pin of the tested resolver: accepted (still exit 1: the catalog expects no-dns).
+    accept_platform_dns(&w, "\"fd00:ec2::253\"");
+    let o = check_with(&w, &["lab", "run", "dns-path"], &t);
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("dns-path: the credential gate accepts platform-dns:fd00:ec2::253 ([egress].accept_platform_dns accepts only fd00:ec2::253)"), "{}", stdout(&o));
+    no_vm_left(&w);
+    // An answered reply is recorded as such, and never accepted.
+    let o = check_with(&w, &["lab", "run", "dns-path"], &transcript_with(&w, &[("dns-platform6-udp", "rc=0 ns=fd00:ec2::253 res=no st=NOERROR ra=yes an=0 au=1")]));
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stdout(&o).contains("dns-path: the credential gate does NOT accept platform-dns-answered:fd00:ec2::253"), "{}", stdout(&o));
+    assert_eq!(rows(&w, "dns-path").pop().unwrap()["verdict"], "platform-dns-answered:fd00:ec2::253");
+    // Without the knob, the fake still refuses (exit 9) and records nothing.
+    let n = rows(&w, "dns-path").len();
+    let o = s5_run(&w, &["lab", "run", "dns-path"]);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert_eq!(rows(&w, "dns-path").len(), n);
+    no_vm_left(&w);
+    // --manual: a usage error naming the line to write.
+    let o = s5_run(&w, &["lab", "run", "dns-path", "--manual", "platform-dns:fd00:ec2::253"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("[egress].accept_platform_dns = \"<ip>\"") && !stderr(&o).contains("= true"), "{}", stderr(&o));
+    assert_eq!(rows(&w, "dns-path").len(), n, "nothing recorded by hand");
+    // --note cannot carry the knob's mark (a live row carrying it would be skipped): refused before any VM.
+    let started = w.runs();
+    let o = s5_run(&w, &["lab", "run", "dns-path", "--note", &format!("copied from a row: {FAKE_SHELL_NOTE}")]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--note may not contain"), "{}", stderr(&o));
+    assert_eq!((w.runs(), rows(&w, "dns-path").len()), (started, n), "nothing started, nothing recorded");
+    // The knob's rows never decide the newest dns-path verdict. Under the legacy `true`, with the knob's newest row the
+    // stub's platform-dns, the warning still has no resolver to name…
+    let bridge_toml = w.bridge().join("bridge.toml");
+    let text = fs::read_to_string(&bridge_toml).unwrap().replace("accept_platform_dns = \"fd00:ec2::253\"", "accept_platform_dns = true");
+    fs::write(&bridge_toml, text).unwrap();
+    let true_warning = "ai-env: warning: [egress].accept_platform_dns = true accepts no resolver (it names none); only no-dns passes the credential gate: in ";
+    // (transcript_with rewrites one file: the stub's transcript again.)
+    let t = transcript_with(&w, &[("dns-platform6-udp", STUB_REPLY), ("dns-platform6-tcp", STUB_REPLY)]);
+    assert_eq!(code(&check_with(&w, &["lab", "run", "dns-path"], &t)), 1);
+    assert_eq!(rows(&w, "dns-path").pop().unwrap()["verdict"], "platform-dns:fd00:ec2::253");
+    let o = s5_run(&w, &["vm", "list"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(true_warning) && stderr(&o).contains(": accept_platform_dns = \"<the resolver you tested>\""), "the knob's row names nothing: {}", stderr(&o));
+    // …while a live probe's row (no mark) decides, and stays the newest that counts whatever the knob writes after it.
+    let live = serde_json::json!({"probe": "dns-path", "stage": "S5", "ext": null, "sdk": null, "verdict": "platform-dns:fd00:ec2::253", "expected": "no-dns", "ts": "2026-10-02T10:00:00Z", "note": "resolves=no resolv.conf nameserver 10.42.0.2; fd00:ec2::253 udp replied (NOERROR, answer 0, authority 0, recursion available) (microvm-live)"});
+    let probes = w.bridge().join("lab").join("probes.jsonl");
+    fs::write(&probes, format!("{}{live}\n", fs::read_to_string(&probes).unwrap())).unwrap();
+    assert_eq!(code(&check_with(&w, &["lab", "run", "dns-path"], &transcript_with(&w, &[("dns-platform6-udp", "rc=0 ns=fd00:ec2::253 res=no st=SERVFAIL ra=yes an=0 au=0")]))), 1);
+    assert_eq!(rows(&w, "dns-path").pop().unwrap()["verdict"], "platform-dns-answered:fd00:ec2::253", "the knob's row is the file's newest");
+    let o = s5_run(&w, &["vm", "list"]);
+    assert!(stderr(&o).contains(true_warning) && stderr(&o).contains(": accept_platform_dns = \"fd00:ec2::253\""), "the live row decides: {}", stderr(&o));
     no_vm_left(&w);
 }
 
@@ -1092,22 +1244,22 @@ fn egress_check_revokes_on_any_failure_and_vm_is_report_only() {
         no_vm_left(&w);
     };
     // A case fails (direct egress answered): the VM's word is enough to fail.
-    squid_log(&w, "10.42.1.17", None);
+    squid_log(&w, "10.42.1.17", None, &[]);
     seed_verified(&w);
     let o = check_with(&w, &["egress", "check"], &transcript_file(&w, Some(("direct-ipv4", "rc=0 code=200 size=9 conn=1 hc=000 t403=no sq=no"))));
     fail(&o, "direct-ipv4: OPEN");
     assert!(stdout(&o).contains("revoked 2 earlier passes of this connector"), "{}", stdout(&o));
     // Every case passes, but squid's log lacks the run's GET :8080 denial (budget scaled to milliseconds).
     seed_verified(&w);
-    squid_log(&w, "10.42.1.17", Some("GET api.anthropic.com:8080"));
+    squid_log(&w, "10.42.1.17", Some("GET api.anthropic.com:8080"), &[]);
     fail(&check_with(&w, &["egress", "check"], &transcript_file(&w, None)), "TCP_DENIED/403 GET api.anthropic.com:8080 from 10.42.1.17");
     // squid's log shows the run from outside the VM subnet.
     seed_verified(&w);
-    squid_log(&w, "10.42.0.99", None);
+    squid_log(&w, "10.42.0.99", None, &[]);
     fail(&check_with(&w, &["egress", "check"], &transcript_file(&w, None)), "outside the VM subnet");
     // The network drifted (a VPC endpoint appeared): squid's log is not even asked.
     seed_verified(&w);
-    squid_log(&w, "10.42.1.17", None);
+    squid_log(&w, "10.42.1.17", None, &[]);
     let endpoints = w.root().join("answers").join("ec2.describe-vpc-endpoints.json");
     let green = fs::read_to_string(&endpoints).unwrap();
     fs::write(&endpoints, serde_json::json!({"VpcEndpoints": [{"VpcEndpointId": "vpce-0123456789abcdef0", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "available"}]}).to_string()).unwrap();
@@ -1136,7 +1288,7 @@ fn egress_check_revokes_on_any_failure_and_vm_is_report_only() {
 #[test]
 fn egress_check_revokes_and_records_nothing_when_a_network_row_is_unknown() {
     let w = green_network();
-    squid_log(&w, "10.42.1.17", None);
+    squid_log(&w, "10.42.1.17", None, &[]);
     seed_verified(&w);
     let t = transcript_file(&w, None);
     let o = s5_run_env(&w, &["egress", "check"], &[(FAKE_SHELL_KNOB, t.as_path()), ("FAKE_AWS_FAIL_OP", Path::new("ec2 describe-nat-gateways"))]);
@@ -1148,6 +1300,135 @@ fn egress_check_revokes_and_records_nothing_when_a_network_row_is_unknown() {
     assert_eq!((last["detail"]["verdict"].as_str(), last["detail"]["revoked"].as_str()), (Some("fail"), Some("2")), "{last}");
     assert!(!aws_calls(&w).contains("logs filter-log-events"), "squid's log is not asked once the network failed");
     no_vm_left(&w);
+}
+
+/// `proxy-github`'s marker when the proxy opened github.com's tunnel (github.com answers 200).
+const GITHUB_TUNNEL: &str = "rc=0 code=200 size=284512 conn=1 hc=200 t403=no sq=no";
+/// The `extras` line `ai-env egress allow some-ws github.com` writes.
+const GITHUB_EXTRA: &str = "github.com\tsome-ws\n";
+/// squid's log line of that tunnel.
+const GITHUB_SQUID_TUNNEL: &str = "TCP_TUNNEL/200 284512 CONNECT github.com:443";
+
+/// github.com among the extras (`ai-env egress allow some-ws github.com`), proved served by the network verification
+/// (the `parameters` row against the proxy's `applied=yes` status line): its case is recorded, not judged — the VM's
+/// tunnel and squid's are no failure, its denial is not required — and the report, stderr, the JSON, the audit row and
+/// the record say so. The same when the VM was still refused (github.com added after its case ran). A case with no
+/// result (an unreadable transcript, a script that never reached it) is judged, and fails; nothing says it recorded.
+#[test]
+fn egress_check_records_a_pass_with_github_allowlisted_and_says_so() {
+    let w = green_network_with("", GITHUB_EXTRA, "");
+    squid_log(&w, "10.42.1.17", Some("CONNECT github.com:443"), &[GITHUB_SQUID_TUNNEL]);
+    let t = transcript_file(&w, Some(("proxy-github", GITHUB_TUNNEL)));
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    let case = "not judged: github.com is allowlisted on the proxy (its effective allowlist, as the network verification read it); curl saw HTTP 200 (rc 0, 284512 bytes; 1 connect), CONNECT 200; this check does not show squid refusing it";
+    assert!(out.lines().any(|l| l.starts_with("  recorded  proxy-github ") && l.ends_with(case)), "{out}");
+    let said = "allowlisted: github.com (on the proxy's effective allowlist as the network verification read it: its case is recorded, not judged, and this check does not show squid refusing it)";
+    assert!(out.lines().any(|l| l == said), "{out}");
+    assert!(stderr(&o).contains(&format!("egress check: {said}")), "{}", stderr(&o));
+    assert!(
+        out.contains("squid log: from 10.42.1.17: 2 tunnels to api.anthropic.com:443; TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443, CONNECT 1.1.1.1:443, CONNECT api.anthropic.com:8443, GET api.anthropic.com:8080; no tunnel to a refused host; allowlisted, not required refused: github.com (after "),
+        "{out}"
+    );
+    assert!(out.contains("egress check passed: recorded for image version 1.0"), "{out}");
+    let rec = verified(&w).records.pop().unwrap();
+    assert_eq!(rec.allowlisted, ["github.com"]);
+    assert!(rec.cases.contains(" proxy-github=recorded:allowlisted ") && rec.squid_log.contains("; allowlisted, not required refused: github.com"), "{rec:?}");
+    let audit = check_audit(&w);
+    assert_eq!((audit[0]["detail"]["verdict"].as_str(), audit[0]["detail"]["allowlisted"].as_str()), (Some("pass"), Some("github.com")), "{}", audit[0]);
+    let o = check_with(&w, &["egress", "check", "--json"], &t);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(doc["allowlisted"], serde_json::json!(["github.com"]), "{doc}");
+    let github = doc["cases"].as_array().unwrap().iter().find(|c| c["name"] == "proxy-github").unwrap().clone();
+    assert_eq!((github["verdict"].as_str(), github["code"].as_u64(), github["connect_code"].as_u64()), (Some("recorded"), Some(200), Some(200)), "{github}");
+    // github.com added after its case ran: the VM was refused, and squid logged it; still recorded, not judged.
+    squid_log(&w, "10.42.1.17", None, &[]);
+    let o = check_with(&w, &["egress", "check"], &transcript_file(&w, None));
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let rec = verified(&w).records.pop().unwrap();
+    assert!(rec.allowlisted == ["github.com"] && rec.cases.contains(" proxy-github=recorded:allowlisted "), "{rec:?}");
+    // Another row failing (the NAT gateways cannot be read) fails the check, but the allowlist was proved all the same:
+    // the report judges github.com as a passing one would, and names the network's failure alone.
+    let t = transcript_file(&w, Some(("proxy-github", GITHUB_TUNNEL)));
+    let o = s5_run_env(&w, &["egress", "check"], &[(FAKE_SHELL_KNOB, t.as_path()), ("FAKE_AWS_FAIL_OP", Path::new("ec2 describe-nat-gateways"))]);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("network verification: unknown nat-gateways") && !stderr(&o).contains("proxy-github"), "{}", stderr(&o));
+    assert!(stdout(&o).lines().any(|l| l == said) && stdout(&o).lines().any(|l| l.starts_with("  recorded  proxy-github ")), "{}", stdout(&o));
+    assert!(verified(&w).records.is_empty(), "the failing check of its own VM revoked the pass");
+    // Its case has no result — its marker does not parse (nor, then, does the transcript), or the script never reached
+    // it: judged, and failing like any other, with github.com still on the proved allowlist. stderr says so, and never
+    // that the case was recorded (the line comes after the judgement, not from the allowlist alone).
+    let no_result = |t: &Path, why: &str| {
+        let o = check_with(&w, &["egress", "check"], t);
+        assert_eq!(code(&o), 9, "{why}: {}\n{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains(&format!("egress check: github.com is on the proxy's effective allowlist as the network verification read it, but its case has no result ({why}): it is judged, and fails")), "{why}: {err}");
+        assert!(!err.contains("is recorded, not judged") && !err.contains("egress check: allowlisted:"), "{why}: {err}");
+        let out = stdout(&o);
+        assert!(out.lines().any(|l| l.starts_with("  FAIL      proxy-github ") && l.ends_with("no result: the script did not reach it")) && !out.lines().any(|l| l.starts_with("allowlisted:")), "{why}: {out}");
+        assert!(verified(&w).records.is_empty(), "{why}: nothing recorded");
+    };
+    no_result(transcript_with(&w, &[("proxy-github", "")]).as_path(), "the transcript could not be read");
+    let t = transcript_file(&w, None);
+    let text = fs::read_to_string(&t).unwrap();
+    fs::write(&t, text.split_inclusive('\n').filter(|l| !l.contains(" proxy-github ")).collect::<String>()).unwrap();
+    no_result(t.as_path(), "the script did not reach it");
+    no_vm_left(&w);
+}
+
+/// github.com among the extras but suspended (`ai-env egress suspend github.com`): squid does not serve it, so its
+/// case is judged — the tunnel is OPEN — and every pass of the connector is revoked.
+#[test]
+fn egress_check_judges_a_suspended_github_and_revokes() {
+    let w = green_network_with("", GITHUB_EXTRA, "github.com\n");
+    seed_verified(&w);
+    squid_log(&w, "10.42.1.17", Some("CONNECT github.com:443"), &[GITHUB_SQUID_TUNNEL]);
+    let o = check_with(&w, &["egress", "check"], &transcript_file(&w, Some(("proxy-github", GITHUB_TUNNEL))));
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("proxy-github: OPEN: the proxy opened a tunnel: HTTP 200 (rc 0, 284512 bytes; 1 connect), CONNECT 200 (github.com was not on the proxy's effective allowlist as this check read it"), "{err}");
+    assert!(stdout(&o).contains("network: 19 checks ok: ") && !stdout(&o).lines().any(|l| l.starts_with("allowlisted:")) && !err.contains("allowlisted:"), "{}\n{err}", stdout(&o));
+    let v = verified(&w);
+    assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "revoked, nothing recorded: {v:?}");
+    let last = check_audit(&w).pop().unwrap();
+    assert_eq!((last["detail"]["verdict"].as_str(), last["detail"]["revoked"].as_str(), last["detail"].get("allowlisted")), (Some("fail"), Some("2"), None), "{last}");
+    assert!(!aws_calls(&w).contains("logs filter-log-events"), "squid's log is not asked once a case failed");
+    no_vm_left(&w);
+}
+
+/// The proxy's status line does not prove what squid serves — it names other extras than SSM holds (the `parameters`
+/// row drifts), or squid does not run them (`applied=no`, squid not active, or the values fail `squid -k parse`, with
+/// `applied=yes` beside them: the `proxy-config` row drifts): github.com's case is judged strictly, OPEN beside the
+/// drift, and the connector's passes are revoked.
+#[test]
+fn egress_check_judges_github_strictly_when_the_status_line_proves_no_allowlist() {
+    let listed = value_sha256(&format!("{EXTRAS_HEADER}{GITHUB_EXTRA}"));
+    let drifts = [
+        (format!("sha256_extras={listed}"), format!("sha256_extras={}", value_sha256(EXTRAS_HEADER)), "network verification: DRIFT parameters: extras: the proxy reads sha256 "),
+        (" applied=yes".to_string(), " applied=no".to_string(), "network verification: DRIFT proxy-config: the proxy serves an older config"),
+        ("squid=active ".to_string(), "squid=inactive ".to_string(), "network verification: DRIFT proxy-config: squid is inactive on the proxy"),
+        (" parse=ok ".to_string(), " parse=failed ".to_string(), "network verification: DRIFT proxy-config: the current parameters fail `squid -k parse`"),
+    ];
+    for (from, to, row) in drifts {
+        let w = green_network_with("", GITHUB_EXTRA, "");
+        seed_verified(&w);
+        let answer = w.root().join("answers").join("ssm.get-command-invocation.json");
+        let text = fs::read_to_string(&answer).unwrap();
+        assert_eq!(text.matches(&from).count(), 1, "{from}: {text}");
+        fs::write(&answer, text.replacen(&from, &to, 1)).unwrap();
+        squid_log(&w, "10.42.1.17", Some("CONNECT github.com:443"), &[GITHUB_SQUID_TUNNEL]);
+        let o = check_with(&w, &["egress", "check"], &transcript_file(&w, Some(("proxy-github", GITHUB_TUNNEL))));
+        assert_eq!(code(&o), 9, "{row}: {}\n{}", stdout(&o), stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains(row) && err.contains("proxy-github: OPEN: the proxy opened a tunnel"), "{row}: {err}");
+        assert!(!err.contains("allowlisted:") && !stdout(&o).lines().any(|l| l.starts_with("allowlisted:")), "{row}: nothing is said allowlisted");
+        let v = verified(&w);
+        assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "{row}: revoked, nothing recorded: {v:?}");
+        assert_eq!(check_audit(&w).pop().unwrap()["detail"]["revoked"].as_str(), Some("2"), "{row}");
+        no_vm_left(&w);
+    }
 }
 
 #[test]
@@ -1220,7 +1501,7 @@ fn lab_connector_pending_judges_the_running_answer_too() {
 #[test]
 fn egress_check_never_claims_a_pass_whose_record_a_newer_revocation_refused() {
     let w = green_network();
-    squid_log(&w, "10.42.1.17", None);
+    squid_log(&w, "10.42.1.17", None, &[]);
     // A failing check revoked the connector after this check began (an hour from now: later than any start).
     let v = EgressVerified { records: vec![], revocations: std::collections::BTreeMap::from([(CONNECTOR.to_string(), unix_now() + 3600)]) };
     fs::create_dir_all(w.bridge().join("state")).unwrap();
@@ -1252,11 +1533,22 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
     versions(serde_json::json!([v10(BUILD)]));
     let golden: serde_json::Value = serde_json::from_str(&fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json")).unwrap()).unwrap();
     let facts = ai_env_cli::bridge::egress::ConnectorFacts::from_get(&golden).unwrap();
-    let rec = VerifiedRecord { image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(), image_version: "1.0".into(), connector: CONNECTOR.into(), vm_id: "microvm-earlier".into(), at: "2026-10-02T06:10:00Z".into(), dns: "no-dns".into(), connector_facts: facts, image_created_at: Some(1_789_804_800), ..VerifiedRecord::default() };
+    let rec = VerifiedRecord {
+        image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(),
+        image_version: "1.0".into(),
+        connector: CONNECTOR.into(),
+        vm_id: "microvm-earlier".into(),
+        at: "2026-10-02T06:10:00Z".into(),
+        dns: "no-dns".into(),
+        dns_rule: DNS_RULE,
+        connector_facts: facts,
+        image_created_at: Some(1_789_804_800),
+        ..VerifiedRecord::default()
+    };
     let seed = |records: Vec<VerifiedRecord>| fs::write(w.bridge().join("state/egress-verified.toml"), toml::to_string(&EgressVerified { records, ..EgressVerified::default() }).unwrap()).unwrap();
     seed(vec![rec.clone()]);
     let t = transcript_file(&w, None);
-    squid_log(&w, "10.42.1.158", None);
+    squid_log(&w, "10.42.1.158", None, &[]);
     let skipped = |o: &std::process::Output| code(o) == 0 && stdout(o).contains("nothing started");
 
     // The pass of the version new VMs run, this build, these connector facts: nothing started, three operator reads.
@@ -1280,19 +1572,52 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
         assert_eq!(code(&check_with(&w, &args, &t)), 2, "{extra:?}");
     }
 
-    // A pass whose DNS verdict the gate does not accept yet: still nothing started, and it says so.
+    // A pass whose DNS verdict the gate does not accept yet: still nothing started, and it says what the configuration
+    // in force accepts — without a pin, and with the legacy `true` (never "= false" for it).
     seed(vec![VerifiedRecord { dns: "platform-dns:fd00:ec2::253".into(), ..rec.clone() }]);
     let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
-    assert!(skipped(&o) && stdout(&o).contains("egress check: note: its DNS verdict platform-dns:fd00:ec2::253 is not accepted ([egress].accept_platform_dns = false): the credential gate refuses this pass until it is"), "{}", stdout(&o));
+    assert!(
+        skipped(&o) && stdout(&o).contains("egress check: note: its DNS verdict platform-dns:fd00:ec2::253 is not accepted ([egress].accept_platform_dns accepts no platform resolver (only no-dns passes)): the credential gate refuses this pass until it is"),
+        "{}",
+        stdout(&o)
+    );
+    let o = check_with(&w, &["egress", "check", "--if-needed", "--json"], &t);
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!((doc["skipped"].as_bool(), doc["dns"].as_str(), doc["dns_accepted"].as_bool()), (Some(true), Some("platform-dns:fd00:ec2::253"), Some(false)), "{doc}");
+    let bridge_toml = w.bridge().join("bridge.toml");
+    let unpinned = fs::read_to_string(&bridge_toml).unwrap();
+    accept_platform_dns(&w, "true");
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(skipped(&o) && stdout(&o).contains("egress check: note: its DNS verdict platform-dns:fd00:ec2::253 is not accepted ([egress].accept_platform_dns = true accepts no resolver (it names none): name the one you tested, accept_platform_dns = \"<ip>\")"), "{}", stdout(&o));
+    assert!(!stdout(&o).contains("= false"), "{}", stdout(&o));
+    assert!(stderr(&o).contains("ai-env: warning: [egress].accept_platform_dns = true accepts no resolver (it names none); only no-dns passes the credential gate: in "), "{}", stderr(&o));
+    // With the pin of the tested resolver: accepted, no note.
+    fs::write(&bridge_toml, &unpinned).unwrap();
+    accept_platform_dns(&w, "\"fd00:ec2::253\"");
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(skipped(&o) && !stdout(&o).contains("note:"), "{}", stdout(&o));
+    let o = check_with(&w, &["egress", "check", "--if-needed", "--json"], &t);
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!((doc["skipped"].as_bool(), doc["dns"].as_str(), doc["dns_accepted"].as_bool()), (Some(true), Some("platform-dns:fd00:ec2::253"), Some(true)), "{doc}");
+    fs::write(&bridge_toml, &unpinned).unwrap();
     seed(vec![rec.clone()]);
 
     // Each difference runs the full check: another build of 1.0 (created 5 s later, the image created again), the
     // connector changed, a new active version without a pass, the live read failing.
+    let earlier_rule = format!("egress check: the recorded pass of image version 1.0 was judged by an earlier DNS rule (0, now {DNS_RULE}): checking again");
     let runs = |what: &str| {
         let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
         assert!(!stdout(&o).contains("nothing started") && stdout(&o).contains("egress check of microvm-"), "{what}: {}\n{}", stdout(&o), stderr(&o));
+        // Why the full check runs is said only for the rule.
+        assert_eq!(stderr(&o).contains(&earlier_rule), what == "an earlier DNS rule", "{what}: {}", stderr(&o));
         seed(vec![rec.clone()]);
     };
+    // A pass judged by an earlier DNS rule (a record written before the field): never honoured, the full check runs
+    // before any connector read, and says why.
+    seed(vec![VerifiedRecord { dns_rule: 0, ..rec.clone() }]);
+    let _ = fs::remove_file(w.root().join("aws.log"));
+    runs("an earlier DNS rule");
+    assert_eq!(aws_calls(&w).lines().filter(|l| l.starts_with("lambda-core get-network-connector ")).count(), 1, "only the network verification's read: --if-needed stopped at the rule: {}", aws_calls(&w));
     versions(serde_json::json!([v10("2026-09-19T11:00:05+03:00")]));
     runs("another build");
     versions(serde_json::json!([v10(BUILD)]));
@@ -1335,7 +1660,7 @@ fn egress_check_refuses_a_stopped_proxy_before_any_vm_and_revokes_nothing() {
 /// the check fails without revoking the connector's passes.
 #[test]
 fn egress_check_refused_before_runmicrovm_revokes_nothing() {
-    let w = green_network_with("max_concurrent = 1");
+    let w = green_network_with("max_concurrent = 1", "", "");
     let (vm, _) = super::cli::foreign_vm(9, Some("someone@elsewhere"), ai_env_cli::bridge::api::VmState::Running, 60);
     w.update(|s| s.insert_vm(vm));
     seed_verified(&w);
@@ -1412,6 +1737,7 @@ fn egress_check_if_needed_never_skips_for_a_padded_image_version() {
         vm_id: "microvm-earlier".into(),
         at: "2026-10-02T06:10:00Z".into(),
         dns: "no-dns".into(),
+        dns_rule: DNS_RULE,
         connector_facts: ai_env_cli::bridge::egress::ConnectorFacts::from_get(&golden).unwrap(),
         image_created_at: Some(1_789_804_800),
         ..VerifiedRecord::default()

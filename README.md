@@ -151,6 +151,10 @@ ai-env vm     suspend ID | resume ID | terminate ID|--all [--yes] | gc [--yes] [
 ai-env vm     shell ID [--auth header|subprotocol]         # experimental: the platform shell (VM started with --shell)
 ai-env vm     smoke [--max-duration 900] [--keep] [--json] # run → RUNNING → /health → terminate, with timings
 ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]   # probes → lab/probes.jsonl
+ai-env egress status [--json] | env [--shell] | reload [--if-changed]   # S5 operator commands (the operator's aws CLI; bridge feature)
+ai-env egress allow SLUG HOST [--remove] | suspend HOST [--restore]    # per-workspace extras (global on the proxy) / the kill switch
+ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a vpc VM: direct egress and DNS closed, the allowlist working → state/egress-verified.toml
+ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress)
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
@@ -334,7 +338,14 @@ per-workspace extras, minus suspended hosts — and refuses everything else: pla
 literals, names that resolve to private, loopback or link-local addresses, clients outside the VM
 subnet. The VPC has no Amazon DNS (`enableDnsSupport` off; DHCP hands out public resolvers that only
 the proxy may reach), so a VM resolves nothing itself; its tools go through the proxy
-(`ai-env egress env` prints `https_proxy` and friends).
+(`ai-env egress env` prints `https_proxy` and friends). The only DNS a VM reaches is the platform's
+`fd00:ec2::253`, which answers locally with an empty reply and sends nothing out (measured with a
+canarytokens and an interactsh test). Every VM reaches squid from the connector's one network interface
+(10.42.1.158), so squid cannot tell VMs apart. The connector's operator role is trusted by
+`lambda.amazonaws.com` only (the principal CloudTrail showed), and an inline Deny confines AWS's managed
+operator policy, which allows interfaces in any subnet with any security group, to the VM subnet and the
+VM security group (`make check-policies` simulates both sides; `make connector-probe` proves interfaces
+still get created).
 
 - **Echo gate.** A VM must echo exactly the connectors its egress requires (`vpc`: the configured
   connector; `internet`: exactly `INTERNET_EGRESS`) when RunMicrovm answers, when it is RUNNING, on
@@ -360,10 +371,26 @@ the proxy may reach), so a VM resolves nothing itself; its tools go through the 
   protocol, subnet and security group, and its Version when the service answers one) and to the image
   build; any failing check of its own VM revokes the connector's records (`--vm ID` only reports).
   The check first waits (up to 60 s) for the VM to reach the proxy's port: a VM's VPC networking may
-  come up after its shell.
+  come up after its shell. Squid's log is matched to the run on squid's own clock: a tunnel to a host
+  an operator may allowlist (github.com) counts against the run only when squid logged it after the
+  run's own refusal of that host. github.com is required refused unless it is on the proxy's
+  effective allowlist (the `allow` list plus the extras, minus suspended hosts) as the network
+  verification proved it on the proxy (the `parameters` row ok, and squid serving those values:
+  active, parse ok, `applied=yes`); while it is, its case is recorded, not judged, and the record
+  names it (`allowlisted`). A suspended host is judged strictly wherever it is listed; a case with no
+  result fails.
 - **Credentials (S7)** may enter a VM only through `egress::credential_gate`: a `vpc` VM whose live
-  echo is exactly the connector, whose image version has a recorded passing check, and whose `dns-path`
-  verdict is `no-dns` (or a platform resolver with `[egress] accept_platform_dns = true`). Never an
+  echo is exactly the connector, whose image version has a recorded passing check under the current DNS
+  rule, and whose DNS verdicts (the check's and the newest `dns-path`) are `no-dns` or `platform-dns:<ip>`
+  of resolvers `[egress] accept_platform_dns = "<ip>"` names (a list for several). A platform reply counts
+  only as an empty NOERROR (no answer, no authority section) to a fresh name `d<nonce>.example.com`, from a
+  server that also answers example.com without an address. Any other platform reply (another status, an
+  authority section, a truncated reply, example.com left unanswered) is `platform-dns-answered`, an address
+  is `platform-dns-resolves`, and a reply from any other server is `open-dns`: none is ever accepted.
+  Records carry the DNS rule they were judged by; a `dns-path` row recorded before this rule still counts
+  until the next `ai-env lab run dns-path`, so run it after upgrading. `accept_platform_dns = true` names no
+  resolver and accepts nothing (doctor prints the one-line fix). Under this rule the `dnsMode = "firewall"`
+  fallback cannot pass `egress check`: its DNS Firewall answers NXDOMAIN (`platform-dns-answered`). Never an
   `internet` VM.
 
 ```sh
@@ -373,14 +400,17 @@ make deploy                    # (Mike) plan check + replacement guard, pulumi u
                                # (its preview runs --non-interactive: export PULUMI_CONFIG_PASSPHRASE_FILE for a passphrase stack)
 make infra-status WRITE=1      # adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
 make s5-smoke                  # three `vm smoke --egress vpc --json` passes; the echo must be exactly the connector
-make test-egress               # the live egress tests (direct closed, allowlist, extra + removal, after resume)
+make test-egress               # the live egress tests (direct closed, allowlist, extra + removal, after resume); a skipped proof fails it
+make connector-probe CONFIRM=create-probe-connector   # a throw-away connector: RunMicrovm while PENDING, the activation time (~4.5 min), deleted on every path
 ai-env egress check            # the recorded proof the credential gate needs (re-run after every new image version; --if-needed: none when the version new VMs run has it)
 make egress-logs [FOLLOW=1]    # squid's access log (hosts only, never a path)
 make proxy-stop                # when idle: stops the proxy (no vpc VM has egress then); proxy-start brings it back
 ```
 
 `ai-env doctor` shows `[NO ]` for the egress row while `[egress] require = true` (the default) and no
-connector is configured; a stopped proxy is `[-  ]`, never `[NO ]`.
+connector is configured; a stopped proxy is `[-  ]`, never `[NO ]`. Its DNS row says whether the newest
+`dns-path` verdict is accepted, and shows the exact `accept_platform_dns = "<ip>"` line to write when the
+value names no resolver.
 
 ### Access-control policies (`keygen --access-control`)
 

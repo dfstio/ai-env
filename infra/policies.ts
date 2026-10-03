@@ -14,10 +14,11 @@
 // while CreateMicrovmImage, PassNetworkConnector and the List* calls have no resource type and need "*".
 //
 // S5 (plans/s5-plan.md) adds the egress proxy's role (its own SSM parameters and its squid log group, plus the
-// AWS managed SSM agent policy), the network connector's operator role (the AWS managed operator policy) and the
-// egress statements of the deploy policy. CreateNetworkConnector is the only connector call with the
-// lambda:SubnetIds / lambda:SecurityGroupIds keys (IAM service reference, 1 Oct 2026); the network-connector
-// resource type is the account's `network-connector:*`.
+// AWS managed SSM agent policy), the network connector's operator role (the AWS managed operator policy, confined
+// to the VM subnet and the VM security group by the inline Deny of operatorRolePolicy) and the egress statements of
+// the deploy policy. CreateNetworkConnector is the only connector call with the lambda:SubnetIds /
+// lambda:SecurityGroupIds keys (IAM service reference, 1 Oct 2026); the network-connector resource type is the
+// account's `network-connector:*`.
 
 /** The one region: the MicroVM API answers 403 elsewhere. Never taken from config or the environment. */
 export const REGION = "eu-central-1";
@@ -57,7 +58,10 @@ export const EC2_SERVICE = "ec2.amazonaws.com";
 export const NETWORK_CONNECTORS_SERVICE = "network-connectors.lambda.amazonaws.com";
 /** The SSM agent's actions (without ssm:GetParameter on "*"), for the proxy instance. */
 export const SSM_INSTANCE_POLICY_ARN = "arn:aws:iam::aws:policy/AmazonSSMManagedEC2InstanceDefaultPolicy";
-/** ec2:CreateNetworkInterface + the ENI tags; ENI deletion is the service-linked role AWSServiceRoleForLambda's. */
+/**
+ * ec2:CreateNetworkInterface in any subnet with any security group (operatorRolePolicy confines it) + the ENI tags;
+ * ENI deletion is the service-linked role AWSServiceRoleForLambda's. `make check-policies` pins its action set.
+ */
 export const CONNECTOR_OPERATOR_POLICY_ARN = "arn:aws:iam::aws:policy/AWSLambdaNetworkConnectorOperatorPolicy";
 /** The managed policies the stack attaches: the deploy policy's iam:AttachRolePolicy is limited to them. */
 export const MANAGED_POLICY_ARNS = [SSM_INSTANCE_POLICY_ARN, CONNECTOR_OPERATOR_POLICY_ARN];
@@ -71,7 +75,10 @@ export interface EgressNames {
     operatorRoleName: string;
     proxyInstanceProfileName: string;
     connectorName: string;
-    /** The connector's subnet and security group: only the deploy policy needs them (its CreateNetworkConnector condition). */
+    /**
+     * The connector's subnet and security group, ids that exist only once the stack created them: the deploy policy's
+     * CreateNetworkConnector condition and the operator role's Deny (operatorRolePolicy) need them.
+     */
     vmSubnetId?: string;
     vmSecurityGroupId?: string;
 }
@@ -207,6 +214,25 @@ export function operatorTrustPolicy(): PolicyDocument {
     });
 }
 
+/**
+ * The operator role's inline policy (next to CONNECTOR_OPERATOR_POLICY_ARN): one Deny, no grant. The managed policy
+ * lets the connector's service create an ENI in any subnet with any security group (its subnet/* and
+ * security-group/* statements have no condition). CreateNetworkInterface authorizes on each resource of the call
+ * separately (the subnet, every security group, the new ENI), so an ENI naming any other subnet or group, in any
+ * VPC, account or region, is denied whatever the managed policy grants. NotResource rather than condition keys: a
+ * negated condition on a key the request lacks would also deny the security-group check, and the IfExists forms can
+ * let a request through. `make check-policies` simulates both sides; `make connector-probe` proves ENIs still come up.
+ */
+export function operatorRolePolicy(n: Names): PolicyDocument {
+    const { vmSubnetId, vmSecurityGroupId } = n.egress;
+    if (vmSubnetId === undefined || vmSecurityGroupId === undefined) throw new Error("operatorRolePolicy: the VM subnet and security group ids are required (EnisOnlyInTheVmSubnet)");
+    const ec2 = `arn:aws:ec2:${n.region}:${n.accountId}`;
+    return doc({
+        Sid: "EnisOnlyInTheVmSubnet", Effect: "Deny", Action: ["ec2:CreateNetworkInterface"],
+        NotResource: [`${ec2}:subnet/${vmSubnetId}`, `${ec2}:security-group/${vmSecurityGroupId}`, `${ec2}:network-interface/*`],
+    });
+}
+
 /** The runtime actions on the image, allowed to ai-env-runtime (§9); tested by `make check-policies`. */
 export const RUNTIME_IMAGE_ACTIONS = [
     "lambda:RunMicrovm", "lambda:GetMicrovm", "lambda:SuspendMicrovm", "lambda:ResumeMicrovm", "lambda:TerminateMicrovm",
@@ -285,7 +311,9 @@ export function deployPolicy(n: Names): PolicyDocument {
         // S5: the egress connector may only be created on the VM subnet and its security group (the two keys exist
         // for CreateNetworkConnector only; Null makes a request without them fail instead of passing ForAllValues).
         // Cosmetic as a boundary: UpdateNetworkConnector takes Configuration and OperatorRole and has no condition
-        // keys, so whoever holds it can move the connector anywhere. Like the whole deploy policy, it documents.
+        // keys. The operator role's Deny (operatorRolePolicy) refuses the connector's ENIs in any other subnet or
+        // security group, but the Roles statement below can rewrite or delete that Deny (iam:PutRolePolicy,
+        // iam:DeleteRolePolicy on role/ai-env-*). Like the whole deploy policy, it documents.
         {
             Sid: "CreateEgressConnector", Effect: "Allow", Resource: accountConnectorArns(n), Action: ["lambda:CreateNetworkConnector"],
             Condition: {
@@ -457,5 +485,6 @@ export function allPolicies(n: Names): NamedPolicy[] {
         { name: "proxy-trust", kind: "trust", document: proxyTrustPolicy() },
         { name: "proxy", kind: "identity", document: proxyRolePolicy(n) },
         { name: "operator-trust", kind: "trust", document: operatorTrustPolicy() },
+        { name: "operator", kind: "identity", document: operatorRolePolicy(n) },
     ];
 }

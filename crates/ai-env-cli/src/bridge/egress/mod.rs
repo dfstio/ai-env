@@ -8,12 +8,12 @@
 //! exactly the connectors its egress requires, or it is terminated), the
 //! proxy environment ([`proxy_env`]), the hostname and parameter grammar the
 //! proxy's reload script enforces too ([`is_valid_host`], [`parse_hosts`],
-//! [`parse_extras`]), the squid access-log line ([`parse_squid_line`]), the
-//! parameter hashes `ai-env-proxy-reload --status` prints
-//! ([`value_sha256`]), the record of passing `ai-env egress check` runs
-//! ([`EgressVerified`]), and [`credential_gate`], which S7's credential
-//! delivery calls: no credential ever enters a VM that is not on the
-//! verified VPC path.
+//! [`parse_extras`]) and the hosts it serves ([`effective_hosts`]), the
+//! squid access-log line ([`parse_squid_line`]), the parameter hashes
+//! `ai-env-proxy-reload --status` prints ([`value_sha256`]), the record of
+//! passing `ai-env egress check` runs ([`EgressVerified`]), and
+//! [`credential_gate`], which S7's credential delivery calls: no credential
+//! ever enters a VM that is not on the verified VPC path.
 //!
 //! The operator commands live in `cli` (`ai-env egress …`, `ai-env proxy
 //! …`) and `ops` (the aws CLI calls); `ai-env egress check` in `check`.
@@ -22,7 +22,7 @@ pub mod cli;
 pub mod ops;
 
 use crate::bridge::api::managed_connector_arn;
-use crate::bridge::config::{is_connector_arn, is_rfc1918, BridgeConfig, Paths};
+use crate::bridge::config::{is_connector_arn, is_platform_address, is_rfc1918, BridgeConfig, EgressCfg, Paths};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::{read_infra_state, write_atomic_mode, InfraState};
 use crate::bridge::registry::{ensure_private_dir, read_regular_file};
@@ -351,6 +351,16 @@ pub fn parse_extras(value: &str) -> Result<Vec<Extra>, String> {
     Ok(out)
 }
 
+/// The hosts the proxy serves: (allow ∪ extras) − suspended, exact names
+/// (squid.conf's `dstdomain -n` lists match exact names only, and squid
+/// denies `suspended` before it allows `allowed` or `extras`; the reload
+/// script's `effective` computes the same set). What `egress allow|suspend`
+/// say, and what `egress check` judges `proxy-github` by.
+#[must_use]
+pub fn effective_hosts(allow: &[String], extras: &[Extra], suspended: &BTreeSet<String>) -> BTreeSet<String> {
+    allow.iter().chain(extras.iter().map(|e| &e.host)).filter(|h| !suspended.contains(*h)).cloned().collect()
+}
+
 /// The first line of the `extras` parameter, exactly as `infra/egress.ts`
 /// creates it: SSM refuses an empty value, so an empty list is this line alone.
 pub const EXTRAS_HEADER: &str = "# ai-env egress extras: host<TAB>slug[,slug...] per line, written by `ai-env egress allow`\n";
@@ -556,8 +566,19 @@ pub struct VerifiedRecord {
     pub at: String,
     /// One line: every case with its verdict.
     pub cases: String,
-    /// The DNS verdict of the run (`no-dns` | `platform-dns:<ip>`).
+    /// The hosts the check asks the proxy to refuse that were allowlisted
+    /// when it ran (`check::ALLOWLISTABLE` on the effective allowlist the
+    /// network verification read): their cases were recorded, not judged
+    /// (`proxy-github=recorded:allowlisted`); this record does not show them
+    /// refused. Empty for records written before the field.
+    #[serde(default)]
+    pub allowlisted: Vec<String>,
+    /// The DNS verdict of the run (`no-dns` | `platform-dns:<ip>[,<ip>…]`).
     pub dns: String,
+    /// The rule `dns` was judged by ([`DNS_RULE`]); 0 for records written
+    /// before the field (example.com asked, any platform reply passed),
+    /// which the credential gate and `--if-needed` never honour.
+    pub dns_rule: u32,
     /// What the squid-log cross-check found.
     pub squid_log: String,
     /// The VM-independent network verification the check ran before
@@ -658,31 +679,102 @@ impl EgressVerified {
 
 /// The `dns-path` probe's verdict when no name resolves from a `vpc` VM.
 pub const DNS_NONE: &str = "no-dns";
-/// The prefix of the verdict when the platform's resolver answers (`platform-dns:<ip>`).
+/// The prefix of the verdict when platform resolvers replied, and only with
+/// an empty NOERROR — no answer and no authority section — to a name that
+/// exists nowhere, and gave no address for example.com:
+/// `platform-dns:<ip>[,<ip>…]`, every such server in case order. The
+/// platform's stub answers so: it answers locally and sends nothing out
+/// (canarytokens and interactsh, 2 Oct 2026). Anything that goes upstream
+/// answers differently: a validating recursor, or a forwarder passing its
+/// reply on, answers a missing name with the zone's SOA in AUTHORITY
+/// (example.com sits on Cloudflare: an empty NOERROR WITH an SOA, "black
+/// lies"), which is `platform-dns-answered:`, never accepted. Blind spot: a
+/// forwarder that strips the SOA and answers example.com without an address
+/// (`check::DnsServer::Platform`).
 pub const DNS_PLATFORM_PREFIX: &str = "platform-dns:";
+/// The DNS rule a record's verdict was judged by (`VerifiedRecord::dns_rule`).
+/// 1: the run asks a fresh `d<nonce>.example.com` (and example.com only of a
+/// server that replied), and a platform reply counts only as an empty
+/// NOERROR, every server that replied named. 0 (no field): example.com was
+/// asked and a platform reply passed whatever its status — evidence the
+/// gate cannot tell from the new, so it is never honoured.
+pub const DNS_RULE: u32 = 1;
 
-/// Does `verdict` let credentials in? `no-dns` always; `platform-dns:<ip>`
-/// only with the operator's recorded acceptance AND a platform address
-/// (an RFC 1918 or link-local IPv4, or the VPC's IPv6 `fd00:ec2::/32`): a
-/// public resolver that answers is open DNS, never acceptable; anything else
-/// never.
+/// Does `verdict` let credentials in? `no-dns` always; `platform-dns:` only
+/// followed by a non-empty list in which every entry parses, is a platform
+/// address ([`is_platform_address`]: a public resolver that answers is open
+/// DNS, whatever the list says) and is one of `accepted` — the resolvers the
+/// operator tested and named (`EgressCfg::accepted_resolvers`), compared as
+/// parsed addresses. Anything else never (`platform-dns-answered:`,
+/// `platform-dns-resolves:`, `open-dns:`, an empty or malformed list).
 #[must_use]
-pub fn dns_verdict_ok(verdict: &str, accept_platform_dns: bool) -> bool {
-    let platform = |ip: &str| match ip.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(a)) => a.is_private() || a.is_link_local(),
-        Ok(std::net::IpAddr::V6(a)) => a.segments()[0] == 0xfd00 && a.segments()[1] == 0x0ec2,
-        Err(_) => false,
-    };
-    verdict == DNS_NONE || (accept_platform_dns && verdict.strip_prefix(DNS_PLATFORM_PREFIX).is_some_and(platform))
+pub fn dns_verdict_ok(verdict: &str, accepted: &[std::net::IpAddr]) -> bool {
+    if verdict == DNS_NONE {
+        return true;
+    }
+    let Some(list) = verdict.strip_prefix(DNS_PLATFORM_PREFIX) else { return false };
+    !list.is_empty() && list.split(',').all(|s| is_platform_address(s) && s.parse::<std::net::IpAddr>().is_ok_and(|ip| accepted.contains(&ip)))
 }
 
-/// The newest `dns-path` row of `lab/probes.jsonl` through
-/// [`dns_verdict_ok`] with `[egress].accept_platform_dns`; false when there
-/// is none or the file cannot be read (fail closed).
+/// Whether the credential gate accepts `verdict` under `egress`.
 #[must_use]
-pub fn dns_ok(paths: &Paths, cfg: &BridgeConfig) -> bool {
-    let Ok(rows) = crate::bridge::census::read_rows(&paths.probes(), None) else { return false };
-    rows.iter().rev().find(|r| r.get("probe").and_then(|p| p.as_str()) == Some("dns-path")).and_then(|r| r.get("verdict").and_then(|v| v.as_str())).is_some_and(|v| dns_verdict_ok(v, cfg.egress.accept_platform_dns))
+pub fn dns_accepted(verdict: &str, egress: &EgressCfg) -> bool {
+    dns_verdict_ok(verdict, &egress.accepted_resolvers())
+}
+
+/// The newest `dns-path` row of `lab/probes.jsonl` a live probe wrote: its
+/// verdict and `ts`. Rows whose note carries [`check::FAKE_SHELL_NOTE`] are
+/// skipped (debug builds: a file stood in for the VM's shell, which proves
+/// nothing about the network, so such a row may never decide). `Ok(None)`
+/// when there is none; `Err` naming the file when it cannot be read (doctor
+/// says so; the gate refuses).
+pub fn newest_dns_path_row(paths: &Paths) -> Result<Option<(String, String)>, String> {
+    let path = paths.probes();
+    let rows = crate::bridge::census::read_rows(&path, None).map_err(|e| format!("{}: {e}", path.display()))?;
+    let live = |r: &serde_json::Value| !r.get("note").and_then(|n| n.as_str()).is_some_and(|n| n.contains(check::FAKE_SHELL_NOTE));
+    Ok(rows.into_iter().rev().find(|r| r.get("probe").and_then(|p| p.as_str()) == Some("dns-path") && live(r)).map(|r| {
+        let field = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        (field("verdict"), field("ts"))
+    }))
+}
+
+/// The verdict of [`newest_dns_path_row`]: what the credential gate reads as
+/// its network-wide kill switch (S7 passes it as read: an unreadable file and
+/// no row each refuse, saying which).
+pub fn newest_dns_path(paths: &Paths) -> Result<Option<String>, String> {
+    newest_dns_path_row(paths).map(|row| row.map(|(verdict, _)| verdict))
+}
+
+/// What to write in `[egress]`, for the legacy `accept_platform_dns = true`,
+/// given the newest dns-path verdict `newest`: the line naming its platform
+/// resolvers (`accept_platform_dns = "fd00:ec2::253"`, a list for several),
+/// "remove the line" for `no-dns` (which needs no acceptance), else a
+/// placeholder — a resolver is named only from a `platform-dns:` verdict,
+/// the empty reply the operator tested, never from any other.
+#[must_use]
+pub fn pin_suggestion(newest: Option<&str>) -> String {
+    if newest == Some(DNS_NONE) {
+        return "remove the line".to_string();
+    }
+    let parsed: Option<Vec<std::net::IpAddr>> = newest.and_then(|v| v.strip_prefix(DNS_PLATFORM_PREFIX)).filter(|l| !l.is_empty()).and_then(|l| l.split(',').map(|s| s.parse::<std::net::IpAddr>().ok().filter(|_| is_platform_address(s))).collect());
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    for ip in parsed.unwrap_or_default() {
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    match ips.as_slice() {
+        [] => "accept_platform_dns = \"<the resolver you tested>\"".to_string(),
+        [one] => format!("accept_platform_dns = \"{one}\""),
+        many => format!("accept_platform_dns = [{}]", many.iter().map(|ip| format!("\"{ip}\"")).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// `the credential gate accepts|does NOT accept <verdict> (<what the
+/// configuration accepts>)`: what `ai-env lab run dns-path` prints.
+#[must_use]
+pub fn acceptance_line(verdict: &str, egress: &EgressCfg) -> String {
+    format!("the credential gate {} {verdict} ({})", if dns_accepted(verdict, egress) { "accepts" } else { "does NOT accept" }, egress.dns_acceptance())
 }
 
 /// What the credential gate compares with, read live by its caller (S7) just
@@ -704,10 +796,15 @@ pub struct LiveEcho<'a> {
 /// `internet` VM); the live echo is exactly that connector; a passing
 /// `ai-env egress check` is recorded for the row's image, image version and
 /// that connector, for the same live connector facts (Id, Version when
-/// answered, network protocol, subnet, security group) and the same image build (`created_at`); its DNS verdict
-/// and `dns_ok` ([`dns_ok`]) pass. `Err(Policy)` (exit 9) names the first
-/// condition that failed and what to run.
-pub fn credential_gate(cfg: &BridgeConfig, row: &VmRow, live: &LiveEcho<'_>, verified: &EgressVerified, dns_ok: bool) -> Result<(), BridgeError> {
+/// answered, network protocol, subnet, security group) and the same image
+/// build (`created_at`); that record judged DNS by the current rule
+/// ([`DNS_RULE`]) and its verdict is accepted ([`dns_verdict_ok`] with
+/// `[egress].accept_platform_dns`); and `dns_path`, the newest dns-path
+/// verdict as [`newest_dns_path`] read it (the network-wide kill switch), is
+/// readable, recorded and accepted too. `Err(Policy)` (exit 9) names the
+/// first condition that failed and what to run; every DNS refusal says what
+/// the configuration in force accepts (`EgressCfg::dns_acceptance`).
+pub fn credential_gate(cfg: &BridgeConfig, row: &VmRow, live: &LiveEcho<'_>, verified: &EgressVerified, dns_path: &Result<Option<String>, String>) -> Result<(), BridgeError> {
     let refuse = |why: String| Err(BridgeError::Policy(format!("no credential for {}: {why}", if row.id.is_empty() { "this VM" } else { &row.id })));
     let Some(configured) = cfg.aws.egress_connector_arn.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
         return refuse("[aws].egress_connector_arn is not set (run `make infra-status WRITE=1`)".into());
@@ -734,11 +831,21 @@ pub fn credential_gate(cfg: &BridgeConfig, row: &VmRow, live: &LiveEcho<'_>, ver
     if record.image_created_at.is_none() || live.image_created_at != record.image_created_at {
         return refuse(format!("image version {} is not the build the recorded check verified (created_at differs or unknown): run `ai-env egress check`", row.image_version));
     }
-    if !dns_verdict_ok(&record.dns, cfg.egress.accept_platform_dns) {
-        return refuse(format!("the recorded `ai-env egress check` saw DNS {:?} (run `ai-env egress check` again; [egress].accept_platform_dns covers only a platform resolver)", record.dns));
+    if record.dns_rule < DNS_RULE {
+        return refuse("the recorded `ai-env egress check` judged DNS by an earlier rule (example.com asked; a platform reply passed whatever its status): run `ai-env egress check`".into());
     }
-    if !dns_ok {
-        return refuse(format!("the newest dns-path verdict is not {DNS_NONE} and [egress].accept_platform_dns is false (run `ai-env lab run dns-path`)"));
+    let accepted = cfg.egress.accepted_resolvers();
+    if !dns_verdict_ok(&record.dns, &accepted) {
+        return refuse(format!("the recorded `ai-env egress check` saw DNS {:?}, not accepted: {}", record.dns, cfg.egress.dns_acceptance()));
+    }
+    let newest = match dns_path {
+        Ok(Some(v)) => v,
+        Ok(None) => return refuse("no dns-path verdict is recorded (run `ai-env lab run dns-path`)".into()),
+        // Not "none recorded": `lab run dns-path` would fail on the same file.
+        Err(e) => return refuse(format!("the dns-path rows cannot be read: {e}")),
+    };
+    if !dns_verdict_ok(newest, &accepted) {
+        return refuse(format!("the newest dns-path verdict {newest:?} is not accepted: {} (run `ai-env lab run dns-path`)", cfg.egress.dns_acceptance()));
     }
     Ok(())
 }
@@ -946,6 +1053,19 @@ mod tests {
         assert!(!fits_parameter(&"x".repeat(PARAM_MAX_BYTES + 1)));
     }
 
+    /// What squid serves: the base list and the extras, less every suspended host — wherever it is listed.
+    #[test]
+    fn the_effective_allowlist_honours_suspended() {
+        let set = |v: BTreeSet<String>| v.into_iter().collect::<Vec<_>>();
+        let allow = s(&["api.anthropic.com", "static.crates.io"]);
+        let extras = parse_extras("github.com\tai-env\nexample.org\tai-env,other\nstatic.crates.io\tai-env\n").unwrap();
+        assert_eq!(set(effective_hosts(&allow, &extras, &BTreeSet::new())), ["api.anthropic.com", "example.org", "github.com", "static.crates.io"], "a host in both lists once");
+        let suspended: BTreeSet<String> = ["github.com".to_string(), "static.crates.io".to_string(), "absent.example".to_string()].into();
+        assert_eq!(set(effective_hosts(&allow, &extras, &suspended)), ["api.anthropic.com", "example.org"], "suspended wins over the base list and the extras");
+        assert!(effective_hosts(&[], &[], &BTreeSet::new()).is_empty());
+        assert_eq!(set(effective_hosts(&[], &extras, &["example.org".to_string()].into())), ["github.com", "static.crates.io"]);
+    }
+
     #[test]
     fn squid_lines() {
         let l = parse_squid_line("aienv 1790000000.123     42 10.42.1.17 TCP_TUNNEL/200 3456 CONNECT api.anthropic.com:443").unwrap();
@@ -1002,6 +1122,7 @@ mod tests {
             vm_id: "microvm-1".into(),
             at: "2026-10-01T10:00:00Z".into(),
             dns: DNS_NONE.into(),
+            dns_rule: DNS_RULE,
             connector_facts: facts(),
             image_created_at: Some(1_790_000_000),
             ..VerifiedRecord::default()
@@ -1104,30 +1225,95 @@ mod tests {
         assert!(EgressVerified::load(&paths).unwrap().records.is_empty());
     }
 
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A newest dns-path verdict as [`newest_dns_path`] reads it.
+    fn at(v: &str) -> Result<Option<String>, String> {
+        Ok(Some(v.to_string()))
+    }
+
     #[test]
     fn dns_verdicts() {
-        assert!(dns_verdict_ok("no-dns", false));
-        assert!(!dns_verdict_ok("platform-dns:10.42.1.2", false));
-        assert!(dns_verdict_ok("platform-dns:10.42.1.2", true));
-        assert!(dns_verdict_ok("platform-dns:169.254.169.253", true));
-        assert!(dns_verdict_ok("platform-dns:fd00:ec2::253", true));
-        assert!(!dns_verdict_ok("platform-dns:9.9.9.9", true), "a public resolver that answers is open DNS");
-        assert!(!dns_verdict_ok("platform-dns:2620:fe::fe", true));
-        assert!(!dns_verdict_ok("platform-dns:resolver", true));
-        assert!(!dns_verdict_ok("platform-dns:", true));
-        assert!(!dns_verdict_ok("unknown", true));
+        let pin = [ip("fd00:ec2::253")];
+        // no-dns needs no acceptance; the pinned resolver in any spelling IpAddr reads, a duplicate included.
+        for v in ["no-dns", "platform-dns:fd00:ec2::253", "platform-dns:fd00:0ec2::0253", "platform-dns:FD00:EC2::253", "platform-dns:fd00:ec2::253,fd00:ec2::253"] {
+            assert!(dns_verdict_ok(v, &pin), "{v}");
+        }
+        assert!(dns_verdict_ok("no-dns", &[]));
+        for v in [
+            // Another platform address than the one tested (the old "any platform address").
+            "platform-dns:169.254.169.253",
+            // Every entry must be accepted, not any.
+            "platform-dns:fd00:ec2::253,10.42.1.2",
+            "platform-dns:10.42.1.2,fd00:ec2::253",
+            // The never-accepted classes (a `starts_with("platform-dns")` would take the first two).
+            "platform-dns-answered:fd00:ec2::253",
+            "platform-dns-resolves:fd00:ec2::253",
+            "open-dns:fd00:ec2::253",
+            "open-dns:1.1.1.1",
+            // Malformed lists.
+            "platform-dns:",
+            "platform-dns:fd00:ec2::253,",
+            "platform-dns:,fd00:ec2::253",
+            "platform-dns: fd00:ec2::253",
+            "platform-dns:fd00:ec2::253%eth0",
+            "platform-dns:[fd00:ec2::253]",
+            "platform-dns:fd00:ec2::253 ",
+            "unknown (no DNS server was asked)",
+            "",
+        ] {
+            assert!(!dns_verdict_ok(v, &pin), "{v}");
+        }
+        assert!(!dns_verdict_ok("platform-dns:fd00:ec2::253", &[]), "an empty pin accepts no platform resolver");
+        // A public address can never pass, even forced into the accepted list: the platform check stays inside.
+        assert!(!dns_verdict_ok("platform-dns:8.8.8.8", &[ip("8.8.8.8")]));
+        assert!(!dns_verdict_ok("platform-dns:8.8.8.8,fd00:ec2::253", &[ip("8.8.8.8"), ip("fd00:ec2::253")]));
+        let two = [ip("169.254.169.253"), ip("fd00:ec2::253")];
+        assert!(dns_verdict_ok("platform-dns:fd00:ec2::253,169.254.169.253", &two) && dns_verdict_ok("platform-dns:169.254.169.253", &two));
+        // Through the configuration: `true` accepts nothing, the pin its resolver.
+        let cfg = |v: &str| BridgeConfig::parse(&format!("[egress]\naccept_platform_dns = {v}\n")).unwrap().egress;
+        assert!(!dns_accepted("platform-dns:fd00:ec2::253", &cfg("true")) && dns_accepted("no-dns", &cfg("true")));
+        assert!(dns_accepted("platform-dns:fd00:ec2::253", &cfg("\"fd00:ec2::253\"")));
+        assert!(!dns_accepted("platform-dns:fd00:ec2::253", &cfg("[\"fd00:ec2::253\", \"8.8.8.8\"]")), "an invalid list accepts nothing");
+        assert_eq!(acceptance_line("platform-dns:fd00:ec2::253", &cfg("\"fd00:ec2::253\"")), "the credential gate accepts platform-dns:fd00:ec2::253 ([egress].accept_platform_dns accepts only fd00:ec2::253)");
+        assert_eq!(acceptance_line("platform-dns:fd00:ec2::253", &EgressCfg::default()), "the credential gate does NOT accept platform-dns:fd00:ec2::253 ([egress].accept_platform_dns accepts no platform resolver (only no-dns passes))");
+        // The newest dns-path row: none without a file, else the newest row of that probe.
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
-        let cfg = BridgeConfig::default();
-        assert!(!dns_ok(&paths, &cfg), "no row: closed");
+        assert_eq!(newest_dns_path(&paths), Ok(None), "no file");
         std::fs::create_dir_all(paths.probes().parent().unwrap()).unwrap();
-        let row = |v: &str| format!("{{\"probe\":\"dns-path\",\"stage\":\"S5\",\"ext\":null,\"sdk\":null,\"verdict\":\"{v}\",\"expected\":\"no-dns\",\"ts\":\"2026-10-01T10:00:00Z\"}}\n");
-        std::fs::write(paths.probes(), format!("{}{}", row("platform-dns:10.42.1.2"), row("no-dns"))).unwrap();
-        assert!(dns_ok(&paths, &cfg), "the newest row decides");
-        std::fs::write(paths.probes(), format!("{}{}", row("no-dns"), row("platform-dns:10.42.1.2"))).unwrap();
-        assert!(!dns_ok(&paths, &cfg));
-        let accepting = BridgeConfig::parse("[egress]\naccept_platform_dns = true\n").unwrap();
-        assert!(dns_ok(&paths, &accepting));
+        let row = |probe: &str, v: &str| format!("{{\"probe\":\"{probe}\",\"stage\":\"S5\",\"ext\":null,\"sdk\":null,\"verdict\":\"{v}\",\"expected\":\"no-dns\",\"ts\":\"2026-10-01T10:00:00Z\"}}\n");
+        std::fs::write(paths.probes(), row("connector-pending", "accepted")).unwrap();
+        assert_eq!(newest_dns_path(&paths), Ok(None), "no row of that probe");
+        std::fs::write(paths.probes(), format!("{}{}{}", row("dns-path", "platform-dns:10.42.1.2"), row("dns-path", "no-dns"), row("connector-pending", "accepted"))).unwrap();
+        assert_eq!(newest_dns_path(&paths), at("no-dns"), "the newest row of the probe decides");
+        std::fs::write(paths.probes(), format!("{}{}", row("dns-path", "no-dns"), row("dns-path", "platform-dns:fd00:ec2::253"))).unwrap();
+        assert_eq!(newest_dns_path(&paths), at("platform-dns:fd00:ec2::253"));
+        assert_eq!(newest_dns_path_row(&paths), Ok(Some(("platform-dns:fd00:ec2::253".to_string(), "2026-10-01T10:00:00Z".to_string()))), "with when it was recorded");
+        // A row the transcript knob wrote (debug builds: a file stood in for the VM's shell) never decides: the newest
+        // live row does, and with none there is none.
+        let knob = |v: &str, note: &str| row("dns-path", v).replace(",\"ts\"", &format!(",\"note\":\"{note}\",\"ts\""));
+        let knob_note = format!("resolves=no; asked d5eed5eed5eed5eed.example.com A, and example.com A of each server that replied (microvm-1); {}", check::FAKE_SHELL_NOTE);
+        std::fs::write(paths.probes(), format!("{}{}", row("dns-path", "open-dns:1.1.1.1"), knob("platform-dns:fd00:ec2::253", &knob_note))).unwrap();
+        assert_eq!(newest_dns_path(&paths), at("open-dns:1.1.1.1"), "the knob's row is skipped");
+        std::fs::write(paths.probes(), knob("platform-dns:fd00:ec2::253", &knob_note)).unwrap();
+        assert_eq!(newest_dns_path(&paths), Ok(None), "only a knob row: none");
+        std::fs::write(paths.probes(), knob("platform-dns:fd00:ec2::253", "resolves=no; asked d5eed5eed5eed5eed.example.com A (microvm-1)")).unwrap();
+        assert_eq!(newest_dns_path(&paths), at("platform-dns:fd00:ec2::253"), "a live row's note decides nothing");
+        // An unreadable file is said as such, never as no row.
+        std::fs::remove_file(paths.probes()).unwrap();
+        std::fs::create_dir(paths.probes()).unwrap();
+        let e = newest_dns_path(&paths).unwrap_err();
+        assert!(e.starts_with(&paths.probes().display().to_string()), "{e}");
+        // The line to write instead of `true`: the resolvers of the newest platform-dns verdict, nothing else.
+        assert_eq!(pin_suggestion(Some("platform-dns:fd00:ec2::253")), "accept_platform_dns = \"fd00:ec2::253\"");
+        assert_eq!(pin_suggestion(Some("platform-dns:169.254.169.253,fd00:0ec2::0253,169.254.169.253")), "accept_platform_dns = [\"169.254.169.253\", \"fd00:ec2::253\"]");
+        assert_eq!(pin_suggestion(Some("no-dns")), "remove the line");
+        for other in [None, Some("platform-dns-answered:fd00:ec2::253"), Some("platform-dns-resolves:10.42.1.2"), Some("open-dns:1.1.1.1"), Some("platform-dns:8.8.8.8"), Some("platform-dns:"), Some("platform-dns:fd00:ec2::253,")] {
+            assert_eq!(pin_suggestion(other), "accept_platform_dns = \"<the resolver you tested>\"", "{other:?}");
+        }
     }
 
     #[test]
@@ -1139,26 +1325,66 @@ mod tests {
         let echo = s(&[CONN]);
         let now = facts();
         let live = LiveEcho { connectors: &echo, alias: None, connector: Some(&now), image_created_at: Some(1_790_000_000) };
-        credential_gate(&cfg, &row, &live, &verified, true).unwrap();
+        credential_gate(&cfg, &row, &live, &verified, &at(DNS_NONE)).unwrap();
         let why = |r: Result<(), BridgeError>| match r {
             Err(BridgeError::Policy(m)) => m,
             other => panic!("expected a policy refusal, got {other:?}"),
         };
-        assert!(why(credential_gate(&BridgeConfig::default(), &row, &live, &verified, true)).contains("egress_connector_arn is not set"));
+        assert!(why(credential_gate(&BridgeConfig::default(), &row, &live, &verified, &at(DNS_NONE))).contains("egress_connector_arn is not set"));
         let internet_row = VmRow { egress: "internet".into(), ..row.clone() };
-        assert!(why(credential_gate(&cfg, &internet_row, &live, &verified, true)).contains("never enter a VM with internet egress"));
+        assert!(why(credential_gate(&cfg, &internet_row, &live, &verified, &at(DNS_NONE))).contains("never enter a VM with internet egress"));
         let open = [internet_egress_arn()];
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connectors: &open, ..live }, &verified, true)).contains("not exactly"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connectors: &open, ..live }, &verified, &at(DNS_NONE))).contains("not exactly"));
         let both = [internet_egress_arn(), CONN.to_string()];
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connectors: &both, ..live }, &verified, true)).contains("not exactly"));
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connectors: &[], ..live }, &verified, true)).contains("echoes egress nothing"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connectors: &both, ..live }, &verified, &at(DNS_NONE))).contains("not exactly"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connectors: &[], ..live }, &verified, &at(DNS_NONE))).contains("echoes egress nothing"));
         let newer = VmRow { image_version: "3.0".into(), ..row.clone() };
-        assert!(why(credential_gate(&cfg, &newer, &live, &verified, true)).contains("run `ai-env egress check`"));
-        assert!(why(credential_gate(&cfg, &row, &live, &EgressVerified::default(), true)).contains("run `ai-env egress check`"));
-        assert!(why(credential_gate(&cfg, &row, &live, &verified, false)).contains("dns-path"));
+        assert!(why(credential_gate(&cfg, &newer, &live, &verified, &at(DNS_NONE))).contains("run `ai-env egress check`"));
+        assert!(why(credential_gate(&cfg, &row, &live, &EgressVerified::default(), &at(DNS_NONE))).contains("run `ai-env egress check`"));
+        assert!(why(credential_gate(&cfg, &row, &live, &verified, &Ok(None))).ends_with("no dns-path verdict is recorded (run `ai-env lab run dns-path`)"));
         let mut leaky = EgressVerified::default();
         leaky.record(VerifiedRecord { dns: "platform-dns:9.9.9.9".into(), ..rec("2.0", CONN) }, 100);
-        assert!(why(credential_gate(&cfg, &row, &live, &leaky, true)).contains("saw DNS"), "the check's own DNS verdict counts too");
+        assert!(why(credential_gate(&cfg, &row, &live, &leaky, &at(DNS_NONE))).contains("saw DNS"), "the check's own DNS verdict counts too");
+        // The pin: the tested resolver in both the record and the newest dns-path verdict passes.
+        let fd00 = "platform-dns:fd00:ec2::253";
+        let pinned = BridgeConfig::parse(&format!("[aws]\negress_connector_arn = \"{CONN}:1\"\n[egress]\naccept_platform_dns = \"fd00:ec2::253\"\n")).unwrap();
+        let mut platform = EgressVerified::default();
+        platform.record(VerifiedRecord { dns: fd00.into(), ..rec("2.0", CONN) }, 100);
+        credential_gate(&pinned, &row, &live, &platform, &at(fd00)).unwrap();
+        credential_gate(&pinned, &row, &live, &verified, &at(fd00)).unwrap();
+        credential_gate(&pinned, &row, &live, &platform, &at(DNS_NONE)).unwrap();
+        // Without the pin, or with the legacy `true`, the same evidence is refused in either position, and each refusal
+        // says what the configuration in force accepts (never "is false" for `true`).
+        let legacy = BridgeConfig::parse(&format!("[aws]\negress_connector_arn = \"{CONN}:1\"\n[egress]\naccept_platform_dns = true\n")).unwrap();
+        for (c, says) in [(&cfg, "accepts no platform resolver (only no-dns passes)"), (&legacy, "= true accepts no resolver (it names none): name the one you tested, accept_platform_dns = \"<ip>\"")] {
+            let in_record = why(credential_gate(c, &row, &live, &platform, &at(DNS_NONE)));
+            assert!(in_record.contains("the recorded `ai-env egress check` saw DNS \"platform-dns:fd00:ec2::253\", not accepted: ") && in_record.contains(says) && !in_record.contains("is false"), "{in_record}");
+            let in_path = why(credential_gate(c, &row, &live, &verified, &at(fd00)));
+            assert!(in_path.contains("the newest dns-path verdict \"platform-dns:fd00:ec2::253\" is not accepted: ") && in_path.contains(says) && in_path.ends_with("(run `ai-env lab run dns-path`)") && !in_path.contains("is false"), "{in_path}");
+        }
+        // Another pinned address accepts only itself.
+        let other = BridgeConfig::parse(&format!("[aws]\negress_connector_arn = \"{CONN}:1\"\n[egress]\naccept_platform_dns = \"169.254.169.253\"\n")).unwrap();
+        assert!(why(credential_gate(&other, &row, &live, &verified, &at(fd00))).contains("accepts only 169.254.169.253"));
+        assert!(why(credential_gate(&other, &row, &live, &platform, &at(DNS_NONE))).contains("accepts only 169.254.169.253"));
+        // The classes never accepted, in either position, whatever the pin.
+        for never in ["platform-dns-answered:fd00:ec2::253", "platform-dns-resolves:fd00:ec2::253", "open-dns:fd00:ec2::253", "open-dns:1.1.1.1", "platform-dns:fd00:ec2::253,10.42.1.2"] {
+            let mut rec_never = EgressVerified::default();
+            rec_never.record(VerifiedRecord { dns: never.into(), ..rec("2.0", CONN) }, 100);
+            assert!(why(credential_gate(&pinned, &row, &live, &rec_never, &at(fd00))).contains("saw DNS"), "{never}");
+            assert!(why(credential_gate(&pinned, &row, &live, &platform, &at(never))).contains("the newest dns-path verdict"), "{never}");
+        }
+        assert!(why(credential_gate(&pinned, &row, &live, &platform, &Ok(None))).contains("no dns-path verdict is recorded"));
+        // An unreadable lab/probes.jsonl is named as such (the probe would fail on it too), never as no verdict.
+        let unreadable = why(credential_gate(&pinned, &row, &live, &platform, &Err("lab/probes.jsonl: Permission denied (os error 13)".into())));
+        assert!(unreadable.ends_with("the dns-path rows cannot be read: lab/probes.jsonl: Permission denied (os error 13)") && !unreadable.contains("is recorded"), "{unreadable}");
+        // A record judged by an earlier DNS rule (no field: 0) is never honoured, even for no-dns and with the pin.
+        let mut old_rule = EgressVerified::default();
+        old_rule.record(VerifiedRecord { dns_rule: 0, ..rec("2.0", CONN) }, 100);
+        for c in [&cfg, &pinned] {
+            assert!(why(credential_gate(c, &row, &live, &old_rule, &at(DNS_NONE))).contains("judged DNS by an earlier rule (example.com asked; a platform reply passed whatever its status): run `ai-env egress check`"));
+        }
+        let parsed_old: EgressVerified = toml::from_str("[[records]]\nimage_arn = \"x\"\ndns = \"no-dns\"\n").unwrap();
+        assert_eq!(parsed_old.records[0].dns_rule, 0, "a record written before the field reads as rule 0");
         // Bound to the connector's live facts: a recreated connector (another Id), an update (Version, also one appearing
         // where none was answered), dual stack, another subnet or SG.
         for changed in [
@@ -1170,24 +1396,24 @@ mod tests {
             ConnectorFacts { security_group_ids: s(&["sg-0bbb", "sg-0ddd3333eeee4444f"]), ..facts() },
             ConnectorFacts::default(),
         ] {
-            assert!(why(credential_gate(&cfg, &row, &LiveEcho { connector: Some(&changed), ..live }, &verified, true)).contains("is not the connector the recorded check verified"), "{changed:?}");
+            assert!(why(credential_gate(&cfg, &row, &LiveEcho { connector: Some(&changed), ..live }, &verified, &at(DNS_NONE))).contains("is not the connector the recorded check verified"), "{changed:?}");
         }
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connector: None, ..live }, &verified, true)).contains("live facts were not read"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { connector: None, ..live }, &verified, &at(DNS_NONE))).contains("live facts were not read"));
         let mut unbound = EgressVerified::default();
         unbound.record(VerifiedRecord { connector_facts: ConnectorFacts::default(), ..rec("2.0", CONN) }, 100);
-        assert!(why(credential_gate(&cfg, &row, &live, &unbound, true)).contains("is not the connector"), "a record without facts binds nothing");
+        assert!(why(credential_gate(&cfg, &row, &live, &unbound, &at(DNS_NONE))).contains("is not the connector"), "a record without facts binds nothing");
         // Bound to the image build: a rebuilt version of the same number (destroy + redeploy) or an unknown created_at.
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { image_created_at: Some(1_790_000_001), ..live }, &verified, true)).contains("is not the build"));
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { image_created_at: None, ..live }, &verified, true)).contains("is not the build"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { image_created_at: Some(1_790_000_001), ..live }, &verified, &at(DNS_NONE))).contains("is not the build"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { image_created_at: None, ..live }, &verified, &at(DNS_NONE))).contains("is not the build"));
         let mut no_build = EgressVerified::default();
         no_build.record(VerifiedRecord { image_created_at: None, ..rec("2.0", CONN) }, 100);
-        assert!(why(credential_gate(&cfg, &row, &LiveEcho { image_created_at: None, ..live }, &no_build, true)).contains("is not the build"));
+        assert!(why(credential_gate(&cfg, &row, &LiveEcho { image_created_at: None, ..live }, &no_build, &at(DNS_NONE))).contains("is not the build"));
         let bad_cfg = BridgeConfig::parse("[aws]\negress_connector_arn = \"arn:aws:lambda:eu-central-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS\"\n").unwrap();
-        assert!(why(credential_gate(&bad_cfg, &row, &LiveEcho { connectors: &open, ..live }, &verified, true)).contains("not a connector ARN"));
+        assert!(why(credential_gate(&bad_cfg, &row, &LiveEcho { connectors: &open, ..live }, &verified, &at(DNS_NONE))).contains("not a connector ARN"));
         let id_echo = s(&["arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-1"]);
         let alias = ConnectorAlias { arn: CONN.into(), id: "nc-1".into() };
-        credential_gate(&cfg, &row, &LiveEcho { connectors: &id_echo, alias: Some(&alias), ..live }, &verified, true).unwrap();
-        assert!(credential_gate(&cfg, &row, &LiveEcho { connectors: &id_echo, alias: None, ..live }, &verified, true).is_err());
+        credential_gate(&cfg, &row, &LiveEcho { connectors: &id_echo, alias: Some(&alias), ..live }, &verified, &at(DNS_NONE)).unwrap();
+        assert!(credential_gate(&cfg, &row, &LiveEcho { connectors: &id_echo, alias: None, ..live }, &verified, &at(DNS_NONE)).is_err());
         // As measured live (1 Oct 2026): the connector's ARN is in the Id form and its answer carries no Version.
         let id_conn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-f0b942fe-0612-44a7-9183-16942c532410";
         let id_cfg = BridgeConfig::parse(&format!("[aws]\negress_connector_arn = \"{id_conn}\"\n")).unwrap();
@@ -1196,6 +1422,6 @@ mod tests {
         let mut measured = EgressVerified::default();
         measured.record(VerifiedRecord { connector_facts: no_version.clone(), ..rec("2.0", id_conn) }, 100);
         let id_live = s(&[id_conn]);
-        credential_gate(&id_cfg, &id_row, &LiveEcho { connectors: &id_live, alias: None, connector: Some(&no_version), ..live }, &measured, true).unwrap();
+        credential_gate(&id_cfg, &id_row, &LiveEcho { connectors: &id_live, alias: None, connector: Some(&no_version), ..live }, &measured, &at(DNS_NONE)).unwrap();
     }
 }

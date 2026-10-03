@@ -4,11 +4,16 @@
 # Why: `iam simulate-*` accepts invented action names, so names are proven with Access Analyzer validate-policy
 # (an unknown action is an ERROR finding); then simulate-custom-policy proves the runtime principal's allowed and
 # implicitly denied actions of plans/s3-plan.md §9 and plans/s5-plan.md; then the egress proxy's role, its inline
-# policy and the AWS managed SSM agent policy evaluated together (what the instance really holds). The documents
-# come from infra/policies.ts (the ones Pulumi creates), compiled into target/infra-policies; the two AWS managed
-# policies the egress roles attach are read from IAM (iam get-policy / get-policy-version), which also proves their
-# ARNs. The caller's account id only lives in shell variables: nothing here writes it to a file. Read-only against
-# AWS; region always $REGION.
+# policy and the AWS managed SSM agent policy evaluated together (what the instance really holds); then the
+# connector's operator role the same way, its inline Deny and the AWS managed operator policy (an ENI in the VM
+# subnet with the VM security group allowed; any other subnet or group, in another region or account too, explicitly
+# denied). The documents come from infra/policies.ts (the ones Pulumi creates), compiled into target/infra-policies;
+# the two AWS managed policies the egress roles attach are read from IAM (iam get-policy / get-policy-version), which
+# also proves their ARNs, and the operator policy's allowed (action, resource) pairs are pinned: operatorRolePolicy's
+# Deny narrows ec2:CreateNetworkInterface on the subnet and the security groups only, so any change there stops the
+# deploy until the Deny is reviewed. The Deny's own shape (one statement, no condition) is asserted before its
+# simulations, which a negated condition would pass. The caller's account id only lives in shell variables: nothing
+# here writes it to a file. Read-only against AWS; region always $REGION.
 #
 # Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, POLICIES_OUT.
 set -euo pipefail
@@ -75,6 +80,37 @@ ssm_managed=$(managed "$(pp --arn ssm-instance-policy)")
 operator_managed=$(managed "$(pp --arn operator-policy)")
 grep -q 'ec2:CreateNetworkInterface' <<<"$operator_managed" \
     || { echo "check-policies: the operator policy no longer grants ec2:CreateNetworkInterface (the connector could not create its ENIs)" >&2; exit 1; }
+# The pin (plans/s5-closing-design.md, step 0: four statements, CreateNetworkInterface on subnet/*, security-group/*
+# and network-interface/*, CreateTags on network-interface/* at creation only), as (action, resource) pairs, a
+# statement without Resource counted as `<action> NotResource`: operatorRolePolicy's Deny narrows
+# ec2:CreateNetworkInterface and nothing else, so another Allow action or any NotAction could reach what it does not
+# cover; and a new resource the managed policy authorizes CreateNetworkInterface on (a vpc/*, say) is one the Deny
+# refuses live, so ENIs would fail closed, first seen as a FAILED connector. Exact strings: a wildcard or a respelled
+# action or ARN fails too, and is reviewed like a new one.
+pinned='ec2:CreateNetworkInterface arn:aws:ec2:*:*:network-interface/*
+ec2:CreateNetworkInterface arn:aws:ec2:*:*:security-group/*
+ec2:CreateNetworkInterface arn:aws:ec2:*:*:subnet/*
+ec2:CreateTags arn:aws:ec2:*:*:network-interface/*'
+pin=$(node -e '
+const d = JSON.parse(require("fs").readFileSync(0, "utf-8"));
+const statements = [].concat(d.Statement ?? []);
+if (statements.some((s) => s.NotAction !== undefined)) { process.stdout.write("NotAction"); process.exit(0); }
+const pairs = statements.filter((s) => s.Effect === "Allow").flatMap((s) => [].concat(s.Action ?? [])
+    .flatMap((a) => (s.Resource === undefined ? ["NotResource"] : [].concat(s.Resource)).map((r) => `${a} ${r}`)));
+process.stdout.write([...new Set(pairs)].sort().join("\n"));
+' <<<"$operator_managed") || { echo "check-policies: cannot read the statements of the operator policy" >&2; exit 1; }
+case "$pin" in
+"$pinned")
+    echo "managed policy pin                the operator policy allows exactly these (action, resource) pairs:"
+    sed 's/^/    /' <<<"$pin"
+    ;;
+NotAction) echo "check-policies: AWS changed AWSLambdaNetworkConnectorOperatorPolicy (a statement uses NotAction): review operatorRolePolicy" >&2; exit 1 ;;
+*)
+    { echo "check-policies: AWS changed AWSLambdaNetworkConnectorOperatorPolicy (its allowed (action, resource) pairs are not the pinned ones): review operatorRolePolicy"
+        echo "  allowed:"; sed 's/^/    /' <<<"${pin:-nothing}"; echo "  pinned:"; sed 's/^/    /' <<<"$pinned"; } >&2
+    exit 1
+    ;;
+esac
 
 # ---- 3. simulate-custom-policy: the runtime principal's §9 table (S5: PassNetworkConnector only) ----
 runtime=$(pp --name runtime)
@@ -110,10 +146,12 @@ failed=0
 # The documents the simulated principal holds (set before each group of sims).
 docs=("$runtime")
 
-# sim <allowed|implicitDeny> <label> <resource arn> <context entry or -> <action>...
+# sim <allowed|implicitDeny|explicitDeny> <label> <resource arn> <context entries or -> <action>...
+# The context is one shorthand entry or a JSON list of entries (several keys at once), passed as given.
 sim() {
     local want=$1 label=$2 resource=$3 context=$4
     shift 4
+    case "$want" in allowed | implicitDeny | explicitDeny) ;; *) echo "simulate $label: unknown decision $want (allowed, implicitDeny or explicitDeny)" >&2; exit 2 ;; esac
     local ctx=()
     if [ "$context" != "-" ]; then ctx=(--context-entries "$context"); fi
     local results
@@ -229,4 +267,63 @@ sim implicitDeny "proxy: the image" "$image" - lambda:RunMicrovm lambda:CreateMi
 sim implicitDeny "proxy: the egress connector" "$connector" - lambda:UpdateNetworkConnector lambda:DeleteNetworkConnector
 sim implicitDeny "proxy: ec2 describes" "*" - ec2:DescribeInstances ec2:DescribeSecurityGroups
 test "$failed" -eq 0 || { echo "check-policies: the egress proxy's role does not match plans/s5-plan.md (above)" >&2; exit 1; }
-echo "check-policies: ok (Access Analyzer clean of ERROR and SECURITY_WARNING; runtime policy matches §9 and S5; the proxy role holds its own parameters and log group only)"
+
+# ---- 5. the connector's operator role: its inline Deny and the AWS managed operator policy together ----
+# The VM subnet and group get ids of the real shape that are not print-policies' placeholders, because the zero ids
+# of $subnet_arn and $sg_arn stand for "another subnet" and "another group" here. The VM ARNs are built here, never
+# printed, so a wrong ARN shape in policies.ts fails the allowed rows. CreateNetworkInterface authorizes on the
+# subnet, each security group and the new ENI separately: each is simulated on its own.
+vm_subnet_id=subnet-0123456789abcdef0
+vm_sg_id=sg-0123456789abcdef0
+vm_subnet_arn="$ec2_arn:subnet/$vm_subnet_id"
+vm_sg_arn="$ec2_arn:security-group/$vm_sg_id"
+# Another account: the documentation one (the only literal account id the repository allows), never the caller's.
+other_acct=123456789012
+docs=("$(pp --vm-subnet-id "$vm_subnet_id" --vm-security-group-id "$vm_sg_id" --name operator)" "$operator_managed")
+# The Deny's shape first, which the rows below cannot see: they carry no request context, and a negated condition
+# (StringNotEquals ec2:Vpc, say) is true for a key the request lacks, so every explicitDeny row would still pass while
+# a real CreateNetworkInterface, which carries the key, escapes the Deny. One unconditional Deny of exactly
+# ec2:CreateNetworkInterface on a NotResource of three (a positive condition fails the rows anyway). Its entries are
+# pinned too: the rows probe only sampled ARNs, so a wildcard such as subnet/subnet-01* would match the VM subnet and
+# none of them while it lets ENIs into other subnets. The new-ENI entry may name this account, or any account (the
+# documented fallback, plans/s5-closing-design.md I).
+node -e '
+const [doc, subnet, sg, acct, region] = process.argv.slice(1);
+const s = [].concat(JSON.parse(doc).Statement ?? []);
+const d = s[0] ?? {};
+const nr = Array.isArray(d.NotResource) ? d.NotResource : [];
+const rest = nr.filter((r) => r !== subnet && r !== sg);
+process.exit(s.length === 1 && d.Effect === "Deny" && d.Condition === undefined && d.Resource === undefined && d.NotAction === undefined
+    && JSON.stringify(d.Action) === JSON.stringify(["ec2:CreateNetworkInterface"]) && nr.length === 3 && nr.includes(subnet) && nr.includes(sg)
+    && rest.length === 1 && [`arn:aws:ec2:${region}:${acct}:network-interface/*`, `arn:aws:ec2:${region}:*:network-interface/*`].includes(rest[0]) ? 0 : 1);
+' "${docs[0]}" "$vm_subnet_arn" "$vm_sg_arn" "$acct" "$region" || { echo "check-policies: operatorRolePolicy is no longer one unconditional Deny of ec2:CreateNetworkInterface on a NotResource of exactly the VM subnet, the VM SG and network-interface/*: review it (plans/s5-closing-design.md I)" >&2; exit 1; }
+echo "operator Deny shape               one unconditional Deny of ec2:CreateNetworkInterface, NotResource of exactly the VM subnet, the VM SG and network-interface/*"
+# The managed policy's conditions (step 0): the new ENI may carry only the two Lambda tag keys (ForAllValues, so also
+# true without tags; given here to be exact), and it is tagged only while the connector service creates it.
+lambda_tags='[{"ContextKeyName":"aws:TagKeys","ContextKeyValues":["aws:lambda:networkConnectorName","aws:lambda:networkConnectorId"],"ContextKeyType":"stringList"}]'
+tag_on_create='[{"ContextKeyName":"ec2:CreateAction","ContextKeyValues":["CreateNetworkInterface"],"ContextKeyType":"string"},{"ContextKeyName":"ec2:ManagedResourceOperator","ContextKeyValues":["network-connectors.lambda.amazonaws.com"],"ContextKeyType":"string"}]'
+sim allowed "operator: an ENI in the VM subnet" "$vm_subnet_arn" - ec2:CreateNetworkInterface
+sim allowed "operator: an ENI with the VM SG" "$vm_sg_arn" - ec2:CreateNetworkInterface
+sim allowed "operator: the new ENI" "$eni_arn" "$lambda_tags" ec2:CreateNetworkInterface
+# The Deny names CreateNetworkInterface only: the tags written at creation still pass (a Deny on them would fail
+# every ENI creation).
+sim allowed "operator: tag the new ENI" "$eni_arn" "$tag_on_create" ec2:CreateTags
+sim explicitDeny "operator: an ENI in another subnet" "$subnet_arn" - ec2:CreateNetworkInterface
+sim explicitDeny "operator: an ENI with another SG" "$sg_arn" - ec2:CreateNetworkInterface
+sim explicitDeny "operator: the VM subnet id, other region" "arn:aws:ec2:eu-west-1:$acct:subnet/$vm_subnet_id" - ec2:CreateNetworkInterface
+sim explicitDeny "operator: the VM SG id, other region" "arn:aws:ec2:eu-west-1:$acct:security-group/$vm_sg_id" - ec2:CreateNetworkInterface
+sim explicitDeny "operator: the VM subnet id, other account" "arn:aws:ec2:$region:$other_acct:subnet/$vm_subnet_id" - ec2:CreateNetworkInterface
+sim explicitDeny "operator: the VM SG id, other account" "arn:aws:ec2:$region:$other_acct:security-group/$vm_sg_id" - ec2:CreateNetworkInterface
+# Implicitly denied: the managed policy grants nothing else, and the Deny grants nothing.
+sim implicitDeny "operator: tag an ENI after its creation" "$eni_arn" - ec2:CreateTags ec2:DeleteTags
+sim implicitDeny "operator: change, attach or delete an ENI" "$eni_arn" - \
+    ec2:ModifyNetworkInterfaceAttribute ec2:AttachNetworkInterface ec2:DetachNetworkInterface ec2:DeleteNetworkInterface ec2:CreateNetworkInterfacePermission
+sim implicitDeny "operator: the VM SG's rules and tags" "$vm_sg_arn" - \
+    ec2:AuthorizeSecurityGroupEgress ec2:AuthorizeSecurityGroupIngress ec2:RevokeSecurityGroupEgress ec2:ModifySecurityGroupRules ec2:CreateTags
+sim implicitDeny "operator: another SG's rules" "$sg_arn" - ec2:AuthorizeSecurityGroupEgress ec2:AuthorizeSecurityGroupIngress
+sim implicitDeny "operator: the VM subnet" "$vm_subnet_arn" - ec2:ModifySubnetAttribute ec2:CreateTags
+sim implicitDeny "operator: its own role (and its Deny)" "$operator_role" - \
+    iam:PassRole iam:PutRolePolicy iam:DeleteRolePolicy iam:AttachRolePolicy iam:DetachRolePolicy iam:UpdateAssumeRolePolicy
+sim implicitDeny "operator: the egress connector" "$connector" - lambda:UpdateNetworkConnector lambda:DeleteNetworkConnector lambda:CreateNetworkConnector
+test "$failed" -eq 0 || { echo "check-policies: the operator role does not match plans/s5-closing-design.md (I, above)" >&2; exit 1; }
+echo "check-policies: ok (Access Analyzer clean of ERROR and SECURITY_WARNING; runtime policy matches §9 and S5; the proxy role holds its own parameters and log group only; the operator role creates ENIs only in the VM subnet with the VM security group, under the pinned managed policy)"

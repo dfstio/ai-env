@@ -28,7 +28,28 @@
 //! revoked the connector after this check began. `--if-needed` starts
 //! nothing when the version a new VM runs (`[aws].image_version` resolved
 //! live, as RunMicrovm does) already has such a pass, bound to that build and
-//! to the connector's live facts (`make claude-update`).
+//! to the connector's live facts, and judged by the current DNS rule
+//! (`egress::DNS_RULE`: a pass recorded before rule 1 never counts, and the
+//! check runs again, saying why) (`make claude-update`).
+//!
+//! **Allowlisted hosts.** github.com (`proxy-github`, [`ALLOWLISTABLE`]) is
+//! a host the proxy refuses until an operator allowlists it (`ai-env egress
+//! allow SLUG github.com`). The check judges it by what squid serves: the
+//! effective allowlist ((allow ∪ extras) − suspended,
+//! `egress::effective_hosts`) of the very parameter values the network
+//! verification proved against the proxy's `--status` line (its
+//! `parameters` row ok, and the line saying squid serves them: active,
+//! parse ok, `applied=yes`), read after the cases ran. While that list
+//! holds the host, its case is recorded, not judged
+//! (`proxy-github=recorded:allowlisted`), squid's log need not show it
+//! refused (its tunnel on 443 is no violation), and the report, the audit
+//! row and the record name it (`allowlisted`: the record does not show it
+//! refused). A case with no result is judged all the same, and fails. A
+//! removal during the check fails closed (the case is judged, and OPEN);
+//! an addition only keeps the record from claiming the host refused;
+//! without a proven list every case is judged strictly. An IP literal,
+//! another port, plain http and the run's nonce host are never
+//! allowlisted.
 //!
 //! **Revocation.** Once a check has asked for its own VM — RunMicrovm made
 //! one, or may have (a pending row) — any failure but Ctrl-C revokes every
@@ -50,11 +71,16 @@
 //! (curl: exit code, HTTP code, body size with `-o /dev/null`, connects
 //! made, the proxy's CONNECT answer, whether curl said [`CONNECT_403`],
 //! whether squid's `X-Squid-Error: ERR_ACCESS_DENIED` came) or `… rc=… ns=…
-//! res=…` (dig: exit code, server, whether an address came back) — never a
-//! body, header value, token or IMDS answer. Markers are built at run time
+//! res=… st=… ra=… an=… au=…` (dig, asking the run's fresh name
+//! [`dns_name`], which exists nowhere, and example.com of a server that
+//! replied: exit code, server, whether an address came back, and of the
+//! fresh name's reply its status (`NOEXAMPLE` instead when example.com got no
+//! reply), recursion flag, ANSWER and AUTHORITY counts) — never a body,
+//! header value, record, token or IMDS answer.
+//! Markers are built at run time
 //! (`printf '%s%s …' '@@' "$R"`), so the shell's echo of the script never
 //! parses as one ([`parse_markers`]). The transcript itself is never
-//! printed, logged or persisted. [`judge`] is pure; `allowed` runs first and
+//! printed, logged or persisted. [`judge_with`] is pure; `allowed` runs first and
 //! last, and the direct, DNS and other-port cases count only when both
 //! passed, so a VM whose networking is dead (or died midway) cannot pass. A
 //! direct case is closed only when curl made no connection at all.
@@ -72,10 +98,10 @@
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::awscli;
 use crate::bridge::config::{is_rfc1918, BridgeConfig, Paths};
-use crate::bridge::egress::{is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
+use crate::bridge::egress::{dns_accepted, is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, DNS_RULE, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::read_infra_state;
-use crate::bridge::probes::{is_platform_resolver, verdict_dns_path, DnsReply};
+use crate::bridge::probes::{is_empty_noerror, is_platform_resolver, verdict_dns_path, DnsReply, DNS_NO_EXAMPLE, DNS_NO_EXAMPLE_SAID};
 use crate::bridge::transport::ShellAuth;
 use crate::bridge::vm::cmd::{audit_event, backend, runtime, with_backend, Backend, Ctx};
 use crate::bridge::vm::registry::{self, RowStatus, VmRow, GATE_PASSED};
@@ -91,8 +117,6 @@ use std::time::{Duration, Instant};
 
 /// Every marker line starts with this, then the run's nonce.
 const MARK: &str = "@@AIENV";
-/// The name every DNS case asks for (it has an address record).
-pub const DNS_NAME: &str = "example.com";
 /// What curl prints when the proxy refuses a CONNECT with 403. Its exit code
 /// changed (56 up to curl 8.19, 7 from 8.20); the text did not.
 pub const CONNECT_403: &str = "CONNECT tunnel failed, response 403";
@@ -118,6 +142,12 @@ pub const CLOCK_SKEW_S: u64 = 60;
 /// the shell's transcript (its markers' nonce is the run's), so process tests
 /// reach the judgement, the network verification, squid's log and the record.
 pub const FAKE_SHELL_KNOB: &str = "AI_ENV_BRIDGE_LAB_FAKE_SHELL";
+/// What the note of a dns-path row says when [`FAKE_SHELL_KNOB`] stood in for
+/// the VM's shell: that row proves nothing about the network, so the readers
+/// of the newest dns-path verdict (`egress::newest_dns_path_row`: the
+/// credential gate, doctor, the `true` warning) skip it, and `lab run
+/// --note` may not carry it.
+pub const FAKE_SHELL_NOTE: &str = "LAB KNOB: transcript from AI_ENV_BRIDGE_LAB_FAKE_SHELL";
 
 /// How a case is judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,9 +184,16 @@ enum DnsServer {
     /// when its address is one (`probes::is_platform_resolver`), else as public.
     ResolvConf,
     /// The platform's resolvers (link-local, `fd00:ec2::253`, the VPC's and
-    /// the subnet's +2): they must not resolve the name; a reply that
-    /// resolves nothing (DNS Firewall) is noted, and the dns-path probe
-    /// records it.
+    /// the subnet's +2): no reply passes; a reply passes only as the empty
+    /// NOERROR the platform's stub gives (no answer, no authority section:
+    /// `probes::is_empty_noerror`) to the run's fresh name, and a reply to
+    /// example.com A without an address. Anything else fails: an address (a
+    /// path out), an SOA (a recursor that went upstream), another status (the
+    /// platform is not what was tested), no reply to example.com (the stub
+    /// answers both at once). Blind spot: a forwarder that strips the SOA and
+    /// answers example.com without an address (whatever that reply's status:
+    /// only its address is read). The run's DNS verdict names the replying
+    /// servers, and only `[egress].accept_platform_dns` accepts them.
     Platform,
 }
 
@@ -248,6 +285,36 @@ pub const DNS_PATH_CASES: [&str; 15] = [
     "allowed-last",
 ];
 
+/// The cases that ask the proxy, CONNECT on 443, for a host an operator may
+/// allowlist (`ai-env egress allow SLUG github.com`), with that host: while
+/// the effective allowlist the network verification proved holds it, the
+/// case is recorded, not judged ([`judge_with`]), and squid's log need not
+/// show it refused ([`refused_requests`]). Only these: an IP literal,
+/// another port, plain http and the run's nonce host are never allowlisted.
+pub const ALLOWLISTABLE: [(&str, &str); 1] = [("proxy-github", "github.com")];
+
+/// The hosts of [`ALLOWLISTABLE`] that `effective` holds (the proxy's
+/// effective allowlist, `egress::effective_hosts`): what [`judge_with`] and
+/// [`squid_poll`] take.
+#[must_use]
+pub fn allowlisted_hosts(effective: &BTreeSet<String>) -> BTreeSet<String> {
+    ALLOWLISTABLE.iter().map(|(_, h)| (*h).to_string()).filter(|h| effective.contains(h)).collect()
+}
+
+/// Does the allowlist let `method host:port` through, so that this run need
+/// not show squid refusing it: `CONNECT` to port 443 of an [`ALLOWLISTABLE`]
+/// host that `allowlisted` holds. Nothing else ever is (squid tunnels port
+/// 443 only).
+fn allowlisted_request(method: &str, host: &str, port: Option<u16>, allowlisted: &BTreeSet<String>) -> bool {
+    method == "CONNECT" && port == Some(443) && ALLOWLISTABLE.iter().any(|(_, h)| *h == host) && allowlisted.contains(host)
+}
+
+/// The host of `case` when it is an [`ALLOWLISTABLE`] case whose host
+/// `allowlisted` holds.
+fn allowlisted_case(case: &str, allowlisted: &BTreeSet<String>) -> Option<&'static str> {
+    ALLOWLISTABLE.iter().find(|(c, h)| *c == case && allowlisted.contains(*h)).map(|(_, h)| *h)
+}
+
 fn case(name: &str) -> Option<&'static Case> {
     CASES.iter().find(|c| c.name == name)
 }
@@ -281,6 +348,16 @@ pub fn denied_host(nonce: &str) -> String {
     format!("n{nonce}.example.com")
 }
 
+/// The name every DNS case asks (`N` in the script): fresh per run, so no
+/// resolver has it cached and any real one must go upstream, where it does
+/// not exist — a recursor's negative answer then carries the zone's SOA,
+/// which the platform's stub never sends. Not [`denied_host`]: the proxy's
+/// log of that host must stay the `denied` case's alone.
+#[must_use]
+pub fn dns_name(nonce: &str) -> String {
+    format!("d{nonce}.example.com")
+}
+
 /// The network address of `cidr` plus two (`10.42.1.0/24` → `10.42.1.2`).
 #[must_use]
 pub fn cidr_plus_two(cidr: &str) -> Option<String> {
@@ -311,21 +388,36 @@ pub fn proxy_ip(cfg: &BridgeConfig, paths: &Paths) -> String {
 /// The shell helpers: `aienv_c NAME CURL-ARGS…` and `aienv_d NAME SERVER
 /// [DIG-OPTS…]` each run one case and print its marker; nothing else they
 /// see is printed (squid's error header is reduced to yes/no in the VM; of
-/// dig's reply only its status, the recursion-available flag and whether it
-/// carried an address; `TRUNCATED` when a UDP reply came truncated and dig's
-/// TCP retry got nothing). `aienv_r IP:PORT` waits for a TCP connection to
-/// the proxy (at most [`READY_WAIT_S`], 30 attempts; a dot per failed one, so
-/// the shell is never silent for long) and prints the `ready` marker. `R`
-/// is `AIENV<nonce>`, `S` the first resolv.conf nameserver.
+/// dig's replies only the fresh name's status, recursion-available flag and
+/// ANSWER and AUTHORITY counts, and whether either reply carried an address;
+/// `TRUNCATED` when a UDP reply came truncated and dig's TCP retry got
+/// nothing). `aienv_d` asks `N` (the run's fresh name, [`dns_name`]) with
+/// dig's header, and only of a server that replied (exit 0) `example.com A`,
+/// whose address alone counts (`res`): a forwarder that drops the authority
+/// section looks like the platform's stub on the fresh name, but hands out
+/// example.com's addresses. example.com's output is read first, so a stray
+/// `;; Truncated` of it never overwrites the fresh name's status; when dig got
+/// no reply to example.com at all (its exit code `q`), the status is
+/// `NOEXAMPLE` instead (`probes::DNS_NO_EXAMPLE`), which fails the case: the
+/// stub answers both at once, so a server that answers only the fresh name
+/// (a forwarder whose upstream does not answer in time) is not the one
+/// tested; a reply to example.com is never read for its status (its exit
+/// code is 0 for SERVFAIL too), only for an address. A
+/// count dig did not print stays `none`, which fails the case (fail closed). It runs
+/// under macOS bash 3.2 too (the bash-run tests). `aienv_r IP:PORT` waits
+/// for a TCP connection to the proxy (at most [`READY_WAIT_S`], 30 attempts;
+/// a dot per failed one, so the shell is never silent for long) and prints
+/// the `ready` marker. `R` is `AIENV<nonce>`, `N` the run's fresh name, `S`
+/// the first resolv.conf nameserver.
 const HELPERS: [&str; 3] = [
     r#"aienv_c() { local n=$1 e rc o=000 s=0 c=- h=000 t=no q=no; shift; e=$(command curl -q -sS -o /dev/null -w 'W=%{http_code},%{size_download},%{num_connects},%{http_connect}=W X=%header{x-squid-error}=X' --connect-timeout 5 --max-time 10 "$@" 2>&1 </dev/null); rc=$?; [[ $e =~ W=([0-9]+),([0-9]+),([0-9]+),([0-9]+)=W ]] && o=${BASH_REMATCH[1]} s=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} h=${BASH_REMATCH[4]}; [[ $e == *'CONNECT tunnel failed, response 403'* ]] && t=yes; [[ $e == *'X=ERR_ACCESS_DENIED'* ]] && q=yes; printf '%s%s %s rc=%s code=%s size=%s conn=%s hc=%s t403=%s sq=%s\n' '@@' "$R" "$n" "$rc" "$o" "$s" "$c" "$h" "$t" "$q"; }"#,
-    r#"aienv_d() { local n=$1 s=$2 o rc r=no t=none a=none l x='status: ([A-Z]+)' y='^;; flags:([a-z ]*);' z='[[:space:]]A[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; shift 2; if [ -z "$s" ]; then printf '%s%s %s rc=none ns=none res=no st=none ra=none\n' '@@' "$R" "$n"; return; fi; o=$(command dig -r +noall +comments +answer +time=2 +tries=1 "$@" "@$s" example.com A 2>&1 </dev/null); rc=$?; while IFS= read -r l; do [[ $l == ';; Truncated'* ]] && t=TRUNCATED; [[ $l =~ $x ]] && t=${BASH_REMATCH[1]}; [[ $l =~ $y ]] && { a=no; [[ " ${BASH_REMATCH[1]} " == *' ra '* ]] && a=yes; }; [[ $l =~ $z ]] && r=yes; done <<<"$o"; printf '%s%s %s rc=%s ns=%s res=%s st=%s ra=%s\n' '@@' "$R" "$n" "$rc" "$s" "$r" "$t" "$a"; }"#,
+    r#"aienv_d() { local n=$1 s=$2 o e rc q=0 r=no t=none a=none c=none d=none l x='status: ([A-Z]+)' y='^;; flags:([a-z ]*);.* ANSWER: ([0-9]+), AUTHORITY: ([0-9]+),' z='[[:space:]]A[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; shift 2; if [ -z "$s" ]; then printf '%s%s %s rc=none ns=none res=no st=none ra=none an=none au=none\n' '@@' "$R" "$n"; return; fi; o=$(command dig -r +noall +comments +answer +time=2 +tries=1 "$@" "@$s" "$N" A 2>&1 </dev/null); rc=$?; [ $rc = 0 ] && { e=$(command dig -r +noall +answer +time=2 +tries=1 "$@" "@$s" example.com A 2>&1 </dev/null); q=$?; }; while IFS= read -r l; do [[ $l == ';; Truncated'* ]] && t=TRUNCATED; [[ $l =~ $x ]] && t=${BASH_REMATCH[1]}; [[ $l =~ $y ]] && { a=no c=${BASH_REMATCH[2]} d=${BASH_REMATCH[3]}; [[ " ${BASH_REMATCH[1]} " == *' ra '* ]] && a=yes; }; [[ $l =~ $z ]] && r=yes; done <<<"$e"$'\n'"$o"; [ $q = 0 ] || t=NOEXAMPLE; printf '%s%s %s rc=%s ns=%s res=%s st=%s ra=%s an=%s au=%s\n' '@@' "$R" "$n" "$rc" "$s" "$r" "$t" "$a" "$c" "$d"; }"#,
     r#"aienv_r() { local i=0 c=0 t=$SECONDS; while [ $i -lt 30 ] && [ $((SECONDS-t)) -lt 60 ]; do i=$((i+1)); c=$(command curl -q -s -o /dev/null -w '%{num_connects}' --noproxy '*' --connect-timeout 2 --max-time 4 "http://$1/" 2>/dev/null </dev/null); [ "${c:-0}" = 0 ] || break; printf .; command sleep 2; done; [ "${c:-0}" = 0 ] && c=no || c=yes; printf '%s%s ready try=%s s=%s ok=%s\n' '@@' "$R" "$i" "$((SECONDS-t))" "$c"; }"#,
 ];
 
 /// The script of `cases` for one run: no alias, no function named like a
 /// tool it calls, a fresh command hash, no history file, no `!` expansion;
-/// `R` and `S`; the helpers; one short line per case (the proxy exports and
+/// `R`, `N` and `S`; the helpers; one short line per case (the proxy exports and
 /// the wait for the proxy before the first proxied case); the `end` marker;
 /// `exit`. No tab, no `!`, under 4 KB (a terminal's line buffer).
 fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
@@ -334,7 +426,7 @@ fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
     };
     let mut lines = vec![
         r"\unalias -a; unset -f command curl dig printf 2>/dev/null; hash -r; unset HISTFILE; set +H".to_string(),
-        format!(r#"R={MARK_BODY}{nonce}; S=; while read -r k v x; do [ "$k" = nameserver ] && [ -z "$S" ] && S=$v; done 2>/dev/null </etc/resolv.conf"#, MARK_BODY = &MARK[2..]),
+        format!(r#"R={MARK_BODY}{nonce}; N={name}; S=; while read -r k v x; do [ "$k" = nameserver ] && [ -z "$S" ] && S=$v; done 2>/dev/null </etc/resolv.conf"#, MARK_BODY = &MARK[2..], name = dns_name(nonce)),
     ];
     lines.extend(HELPERS.iter().map(|h| (*h).to_string()));
     let mut exported = false;
@@ -396,14 +488,22 @@ pub struct CaseResult {
     pub sq: Option<bool>,
     /// dig: the server asked (`None` for `none`).
     pub ns: Option<String>,
-    /// dig: whether the reply carried an address.
+    /// dig: whether a reply carried an address (the fresh name's, or
+    /// example.com's of a server that replied).
     pub resolves: Option<bool>,
-    /// dig: the reply's status (`NOERROR`, `REFUSED`, `SERVFAIL`, …; `None`:
-    /// no reply, or none printed).
+    /// dig: the fresh name's reply's status (`NOERROR`, `REFUSED`,
+    /// `SERVFAIL`, …; `TRUNCATED`: a UDP reply came truncated and dig's TCP
+    /// retry got nothing; `NOEXAMPLE`: the fresh name got a reply, example.com
+    /// none; `None`: no reply, or none printed).
     pub status: Option<String>,
     /// dig: whether the reply's flags said recursion available (`ra`; `None`:
     /// no reply, or no flags printed).
     pub ra: Option<bool>,
+    /// dig: the header's `ANSWER:` count (`None`: no reply, or no header printed).
+    pub answers: Option<u16>,
+    /// dig: the header's `AUTHORITY:` count (`None`: no reply, or no header
+    /// printed). A recursor's negative answer carries the zone's SOA here.
+    pub authority: Option<u16>,
 }
 
 /// The script's wait for the proxy before its first case (`aienv_r`): the
@@ -445,7 +545,7 @@ fn is_server(s: &str) -> bool {
 }
 
 const CURL_FIELDS: [&str; 7] = ["rc", "code", "size", "conn", "hc", "t403", "sq"];
-const DIG_FIELDS: [&str; 5] = ["rc", "ns", "res", "st", "ra"];
+const DIG_FIELDS: [&str; 7] = ["rc", "ns", "res", "st", "ra", "an", "au"];
 const READY_FIELDS: [&str; 3] = ["try", "s", "ok"];
 
 /// The marker lines of run `nonce` in `output` (the remote's transcript:
@@ -530,6 +630,14 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
                 "st" if (1..=16).contains(&v.len()) && v.bytes().all(|c| c.is_ascii_uppercase()) => r.status = Some(v.to_string()),
                 "ra" if v == "none" => r.ra = None,
                 "ra" => r.ra = Some(yes_no()?),
+                "an" | "au" => {
+                    let n: Option<u16> = match v {
+                        "none" => None,
+                        _ if (1..=5).contains(&v.len()) && digits(v) => Some(v.parse().map_err(|_| bad())?),
+                        _ => return Err(bad()),
+                    };
+                    if key == "an" { r.answers = n } else { r.authority = n }
+                }
                 _ => return Err(bad()),
             }
         }
@@ -539,8 +647,8 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
         if spec.is_dns() && (r.rc.is_none() != r.ns.is_none()) {
             return Err(format!("{name}: rc and ns disagree on whether a server was asked"));
         }
-        if spec.is_dns() && r.rc.is_none() && (r.status.is_some() || r.ra.is_some()) {
-            return Err(format!("{name}: a status or flags, but no server was asked"));
+        if spec.is_dns() && r.rc.is_none() && (r.status.is_some() || r.ra.is_some() || r.answers.is_some() || r.authority.is_some()) {
+            return Err(format!("{name}: a status, flags or counts, but no server was asked"));
         }
         m.cases.push(r);
     }
@@ -621,9 +729,14 @@ pub struct Judgement {
     /// The script's `end` marker came.
     pub finished: bool,
     /// The run's DNS verdict by the dns-path rule (`no-dns` |
-    /// `platform-dns:<ip>` | `platform-dns-resolves:<ip>` | `open-dns:<ip>`)
-    /// over its DNS cases, or `unknown (…)`.
+    /// `platform-dns:<ips>` | `platform-dns-answered:<ips>` |
+    /// `platform-dns-resolves:<ips>` | `open-dns:<ips>`, each listing every
+    /// server of its class) over its DNS cases, or `unknown (…)`.
     pub dns: String,
+    /// The hosts of [`ALLOWLISTABLE`] whose cases were recorded, not judged,
+    /// because the proxy's effective allowlist held them ([`judge_with`]; a
+    /// case without a marker fails, and is not one).
+    pub allowlisted: Vec<String>,
 }
 
 impl Judgement {
@@ -643,12 +756,15 @@ impl Judgement {
         out
     }
 
-    /// One line: every case with its verdict (`imds=recorded:<HTTP code>`).
+    /// One line: every case with its verdict (`imds=recorded:<HTTP code>`;
+    /// `proxy-github=recorded:allowlisted` while its host is allowlisted).
     #[must_use]
     pub fn summary(&self) -> String {
+        let allowlisted = |name: &str| ALLOWLISTABLE.iter().any(|(c, h)| *c == name && self.allowlisted.iter().any(|a| a == h));
         self.cases
             .iter()
             .map(|c| match (c.verdict, &c.result) {
+                (Verdict::Recorded, Some(_)) if allowlisted(c.name) => format!("{}=recorded:allowlisted", c.name),
                 (Verdict::Recorded, Some(r)) => format!("{}=recorded:{:03}", c.name, r.code.unwrap_or(0)),
                 (v, _) => format!("{}={}", c.name, v.as_str()),
             })
@@ -683,9 +799,19 @@ fn curl_seen(r: &CaseResult) -> String {
 }
 
 /// What a DNS reply said beyond its address, for the reasons: ` (status
-/// REFUSED, no recursion)`; empty when dig printed neither.
+/// NOERROR, answer 0, authority 0, recursion available)`, with `example.com A
+/// unanswered` in place of the status for `NOEXAMPLE`; what dig did not print
+/// is left out, and nothing at all is empty.
 fn dns_said(r: &CaseResult) -> String {
-    let parts: Vec<String> = [r.status.as_deref().map(|s| format!("status {s}")), r.ra.map(|a| (if a { "recursion available" } else { "no recursion" }).to_string())].into_iter().flatten().collect();
+    let parts: Vec<String> = [
+        r.status.as_deref().map(|s| if s == DNS_NO_EXAMPLE { DNS_NO_EXAMPLE_SAID.to_string() } else { format!("status {s}") }),
+        r.answers.map(|n| format!("answer {n}")),
+        r.authority.map(|n| format!("authority {n}")),
+        r.ra.map(|a| (if a { "recursion available" } else { "no recursion" }).to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if parts.is_empty() {
         String::new()
     } else {
@@ -726,9 +852,16 @@ fn judge_case(c: &Case, r: &CaseResult) -> (Verdict, String) {
                 Some(9) if r.status.is_some() && public => (Verdict::Fail, format!("OPEN: {ns}, not a platform resolver, replied over UDP (truncated; dig's TCP retry got nothing)")),
                 Some(9) if r.status.is_some() => (Verdict::Fail, format!("not proven closed: {ns} sent a truncated UDP reply and dig's TCP retry got nothing")),
                 Some(9) => (Verdict::Pass, format!("closed: no reply from {ns}")),
-                Some(0) if r.resolves == Some(true) => (Verdict::Fail, format!("OPEN: {ns} resolved {DNS_NAME}{}", dns_said(r))),
+                Some(0) if r.resolves == Some(true) => (Verdict::Fail, format!("OPEN: {ns} returned an address (the run's name, which exists nowhere, or example.com){}", dns_said(r))),
                 Some(0) if public => (Verdict::Fail, format!("OPEN: {ns}, not a platform resolver, replied{} (it resolved nothing, but the path is open)", dns_said(r))),
-                Some(0) => (Verdict::Pass, format!("{ns} replied{} and resolved nothing (platform DNS: `ai-env lab run dns-path` records it)", dns_said(r))),
+                // Only the reply the operator tested passes: another status, a record or an SOA means the resolver is
+                // not the stub that was tested (a recursor's negative answer carries the SOA); a count not printed fails
+                // too (fail closed).
+                Some(0) if !is_empty_noerror(r.status.as_deref(), r.answers, r.authority) => (
+                    Verdict::Fail,
+                    format!("{ns} replied{}: not the platform stub's empty reply (NOERROR, answer 0, authority 0), the only one accepted: the resolver is not what was tested (`ai-env lab run dns-path` records what it says)", dns_said(r)),
+                ),
+                Some(0) => (Verdict::Pass, format!("{ns} replied with an empty NOERROR{} and no address for example.com (platform DNS: the run's DNS verdict names it, and only [egress].accept_platform_dns accepts it)", dns_said(r))),
                 Some(rc) => (Verdict::Fail, format!("not proven closed: dig exited {rc} asking {ns}{}", if rc == 127 { " (dig is not in the image)" } else { "" })),
             }
         }
@@ -739,7 +872,13 @@ fn judge_case(c: &Case, r: &CaseResult) -> (Verdict, String) {
         Kind::Allowed => (Verdict::Fail, format!("expected HTTP 401 through a tunnel the proxy opened (CONNECT 200): {}, CONNECT {hc:03}", curl_seen(r))),
         Kind::Connect403 if hc == 403 && r.t403 == Some(true) => (Verdict::Pass, "the proxy refused the CONNECT (403)".into()),
         Kind::Connect403 if code != 0 || hc == 200 => {
-            let hint = if c.name == "proxy-github" { " (is github.com among the extras? ai-env egress status; ai-env egress allow <workspace> github.com --remove)" } else { "" };
+            // An allowlisted host's case never gets here (judge_with records it): this host was not on the effective
+            // allowlist the network verification proved, or no list was proved — said, not prescribed.
+            let hint = ALLOWLISTABLE
+                .iter()
+                .find(|(n, _)| *n == c.name)
+                .map(|(_, h)| format!(" ({h} was not on the proxy's effective allowlist as this check read it, or that list could not be verified: ai-env egress status)"))
+                .unwrap_or_default();
             (Verdict::Fail, format!("OPEN: the proxy opened a tunnel: {}, CONNECT {hc:03}{hint}", curl_seen(r)))
         }
         Kind::Connect403 => (Verdict::Fail, format!("no 403 from the proxy: {}, CONNECT {hc:03}", curl_seen(r))),
@@ -761,6 +900,8 @@ fn dns_replies(m: &Markers) -> (Option<String>, Vec<DnsReply>) {
                 resolves: r.resolves == Some(true),
                 status: r.status.clone(),
                 ra: r.ra,
+                answers: r.answers,
+                authority: r.authority,
             });
         }
     }
@@ -768,21 +909,36 @@ fn dns_replies(m: &Markers) -> (Option<String>, Vec<DnsReply>) {
     (resolv, out)
 }
 
+/// [`judge_with`] with no host allowlisted: every case judged strictly (the
+/// bash-run tests, and wherever no effective allowlist was proved).
+#[must_use]
+pub fn judge(m: &Markers) -> Judgement {
+    judge_with(m, &BTreeSet::new())
+}
+
 /// Judge every case of [`CASES`] (pure). A missing case fails; a direct,
 /// DNS or other-port case that passed on its own still fails unless both
 /// `allowed` cases of the same run passed (a VM whose networking is dead,
 /// or died midway, proves nothing closed); a failing `allowed` says when
-/// the script's wait never reached the proxy. `dns` is the run's dns-path
-/// verdict.
+/// the script's wait never reached the proxy. An [`ALLOWLISTABLE`] case
+/// whose host `allowlisted` holds (the proxy's effective allowlist as the
+/// network verification proved it, [`allowlisted_hosts`]) is recorded, not
+/// judged, whatever its marker says — a tunnel, or a refusal from before
+/// the host was added — and a missing marker still fails. `dns` is the
+/// run's dns-path verdict.
 #[must_use]
-pub fn judge(m: &Markers) -> Judgement {
+pub fn judge_with(m: &Markers, allowlisted: &BTreeSet<String>) -> Judgement {
     let allowed_ok = ALLOWED_CASES.iter().all(|n| allowed_passed(m.get(n)));
-    let cases = CASES
+    let cases: Vec<CaseVerdict> = CASES
         .iter()
         .map(|c| {
             let Some(r) = m.get(c.name) else {
                 return CaseVerdict { name: c.name, group: c.group, verdict: Verdict::Fail, reason: "no result: the script did not reach it".into(), result: None };
             };
+            if let Some(host) = allowlisted_case(c.name, allowlisted) {
+                let reason = format!("not judged: {host} is allowlisted on the proxy (its effective allowlist, as the network verification read it); curl saw {}, CONNECT {:03}; this check does not show squid refusing it", curl_seen(r), r.hc.unwrap_or(0));
+                return CaseVerdict { name: c.name, group: c.group, verdict: Verdict::Recorded, reason, result: Some(r.clone()) };
+            }
             let (mut verdict, mut reason) = judge_case(c, r);
             if let Some(w) = m.ready.filter(|w| c.name == "allowed" && verdict == Verdict::Fail && !w.ok) {
                 reason = format!("{reason} — the script waited {} s ({} attempts) and never opened a connection to the proxy's port", w.secs, w.tries);
@@ -799,7 +955,9 @@ pub fn judge(m: &Markers) -> Judgement {
         Ok((v, _)) => v,
         Err(e) => format!("unknown ({e})"),
     };
-    Judgement { cases, ready: m.ready, finished: m.finished, dns }
+    // Only an allowlisted case is recorded with a host of ALLOWLISTABLE (judge_case records the IMDS cases alone).
+    let allowlisted = cases.iter().filter(|c| c.verdict == Verdict::Recorded).filter_map(|c| allowlisted_case(c.name, allowlisted)).map(str::to_string).collect();
+    Judgement { cases, ready: m.ready, finished: m.finished, dns, allowlisted }
 }
 
 /// The dns-path probe's verdict and note from its transcript's markers: the
@@ -851,16 +1009,21 @@ fn line_text(l: &SquidLine) -> String {
 /// The allowlisted host the `allowed` cases ask (port 443 through the proxy).
 const ALLOWED_HOST: &str = "api.anthropic.com";
 
-/// The requests of a run the proxy had to refuse: (method, host, port).
+/// The requests of a run the proxy had to refuse: (method, host, port) —
+/// all but those the allowlist lets through ([`allowlisted_request`]:
+/// CONNECT github.com:443 while `allowlisted` holds github.com). The nonce
+/// host, the IP literal, the other ports and plain http stay, whatever
+/// `allowlisted` says.
 #[must_use]
-pub fn refused_requests(nonce: &str) -> Vec<(&'static str, String, u16)> {
-    vec![
+pub fn refused_requests(nonce: &str, allowlisted: &BTreeSet<String>) -> Vec<(&'static str, String, u16)> {
+    let all = vec![
         ("CONNECT", denied_host(nonce), 443),
         ("CONNECT", "1.1.1.1".to_string(), 443),
         ("CONNECT", "api.anthropic.com".to_string(), 8443),
         ("CONNECT", "github.com".to_string(), 443),
         ("GET", "api.anthropic.com".to_string(), 8080),
-    ]
+    ];
+    all.into_iter().filter(|(m, h, p)| !allowlisted_request(m, h, Some(*p), allowlisted)).collect()
 }
 
 /// What squid's log says about a run.
@@ -886,8 +1049,12 @@ pub enum SquidEvidence {
 /// this run's: every VM shares the connector's address, so a tunnel to a host
 /// an operator may allowlist for a while (github.com) that squid logged
 /// before the run's own refusal of that host is an earlier run's (see below).
+/// While `allowlisted` (the run's [`allowlisted_hosts`]) holds such a host,
+/// its CONNECT on 443 is neither required refused nor, tunnelled, a
+/// violation ([`allowlisted_request`]); a tunnel to it on another port
+/// still is.
 #[must_use]
-pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, tunnels: usize) -> SquidEvidence {
+pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, tunnels: usize, allowlisted: &BTreeSet<String>) -> SquidEvidence {
     let at = |l: &SquidLine| l.ts.split('.').next().and_then(|s| s.parse::<u64>().ok());
     let window: Vec<&SquidLine> = lines.iter().filter(|l| at(l).is_some_and(|t| (from_s..=to_s).contains(&t))).collect();
     let host = denied_host(nonce);
@@ -903,9 +1070,13 @@ pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, 
     };
     let (client, nonce_ms) = (anchor.client.clone(), squid_ms(anchor));
     let from: Vec<&&SquidLine> = window.iter().filter(|l| l.client == client).collect();
-    let refused = refused_requests(nonce);
-    // A refused host, on any port — but the allowlisted API host only on the ports it was refused on.
-    let refused_tunnel = |l: &SquidLine| refused.iter().any(|(_, h, p)| l.host == *h && (h != ALLOWED_HOST || l.port == Some(*p)));
+    // What squid must have refused in this run (the allowlist's CONNECTs aside), and the hosts it must not have
+    // tunnelled to: every host the run asked it to refuse.
+    let refused = refused_requests(nonce, allowlisted);
+    let asked = refused_requests(nonce, &BTreeSet::new());
+    // A refused host, on any port — but the allowlisted API host only on the ports it was refused on, and never a
+    // tunnel the allowlist lets through (CONNECT github.com:443 while it is allowlisted).
+    let refused_tunnel = |l: &SquidLine| !allowlisted_request(&l.method, &l.host, l.port, allowlisted) && asked.iter().any(|(_, h, p)| l.host == *h && (h != ALLOWED_HOST || l.port == Some(*p)));
     // Every VM reaches squid from the connector's one address (measured 2 Oct 2026: two VMs at once, both
     // 10.42.1.158), so `from` holds other runs' lines too. A tunnel squid must never open (an IP literal, a port other
     // than 443) is a violation whoever opened it. A host an operator may allowlist for a while (`ai-env egress allow`:
@@ -965,8 +1136,10 @@ pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, 
         0 => String::new(),
         _ => format!(" (tunnels to {} logged before this run refused it: an earlier run's, not counted)", earlier.join(", ")),
     };
+    let skipped: Vec<&str> = asked.iter().filter(|r| !refused.contains(r)).map(|(_, h, _)| h.as_str()).collect();
+    let skipped = if skipped.is_empty() { String::new() } else { format!("; allowlisted, not required refused: {}", skipped.join(", ")) };
     SquidEvidence::Complete(format!(
-        "from {client}: {opened} tunnels to api.anthropic.com:443; TCP_DENIED/403 for {}; no tunnel to a refused host{not_ours}",
+        "from {client}: {opened} tunnels to api.anthropic.com:443; TCP_DENIED/403 for {}; no tunnel to a refused host{not_ours}{skipped}",
         refused.iter().map(|(m, h, p)| format!("{m} {h}:{p}")).collect::<Vec<_>>().join(", ")
     ))
 }
@@ -975,7 +1148,8 @@ pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, 
 /// filter-log-events --filter-pattern '"aienv"'` over the script's window,
 /// widened by [`CLOCK_SKEW_S`]) until [`squid_evidence`] is complete, a
 /// violation shows, or `budget` passes (then what is missing is the error).
-pub async fn squid_poll(nonce: &str, started_s: u64, ended_s: u64, budget: Duration, step: Duration) -> std::result::Result<String, String> {
+/// `allowlisted`: the hosts the cases were judged with ([`judge_with`]).
+pub async fn squid_poll(nonce: &str, started_s: u64, ended_s: u64, budget: Duration, step: Duration, allowlisted: &BTreeSet<String>) -> std::result::Result<String, String> {
     let (from_s, to_s) = (started_s.saturating_sub(CLOCK_SKEW_S), ended_s.saturating_add(CLOCK_SKEW_S));
     let start = from_s.saturating_mul(1000).to_string();
     let end = to_s.saturating_add(5 * CLOCK_SKEW_S).saturating_mul(1000).to_string();
@@ -985,7 +1159,7 @@ pub async fn squid_poll(nonce: &str, started_s: u64, ended_s: u64, budget: Durat
         let doc = tokio::task::spawn_blocking(move || awscli::aws_json("logs", &["filter-log-events", "--log-group-name", LOG_GROUP, "--filter-pattern", "\"aienv\"", "--start-time", &s, "--end-time", &e]))
             .await
             .map_err(|e| format!("internal: {e}"))??;
-        match squid_evidence(&squid_lines(&doc)?, nonce, from_s, to_s, ALLOWED_CASES.len()) {
+        match squid_evidence(&squid_lines(&doc)?, nonce, from_s, to_s, ALLOWED_CASES.len(), allowlisted) {
             SquidEvidence::Complete(found) => return Ok(format!("{found} (after {} s)", t0.elapsed().as_secs())),
             SquidEvidence::Violation(v) => return Err(v),
             SquidEvidence::Missing(m) if t0.elapsed() >= budget => {
@@ -996,26 +1170,50 @@ pub async fn squid_poll(nonce: &str, started_s: u64, ended_s: u64, budget: Durat
     }
 }
 
-/// The network verification for the record: `Ok(summary)` when every row
-/// of `egress status`'s checks is `ok`, else `Err` naming each row that
-/// drifted or could not be verified (or why none could run); and the facts
-/// of the connector answer it judged ok (a pass binds exactly those: a
-/// configuration change after the verification then shows at the credential
-/// gate as live facts that differ from the record's).
-fn network_verdict() -> (std::result::Result<String, String>, Option<ConnectorFacts>) {
-    let (rows, facts) = match super::cli::network_verification() {
+/// What the network verification gave the check.
+struct NetworkVerdict {
+    /// `Ok(summary)` when every row of `egress status`'s checks is `ok`, else
+    /// `Err` naming each row that drifted or could not be verified (or why
+    /// none could run).
+    result: std::result::Result<String, String>,
+    /// The facts of the connector answer it judged ok, when every row is (a
+    /// pass binds exactly those: a configuration change after the
+    /// verification then shows at the credential gate as live facts that
+    /// differ from the record's).
+    facts: Option<ConnectorFacts>,
+    /// The proxy's effective allowlist, what squid serves (the `parameters`
+    /// row ok against a status line saying squid serves them: active, parse
+    /// ok, `applied=yes`): `Some` whatever another row says, so a failing
+    /// report judges `proxy-github` as a passing one would; `None` when not
+    /// proved.
+    allowlist: Option<BTreeSet<String>>,
+}
+
+/// The network verification for the record ([`NetworkVerdict`]).
+fn network_verdict() -> NetworkVerdict {
+    let v = match super::cli::network_verification() {
         Ok(v) => v,
-        Err(e) => return (Err(format!("not run: {e}")), None),
+        Err(e) => return NetworkVerdict { result: Err(format!("not run: {e}")), facts: None, allowlist: None },
     };
-    let bad: Vec<String> = rows.iter().filter(|r| r.status != "ok").map(|r| format!("{} {}: {}", r.status, r.check, r.detail)).collect();
-    if rows.is_empty() {
-        return (Err("no check ran".into()), None);
-    }
-    if bad.is_empty() {
-        (Ok(format!("{} checks ok: {}", rows.len(), rows.iter().map(|r| r.check).collect::<Vec<_>>().join(", "))), facts)
+    let bad: Vec<String> = v.rows.iter().filter(|r| r.status != "ok").map(|r| format!("{} {}: {}", r.status, r.check, r.detail)).collect();
+    let (result, facts) = if v.rows.is_empty() {
+        (Err("no check ran".into()), None)
+    } else if bad.is_empty() {
+        (Ok(format!("{} checks ok: {}", v.rows.len(), v.rows.iter().map(|r| r.check).collect::<Vec<_>>().join(", "))), v.connector_facts)
     } else {
         (Err(bad.join("; ")), None)
-    }
+    };
+    NetworkVerdict { result, facts, allowlist: v.allowlist }
+}
+
+/// The proxy's effective allowlist as SSM holds it now — `allow`, `extras` and
+/// `suspended` in one light `get-parameters` (the operator's aws CLI),
+/// (allow ∪ extras) − suspended — for the live tests only, which judge
+/// `proxy-github` by it ([`judge_with`] over [`allowlisted_hosts`]). Unlike
+/// the check's, nothing proves the proxy serves it (no `--status`); `Err`
+/// when a list is missing or does not parse.
+pub fn live_allowlist() -> std::result::Result<BTreeSet<String>, String> {
+    super::cli::read_effective("the live allowlist").map_err(|e| e.to_string())
 }
 
 // ---- the decision -----------------------------------------------------------------------------
@@ -1051,6 +1249,8 @@ pub struct Evidence {
     /// or after it refuses the record (`EgressVerified::record`).
     pub started_s: u64,
     pub denied_host: String,
+    /// The fresh name the DNS cases asked ([`dns_name`]).
+    pub dns_name: String,
 }
 
 /// What [`decide`] concluded.
@@ -1117,7 +1317,9 @@ pub fn decide(ev: &Evidence, connector: &str, at: &str) -> Decision {
         vm_id: ev.id.clone(),
         at: at.to_string(),
         cases: ev.judgement.summary(),
+        allowlisted: ev.judgement.allowlisted.clone(),
         dns: ev.judgement.dns.clone(),
+        dns_rule: DNS_RULE,
         squid_log: ok_text(&ev.squid),
         network: ok_text(&ev.network),
         connector_facts: facts,
@@ -1169,11 +1371,14 @@ struct Early {
 /// RunMicrovm resolves it (`active`: `get-microvm-image`'s
 /// latestActiveImageVersion; `N`: `N` or `N.0`; `N.M`) and is runnable
 /// (`list-microvm-image-versions`: SUCCESSFUL, ACTIVE); a pass is recorded
-/// for it with `connector`; the pass is bound to this very build (its
+/// for it with `connector`, judged by the current DNS rule (a pass judged by
+/// an earlier one does not count: its DNS evidence cannot be told from the
+/// new, so the full check runs, and stderr says why — every record written
+/// before rule 1 is such a pass); the pass is bound to this very build (its
 /// `created_at` the version's `createdAt`, to the second) and to the
 /// connector's live facts (`get-network-connector`). The third value notes a
-/// DNS verdict the gate does not accept (`[egress].accept_platform_dns`),
-/// which another check would not change.
+/// DNS verdict the gate does not accept (`[egress].accept_platform_dns` as
+/// configured now), which another check would not change.
 fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(String, VerifiedRecord, Option<String>)> {
     let image_arn = plan.image_arn.as_str();
     let versions = crate::bridge::infra::read_live_image_versions(image_arn).ok()?;
@@ -1190,6 +1395,12 @@ fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(
     }
     let created = crate::wire::time::parse_rfc3339(live.created_at.as_deref()?)?;
     let rec = EgressVerified::load(&ctx.paths).ok()?.find(image_arn, &version, connector)?.clone();
+    if rec.dns_rule < DNS_RULE {
+        // Said, because the first `make claude-update` after an install that raised the rule starts a VM for a
+        // version that has a recorded pass.
+        eprintln!("egress check: the recorded pass of image version {version} was judged by an earlier DNS rule ({}, now {DNS_RULE}): checking again", rec.dns_rule);
+        return None;
+    }
     if rec.image_created_at.is_none_or(|t| (t - created).abs() > 1) {
         return None;
     }
@@ -1198,8 +1409,8 @@ fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(
     if !rec.connector_facts.complete() || facts != rec.connector_facts {
         return None;
     }
-    let note = (!crate::bridge::egress::dns_verdict_ok(&rec.dns, ctx.cfg.egress.accept_platform_dns))
-        .then(|| format!("its DNS verdict {} is not accepted ([egress].accept_platform_dns = false): the credential gate refuses this pass until it is (another check would see the same)", rec.dns));
+    let note = (!dns_accepted(&rec.dns, &ctx.cfg.egress))
+        .then(|| format!("its DNS verdict {} is not accepted ({}): the credential gate refuses this pass until it is (another check would see the same)", rec.dns, ctx.cfg.egress.dns_acceptance()));
     Some((version, rec, note))
 }
 
@@ -1376,9 +1587,10 @@ fn early_failure(ctx: &Ctx, connector: &str, early: Early) -> CliError {
 }
 
 /// Acquire the VM and wait for its `/health`, refuse the fake (unless its
-/// transcript knob stands in for the shell), run the script, judge it, then
-/// the VM-independent evidence: the network verification (always, once a
-/// transcript exists) and squid's log (only when every case and the network
+/// transcript knob stands in for the shell), run the script, read its
+/// markers, then the network verification (always, once a transcript
+/// exists), judge the markers by the effective allowlist it proved
+/// ([`judge_with`]), and squid's log (only when every case and the network
 /// passed).
 async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, target: &Target, fake: bool, connector: &str, guard: &mut Guard) -> Result<Evidence> {
     let (row, vm, own) = match target {
@@ -1392,7 +1604,7 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
     health::read_health(api, ep, &ctx.paths, &vm.id, health::Backoff::HEALTH.scaled(ctx.knobs.backoff_ms)).await?;
     let started_s = unix_now();
     let (nonce, output) = if fake {
-        fake_transcript()?
+        fake_transcript("egress check")?
     } else {
         let nonce = new_nonce();
         let script = render_script(&nonce, &proxy_ip(&ctx.cfg, &ctx.paths));
@@ -1402,16 +1614,30 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
         (nonce, output)
     };
     let ended_s = unix_now();
-    let (judgement, transcript) = match parse_markers(&output, &nonce) {
-        Ok(m) => (judge(&m), Ok(())),
-        Err(e) => (judge(&Markers::default()), Err(e)),
-    };
+    let markers = parse_markers(&output, &nonce);
     eprintln!("egress check: verifying the network (every check of `ai-env egress status`)");
-    let (network, verified_facts) = tokio::task::spawn_blocking(network_verdict).await.unwrap_or_else(|e| (Err(format!("internal: {e}")), None));
+    let net = tokio::task::spawn_blocking(network_verdict).await.unwrap_or_else(|e| NetworkVerdict { result: Err(format!("internal: {e}")), facts: None, allowlist: None });
+    // Judged by what squid serves, read after the cases ran: a host removed in between fails closed (judged, and
+    // OPEN); one added in between only keeps the record from claiming it refused. Not proved: every case strictly.
+    let skip = allowlisted_hosts(&net.allowlist.unwrap_or_default());
+    let (judgement, transcript) = match markers {
+        Ok(m) => (judge_with(&m, &skip), Ok(())),
+        Err(e) => (judge_with(&Markers::default(), &skip), Err(e)),
+    };
+    // Said once judged, never from `skip` alone: only a case with a result is recorded, not judged — an unreadable
+    // transcript, or a script that died before the case, leaves it judged, and failing.
+    if !judgement.allowlisted.is_empty() {
+        eprintln!("egress check: allowlisted: {}", allowlisted_text(&judgement.allowlisted));
+    }
+    for host in skip.iter().filter(|h| !judgement.allowlisted.contains(h)) {
+        let why = if transcript.is_err() { "the transcript could not be read" } else { "the script did not reach it" };
+        eprintln!("egress check: {host} is on the proxy's effective allowlist as the network verification read it, but its case has no result ({why}): it is judged, and fails");
+    }
+    let (network, verified_facts) = (net.result, net.facts);
     let squid = if transcript.is_ok() && judgement.passed() && network.is_ok() {
         let (budget, step) = (scaled(SQUID_LOG_BUDGET, ctx.knobs.backoff_ms), scaled(SQUID_LOG_STEP, ctx.knobs.backoff_ms));
         eprintln!("egress check: every case passed; reading squid's log in CloudWatch (at most {} s)", budget.as_secs());
-        Some(squid_poll(&nonce, started_s, ended_s, budget, step).await)
+        Some(squid_poll(&nonce, started_s, ended_s, budget, step, &skip).await)
     } else {
         None
     };
@@ -1439,6 +1665,7 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
         image_created_at,
         started_s: guard.since,
         denied_host: denied_host(&nonce),
+        dns_name: dns_name(&nonce),
     })
 }
 
@@ -1458,6 +1685,13 @@ fn ready_text(ready: Option<Ready>) -> String {
     }
 }
 
+/// What a run's allowlisted hosts mean (the report's `allowlisted:` line, and stderr): the hosts whose cases were
+/// recorded, not judged ([`Judgement::allowlisted`]), never merely those on the effective allowlist.
+fn allowlisted_text(hosts: &[String]) -> String {
+    let (case, it) = if hosts.len() == 1 { ("its case is", "it") } else { ("their cases are", "them") };
+    format!("{} (on the proxy's effective allowlist as the network verification read it: {case} recorded, not judged, and this check does not show squid refusing {it})", hosts.join(", "))
+}
+
 /// A poll duration under the lab's `AI_ENV_BRIDGE_LAB_BACKOFF_MS` (1 s → n ms).
 fn scaled(d: Duration, ms_per_second: Option<u64>) -> Duration {
     match ms_per_second {
@@ -1466,21 +1700,23 @@ fn scaled(d: Duration, ms_per_second: Option<u64>) -> Duration {
     }
 }
 
-/// Under the file-backed fake: the refusal (it cannot carry a shell), or —
-/// debug builds, with [`FAKE_SHELL_KNOB`] set — the transcript that file
-/// holds and the nonce of its markers.
-fn fake_transcript() -> Result<(String, String)> {
+/// Under the file-backed fake, for `label` (`egress check`, `dns-path`): the
+/// refusal (it cannot carry a shell), or — debug builds, with
+/// [`FAKE_SHELL_KNOB`] set — the transcript that file holds and the nonce of
+/// its markers, so process tests reach the judgement (an unreadable or
+/// marker-less file is exit 1).
+pub(crate) fn fake_transcript(label: &str) -> std::result::Result<(String, String), BridgeError> {
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os(FAKE_SHELL_KNOB).filter(|p| !p.is_empty()) {
-        let text = std::fs::read_to_string(&path).map_err(|e| CliError::Msg(format!("{FAKE_SHELL_KNOB}: cannot read {}: {e}", std::path::Path::new(&path).display())))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| BridgeError::Config(format!("{FAKE_SHELL_KNOB}: cannot read {}: {e}", std::path::Path::new(&path).display())))?;
         let nonce: String = text.split(MARK).nth(1).map(|rest| rest.chars().take_while(char::is_ascii_hexdigit).collect()).unwrap_or_default();
         if !is_nonce(&nonce) {
-            return Err(CliError::Msg(format!("{FAKE_SHELL_KNOB}: no {MARK}<nonce> marker in the file")));
+            return Err(BridgeError::Config(format!("{FAKE_SHELL_KNOB}: no {MARK}<nonce> marker in the file")));
         }
-        eprintln!("ai-env: LAB KNOB ACTIVE ({FAKE_SHELL_KNOB}): the shell's transcript is read from a file (debug build)");
+        eprintln!("ai-env: LAB KNOB ACTIVE ({FAKE_SHELL_KNOB}): the shell's transcript of {label} is read from a file (debug build)");
         return Ok((nonce, text));
     }
-    Err(shell::fake_backend_refusal("egress check").into())
+    Err(shell::fake_backend_refusal(label))
 }
 
 /// `--vm ID` live: RUNNING, and its echo still exactly what its row
@@ -1599,8 +1835,9 @@ pub const EVIDENCE_NOTE: &str = "the case results are reported by the VM itself;
 
 /// [`decide`], then act on it: record a pass of the check's own VM, or
 /// revoke every record of the connector after any failure of it (`--vm`:
-/// neither); audit `egress_check {id, image_version, verdict[, revoked]}`;
-/// print (one JSON document with `--json`); exit 9 naming every failure.
+/// neither); audit `egress_check {id, image_version, verdict[, revoked][,
+/// allowlisted]}`; print (one JSON document with `--json`), with the hosts
+/// recorded, not judged, named (`allowlisted:`); exit 9 naming every failure.
 fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
     let mut d = decide(ev, connector, &rfc3339_utc(unix_now()));
     // The record (under the file's lock) is refused when a failing check revoked the connector after this one began.
@@ -1625,6 +1862,9 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
     if let Some(w) = ev.judgement.ready {
         pairs.push(("ready", format!("{}s/{}/{}", w.secs, w.tries, if w.ok { "ok" } else { "never" })));
     }
+    if !ev.judgement.allowlisted.is_empty() {
+        pairs.push(("allowlisted", ev.judgement.allowlisted.join(",")));
+    }
     if !ev.own {
         pairs.push(("report_only", "true".to_string()));
     }
@@ -1641,6 +1881,9 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
     };
     let (network_ok, network_text) = ok_or(&ev.network);
     let (squid_ok, squid_text) = ok_or(&ev.squid);
+    // What the credential gate would do with the run's DNS verdict under the configuration in force (a pass is
+    // recorded either way: the record keeps the evidence, the gate reads the pin when it decides).
+    let dns_ok = dns_accepted(&ev.judgement.dns, &ctx.cfg.egress);
     if json {
         let cases: Vec<serde_json::Value> = ev
             .judgement
@@ -1651,7 +1894,7 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
                 serde_json::json!({
                     "name": c.name, "group": c.group, "verdict": c.verdict.as_str(), "reason": c.reason, "rc": r.rc, "code": r.code, "size": r.size,
                     "connects": r.conn, "connect_code": r.hc, "t403": r.t403, "squid_error": r.sq, "ns": r.ns, "resolves": r.resolves,
-                    "dns_status": r.status, "recursion_available": r.ra,
+                    "dns_status": r.status, "recursion_available": r.ra, "dns_answers": r.answers, "dns_authority": r.authority,
                 })
             })
             .collect();
@@ -1660,7 +1903,9 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
             "echoed_image_arn": ev.vm_image_arn, "row_image_version": ev.row_image_version, "connector": normalize_connector(connector),
             "denied_host": ev.denied_host, "finished": ev.judgement.finished, "transcript_error": ev.transcript.as_ref().err(), "cases": cases,
             "ready": ev.judgement.ready.map(|w| serde_json::json!({"tries": w.tries, "secs": w.secs, "ok": w.ok})),
-            "dns": ev.judgement.dns, "network": { "ok": network_ok, "detail": network_text }, "squid_log": { "ok": squid_ok, "detail": squid_text },
+            "dns": ev.judgement.dns, "dns_name": ev.dns_name, "dns_accepted": dns_ok, "dns_acceptance": ctx.cfg.egress.dns_acceptance(),
+            "allowlisted": ev.judgement.allowlisted,
+            "network": { "ok": network_ok, "detail": network_text }, "squid_log": { "ok": squid_ok, "detail": squid_text },
             "evidence": EVIDENCE_NOTE, "verdict": verdict, "recorded": d.record.is_some(),
             "revoked": revoked.as_ref().map(|r| r.as_ref().map_or_else(|e| serde_json::json!({"error": e}), |n| serde_json::json!(n))), "failures": d.failures,
         });
@@ -1680,7 +1925,10 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
         if let Err(e) = &ev.transcript {
             outln!("transcript: {e}");
         }
-        outln!("dns: {}", ev.judgement.dns);
+        if !ev.judgement.allowlisted.is_empty() {
+            outln!("allowlisted: {}", allowlisted_text(&ev.judgement.allowlisted));
+        }
+        outln!("dns: {} (asked {} A; the credential gate {} it: {})", ev.judgement.dns, ev.dns_name, if dns_ok { "accepts" } else { "does NOT accept" }, ctx.cfg.egress.dns_acceptance());
         outln!("network: {network_text}");
         outln!("squid log: {squid_text}");
         if d.record.is_some() {
@@ -1712,7 +1960,12 @@ mod tests {
     }
 
     fn dig(name: &str, rc: &str, ns: &str, res: bool) -> String {
-        format!("@@AIENV{NONCE} {name} rc={rc} ns={ns} res={} st=none ra=none", if res { "yes" } else { "no" })
+        format!("@@AIENV{NONCE} {name} rc={rc} ns={ns} res={} st=none ra=none an=none au=none", if res { "yes" } else { "no" })
+    }
+
+    /// The platform stub's reply as measured on 2 Oct 2026: NOERROR, no answer, no authority, recursion offered.
+    fn stub(name: &str, ns: &str) -> String {
+        format!("@@AIENV{NONCE} {name} rc=0 ns={ns} res=no st=NOERROR ra=yes an=0 au=0")
     }
 
     /// Every case's marker in a closed, working VPC.
@@ -1772,6 +2025,15 @@ mod tests {
         assert!(s.lines().all(|l| l.len() < 1024), "short lines");
         assert!(s.starts_with("\\unalias -a; unset -f command curl dig printf 2>/dev/null; hash -r; unset HISTFILE; set +H\n") && s.ends_with("\nexit\n"), "{s}");
         assert!(s.contains("command curl -q -sS ") && s.contains("command dig -r "), "no .curlrc, no .digrc, no alias or function");
+        // The DNS cases ask the run's fresh name; example.com only in the second, address-only query.
+        assert!(s.lines().nth(1).unwrap().starts_with(&format!("R=AIENV{NONCE}; N=d{NONCE}.example.com; S=;")), "{s}");
+        assert!(s.contains("+noall +comments +answer +time=2 +tries=1 \"$@\" \"@$s\" \"$N\" A 2>&1"), "the fresh name with dig's header: {s}");
+        assert_eq!(s.matches("example.com A").count(), 1, "example.com is asked once, without the header: {s}");
+        assert!(s.contains("[ $rc = 0 ] && { e=$(command dig -r +noall +answer +time=2 +tries=1 \"$@\" \"@$s\" example.com A 2>&1 </dev/null); q=$?; }; "), "only of a server that replied, its exit code kept: {s}");
+        assert!(s.contains(&format!("done <<<\"$e\"$'\\n'\"$o\"; [ $q = 0 ] || t={DNS_NO_EXAMPLE}; printf ")), "example.com's output first, so the fresh name's status wins, unless example.com got no reply at all: {s}");
+        assert!(HELPERS[1].len() < 1024 && s.len() < 4096, "the helper is {} characters, the script {} bytes", HELPERS[1].len(), s.len());
+        assert_eq!(dns_name(NONCE), format!("d{NONCE}.example.com"));
+        assert!(dns_name(NONCE) != denied_host(NONCE) && crate::bridge::egress::is_valid_host(&dns_name(NONCE)));
         assert!(!s.contains(MARK), "the echoed script carries no marker");
         assert_eq!(parse_markers(&s, NONCE).unwrap(), Markers::default(), "the echo of the script is not a marker");
         for c in &CASES {
@@ -1809,6 +2071,7 @@ mod tests {
         let a = new_nonce();
         assert!(is_nonce(&a) && a.len() == 16 && a != new_nonce(), "{a}");
         assert!(crate::bridge::egress::is_valid_host(&denied_host(&a)), "the denied host is a valid host");
+        assert!(crate::bridge::egress::is_valid_host(&dns_name(&a)) && dns_name(&a) != denied_host(&a) && dns_name(&a) != dns_name(&new_nonce()), "a fresh name per run, never the denied host");
         assert!(!is_nonce("ABCDEF0123") && !is_nonce("short") && !is_nonce(&"a".repeat(33)) && !is_nonce("0123456789abcdeg"));
         assert_eq!(cidr_plus_two(VM_SUBNET_CIDR).as_deref(), Some("10.42.1.2"));
         assert_eq!(cidr_plus_two(VPC_CIDR).as_deref(), Some("10.42.0.2"));
@@ -1874,25 +2137,68 @@ mod tests {
         assert!(allowed.reason.contains("did not answer") && allowed.reason.contains("waited 60 s (30 attempts) and never opened a connection"), "{}", allowed.reason);
         assert!(ready_text(j.ready).contains("did NOT reach the proxy's port in 60 s"));
         assert!(verdict_of(&judged(&with("allowed", dead.clone())), "allowed").reason.contains("did not answer") && !verdict_of(&judged(&with("allowed", dead)), "allowed").reason.contains("waited"));
-        // dig's status and flags reach the reasons and the dns-path note.
-        let platform6 = format!("@@AIENV{NONCE} dns-platform6-udp rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no");
-        let m = parse_markers(&transcript(&with("dns-platform6-udp", platform6)), NONCE).unwrap();
+        // dig's status, counts and flags reach the reasons and the dns-path note. The stub's empty NOERROR (as
+        // measured 2 Oct 2026) passes, and is the run's DNS verdict.
+        let m = parse_markers(&transcript(&with("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253"))), NONCE).unwrap();
         let r = m.get("dns-platform6-udp").unwrap();
-        assert_eq!((r.status.as_deref(), r.ra), (Some("REFUSED"), Some(false)));
+        assert_eq!((r.status.as_deref(), r.ra, r.answers, r.authority), (Some("NOERROR"), Some(true), Some(0), Some(0)));
         let j = judge(&m);
         assert!(j.passed(), "{:?}", j.failures());
-        assert_eq!(verdict_of(&j, "dns-platform6-udp").reason, "fd00:ec2::253 replied (status REFUSED, no recursion) and resolved nothing (platform DNS: `ai-env lab run dns-path` records it)");
+        assert_eq!(verdict_of(&j, "dns-platform6-udp").reason, "fd00:ec2::253 replied with an empty NOERROR (status NOERROR, answer 0, authority 0, recursion available) and no address for example.com (platform DNS: the run's DNS verdict names it, and only [egress].accept_platform_dns accepts it)");
         assert_eq!(j.dns, "platform-dns:fd00:ec2::253");
+        // REFUSED (what S5 first accepted) is not the reply that was tested: it fails, and the verdict is answered.
+        let platform6 = format!("@@AIENV{NONCE} dns-platform6-udp rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no an=0 au=0");
+        let j = judged(&with("dns-platform6-udp", platform6));
+        assert_eq!(failing(&j), ["dns-platform6-udp"], "{:?}", j.failures());
+        assert_eq!(verdict_of(&j, "dns-platform6-udp").reason, "fd00:ec2::253 replied (status REFUSED, answer 0, authority 0, no recursion): not the platform stub's empty reply (NOERROR, answer 0, authority 0), the only one accepted: the resolver is not what was tested (`ai-env lab run dns-path` records what it says)");
+        assert_eq!(j.dns, "platform-dns-answered:fd00:ec2::253");
         // A truncated UDP reply whose TCP retry got nothing (dig exit 9, `st=TRUNCATED`): open for a public resolver, unproven for the platform's.
-        let j = judged(&with("dns-public-udp", format!("@@AIENV{NONCE} dns-public-udp rc=9 ns=1.1.1.1 res=no st=TRUNCATED ra=none")));
+        let j = judged(&with("dns-public-udp", format!("@@AIENV{NONCE} dns-public-udp rc=9 ns=1.1.1.1 res=no st=TRUNCATED ra=none an=none au=none")));
         assert!(verdict_of(&j, "dns-public-udp").verdict == Verdict::Fail && verdict_of(&j, "dns-public-udp").reason.starts_with("OPEN: 1.1.1.1"), "{:?}", verdict_of(&j, "dns-public-udp"));
         assert_eq!(j.dns, "open-dns:1.1.1.1");
-        let j = judged(&with("dns-platform6-udp", format!("@@AIENV{NONCE} dns-platform6-udp rc=9 ns=fd00:ec2::253 res=no st=TRUNCATED ra=none")));
-        assert!(verdict_of(&j, "dns-platform6-udp").reason.starts_with("not proven closed: fd00:ec2::253 sent a truncated UDP reply") && !j.passed() && j.dns.starts_with("unknown ("), "{}", j.dns);
-        let servfail = format!("@@AIENV{NONCE} dns-public-udp rc=0 ns=1.1.1.1 res=no st=SERVFAIL ra=yes");
-        assert!(verdict_of(&judged(&with("dns-public-udp", servfail)), "dns-public-udp").reason.contains("replied (status SERVFAIL, recursion available) (it resolved nothing"));
-        let (_, note) = dns_path_outcome(&parse_markers(&transcript(&ready("try=1 s=0 ok=yes").into_iter().map(|(k, l)| if k == "dns-platform6-tcp" { (k, format!("@@AIENV{NONCE} dns-platform6-tcp rc=0 ns=fd00:ec2::253 res=no st=REFUSED ra=no")) } else { (k, l) }).collect::<Vec<_>>()), NONCE).unwrap()).unwrap();
-        assert!(note.contains("fd00:ec2::253 udp no reply, tcp replied (REFUSED, no recursion)") && note.ends_with("(allowed, allowed-last: HTTP 401), reached 0 s after the script began"), "{note}");
+        let j = judged(&with("dns-platform6-udp", format!("@@AIENV{NONCE} dns-platform6-udp rc=9 ns=fd00:ec2::253 res=no st=TRUNCATED ra=none an=none au=none")));
+        assert!(verdict_of(&j, "dns-platform6-udp").reason.starts_with("not proven closed: fd00:ec2::253 sent a truncated UDP reply") && !j.passed(), "{:?}", j.failures());
+        assert_eq!(j.dns, "platform-dns-answered:fd00:ec2::253", "the judge's FAIL and the verdict agree: a reply, not the empty NOERROR");
+        // The fresh name answered, but example.com got no reply at all (`st=NOEXAMPLE`): not the stub, which answers
+        // both at once.
+        let j = judged(&with("dns-platform6-udp", format!("@@AIENV{NONCE} dns-platform6-udp rc=0 ns=fd00:ec2::253 res=no st={DNS_NO_EXAMPLE} ra=yes an=0 au=0")));
+        assert_eq!(failing(&j), ["dns-platform6-udp"], "{:?}", j.failures());
+        assert!(verdict_of(&j, "dns-platform6-udp").reason.starts_with("fd00:ec2::253 replied (example.com A unanswered, answer 0, authority 0, recursion available): not the platform stub's empty reply"), "{}", verdict_of(&j, "dns-platform6-udp").reason);
+        assert_eq!(j.dns, "platform-dns-answered:fd00:ec2::253");
+        let servfail = format!("@@AIENV{NONCE} dns-public-udp rc=0 ns=1.1.1.1 res=no st=SERVFAIL ra=yes an=0 au=0");
+        assert!(verdict_of(&judged(&with("dns-public-udp", servfail)), "dns-public-udp").reason.contains("replied (status SERVFAIL, answer 0, authority 0, recursion available) (it resolved nothing"));
+        let (v, note) = dns_path_outcome(&parse_markers(&transcript(&ready("try=1 s=0 ok=yes").into_iter().map(|(k, l)| if k == "dns-platform6-tcp" { (k, stub("dns-platform6-tcp", "fd00:ec2::253")) } else { (k, l) }).collect::<Vec<_>>()), NONCE).unwrap()).unwrap();
+        assert_eq!(v, "platform-dns:fd00:ec2::253");
+        assert!(note.contains("fd00:ec2::253 udp no reply, tcp replied (NOERROR, answer 0, authority 0, recursion available)") && note.ends_with("(allowed, allowed-last: HTTP 401), reached 0 s after the script began"), "{note}");
+    }
+
+    /// The judge and the dns-path verdict agree on every reply a platform resolver can give: the case passes exactly
+    /// for NOERROR with no answer, no authority and no address — the reply the operator tested — and the run's verdict
+    /// is that reply's class.
+    #[test]
+    fn the_judge_and_the_verdict_agree_on_every_platform_reply() {
+        let mut passes = 0;
+        for st in ["none", "NOERROR", "NXDOMAIN", "SERVFAIL", "REFUSED", "NOTIMP", "TRUNCATED", DNS_NO_EXAMPLE] {
+            for an in ["none", "0", "1"] {
+                for au in ["none", "0", "1"] {
+                    for res in ["no", "yes"] {
+                        let line = format!("@@AIENV{NONCE} dns-platform6-udp rc=0 ns=fd00:ec2::253 res={res} st={st} ra=yes an={an} au={au}");
+                        let j = judged(&with("dns-platform6-udp", line.clone()));
+                        let empty = (st, an, au, res) == ("NOERROR", "0", "0", "no");
+                        assert_eq!(j.passed(), empty, "{line}: {:?}", j.failures());
+                        assert_eq!(failing(&j), if empty { vec![] } else { vec!["dns-platform6-udp"] }, "{line}");
+                        let class = match (res, empty) {
+                            ("yes", _) => "platform-dns-resolves:",
+                            (_, true) => "platform-dns:",
+                            _ => "platform-dns-answered:",
+                        };
+                        assert_eq!(j.dns, format!("{class}fd00:ec2::253"), "{line}");
+                        passes += usize::from(empty);
+                    }
+                }
+            }
+        }
+        assert_eq!(passes, 1);
     }
 
     #[test]
@@ -1929,6 +2235,17 @@ mod tests {
             (dig("dns-platform-udp", "0", "169.254.169.253", false).replace("ra=none", "ra=maybe"), "yes|no"),
             (dig("dns-platform-udp", "0", "169.254.169.253", false).replace(" st=none", ""), "st field is missing"),
             (dig("dns-resolv-udp", "none", "none", false).replace("st=none", "st=REFUSED"), "no server was asked"),
+            (dig("dns-resolv-udp", "none", "none", false).replace("an=none", "an=0"), "no server was asked"),
+            (dig("dns-resolv-udp", "none", "none", false).replace("au=none", "au=1"), "no server was asked"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace(" an=0", ""), "an field is missing"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace(" au=0", ""), "au field is missing"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace("an=0", "an=x"), "bad an"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace("au=0", "au=123456"), "bad au"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace("au=0", "au=99999"), "bad au"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace("an=0", "an=-1"), "bad an"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace("an=0", "an="), "bad an"),
+            (stub("dns-platform6-udp", "fd00:ec2::253").replace("an=0", "an=0 an=0"), "an twice"),
+            (format!("{} an=0", curl("allowed", 0, "401", "1", "200", false, false)), "unexpected field"),
             (format!("@@AIENV{NONCE} ready try=1 s=0 ok=yes\n@@AIENV{NONCE} ready try=1 s=0 ok=yes"), "ready marker twice"),
             (format!("@@AIENV{NONCE} ready try=1 s=0"), "ok field is missing"),
             (format!("@@AIENV{NONCE} ready try=1 s=0 ok=yes x=1"), "unexpected field"),
@@ -1970,17 +2287,29 @@ mod tests {
             ("direct-ipv6", curl("direct-ipv6", 127, "000", "0", "000", false, false), "did not run"),
             ("dns-public-udp", dig("dns-public-udp", "0", "1.1.1.1", false), "1.1.1.1, not a platform resolver, replied"),
             ("dns-public-port", dig("dns-public-port", "0", "208.67.222.222", false), "not a platform resolver"),
-            ("dns-public-tcp", dig("dns-public-tcp", "0", "1.1.1.1", true), "resolved example.com"),
+            ("dns-public-tcp", dig("dns-public-tcp", "0", "1.1.1.1", true), "OPEN: 1.1.1.1 returned an address (the run's name, which exists nowhere, or example.com)"),
             ("dns-resolv-udp", dig("dns-resolv-udp", "0", "9.9.9.9", false), "9.9.9.9, not a platform resolver"),
             ("dns-resolv-tcp", dig("dns-resolv-tcp", "0", "127.0.0.53", false), "127.0.0.53, not a platform resolver"),
-            ("dns-platform-udp", dig("dns-platform-udp", "0", "169.254.169.253", true), "OPEN: 169.254.169.253 resolved"),
-            ("dns-platform6-tcp", dig("dns-platform6-tcp", "0", "fd00:ec2::253", true), "OPEN: fd00:ec2::253 resolved"),
+            ("dns-platform-udp", dig("dns-platform-udp", "0", "169.254.169.253", true), "OPEN: 169.254.169.253 returned an address"),
+            ("dns-platform6-tcp", dig("dns-platform6-tcp", "0", "fd00:ec2::253", true), "OPEN: fd00:ec2::253 returned an address"),
+            // The stub's reply with an address (the fresh name's or example.com's: a forwarder that strips the SOA).
+            ("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253").replace("res=no", "res=yes"), "OPEN: fd00:ec2::253 returned an address"),
+            // Anything but the stub's empty NOERROR: an SOA (a recursor's black lie), a record, another status, no header.
+            ("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253").replace("au=0", "au=1"), "fd00:ec2::253 replied (status NOERROR, answer 0, authority 1, recursion available): not the platform stub's empty reply"),
+            ("dns-platform6-tcp", stub("dns-platform6-tcp", "fd00:ec2::253").replace("an=0", "an=1"), "not the platform stub's empty reply"),
+            ("dns-platform-udp", stub("dns-platform-udp", "169.254.169.253").replace("st=NOERROR", "st=NXDOMAIN").replace("au=0", "au=1"), "status NXDOMAIN"),
+            ("dns-vpc-tcp", stub("dns-vpc-tcp", "10.42.0.2").replace("st=NOERROR", "st=SERVFAIL"), "not the platform stub's empty reply"),
+            ("dns-subnet-udp", stub("dns-subnet-udp", "10.42.1.2").replace("st=NOERROR", "st=REFUSED"), "not the platform stub's empty reply"),
+            ("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253").replace("st=NOERROR", "st=none"), "fd00:ec2::253 replied (answer 0, authority 0, recursion available): not the platform stub's empty reply"),
+            ("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253").replace("an=0", "an=none").replace("au=0", "au=none"), "replied (status NOERROR, recursion available): not the platform stub's empty reply"),
+            ("dns-resolv-udp", stub("dns-resolv-udp", "10.42.0.2").replace("au=0", "au=1"), "not the platform stub's empty reply"),
             ("dns-subnet-tcp", dig("dns-subnet-tcp", "10", "10.42.1.2", false), "dig exited 10"),
             ("proxy-other-port", curl("proxy-other-port", 7, "000", "0", "000", false, false), "reached the proxy host"),
             ("proxy-other-port", curl("proxy-other-port", 28, "000", "1", "000", false, false), "OPEN"),
             ("proxy-other-port", curl("proxy-other-port", 0, "200", "1", "000", false, false), "OPEN"),
             ("proxy-ip-literal", curl("proxy-ip-literal", 0, "200", "1", "200", false, false), "opened a tunnel"),
-            ("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false), "github.com --remove"),
+            // Judged strictly (no allowlist proved, or github.com not on it): said, not prescribed.
+            ("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false), "(github.com was not on the proxy's effective allowlist as this check read it, or that list could not be verified: ai-env egress status)"),
             // curl's 403 text without the proxy's CONNECT 403, and the other way round: not squid's refusal.
             ("proxy-connect-8443", curl("proxy-connect-8443", 56, "000", "1", "000", true, false), "no 403"),
             ("denied", curl("denied", 56, "000", "1", "403", false, false), "no 403"),
@@ -2001,12 +2330,19 @@ mod tests {
         assert_eq!(judged(&with("dns-public-udp", dig("dns-public-udp", "0", "1.1.1.1", false))).dns, "open-dns:1.1.1.1");
         // A platform resolver that resolves fails, and the run's DNS verdict says so.
         assert_eq!(judged(&with("dns-platform-udp", dig("dns-platform-udp", "0", "169.254.169.253", true))).dns, "platform-dns-resolves:169.254.169.253");
-        // The platform resolver replying without resolving (DNS Firewall) passes, and is the run's DNS verdict.
-        let j = judged(&with("dns-platform-udp", dig("dns-platform-udp", "0", "169.254.169.253", false)));
+        // A platform resolver's empty NOERROR (the stub's reply) passes, and is the run's DNS verdict; the same reply
+        // without the status dig prints, or without its counts, fails (fail closed).
+        let j = judged(&with("dns-platform-udp", stub("dns-platform-udp", "169.254.169.253")));
         assert!(j.passed(), "{:?}", j.failures());
         assert_eq!(j.dns, "platform-dns:169.254.169.253");
-        // So does a private resolv.conf nameserver; and none at all.
-        assert!(judged(&with("dns-resolv-udp", dig("dns-resolv-udp", "0", "10.42.0.2", false))).passed());
+        for broken in [stub("dns-platform-udp", "169.254.169.253").replace("st=NOERROR", "st=none"), dig("dns-platform-udp", "0", "169.254.169.253", false)] {
+            let j = judged(&with("dns-platform-udp", broken.clone()));
+            assert_eq!(failing(&j), ["dns-platform-udp"], "{broken}");
+            assert_eq!(j.dns, "platform-dns-answered:169.254.169.253", "{broken}");
+        }
+        // So does a private resolv.conf nameserver's; and none at all.
+        assert!(judged(&with("dns-resolv-udp", stub("dns-resolv-udp", "10.42.0.2"))).passed());
+        assert_eq!(failing(&judged(&with("dns-resolv-udp", stub("dns-resolv-udp", "10.42.0.2").replace("st=NOERROR", "st=none")))), ["dns-resolv-udp"]);
         let j = judged(&with("dns-resolv-udp", dig("dns-resolv-udp", "none", "none", false)));
         assert!(j.passed() && verdict_of(&j, "dns-resolv-udp").reason.contains("not asked"));
     }
@@ -2032,6 +2368,106 @@ mod tests {
         assert!(verdict_of(&refused, "allowed").reason.contains("CONNECT 403"));
         let no_tunnel = judged(&with("allowed", curl("allowed", 0, "401", "1", "000", false, false)));
         assert!(verdict_of(&no_tunnel, "allowed").reason.contains("a tunnel the proxy opened"), "a 401 not through the proxy's tunnel");
+    }
+
+    /// While the proxy's effective allowlist holds github.com, `proxy-github` is recorded, not judged — whatever its
+    /// marker says — and a missing marker still fails. Nothing else changes: other hosts in the set, or github.com with
+    /// another proxy case opened, judge exactly as the strict judge.
+    #[test]
+    fn an_allowlisted_host_is_recorded_not_judged() {
+        let github: BTreeSet<String> = ["github.com".to_string()].into();
+        let tunnel = curl("proxy-github", 0, "200", "1", "200", false, false);
+        // Strictly, github.com's tunnel is OPEN, with a hint that says why without prescribing a removal.
+        let strict = judged(&with("proxy-github", tunnel.clone()));
+        assert_eq!(failing(&strict), ["proxy-github"]);
+        let reason = &verdict_of(&strict, "proxy-github").reason;
+        assert!(reason.ends_with("CONNECT 200 (github.com was not on the proxy's effective allowlist as this check read it, or that list could not be verified: ai-env egress status)") && !reason.contains("--remove"), "{reason}");
+        assert!(strict.allowlisted.is_empty() && strict.summary().contains(" proxy-github=fail "), "{}", strict.summary());
+        // Allowlisted: recorded, and the run passes.
+        let m = parse_markers(&transcript(&with("proxy-github", tunnel)), NONCE).unwrap();
+        let j = judge_with(&m, &github);
+        assert!(j.passed(), "{:?}", j.failures());
+        let v = verdict_of(&j, "proxy-github");
+        assert_eq!((v.verdict, v.result.as_ref().and_then(|r| r.hc)), (Verdict::Recorded, Some(200)), "the marker is kept");
+        assert_eq!(v.reason, "not judged: github.com is allowlisted on the proxy (its effective allowlist, as the network verification read it); curl saw HTTP 200 (rc 0, 0 bytes; 1 connect), CONNECT 200; this check does not show squid refusing it");
+        assert_eq!(j.allowlisted, ["github.com"]);
+        assert!(j.summary().contains(" proxy-github=recorded:allowlisted ") && j.summary().contains(" imds=recorded:401 "), "{}", j.summary());
+        assert_eq!(j.cases.iter().filter(|c| c.verdict == Verdict::Recorded).count(), 3, "imds, imds-v6, proxy-github");
+        // A refusal (github.com added after its case ran) is recorded too: the record never claims it refused.
+        let j = judge_with(&parse_markers(&transcript(&passing()), NONCE).unwrap(), &github);
+        let v = verdict_of(&j, "proxy-github");
+        assert!(j.passed() && v.verdict == Verdict::Recorded && v.reason.contains("curl saw no HTTP answer (rc 56: receive failure; 1 connect), CONNECT 403;"), "{v:?}");
+        // A missing marker still fails, and nothing was recorded for the allowlist.
+        let gone: Vec<(String, String)> = passing().into_iter().filter(|(k, _)| k != "proxy-github").collect();
+        let j = judge_with(&parse_markers(&transcript(&gone), NONCE).unwrap(), &github);
+        assert_eq!(failing(&j), ["proxy-github"]);
+        assert!(verdict_of(&j, "proxy-github").reason.contains("no result") && j.allowlisted.is_empty() && !j.summary().contains("allowlisted"), "{}", j.summary());
+        assert!(judge_with(&Markers::default(), &github).allowlisted.is_empty(), "an unreadable transcript records nothing");
+        // An allowlist of other hosts — the API host, the IP literal, the nonce host among them — changes nothing.
+        let nonce_host = denied_host(NONCE);
+        let others: BTreeSet<String> = ["api.anthropic.com", "1.1.1.1", nonce_host.as_str(), "example.org"].iter().map(|h| (*h).to_string()).collect();
+        for lines in [passing(), with("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false))] {
+            let m = parse_markers(&transcript(&lines), NONCE).unwrap();
+            assert_eq!(judge_with(&m, &others), judge(&m));
+        }
+        // With github.com allowlisted (alone, or with every other host), any other case the proxy let through fails
+        // exactly as it would strictly.
+        let both: BTreeSet<String> = others.union(&github).cloned().collect();
+        for (name, line) in [
+            ("proxy-ip-literal", curl("proxy-ip-literal", 0, "200", "1", "200", false, false)),
+            ("proxy-connect-8443", curl("proxy-connect-8443", 0, "200", "1", "200", false, false)),
+            ("proxy-http-8080", curl("proxy-http-8080", 0, "200", "1", "000", false, false)),
+            ("denied", curl("denied", 0, "200", "1", "200", false, false)),
+        ] {
+            let m = parse_markers(&transcript(&with(name, line.clone())), NONCE).unwrap();
+            for set in [&github, &both] {
+                let j = judge_with(&m, set);
+                assert_eq!(failing(&j), [name], "{line}");
+                assert_eq!(verdict_of(&j, name), verdict_of(&judge(&m), name), "{line}");
+                assert!(verdict_of(&j, name).reason.starts_with("OPEN") || name == "proxy-http-8080", "{}", verdict_of(&j, name).reason);
+            }
+        }
+    }
+
+    /// Only github.com's CONNECT on 443 can be allowlisted: the hosts taken from the effective allowlist, the requests
+    /// squid must refuse, and the one predicate both rest on (squid's log too).
+    #[test]
+    fn allowlisted_hosts_and_the_requests_squid_must_refuse() {
+        let set = |hosts: &[&str]| -> BTreeSet<String> { hosts.iter().map(|h| (*h).to_string()).collect() };
+        assert!(allowlisted_hosts(&BTreeSet::new()).is_empty());
+        assert_eq!(allowlisted_hosts(&set(&["github.com", "api.anthropic.com", "x.example"])), set(&["github.com"]));
+        assert!(allowlisted_hosts(&set(&["api.anthropic.com", "gist.github.com", "github.com.example"])).is_empty(), "exact names only");
+        let all = refused_requests(NONCE, &BTreeSet::new());
+        let nonce_host = denied_host(NONCE);
+        assert_eq!(
+            all,
+            [("CONNECT", nonce_host.clone(), 443), ("CONNECT", "1.1.1.1".to_string(), 443), ("CONNECT", "api.anthropic.com".to_string(), 8443), ("CONNECT", "github.com".to_string(), 443), ("GET", "api.anthropic.com".to_string(), 8080)]
+        );
+        assert_eq!(refused_requests(NONCE, &set(&["api.anthropic.com", "1.1.1.1", nonce_host.as_str()])), all, "never the API host's other ports, the IP literal or the nonce host");
+        let without: Vec<(&str, String, u16)> = all.iter().filter(|(_, h, _)| h != "github.com").cloned().collect();
+        assert_eq!(refused_requests(NONCE, &set(&["github.com"])), without);
+        assert_eq!(refused_requests(NONCE, &set(&["github.com", "api.anthropic.com", "1.1.1.1", nonce_host.as_str()])), without);
+        // The predicate: CONNECT, port 443, an allowlistable host, held by the set — each of the four needed.
+        let github = set(&["github.com"]);
+        assert!(allowlisted_request("CONNECT", "github.com", Some(443), &github));
+        for (method, host, port, s) in [
+            ("GET", "github.com", Some(443), &github),
+            ("CONNECT", "github.com", Some(8443), &github),
+            ("CONNECT", "github.com", None, &github),
+            ("CONNECT", "github.com", Some(443), &BTreeSet::new()),
+            ("CONNECT", "1.1.1.1", Some(443), &set(&["1.1.1.1"])),
+            ("CONNECT", nonce_host.as_str(), Some(443), &set(&[nonce_host.as_str()])),
+            ("CONNECT", "api.anthropic.com", Some(443), &set(&["api.anthropic.com"])),
+        ] {
+            assert!(!allowlisted_request(method, host, port, s), "{method} {host}:{port:?}");
+        }
+        assert_eq!((allowlisted_case("proxy-github", &github), allowlisted_case("proxy-github", &BTreeSet::new()), allowlisted_case("denied", &github)), (Some("github.com"), None, None));
+        // Every allowlistable case asks the proxy for its host with CONNECT on 443, as the request list does.
+        for (name, host) in ALLOWLISTABLE {
+            let c = case(name).unwrap();
+            assert!(c.kind == Kind::Connect403 && c.args == format!("https://{host}/"), "{name}");
+            assert!(all.contains(&("CONNECT", host.to_string(), 443)), "{name}");
+        }
     }
 
     #[test]
@@ -2061,8 +2497,11 @@ mod tests {
         let (v, note) = dns_path_outcome(&only(with("dns-subnet-udp", dig("dns-subnet-udp", "0", "10.42.1.2", true)))).unwrap();
         assert_eq!(v, "platform-dns-resolves:10.42.1.2", "a platform resolver that resolves names: never plain platform-dns");
         assert!(note.starts_with("resolves=yes"), "{note}");
-        let (v, _) = dns_path_outcome(&only(with("dns-subnet-udp", dig("dns-subnet-udp", "0", "10.42.1.2", false)))).unwrap();
-        assert_eq!(v, "platform-dns:10.42.1.2", "answers without resolving (DNS Firewall)");
+        let (v, _) = dns_path_outcome(&only(with("dns-subnet-udp", stub("dns-subnet-udp", "10.42.1.2")))).unwrap();
+        assert_eq!(v, "platform-dns:10.42.1.2", "the platform's empty reply");
+        let (v, note) = dns_path_outcome(&only(with("dns-subnet-udp", stub("dns-subnet-udp", "10.42.1.2").replace("st=NOERROR", "st=NXDOMAIN").replace("au=0", "au=1")))).unwrap();
+        assert_eq!(v, "platform-dns-answered:10.42.1.2", "a recursor's negative answer: {note}");
+        assert!(note.contains("10.42.1.2 udp replied (NXDOMAIN, answer 0, authority 1, recursion available), tcp no reply"), "{note}");
         let (v, _) = dns_path_outcome(&only(with("dns-public-tcp", dig("dns-public-tcp", "0", "1.1.1.1", false)))).unwrap();
         assert_eq!(v, "open-dns:1.1.1.1", "a public resolver that replies is open DNS, never platform DNS");
         let (v, _) = dns_path_outcome(&only(with("dns-resolv-udp", dig("dns-resolv-udp", "0", "9.9.9.9", false)))).unwrap();
@@ -2101,7 +2540,7 @@ mod tests {
     #[test]
     fn squid_evidence_needs_every_line_from_the_runs_client_in_its_window() {
         let t = 1_790_000_000;
-        let ev = |msgs: &[String]| squid_evidence(&lines_of(msgs), NONCE, t - 60, t + 60, 2);
+        let ev = |msgs: &[String]| squid_evidence(&lines_of(msgs), NONCE, t - 60, t + 60, 2, &BTreeSet::new());
         let SquidEvidence::Complete(found) = ev(&squid_run("10.42.1.17", t)) else { panic!("{:?}", ev(&squid_run("10.42.1.17", t))) };
         assert!(found.starts_with("from 10.42.1.17: 2 tunnels to api.anthropic.com:443") && found.contains("GET api.anthropic.com:8080"), "{found}");
         assert!(squid_lines(&serde_json::json!({})).is_err());
@@ -2143,7 +2582,7 @@ mod tests {
         let no_tunnels: Vec<String> = squid_run("10.42.1.17", t).into_iter().filter(|l| !l.contains("TCP_TUNNEL")).collect();
         assert!(matches!(ev(&no_tunnels), SquidEvidence::Missing(m) if m[0].contains("(0 found)")));
         // Every CONNECT case the proxy must refuse, and the plain-http one, is a required squid line.
-        let refused = refused_requests(NONCE);
+        let refused = refused_requests(NONCE, &BTreeSet::new());
         for c in CASES.iter().filter(|c| matches!(c.kind, Kind::Connect403 | Kind::Get403)) {
             let url = c.args.replace("@H@", &denied_host(NONCE));
             let (scheme, rest) = url.split_once("://").unwrap();
@@ -2165,7 +2604,7 @@ mod tests {
     fn squid_evidence_attributes_the_shared_address_by_squids_clock() {
         let t = 1_790_000_000;
         let c = "10.42.1.158";
-        let ev = |msgs: &[String]| squid_evidence(&lines_of(msgs), NONCE, t - 60, t + 60, 2);
+        let ev = |msgs: &[String]| squid_evidence(&lines_of(msgs), NONCE, t - 60, t + 60, 2, &BTreeSet::new());
         let at = |secs: u64, ms: u64, dur: u64, code: &str, dest: &str| format!("aienv {secs}.{ms:03} {dur} {c} {code} 4000 CONNECT {dest}");
         let with = |extra: &[String]| squid_run(c, t).into_iter().chain(extra.iter().cloned()).collect::<Vec<_>>();
         // live_egress_extra_and_removal 35 s earlier: refused, allowed (a tunnel of 0.9 s), refused again.
@@ -2212,6 +2651,53 @@ mod tests {
         assert_eq!(squid_ms(&lines_of(&[format!("aienv {t}.5 0 {c} TCP_DENIED/403 4000 CONNECT github.com:443")])[0]), Some(t * 1000 + 500));
     }
 
+    /// With github.com allowlisted, squid's log need not show it refused, and a tunnel to it on 443 — whenever logged,
+    /// whoever's — is no violation; everything else holds: a tunnel to the IP literal, to the API host's or github.com's
+    /// other port, and every other denial missing. An allowlist of other hosts changes nothing.
+    #[test]
+    fn squid_evidence_with_github_allowlisted() {
+        let t = 1_790_000_000;
+        let c = "10.42.1.17";
+        let github: BTreeSet<String> = ["github.com".to_string()].into();
+        let none = BTreeSet::new();
+        let ev = |msgs: &[String], set: &BTreeSet<String>| squid_evidence(&lines_of(msgs), NONCE, t - 60, t + 60, 2, set);
+        let tunnel = |secs: u64, dest: &str| format!("aienv {secs}.900 900 {c} TCP_TUNNEL/200 5000 CONNECT {dest}");
+        let plus = |base: &[String], extra: &[String]| base.iter().chain(extra).cloned().collect::<Vec<String>>();
+        let no_denial: Vec<String> = squid_run(c, t).into_iter().filter(|l| !l.contains("github.com")).collect();
+        match ev(&no_denial, &github) {
+            SquidEvidence::Complete(found) => assert!(found.ends_with("; no tunnel to a refused host; allowlisted, not required refused: github.com") && !found.contains("CONNECT github.com:443"), "{found}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(ev(&no_denial, &none), SquidEvidence::Missing(m) if m == ["TCP_DENIED/403 CONNECT github.com:443 from 10.42.1.17"]), "strictly, the denial is required");
+        // github.com tunnels on 443 — the run's own after its case, an earlier one, a later one — with or without the
+        // run's denial in the log (github.com added after its case ran): complete, never a violation.
+        for extra in [vec![tunnel(t, "github.com:443")], vec![tunnel(t - 50, "github.com:443"), tunnel(t + 30, "github.com:443")]] {
+            for base in [&no_denial, &squid_run(c, t)] {
+                let msgs = plus(base, &extra);
+                assert!(matches!(ev(&msgs, &github), SquidEvidence::Complete(ref f) if f.ends_with("allowlisted, not required refused: github.com")), "{extra:?}: {:?}", ev(&msgs, &github));
+            }
+            // Strictly, a tunnel logged after the run's refusal is a violation, and one without it cannot be placed.
+            assert!(matches!(ev(&plus(&squid_run(c, t), &extra), &none), SquidEvidence::Violation(v) if v.contains("github.com:443")), "{extra:?}");
+            assert!(matches!(ev(&plus(&no_denial, &extra), &none), SquidEvidence::Missing(_)), "{extra:?}");
+        }
+        // Every other tunnel is still a violation: the IP literal, the API host's other port, github.com on another port.
+        for dest in ["1.1.1.1:443", "api.anthropic.com:8443", "github.com:8443", "github.com:80"] {
+            assert!(matches!(ev(&plus(&no_denial, &[tunnel(t, dest)]), &github), SquidEvidence::Violation(v) if v.contains(dest)), "{dest}");
+        }
+        // Every other denial is still required.
+        let nonce_denial = format!("CONNECT {}:443", denied_host(NONCE));
+        for gone in ["CONNECT api.anthropic.com:8443", "CONNECT 1.1.1.1:443", "GET api.anthropic.com:8080", nonce_denial.as_str()] {
+            let msgs: Vec<String> = no_denial.iter().filter(|l| !l.ends_with(gone)).cloned().collect();
+            assert!(matches!(ev(&msgs, &github), SquidEvidence::Missing(m) if m.iter().any(|x| x.contains(gone))), "{gone}: {:?}", ev(&msgs, &github));
+        }
+        // An allowlist of other hosts changes nothing.
+        let nonce_host = denied_host(NONCE);
+        let others: BTreeSet<String> = ["api.anthropic.com", "1.1.1.1", nonce_host.as_str()].iter().map(|h| (*h).to_string()).collect();
+        for msgs in [squid_run(c, t), no_denial.clone(), plus(&squid_run(c, t), &[tunnel(t, "1.1.1.1:443")]), plus(&squid_run(c, t), &[tunnel(t, "github.com:443")])] {
+            assert_eq!(ev(&msgs, &others), ev(&msgs, &none));
+        }
+    }
+
     fn evidence(lines: &[(String, String)]) -> Evidence {
         Evidence {
             id: "microvm-00000000-0000-4000-8000-000000000001".into(),
@@ -2228,6 +2714,7 @@ mod tests {
             image_created_at: Some(Ok(1_789_804_800)),
             started_s: 1_790_000_000,
             denied_host: denied_host(NONCE),
+            dns_name: dns_name(NONCE),
         }
     }
 
@@ -2246,6 +2733,11 @@ mod tests {
         assert_eq!((rec.image_arn.as_str(), rec.image_version.as_str(), rec.connector.as_str(), rec.vm_id.as_str()), (crate::bridge::api::FAKE_IMAGE_ARN, "1.0", CONN, ev.id.as_str()));
         assert_eq!((rec.dns.as_str(), rec.network.as_str(), rec.squid_log.as_str(), rec.at.as_str()), ("no-dns", "21 checks ok: connector, vm-route-table", "from 10.42.1.17: 2 tunnels", "2026-10-01T10:00:00Z"));
         assert!(rec.cases.contains("denied=pass"));
+        assert_eq!(rec.dns_rule, DNS_RULE, "judged by the current DNS rule");
+        // The stub's empty reply is recorded as the run's verdict (the gate decides with the pin).
+        let platform = decide(&evidence(&with("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253"))), CONN, "t");
+        assert!(platform.passed, "{:?}", platform.failures);
+        assert_eq!(platform.record.map(|r| (r.dns, r.dns_rule)), Some(("platform-dns:fd00:ec2::253".to_string(), DNS_RULE)));
         assert_eq!((rec.connector_facts.clone(), rec.image_created_at), (facts(), Some(1_789_804_800)), "bound to the connector's live facts and the image build");
         // --vm needs no binding (it records nothing).
         let d = decide(&Evidence { own: false, connector_facts: None, image_created_at: None, ..ev.clone() }, CONN, "t");
@@ -2253,6 +2745,12 @@ mod tests {
         // --vm: the same evidence, report only.
         let d = decide(&Evidence { own: false, ..ev.clone() }, CONN, "t");
         assert!(d.passed && d.record.is_none() && !d.revoke);
+        // An allowlisted host's case was recorded, not judged: the record says so, in `allowlisted` and in its cases.
+        let opened = parse_markers(&transcript(&with("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false))), NONCE).unwrap();
+        let allowlisted = decide(&Evidence { judgement: judge_with(&opened, &["github.com".to_string()].into()), ..ev.clone() }, CONN, "t").record.unwrap();
+        assert_eq!(allowlisted.allowlisted, ["github.com"]);
+        assert!(allowlisted.cases.contains(" proxy-github=recorded:allowlisted "), "{}", allowlisted.cases);
+        assert!(rec.allowlisted.is_empty() && rec.cases.contains(" proxy-github=pass "), "nothing allowlisted, nothing said: {rec:?}");
     }
 
     #[test]
@@ -2260,8 +2758,11 @@ mod tests {
         let base = evidence(&passing());
         let failing_cases = evidence(&with("direct-ipv4", curl("direct-ipv4", 0, "200", "1", "000", false, false)));
         let cases_ok_squid = |squid| Evidence { squid, ..base.clone() };
+        let answered = evidence(&with("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253").replace("au=0", "au=1")));
+        assert_eq!(answered.judgement.dns, "platform-dns-answered:fd00:ec2::253");
         let variants: Vec<(Evidence, &str)> = vec![
             (failing_cases, "direct-ipv4: OPEN"),
+            (answered, "dns-platform6-udp: fd00:ec2::253 replied (status NOERROR, answer 0, authority 1, recursion available): not the platform stub's empty reply"),
             (Evidence { transcript: Err("case allowed twice".into()), ..base.clone() }, "the transcript could not be read"),
             (Evidence { network: Some(Err("DRIFT vm-sg: unexpected tcp 443".into())), squid: None, ..base.clone() }, "network verification: DRIFT vm-sg"),
             (Evidence { network: Some(Err("unknown proxy-ssm: Offline".into())), squid: None, ..base.clone() }, "network verification: unknown"),

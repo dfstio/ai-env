@@ -11,7 +11,9 @@
 //! rendered `egress check` and dns-path scripts also run for real in
 //! /bin/bash behind the loopback server, with fake `curl` and `dig` on a
 //! pinned PATH (no network), modelling a closed VPC, a leaky one, a dead
-//! proxy, and platform DNS.
+//! proxy, and platform DNS: the stub's empty NOERROR and every other reply
+//! a platform resolver can give (an SOA, NXDOMAIN, SERVFAIL, REFUSED, a
+//! record, a forwarder that strips the SOA, an address).
 use ai_env_cli::bridge::egress::check::{dns_path_outcome, judge, parse_markers, render_dns_script, render_script, Verdict, CASES};
 use ai_env_cli::bridge::egress::PROXY_IP;
 use ai_env_cli::bridge::vm::shell::{pump, run_script_over, session_init_id, PumpEnd, ESCAPE, SCRIPT_OUTPUT_MAX};
@@ -164,9 +166,9 @@ fn passing_markers() -> String {
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
             n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
-            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
-            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none".to_string(),
-            n if n.starts_with("dns-") => "rc=9 ns=10.42.0.2 res=no st=none ra=none".to_string(),
+            n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none an=none au=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
+            n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none an=none au=none".to_string(),
+            n if n.starts_with("dns-") => "rc=9 ns=10.42.0.2 res=no st=none ra=none an=none au=none".to_string(),
             other => panic!("no marker for {other}"),
         };
         out.push_str(&format!("@@AIENV{NONCE} {} {line}\r\n", c.name));
@@ -291,36 +293,68 @@ printf '%s' "$fmt" | sed -e "s/%{http_code}/$code/" -e "s/%{size_download}/$size
 exit "$rc"
 "#;
 
-/// A fake `dig` printing what `+noall +comments +answer` prints: no server
-/// replies (dig's own error lines, which name the server, then exit 9)
-/// unless `FAKE_DNS_REPLY` names it (exit 0: a header with its status, the
-/// flags line, `ra` among them with `FAKE_DNS_RA=1`; with
-/// `FAKE_DNS_RESOLVES=1` status NOERROR and an answer, else
-/// `FAKE_DNS_STATUS`, REFUSED by default); `FAKE_DNS_TRUNCATE` names a
-/// server whose UDP reply comes truncated and whose TCP retry fails (exit 9).
+/// A fake `dig` printing what `+noall +comments +answer` (the run's fresh
+/// name, with the header) and `+noall +answer` (example.com, records only)
+/// print. The name after `@server` must be `FAKE_DNS_NAME` with `+comments`
+/// and `example.com` without, or it exits 10 (a script that asks another
+/// name never passes). No server replies (dig's own error lines, which name
+/// the server, then exit 9) unless `FAKE_DNS_REPLY` names it (exit 0): the
+/// header with `FAKE_DNS_STATUS` (NOERROR by default), the flags line (`ra`
+/// with `FAKE_DNS_RA=1`) and its counts, `FAKE_DNS_ANSWERS` (a CNAME line
+/// when above 0) and `FAKE_DNS_AUTHORITY` (0 by default: the platform stub's
+/// empty NOERROR); `FAKE_DNS_RESOLVES=1` answers an address for whatever
+/// name is asked, `FAKE_DNS_EXAMPLE=1` one for example.com only (a forwarder
+/// that strips the SOA but resolves), `FAKE_DNS_EXAMPLE_SILENT=1` no reply to
+/// example.com at all (dig's timeout, exit 9: a forwarder whose upstream is
+/// slow). `FAKE_DNS_TRUNCATE` names a server whose UDP reply comes truncated
+/// and whose TCP retry fails (exit 9).
 const FAKE_DIG: &str = r#"#!/bin/sh
-server=
-for a in "$@"; do case "$a" in @*) server=${a#@} ;; esac; done
+server=; name=; comments=0; next=0
+for a in "$@"; do
+  [ "$next" = 1 ] && name=$a
+  next=0
+  case "$a" in @*) server=${a#@}; next=1 ;; +comments) comments=1 ;; esac
+done
+if [ "$comments" = 1 ]; then want=${FAKE_DNS_NAME:-}; else want=example.com; fi
+if [ -z "$want" ] || [ "$name" != "$want" ]; then
+  echo ";; fake dig: asked $name, expected $want"
+  exit 10
+fi
+if [ "$comments" = 0 ] && [ "${FAKE_DNS_EXAMPLE_SILENT:-0}" = 1 ]; then
+  echo ";; communications error to $server#53: timed out"
+  echo ";; no servers could be reached"
+  exit 9
+fi
 if [ -n "${FAKE_DNS_TRUNCATE:-}" ] && [ "$server" = "$FAKE_DNS_TRUNCATE" ]; then
   echo ";; Truncated, retrying in TCP mode."
-  echo ";; Connection to $server#53($server) for example.com failed: connection refused."
+  echo ";; Connection to $server#53($server) for $name failed: connection refused."
   echo ";; no servers could be reached"
   exit 9
 fi
 if [ -n "${FAKE_DNS_REPLY:-}" ] && [ "$server" = "$FAKE_DNS_REPLY" ]; then
-  st=${FAKE_DNS_STATUS:-REFUSED}; [ "${FAKE_DNS_RESOLVES:-0}" = 1 ] && st=NOERROR
-  ra=; [ "${FAKE_DNS_RA:-0}" = 1 ] && ra=' ra'
-  echo ";; Got answer:"
-  echo ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 4242"
-  echo ";; flags: qr rd$ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1"
-  echo
-  [ "${FAKE_DNS_RESOLVES:-0}" = 1 ] && printf 'example.com.\t\t300\tIN\tA\t93.184.215.14\n'
+  resolves=${FAKE_DNS_RESOLVES:-0}
+  if [ "$comments" = 1 ]; then
+    st=${FAKE_DNS_STATUS:-NOERROR}; an=${FAKE_DNS_ANSWERS:-0}; au=${FAKE_DNS_AUTHORITY:-0}
+    [ "$resolves" = 1 ] && st=NOERROR && an=1
+    ra=; [ "${FAKE_DNS_RA:-0}" = 1 ] && ra=' ra'
+    echo ";; Got answer:"
+    echo ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 4242"
+    echo ";; flags: qr rd$ra; QUERY: 1, ANSWER: $an, AUTHORITY: $au, ADDITIONAL: 1"
+    echo
+    [ "$an" -gt 0 ] && [ "$resolves" != 1 ] && printf '%s.\t\t300\tIN\tCNAME\tother.example.net.\n' "$name"
+  fi
+  [ "$resolves" = 1 ] && printf '%s.\t\t300\tIN\tA\t93.184.215.14\n' "$name"
+  [ "$comments" = 0 ] && [ "$resolves" != 1 ] && [ "${FAKE_DNS_EXAMPLE:-0}" = 1 ] && printf 'example.com.\t\t300\tIN\tA\t93.184.215.14\n'
   exit 0
 fi
 echo ";; communications error to $server#53: timed out"
 echo ";; no servers could be reached"
 exit 9
 "#;
+
+/// The run's fresh name the fake `dig` insists on (`d<NONCE>.example.com`), spelled out so a change of the
+/// script's name fails here.
+const FAKE_DNS_NAME: &str = "d00c0ffee12345678.example.com";
 
 /// Run `script` in /bin/bash (no rc files, a clean environment, the fakes
 /// first on PATH, `/etc/resolv.conf` replaced by `resolv`), killed after 60 s.
@@ -337,7 +371,7 @@ fn run_bash(dir: &Path, script: &[u8], resolv: &str, env: &[(&str, &str)]) -> St
     std::fs::write(&conf, resolv).unwrap();
     let script = String::from_utf8_lossy(script).replace("/etc/resolv.conf", &conf.display().to_string());
     let mut c = std::process::Command::new("/bin/bash");
-    c.args(["--norc", "--noprofile"]).env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("HOME", dir).env("LC_ALL", "C");
+    c.args(["--norc", "--noprofile"]).env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("HOME", dir).env("LC_ALL", "C").env("FAKE_DNS_NAME", FAKE_DNS_NAME);
     for (k, v) in env {
         c.env(k, v);
     }
@@ -428,28 +462,29 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
     let unwaited = render_script(NONCE, PROXY_IP).replace("aienv_r 10.42.0.10:3128\n", "");
     let j = judge(&parse_markers(&through_bash(unwaited, resolv, &[("FAKE_WORLD", "late")]).await, NONCE).unwrap());
     assert!(f(&j, "allowed").reason.contains("did not answer") && f(&j, "direct-name").reason.contains("not counted") && f(&j, "allowed-last").verdict == Verdict::Pass, "{:?}", j.failures());
-    // The platform resolver resolves: those cases fail; DNS Firewall (a reply, no address) passes.
+    // The platform resolver resolves: those cases fail; the stub's empty NOERROR (no answer, no authority) passes.
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "169.254.169.253"), ("FAKE_DNS_RESOLVES", "1")]).await, NONCE).unwrap());
     assert_eq!(failing(&j), ["dns-platform-udp", "dns-platform-tcp"], "{:?}", j.failures());
     assert_eq!(j.dns, "platform-dns-resolves:169.254.169.253", "a resolving platform resolver is never plain platform-dns");
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "169.254.169.253")]).await, NONCE).unwrap());
     assert!(j.passed(), "{:?}", j.failures());
     assert_eq!(j.dns, "platform-dns:169.254.169.253");
-    assert!(f(&j, "dns-platform-udp").reason.starts_with("169.254.169.253 replied (status REFUSED, no recursion) and resolved nothing"), "{}", f(&j, "dns-platform-udp").reason);
+    assert!(f(&j, "dns-platform-udp").reason.starts_with("169.254.169.253 replied with an empty NOERROR (status NOERROR, answer 0, authority 0, no recursion) and no address for example.com"), "{}", f(&j, "dns-platform-udp").reason);
     // A truncated UDP reply whose TCP retry fails comes through as TRUNCATED: a public resolver that did so is open.
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_TRUNCATE", "1.1.1.1")]).await, NONCE).unwrap());
     assert_eq!(failing(&j), ["dns-public-udp", "dns-public-tcp"], "{:?}", j.failures());
     assert_eq!(j.dns, "open-dns:1.1.1.1");
     // The dead world's wait printed a dot per failed attempt before its marker (the shell is never silent for a minute).
     assert!(run(resolv, &[("FAKE_WORLD", "dead")]).await.contains(&format!("{}@@AIENV{NONCE} ready try=30", ".".repeat(30))));
-    // dig's status and the recursion flag come through the VM's shell variables.
-    let m = parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_STATUS", "SERVFAIL"), ("FAKE_DNS_RA", "1")]).await, NONCE).unwrap();
+    // dig's status, counts and the recursion flag come through the VM's shell variables.
+    let m = parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_STATUS", "SERVFAIL"), ("FAKE_DNS_RA", "1"), ("FAKE_DNS_AUTHORITY", "1")]).await, NONCE).unwrap();
     let r = m.get("dns-platform6-tcp").unwrap();
-    assert_eq!((r.rc, r.resolves, r.status.as_deref(), r.ra), (Some(0), Some(false), Some("SERVFAIL"), Some(true)));
-    assert_eq!(m.get("dns-platform-udp").unwrap().status, None, "no reply, no status");
+    assert_eq!((r.rc, r.resolves, r.status.as_deref(), r.ra, r.answers, r.authority), (Some(0), Some(false), Some("SERVFAIL"), Some(true), Some(0), Some(1)));
+    let r = m.get("dns-platform-udp").unwrap();
+    assert_eq!((r.status.as_deref(), r.answers, r.authority), (None, None, None), "no reply, no status, no counts");
     let m = parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "169.254.169.253"), ("FAKE_DNS_RESOLVES", "1"), ("FAKE_DNS_RA", "1")]).await, NONCE).unwrap();
     let r = m.get("dns-platform-udp").unwrap();
-    assert_eq!((r.resolves, r.status.as_deref(), r.ra), (Some(true), Some("NOERROR"), Some(true)), "an answer line is an address");
+    assert_eq!((r.resolves, r.status.as_deref(), r.ra, r.answers), (Some(true), Some("NOERROR"), Some(true), Some(1)), "an answer line is an address");
     // OpenDNS answering on UDP 443: open.
     let j = judge(&parse_markers(&run(resolv, &[("FAKE_DNS_REPLY", "208.67.222.222")]).await, NONCE).unwrap());
     assert_eq!(failing(&j), ["dns-public-port"], "{:?}", j.failures());
@@ -497,7 +532,17 @@ async fn the_dns_path_script_runs_in_bash() {
     let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "10.42.1.2")]).await, NONCE).unwrap();
     let (v, note) = dns_path_outcome(&m).unwrap();
     assert_eq!(v, "platform-dns:10.42.1.2");
-    assert!(note.starts_with("resolves=no") && note.contains("10.42.1.2 udp replied (REFUSED, no recursion), tcp replied (REFUSED, no recursion)"), "{note}");
+    assert!(note.starts_with("resolves=no") && note.contains("10.42.1.2 udp replied (NOERROR, answer 0, authority 0, no recursion), tcp replied (NOERROR, answer 0, authority 0, no recursion)"), "{note}");
+    // A recursor's negative answer (NXDOMAIN with the zone's SOA): answered, never accepted.
+    let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "10.42.1.2"), ("FAKE_DNS_STATUS", "NXDOMAIN"), ("FAKE_DNS_AUTHORITY", "1"), ("FAKE_DNS_RA", "1")]).await, NONCE).unwrap();
+    let (v, note) = dns_path_outcome(&m).unwrap();
+    assert_eq!(v, "platform-dns-answered:10.42.1.2");
+    assert!(note.contains("10.42.1.2 udp replied (NXDOMAIN, answer 0, authority 1, recursion available)"), "{note}");
+    // The stub's reply to the fresh name, but no reply to example.com at all: answered, and the note says so.
+    let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "10.42.1.2"), ("FAKE_DNS_EXAMPLE_SILENT", "1")]).await, NONCE).unwrap();
+    let (v, note) = dns_path_outcome(&m).unwrap();
+    assert_eq!(v, "platform-dns-answered:10.42.1.2");
+    assert!(note.contains("10.42.1.2 udp replied (example.com A unanswered, answer 0, authority 0, no recursion), tcp replied (example.com A unanswered, answer 0, authority 0, no recursion)"), "{note}");
     let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "10.42.1.2"), ("FAKE_DNS_RESOLVES", "1")]).await, NONCE).unwrap();
     assert_eq!(dns_path_outcome(&m).unwrap().0, "platform-dns-resolves:10.42.1.2", "names resolve through the platform: never plain platform-dns");
     let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, &[("FAKE_DNS_REPLY", "1.1.1.1")]).await, NONCE).unwrap();
@@ -508,6 +553,75 @@ async fn the_dns_path_script_runs_in_bash() {
         let m = parse_markers(&through_bash(render_dns_script(NONCE, PROXY_IP), resolv, world).await, NONCE).unwrap();
         assert!(dns_path_outcome(&m).unwrap_err().contains("proves nothing"), "{world:?}: no verdict from a VM whose networking is dead");
     }
+}
+
+/// Every platform reply the matrix of the design names, at `fd00:ec2::253`, through the real script in bash: only
+/// the stub's empty NOERROR (no answer, no authority) and no address for example.com passes; every other reply fails
+/// both platform6 cases, and the run's verdict is its class.
+#[tokio::test]
+async fn every_platform_reply_through_bash_is_judged_by_its_class() {
+    const STUB: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_RA", "1")];
+    const SOA: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_RA", "1"), ("FAKE_DNS_AUTHORITY", "1")];
+    const NXDOMAIN: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_STATUS", "NXDOMAIN"), ("FAKE_DNS_AUTHORITY", "1")];
+    const SERVFAIL: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_STATUS", "SERVFAIL"), ("FAKE_DNS_RA", "1")];
+    const REFUSED: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_STATUS", "REFUSED")];
+    const CNAME: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_ANSWERS", "1")];
+    const FORWARDER: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_EXAMPLE", "1")];
+    const SOA_AND_EXAMPLE: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_AUTHORITY", "1"), ("FAKE_DNS_EXAMPLE", "1")];
+    const RESOLVES: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_RESOLVES", "1")];
+    const EXAMPLE_SILENT: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_RA", "1"), ("FAKE_DNS_EXAMPLE_SILENT", "1")];
+    let answered = "platform-dns-answered:fd00:ec2::253";
+    let resolves = "platform-dns-resolves:fd00:ec2::253";
+    for (world, what, verdict) in [
+        (STUB, "the stub's empty NOERROR", "platform-dns:fd00:ec2::253"),
+        (SOA, "an SOA in AUTHORITY (a validating recursor's black lie)", answered),
+        (NXDOMAIN, "NXDOMAIN with the SOA", answered),
+        (SERVFAIL, "SERVFAIL", answered),
+        (REFUSED, "REFUSED", answered),
+        (CNAME, "a record without an address", answered),
+        (EXAMPLE_SILENT, "the stub's reply to the fresh name, but none to example.com (a forwarder whose upstream is slow)", answered),
+        (FORWARDER, "an empty fresh name, but example.com resolves (a forwarder that strips the SOA)", resolves),
+        (SOA_AND_EXAMPLE, "an SOA and example.com resolving", resolves),
+        (RESOLVES, "an address for the fresh name", resolves),
+    ] {
+        let out = through_bash(render_script(NONCE, PROXY_IP), "nameserver 10.42.0.2\n", world).await;
+        let j = judge(&parse_markers(&out, NONCE).unwrap_or_else(|e| panic!("{what}: {e}")));
+        let empty = verdict.starts_with("platform-dns:");
+        assert_eq!(failing(&j), if empty { vec![] } else { vec!["dns-platform6-udp", "dns-platform6-tcp"] }, "{what}: {:?}", j.failures());
+        assert_eq!(j.dns, verdict, "{what}");
+        assert_eq!(j.passed(), empty, "{what}");
+        if world == EXAMPLE_SILENT {
+            // The fresh name's counts still come through; the status says what went missing.
+            let r = j.cases.iter().find(|c| c.name == "dns-platform6-tcp").unwrap();
+            assert!(r.reason.starts_with("fd00:ec2::253 replied (example.com A unanswered, answer 0, authority 0, recursion available): "), "{}", r.reason);
+        }
+    }
+}
+
+/// The script's two DNS queries are each what the judgement rests on: asking example.com instead of the fresh name
+/// fails every DNS case (the fake dig refuses any other name), and without the example.com query the forwarder that
+/// strips the SOA would pass — so its row of the matrix is not vacuous. Likewise without the check of that query's
+/// exit code a server that never answers example.com would pass.
+#[tokio::test]
+async fn each_dns_query_of_the_script_is_load_bearing() {
+    const FORWARDER: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_EXAMPLE", "1")];
+    const EXAMPLE_SILENT: &[(&str, &str)] = &[("FAKE_DNS_REPLY", "fd00:ec2::253"), ("FAKE_DNS_EXAMPLE_SILENT", "1")];
+    let script = render_script(NONCE, PROXY_IP);
+    let old_name = script.replace("\"@$s\" \"$N\" A", "\"@$s\" example.com A");
+    assert_ne!(old_name, script, "the fresh-name query is in the script");
+    let j = judge(&parse_markers(&through_bash(old_name, "nameserver 10.42.0.2\n", &[]).await, NONCE).unwrap());
+    let dns: Vec<&str> = CASES.iter().filter(|c| c.group == "dns").map(|c| c.name).collect();
+    assert_eq!(dns.len(), 13);
+    assert_eq!(failing(&j), dns, "{:?}", j.failures());
+    assert!(j.cases.iter().filter(|c| c.group == "dns").all(|c| c.reason.contains("dig exited 10")), "{:?}", j.failures());
+    let no_example = script.replace("[ $rc = 0 ] && { e=$(command dig -r +noall +answer +time=2 +tries=1 \"$@\" \"@$s\" example.com A 2>&1 </dev/null); q=$?; }; ", "");
+    assert_ne!(no_example, script, "the example.com query is in the script");
+    let j = judge(&parse_markers(&through_bash(no_example, "nameserver 10.42.0.2\n", FORWARDER).await, NONCE).unwrap());
+    assert!(j.passed() && j.dns == "platform-dns:fd00:ec2::253", "without the example.com query the forwarder passes: {:?}", j.failures());
+    let unchecked = script.replace("[ $q = 0 ] || t=NOEXAMPLE; ", "");
+    assert_ne!(unchecked, script, "the example.com query's exit code is checked");
+    let j = judge(&parse_markers(&through_bash(unchecked, "nameserver 10.42.0.2\n", EXAMPLE_SILENT).await, NONCE).unwrap());
+    assert!(j.passed() && j.dns == "platform-dns:fd00:ec2::253", "without that check a server that never answers example.com passes: {:?}", j.failures());
 }
 
 #[test]

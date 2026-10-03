@@ -425,6 +425,59 @@ fn cli_suspend_resume_status_and_health() {
     assert!(w.audit().contains("\"vm_suspend\"") && w.audit().contains("\"vm_resume\""));
 }
 
+/// `[egress] accept_platform_dns = <value>` appended to this world's bridge.toml (its last section is `[vm]`).
+fn with_dns_pin(w: &World, value: &str) {
+    let path = w.bridge().join("bridge.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("{text}\n[egress]\naccept_platform_dns = {value}\n")).unwrap();
+}
+
+/// `[egress].accept_platform_dns` as `ai-env vm`, `lab` and `egress check` take it: a value that is not a platform
+/// resolver's address is refused before anything (exit 1 naming the key, no RunMicrovm, no aws call); the legacy
+/// `true` is said, never refused, with the line to write for the newest dns-path verdict; the pin is silent.
+#[test]
+fn cli_refuses_an_invalid_dns_pin_and_says_what_true_accepts() {
+    for bad in ["\"8.8.8.8\"", "\"resolver\"", "[\"fd00:ec2::253\", \"1.1.1.1\"]"] {
+        let w = World::new("");
+        with_connector(&w);
+        with_dns_pin(&w, bad);
+        for args in [&["vm", "run", "--egress", "internet"][..], &["lab", "run", "dns-path"][..], &["egress", "check"][..], &["vm", "list"][..]] {
+            let o = run_pinned(&w, args);
+            assert_eq!(code(&o), 1, "{bad} {args:?}: {}", stderr(&o));
+            assert!(stderr(&o).contains("[egress].accept_platform_dns") && !stderr(&o).contains("stub aws"), "{bad} {args:?}: {}", stderr(&o));
+        }
+        assert_eq!(w.runs(), 0, "{bad}: refused before any RunMicrovm");
+        assert!(w.state().calls.is_empty(), "{bad}: no call at all");
+    }
+    // The legacy `true`: every command works and says it accepts nothing, with the line to write.
+    let w = World::new("");
+    with_dns_pin(&w, "true");
+    let o = run_pinned(&w, &["vm", "list"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let config = w.bridge().join("bridge.toml").display().to_string();
+    assert!(
+        stderr(&o).contains(&format!("ai-env: warning: [egress].accept_platform_dns = true accepts no resolver (it names none); only no-dns passes the credential gate: in {config}: accept_platform_dns = \"<the resolver you tested>\"")),
+        "{}",
+        stderr(&o)
+    );
+    // With Mike's newest dns-path row, the exact line.
+    fs::create_dir_all(w.bridge().join("lab")).unwrap();
+    let row = serde_json::json!({"probe": "dns-path", "stage": "S5", "ext": null, "sdk": null, "verdict": "platform-dns:fd00:ec2::253", "expected": "no-dns", "ts": "2026-10-02T10:00:00Z"});
+    fs::write(w.bridge().join("lab").join("probes.jsonl"), format!("{row}\n")).unwrap();
+    let o = run_pinned(&w, &["vm", "list"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("in {config}: accept_platform_dns = \"fd00:ec2::253\"")), "{}", stderr(&o));
+    let o = run_pinned(&w, &["vm", "run", "--egress", "internet"]);
+    assert_eq!(code(&o), 0, "a warning, never a refusal: {}", stderr(&o));
+    assert_eq!(stderr(&o).matches("accepts no resolver").count(), 1, "said once: {}", stderr(&o));
+    // The pin: silent.
+    let w = World::new("");
+    with_dns_pin(&w, "\"fd00:ec2::253\"");
+    let o = run_pinned(&w, &["vm", "list"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stderr(&o).contains("accept_platform_dns"), "{}", stderr(&o));
+}
+
 #[test]
 fn cli_without_bridge_toml_exits_1_naming_infra_status() {
     let w = World::new("");
