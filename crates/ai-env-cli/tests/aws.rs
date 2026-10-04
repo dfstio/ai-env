@@ -85,12 +85,13 @@ fn derive_accept_key_kat() {
 #[test]
 fn ws_request_bytes() {
     use tokio_tungstenite::tungstenite::handshake::client::generate_request;
-    let req = agent_request("mvm-1.microvms.eu-central-1.on.aws", &Secret::new("tok".into()), 8080).unwrap();
+    // The real host shape: agent_request pins the endpoint suffix (S6).
+    let req = agent_request("bed07657-5d0f-abe5-1e5e-6bc7bcb0b637.lambda-microvm.eu-central-1.on.aws", &Secret::new("tok".into()), 8080).unwrap();
     let (bytes, _key) = generate_request(req).unwrap();
     let text = String::from_utf8(bytes).unwrap();
     assert!(text.starts_with("GET /agent HTTP/1.1\r\n"), "{text}");
     let lower = text.to_ascii_lowercase();
-    assert!(lower.contains("host: mvm-1.microvms.eu-central-1.on.aws"), "{text}");
+    assert!(lower.contains("host: bed07657-5d0f-abe5-1e5e-6bc7bcb0b637.lambda-microvm.eu-central-1.on.aws"), "{text}");
     assert!(lower.contains("x-aws-proxy-auth: tok"), "{text}");
     assert!(lower.contains("x-aws-proxy-port: 8080"), "{text}");
     assert!(lower.contains("sec-websocket-version: 13"), "{text}");
@@ -983,4 +984,261 @@ fn live_egress_after_resume() {
         show("live_egress_after_resume", &vm.id, &j);
         assert!(j.passed(), "{:?}", j.failures());
     });
+}
+
+// ---- S6: the live agent-transport tests (part B: Mike's terminal, `make test-aws`) ---------
+//
+// Each starts its own MicroVM (900 s, or 4500 s for the rotation hold), runs
+// commands as the agent through `/agent`, and is cleaned up by `VmGuard`.
+// `live_agent_rotation` needs AI_ENV_AWS_SLOW=1 (65 minutes). Nothing runs the
+// developer's `claude`: the spawns are `cat` and a `sh` line producer.
+
+use ai_env_cli::bridge::agent::{run_spawn, spawn_channels, AgentEnv, AgentTarget, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnSpec, Start};
+use ai_env_cli::bridge::config::Rotation;
+use ai_env_cli::bridge::transport::AgentDial;
+use ai_env_cli::wire::frame::CHUNK_MAX;
+use std::collections::BTreeMap;
+
+/// `spec` as the agent through one `run_spawn`, feeding `stdin` then EOF and
+/// consuming every chunk: (stdout, stderr, pid, exit).
+async fn agent_exec<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spec: SpawnSpec, stdin: Vec<u8>) -> (Vec<u8>, Vec<u8>, Option<u32>, RemoteExit) {
+    let (io, c) = spawn_channels(16);
+    let feed = c.input.clone();
+    let feeder = tokio::spawn(async move {
+        for chunk in stdin.chunks(CHUNK_MAX) {
+            if feed.send(SpawnInput::Stdin(chunk.to_vec())).await.is_err() {
+                return;
+            }
+        }
+        let _ = feed.send(SpawnInput::StdinEof).await;
+    });
+    let mut events = c.events;
+    let consumed = c.consumed.clone();
+    let consumer = tokio::spawn(async move {
+        let (mut out, mut err, mut pid) = (Vec::new(), Vec::new(), None);
+        while let Some(ev) = events.recv().await {
+            match ev {
+                SpawnEvent::Started { pid: p, .. } => pid = Some(p),
+                SpawnEvent::Stdout { seq, bytes } => {
+                    out.extend_from_slice(&bytes);
+                    consumed.stdout_done(seq);
+                }
+                SpawnEvent::Stderr { seq, bytes, .. } => {
+                    err.extend_from_slice(&bytes);
+                    consumed.stderr_done(seq);
+                }
+                SpawnEvent::Note(_) | SpawnEvent::Link(_) | SpawnEvent::Exit(_) => {}
+            }
+        }
+        (out, err, pid)
+    });
+    let outcome = run_spawn(env, Start::New(spec), io).await.unwrap_or_else(|e| panic!("run_spawn: {}", no_account(&e.to_string())));
+    drop(c.input);
+    drop(c.control);
+    feeder.abort();
+    let (out, err, pid) = consumer.await.unwrap();
+    (out, err, pid, outcome.exit)
+}
+
+/// The agent target from a started VM's row (its session token).
+fn agent_target(live: &Live, id: &str) -> AgentTarget {
+    let row = ai_env_cli::bridge::vm::registry::read_row(&live.paths, id).unwrap().unwrap_or_else(|| panic!("no row for {id}"));
+    AgentTarget::from_row(&row).unwrap_or_else(|e| panic!("agent target: {}", no_account(&e.to_string())))
+}
+
+fn agent_policy(live: &Live, id: &str) -> RunPolicy {
+    let row = ai_env_cli::bridge::vm::registry::read_row(&live.paths, id).unwrap().unwrap();
+    RunPolicy::from_cfg(&live.cfg.transport, &row, None)
+}
+
+fn audit_text(live: &Live) -> String {
+    std::fs::read_to_string(live.paths.audit()).unwrap_or_default()
+}
+
+#[tokio::test]
+#[ignore = "live, starts a MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 make test-aws"]
+async fn live_agent_exec_roundtrip() {
+    if !live() {
+        return;
+    }
+    let live = live_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    let (_, vm, _) = start(&api, &ep, &live, &guard, &test_plan(&live, None)).await;
+    ai_env_cli::bridge::vm::health::read_health(&api, &ep, &live.paths, &vm.id, ai_env_cli::bridge::vm::health::Backoff::HEALTH).await.unwrap();
+    let env = AgentEnv { api: &api, ep: &ep, paths: &live.paths, target: agent_target(&live, &vm.id), policy: agent_policy(&live, &vm.id), dial: AgentDial::default() };
+    let mut input = b"hello\nsecond line\n".to_vec();
+    input.extend_from_slice(&[0x00, 0xff, 0xfe, b'\n']);
+    input.extend(std::iter::repeat_n(b'x', 200_000));
+    let t = std::time::Instant::now();
+    let (out, err, pid, exit) = agent_exec(&env, SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60) }, input.clone()).await;
+    eprintln!("live_agent_exec_roundtrip: {} bytes round trip in {} ms; pid {pid:?}; exit {exit:?}", input.len(), t.elapsed().as_millis());
+    assert_eq!(out.len(), input.len(), "stdout length");
+    assert!(out == input, "stdout differs from stdin");
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    assert_eq!((exit.code, exit.signal), (Some(0), None));
+    assert!(pid.is_some_and(|p| p > 1), "{pid:?}");
+    let t = std::time::Instant::now();
+    vmrun::terminate_and_record(&api, &live.paths, &vm.id, "test", Some(Poll::SETTLE)).await.unwrap();
+    eprintln!("live_agent_exec_roundtrip: TERMINATED after {} ms", t.elapsed().as_millis());
+}
+
+/// 20 000 lines over about 5 s (a 0.05 s pause every 200 lines), then exit
+/// 0: it outlives the cut after the first chunk plus the D22 ladder (TERM
+/// at +0.8 s, KILL at +1.2 s) by a wide margin, so a lost socket that killed
+/// it shows (critic H1), as the `reattach` probe's producer does.
+const LIVE_PRODUCER: &str = "i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); if [ $((i % 200)) -eq 0 ]; then sleep 0.05; fi; done";
+
+#[tokio::test]
+#[ignore = "live, starts a MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 make test-aws"]
+async fn live_agent_reattach() {
+    if !live() {
+        return;
+    }
+    let live = live_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    let (_, vm, _) = start(&api, &ep, &live, &guard, &test_plan(&live, None)).await;
+    ai_env_cli::bridge::vm::health::read_health(&api, &ep, &live.paths, &vm.id, ai_env_cli::bridge::vm::health::Backoff::HEALTH).await.unwrap();
+    let env = AgentEnv { api: &api, ep: &ep, paths: &live.paths, target: agent_target(&live, &vm.id), policy: agent_policy(&live, &vm.id), dial: AgentDial::default() };
+
+    // Session 1: a producer with a null stdin, cut after the first chunk.
+    let (io1, c1) = spawn_channels(16);
+    drop(c1.input);
+    let mut ev1 = c1.events;
+    let consumed1 = c1.consumed.clone();
+    let (mut out, mut last_seq, mut sid, mut pid1, mut chunks) = (Vec::new(), 0u64, None, None, 0u32);
+    let mut s1 = Box::pin(run_spawn(&env, Start::New(SpawnSpec { argv: vec!["sh".into(), "-c".into(), LIVE_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300) }), io1));
+    loop {
+        tokio::select! {
+            ev = ev1.recv() => match ev {
+                Some(SpawnEvent::Started { spawn_id, pid, .. }) => { sid = Some(spawn_id); pid1 = Some(pid); }
+                Some(SpawnEvent::Stdout { seq, bytes }) => { out.extend_from_slice(&bytes); last_seq = seq; consumed1.stdout_done(seq); chunks += 1; if chunks >= 1 && sid.is_some() { break; } }
+                Some(_) => {}
+                None => break,
+            },
+            r = &mut s1 => { r.unwrap_or_else(|e| panic!("session 1: {}", no_account(&e.to_string()))); break; }
+        }
+    }
+    drop(s1);
+    let sid = sid.expect("a spawned frame before the cut");
+
+    // Session 2: reattach and collect the rest.
+    let (io2, c2) = spawn_channels(16);
+    drop(c2.input);
+    let mut ev2 = c2.events;
+    let consumed2 = c2.consumed.clone();
+    let mut pid2 = None;
+    let mut s2 = Box::pin(run_spawn(&env, Start::Attach { spawn_id: sid.clone(), from_seq: Some(last_seq + 1), err_from_seq: None }, io2));
+    let outcome2 = loop {
+        tokio::select! {
+            ev = ev2.recv() => match ev {
+                Some(SpawnEvent::Started { pid, .. }) => pid2 = Some(pid),
+                Some(SpawnEvent::Stdout { seq, bytes }) => { out.extend_from_slice(&bytes); consumed2.stdout_done(seq); }
+                Some(_) => {}
+                None => {}
+            },
+            r = &mut s2 => break r,
+        }
+    };
+    while let Ok(ev) = ev2.try_recv() {
+        if let SpawnEvent::Stdout { bytes, .. } = ev {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    let outcome2 = outcome2.unwrap_or_else(|e| panic!("session 2 (reattach): {}", no_account(&e.to_string())));
+
+    let mut seen = vec![0u32; 20000];
+    for line in String::from_utf8_lossy(&out).lines() {
+        if let Some(n) = line.strip_prefix("line-").and_then(|s| s.parse::<usize>().ok()) {
+            if n < 20000 {
+                seen[n] += 1;
+            }
+        }
+    }
+    let missing = seen.iter().filter(|c| **c == 0).count();
+    let doubled = seen.iter().filter(|c| **c > 1).count();
+    eprintln!("live_agent_reattach: cut after {chunks} chunk(s); pid {pid1:?} → {pid2:?}; missing {missing}, doubled {doubled}; exit {:?}", outcome2.exit);
+    assert_eq!((missing, doubled), (0, 0), "no line lost or doubled across the reattach");
+    assert!(pid1.is_some() && pid1 == pid2, "the same pid across the reattach: {pid1:?} vs {pid2:?}");
+    assert_eq!((outcome2.exit.code, outcome2.exit.signal), (Some(0), None), "the producer ran to its end: the cut did not kill it");
+}
+
+#[tokio::test]
+#[ignore = "live, 65 minutes, one MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 (make test-aws SLOW=1)"]
+async fn live_agent_rotation() {
+    if !live() {
+        return;
+    }
+    if std::env::var("AI_ENV_AWS_SLOW").as_deref() != Ok("1") {
+        eprintln!("skipped: set AI_ENV_AWS_SLOW=1 (make test-aws SLOW=1) for the 65-minute rotation hold");
+        return;
+    }
+    let live = live_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    // Max duration and idle both well past the hold: the only socket change is the token rotation.
+    let flags = RunFlags { max_duration_s: Some(4500), idle_s: Some(4500), label: Some("test-rotation".into()), purpose: "test", imply_internet: true, ..RunFlags::default() };
+    let plan = RunPlan::from_cfg(&live.cfg, &flags).unwrap_or_else(|e| panic!("rotation plan: {e}"));
+    let (_, vm, _) = start(&api, &ep, &live, &guard, &plan).await;
+    ai_env_cli::bridge::vm::health::read_health(&api, &ep, &live.paths, &vm.id, ai_env_cli::bridge::vm::health::Backoff::HEALTH).await.unwrap();
+    // This tests the proactive rotation, whatever `[transport] rotation` the operator chose (runbook step 10 may set `lazy`).
+    let mut policy = agent_policy(&live, &vm.id);
+    policy.rotation = Rotation::Proactive;
+    let env = AgentEnv { api: &api, ep: &ep, paths: &live.paths, target: agent_target(&live, &vm.id), policy, dial: AgentDial::default() };
+
+    // A line a minute for 65 minutes, then EOF: cat echoes each, the session rotates once at T−10 min.
+    let (io, c) = spawn_channels(16);
+    let feed = c.input.clone();
+    let feeder = tokio::spawn(async move {
+        for i in 0..65u32 {
+            if feed.send(SpawnInput::Stdin(format!("line {i}\n").into_bytes())).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+        let _ = feed.send(SpawnInput::StdinEof).await;
+    });
+    let mut events = c.events;
+    let consumed = c.consumed.clone();
+    // Every echoed line, and the session's notes: a failed rotation attempt is only a note.
+    let consumer = tokio::spawn(async move {
+        let (mut lines, mut notes) = (0u32, Vec::new());
+        while let Some(ev) = events.recv().await {
+            match ev {
+                SpawnEvent::Stdout { seq, bytes } => {
+                    lines += bytes.iter().filter(|b| **b == b'\n').count() as u32;
+                    consumed.stdout_done(seq);
+                }
+                SpawnEvent::Note(n) => notes.push(n),
+                _ => {}
+            }
+        }
+        (lines, notes)
+    });
+    let outcome = run_spawn(&env, Start::New(SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300) }), io).await;
+    drop(c.input);
+    drop(c.control);
+    feeder.abort();
+    let (lines, notes) = consumer.await.unwrap();
+    let shown = no_account(&notes.join(" | "));
+    let outcome = outcome.unwrap_or_else(|e| panic!("live_agent_rotation: the session ended with an error: {} (notes: {shown})", no_account(&e.to_string())));
+    let audit = audit_text(&live);
+    let count = |event: &str| audit.lines().filter(|l| l.contains(&format!("\"{event}\""))).count();
+    let (rotations, remints, reconnects) = (count("agent_rotate"), count("agent_remint"), count("agent_reconnect"));
+    eprintln!("live_agent_rotation: {lines} lines echoed; exit {:?}; agent_rotate×{rotations}, agent_remint×{remints}, agent_reconnect×{reconnects}; notes: {shown}", outcome.exit);
+    assert_eq!((outcome.exit.code, outcome.exit.signal), (Some(0), None), "cat exited cleanly after EOF");
+    assert_eq!(rotations, 1, "exactly one proactive rotation over 65 minutes (audit: {})", no_account(&audit));
+    // A failed rotation attempt (a 403 or a 429 on its own dial, a failed mint, a refused hello) writes no
+    // agent_remint and no agent_reconnect: the session notes it and tries again, and the retry's rotation is the
+    // one agent_rotate above.
+    let failed: Vec<&str> = notes.iter().map(String::as_str).filter(|n| n.starts_with("the token rotation failed")).collect();
+    assert!(failed.is_empty(), "the rotation succeeded at its first attempt: {}", no_account(&failed.join(" | ")));
+    // The session heals a 403 on its first dial or a reconnect's (one re-mint) and a close (a reconnect) on its own: either would pass unseen without these.
+    assert_eq!(remints, 0, "no re-mint: no 403 on the first dial or a reconnect's, and no token down to its last 5 min (the rotation came first) (audit: {})", no_account(&audit));
+    assert_eq!(reconnects, 0, "no close: the socket was replaced only by the rotation (audit: {})", no_account(&audit));
+    assert_eq!(lines, 65, "every line echoed: none lost across the rotation's hello-resume and stdin resend");
 }

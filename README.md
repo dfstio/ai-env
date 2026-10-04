@@ -149,7 +149,10 @@ ai-env vm     run [--workspace PATH] [--max-duration S] [--egress internet|vpc] 
 ai-env vm     token ID [--port 8080|8082|9418] [--minutes M] [--reveal]   # the value only with --reveal
 ai-env vm     suspend ID | resume ID | terminate ID|--all [--yes] | gc [--yes] [--include-orphans AGE]
 ai-env vm     shell ID [--auth header|subprotocol]         # experimental: the platform shell (VM started with --shell)
-ai-env vm     smoke [--max-duration 900] [--keep] [--json] # run → RUNNING → /health → terminate, with timings
+ai-env vm     smoke [--max-duration 900] [--keep] [--exec] [--json]   # run → RUNNING → /health (→ exec checks) → terminate, with timings
+ai-env vm     exec ID [--cwd P] [--env K=V]… [--detach-grace S] -- CMD ARGS…   # run as the agent over /agent; stdio byte-exact, the command's exit status (S6)
+ai-env vm     attach ID --spawn UUID [--from-seq N]       # reattach to a running command (the newest client wins)
+ai-env vm     health ID --detail [--json]                  # /health/detail with the session bearer: guard, sockets, spawns, listeners
 ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]   # probes → lab/probes.jsonl
 ai-env egress status [--json] | env [--shell] | reload [--if-changed]   # S5 operator commands (the operator's aws CLI; bridge feature)
 ai-env egress allow SLUG HOST [--remove] | suspend HOST [--restore]    # per-workspace extras (global on the proxy) / the kill switch
@@ -159,11 +162,17 @@ ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM i
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
 
-Exit codes: `0` ok (broken pipes too) · `1` error · `2` usage · `3` cancelled at the prompt ·
-`4` no key opens this file · `5` auth unavailable (plugin missing, no GUI session, AWS credentials
-unavailable) · `6` corrupt or plaintext file where a container was expected · `7` AWS/infra API
-failure · `8` MicroVM terminal or transport lost · `9` policy refusal (tripwire, egress gate,
-workspace outside the approved roots).
+Exit codes: `0` ok (broken pipes too) · `1` error · `2` usage · `3` cancelled at the prompt (or a
+Ctrl-C during `lab run`, once the probe's VMs are ended) · `4` no key opens this file · `5` auth
+unavailable (plugin missing, no GUI session, AWS credentials unavailable) · `6` corrupt or plaintext
+file where a container was expected · `7` AWS/infra API failure · `8` MicroVM terminal or transport
+lost · `9` policy refusal (tripwire, egress gate, workspace outside the approved roots). `vm exec`
+exits with the remote command's own status (128 + N when a signal killed it; 127 when the VM has no
+such program, 126 when it cannot run it and 1 when the working directory cannot be made, each with an
+`ai-env: vm exec:` line); its own failures keep 7/8/9 and print an `ai-env:` line (9 also when the
+VM already runs 8 commands). After SIGTERM or SIGHUP it exits 143, after a Ctrl-C before the command
+started (or a second one while the connection is down) 130, and after a closed stdout 0, whatever the
+command did.
 
 `ai-env doctor` exits `1` when any row is `[NO ]` and `5` when AWS credentials are unavailable;
 every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings) never
@@ -226,15 +235,18 @@ extension updates itself, often daily: `make claude-update` follows it in one co
 
 `ai-env shim` is the image's ENTRYPOINT. As PID 1 it is a small init (child subreaper, signal
 forwarding, orphan reaping) that runs the same binary as its worker; the worker serves the
-platform hooks on 9000 (`/ready` waits for the listeners and one `claude --version`, `/validate`
-checks the version against the lock, the settings files and that no build-time state leaked into
-the snapshot, `/run` is first-wins and fail-closed without a payload), `/health` on 8080 and a
-placeholder on 9418. In v0 it logs where hook requests come from and measures the clock without
-stepping it (`--hook-source enforce` and `--clock forward` exist for S6).
+platform hooks on 9000 (`/ready` waits for the listeners and one `claude --version`; `/validate`
+checks the version against the lock, the settings files, that no build-time state leaked into the
+snapshot and, from S6 (V6), the peer guard itself, and answers 409 without checking once a `/run`
+was accepted; `/run` is first-wins and fail-closed without a payload), `/health`, `/agent` and the
+bearer-only `/health/detail` on 8080, and a bearer-only side port on 9418. It logs where every hook
+request comes from; from S6 the image runs `--hook-source peer` (see "Agent transport"), and it
+measures the clock without stepping it (`--clock forward` needs CAP_SYS_TIME, which the image does not
+grant).
 
 ```sh
 make image-zip                 # vm-build + stage + scan + zip
-make test-docker               # the shim in the base image (L1) and the built image (L2); stamps the zip
+make test-docker               # the shim in the base image (L1) and the built image (L2), then `vm exec` on L2; stamps the zip
 make s3-preflight PHASE=a      # build-side preconditions, one row each
 make check-policies preview-scratch   # IAM Access Analyzer + a throwaway-backend Pulumi preview (read-only)
 make deploy                    # (Mike) Pulumi up of infra/ in eu-central-1, then waits for the image build
@@ -411,6 +423,100 @@ make proxy-stop                # when idle: stops the proxy (no vpc VM has egres
 connector is configured; a stopped proxy is `[-  ]`, never `[NO ]`. Its DNS row says whether the newest
 `dns-path` verdict is accepted, and shows the exact `accept_platform_dns = "<ip>"` line to write when the
 value names no resolver.
+
+### Agent transport (stage S6)
+
+`ai-env vm exec ID -- CMD ARGS…` runs a command in a VM `vm run` started, as the agent (uid 1000), over
+the shim's `/agent` WebSocket through the MicroVM endpoint (`wss://<endpoint>/agent`, TLS 1.3, a
+60-minute `Port(8080)` token). stdin, stdout and stderr cross as raw byte chunks of at most 64 KiB (text,
+or base64 when not UTF-8): no lines on the wire, so binary output and a 20 MiB line arrive byte-exact.
+The exit status is the command's own (128 + N for a signal); ai-env's own failures keep 7/8/9 with an
+`ai-env:` line, the only way to tell them from a remote 7, 8 or 9.
+
+- **Sessions outlive sockets.** The VM numbers every stdout chunk and keeps it until the Mac acks it
+  (an 8 MiB credit window: a reader that stops reading pauses the command, nothing is dropped); stderr
+  keeps the newest 2 MiB (drops are counted); stdin is acked by the VM and resent after a reconnect. A
+  lost socket is redialed with backoff (1–60 s) while the command keeps running for its detach grace
+  (60 s, `--detach-grace S`; frozen while the VM is suspended); the newest client wins (`vm attach ID
+  --spawn UUID`, the earlier client exits 8). A command never runs twice: spawn ids are single-use on a
+  VM, so if the connection was lost before the VM confirmed the start and the VM has since let the
+  command go (its grace ran out), `vm exec` exits 8 with the `vm attach` hint instead of starting it
+  again. `[transport]` in bridge.toml: `rotation = "proactive"` (a
+  second socket 10 min before the token expires) or `"lazy"`; `keepalive = "http"` (a `GET /health`
+  every max-idle/3 keeps a running command's VM from idling into suspend) or `"frames"`;
+  `suspend_wait_s` (after the VM was suspended under a client, how long it waits for someone to resume
+  it — it never resumes one itself — before exit 8 naming `vm resume` and `vm attach`).
+- **The endpoint's answers.** 401/403: one re-mint, then exit 7. 429: wait the longer of `Retry-After`
+  and the backoff step (exponential when no `Retry-After` comes), never re-mint, audited `endpoint_429`.
+  502: GetMicrovm decides (gone or terminating: exit 8; suspended: resume, then reattach). The shim's 503
+  `not_run` (before `/run` returned) is retried for 30 s. A refused `hello` is exit 8 (`bad_token`: a
+  stale row; `no_commitment`: a fail-closed `/run`). Reconnecting stops after 300 s without a lasting
+  connection: exit 7 when the endpoint was still throttling, else exit 8 (`no lasting /agent connection`).
+- **Signals.** Ctrl-C sends INT to the command's process group (a second within 3 s sends KILL); the
+  command's own status follows. SIGTERM or SIGHUP sends TERM and waits at most 2 s for the command to
+  exit, else the attachment ends for good (the VM sends TERM 0.8 s later and KILL at 1.2 s); `vm exec` exits
+  143 either way. A closed stdout (EPIPE) ends it at once and exits 0. While the connection is down
+  (`ai-env: lost the connection …`) nothing reaches the VM: Ctrl-C is queued and says so, and a second
+  within 3 s gives up (exit 130); SIGTERM, SIGHUP or a closed stdout wait at most 10 s for the
+  connection (another signal: not at all). Once it is back TERM goes out first: after SIGTERM or
+  SIGHUP the command gets its 2 s before `detach final`, after a closed stdout `detach final` follows
+  at once. A stop that never
+  reached the VM says so: the command runs until its detach grace ends it, and
+  `ai-env vm attach ID --spawn UUID` (then Ctrl-C) stops it sooner. Before the command has started
+  (the endpoint throttling, the shim not up yet) Ctrl-C, SIGTERM or SIGHUP give up instead (exit 130 or
+  143): no `spawn` is sent after that, a command whose `spawn` was already on its way gets the signal
+  and then `detach final` as it starts, and `vm attach` leaves the spawn as it was. A signal ignored
+  when ai-env started (`nohup`, a script's background job) stays ignored. `vm attach` reads stdin only
+  from a terminal (Ctrl-D closes the command's stdin for good); otherwise the command's stdin is left
+  as it is. On a terminal, stderr names the spawn's id and pid (for `vm attach`). No PTY: `vm shell`
+  stays the interactive path.
+- **What a command runs as.** uid/gid 1000 in its own session and process group, `NO_NEW_PRIVS` (no
+  setuid binary or file capability changes its uid), a cleared environment (`HOME=/Users/mike`, `PATH`,
+  `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, then `--env K=V`: never `AWS_*`, `CLAUDECODE`,
+  `NODE_OPTIONS` or a TOKEN/KEY/SECRET/PASSWORD name; `vpc` rows also get the proxy variables), the
+  working directory created and entered as the agent (`--cwd`, default HOME: no root filesystem
+  operation ever touches an agent-writable path), fds 0–2 only. When the command's leader exits, its
+  group gets TERM, then KILL 1 s later; once no command is left, any agent process still alive (a
+  `setsid` escaper) is killed. `vm exec` and `vm attach` are refused (exit 9) on `--shell` VMs (the
+  session itself refuses such a VM, whoever asks) until the platform shell's in-VM listener is shown
+  unreachable from the agent.
+- **The peer guard.** The platform POSTs its hooks from 127.0.0.1 inside the VM, so an address cannot
+  tell it from the agent; socket ownership can. Under `--hook-source peer` (the image default) a runtime
+  hook (`run`, `resume`, `suspend`, `terminate`) from a local client is admitted only when the client's
+  own row in `/proc/net/tcp` (or `tcp6`) is found, live (inode ≠ 0: a client that closed before the
+  lookup shows uid 0 and inode 0) and not owned by the agent uid; anything else is 403 `forbidden_peer`.
+  `--agent-guard on` (the default as root on Linux) does the same on 8080 and 9418. No capability is
+  needed: the image still runs with `additionalOsCapabilities: []`. `/validate` tests the guard on the
+  build VM before an image can become ACTIVE (V6: the platform's own `/validate` socket is admitted, and
+  `curl` as the agent POSTing `/resume` to 127.0.0.1 and to the VM's own IPv4 gets 403 — only to
+  127.0.0.1, with a note, on a VM with no other IPv4; it fails when the hooks guard is off). Once
+  `/run` was accepted `/validate` answers 409 without checking anything (the platform validates only
+  build VMs; an agent could otherwise steer its root reads through links in its home). Every hook and
+  guard line logs `peer_uid`, `ino`, `st` and the decision.
+- **Side channels.** 8080 serves `/health` and `/agent` to anyone with an endpoint token; every other
+  path, and every path of 9418, needs `Authorization: Bearer <session token>` (the token whose
+  commitment rode `/run`). `vm health ID --detail` shows `/health/detail`: the guard's mode and
+  refusals, the last admitted and the last refused peer of each hook, the sockets, the spawns, the
+  listeners (one row each) and the last clock report (`--json` prints `{backend, id, detail}`, as
+  `vm health --json` puts `/health` under `health`).
+- **Probes.** `ai-env lab run e0|e1|e5|frames|reattach|clock-after-resume|in-vm-firewall` measure the
+  live endpoint and VM: the upgrade through the proxy (`101 HTTP/1.1 403 403 403`), a socket held past its
+  token's expiry, which traffic keeps a VM from idling, byte-exact frames and MB/s, a reattach without
+  loss, the guest clock after a 15-minute suspension, and whether the agent reaches anything privileged
+  in the VM (`guarded`, `exposed:<port>`, or `gap:<checks>` when a check could not run; IMDS, the
+  setuid inventory and the platform shell's listener in the note). Ctrl-C during `lab run` still
+  terminates every VM the probe started, then exits 3.
+
+```sh
+make test-docker               # + the agent in Docker: uid 1000, NO_NEW_PRIVS, groups, the sweep, the peer guard, /validate V6, and the real `vm exec` on the built image through the fake endpoint
+make s6-smoke                  # three `vm smoke --egress vpc --exec --max-duration 900 --json` passes: backend sdk, egress_ok, exec_ok (claude --version, id -u = 1000, 401 through the proxy, 6 proxy variables)
+make test-aws [SLOW=1]         # + live_agent_*; SLOW=1 adds the 65-minute rotation hold
+ai-env vm exec ID -- claude --version
+```
+
+Debug builds also honour `AI_ENV_BRIDGE_LAB_AGENT_ADDR=127.0.0.1:<port>` together with the fake API:
+`/agent` is then dialed in plain `ws://` at that loopback address (the tests' fake endpoint). Without the
+fake API, or for any other address, it is refused; release builds compile it out.
 
 ### Access-control policies (`keygen --access-control`)
 

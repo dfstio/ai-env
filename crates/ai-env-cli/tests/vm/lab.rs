@@ -17,7 +17,9 @@
 //! neither; `--if-needed` never honours a pass of an earlier DNS rule;
 //! github.com on the effective allowlist the network verification proved is
 //! recorded, not judged, and said so — suspended, or not proved, it is
-//! judged, and OPEN.
+//! judged, and OPEN. S6: the agent-transport probes refuse under the fake
+//! and end their VMs; a Ctrl-C during a live probe still ends every VM it
+//! started (exit 3, nothing recorded).
 use super::cli::{code, stderr, stdout, World};
 use crate::common::CONNECTOR;
 use ai_env_cli::bridge::api::{Call, FakeFailure};
@@ -503,7 +505,7 @@ fn probe_rows_of_the_old_schema_parse_in_lab_list() {
     let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entry = list.as_array().unwrap().iter().find(|r| r["probe"] == "entrypoint").unwrap();
     assert_eq!(entry["last_verdict"], "claude-vscode");
-    assert_eq!(list.as_array().unwrap().len(), 14);
+    assert_eq!(list.as_array().unwrap().len(), 21, "S1/S3 3, S4 9, S5 2, S6 7");
 }
 
 #[test]
@@ -552,7 +554,11 @@ const PROBE_CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-
 
 /// Wait for `c` (stdout and stderr captured), killing it after 120 s.
 fn bounded(mut c: std::process::Command) -> std::process::Output {
-    let child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("spawn ai-env");
+    finished(c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("spawn ai-env"))
+}
+
+/// Wait for `child`, killing it after 120 s.
+fn finished(child: std::process::Child) -> std::process::Output {
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1778,4 +1784,128 @@ fn egress_check_refuses_a_gone_proxy_before_any_vm_and_revokes_nothing() {
         assert_eq!(verified(&w), before, "{gone}: nothing revoked");
         assert!(check_audit(&w).is_empty(), "{gone}");
     }
+}
+
+// ---- S6: the agent-transport probes under the fake (W6) ----------------------------------
+
+/// `ai-env lab list` shows the seven S6 probes with their catalog
+/// expectations and no verdict yet.
+#[test]
+fn lab_list_shows_the_seven_s6_probes() {
+    let w = World::new("");
+    let o = w.run(&["lab", "list", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let rows = list.as_array().unwrap();
+    for (name, expected) in [
+        ("e0", "101 HTTP/1.1 403 403 403"),
+        ("e1", "recorded"),
+        ("e5", "recorded"),
+        ("frames", "byte-identical"),
+        ("reattach", "no-loss-same-pid"),
+        ("clock-after-resume", "any-of:within-2s"),
+        ("in-vm-firewall", "guarded"),
+    ] {
+        let r = rows.iter().find(|r| r["probe"] == name).unwrap_or_else(|| panic!("{name} missing from lab list"));
+        assert_eq!((r["stage"].as_str(), r["source"].as_str(), r["expected"].as_str()), (Some("S6"), Some("live"), Some(expected)), "{name}: {r}");
+        assert!(r["last_verdict"].is_null(), "{name}: nothing recorded yet");
+    }
+    assert_eq!(rows.iter().filter(|r| r["stage"] == "S6").count(), 7, "exactly seven S6 probes");
+}
+
+/// Under the file-backed fake there is no shim behind the endpoint: each S6
+/// probe starts its own VM, refuses clearly (exit 9), records nothing, and
+/// leaves no VM running (the terminate guard ends it).
+#[test]
+fn lab_s6_probes_refuse_under_the_fake_and_end_their_vms() {
+    for probe in ["e0", "e1", "e5", "frames", "reattach", "clock-after-resume", "in-vm-firewall"] {
+        let w = World::new("");
+        // clock-after-resume runs with `--egress vpc`, which needs a connector before any VM.
+        if probe == "clock-after-resume" {
+            connect(&w, CONNECTOR);
+        }
+        let o = w.run(&["lab", "run", probe]);
+        assert_eq!(code(&o), 9, "{probe}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains("no shim behind its endpoint"), "{probe}: {}", stderr(&o));
+        assert!(rows(&w, probe).is_empty(), "{probe}: nothing recorded");
+        no_vm_left(&w);
+        let st = w.state();
+        assert!(st.calls.iter().any(|c| matches!(c, Call::Run { .. })), "{probe}: a VM was started");
+        assert!(st.calls.iter().any(|c| matches!(c, Call::Terminate(_))), "{probe}: the VM was terminated");
+        // The VM's /health was read (ProbeOutcome claude/shim/image_version come from it).
+        assert!(st.calls.iter().any(|c| matches!(c, Call::Health { .. })), "{probe}: /health was read");
+    }
+}
+
+/// The S6 probes take no positional argument and read no log.
+#[test]
+fn lab_s6_probes_refuse_stray_arguments() {
+    let w = World::new("");
+    assert_eq!(code(&w.run(&["lab", "run", "e0", "--log", &fixture("hooks.log")])), 2, "e0 reads no log");
+    assert_eq!(code(&w.run(&["lab", "run", "frames", "microvm-x"])), 2, "frames takes no id");
+    assert_eq!(code(&w.run(&["lab", "run", "in-vm-firewall", "microvm-x"])), 2, "in-vm-firewall takes no id");
+    assert_eq!(w.state().calls.len(), 0, "refused before any call");
+}
+
+// ---- Ctrl-C during a live probe ---------------------------------------------------------------
+
+/// `ai-env lab run <probe>` in `w`, in the background (stdout and stderr
+/// captured), its polls scaled to 200 ms a second: long enough to be
+/// interrupted mid-probe.
+fn lab_in_background(w: &World, probe: &str) -> std::process::Child {
+    let mut c = w.cmd(&["lab", "run", probe]);
+    c.env("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "200").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    c.spawn().expect("spawn ai-env")
+}
+
+/// Wait (at most 30 s) until the fake's state shows `what`.
+fn wait_for(w: &World, what: &str, seen: impl Fn(&ai_env_cli::bridge::api::FakeState) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !seen(&w.state()) {
+        assert!(std::time::Instant::now() < deadline, "no {what} within 30 s");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A moment later, Ctrl-C (SIGINT) to `child`; then its output.
+fn interrupt(child: std::process::Child) -> std::process::Output {
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: kill(2) on our own child's pid, not yet reaped.
+    assert_eq!(unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGINT) }, 0);
+    finished(child)
+}
+
+/// A Ctrl-C during a live probe ends the probe, never its terminate guard
+/// (SIGINT used to keep its default and kill `lab run` first, leaving the
+/// VM to its maximum duration): the probe's VM is terminated, the command
+/// exits 3 (cancelled) and records nothing. Here no-traffic-before-run keeps
+/// asking a /health that never saw /run.
+#[test]
+fn lab_ctrl_c_ends_the_probes_vm_and_records_nothing() {
+    let w = World::new("");
+    w.update(|s| s.pre_run_health = 1_000_000);
+    let child = lab_in_background(&w, "no-traffic-before-run");
+    wait_for(&w, "/health of the probe's VM", |s| s.calls.iter().any(|c| matches!(c, Call::Health { .. })));
+    let o = interrupt(child);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("lab: cancelled") && stderr(&o).contains("lab: terminated microvm-"), "{}", stderr(&o));
+    no_vm_left(&w);
+    assert!(rows(&w, "no-traffic-before-run").is_empty(), "nothing recorded");
+}
+
+/// A Ctrl-C while the probe's VM is still starting (RunMicrovm answered, the
+/// VM is not RUNNING yet, so the probe holds no id): the VM is found through
+/// the rows of the probe's own client token, as `vm smoke` finds its own,
+/// and ended too.
+#[test]
+fn lab_ctrl_c_while_its_vm_starts_ends_that_vm_too() {
+    let w = World::new("");
+    w.update(|s| s.auto_advance = false);
+    let child = lab_in_background(&w, "e0");
+    wait_for(&w, "RunMicrovm", |s| !s.vms.is_empty());
+    let o = interrupt(child);
+    assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("lab: terminated microvm-"), "{}", stderr(&o));
+    no_vm_left(&w);
+    assert!(rows(&w, "e0").is_empty(), "nothing recorded");
 }

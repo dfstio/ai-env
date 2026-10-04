@@ -1,0 +1,13 @@
+{"dir":"mac","frame":{"v":1,"t":"hello","session_token":"golden-session-token","client":{"name":"ai-env","version":"0.1.0","host":"mike@mbp"},"resume":[],"idle_s":90}}
+{"dir":"vm","frame":{"v":1,"t":"hello_ok","wire":1,"shim_version":"0.1.0","claude_version":"2.1.287","microvm_id":"microvm-00000000-0000-4000-8000-000000000001","image_version":"5.0","boot_nonce":"00112233445566778899aabbccddeeff","owner":"mike@mbp","has_credentials":false,"uptime_s":1,"run_hook_seen":true,"spawns":[],"resumed":[]}}
+{"dir":"mac","frame":{"v":1,"t":"spawn","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","argv":["cat"],"env":{},"deliver_secret":"fd"}}
+{"dir":"vm","frame":{"v":1,"t":"spawned","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","pid":4242,"pgid":4242}}
+{"dir":"mac","frame":{"v":1,"t":"stdin","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":1,"text":"hello\n"}}
+{"dir":"mac","frame":{"v":1,"t":"stdin","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":2,"b64":"AP8K"}}
+{"dir":"vm","frame":{"v":1,"t":"stdin_ack","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":2}}
+{"dir":"vm","frame":{"v":1,"t":"stdout","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":1,"text":"hello\n"}}
+{"dir":"vm","frame":{"v":1,"t":"stdout","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":2,"b64":"AP8K"}}
+{"dir":"mac","frame":{"v":1,"t":"stdin_eof","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":2}}
+{"dir":"mac","frame":{"v":1,"t":"ack","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":2,"err_seq":0}}
+{"dir":"vm","frame":{"v":1,"t":"exit","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":3,"code":0,"signal":null,"stderr_dropped":0,"stdout_truncated":false}}
+{"dir":"mac","frame":{"v":1,"t":"ack","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192","seq":3,"err_seq":0}}

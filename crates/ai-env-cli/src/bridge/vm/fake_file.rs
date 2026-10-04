@@ -111,6 +111,10 @@ impl EndpointClient for FileFakeMicrovmApi {
     async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
         self.with(|s| s.get_health(endpoint, token, port_header))
     }
+
+    async fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &crate::wire::redact::Secret<String>) -> Result<crate::bridge::api::HealthDetailReply, BridgeError> {
+        self.with(|s| s.get_health_detail(endpoint, token, bearer))
+    }
 }
 
 #[cfg(test)]

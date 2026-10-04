@@ -12,7 +12,8 @@ FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:05cb9b38d841e7ff1b693d
 
 # Packages the agent needs (git, archives, ps, useradd, find; dig for the S5
 # egress check and dns-path probe); no weak deps, so no systemd. No chrony
-# and no nftables in v0 (the shim measures the clock).
+# and no nftables: the shim measures the clock, and the hooks are guarded by
+# socket ownership (`--hook-source peer`, S6), not by a firewall.
 RUN microdnf -y --setopt=install_weak_deps=0 install tar gzip unzip git-core procps-ng shadow-utils findutils bind-utils \
  && microdnf clean all \
  && rm -rf /var/cache/dnf /var/cache/yum /var/lib/dnf/history* /var/log/dnf* /var/log/hawkey.log \
@@ -66,4 +67,4 @@ COPY ai-env /usr/local/bin/ai-env
 RUN chmod 0755 /usr/local/bin/ai-env && /usr/local/bin/ai-env --version
 
 EXPOSE 8080 9000 9418
-ENTRYPOINT ["/usr/local/bin/ai-env","shim","--app-port","8080","--hooks-port","9000","--code-port","9418","--claude","/usr/local/bin/claude","--home","/Users/mike","--uid","1000"]
+ENTRYPOINT ["/usr/local/bin/ai-env","shim","--app-port","8080","--hooks-port","9000","--code-port","9418","--claude","/usr/local/bin/claude","--home","/Users/mike","--uid","1000","--hook-source","peer"]

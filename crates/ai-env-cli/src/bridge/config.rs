@@ -2,7 +2,7 @@
 //! (§2.4 of the plan). The AWS region is pinned in code: a differing value in
 //! the file is an error and the environment is never consulted.
 use crate::bridge::errors::BridgeError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The only region the MicroVM API is available in for this account (eu-west-3
@@ -560,6 +560,55 @@ impl Default for PanelCfg {
     }
 }
 
+/// `[transport]` (S6): how `vm exec` and `vm attach` keep their `/agent` socket.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransportCfg {
+    /// `proactive` (default): 10 min before the endpoint token expires, mint
+    /// and open a second socket, then close the first; `lazy`: a new token
+    /// only at the next reconnect (safe when probe e1 recorded `survives`).
+    pub rotation: Rotation,
+    /// `http` (default): a bearer-less `GET /health` every max_idle/3 while a
+    /// spawn is attached and unfinished keeps the VM from idling into
+    /// suspend; `frames`: pings only (when probe e5 shows frames count).
+    pub keepalive: Keepalive,
+    /// After the VM was suspended under a client (`event hook_suspend`), how
+    /// long it waits for someone to resume the VM — it never resumes one
+    /// itself — before exit 8 (10..=3600).
+    pub suspend_wait_s: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rotation {
+    #[default]
+    Proactive,
+    Lazy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Keepalive {
+    #[default]
+    Http,
+    Frames,
+}
+
+impl Default for TransportCfg {
+    fn default() -> Self {
+        TransportCfg { rotation: Rotation::Proactive, keepalive: Keepalive::Http, suspend_wait_s: 600 }
+    }
+}
+
+impl TransportCfg {
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        if !(10..=3600).contains(&self.suspend_wait_s) {
+            return Err(BridgeError::Config(format!("[transport].suspend_wait_s = {} is outside 10..=3600", self.suspend_wait_s)));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BridgeConfig {
@@ -573,6 +622,7 @@ pub struct BridgeConfig {
     pub egress: EgressCfg,
     pub review: ReviewCfg,
     pub panel: PanelCfg,
+    pub transport: TransportCfg,
 }
 
 impl BridgeConfig {

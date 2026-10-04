@@ -3,9 +3,11 @@
 //! rows, the pre-code gates, the S2 pump with its host-state recorder,
 //! transcript-mirror writer, session registry, resume seeder and audit log,
 //! the S3 infrastructure helpers (image scan, claude pin, stack outputs,
-//! sealed AWS credentials), the S4 MicroVM lifecycle (`vm`), and the S5
+//! sealed AWS credentials), the S4 MicroVM lifecycle (`vm`), the S5
 //! egress allowlist (`egress`, with the operator's aws CLI calls in
-//! `awscli`). Nothing here is compiled into the VM image.
+//! `awscli`), and the S6 agent transport (`agent`: `vm exec`, `vm attach`).
+//! Nothing here is compiled into the VM image.
+pub mod agent;
 pub mod api;
 pub mod audit;
 pub mod awscli;

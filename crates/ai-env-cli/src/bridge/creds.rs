@@ -302,6 +302,7 @@ pub(crate) fn with_note(e: CliError, note: &str) -> CliError {
         CliError::VmLost(m) => CliError::VmLost(add(m)),
         CliError::Policy(m) => CliError::Policy(add(m)),
         CliError::BrokenPipe => CliError::Msg(add("broken pipe".into())),
+        CliError::Exit(code) => CliError::Msg(add(format!("exit status {code}"))),
         CliError::Cancelled => {
             eprintln!("{note}");
             CliError::Cancelled

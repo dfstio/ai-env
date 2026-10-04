@@ -4,6 +4,11 @@
 //! Image hooks: `/ready` (503 until the listeners are bound and one claude
 //! probe succeeded; the snapshot is taken after the first 200) and
 //! `/validate` (checks on a fresh VM; any failure fails the image build).
+//! Once `/run` was accepted (a run record exists) `/validate` answers 409
+//! `already run` at once and checks nothing: the platform validates only
+//! build VMs, which never get `/run`, and the agent exists only after it —
+//! its checks would read and walk the agent's own paths under `--home` as
+//! root.
 //! VM hooks: `/run` once per clone with the Mac's payload (first-wins, see
 //! `state`), then `/resume`, `/suspend`, `/terminate`. A 503 on ready or
 //! validate is answered at once (the platform retries); a failed or
@@ -16,36 +21,57 @@
 //! it is the zombie sample, and the shim stops soon after). See
 //! [`sys::run_report`].
 //!
-//! Source policy: where hook requests come from is documented nowhere, so S3
-//! only LOGS each request's origin (`--hook-source log`, the image default).
-//! `enforce` refuses runtime hooks from this VM itself (loopback or our own
-//! address) and is exercised by the tests; S6 turns it on once S4's
-//! `hooks-source-ip` probe has data and an untrusted process first runs in
-//! the VM. `/ready` and `/validate` are never filtered.
+//! The agent transport (S6): `/suspend` freezes the spawns' detach graces,
+//! sends `event hook_suspend` to every `/agent` socket and closes them
+//! (1001, at most 1 s); `/resume` reports the clock, then thaws the graces;
+//! `/terminate` drains, sends `event hook_terminate` and closes every
+//! socket, stops the spawns (TERM every process group, at most 5 s for the
+//! leaders, then KILL the groups whose leader still runs, at most 1 s: the
+//! spawn manager's `terminate`), then writes the run report — well inside
+//! the 60 s terminate budget. The `/run` and `/resume` clock reports are
+//! kept for `/health/detail`.
+//!
+//! Source policy: every hook arrives from 127.0.0.1 (S4's `hooks-source-ip`
+//! probe and every live run since), so an address cannot tell the platform
+//! from a process in the VM. `--hook-source peer` (the S6 image default)
+//! decides by socket ownership instead (`peer`): a local client owned by the
+//! agent uid, or orphaned, is refused 403 `forbidden_peer`. `log` refuses
+//! nothing and logs each request's origin and what the guard would decide;
+//! `enforce` (S3) refuses runtime hooks from this VM's own addresses and is
+//! kept for the native tests, which POST `/run` from outside. Where the guard
+//! runs (root on Linux: the image) `/validate` fails under either (V6). `/ready` and
+//! `/validate` are never filtered by the source policy (`/validate` refuses
+//! by itself after `/run`, above). In every mode each hook line carries the
+//! client row's facts (`peer_uid`, `ino`, `st`, `fam`) and the decision, and
+//! `/health/detail` keeps the last peer of each runtime hook.
 use crate::shim::health::ShimState;
+use crate::shim::peer::{self, Decision, PeerFacts};
 use crate::shim::state::{Claim, RunRecord};
 use crate::shim::sys;
-use crate::wire::frame::RunHookPayload;
+use crate::wire::frame::{EventKind, Frame, HookPeerSeen, RunHookPayload, CLOSE_GOING_AWAY};
 use axum::body::Bytes;
-use axum::extract::connect_info::{ConnectInfo, Connected};
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::serve::IncomingStream;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::net::TcpListener;
+use std::time::{Duration, Instant};
 
 pub const PREFIX: &str = "/aws/lambda-microvms/runtime/v1";
 
 /// Largest hook body accepted (the payload inside is capped at 4096 bytes).
 pub const MAX_BODY: usize = 32 * 1024;
+
+/// `/terminate`'s bound on stopping the spawns: the manager's terminate
+/// ladder (TERM, at most 5 s for the leaders, KILL, at most 1 s) with room
+/// to spare, well inside the platform's 60 s terminate budget.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookSource {
@@ -53,22 +79,23 @@ pub enum HookSource {
     Log,
     /// Refuse run/resume/suspend/terminate from this VM itself (loopback or our own address)
     Enforce,
+    /// Refuse run/resume/suspend/terminate from a local client owned by the agent uid, or orphaned (S6; Linux)
+    Peer,
 }
 
-/// Both ends of a hook connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HookPeer {
-    pub peer: SocketAddr,
-    pub local: SocketAddr,
-}
-
-impl Connected<IncomingStream<'_, TcpListener>> for HookPeer {
-    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        let peer = *stream.remote_addr();
-        let local = stream.io().local_addr().unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-        HookPeer { peer, local }
+impl HookSource {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            HookSource::Log => "log",
+            HookSource::Enforce => "enforce",
+            HookSource::Peer => "peer",
+        }
     }
 }
+
+/// Both ends of a hook connection (the `ConnectInfo` every router shares).
+pub use crate::shim::peer::Peer as HookPeer;
 
 /// Where a hook request came from, relative to this VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,16 +117,9 @@ impl Origin {
     }
 }
 
-fn canonical(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        v4 => v4,
-    }
-}
-
 #[must_use]
 pub fn origin_of(peer: SocketAddr, local: SocketAddr) -> Origin {
-    let (p, l) = (canonical(peer.ip()), canonical(local.ip()));
+    let (p, l) = (peer::canonical(peer.ip()), peer::canonical(local.ip()));
     if p.is_loopback() {
         Origin::Loopback
     } else if p == l {
@@ -115,42 +135,140 @@ pub fn is_runtime_hook(hook: &str) -> bool {
     matches!(hook, "run" | "resume" | "suspend" | "terminate")
 }
 
-/// Is `hook` from `origin` admitted under `policy`?
+/// Is `hook` from `origin` admitted under `policy`? (`peer` is decided by the
+/// peer guard, `peer::decide`, not by the origin: see [`gate`].)
 #[must_use]
 pub fn admit(policy: HookSource, hook: &str, origin: Origin) -> bool {
-    policy == HookSource::Log || !is_runtime_hook(hook) || origin == Origin::Remote
+    policy != HookSource::Enforce || !is_runtime_hook(hook) || origin == Origin::Remote
+}
+
+/// What the source policy does with one hook request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Passed: an image hook, or a runtime hook the policy admits.
+    Admit,
+    /// `log`: passed; the peer guard's decision is only logged.
+    Logged(Decision),
+    /// `peer`: refused 403 `forbidden_peer`.
+    RefusePeer(&'static str),
+    /// `enforce`: refused 403 `forbidden_origin`.
+    RefuseOrigin(Origin),
+}
+
+impl Gate {
+    /// The log's `decision=` value.
+    #[must_use]
+    pub fn shown(self) -> String {
+        match self {
+            Gate::Admit => "admit".into(),
+            Gate::Logged(d) => d.shown(false),
+            Gate::RefusePeer(r) => Decision::Refuse(r).shown(true),
+            Gate::RefuseOrigin(_) => "refuse:origin".into(),
+        }
+    }
+
+    /// `HookPeerSeen::decision`.
+    #[must_use]
+    pub fn recorded(self) -> &'static str {
+        match self {
+            Gate::Admit => "admitted",
+            Gate::Logged(_) => "logged",
+            Gate::RefusePeer(_) | Gate::RefuseOrigin(_) => "refused",
+        }
+    }
+}
+
+/// Pure: the gate of `hook` under `policy`, from the client row's facts and
+/// the origin (`None` without `ConnectInfo`: `enforce` then admits, as in
+/// S3, and `peer` sees no row and refuses).
+#[must_use]
+pub fn gate(policy: HookSource, hook: &str, facts: &PeerFacts, origin: Option<Origin>, agent_uid: u32) -> Gate {
+    if !is_runtime_hook(hook) {
+        return Gate::Admit;
+    }
+    match policy {
+        HookSource::Log => Gate::Logged(peer::decide(facts, agent_uid)),
+        HookSource::Enforce => match origin {
+            Some(o) if !admit(policy, hook, o) => Gate::RefuseOrigin(o),
+            _ => Gate::Admit,
+        },
+        HookSource::Peer => match peer::decide(facts, agent_uid) {
+            Decision::Admit => Gate::Admit,
+            Decision::Refuse(r) => Gate::RefusePeer(r),
+        },
+    }
 }
 
 fn reply(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// Every hook request: one log line with both addresses, the origin, body
-/// length, status and latency; `Connection: close` on every response (no
-/// keep-alive socket survives a suspend); the source policy.
+/// `/health/detail`'s last peer of a runtime hook.
+fn record_hook_peer(state: &ShimState, hook: &str, hp: Option<HookPeer>, facts: &PeerFacts, gate: Gate) {
+    let row = facts.row;
+    let seen = HookPeerSeen {
+        peer: hp.map_or("-".into(), |h| h.peer.to_string()),
+        family: row.map(|(f, _)| f),
+        uid: row.map(|(_, r)| r.uid),
+        inode: row.map(|(_, r)| r.inode),
+        decision: gate.recorded().into(),
+        at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()),
+    };
+    // A refusal is kept apart: it never replaces the platform's admitted record.
+    let map = if matches!(gate, Gate::RefusePeer(_) | Gate::RefuseOrigin(_)) { &state.hook_refusals } else { &state.hook_peers };
+    map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hook.to_string(), seen);
+}
+
+/// Every hook request: the source policy ([`gate`]); one log line with both
+/// addresses, the origin, body length, status, latency, the client row's
+/// facts and the decision; `Connection: close` on every response (no
+/// keep-alive socket survives a suspend).
 async fn frame(State(state): State<Arc<ShimState>>, req: Request, next: Next) -> Response {
     let start = Instant::now();
-    let hook = req.uri().path().strip_prefix(PREFIX).map(|p| p.trim_start_matches('/').to_string()).unwrap_or_else(|| req.uri().path().to_string());
     let hp = req.extensions().get::<ConnectInfo<HookPeer>>().map(|c| c.0);
+    // The lookup comes first: the client's row is surest while its request is in flight.
+    let facts = hp.map_or(PeerFacts::UNKNOWN, |h| peer::facts(&h));
+    let hook = req.uri().path().strip_prefix(PREFIX).map(|p| p.trim_start_matches('/').to_string()).unwrap_or_else(|| req.uri().path().to_string());
     let len = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
     let origin = hp.map(|h| origin_of(h.peer, h.local));
-    let mut res = match origin {
-        Some(o) if !admit(state.opts.hook_source, &hook, o) => {
-            // Drain (bounded) before refusing, as the handlers do: see `ready`.
+    let gate = gate(state.opts.hook_source, &hook, &facts, origin, state.opts.uid);
+    if is_runtime_hook(&hook) {
+        record_hook_peer(&state, &hook, hp, &facts, gate);
+    }
+    let mut res = match gate {
+        // Drain (bounded) before refusing, as the handlers do: see `ready`.
+        Gate::RefusePeer(reason) => {
+            peer::count_refusal(&state, hp.map_or(0, |h| h.local.port()));
+            let _ = axum::body::to_bytes(req.into_body(), MAX_BODY).await;
+            peer::forbidden(reason)
+        }
+        Gate::RefuseOrigin(o) => {
             let _ = axum::body::to_bytes(req.into_body(), MAX_BODY).await;
             reply(StatusCode::FORBIDDEN, serde_json::json!({"status": "forbidden_origin", "origin": o.name()}))
         }
-        _ => next.run(req).await,
+        Gate::Admit | Gate::Logged(_) => next.run(req).await,
     };
     res.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
     let (peer, local) = hp.map_or(("-".to_string(), "-".to_string()), |h| (h.peer.to_string(), h.local.to_string()));
     errln!(
-        "ai-env: hook {hook} peer={peer} local={local} origin={} len={len} status={} ms={}",
+        "ai-env: hook {hook} peer={peer} local={local} origin={} len={len} status={} ms={} {} decision={}",
         origin.map_or("-", Origin::name),
         res.status().as_u16(),
-        start.elapsed().as_millis()
+        start.elapsed().as_millis(),
+        peer::log_fields(Some(&facts)),
+        gate.shown()
     );
     res
+}
+
+/// An `event` frame for the `/agent` sockets, stamped now.
+fn event(kind: EventKind) -> Frame {
+    Frame::Event { kind, at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()), reference: None }
+}
+
+/// Keep `report` as `/health/detail`'s last clock report.
+fn keep_clock(state: &ShimState, report: &sys::ClockReport) {
+    *state.last_clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = serde_json::to_value(report).ok();
 }
 
 // Every handler takes the body even when it ignores it: answering with
@@ -164,11 +282,16 @@ async fn ready(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     }
 }
 
-async fn validate(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
+/// The image checks, before `/run` only (see the module doc): after it, 409
+/// at once, before the single-flight lock and without any check.
+async fn validate(State(state): State<Arc<ShimState>>, conn: Option<Extension<ConnectInfo<HookPeer>>>, _body: Bytes) -> Response {
+    if state.run.view().at.is_some() {
+        return reply(StatusCode::CONFLICT, serde_json::json!({"status": "already run"}));
+    }
     let Ok(_guard) = state.validating.try_lock() else {
         return reply(StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({"status": "busy"}));
     };
-    let checks = crate::shim::validate::run_checks(&state).await;
+    let checks = crate::shim::validate::run_checks(&state, conn.map(|Extension(ConnectInfo(p))| p)).await;
     let failed: Vec<String> = checks.iter().filter(|c| !c.ok).map(|c| format!("{}: {}", c.id, c.detail)).collect();
     for c in &checks {
         errln!("ai-env: validate {} {} {}", c.id, if c.ok { "ok" } else { "FAILED" }, c.detail);
@@ -281,9 +404,10 @@ async fn run(State(state): State<Arc<ShimState>>, body: Bytes) -> Response {
     }
     errln!("ai-env: run microvm={microvm_log} payload={} {entropy}", if fail_closed { "absent (fail-closed: every hello will be refused)" } else { "ok" });
     errln!("ai-env: clock {}", serde_json::to_string(&clock).unwrap_or_default());
+    keep_clock(&state, &clock);
     if state.opts.delay_run > 0 {
         errln!("ai-env: run delayed {} s (--delay-run)", state.opts.delay_run);
-        tokio::time::sleep(std::time::Duration::from_secs(state.opts.delay_run)).await;
+        tokio::time::sleep(Duration::from_secs(state.opts.delay_run)).await;
     }
     state.run.mark_seen();
     // Detached: the report reads /proc and statvfs, and /run waits on
@@ -295,24 +419,36 @@ async fn run(State(state): State<Arc<ShimState>>, body: Bytes) -> Response {
 async fn resume(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     // Bounded: a stuck clock step must not eat the 30 s resume budget.
     let s = state.clone();
-    let report = tokio::time::timeout(std::time::Duration::from_secs(5), tokio::task::spawn_blocking(move || sys::clock_report(s.sys.as_ref(), "resume", s.opts.clock, None))).await;
+    let report = tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || sys::clock_report(s.sys.as_ref(), "resume", s.opts.clock, None))).await;
     match report {
-        Ok(Ok(r)) => errln!("ai-env: clock {}", serde_json::to_string(&r).unwrap_or_default()),
+        Ok(Ok(r)) => {
+            errln!("ai-env: clock {}", serde_json::to_string(&r).unwrap_or_default());
+            keep_clock(&state, &r);
+        }
         _ => errln!("ai-env: clock report on resume did not finish within 5 s"),
     }
+    state.spawns.thaw();
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
 
-async fn suspend(_body: Bytes) -> Response {
+/// Freeze the detach graces, then tell every `/agent` socket and close it
+/// (no socket survives a suspend), then answer.
+async fn suspend(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
+    state.spawns.freeze();
+    state.agents.close_all_with(CLOSE_GOING_AWAY, "suspend", Some(event(EventKind::HookSuspend))).await;
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
 
 async fn terminate(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     state.set_draining();
+    state.agents.close_all_with(CLOSE_GOING_AWAY, "terminate", Some(event(EventKind::HookTerminate))).await;
+    if tokio::time::timeout(SHUTDOWN_WAIT, state.spawns.terminate()).await.is_err() {
+        errln!("ai-env: stopping the spawns on terminate did not finish within {} s", SHUTDOWN_WAIT.as_secs());
+    }
     // Logged before the answer (the platform stops the VM soon after), with
     // the id of the accepted /run; bounded like resume's clock report.
     let id = state.run.view().microvm_id;
-    let report = tokio::time::timeout(std::time::Duration::from_secs(5), tokio::task::spawn_blocking(move || sys::run_report("terminate", id.as_deref()))).await;
+    let report = tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || sys::run_report("terminate", id.as_deref()))).await;
     match report {
         Ok(Ok(r)) => errln!("ai-env: run-report {r}"),
         _ => errln!("ai-env: run report on terminate did not finish within 5 s"),
@@ -371,6 +507,43 @@ mod tests {
             assert!(admit(HookSource::Enforce, hook, Origin::Loopback), "{hook} is never filtered");
             assert!(admit(HookSource::Enforce, hook, Origin::SelfAddr));
         }
+    }
+
+    /// The source policies over the guard's facts: `peer` refuses a local
+    /// agent-uid, orphaned or row-less client on the runtime hooks only;
+    /// `log` passes everything and reports what `peer` would do; `enforce`
+    /// keeps S3's origin rule and ignores the facts.
+    #[test]
+    fn gate_matrix() {
+        use crate::shim::peer::TcpRow;
+        let row = |uid, inode| Some((4, TcpRow { local: sa("127.0.0.1:40000"), remote: sa("127.0.0.1:9000"), state: 1, uid, inode }));
+        let platform = PeerFacts { local: true, row: row(0, 9) };
+        let agent = PeerFacts { local: true, row: row(1000, 9) };
+        let orphan = PeerFacts { local: true, row: row(0, 0) };
+        let remote = PeerFacts { local: false, row: None };
+        let lo = Some(Origin::Loopback);
+        for hook in ["run", "resume", "suspend", "terminate"] {
+            assert_eq!(gate(HookSource::Peer, hook, &platform, lo, 1000), Gate::Admit, "{hook}: the platform (root, live socket)");
+            assert_eq!(gate(HookSource::Peer, hook, &agent, lo, 1000), Gate::RefusePeer("agent_uid"), "{hook}");
+            assert_eq!(gate(HookSource::Peer, hook, &orphan, lo, 1000), Gate::RefusePeer("orphaned"), "{hook}");
+            assert_eq!(gate(HookSource::Peer, hook, &PeerFacts::UNKNOWN, None, 1000), Gate::RefusePeer("no_row"), "{hook}: no ConnectInfo fails closed");
+            assert_eq!(gate(HookSource::Peer, hook, &remote, Some(Origin::Remote), 1000), Gate::Admit, "{hook}: a remote client");
+            assert_eq!(gate(HookSource::Log, hook, &agent, lo, 1000), Gate::Logged(Decision::Refuse("agent_uid")), "{hook}");
+            assert_eq!(gate(HookSource::Log, hook, &platform, lo, 1000), Gate::Logged(Decision::Admit), "{hook}");
+            assert_eq!(gate(HookSource::Enforce, hook, &platform, lo, 1000), Gate::RefuseOrigin(Origin::Loopback), "{hook}: enforce ignores the row");
+            assert_eq!(gate(HookSource::Enforce, hook, &agent, Some(Origin::Remote), 1000), Gate::Admit, "{hook}");
+            assert_eq!(gate(HookSource::Enforce, hook, &agent, None, 1000), Gate::Admit, "{hook}: S3 admits without ConnectInfo");
+        }
+        for hook in ["ready", "validate", "nope"] {
+            for policy in [HookSource::Log, HookSource::Enforce, HookSource::Peer] {
+                assert_eq!(gate(policy, hook, &agent, lo, 1000), Gate::Admit, "{hook} is never filtered under {}", policy.name());
+            }
+        }
+        let shown: Vec<(String, &str)> = [Gate::Admit, Gate::Logged(Decision::Admit), Gate::Logged(Decision::Refuse("no_row")), Gate::RefusePeer("agent_uid"), Gate::RefuseOrigin(Origin::SelfAddr)].iter().map(|g| (g.shown(), g.recorded())).collect();
+        assert_eq!(
+            shown,
+            [("admit".to_string(), "admitted"), ("admit".into(), "logged"), ("would-refuse:no_row".into(), "logged"), ("refuse:agent_uid".into(), "refused"), ("refuse:origin".into(), "refused")]
+        );
     }
 
     #[test]

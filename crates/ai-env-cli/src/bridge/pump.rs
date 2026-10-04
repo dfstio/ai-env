@@ -30,7 +30,10 @@
 //!
 //! The child is reached through a [`ChildLink`] (an input sender, a signal
 //! sender, an event receiver): S2 builds it over a local process
-//! ([`spawn_local`]); S6 builds the same link over the MicroVM WebSocket.
+//! ([`spawn_local`]); S8 builds the same link over the MicroVM WebSocket
+//! (`RemoteLink`, moved there from S6 by its D5: `spawn_next` then needs an
+//! async link seam, and a refused remote spawn a [`ChildEvent`] of its own,
+//! never `Exit(None)`, so the [`EndReason`]s keep their meaning).
 //!
 //! Timing (plan D22): host stdin EOF → child stdin closed → SIGTERM at
 //! +800 ms → SIGKILL at +1200 ms → hard stop at +1400 ms → exit ≤ 1500 ms;
@@ -42,9 +45,9 @@
 //! registry row closed and a second census row (the start row + `end`,
 //! `exit`, a note) appended before `process::exit`.
 //!
-//! Lines are split at the CLI's own limit (256 MiB, `CLI_LINE_BYTES`), never
-//! at the 4 MiB WebSocket cap: a user message with pasted images or a
-//! transcript entry holding them passes as the CLI would take it.
+//! Lines are split at the CLI's own limit (256 MiB, `CLI_LINE_BYTES`): a user
+//! message with pasted images or a transcript entry holding them passes as
+//! the CLI would take it (the agent transport carries byte chunks, S6).
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::census::{self, CensusRow};
 use crate::bridge::config::{BridgeConfig, Paths};
@@ -289,7 +292,7 @@ pub enum Sig {
 pub enum ChildEvent {
     /// One stdout line (without `\n`).
     Line(Bytes),
-    /// A stdout line over the 4 MiB cap was dropped.
+    /// A stdout line over the CLI's 256 MiB limit was dropped.
     TooLong(usize),
     StdoutEof,
     StderrEof,
@@ -297,7 +300,7 @@ pub enum ChildEvent {
     Exit(Option<ExitStatus>),
 }
 
-/// The pump's handle on one child: the seam S6 reuses with a WebSocket behind it.
+/// The pump's handle on one child: the seam S8's `RemoteLink` reuses with a WebSocket behind it.
 #[derive(Debug)]
 pub struct ChildLink {
     pub pid: Option<u32>,
@@ -728,7 +731,7 @@ impl Pump {
             }
             Some(HostIn::TooLong(n)) => {
                 self.out.dropped_lines += 1;
-                tracing::warn!("host line over the 4 MiB cap dropped ({n} bytes)");
+                tracing::warn!("host line over the CLI's 256 MiB limit dropped ({n} bytes)");
             }
             Some(HostIn::Eof) | None => self.on_host_eof(),
         }
@@ -817,7 +820,7 @@ impl Pump {
             Some(ChildEvent::Line(line)) => self.on_child_line(line),
             Some(ChildEvent::TooLong(n)) => {
                 self.out.dropped_lines += 1;
-                tracing::warn!("child line over the 4 MiB cap dropped ({n} bytes)");
+                tracing::warn!("child line over the CLI's 256 MiB limit dropped ({n} bytes)");
             }
             Some(ChildEvent::StdoutEof) => self.stdout_eof = true,
             Some(ChildEvent::StderrEof) => self.stderr_eof = true,

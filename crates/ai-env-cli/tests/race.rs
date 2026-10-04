@@ -2,7 +2,7 @@
 //! against `tests/fakes/claude-v2.sh`: host stdin EOF → exit ≤ 1500 ms (every
 //! rung of the ladder), SIGTERM → exit ≤ 1000 ms (every rung), the
 //! `after-init` lab exit, stdout never carrying the wrapper's own noise, the
-//! delayed initialize, lines far above the 4 MiB WebSocket cap passing intact,
+//! delayed initialize, lines far above 4 MiB passing intact (up to the CLI's 256 MiB),
 //! backpressure under a stalled host reader, a host that stops reading, and a
 //! slow host after the child's own exit.
 //!
@@ -211,9 +211,9 @@ fn delay_init_holds_the_init_response() {
     assert!(took < EOF_BUDGET, "EOF -> exit took {took:?} (budget {EOF_BUDGET:?})\n{}", h.transcript());
 }
 
-/// Lines are split at the CLI's own limit (256 MiB), not at the 4 MiB
-/// WebSocket cap: a 5 MiB user line reaches the child and a 5 MiB child
-/// line reaches the host, both byte for byte.
+/// Lines are split at the CLI's own limit (256 MiB), not at 4 MiB (the
+/// line cap S2 first planned for the wire): a 5 MiB user line reaches the
+/// child and a 5 MiB child line reaches the host, both byte for byte.
 #[test]
 fn large_lines_pass_intact() {
     let _g = serial();

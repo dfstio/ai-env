@@ -190,6 +190,7 @@ pub fn health_claiming(microvm_id: Option<&str>, owner: &str, created: &str) -> 
         boot_nonce: Some("0f".repeat(8)),
         run_hook_seen: true,
         uptime_s: 1,
+        wire: None,
     }
 }
 

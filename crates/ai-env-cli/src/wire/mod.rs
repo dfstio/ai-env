@@ -4,6 +4,7 @@
 //! functions. Everything here compiles in every feature set (serde and the
 //! tungstenite message type only — no sockets, no TLS, no AWS).
 pub mod argv;
+pub mod chunk;
 pub mod claude;
 pub mod frame;
 pub mod managed;

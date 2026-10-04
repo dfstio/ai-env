@@ -194,7 +194,7 @@ pub struct ProbeSpec {
 
 /// Every probe the stages record (plan §7), S1 and S3 included so `lab list`
 /// shows the whole picture.
-pub const CATALOG: [ProbeSpec; 14] = [
+pub const CATALOG: [ProbeSpec; 21] = [
     ProbeSpec { name: "entrypoint", stage: "S1", source: Source::Census, expect: Expect::Exact("claude-vscode"), recorded_by: "ai-env wrapper census --record-probes", what: "CLAUDE_CODE_ENTRYPOINT the extension sets for the wrapper" },
     ProbeSpec { name: "stock-ext-oauth", stage: "S1", source: Source::Census, expect: Expect::Exact("absent"), recorded_by: "ai-env wrapper census --record-probes", what: "whether the stock extension advertises OAuth refresh" },
     ProbeSpec { name: "image-version-delete", stage: "S3", source: Source::Deploy, expect: Expect::Exact("kept"), recorded_by: "make deploy RECORD_PROBE=1", what: "whether an image update deletes earlier versions" },
@@ -212,6 +212,15 @@ pub const CATALOG: [ProbeSpec; 14] = [
     ProbeSpec { name: "idle-policy-limits", stage: "S4", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run idle-policy-limits", what: "which suspended durations the service accepts" },
     ProbeSpec { name: "connector-pending", stage: "S5", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run connector-pending ARN (make connector-probe CONFIRM=create-probe-connector)", what: "what RunMicrovm does with an egress connector that is still PENDING (rejected:<code>, or accepted[:echo-mismatch|:internet|:terminated])" },
     ProbeSpec { name: "dns-path", stage: "S5", source: Source::Live, expect: Expect::Exact("no-dns"), recorded_by: "ai-env lab run dns-path", what: "whether a vpc VM reaches any DNS server, asked a fresh name d<nonce>.example.com A (and example.com A of each server that replied): no-dns; platform-dns:<ip>[,<ip>…] when platform resolvers replied only with an empty NOERROR (no answer, no authority); platform-dns-answered:<ip>[,…] for any other platform reply; platform-dns-resolves:<ip>[,…] when one returned an address; open-dns:<ip>[,…] for any other server; resolves=yes|no in the note" },
+    // S6 (plan S6 "Probes"): the agent transport through the live endpoint. Each owns its VMs on the lab path with its
+    // own budget and terminate guard; in-vm-firewall runs a default VM and a `--shell` VM.
+    ProbeSpec { name: "e0", stage: "S6", source: Source::Live, expect: Expect::Exact("101 HTTP/1.1 403 403 403"), recorded_by: "ai-env lab run e0", what: "the /agent upgrade through the endpoint: headers-only token (a 101 the client accepted, 101-refused when it refused one; the HTTP version as the client parsed the answer, always HTTP/1.1: the shim's own view is the http= field of its agent upgrade log line), no token, a Port(8081) token, a Port(9418) token with port header 8080; in the note the subprotocol form, the bearer through the endpoint, and eight sockets held open after hello, then a 9th (its answer) and the shim's socket count, read once one held socket closed (with all eight open the endpoint's cap would likely refuse the read)" },
+    ProbeSpec { name: "e1", stage: "S6", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run e1", what: "whether an open /agent socket survives its endpoint token's expiry (a 2-min token held 4 min with pings): survives (pongs kept arriving past the expiry), cut-at-expiry:<s> or silent-at-expiry:<s> (open, but nothing came back); WS#2 hello-resume keeps the pid" },
+    ProbeSpec { name: "e5", stage: "S6", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run e5", what: "which traffic keeps a VM with max idle 60 s from suspending: a silent socket, pings only, VM-to-Mac output only, a GET /health every 30 s (silent:<kept|suspended> pings:<…> outbound:<…> http:<…>; http is suspended when GetMicrovm saw it at any point of the phase); a reconnect to the suspended VM, timed, with the state after, in the note (whether 8080 traffic reaches the shim before /resume returns cannot be measured from the Mac: the endpoint holds the request through /resume, and the note says so)" },
+    ProbeSpec { name: "frames", stage: "S6", source: Source::Live, expect: Expect::Exact("byte-identical"), recorded_by: "ai-env lab run frames", what: "vm exec through the endpoint: 1 000 lines incl. 1 MiB, a 20 MiB line both ways, non-UTF-8 bytes and an unterminated last line arrive byte-identical (MB/s in the note)" },
+    ProbeSpec { name: "reattach", stage: "S6", source: Source::Live, expect: Expect::Exact("no-loss-same-pid"), recorded_by: "ai-env lab run reattach", what: "a client-side cut mid-stream (stdin closed; the producer outlives the cut and the D22 ladder), then a reattach: no line lost or doubled, the same pid, the producer ran to its end (exit 0); a stale from_seq; a full window, a kill, then an attach (reattach ms in the note)" },
+    ProbeSpec { name: "clock-after-resume", stage: "S6", source: Source::Live, expect: Expect::AnyOf(&["within-2s"]), recorded_by: "ai-env lab run clock-after-resume", what: "the guest clock against the Mac after at least 15 min suspended (vpc egress): within-2s, else the offset; the monotonic jump and the time to the first proxied success in the note" },
+    ProbeSpec { name: "in-vm-firewall", stage: "S6", source: Source::Live, expect: Expect::Exact("guarded"), recorded_by: "ai-env lab run in-vm-firewall", what: "whether the agent uid can reach the VM's privileged listeners: forged hooks via 127.0.0.1 and the VM's own address (resume first, terminate last), the close-before-lookup trick, an RST-aborted GET /health via the VM's own address on 8080 (under agent_guard on the guard's refusal count must rise by two per connection; under log or off it is not judged), 8080/9418 judged by the guard mode in the note (agent_guard on: 403; tree B's log or off: GET /health may answer the public summary, a bearer path must answer 401 or 403), every listener the shim does not own dialed where it listens (8022 on a --shell VM), NoNewPrivs, setuid inventory, IMDS, nf_tables; the endpoint's bearer-less PUT /seed and /health/detail; guarded, exposed:<port>, or gap:<checks> when a check could not run (vm-address, listeners, rst-abort)" },
 ];
 
 /// The catalog entry of `name`.
@@ -931,6 +940,153 @@ pub fn verdict_connector_rejected(e: &crate::bridge::errors::BridgeError) -> Opt
     Some((format!("rejected:{}", code.as_deref().unwrap_or("unknown")), format!("RunMicrovm refused the connector: {text}")))
 }
 
+// ---- S6: the agent-transport verdict renderers (pure; `vm/lab.rs` feeds them) --------------
+
+/// e0's exact verdict `<header> <http version> <no-token> <other-port>
+/// <proxy-port>` — `101 HTTP/1.1 403 403 403` when the header token upgraded
+/// (`accepted`: a 101 the client took, so the WebSocket opened) and the three
+/// mis-scoped tokens were each refused 403. A 101 the client refused (a
+/// `Connection` other than `Upgrade`, a bad `Sec-WebSocket-Accept`, an
+/// unrequested subprotocol) is `101-refused`, which never matches. The
+/// version is the client's parse of the endpoint's answer, always `HTTP/1.1`
+/// (tungstenite refuses HTTP/1.0); the shim's own view of it is the `http=`
+/// field of its `agent upgrade` log line. The note (built in the probe)
+/// carries the refusal, the subprotocol form, the bearer through the endpoint
+/// and the 9th socket.
+#[must_use]
+pub fn verdict_e0(header_status: u16, accepted: bool, http_version: &str, no_token: u16, other_port: u16, proxy_port: u16) -> String {
+    let header = if header_status == 101 && !accepted { "101-refused".to_string() } else { header_status.to_string() };
+    format!("{header} {http_version} {no_token} {other_port} {proxy_port}")
+}
+
+/// e1: `survives` when the open socket outlived its endpoint token (the
+/// shim's pongs kept arriving past the expiry), else `cut-at-expiry:<s>`
+/// (the socket closed or failed) or `silent-at-expiry:<s>` (it stayed open,
+/// but nothing came back from its last frame on), in whole seconds after
+/// expiry; at or before expiry is `0`. A cut outranks a silence.
+#[must_use]
+pub fn verdict_e1(cut_after_expiry_s: Option<i64>, silent_after_expiry_s: Option<i64>) -> String {
+    match (cut_after_expiry_s, silent_after_expiry_s) {
+        (Some(s), _) => format!("cut-at-expiry:{}", s.max(0)),
+        (None, Some(s)) => format!("silent-at-expiry:{}", s.max(0)),
+        (None, None) => "survives".to_string(),
+    }
+}
+
+/// `kept` (the VM was RUNNING after the phase) or `suspended` (the service
+/// suspended it), for one e5 phase.
+#[must_use]
+pub fn phase_outcome(kept: bool) -> &'static str {
+    if kept {
+        "kept"
+    } else {
+        "suspended"
+    }
+}
+
+/// e5's recorded verdict: whether a VM with max idle 60 s stayed RUNNING under
+/// a silent socket, app pings only, VM→Mac output only, and a bearer-less
+/// `GET /health` every 30 s.
+#[must_use]
+pub fn verdict_e5(silent: bool, pings: bool, outbound: bool, http: bool) -> String {
+    format!("silent:{} pings:{} outbound:{} http:{}", phase_outcome(silent), phase_outcome(pings), phase_outcome(outbound), phase_outcome(http))
+}
+
+/// frames: `byte-identical` when stdout equalled stdin, else
+/// `differs:<first offset>` (the first byte that differs, or the shorter
+/// length when one is a prefix of the other). MB/s goes in the note.
+#[must_use]
+pub fn verdict_frames(input: &[u8], output: &[u8]) -> String {
+    if input == output {
+        return "byte-identical".to_string();
+    }
+    let offset = input.iter().zip(output).position(|(a, b)| a != b).unwrap_or_else(|| input.len().min(output.len()));
+    format!("differs:{offset}")
+}
+
+/// reattach: `no-loss-same-pid` when a client-side cut mid-stream lost and
+/// doubled no line, the pid was unchanged and the producer ran to its end
+/// (exit code 0, no signal: a cut that killed it — the D22 ladder applied to
+/// a lost socket, critic H1 — never passes); else every problem joined
+/// (`lost:<n>`, `doubled:<n>`, `pid-changed`, `signal:<n>` or `exit:<code>`,
+/// `exit:?` when the shim reported neither). The stale-from_seq gap, the
+/// full-window kill replay and the reattach ms go in the note.
+#[must_use]
+pub fn verdict_reattach(missing: u64, doubled: u64, same_pid: bool, exit_code: Option<i32>, signal: Option<i32>) -> String {
+    let mut problems = Vec::new();
+    if missing > 0 {
+        problems.push(format!("lost:{missing}"));
+    }
+    if doubled > 0 {
+        problems.push(format!("doubled:{doubled}"));
+    }
+    if !same_pid {
+        problems.push("pid-changed".to_string());
+    }
+    match (exit_code, signal) {
+        (Some(0), None) => {}
+        (_, Some(s)) => problems.push(format!("signal:{s}")),
+        (Some(c), None) => problems.push(format!("exit:{c}")),
+        (None, None) => problems.push("exit:?".to_string()),
+    }
+    if problems.is_empty() {
+        "no-loss-same-pid".to_string()
+    } else {
+        problems.join(" ")
+    }
+}
+
+/// The guest-vs-Mac clock offset within which `clock-after-resume` passes.
+pub const CLOCK_TOLERANCE_S: f64 = 2.0;
+
+/// clock-after-resume: `within-2s` when the guest clock after a long suspend
+/// is within [`CLOCK_TOLERANCE_S`] of the Mac's (round-trip corrected), else
+/// `offset:<s>` (signed seconds, the guest minus the Mac). The monotonic and
+/// boottime deltas and the time to the first proxied success go in the note.
+#[must_use]
+pub fn verdict_clock(offset_s: f64) -> String {
+    if offset_s.abs() <= CLOCK_TOLERANCE_S {
+        "within-2s".to_string()
+    } else {
+        format!("offset:{offset_s:.3}")
+    }
+}
+
+/// in-vm-firewall: `guarded` when nothing on the DEFAULT VM let the agent uid
+/// through and every required check ran, else `exposed:<port>` for the lowest
+/// exposed port, else `gap:<names>` when a required check could not run.
+/// `exposures` holds the port of every default-VM check that did not hold: a
+/// forged hook that was not refused (or drained the VM: the firewall spawn
+/// ended with `hook_terminate` while the VM is RUNNING) → 9000; uid 1000's
+/// `GET /health` or `GET /health/detail` on 8080, or its request on 9418,
+/// that the guard did not refuse — or, under tree B's fallback (`agent_guard`
+/// `log` or `off`, where only the bearer holds), that the bearer did not
+/// refuse, `GET /health` answering the public summary being no exposure
+/// there — → that port; an RST-aborted `GET /health` through the VM's own
+/// address that the guard did not refuse (its 8080 refusal count rose by
+/// less than two per connection; not judged under the fallback, which
+/// counts nothing) → 8080; and every foreign listener a uid-1000 connect
+/// reached where it listens → its port. `gaps` names a required measurement
+/// that was skipped — `vm-address` when the VM's own IPv4 was not found, so
+/// the via-own-address checks (critic M6a: a guard that caches locality at
+/// start) never ran; `listeners` when the inventory could not be read whole
+/// or a foreign listener was not dialed where it listens (a wildcard without
+/// the VM's own address, an IPv6 link-local one); `rst-abort` when the RST
+/// abort did not run, made no connection, or the guard's refusal count could
+/// not be read: that must not read as a clean pass. An exposure outranks a gap (it is the worse
+/// finding). The `--shell` VM's own listeners (8022) are recorded in the
+/// note, never an exposure of the default VM.
+#[must_use]
+pub fn verdict_in_vm_firewall(exposures: &[u16], gaps: &[&str]) -> String {
+    if let Some(port) = exposures.iter().copied().min() {
+        return format!("exposed:{port}");
+    }
+    if !gaps.is_empty() {
+        return format!("gap:{}", gaps.join(","));
+    }
+    "guarded".to_string()
+}
+
 // ---- `ai-env lab list|show` ---------------------------------------------------------------
 
 /// `ai-env lab list [--json]`: every probe with its last recorded verdict.
@@ -1008,11 +1164,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_names_are_unique_and_cover_the_nine_s4_and_two_s5_probes() {
+    fn catalog_names_are_unique_and_cover_the_nine_s4_two_s5_and_seven_s6_probes() {
         let names: std::collections::BTreeSet<&str> = CATALOG.iter().map(|p| p.name).collect();
         assert_eq!(names.len(), CATALOG.len());
         assert_eq!(CATALOG.iter().filter(|p| p.stage == "S4").count(), 9);
         assert_eq!(CATALOG.iter().filter(|p| p.stage == "S5").map(|p| p.name).collect::<Vec<_>>(), ["connector-pending", "dns-path"]);
+        assert_eq!(CATALOG.iter().filter(|p| p.stage == "S6").map(|p| p.name).collect::<Vec<_>>(), ["e0", "e1", "e5", "frames", "reattach", "clock-after-resume", "in-vm-firewall"]);
         assert_eq!(spec("dns-path").unwrap().expect.expectation().render(), crate::bridge::egress::DNS_NONE);
         assert_eq!(spec("cloudtrail-payload").unwrap().expect.expectation().render(), "any-of:not-logged|hidden|absent|commitment-only");
     }
@@ -1437,6 +1594,66 @@ mod tests {
         ] {
             assert!(verdict_connector_rejected(&e).is_none(), "{e}");
         }
+    }
+
+    #[test]
+    fn s6_verdict_renderers() {
+        // e0: the exact string the catalog pins, and the failing shapes.
+        assert_eq!(verdict_e0(101, true, "HTTP/1.1", 403, 403, 403), "101 HTTP/1.1 403 403 403");
+        assert_eq!(spec("e0").unwrap().expect.expectation().render(), verdict_e0(101, true, "HTTP/1.1", 403, 403, 403));
+        assert_eq!(verdict_e0(101, true, "HTTP/2.0", 403, 403, 403), "101 HTTP/2.0 403 403 403", "the version the client parsed is built in");
+        assert_ne!(verdict_e0(403, false, "HTTP/1.1", 403, 403, 403), "101 HTTP/1.1 403 403 403", "a refused header token fails");
+        // A 101 the client refused opened no WebSocket: never the catalog's pass.
+        let refused = verdict_e0(101, false, "HTTP/1.1", 403, 403, 403);
+        assert_eq!(refused, "101-refused HTTP/1.1 403 403 403");
+        assert!(!expectation_holds(&spec("e0").unwrap().expect.expectation().render(), &refused), "{refused}");
+        // e1: survives only with pongs past the expiry; a cut outranks a silence.
+        assert_eq!(verdict_e1(None, None), "survives");
+        assert_eq!(verdict_e1(Some(12), None), "cut-at-expiry:12");
+        assert_eq!(verdict_e1(Some(-3), None), "cut-at-expiry:0", "a cut at or before expiry is 0");
+        assert_eq!(verdict_e1(None, Some(4)), "silent-at-expiry:4");
+        assert_eq!(verdict_e1(None, Some(-20)), "silent-at-expiry:0", "silent from before the expiry on is 0");
+        assert_eq!(verdict_e1(Some(30), Some(0)), "cut-at-expiry:30");
+        // e5: recorded, four phases.
+        assert_eq!(verdict_e5(true, true, true, true), "silent:kept pings:kept outbound:kept http:kept");
+        assert_eq!(verdict_e5(false, true, false, true), "silent:suspended pings:kept outbound:suspended http:kept");
+        assert!(expectation_holds(&spec("e5").unwrap().expect.expectation().render(), &verdict_e5(false, false, false, true)), "e5 records any phase mix");
+        // frames.
+        assert_eq!(verdict_frames(b"abc", b"abc"), "byte-identical");
+        assert_eq!(verdict_frames(&[0u8, 0xff, 0x01], &[0u8, 0xff, 0x02]), "differs:2");
+        assert_eq!(verdict_frames(b"abcd", b"abc"), "differs:3", "a prefix differs at the shorter length");
+        assert_eq!(verdict_frames(b"", b""), "byte-identical");
+        assert_eq!(spec("frames").unwrap().expect.expectation().render(), "byte-identical");
+        // reattach: the pass needs the producer to have run to its end.
+        assert_eq!(verdict_reattach(0, 0, true, Some(0), None), "no-loss-same-pid");
+        assert_eq!(verdict_reattach(2, 0, true, Some(0), None), "lost:2");
+        assert_eq!(verdict_reattach(0, 1, false, Some(0), None), "doubled:1 pid-changed");
+        assert_eq!(verdict_reattach(3, 4, false, Some(0), None), "lost:3 doubled:4 pid-changed");
+        // A cut that killed it (critic H1: the D22 ladder on a lost socket) never passes, whatever the lines say.
+        assert_eq!(verdict_reattach(0, 0, true, None, Some(15)), "signal:15");
+        assert_eq!(verdict_reattach(5, 0, true, None, Some(9)), "lost:5 signal:9");
+        assert_eq!(verdict_reattach(0, 0, true, Some(143), None), "exit:143");
+        assert_eq!(verdict_reattach(0, 0, true, None, None), "exit:?");
+        assert_eq!(spec("reattach").unwrap().expect.expectation().render(), "no-loss-same-pid");
+        // clock: AnyOf within-2s, ±2 s inclusive.
+        assert_eq!(verdict_clock(0.0), "within-2s");
+        assert_eq!(verdict_clock(-2.0), "within-2s");
+        assert_eq!(verdict_clock(1.999), "within-2s");
+        assert_eq!(verdict_clock(2.5), "offset:2.500");
+        assert_eq!(verdict_clock(-9.25), "offset:-9.250");
+        assert!(expectation_holds(&spec("clock-after-resume").unwrap().expect.expectation().render(), &verdict_clock(0.5)));
+        assert!(!expectation_holds(&spec("clock-after-resume").unwrap().expect.expectation().render(), &verdict_clock(3.0)));
+        // in-vm-firewall: guarded with nothing exposed, else the lowest port.
+        assert_eq!(verdict_in_vm_firewall(&[], &[]), "guarded");
+        assert_eq!(verdict_in_vm_firewall(&[9418, 9000, 8080], &[]), "exposed:8080", "the lowest exposed port");
+        assert_eq!(verdict_in_vm_firewall(&[8022], &[]), "exposed:8022");
+        // A skipped required check (the VM's own IPv4 was not found) is a gap, not a clean pass.
+        assert_eq!(verdict_in_vm_firewall(&[], &["vm-address"]), "gap:vm-address");
+        assert_eq!(verdict_in_vm_firewall(&[8080], &["vm-address"]), "exposed:8080", "an exposure outranks a gap");
+        assert!(!expectation_holds(&spec("in-vm-firewall").unwrap().expect.expectation().render(), &verdict_in_vm_firewall(&[], &["vm-address"])), "a gap does not satisfy the guarded expectation");
+        assert_eq!(spec("in-vm-firewall").unwrap().expect.expectation().render(), "guarded");
+        assert_eq!(phase_outcome(true), "kept");
+        assert_eq!(phase_outcome(false), "suspended");
     }
 
     #[test]

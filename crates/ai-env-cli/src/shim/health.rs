@@ -1,16 +1,26 @@
 //! `GET /health` — the public summary the Mac polls after `run_microvm` — and
 //! the state every listener shares: options, the claude probe, the `/run`
-//! record, and the booting/draining flags.
+//! record, the booting/draining flags, and (S6) the spawn manager, the agent
+//! registry and what the peer guard saw. `GET /health/detail` (bearer only)
+//! adds the guard, the sockets, the spawns and the listeners. The app router
+//! puts the peer guard first, then the bearer (every path but `/health` and
+//! `/agent`), and answers any other path 404 behind them.
+use crate::shim::agent::AgentRegistry;
 use crate::shim::hooks::HookSource;
+use crate::shim::peer::AgentGuard;
+use crate::shim::spawn::{SpawnManager, SpawnOpts};
 use crate::shim::state::RunState;
 use crate::shim::sys::{ClockMode, RealSys, SysOps};
-use crate::wire::frame::{Health, HealthStatus};
-use axum::extract::State;
-use axum::routing::get;
+use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, STDOUT_WINDOW_BYTES, WIRE_VERSION};
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
+use axum::routing::{any, get};
 use axum::{Json, Router};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
@@ -45,6 +55,8 @@ impl ProbeSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShimOpts {
     pub hook_source: HookSource,
+    /// The peer guard on the app and code ports (S6).
+    pub agent_guard: AgentGuard,
     pub clock: ClockMode,
     pub delay_run: u64,
     /// Prefix for every path `/validate` checks (native tests).
@@ -52,20 +64,32 @@ pub struct ShimOpts {
     pub home: PathBuf,
     pub uid: u32,
     pub gid: u32,
+    /// stdout window per spawn (hidden `--agent-window-bytes`).
+    pub window_bytes: u64,
 }
 
 impl Default for ShimOpts {
     fn default() -> Self {
         ShimOpts {
             hook_source: HookSource::Log,
+            agent_guard: AgentGuard::Off,
             clock: ClockMode::Measure,
             delay_run: 0,
             fs_root: None,
             home: PathBuf::from("/Users/mike"),
             uid: 1000,
             gid: 1000,
+            window_bytes: STDOUT_WINDOW_BYTES,
         }
     }
+}
+
+/// The ports the worker actually bound (`--*-port 0` picks a free one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundPorts {
+    pub hooks: u16,
+    pub app: u16,
+    pub code: u16,
 }
 
 pub struct ShimState {
@@ -81,6 +105,22 @@ pub struct ShimState {
     pub sys: Arc<dyn SysOps>,
     /// Held while one `/validate` runs (single flight).
     pub validating: tokio::sync::Mutex<()>,
+    /// The processes `/agent` started (S6).
+    pub spawns: SpawnManager,
+    /// The open `/agent` sockets (S6).
+    pub agents: AgentRegistry,
+    /// `AWS_LAMBDA_MICROVM_IMAGE_VERSION` at worker start (`None` outside a VM).
+    pub image_version: Option<String>,
+    /// The last peer the guard let through, per runtime hook.
+    pub hook_peers: Mutex<BTreeMap<String, HookPeerSeen>>,
+    /// The last refused peer, per runtime hook.
+    pub hook_refusals: Mutex<BTreeMap<String, HookPeerSeen>>,
+    /// Guard refusals by port.
+    pub refused: Mutex<BTreeMap<String, u64>>,
+    /// The last clock report (`/run`, `/resume`), as logged.
+    pub last_clock: Mutex<Option<serde_json::Value>>,
+    /// Set once by [`Self::set_ports`].
+    pub ports: OnceLock<BoundPorts>,
 }
 
 impl ShimState {
@@ -96,6 +136,15 @@ impl ShimState {
     /// The binary's state: `booting` until [`Self::set_bound`].
     #[must_use]
     pub fn with(claude: PathBuf, opts: ShimOpts, probe: ProbeSpec, sys: Arc<dyn SysOps>) -> Self {
+        let spawns = SpawnManager::new(SpawnOpts {
+            claude: claude.clone(),
+            home: opts.home.clone(),
+            uid: probe.uid,
+            gid: probe.gid,
+            agent_uid: opts.uid,
+            window_bytes: opts.window_bytes,
+            sweep: cfg!(target_os = "linux") && probe.uid.is_some(),
+        });
         ShimState {
             started: Instant::now(),
             claude,
@@ -107,7 +156,20 @@ impl ShimState {
             opts,
             sys,
             validating: tokio::sync::Mutex::new(()),
+            spawns,
+            agents: AgentRegistry::new(),
+            image_version: std::env::var("AWS_LAMBDA_MICROVM_IMAGE_VERSION").ok().filter(|v| !v.is_empty() && v.len() <= 32 && v.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.')),
+            hook_peers: Mutex::new(BTreeMap::new()),
+            hook_refusals: Mutex::new(BTreeMap::new()),
+            refused: Mutex::new(BTreeMap::new()),
+            last_clock: Mutex::new(None),
+            ports: OnceLock::new(),
         }
+    }
+
+    /// Record the ports the worker bound (once).
+    pub fn set_ports(&self, ports: BoundPorts) {
+        let _ = self.ports.set(ports);
     }
 
     pub fn set_bound(&self) {
@@ -231,6 +293,31 @@ impl ShimState {
             boot_nonce: run.boot_nonce,
             run_hook_seen: run.seen,
             uptime_s: since.elapsed().as_secs(),
+            wire: Some(WIRE_VERSION),
+        }
+    }
+
+    /// `GET /health/detail`: [`Self::health`] plus the guard's counters and
+    /// last hook peers, the sockets, the spawns, the last clock report and
+    /// the LISTEN inventory (read now, bounded: `peer::bounded`).
+    pub async fn detail(&self) -> HealthDetail {
+        let (open, authenticated) = self.agents.counts();
+        let (listeners, listeners_omitted) = crate::shim::peer::bounded(crate::shim::peer::listeners(), self.opts.uid);
+        HealthDetail {
+            health: self.health().await,
+            image_version: self.image_version.clone(),
+            hook_source: self.opts.hook_source.name().to_string(),
+            agent_guard: self.opts.agent_guard.name().to_string(),
+            refused_peers: self.refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            hook_peers: self.hook_peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            hook_refusals: self.hook_refusals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            sockets_open: open,
+            sockets_authenticated: authenticated,
+            spawns: self.spawns.detail(),
+            has_credentials: false,
+            clock: self.last_clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            listeners,
+            listeners_omitted,
         }
     }
 }
@@ -239,9 +326,31 @@ async fn health(State(state): State<Arc<ShimState>>) -> Json<Health> {
     Json(state.health().await)
 }
 
-/// The app-port router (http1 only; `/agent` joins it in the transport stage).
+async fn detail(State(state): State<Arc<ShimState>>) -> Json<HealthDetail> {
+    Json(state.detail().await)
+}
+
+/// 405 for a method a route does not serve (axum adds `Allow`), after
+/// draining the request body like every other refusal.
+async fn method_not_allowed(req: Request) -> StatusCode {
+    crate::shim::peer::drain(req).await;
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+/// The app-port router (http1 only): the public `/health` and the `/agent`
+/// upgrade (which checks its method itself, after the 503s), the bearer-only
+/// `/health/detail`, and 404 for the rest. Serve it with
+/// `into_make_service_with_connect_info::<peer::Peer>()`.
 pub fn router(state: Arc<ShimState>) -> Router {
-    Router::new().route("/health", get(health)).with_state(state)
+    // The last layer runs first: the guard, then the bearer.
+    Router::new()
+        .route("/health", get(health).fallback(method_not_allowed))
+        .route("/health/detail", get(detail).fallback(method_not_allowed))
+        .route("/agent", any(crate::shim::agent::upgrade))
+        .fallback(crate::shim::auth::not_implemented)
+        .layer(from_fn_with_state(state.clone(), crate::shim::auth::app_bearer))
+        .layer(from_fn_with_state(state.clone(), crate::shim::peer::guard))
+        .with_state(state)
 }
 
 #[cfg(test)]

@@ -3,8 +3,9 @@
 //! forwarded lines stay byte-identical.
 use bytes::{Buf, Bytes, BytesMut};
 
-/// Longest line accepted by default: the WebSocket framing cap (S6), which
-/// bounds memory per frame.
+/// Longest line accepted by default: a bound for splitters that set none of
+/// their own. The pumps split at [`CLI_LINE_BYTES`]; the agent transport (S6)
+/// carries raw byte chunks, not lines, so no wire cap applies to a line.
 pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The Claude CLI's own stream-json line limit (268,435,456 characters in

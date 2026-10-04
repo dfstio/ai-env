@@ -4,8 +4,9 @@
 //! A VM restored from the image snapshot keeps the snapshot's wall clock and
 //! the snapshot's RNG state, identically in every clone. S3 v0 therefore
 //! MEASURES the clock (guest time, the PL031 RTC, the payload's `created`)
-//! and only steps it under `--clock forward`, which S6 enables once its
-//! `clock-after-resume` probe has data. Entropy: `/run` mixes per-VM material
+//! and only steps it under `--clock forward`. Plan S6 D7: `--clock measure`
+//! stays; S6's `clock-after-resume` probe measures the drift, and a
+//! follow-up decides only beyond ±2 s. Entropy: `/run` mixes per-VM material
 //! into `/dev/urandom` and attempts `RNDRESEEDCRNG` (needs CAP_SYS_ADMIN;
 //! logged, never fatal); the boot nonce does not depend on either.
 //!
@@ -122,6 +123,10 @@ pub struct ClockReport {
     /// The forward step taken (`--clock forward` only), or why it failed.
     pub stepped_to: Option<u64>,
     pub step_error: Option<String>,
+    /// CLOCK_MONOTONIC and CLOCK_BOOTTIME (Linux only) in ms: across a
+    /// suspend, how far each jumped (the detach graces run on the first).
+    pub monotonic_ms: Option<u64>,
+    pub boottime_ms: Option<u64>,
 }
 
 /// What the kernel side of a hook needs. [`RealSys`] is the machine;
@@ -139,6 +144,14 @@ pub trait SysOps: Send + Sync {
     /// Effective capability mask (None off Linux).
     fn cap_eff(&self) -> Option<u64>;
     fn set_clock(&self, secs: u64) -> Result<(), String>;
+    /// CLOCK_MONOTONIC in ms (a machine without one, or a fake, says None).
+    fn monotonic_ms(&self) -> Option<u64> {
+        None
+    }
+    /// CLOCK_BOOTTIME in ms (Linux; None elsewhere).
+    fn boottime_ms(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Measure (and under `forward`, step) the clock; never fails.
@@ -160,6 +173,8 @@ pub fn clock_report(sys: &dyn SysOps, hook: &'static str, mode: ClockMode, creat
         settable,
         stepped_to: None,
         step_error: None,
+        monotonic_ms: sys.monotonic_ms(),
+        boottime_ms: sys.boottime_ms(),
     };
     if mode == ClockMode::Forward {
         if let Some(target) = decide_step(guest_s, rtc_s, created) {
@@ -252,6 +267,25 @@ impl SysOps for RealSys {
     fn set_clock(&self, _secs: u64) -> Result<(), String> {
         Err("stepping the clock is Linux-only".into())
     }
+
+    fn monotonic_ms(&self) -> Option<u64> {
+        clock_ms(libc::CLOCK_MONOTONIC)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn boottime_ms(&self) -> Option<u64> {
+        clock_ms(libc::CLOCK_BOOTTIME)
+    }
+}
+
+/// `clock_gettime(clock)` in whole milliseconds.
+fn clock_ms(clock: libc::clockid_t) -> Option<u64> {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid timespec on the stack; the clock id is a libc constant.
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+        return None;
+    }
+    Some(u64::try_from(ts.tv_sec).ok()?.saturating_mul(1000).saturating_add(u64::try_from(ts.tv_nsec).ok()? / 1_000_000))
 }
 
 /// Facts logged once at startup (the build log and CloudWatch carry them):
@@ -278,6 +312,94 @@ pub struct BootReport {
     pub machine_id: &'static str,
     pub boot_id: Option<String>,
     pub guest_s: u64,
+    pub nf_tables: NftEvidence,
+}
+
+/// The `/proc/kallsyms` names [`NftEvidence`] counts (plan S6, critic L6).
+pub const NFT_SYMBOLS: [&str; 4] = ["nft_", "nf_tables", "xt_owner", "nft_meta"];
+
+/// Whether this kernel has nf_tables (the D1-B fallback needs it), read
+/// without any capability: symbol NAMES in `/proc/kallsyms` are readable
+/// without CAP_SYSLOG (only the addresses read as zero), and `/proc/modules`
+/// lists loaded modules. Built-in code shows in the first only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NftEvidence {
+    /// How many symbol names contain each of [`NFT_SYMBOLS`] (`None`: unreadable).
+    pub kallsyms: Option<BTreeMap<&'static str, usize>>,
+    /// The `nf_*`, `nft_*`, `nfnetlink*`, `x_tables` and `xt_*` entries of `/proc/modules`, names only (`None`: unreadable).
+    pub modules: Option<Vec<String>>,
+}
+
+/// Count the symbol names (the third field of each line) containing each of
+/// [`NFT_SYMBOLS`].
+#[must_use]
+pub fn count_nft_symbols(lines: impl Iterator<Item = String>) -> BTreeMap<&'static str, usize> {
+    let mut counts: BTreeMap<&'static str, usize> = NFT_SYMBOLS.iter().map(|n| (*n, 0)).collect();
+    for line in lines {
+        let Some(name) = line.split_whitespace().nth(2) else { continue };
+        for needle in NFT_SYMBOLS {
+            if name.contains(needle) {
+                *counts.entry(needle).or_default() += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// The prefixes of netfilter's table modules (nf_tables, nf_conntrack,
+/// nft_chain_nat, nfnetlink_queue, xt_owner); `x_tables` itself is matched
+/// whole. A bare `nf` would take nfs, nfsd, nfit and nfc too.
+const NF_MODULE_PREFIXES: [&str; 4] = ["nf_", "nft_", "nfnetlink", "xt_"];
+
+/// The module names of a `/proc/modules` text that belong to netfilter's
+/// tables: `nf_*`, `nft_*`, `nfnetlink*`, `x_tables` and `xt_*`.
+#[must_use]
+pub fn nf_modules(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|n| *n == "x_tables" || NF_MODULE_PREFIXES.iter().any(|p| n.starts_with(p)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// [`NftEvidence`] from `<proc>/kallsyms` (streamed: it is megabytes) and `<proc>/modules`.
+#[must_use]
+pub fn nft_evidence(proc: &Path) -> NftEvidence {
+    use std::io::BufRead;
+    let kallsyms = std::fs::File::open(proc.join("kallsyms")).ok().map(|f| count_nft_symbols(std::io::BufReader::new(f).lines().map_while(std::result::Result::ok)));
+    let modules = std::fs::read_to_string(proc.join("modules")).ok().map(|t| nf_modules(&t));
+    NftEvidence { kallsyms, modules }
+}
+
+/// `(real, effective)` uid of a `/proc/<pid>/status` text.
+#[must_use]
+pub fn parse_uids(status: &str) -> Option<(u32, u32)> {
+    let mut f = status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace();
+    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+}
+
+/// Is this `/proc/<pid>/status` text a process that still runs (not a
+/// zombie: it holds nothing and cannot be killed) whose real and effective
+/// uid are `uid`?
+#[must_use]
+pub fn is_running_as(status: &str, uid: u32) -> bool {
+    let dead = status.lines().find_map(|l| l.strip_prefix("State:")).and_then(|v| v.trim_start().chars().next()).is_some_and(|c| c == 'Z' || c == 'X');
+    !dead && parse_uids(status) == Some((uid, uid))
+}
+
+/// The pids under `proc` (numeric entries only) that [`is_running_as`]
+/// `uid`, ascending; a process that exits meanwhile is skipped. The spawn
+/// manager's idle sweep re-checks each one after opening a pidfd.
+#[must_use]
+pub fn pids_of_uid(proc: &Path, uid: u32) -> Vec<u32> {
+    let Ok(rd) = std::fs::read_dir(proc) else { return Vec::new() };
+    let mut pids: Vec<u32> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).and_then(|n| n.parse().ok()))
+        .filter(|pid: &u32| std::fs::read_to_string(proc.join(pid.to_string()).join("status")).is_ok_and(|s| is_running_as(&s, uid)))
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 fn read_trim(path: impl AsRef<Path>) -> Option<String> {
@@ -310,6 +432,7 @@ pub fn boot_report(sys: &dyn SysOps) -> BootReport {
         machine_id,
         boot_id: read_trim("/proc/sys/kernel/random/boot_id"),
         guest_s: sys.now().0,
+        nf_tables: nft_evidence(Path::new("/proc")),
     }
 }
 
@@ -880,5 +1003,97 @@ mod tests {
             assert_eq!(r["unsupported"], true, "{r}");
         }
         assert!(run_report("terminate", None)["microvm_id"].is_null());
+    }
+
+    #[test]
+    fn clock_report_carries_monotonic_and_boottime() {
+        let fake = serde_json::to_string(&clock_report(&fake(1, None), "resume", ClockMode::Measure, None)).unwrap();
+        assert!(fake.contains("\"monotonic_ms\":null") && fake.contains("\"boottime_ms\":null"), "a fake has neither: {fake}");
+        let r = clock_report(&RealSys, "resume", ClockMode::Measure, None);
+        let first = r.monotonic_ms.expect("CLOCK_MONOTONIC on Linux and macOS");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = RealSys.monotonic_ms().unwrap();
+        assert!(second >= first + 15, "{first} then {second}");
+        assert_eq!(r.boottime_ms.is_some(), cfg!(target_os = "linux"), "CLOCK_BOOTTIME on Linux only: {r:?}");
+        if let (Some(m), Some(b)) = (r.monotonic_ms, r.boottime_ms) {
+            assert!(b + 1000 >= m, "boottime counts at least what monotonic does: {r:?}");
+        }
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.starts_with("{\"hook\":\"resume\",\"mode\":\"measure\",\"guest_s\":") && json.contains("\"monotonic_ms\":"), "the old fields first, unchanged: {json}");
+    }
+
+    /// A `/proc/kallsyms` excerpt as uid 1000 reads it (kptr_restrict: zero
+    /// addresses, names intact); the addresses are built here, not written out.
+    fn kallsyms() -> String {
+        let z = "0".repeat(16);
+        ["T nft_do_chain", "t nft_meta_get_eval\t[nft_meta_bridge]", "T nf_tables_newrule", "t owner_mt\t[xt_owner]", "d xt_owner_mt_reg\t[xt_owner]", "T tcp_v4_connect", "T"].iter().map(|l| format!("{z} {l}\n")).collect()
+    }
+
+    /// A `/proc/modules` excerpt: netfilter's tables, and modules that only
+    /// share their first letters (NFS, the NVDIMM driver, NFC).
+    fn modules() -> String {
+        let z = format!("0x{}", "0".repeat(16));
+        ["nf_tables 307200 0 -", "nfsd 856064 0 -", "nft_chain_nat 16384 0 -", "nfs 413696 0 -", "nfs_acl 16384 1 nfsd,", "nfnetlink 20480 1 nf_tables,", "nfit 69632 0 -", "nfc 135168 0 -", "x_tables 53248 1 xt_owner,", "xt_owner 16384 0 -", "ip_tables 32768 0 -", "virtio_net 61440 0 -"].iter().map(|l| format!("{l} Live {z}\n")).collect()
+    }
+
+    #[test]
+    fn nft_symbols_and_modules_are_counted_by_name() {
+        let counts = count_nft_symbols(kallsyms().lines().map(str::to_string));
+        assert_eq!(counts.get("nft_"), Some(&2), "nft_do_chain, nft_meta_get_eval: {counts:?}");
+        assert_eq!(counts.get("nf_tables"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("xt_owner"), Some(&1), "the symbol name, not the [module] tag: {counts:?}");
+        assert_eq!(counts.get("nft_meta"), Some(&1), "{counts:?}");
+        assert_eq!(count_nft_symbols(std::iter::empty()).values().sum::<usize>(), 0);
+        assert_eq!(nf_modules(&modules()), ["nf_tables", "nft_chain_nat", "nfnetlink", "x_tables", "xt_owner"], "never nfs, nfsd, nfs_acl, nfit or nfc");
+        assert!(nf_modules("").is_empty());
+    }
+
+    #[test]
+    fn nft_evidence_reads_a_planted_proc_and_says_none_when_unreadable() {
+        let t = tempfile::tempdir().unwrap();
+        let (k, m) = (kallsyms(), modules());
+        plant_proc(t.path(), &[("kallsyms", k.as_bytes()), ("modules", m.as_bytes())]);
+        let e = nft_evidence(&t.path().join("proc"));
+        assert_eq!(e.kallsyms.as_ref().and_then(|k| k.get("nf_tables")), Some(&1));
+        assert_eq!(e.modules.as_deref().map(<[String]>::len), Some(5));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.starts_with("{\"kallsyms\":{\"nf_tables\":1,\"nft_\":2,\"nft_meta\":1,\"xt_owner\":1},\"modules\":[\"nf_tables\""), "{json}");
+        assert_eq!(nft_evidence(&t.path().join("absent")), NftEvidence { kallsyms: None, modules: None });
+        let boot = serde_json::to_string(&boot_report(&RealSys)).unwrap();
+        assert!(boot.starts_with("{\"pid\":") && boot.contains("\"nf_tables\":{\"kallsyms\":"), "{boot}");
+        if !cfg!(target_os = "linux") {
+            assert!(boot.contains("\"nf_tables\":{\"kallsyms\":null,\"modules\":null}"), "no /proc here: {boot}");
+        }
+    }
+
+    #[test]
+    fn uids_are_read_from_proc_status() {
+        assert_eq!(parse_uids("Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"), Some((1000, 1000)));
+        assert_eq!(parse_uids("Uid:\t1000\t0\t0\t0\n"), Some((1000, 0)));
+        assert_eq!(parse_uids("Uid:\t1000\n"), None);
+        assert_eq!(parse_uids("Name:\tx\n"), None);
+        let t = tempfile::tempdir().unwrap();
+        let status = |r: u32, e: u32| format!("Name:\tx\nState:\tS (sleeping)\nUid:\t{r}\t{e}\t{e}\t{e}\n");
+        let (agent, root, setuid, other) = (status(1000, 1000), status(0, 0), status(1000, 0), status(1001, 1001));
+        let zombie = agent.replace("S (sleeping)", "Z (zombie)");
+        let no_state = "Name:\tx\nUid:\t1000\t1000\t1000\t1000\n";
+        assert!(is_running_as(&agent, 1000) && is_running_as(no_state, 1000) && !is_running_as(&zombie, 1000) && !is_running_as(&setuid, 1000));
+        plant_proc(
+            t.path(),
+            &[
+                ("42/status", agent.as_bytes()),
+                ("7/status", agent.as_bytes()),
+                ("1/status", root.as_bytes()),
+                ("43/status", setuid.as_bytes()),
+                ("44/status", other.as_bytes()),
+                ("46/status", zombie.as_bytes()),
+                ("self/status", agent.as_bytes()),
+                ("+5/status", agent.as_bytes()),
+            ],
+        );
+        std::fs::create_dir_all(t.path().join("proc/45")).unwrap();
+        assert_eq!(pids_of_uid(&t.path().join("proc"), 1000), [7, 42], "real and effective, running (46 is a zombie), numeric entries only, ascending");
+        assert_eq!(pids_of_uid(&t.path().join("proc"), 0), [1]);
+        assert!(pids_of_uid(&t.path().join("absent"), 1000).is_empty());
     }
 }

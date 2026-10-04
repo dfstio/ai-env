@@ -335,13 +335,44 @@ pub enum VmCmd {
         #[arg(long)]
         json: bool,
     },
-    /// GET /health through the endpoint (a 5-minute Port(8080) token)
+    /// GET /health through the endpoint (a 5-minute Port(8080) token); --detail reads /health/detail with the session bearer
     Health {
         /// MicroVM id
         id: String,
+        /// GET /health/detail (guard, sockets, spawns, listeners; needs the row's session token)
+        #[arg(long)]
+        detail: bool,
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+    },
+    /// Run a command in the VM as the agent (uid 1000) over /agent; stdio is byte-exact, the exit status is the command's
+    Exec {
+        /// MicroVM id (a VM `vm run` started: its row holds the session token)
+        id: String,
+        /// Working directory in the VM (absolute; created as the agent; default its HOME)
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<String>,
+        /// An environment variable for the command (repeatable; never AWS_*, CLAUDECODE, NODE_OPTIONS or a TOKEN/KEY/SECRET/PASSWORD name)
+        #[arg(long = "env", value_name = "K=V")]
+        env: Vec<String>,
+        /// Seconds the command survives a lost connection before it is stopped (default 60)
+        #[arg(long, value_name = "S", value_parser = clap::value_parser!(u32).range(1..=86_400))]
+        detach_grace: Option<u32>,
+        /// The command and its arguments (after --)
+        #[arg(last = true, required = true, value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+    /// Reattach to a running command (the newest attachment wins; the previous client exits 8). A terminal's input feeds the command's stdin (Ctrl-D closes it for good); any other stdin is not read, and the command's stdin is left as it is
+    Attach {
+        /// MicroVM id
+        id: String,
+        /// The spawn's id (printed by vm exec on stderr)
+        #[arg(long, value_name = "UUID")]
+        spawn: String,
+        /// Replay stdout from this seq (default: the oldest the VM still holds; a seq past the end shows what the command prints from then on)
+        #[arg(long, value_name = "N")]
+        from_seq: Option<u64>,
     },
     /// Mint an endpoint token for one port; the value is printed only with --reveal
     Token {
@@ -425,6 +456,9 @@ pub enum VmCmd {
         /// Leave the VM running
         #[arg(long)]
         keep: bool,
+        /// Also run `claude --version` and `id -u` over /agent (S6) and check them
+        #[arg(long)]
+        exec: bool,
         /// One JSON record on stdout (the step lines go to stderr)
         #[arg(long)]
         json: bool,

@@ -6,7 +6,8 @@
 //! (`vm/lab.rs`) against the file-backed fake of the debug-build knob
 //! `AI_ENV_BRIDGE_LAB_FAKE_API`. S5: the egress echo gate in-process
 //! (`vm/egress.rs`) and `ai-env egress|proxy …` as processes over the fake
-//! aws CLI (`vm/egress_cli.rs`).
+//! aws CLI (`vm/egress_cli.rs`). S6: `ai-env vm exec|attach|…` as processes
+//! (`vm/exec_cli.rs`) over the fake endpoint (`common/fake_endpoint.rs`).
 //! Each area lives in its own file under tests/vm/ (declared with `#[path]`,
 //! so the undeclared-test lint only sees this root). Nothing here touches
 //! AWS, the real bridge directory or the process environment; polls are
@@ -28,3 +29,7 @@ mod shell;
 mod egress;
 #[path = "vm/egress_cli.rs"]
 mod egress_cli;
+#[path = "vm/exec_cli.rs"]
+mod exec_cli;
+#[path = "common/fake_endpoint.rs"]
+mod fake_endpoint;

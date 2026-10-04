@@ -10,7 +10,7 @@
 //! client is `vm::client::SdkMicrovmApi`.
 use crate::bridge::config::REGION;
 use crate::bridge::errors::BridgeError;
-use crate::wire::frame::{Health, HealthStatus, RunHookPayload};
+use crate::wire::frame::{Health, HealthDetail, HealthStatus, RunHookPayload};
 use crate::wire::redact::Secret;
 use crate::wire::time::unix_now;
 use aws_sdk_lambdamicrovms::error::BuildError;
@@ -264,6 +264,18 @@ pub trait MicrovmApi: Send + Sync {
     fn list_managed_images(&self) -> impl Future<Output = Result<Vec<ManagedImage>, BridgeError>> + Send;
 }
 
+/// One `GET https://<endpoint>/health/detail` through the proxy (S6, bearer only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthDetailReply {
+    pub status: u16,
+    pub proxy_error: Option<String>,
+    pub retry_after_s: Option<u64>,
+    /// The parsed body of a 200.
+    pub detail: Option<HealthDetail>,
+    /// At most 512 bytes of a non-200 body, scrubbed.
+    pub body: String,
+}
+
 /// The MicroVM endpoint (data plane), behind a trait for the fakes.
 pub trait EndpointClient: Send + Sync {
     /// `GET https://<endpoint>/health` with `x-aws-proxy-auth: <token>` and
@@ -272,6 +284,15 @@ pub trait EndpointClient: Send + Sync {
     /// failure (connect, reset, timeout) the caller may retry; any other
     /// `Err` is final (TLS verification, a refused host).
     fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> impl Future<Output = Result<HealthReply, BridgeError>> + Send;
+
+    /// `GET https://<endpoint>/health/detail` with the token headers (port
+    /// 8080) and `Authorization: Bearer <session token>` (S6). Errors as
+    /// [`Self::get_health`]. The default (a test double that cannot) is a
+    /// final `Sdk { op: "health_detail" }`.
+    fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &Secret<String>) -> impl Future<Output = Result<HealthDetailReply, BridgeError>> + Send {
+        let _ = (endpoint, token, bearer);
+        async { Err(BridgeError::Sdk { op: "health_detail", message: "this endpoint client cannot read /health/detail".into() }) }
+    }
 }
 
 /// `IdlePolicy` with every required field set — `IdlePolicy::builder().build()`
@@ -342,6 +363,8 @@ pub enum Call {
     ListImageVersions(String),
     ListImages,
     Health { endpoint: String, port: u16 },
+    /// `GET /health/detail` (S6).
+    HealthDetail { endpoint: String, port: u16 },
 }
 
 /// A scripted failure, serialisable so the file-backed fake can queue it.
@@ -441,6 +464,14 @@ pub struct FakeState {
     pub get_egress_echo: Option<Vec<String>>,
     pub image: Option<ImageInfo>,
     pub versions: Vec<ImageVersion>,
+    /// The `Retry-After` a scripted 429 carries; `None` = no header (the
+    /// documented form: the client then backs off exponentially) (S6).
+    #[serde(default = "default_retry_after_429")]
+    pub retry_after_429: Option<u64>,
+}
+
+fn default_retry_after_429() -> Option<u64> {
+    Some(1)
 }
 
 /// The image the fakes serve unless told otherwise.
@@ -459,6 +490,7 @@ impl FakeState {
                 latest_failed: None,
             }),
             versions: vec![ImageVersion { version: "1.0".into(), state: "SUCCESSFUL".into(), status: "ACTIVE".into(), memory_mib: Some(2048), created_at_unix: Some(1_789_804_800) }],
+            retry_after_429: default_retry_after_429(),
             ..FakeState::default()
         }
     }
@@ -702,36 +734,49 @@ impl FakeState {
         Ok(vec![ManagedImage { arn: format!("arn:aws:lambda:{REGION}:aws:microvm-image:al2023-1") }])
     }
 
-    /// The fake endpoint: the proxy's checks, then the shim's `/health`.
-    pub fn get_health(&mut self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
-        self.calls.push(Call::Health { endpoint: endpoint.to_string(), port: port_header });
-        self.fail("health", "health")?;
-        let unauthorized = || HealthReply { status: 403, proxy_error: Some("UNAUTHORIZED".into()), retry_after_s: None, health: None, body: String::new() };
+    /// The proxy's part of every fake endpoint request (shared by
+    /// [`Self::get_health`], [`Self::get_health_detail`] and the tests' fake
+    /// `/agent` endpoint): the VM of `endpoint` and a token valid for it, for
+    /// `port_header` and now; a SUSPENDED VM with auto-resume is resumed (the
+    /// platform holds the request through `/resume`). `Err` is the proxy's
+    /// own answer: 403 `UNAUTHORIZED`, 502 `BAD_GATEWAY` / `MICROVM_SUSPENDED`.
+    pub fn endpoint_check(&mut self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<String, Box<HealthReply>> {
+        let refuse = |status: u16, err: &str| Box::new(HealthReply { status, proxy_error: Some(err.into()), retry_after_s: None, health: None, body: String::new() });
         self.settle();
         let Some(id) = self.vms.values().find(|v| v.endpoint == endpoint).map(|v| v.id.clone()) else {
-            return Ok(unauthorized());
+            return Err(refuse(403, "UNAUTHORIZED"));
         };
         let now = unix_now() + self.clock_offset_s;
         let valid = token.headers.get(TOKEN_HEADER).and_then(|t| Self::parse_token(t.expose())).is_some_and(|(tid, tport, exp)| tid == id && tport == port_header && port_header == token.port && now < exp);
         if !valid {
-            return Ok(unauthorized());
+            return Err(refuse(403, "UNAUTHORIZED"));
         }
         let vm = self.vms.get_mut(&id).expect("found above");
         match vm.state {
-            VmState::Terminating | VmState::Terminated | VmState::Pending => {
-                return Ok(HealthReply { status: 502, proxy_error: Some("BAD_GATEWAY".into()), retry_after_s: None, health: None, body: String::new() });
-            }
+            VmState::Terminating | VmState::Terminated | VmState::Pending => return Err(refuse(502, "BAD_GATEWAY")),
             VmState::Suspended | VmState::Suspending if vm.idle.is_some_and(|i| i.auto_resume) => vm.state = VmState::Running,
-            VmState::Suspended | VmState::Suspending => {
-                return Ok(HealthReply { status: 502, proxy_error: Some("MICROVM_SUSPENDED".into()), retry_after_s: None, health: None, body: String::new() });
-            }
+            VmState::Suspended | VmState::Suspending => return Err(refuse(502, "MICROVM_SUSPENDED")),
             _ => {}
         }
-        if let Some(status) = self.health_script.get_mut(&id).and_then(VecDeque::pop_front) {
-            if status != 200 {
-                let retry_after_s = (status == 429).then_some(1);
-                return Ok(HealthReply { status, proxy_error: None, retry_after_s, health: None, body: String::new() });
-            }
+        Ok(id)
+    }
+
+    /// A scripted status for `id`'s next endpoint request (`None` = the normal answer).
+    fn scripted(&mut self, id: &str) -> Option<HealthReply> {
+        let status = self.health_script.get_mut(id).and_then(VecDeque::pop_front)?;
+        (status != 200).then(|| HealthReply { status, proxy_error: None, retry_after_s: if status == 429 { self.retry_after_429 } else { None }, health: None, body: String::new() })
+    }
+
+    /// The fake endpoint: the proxy's checks, then the shim's `/health`.
+    pub fn get_health(&mut self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
+        self.calls.push(Call::Health { endpoint: endpoint.to_string(), port: port_header });
+        self.fail("health", "health")?;
+        let id = match self.endpoint_check(endpoint, token, port_header) {
+            Ok(id) => id,
+            Err(refusal) => return Ok(*refusal),
+        };
+        if let Some(r) = self.scripted(&id) {
+            return Ok(r);
         }
         let mut health = self.health_override.get(&id).cloned().unwrap_or_else(|| self.default_health(&id));
         let served = self.pre_run_served.entry(id.clone()).or_default();
@@ -741,6 +786,44 @@ impl FakeState {
             health = Health { run_hook_seen: false, owner: None, created: None, boot_nonce: None, microvm_id: None, uptime_s: 0, ..health };
         }
         Ok(HealthReply { status: 200, proxy_error: None, retry_after_s: None, health: Some(health), body: String::new() })
+    }
+
+    /// The fake endpoint's `/health/detail`: the proxy's checks, then the
+    /// bearer (the VM's session token, whose commitment is in its payload).
+    pub fn get_health_detail(&mut self, endpoint: &str, token: &AuthToken, bearer: &Secret<String>) -> Result<HealthDetailReply, BridgeError> {
+        self.calls.push(Call::HealthDetail { endpoint: endpoint.to_string(), port: token.port });
+        self.fail("health_detail", "health_detail")?;
+        let as_detail = |r: HealthReply| HealthDetailReply { status: r.status, proxy_error: r.proxy_error, retry_after_s: r.retry_after_s, detail: None, body: r.body };
+        let id = match self.endpoint_check(endpoint, token, token.port) {
+            Ok(id) => id,
+            Err(refusal) => return Ok(as_detail(*refusal)),
+        };
+        if let Some(r) = self.scripted(&id) {
+            return Ok(as_detail(r));
+        }
+        let spec = self.tokens.iter().find(|(_, v)| v.as_str() == id).and_then(|(ct, _)| self.specs.iter().find(|s| &s.client_token == ct));
+        let payload = spec.and_then(|s| RunHookPayload::from_json(&s.run_hook_payload).ok());
+        if !payload.is_some_and(|p| p.matches(bearer.expose().as_bytes())) {
+            return Ok(HealthDetailReply { status: 401, proxy_error: None, retry_after_s: None, detail: None, body: "ai-env: bearer required\n".into() });
+        }
+        let health = self.health_override.get(&id).cloned().unwrap_or_else(|| self.default_health(&id));
+        let detail = HealthDetail {
+            health,
+            image_version: self.vms.get(&id).map(|v| v.image_version.clone()),
+            hook_source: "peer".into(),
+            agent_guard: "on".into(),
+            refused_peers: BTreeMap::new(),
+            hook_peers: BTreeMap::new(),
+            hook_refusals: BTreeMap::new(),
+            sockets_open: 0,
+            sockets_authenticated: 0,
+            spawns: Vec::new(),
+            has_credentials: false,
+            clock: None,
+            listeners: Vec::new(),
+            listeners_omitted: 0,
+        };
+        Ok(HealthDetailReply { status: 200, proxy_error: None, retry_after_s: None, detail: Some(detail), body: String::new() })
     }
 
     /// What the shim would answer: owner and created from the VM's own payload.
@@ -757,6 +840,7 @@ impl FakeState {
             boot_nonce: Some(hex::encode(&crate::wire::frame::commitment_hex(id.as_bytes()).as_bytes()[..16])),
             run_hook_seen: true,
             uptime_s: 1,
+            wire: Some(crate::wire::frame::WIRE_VERSION),
         }
     }
 }
@@ -901,6 +985,10 @@ impl MicrovmApi for FakeMicrovmApi {
 impl EndpointClient for FakeMicrovmApi {
     async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
         self.state().get_health(endpoint, token, port_header)
+    }
+
+    async fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &Secret<String>) -> Result<HealthDetailReply, BridgeError> {
+        self.state().get_health_detail(endpoint, token, bearer)
     }
 }
 

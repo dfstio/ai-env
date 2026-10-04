@@ -68,6 +68,7 @@ impl World {
             .env("AI_ENV_BRIDGE_DIR", self.bridge())
             .env("AI_ENV_DIR", self.root().join("keys"))
             .env_remove("AI_ENV_BRIDGE_CONFIG")
+            .env_remove("AI_ENV_BRIDGE_TRACE")
             .env_remove("RUST_LOG")
             .stdin(Stdio::null());
         for (k, _) in std::env::vars_os() {
@@ -170,6 +171,7 @@ pub fn foreign_vm(n: u64, owner: Option<&str>, state: VmState, age_s: i64) -> (V
         boot_nonce: Some(format!("{n:032x}")),
         run_hook_seen: true,
         uptime_s: 1,
+        wire: None,
     });
     (vm, health)
 }

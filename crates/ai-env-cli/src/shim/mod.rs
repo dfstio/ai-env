@@ -4,10 +4,12 @@
 //! Two roles (see `init`): as PID 1, or with the hidden `--supervise`, the
 //! process is a signal-forwarding, orphan-reaping init that spawns the same
 //! binary as the worker; otherwise it is the worker. The worker binds three
-//! listeners — hooks (`hooks`, 9000), app (`/health`, 8080; `/agent` in S6)
-//! and code (9418, a 404 placeholder until S8/S9) — probes `claude
-//! --version` in the background (`/ready` waits for it), and shuts down
-//! gracefully on SIGTERM/SIGINT/SIGQUIT or when its init dies.
+//! listeners — hooks (`hooks`, 9000), app (`/health`, `/agent` and the
+//! bearer-only `/health/detail`, 8080) and code (9418, bearer-only; its
+//! routes arrive in S8/S9) — probes `claude --version` in the background
+//! (`/ready` waits for it), and shuts down gracefully on SIGTERM/SIGINT/SIGQUIT
+//! or when its init dies: the `/agent` sockets are closed and every spawn's
+//! process group is stopped before the servers end.
 //!
 //! Every log line goes through `errln!`: stderr is whatever PID 1 was
 //! given, and a reader that went away must not panic a hook (`eprintln!`
@@ -28,10 +30,15 @@ macro_rules! errln {
     }};
 }
 
+pub mod agent;
+pub mod auth;
 pub mod code;
 pub mod health;
 pub mod hooks;
 pub mod init;
+pub mod peer;
+pub mod replay;
+pub mod spawn;
 pub mod state;
 pub mod sys;
 pub mod validate;
@@ -66,15 +73,18 @@ pub struct ShimArgs {
     /// gid the agent runs as
     #[arg(long, default_value_t = 1000)]
     pub gid: u32,
-    /// Echo mode for local transport tests
-    #[arg(long)]
-    pub echo: bool,
     /// Delay the /run hook response by S seconds (probe; 0–25, the hook budget is 30)
     #[arg(long, value_name = "S", value_parser = clap::value_parser!(u64).range(0..=25))]
     pub delay_run: Option<u64>,
-    /// Hook source policy: log every origin (default) or refuse runtime hooks from this VM itself
+    /// Hook source policy: log every origin (default), refuse runtime hooks from this VM's addresses (enforce), or from local agent-uid sockets (peer; Linux)
     #[arg(long, value_enum, default_value_t = hooks::HookSource::Log)]
     pub hook_source: hooks::HookSource,
+    /// Peer guard on the app and code ports (default: on as root on Linux, else off)
+    #[arg(long, value_enum)]
+    pub agent_guard: Option<peer::AgentGuard>,
+    /// stdout window per spawn in bytes (tests)
+    #[arg(long, value_name = "BYTES", hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+    pub agent_window_bytes: Option<u64>,
     /// Clock handling on /run and /resume: measure only (default) or step forward to the RTC
     #[arg(long, value_enum, default_value_t = sys::ClockMode::Measure)]
     pub clock: sys::ClockMode,
@@ -176,18 +186,37 @@ impl Signals {
     }
 }
 
+/// Peer mode and the agent guard read `/proc/net/tcp`: off Linux they are
+/// refused at startup (fail closed), never silently off.
+fn check_guard_host(hook_source: hooks::HookSource, guard: peer::AgentGuard) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    if hook_source == hooks::HookSource::Peer {
+        return Err(CliError::Usage("--hook-source peer needs Linux (/proc/net/tcp)".into()));
+    }
+    if guard == peer::AgentGuard::On {
+        return Err(CliError::Usage("--agent-guard on needs Linux (/proc/net/tcp)".into()));
+    }
+    Ok(())
+}
+
 async fn serve(args: ShimArgs) -> Result<()> {
     // First, before binding or spawning anything: from here on a signal is
     // tokio's, and children get default dispositions back at exec.
     let signals = Signals::register()?;
+    let agent_guard = args.agent_guard.unwrap_or_else(peer::AgentGuard::default_for_host);
+    check_guard_host(args.hook_source, agent_guard)?;
     let opts = health::ShimOpts {
         hook_source: args.hook_source,
+        agent_guard,
         clock: args.clock,
         delay_run: args.delay_run.unwrap_or(0),
         fs_root: args.fs_root.clone(),
         home: args.home.clone(),
         uid: args.uid,
         gid: args.gid,
+        window_bytes: args.agent_window_bytes.unwrap_or(crate::wire::frame::STDOUT_WINDOW_BYTES),
     };
     let probe = health::ProbeSpec::for_agent(args.uid, args.gid);
     let state = Arc::new(health::ShimState::with(args.claude.clone(), opts, probe, Arc::new(sys::RealSys)));
@@ -200,6 +229,8 @@ async fn serve(args: ShimArgs) -> Result<()> {
     errln!("ai-env: shim {v} hooks listening on {}", hooks_l.local_addr()?);
     errln!("ai-env: shim {v} app listening on {}", app_l.local_addr()?);
     errln!("ai-env: shim {v} code listening on {}", code_l.local_addr()?);
+    errln!("ai-env: shim {v} hook-source {} agent-guard {}", args.hook_source.name(), agent_guard.name());
+    state.set_ports(health::BoundPorts { hooks: hooks_l.local_addr()?.port(), app: app_l.local_addr()?.port(), code: code_l.local_addr()?.port() });
     state.set_bound();
     errln!("ai-env: shim worker pid {} (init {})", std::process::id(), args.init_pid.map_or("none".to_string(), |p| p.to_string()));
     errln!("ai-env: boot {}", serde_json::to_string(&sys::boot_report(state.sys.as_ref())).unwrap_or_default());
@@ -211,10 +242,11 @@ async fn serve(args: ShimArgs) -> Result<()> {
     let stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
         let _ = rx.wait_for(|s| *s).await;
     };
-    let hooks_srv = axum::serve(hooks_l, hooks::router(state.clone()).into_make_service_with_connect_info::<hooks::HookPeer>())
+    // Every router sees both ends of its connections (the peer guard).
+    let hooks_srv = axum::serve(hooks_l, hooks::router(state.clone()).into_make_service_with_connect_info::<peer::Peer>())
         .with_graceful_shutdown(stopped(stop_rx.clone()));
-    let app_srv = axum::serve(app_l, health::router(state.clone())).with_graceful_shutdown(stopped(stop_rx.clone()));
-    let code_srv = axum::serve(code_l, code::router()).with_graceful_shutdown(stopped(stop_rx));
+    let app_srv = axum::serve(app_l, health::router(state.clone()).into_make_service_with_connect_info::<peer::Peer>()).with_graceful_shutdown(stopped(stop_rx.clone()));
+    let code_srv = axum::serve(code_l, code::router(state.clone()).into_make_service_with_connect_info::<peer::Peer>()).with_graceful_shutdown(stopped(stop_rx));
     let (h, a, c) = tokio::join!(hooks_srv.into_future(), app_srv.into_future(), code_srv.into_future());
     for (what, r) in [("hooks", h), ("app", a), ("code", c)] {
         r.map_err(|e| CliError::Msg(format!("shim {what} server error: {e}")))?;
@@ -277,5 +309,9 @@ async fn stop_on_signal_or_orphan(state: Arc<health::ShimState>, stop: tokio::sy
     };
     errln!("ai-env: shim stopping ({why})");
     state.set_draining();
+    // Upgraded sockets are not tracked by axum's graceful shutdown: close them,
+    // then stop every spawn's process group, before the servers end.
+    state.agents.close_all(crate::wire::frame::CLOSE_GOING_AWAY, "stopping").await;
+    state.spawns.shutdown("stop").await;
     let _ = stop.send(true);
 }

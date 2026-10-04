@@ -15,11 +15,6 @@ autotests = false
 # The only example is the negative clippy fixture, declared below; never auto-discovered.
 autoexamples = false
 
-# Dependencies pinned by the plan ahead of the stage that consumes them (see the
-# trailing comment on each line under [dependencies]); `make check-deps` runs cargo machete.
-[package.metadata.cargo-machete]
-ignored = ["hyper", "hyper-util", "http-body-util"]
-
 [lib]
 name = "ai_env_cli"
 path = "src/lib.rs"
@@ -94,12 +89,33 @@ name = "shim_local"
 path = "tests/shim_local.rs"
 required-features = ["shim"]
 
+# S6: the real shim (native, log mode) and the real `ai-env vm exec` through the tests' fake endpoint
+# (the debug-build knob AI_ENV_BRIDGE_LAB_AGENT_ADDR): transport_local + exec_local.
+[[test]]
+name = "shim_bridge_local"
+path = "tests/shim_bridge_local.rs"
+required-features = ["shim", "bridge"]
+
+# S6: the Mac's TLS policy against local listeners (openssl s_server at test time: self-signed, TLS 1.2-only),
+# the proxy environment ignored, exactly one crypto provider.
+[[test]]
+name = "tls_policy"
+path = "tests/tls_policy.rs"
+required-features = ["bridge"]
+
 # Opt-in (AI_ENV_DOCKER_TESTS=1, every test #[ignore]d): the shim inside the AL2023
 # base image and the locally built image (`make test-docker`).
 [[test]]
 name = "shim_docker"
 path = "tests/shim_docker.rs"
 required-features = ["shim"]
+
+# Opt-in (AI_ENV_DOCKER_TESTS=1, every test #[ignore]d): the real `ai-env vm exec` against the
+# locally built image through the tests' fake endpoint (`make test-docker`, after shim_docker).
+[[test]]
+name = "docker_exec"
+path = "tests/docker_exec.rs"
+required-features = ["bridge"]
 
 # Opt-in (AI_ENV_PROXY_TESTS=1, every test #[ignore]d): squid on AL2023 with the S5 proxy
 # config, reload script and allowlist (`make test-proxy`); uses the lib's log parser and hashes.
@@ -145,7 +161,7 @@ bridge = [
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 # VM side: HTTP listeners, WebSocket server via the hyper upgrade, PID-1 duties.
-shim = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:nix"]
+shim = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:nix"]
 # `make lint-negative` only: builds examples/tls_lint_negative.rs, which clippy must reject.
 lint-negative = ["bridge"]
 
@@ -188,9 +204,8 @@ rustls-pki-types = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 # shim
 axum = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
-hyper-util = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
-http-body-util = { workspace = true, optional = true } # S6 WebSocket upgrade extractor (not consumed before then; cargo-machete allowlist above)
+hyper = { workspace = true, optional = true } # S6 `/agent`: the upgrade (`hyper::upgrade::OnUpgrade`)
+hyper-util = { workspace = true, optional = true } # S6 `/agent`: `TokioIo` over the upgraded connection
 nix = { workspace = true, optional = true } # S3 PID-1 init, signals, prctl
 
 [dev-dependencies]

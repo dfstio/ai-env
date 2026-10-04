@@ -51,7 +51,7 @@ pub const SESSION_ARGV: [&str; 16] = [
 
 /// Variables a developer's shell may carry that would steer the wrapper or
 /// the fake; removed from every harness run before the test's own `envs`.
-pub const REMOVED_ENV: [&str; 39] = [
+pub const REMOVED_ENV: [&str; 41] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -64,6 +64,8 @@ pub const REMOVED_ENV: [&str; 39] = [
     "AI_ENV_BRIDGE_LAB_FAKE_API",
     "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
     "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
+    "AI_ENV_BRIDGE_LAB_AGENT_ADDR",
+    "AI_ENV_BRIDGE_TRACE",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_PROJECT_DIR_NAME",

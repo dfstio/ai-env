@@ -1,15 +1,24 @@
 //! Native shim tests (`--features shim`): the hooks, `/validate`, `/health`,
-//! the code placeholder and the two-process init, in-process (the routers on
-//! 127.0.0.1) and through the real binary. No reqwest here — the shim graph
-//! has no HTTP client — so requests are written by hand on a TcpStream. No
+//! the code placeholder, the two-process init, and (S6) the `/agent`
+//! WebSocket, the session bearer and the peer guard, in-process (the routers
+//! on 127.0.0.1) and through the real binary. No reqwest here — the shim
+//! graph has no HTTP client — so requests are written by hand on a TcpStream
+//! and the WebSocket client is tokio-tungstenite over a plain TcpStream. No
 //! test runs the real `claude` (a fake answers `--version`), steps the clock
 //! or needs root.
 use ai_env_cli::shim::health::{router, ProbeSpec, ShimOpts, ShimState};
 use ai_env_cli::shim::hooks::{self, HookPeer, HookSource, PREFIX};
+use ai_env_cli::shim::peer::{AgentGuard, Peer, DRAIN_MAX};
 use ai_env_cli::shim::sys::{ClockMode, SysOps};
-use ai_env_cli::wire::frame::{Health, HealthStatus, RunHookPayload};
+use ai_env_cli::wire::frame::{
+    ClientInfo, Deliver, ErrorCode, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, HelloErrCode, ResumePoint, ResumeStatus, Resumed, RunHookPayload, SpawnId, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL,
+    CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
+};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 use ai_env_cli::wire::pin::{render_lock, ClaudePin};
 use ai_env_cli::wire::redact::Secret;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -120,7 +129,7 @@ fn plant_vm_tree(root: &Path) {
 
 fn opts(root: Option<&Path>, source: HookSource, delay: u64) -> ShimOpts {
     let (uid, gid) = uid_gid();
-    ShimOpts { hook_source: source, clock: ClockMode::Measure, delay_run: delay, fs_root: root.map(Path::to_path_buf), home: PathBuf::from("/Users/mike"), uid, gid }
+    ShimOpts { hook_source: source, clock: ClockMode::Measure, delay_run: delay, fs_root: root.map(Path::to_path_buf), home: PathBuf::from("/Users/mike"), uid, gid, ..ShimOpts::default() }
 }
 
 /// In-process state: listeners "bound", the fake claude probed once.
@@ -132,7 +141,12 @@ async fn state_with(claude: PathBuf, o: ShimOpts) -> Arc<ShimState> {
 }
 
 async fn serve_hooks(state: Arc<ShimState>) -> SocketAddr {
-    let l = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+    serve_hooks_at(state, "0.0.0.0").await
+}
+
+/// The hooks router on `ip` (`0.0.0.0` where a test needs our own address too).
+async fn serve_hooks_at(state: Arc<ShimState>, ip: &str) -> SocketAddr {
+    let l = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
     let port = l.local_addr().unwrap().port();
     tokio::spawn(async move {
         axum::serve(l, hooks::router(state).into_make_service_with_connect_info::<HookPeer>()).await.unwrap();
@@ -144,21 +158,40 @@ async fn serve_app(state: Arc<ShimState>) -> SocketAddr {
     let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(l, router(state)).await.unwrap();
+        axum::serve(l, router(state).into_make_service_with_connect_info::<Peer>()).await.unwrap();
+    });
+    addr
+}
+
+async fn serve_code(state: Arc<ShimState>) -> SocketAddr {
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, ai_env_cli::shim::code::router(state).into_make_service_with_connect_info::<Peer>()).await.unwrap();
     });
     addr
 }
 
 /// One HTTP/1.1 request, `Connection: close`; (status, headers, body).
 async fn http(addr: SocketAddr, method: &str, path: &str, body: &[u8], content_type: Option<&str>) -> (u16, String, String) {
-    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     let ct = content_type.map_or(String::new(), |c| format!("Content-Type: {c}\r\n"));
-    let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{ct}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-    s.write_all(head.as_bytes()).await.unwrap();
-    s.write_all(body).await.unwrap();
+    http_with(addr, method, path, &ct, body).await
+}
+
+/// [`http`] with extra header lines (each ending in CRLF).
+async fn http_with(addr: SocketAddr, method: &str, path: &str, extra: &str, body: &[u8]) -> (u16, String, String) {
+    try_http_with(addr, method, path, extra, body).await.unwrap_or_else(|e| panic!("{method} {path}: {e}"))
+}
+
+/// [`http_with`], with a reset (or a refused write) as the error.
+async fn try_http_with(addr: SocketAddr, method: &str, path: &str, extra: &str, body: &[u8]) -> std::io::Result<(u16, String, String)> {
+    let mut s = tokio::net::TcpStream::connect(addr).await?;
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    s.write_all(head.as_bytes()).await?;
+    s.write_all(body).await?;
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(20), s.read_to_end(&mut buf)).await.expect("response within 20 s").unwrap();
-    split_response(&buf)
+    tokio::time::timeout(Duration::from_secs(20), s.read_to_end(&mut buf)).await.expect("response within 20 s")?;
+    Ok(split_response(&buf))
 }
 
 fn split_response(buf: &[u8]) -> (u16, String, String) {
@@ -173,8 +206,15 @@ async fn hook(addr: SocketAddr, name: &str, body: &[u8]) -> (u16, String) {
     (s, b)
 }
 
+/// The session token every `/run` payload here commits to.
+const TOKEN: &str = "test-token";
+
 fn payload_json(owner: &str) -> String {
-    RunHookPayload::new(&Secret::new("test-token".into()), owner, "2026-09-29T08:00:00Z").to_json().unwrap()
+    RunHookPayload::new(&Secret::new(TOKEN.into()), owner, "2026-09-29T08:00:00Z").to_json().unwrap()
+}
+
+fn bearer_header(token: &str) -> String {
+    format!("Authorization: Bearer {token}\r\n")
 }
 
 fn run_body(microvm: &str, payload: Option<&str>) -> Vec<u8> {
@@ -662,6 +702,45 @@ async fn validate_is_single_flight() {
     assert_eq!(s, 200, "the first validate completes: {b}");
 }
 
+/// Once `/run` was accepted `/validate` answers 409 at once and checks
+/// nothing: the agent exists from then on, and V3 and V4 read its paths as
+/// root. Here a FIFO at `<home>/.claude/settings.json` would hold V3's read
+/// (and the single-flight lock) forever, and the fake claude records any
+/// fresh `--version`. A check stuck on the FIFO blocks one of the two
+/// workers and starves the runtime's timers, so the client is a blocking
+/// socket with its own read timeout, and the test fails instead of hanging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_after_run_is_409_at_once_and_checks_nothing() {
+    let t = tempfile::tempdir().unwrap();
+    plant_vm_tree(t.path());
+    let settings = t.path().join("Users/mike/.claude/settings.json");
+    std::fs::remove_file(&settings).unwrap();
+    nix::unistd::mkfifo(&settings, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let _release = ReleaseFifo(settings);
+    let runs = t.path().join("claude-runs");
+    let state = state_with(fake_claude(t.path(), &format!("ID_FILE={}\n", runs.display())), opts(Some(t.path()), HookSource::Log, 0)).await;
+    let addr = serve_hooks(state).await;
+    assert_eq!(hook(addr, "run", &run_body("mvm-v", Some(&payload_json("mike@mbp")))).await.0, 200);
+    let probes = std::fs::read_to_string(&runs).unwrap().lines().count();
+    let started = Instant::now();
+    let (s, b) = tokio::task::spawn_blocking(move || http_sync(addr, "POST", &format!("{PREFIX}/validate"))).await.expect("an answer within the read timeout, not a check stuck on the FIFO");
+    assert_eq!(s, 409, "{b}");
+    assert!(b.contains("\"already run\"") && started.elapsed() < Duration::from_secs(2), "{b} after {:?}", started.elapsed());
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), probes, "no fresh claude --version");
+}
+
+/// Opens a FIFO's write end without waiting, and closes it, on drop: a
+/// reader stuck in open(2) on it (a check the test failed to stop) reads
+/// EOF and lets the runtime end.
+struct ReleaseFifo(PathBuf);
+
+impl Drop for ReleaseFifo {
+    fn drop(&mut self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&self.0);
+    }
+}
+
 // ---- /health after /run -----------------------------------------------------------
 
 #[tokio::test]
@@ -710,15 +789,741 @@ async fn terminate_drains() {
     assert_eq!(state.health().await.status, HealthStatus::Draining);
 }
 
+/// The code port puts the session bearer in front of every path (S6): 401
+/// before `/run`, without the bearer or with a wrong one; 404 "not
+/// implemented" behind it.
 #[tokio::test]
-async fn code_port_answers_404() {
-    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, ai_env_cli::shim::code::router()).await.unwrap() });
-    for (m, p) in [("GET", "/"), ("PUT", "/seed"), ("GET", "/bundle?since=x")] {
-        let (s, _, b) = http(addr, m, p, b"", None).await;
+async fn code_port_answers_401_then_404_with_the_bearer() {
+    let t = tempfile::tempdir().unwrap();
+    let state = state_with(fake_claude(t.path(), ""), opts(None, HookSource::Log, 0)).await;
+    let code = serve_code(state.clone()).await;
+    let hooks_addr = serve_hooks(state).await;
+    let paths = [("GET", "/"), ("PUT", "/seed"), ("GET", "/bundle?since=x")];
+    for (m, p) in paths {
+        let (s, head, b) = http_with(code, m, p, &bearer_header(TOKEN), b"").await;
+        assert_eq!(s, 401, "before /run, no commitment: {m} {p}: {b}");
+        assert!(head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}");
+    }
+    assert_eq!(hook(hooks_addr, "run", &run_body("mvm-code", Some(&payload_json("mike@mbp")))).await.0, 200);
+    for (m, p) in paths {
+        let (s, _, b) = http(code, m, p, b"x", Some("text/plain")).await;
+        assert_eq!(s, 401, "{m} {p}: {b}");
+        assert!(b.contains("unauthorized"), "{b}");
+        assert_eq!(http_with(code, m, p, &bearer_header("not-the-token"), b"").await.0, 401, "{m} {p}: a wrong token");
+        let (s, _, b) = http_with(code, m, p, &bearer_header(TOKEN), b"").await;
         assert_eq!(s, 404, "{m} {p}: {b}");
-        assert!(b.contains("not implemented"), "{b}");
+        assert!(b.contains("not implemented (S8/S9)"), "{b}");
+    }
+}
+
+// ---- S6: /agent, the session bearer, the peer guard ---------------------------------
+
+/// One in-process shim on 127.0.0.1 with OS-chosen ports: hooks, app, code.
+struct Stack {
+    state: Arc<ShimState>,
+    hooks: SocketAddr,
+    app: SocketAddr,
+    code: SocketAddr,
+    _dir: tempfile::TempDir,
+}
+
+async fn stack(o: ShimOpts) -> Stack {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(fake_claude(dir.path(), ""), o).await;
+    let (hooks, app, code) = (serve_hooks_at(state.clone(), "127.0.0.1").await, serve_app(state.clone()).await, serve_code(state.clone()).await);
+    Stack { state, hooks, app, code, _dir: dir }
+}
+
+impl Stack {
+    async fn log() -> Stack {
+        stack(opts(None, HookSource::Log, 0)).await
+    }
+
+    /// `/run` committing to [`TOKEN`], or fail-closed (no payload).
+    async fn run(&self, commit: bool) {
+        let payload = commit.then(|| payload_json("mike@mbp"));
+        assert_eq!(hook(self.hooks, "run", &run_body("mvm-agent", payload.as_deref())).await.0, 200);
+    }
+
+    /// `GET /health/detail` with the bearer.
+    async fn detail(&self) -> (HealthDetail, String) {
+        let (st, _, body) = http_with(self.app, "GET", "/health/detail", &bearer_header(TOKEN), b"").await;
+        assert_eq!(st, 200, "{body}");
+        (serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}")), body)
+    }
+
+    /// Wait (at most 5 s) until the registry counts (open, past hello) are `want`.
+    async fn wait_sockets(&self, want: (u32, u32)) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while self.state.agents.counts() != want {
+            assert!(Instant::now() < until, "sockets {:?}, want {want:?}", self.state.agents.counts());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_no_sockets(&self) {
+        self.wait_sockets((0, 0)).await;
+    }
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// A WebSocket to `/agent` over a plain TcpStream; the 101 carries no subprotocol.
+async fn ws(app: SocketAddr) -> Ws {
+    let tcp = tokio::net::TcpStream::connect(app).await.unwrap();
+    let dial = tokio_tungstenite::client_async_with_config(format!("ws://{app}/agent"), tcp, Some(ai_env_cli::wire::frame::ws_config()));
+    let (ws, resp) = tokio::time::timeout(Duration::from_secs(10), dial).await.expect("an upgrade answer within 10 s").expect("101");
+    assert!(resp.headers().get("sec-websocket-protocol").is_none(), "{resp:?}");
+    ws
+}
+
+fn hello(token: &str) -> Frame {
+    hello_resuming(token, vec![])
+}
+
+fn hello_resuming(token: &str, resume: Vec<ResumePoint>) -> Frame {
+    Frame::Hello { session_token: Secret::new(token.to_string()), client: ClientInfo { name: "shim_local".into(), version: env!("CARGO_PKG_VERSION").into(), host: "test@host".into() }, resume, idle_s: None }
+}
+
+/// Send one message within 20 s; `false` when the socket refused it (a reset).
+async fn send_msg(w: &mut Ws, m: Message) -> bool {
+    tokio::time::timeout(Duration::from_secs(20), w.send(m)).await.expect("a send within 20 s").is_ok()
+}
+
+async fn send_frame(w: &mut Ws, f: &Frame) {
+    assert!(send_msg(w, Message::from(f)).await, "the socket took {}", f.kind());
+}
+
+/// The next frame, or how the socket ended: `Err(Some(code))` after a Close
+/// (read on to the end, so the client's answer goes out), `Err(None)` after a
+/// reset or an end without one.
+async fn next_frame(w: &mut Ws) -> Result<Frame, Option<u16>> {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), w.next()).await.expect("a message within 10 s") {
+            Some(Ok(Message::Text(t))) => return Ok(Frame::from_json(t.as_str()).unwrap_or_else(|e| panic!("{e}"))),
+            Some(Ok(Message::Close(f))) => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), async { while let Some(Ok(_)) = w.next().await {} }).await;
+                return Err(f.map(|f| u16::from(f.code)));
+            }
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return Err(None),
+        }
+    }
+}
+
+/// A socket past `hello`.
+async fn ws_hello_ok(app: SocketAddr) -> Ws {
+    let mut w = ws(app).await;
+    send_frame(&mut w, &hello(TOKEN)).await;
+    match next_frame(&mut w).await {
+        Ok(Frame::HelloOk { wire, run_hook_seen, has_credentials, owner, .. }) => assert_eq!((wire, run_hook_seen, has_credentials, owner.as_deref()), (1, true, false, Some("mike@mbp"))),
+        other => panic!("hello_ok, got {other:?}"),
+    }
+    w
+}
+
+async fn ping(w: &mut Ws, ts: u64) {
+    send_frame(w, &Frame::Ping { ts }).await;
+    assert_eq!(next_frame(w).await, Ok(Frame::Pong { ts }), "the socket is up");
+}
+
+/// An upgrade request's head (no blank line): the four WebSocket headers but
+/// those named in `skip` (`connection`, `upgrade`, `version`, `key`), then `extra`.
+fn upgrade_head(addr: SocketAddr, method: &str, http: &str, skip: &[&str], extra: &[&str]) -> String {
+    let mut lines = vec![format!("{method} /agent {http}"), format!("Host: {addr}")];
+    for (name, line) in [("connection", "Connection: Upgrade"), ("upgrade", "Upgrade: websocket"), ("version", "Sec-WebSocket-Version: 13"), ("key", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==")] {
+        if !skip.contains(&name) {
+            lines.push(line.to_string());
+        }
+    }
+    lines.extend(extra.iter().map(|l| (*l).to_string()));
+    lines.join("\r\n")
+}
+
+/// One raw request; (status, head, body), the body read by its
+/// Content-Length (the server may keep the connection open).
+async fn raw(addr: SocketAddr, head: &str) -> (u16, String, String) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("{head}\r\n\r\n").as_bytes()).await.unwrap();
+    let complete = |buf: &[u8]| {
+        let text = String::from_utf8_lossy(buf);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else { return false };
+        let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+        body.len() >= len
+    };
+    let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+    while !complete(&buf) {
+        let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut chunk)).await.expect("a response within 10 s").unwrap();
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    split_response(&buf)
+}
+
+#[tokio::test]
+async fn agent_before_run_is_503_not_run_with_retry_after() {
+    let s = Stack::log().await;
+    let (st, head, body) = raw(s.app, &upgrade_head(s.app, "GET", "HTTP/1.1", &[], &[])).await;
+    assert_eq!(st, 503, "{head}{body}");
+    assert!(head.to_ascii_lowercase().contains("\r\nretry-after: 1"), "{head}");
+    assert!(body.contains("\"not_run\""), "{body}");
+    assert_eq!(s.state.agents.counts(), (0, 0), "nothing is reserved for a refused upgrade");
+}
+
+#[tokio::test]
+async fn agent_hello_after_a_fail_closed_run_is_no_commitment_4403() {
+    let s = Stack::log().await;
+    s.run(false).await;
+    let mut w = ws(s.app).await;
+    send_frame(&mut w, &hello(TOKEN)).await;
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::HelloErr { code: HelloErrCode::NoCommitment, .. })));
+    assert_eq!(next_frame(&mut w).await, Err(Some(CLOSE_HELLO_REFUSED)));
+    s.wait_no_sockets().await;
+}
+
+#[tokio::test]
+async fn agent_hello_with_another_token_is_bad_token_4403() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws(s.app).await;
+    send_frame(&mut w, &hello("not-the-token")).await;
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::HelloErr { code: HelloErrCode::BadToken, .. })));
+    assert_eq!(next_frame(&mut w).await, Err(Some(CLOSE_HELLO_REFUSED)));
+    let mut ok = ws_hello_ok(s.app).await;
+    ping(&mut ok, 1).await;
+}
+
+/// Binary messages and unknown kinds are answered and the socket stays up;
+/// `/health` and `/health/detail` answer while it is open; malformed JSON
+/// ends it with `bad_frame` and 1008.
+#[tokio::test]
+async fn agent_socket_answers_binary_unknown_and_malformed_frames() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    assert!(send_msg(&mut w, Message::binary(vec![0u8, 1, 2])).await);
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::Error { code: ErrorCode::BinaryRejected, .. })));
+    ping(&mut w, 1).await;
+    assert!(send_msg(&mut w, Message::text("{\"v\":1,\"t\":\"from_a_later_wire\",\"x\":1}")).await);
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::Error { code: ErrorCode::UnknownFrame, .. })));
+    ping(&mut w, 2).await;
+    let (st, _, body) = http(s.app, "GET", "/health", b"", None).await;
+    assert_eq!(st, 200, "/health while a socket is open: {body}");
+    let (d, _) = s.detail().await;
+    assert_eq!((d.sockets_open, d.sockets_authenticated), (1, 1));
+    assert!(send_msg(&mut w, Message::text("{\"v\":1,\"t\":\"ping\",")).await);
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::Error { code: ErrorCode::BadFrame, .. })));
+    assert_eq!(next_frame(&mut w).await, Err(Some(CLOSE_PROTOCOL)));
+    s.wait_no_sockets().await;
+}
+
+/// A message over the 16 MiB cap closes its socket (1009, or a reset when
+/// the close loses the race); the shim serves the next socket.
+#[tokio::test]
+async fn agent_message_over_16_mib_closes_1009_and_the_shim_serves_on() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    let end = if send_msg(&mut w, Message::text("x".repeat(WS_MAX_MESSAGE + 1))).await { next_frame(&mut w).await } else { Err(None) };
+    assert!(matches!(end, Err(Some(CLOSE_TOO_BIG) | None)), "{end:?}");
+    drop(w);
+    let mut again = ws_hello_ok(s.app).await;
+    ping(&mut again, 3).await;
+}
+
+/// T6.1 strict: a message over the cap ends only its socket, never the
+/// spawn attached to it. For a text and a binary message of
+/// `WS_MAX_MESSAGE + 1` bytes, each on the socket the spawn is attached to,
+/// the end is 1009 (or a reset when the close loses the race), and a new
+/// socket's hello resumes the spawn: alive, the same pid, no grace running.
+#[tokio::test]
+async fn a_spawn_survives_a_1009_close_and_resumes_on_a_new_socket() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    let (pid, _) = start(&mut w, &id, &["/bin/sleep", "30"], Some(60)).await;
+    for big in [Message::text("x".repeat(WS_MAX_MESSAGE + 1)), Message::binary(vec![b'x'; WS_MAX_MESSAGE + 1])] {
+        let what = if big.is_text() { "text" } else { "binary" };
+        let end = if send_msg(&mut w, big).await { next_frame(&mut w).await } else { Err(None) };
+        assert!(matches!(end, Err(Some(CLOSE_TOO_BIG) | None)), "{what}: {end:?}");
+        drop(w);
+        w = ws(s.app).await;
+        send_frame(&mut w, &hello_resuming(TOKEN, vec![ResumePoint { spawn_id: id.clone(), from_seq: None, err_from_seq: None }])).await;
+        match next_frame(&mut w).await {
+            Ok(Frame::HelloOk { resumed, spawns, .. }) => {
+                assert_eq!(resumed, vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }], "{what}");
+                let st = spawns.iter().find(|x| x.spawn_id == id).unwrap_or_else(|| panic!("{what}: {id} listed: {spawns:?}"));
+                assert!(st.alive && st.pid == pid, "{what}: {st:?}");
+            }
+            other => panic!("{what}: hello_ok, got {other:?}"),
+        }
+        let (d, _) = s.detail().await;
+        assert_eq!(d.spawns.iter().find(|x| x.status.spawn_id == id).map(|x| x.detach_left_s), Some(None), "{what}: attached to the new socket: {:?}", d.spawns);
+    }
+    send_frame(&mut w, &Frame::Detach { spawn_id: id, is_final: true }).await;
+    ping(&mut w, 11).await;
+    s.state.spawns.shutdown("test").await;
+}
+
+/// The upgrade checks (axum 0.8.9's order, `Connection` as a token list):
+/// 400 for each missing or wrong header and for `Connection: close`, 405 for
+/// another method, 426 for HTTP/1.0 (hyper offers no upgrade); all four
+/// right: 101 with the RFC 6455 accept key and no subprotocol.
+#[tokio::test]
+async fn agent_upgrade_negatives() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let a = s.app;
+    for (what, head) in [
+        ("no Upgrade", upgrade_head(a, "GET", "HTTP/1.1", &["upgrade"], &[])),
+        ("no Connection", upgrade_head(a, "GET", "HTTP/1.1", &["connection"], &[])),
+        ("Connection: close", upgrade_head(a, "GET", "HTTP/1.1", &["connection"], &["Connection: Upgrade, close"])),
+        ("version 8", upgrade_head(a, "GET", "HTTP/1.1", &["version"], &["Sec-WebSocket-Version: 8"])),
+        ("no key", upgrade_head(a, "GET", "HTTP/1.1", &["key"], &[])),
+    ] {
+        let (st, _, body) = raw(a, &head).await;
+        assert_eq!(st, 400, "{what}: {body}");
+    }
+    let (st, head, _) = raw(a, &upgrade_head(a, "POST", "HTTP/1.1", &[], &["Content-Length: 0"])).await;
+    assert_eq!(st, 405, "{head}");
+    assert!(head.to_ascii_lowercase().contains("\r\nallow: get"), "{head}");
+    let (st, _, body) = raw(a, &upgrade_head(a, "GET", "HTTP/1.0", &[], &[])).await;
+    assert_eq!(st, 426, "{body}");
+    let (st, head, _) = raw(a, &upgrade_head(a, "GET", "HTTP/1.1", &[], &[])).await;
+    assert_eq!(st, 101, "{head}");
+    let h = head.to_ascii_lowercase();
+    assert!(h.contains("\r\nconnection: upgrade") && h.contains("\r\nupgrade: websocket") && h.contains("\r\nsec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
+    assert!(!h.contains("sec-websocket-protocol"), "{head}");
+}
+
+/// At most MAX_UNAUTHENTICATED sockets may wait for their hello: the next
+/// upgrade gets 503 `busy`, and `busy` comes before axum's checks (agent.rs's
+/// order), so a malformed upgrade, a POST or an HTTP/1.0 one gets it too,
+/// never a 400, 405 or 426; a socket past hello frees its slot.
+#[tokio::test]
+async fn agent_upgrade_is_busy_after_max_unauthenticated() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut held = Vec::new();
+    for _ in 0..MAX_UNAUTHENTICATED {
+        let mut t = tokio::net::TcpStream::connect(s.app).await.unwrap();
+        t.write_all(format!("{}\r\n\r\n", upgrade_head(s.app, "GET", "HTTP/1.1", &[], &[])).as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(tokio::time::timeout(Duration::from_secs(10), t.read(&mut b)).await.expect("a 101 within 10 s").unwrap(), 1);
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        held.push(t);
+    }
+    s.wait_sockets((u32::try_from(MAX_UNAUTHENTICATED).unwrap(), 0)).await;
+    let a = s.app;
+    for (what, head) in [
+        ("well-formed", upgrade_head(a, "GET", "HTTP/1.1", &[], &[])),
+        ("no key", upgrade_head(a, "GET", "HTTP/1.1", &["key"], &[])),
+        ("version 8", upgrade_head(a, "GET", "HTTP/1.1", &["version"], &["Sec-WebSocket-Version: 8"])),
+        ("POST", upgrade_head(a, "POST", "HTTP/1.1", &[], &["Content-Length: 0"])),
+        ("HTTP/1.0", upgrade_head(a, "GET", "HTTP/1.0", &[], &[])),
+    ] {
+        let (st, _, body) = raw(a, &head).await;
+        assert_eq!(st, 503, "{what}: {body}");
+        assert!(body.contains("\"busy\""), "{what}: {body}");
+    }
+    drop(held);
+    s.wait_no_sockets().await;
+    let mut w = ws_hello_ok(s.app).await;
+    ping(&mut w, 10).await;
+}
+
+/// The app port: `/health` and `/agent` are public; `/health/detail` and
+/// every other path need the session bearer (401 without, and before any
+/// commitment exists); an unknown path is 404 behind it.
+#[tokio::test]
+async fn app_port_bearer() {
+    let s = Stack::log().await;
+    assert_eq!(http_with(s.app, "GET", "/health/detail", &bearer_header(TOKEN), b"").await.0, 401, "no commitment before /run");
+    s.run(true).await;
+    assert_eq!(http(s.app, "GET", "/health", b"", None).await.0, 200);
+    for (m, p, body) in [("PUT", "/transcript", &b"{}"[..]), ("GET", "/health/detail", b""), ("POST", "/seed", b"x")] {
+        let (st, head, b) = http(s.app, m, p, body, Some("application/json")).await;
+        assert_eq!(st, 401, "{m} {p}: {b}");
+        assert!(b.contains("\"unauthorized\"") && head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}{b}");
+        assert_eq!(http_with(s.app, m, p, &bearer_header("not-the-token"), body).await.0, 401, "{m} {p}: a wrong token");
+    }
+    let (st, _, b) = http_with(s.app, "PUT", "/transcript", &bearer_header(TOKEN), b"{}").await;
+    assert_eq!(st, 404, "{b}");
+    assert!(b.contains("not implemented (S8/S9)"), "{b}");
+    let (d, body) = s.detail().await;
+    for key in ["\"hook_source\":\"log\"", "\"agent_guard\":\"off\"", "\"listeners\":", "\"refused_peers\":", "\"hook_peers\":", "\"wire\":1"] {
+        assert!(body.contains(key), "{key} in {body}");
+    }
+    assert!(d.health.run_hook_seen && !d.has_credentials && d.spawns.is_empty());
+    assert_eq!(d.listeners.is_empty(), !cfg!(target_os = "linux"), "the LISTEN inventory exists on Linux only: {:?}", d.listeners);
+    assert!(!body.contains(TOKEN) && !body.contains("commit"), "{body}");
+}
+
+/// Every answer of the side ports reads the request body first (at most
+/// `DRAIN_MAX`): an answer over unread request bytes makes the kernel reset
+/// the connection, and the client loses the answer. A body just under the
+/// bound, a few times each: the 404 behind the bearer on both ports, the
+/// 405s, and an `/agent` refusal.
+#[tokio::test]
+async fn side_port_answers_read_the_body_first() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let body = vec![b'x'; DRAIN_MAX - 1024];
+    let bearer = bearer_header(TOKEN);
+    let mut lost = Vec::new();
+    for (addr, method, path, extra, want) in [
+        (s.app, "PUT", "/transcript", bearer.as_str(), 404),
+        (s.code, "PUT", "/seed", bearer.as_str(), 404),
+        (s.app, "POST", "/health", "", 405),
+        (s.app, "POST", "/health/detail", bearer.as_str(), 405),
+        (s.app, "POST", "/agent", "", 405),
+    ] {
+        for i in 0..5 {
+            match try_http_with(addr, method, path, extra, &body).await {
+                Ok((st, _, b)) => assert_eq!(st, want, "{method} {path} #{i}: {b}"),
+                Err(e) => lost.push(format!("{method} {path} #{i}: {e}")),
+            }
+        }
+    }
+    assert!(lost.is_empty(), "answers lost to a reset: {lost:#?}");
+}
+
+/// `--agent-guard on` refuses a local client first, on both side ports and
+/// on `/agent`, counting every refusal. Natively the client has no row
+/// (macOS) or is this test's own uid, the agent's here (Linux).
+#[tokio::test]
+async fn guard_on_refuses_a_local_agent_client_before_the_bearer() {
+    let s = stack(ShimOpts { agent_guard: AgentGuard::On, ..opts(None, HookSource::Log, 0) }).await;
+    s.run(true).await;
+    let want = if cfg!(target_os = "linux") { "agent_uid" } else { "no_row" };
+    for (addr, path) in [(s.app, "/health"), (s.app, "/health/detail"), (s.code, "/seed")] {
+        let (st, _, b) = http_with(addr, "GET", path, &bearer_header(TOKEN), b"").await;
+        assert_eq!(st, 403, "{path}: {b}");
+        assert!(b.contains("\"forbidden_peer\"") && b.contains(want), "{b}");
+    }
+    let (st, _, b) = raw(s.app, &upgrade_head(s.app, "GET", "HTTP/1.1", &[], &[])).await;
+    assert_eq!(st, 403, "{b}");
+    let refused = s.state.detail().await.refused_peers;
+    assert_eq!(refused.get(&s.app.port().to_string()), Some(&3), "{refused:?}");
+    assert_eq!(refused.get(&s.code.port().to_string()), Some(&1), "{refused:?}");
+}
+
+#[tokio::test]
+async fn guard_log_refuses_nothing() {
+    let s = stack(ShimOpts { agent_guard: AgentGuard::Log, ..opts(None, HookSource::Log, 0) }).await;
+    s.run(true).await;
+    assert_eq!(http(s.app, "GET", "/health", b"", None).await.0, 200);
+    assert_eq!(http(s.code, "GET", "/", b"", None).await.0, 401, "past the guard, the bearer");
+    let mut w = ws_hello_ok(s.app).await;
+    ping(&mut w, 5).await;
+    assert!(s.state.detail().await.refused_peers.is_empty());
+}
+
+/// `--hook-source peer`: local clients are refused 403 `forbidden_peer` on
+/// the runtime hooks — a forged `/terminate` drains nothing — counted and
+/// recorded as each hook's last peer; `/ready` is never filtered.
+#[tokio::test]
+async fn hooks_peer_mode_refuses_local_runtime_hooks() {
+    let s = stack(opts(None, HookSource::Peer, 0)).await;
+    let want = if cfg!(target_os = "linux") { "agent_uid" } else { "no_row" };
+    for h in ["run", "resume", "suspend", "terminate"] {
+        let (st, b) = hook(s.hooks, h, &run_body("mvm-peer", None)).await;
+        assert_eq!(st, 403, "{h}: {b}");
+        assert!(b.contains("\"forbidden_peer\"") && b.contains(want), "{h}: {b}");
+    }
+    assert_eq!(hook(s.hooks, "ready", b"").await.0, 200, "ready is never filtered");
+    let d = s.state.detail().await;
+    assert!(!d.health.run_hook_seen && d.health.status == HealthStatus::Ok, "nothing ran and nothing drains: {:?}", d.health);
+    assert_eq!(d.refused_peers.get(&s.hooks.port().to_string()), Some(&4), "{:?}", d.refused_peers);
+    for h in ["run", "resume", "suspend", "terminate"] {
+        let seen = &d.hook_refusals[h];
+        assert_eq!(seen.decision, "refused", "{h}: {seen:?}");
+        assert!(seen.peer.starts_with("127.0.0.1:"), "{seen:?}");
+        assert_eq!(seen.uid.is_some(), cfg!(target_os = "linux"), "{seen:?}");
+    }
+    assert!(d.hook_peers.is_empty(), "a refusal never stands as the platform's record: {:?}", d.hook_peers);
+    assert!(!d.hook_refusals.contains_key("ready"), "only runtime hooks are recorded");
+}
+
+/// The orphan rule on a live kernel (Linux): a client that sent a runtime
+/// hook's head and part of its body, then closed — all before the shim read
+/// a byte (blocking calls on this test's one runtime thread hold the server)
+/// — owns no socket file any more: its row shows inode 0 (and uid 0 on some
+/// kernels), and it is refused `orphaned` although its uid is not the
+/// agent's. hyper dispatches on the head, so the guard sees it; a whole
+/// request then close is dropped at EOF, unseen, and cannot test the rule.
+#[tokio::test]
+async fn hooks_peer_mode_refuses_a_client_gone_before_the_lookup() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("no /proc/net/tcp off Linux");
+        return;
+    }
+    // This test's uid is not the agent's: its live sockets are admitted.
+    let s = stack(ShimOpts { uid: uid_gid().0.wrapping_add(1), ..opts(None, HookSource::Peer, 0) }).await;
+    {
+        let mut c = std::net::TcpStream::connect(s.hooks).unwrap();
+        c.write_all(format!("POST {PREFIX}/resume HTTP/1.1\r\nHost: {}\r\nContent-Length: 100\r\n\r\n{{}}", s.hooks).as_bytes()).unwrap();
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    let seen = loop {
+        if let Some(seen) = s.state.hook_refusals.lock().unwrap().get("resume").cloned() {
+            break seen;
+        }
+        assert!(Instant::now() < until, "the half-sent /resume never reached the guard");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!((seen.decision.as_str(), seen.inode), ("refused", Some(0)), "{seen:?}");
+    assert_eq!(s.state.detail().await.refused_peers.get(&s.hooks.port().to_string()), Some(&1));
+    assert!(s.state.hook_peers.lock().unwrap().get("resume").is_none(), "the refusal is kept apart");
+    assert_eq!(hook(s.hooks, "resume", b"{}").await.0, 200, "the same uid with its socket open");
+    assert_eq!(s.state.hook_peers.lock().unwrap()["resume"].decision, "admitted");
+    assert_eq!(s.state.hook_refusals.lock().unwrap()["resume"].inode, Some(0), "and stays");
+}
+
+/// `log` records each runtime hook's last peer as `logged`; `/run` and
+/// `/resume` leave their clock report for `/health/detail`.
+#[tokio::test]
+async fn hooks_record_the_last_peer_and_the_clock() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    assert_eq!(s.state.detail().await.clock.as_ref().and_then(|c| c["hook"].as_str()), Some("run"));
+    assert_eq!(hook(s.hooks, "resume", b"{}").await.0, 200);
+    let (d, _) = s.detail().await;
+    assert_eq!(d.clock.as_ref().and_then(|c| c["hook"].as_str()), Some("resume"));
+    for h in ["run", "resume"] {
+        assert_eq!(d.hook_peers[h].decision, "logged", "{h}: {:?}", d.hook_peers[h]);
+        assert!(d.hook_peers[h].peer.starts_with("127.0.0.1:"), "{:?}", d.hook_peers[h]);
+    }
+    assert!(d.refused_peers.is_empty());
+}
+
+/// `/suspend` tells every socket past hello, closes it 1001, then answers;
+/// the next socket is served.
+#[tokio::test]
+async fn suspend_sends_hook_suspend_then_closes_every_socket() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    let started = Instant::now();
+    let (answer, (ev, end)) = tokio::join!(hook(s.hooks, "suspend", b"{}"), async { (next_frame(&mut w).await, next_frame(&mut w).await) });
+    assert_eq!(answer.0, 200, "{}", answer.1);
+    assert!(matches!(ev, Ok(Frame::Event { kind: EventKind::HookSuspend, .. })), "{ev:?}");
+    assert_eq!(end, Err(Some(CLOSE_GOING_AWAY)));
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    s.wait_no_sockets().await;
+    let mut again = ws_hello_ok(s.app).await;
+    ping(&mut again, 4).await;
+}
+
+/// `/terminate` drains: every socket gets `event hook_terminate` and 1001,
+/// and a new upgrade gets 503 `draining`.
+#[tokio::test]
+async fn terminate_closes_the_sockets_and_refuses_new_ones() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    let (answer, (ev, end)) = tokio::join!(hook(s.hooks, "terminate", b"{}"), async { (next_frame(&mut w).await, next_frame(&mut w).await) });
+    assert_eq!(answer.0, 200, "{}", answer.1);
+    assert!(matches!(ev, Ok(Frame::Event { kind: EventKind::HookTerminate, .. })), "{ev:?}");
+    assert_eq!(end, Err(Some(CLOSE_GOING_AWAY)));
+    let (st, _, body) = raw(s.app, &upgrade_head(s.app, "GET", "HTTP/1.1", &[], &[])).await;
+    assert_eq!(st, 503, "{body}");
+    assert!(body.contains("\"draining\""), "{body}");
+}
+
+/// `/terminate` stops the spawns with the plan's ladder before it answers:
+/// TERM every group, at most 5 s for the leaders, then KILL only the
+/// groups whose leader still runs. A leader that traps TERM and needs 4 s
+/// exits on its own (0); one that ignores TERM is KILLed at 5 s.
+#[tokio::test]
+async fn terminate_gives_the_leaders_5_s_then_kills_the_rest() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let (slow, deaf) = (SpawnId::new_v7(), SpawnId::new_v7());
+    start(&mut w, &slow, &["/bin/sh", "-c", "trap 'sleep 4; exit 0' TERM; echo ready; while :; do sleep 0.1; done"], None).await;
+    let (_, early) = start(&mut w, &deaf, &["/bin/sh", "-c", "trap '' TERM; echo ready; while :; do sleep 0.1; done"], None).await;
+    // Both traps are set before the TERM (`slow`'s ready may come before `deaf`'s spawned).
+    let mut ready: std::collections::BTreeSet<SpawnId> = early.iter().filter(|f| f.kind() == "stdout").filter_map(Frame::spawn_id).cloned().collect();
+    while ready.len() < 2 {
+        match next_frame(&mut w).await {
+            Ok(Frame::Stdout { spawn_id, .. }) => _ = ready.insert(spawn_id),
+            Ok(_) => {}
+            Err(e) => panic!("the socket ended ({e:?}) before both traps were set"),
+        }
+    }
+    let t = Instant::now();
+    let (st, b) = hook(s.hooks, "terminate", b"{}").await;
+    let took = t.elapsed();
+    assert_eq!(st, 200, "{b}");
+    assert!(took >= Duration::from_millis(4900) && took < Duration::from_secs(8), "{took:?}");
+    let exits: BTreeMap<SpawnId, Option<ExitInfo>> = s.state.spawns.status(None).into_iter().map(|x| (x.spawn_id, x.exit)).collect();
+    assert_eq!(exits.get(&slow), Some(&Some(ExitInfo { code: Some(0), signal: None })), "the trap ran to its end: {exits:?}");
+    assert_eq!(exits.get(&deaf), Some(&Some(ExitInfo { code: None, signal: Some(9) })), "KILLed once the 5 s were out: {exits:?}");
+}
+
+/// A `spawn` is answered by the spawn manager: `spawned`, naming the spawn
+/// and its pid, before anything else (spawning works natively: see `start`).
+#[tokio::test]
+async fn agent_spawn_is_answered_by_the_spawn_manager() {
+    let home = tempfile::tempdir().unwrap();
+    let s = stack(ShimOpts { home: std::fs::canonicalize(home.path()).unwrap(), ..opts(None, HookSource::Log, 0) }).await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None };
+    send_frame(&mut w, &spawn).await;
+    match next_frame(&mut w).await {
+        Ok(Frame::Spawned { spawn_id, pid, .. }) => assert!(spawn_id == id && pid != 0, "{spawn_id} {pid}"),
+        other => panic!("spawned for the spawn, got {other:?}"),
+    }
+    send_frame(&mut w, &Frame::Detach { spawn_id: id, is_final: true }).await;
+    w.close(None).await.unwrap();
+}
+
+/// A stack whose spawns run in a fresh home (canonical: no symlink in the path).
+async fn spawning_stack() -> (Stack, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let s = stack(ShimOpts { home: std::fs::canonicalize(home.path()).unwrap(), ..opts(None, HookSource::Log, 0) }).await;
+    s.run(true).await;
+    (s, home)
+}
+
+/// Start `argv` on `w`: its pid, and the frames of the socket's other spawns
+/// read before its `spawned` (only a spawn's own frames wait for its answer:
+/// another's output may come first). Spawning works natively wherever these
+/// tests run (the agent is this process's own uid, the home a canonical
+/// tempdir), so anything else before its `spawned` fails the test.
+async fn start(w: &mut Ws, id: &SpawnId, argv: &[&str], detach_grace_s: Option<u32>) -> (u32, Vec<Frame>) {
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s };
+    send_frame(w, &spawn).await;
+    let mut others = Vec::new();
+    loop {
+        match next_frame(w).await {
+            Ok(Frame::Spawned { spawn_id, pid, .. }) if spawn_id == *id && pid != 0 => return (pid, others),
+            Ok(f) if f.spawn_id().is_some_and(|s| s != id) => others.push(f),
+            other => panic!("spawned for {id}, got {other:?}"),
+        }
+    }
+}
+
+/// `cat` round-trips raw bytes through the socket: stdin frames in, stdout
+/// frames and `exit` out through the writer's outbox, byte-exact (non-UTF-8
+/// and an unterminated last line included); acking the exit's seq releases
+/// the spawn and the socket stays up.
+#[tokio::test]
+async fn agent_cat_round_trips_raw_bytes() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/cat"], None).await;
+    let input = b"hello\n\x00\xff\n\xe2\x82\xac done".to_vec();
+    let mut chunker = ai_env_cli::wire::chunk::Chunker::new();
+    let mut chunks = chunker.push(&input);
+    chunks.extend(chunker.finish());
+    let last = chunks.len() as u64;
+    for (seq, data) in (1..).zip(chunks) {
+        send_frame(&mut w, &Frame::Stdin { spawn_id: id.clone(), seq, data }).await;
+    }
+    send_frame(&mut w, &Frame::StdinEof { spawn_id: id.clone(), seq: last }).await;
+    let mut out = Vec::new();
+    let (exit_seq, code) = loop {
+        match next_frame(&mut w).await {
+            Ok(Frame::Stdout { spawn_id, data, .. }) if spawn_id == id => out.extend(ai_env_cli::wire::chunk::decode(&data).unwrap()),
+            Ok(Frame::Exit { spawn_id, seq, code, .. }) if spawn_id == id => break (seq, code),
+            Ok(Frame::StdinAck { spawn_id, .. } | Frame::Stderr { spawn_id, .. }) if spawn_id == id => {}
+            other => panic!("cat's frames, got {other:?}"),
+        }
+    };
+    assert_eq!(out, input, "byte-exact");
+    assert_eq!(code, Some(0));
+    send_frame(&mut w, &Frame::Ack { spawn_id: id, seq: exit_seq, err_seq: 0 }).await;
+    ping(&mut w, 6).await;
+}
+
+/// A socket that ends without `detach` hands its spawns to the detach
+/// grace (`connection_lost`): `/health/detail` shows the grace running.
+#[tokio::test]
+async fn a_lost_socket_starts_the_detach_grace() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sleep", "30"], Some(60)).await;
+    let (d, _) = s.detail().await;
+    assert_eq!(d.spawns.iter().find(|sp| sp.status.spawn_id == id).map(|sp| sp.detach_left_s), Some(None), "attached: no grace yet");
+    drop(w);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (d, _) = s.detail().await;
+        let left = d.spawns.iter().find(|sp| sp.status.spawn_id == id).and_then(|sp| sp.detach_left_s);
+        if let Some(left) = left {
+            assert!(left <= 60, "{left}");
+            break;
+        }
+        assert!(Instant::now() < until, "no detach grace after the socket was lost: {:?}", d.spawns);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    s.state.spawns.shutdown("test").await;
+}
+
+/// The newest attachment wins: a second socket's hello resuming a spawn
+/// supersedes the first (`error superseded` there; `resumed ok` and the spawn
+/// listed as attached to no other socket here), and the first socket's later
+/// end detaches nothing.
+#[tokio::test]
+async fn a_resuming_hello_supersedes_and_the_old_socket_end_detaches_nothing() {
+    let (s, _home) = spawning_stack().await;
+    let mut a = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut a, &id, &["/bin/sleep", "30"], Some(60)).await;
+    let mut b = ws(s.app).await;
+    send_frame(&mut b, &hello_resuming(TOKEN, vec![ResumePoint { spawn_id: id.clone(), from_seq: None, err_from_seq: None }])).await;
+    match next_frame(&mut b).await {
+        Ok(Frame::HelloOk { resumed, spawns, .. }) => {
+            assert_eq!(resumed, vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }]);
+            let st = spawns.iter().find(|x| x.spawn_id == id).unwrap_or_else(|| panic!("{id} listed: {spawns:?}"));
+            assert!(st.alive && !st.attached, "attached to this socket, not another: {st:?}");
+        }
+        other => panic!("hello_ok, got {other:?}"),
+    }
+    loop {
+        match next_frame(&mut a).await {
+            Ok(Frame::Error { code: ErrorCode::Superseded, spawn_id: Some(sid), .. }) if sid == id => break,
+            Ok(_) => {}
+            Err(e) => panic!("the old socket ended before hearing it was superseded: {e:?}"),
+        }
+    }
+    drop(a);
+    s.wait_sockets((1, 1)).await;
+    let (d, _) = s.detail().await;
+    assert_eq!(d.spawns.iter().find(|x| x.status.spawn_id == id).map(|x| x.detach_left_s), Some(None), "still attached to the new socket: {:?}", d.spawns);
+    send_frame(&mut b, &Frame::Detach { spawn_id: id, is_final: true }).await;
+    ping(&mut b, 9).await;
+    s.state.spawns.shutdown("test").await;
+}
+
+/// V6 runs only under `--hook-source peer` (V1–V5 pass on a clean tree), and
+/// natively — not root — fails closed: the guard cannot be self-tested
+/// without dropping to the agent uid.
+#[tokio::test]
+async fn validate_v6_fails_closed_natively_under_peer_mode() {
+    if uid_gid().0 == 0 {
+        eprintln!("as root V6 runs its curl self-test: covered in Docker");
+        return;
+    }
+    let t = tempfile::tempdir().unwrap();
+    plant_vm_tree(t.path());
+    let addr = serve_hooks(state_with(fake_claude(t.path(), ""), opts(Some(t.path()), HookSource::Peer, 0)).await).await;
+    let (st, b) = hook(addr, "validate", b"").await;
+    assert_eq!(st, 503, "{b}");
+    assert!(b.contains("V6: ") && b.contains("needs root"), "{b}");
+    for v in ["V1:", "V2:", "V3:", "V4:"] {
+        assert!(!b.contains(v), "only V6 fails on a clean tree: {b}");
     }
 }
 
@@ -742,9 +1547,10 @@ fn shim_help_lists_the_entrypoint_surface() {
     let out = ai_env(&["shim", "--help"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--app-port", "--hooks-port", "--code-port", "--claude", "--home", "--uid", "--gid", "--echo", "--delay-run", "--hook-source", "--clock"] {
+    for flag in ["--app-port", "--hooks-port", "--code-port", "--claude", "--home", "--uid", "--gid", "--delay-run", "--hook-source", "--agent-guard", "--clock"] {
         assert!(text.contains(flag), "{flag} missing from:\n{text}");
     }
+    assert!(!text.contains("--echo"), "--echo is gone (S6: plain argv spawns cover it):\n{text}");
     // Per flag: the image ENTRYPOINT passes --uid but relies on --gid's default.
     for (head, default) in [
         ("--app-port <APP_PORT>", "8080"),
@@ -759,7 +1565,7 @@ fn shim_help_lists_the_entrypoint_surface() {
         let block = flag_block(&text, head);
         assert!(block.contains(&format!("[default: {default}]")), "{head}: [default: {default}] missing from {block:?}");
     }
-    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s"] {
+    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes"] {
         assert!(!text.contains(hidden), "{hidden} is a hidden test/role flag:\n{text}");
     }
 }
@@ -780,7 +1586,10 @@ fn entrypoint() -> Vec<String> {
 }
 
 /// What the shipped argv resolves to, defaults included (the gid is not on
-/// the line: a changed default would run claude as 1000:<other>).
+/// the line: a changed default would run claude as 1000:<other>). The hooks
+/// guard is always `peer`; the agent guard is its default (on as root on
+/// Linux) or tree B's fallback `--agent-guard log` (plan S6: the endpoint
+/// reaches 8080 as a local peer), never `off`.
 #[test]
 fn the_image_entrypoint_runs_the_agent_as_1000_1000() {
     #[derive(clap::Parser)]
@@ -796,7 +1605,8 @@ fn the_image_entrypoint_runs_the_agent_as_1000_1000() {
     assert_eq!(a.home, PathBuf::from("/Users/mike"));
     assert_eq!(a.claude, PathBuf::from("/usr/local/bin/claude"));
     assert_eq!((a.app_port, a.hooks_port, a.code_port), (8080, 9000, 9418));
-    assert_eq!((a.hook_source, a.clock), (HookSource::Log, ClockMode::Measure));
+    assert_eq!((a.hook_source, a.clock), (HookSource::Peer, ClockMode::Measure), "S6: the peer guard on the hooks; the clock is measured (D7)");
+    assert!(matches!(a.agent_guard, None | Some(AgentGuard::On | AgentGuard::Log)), "the image never runs --agent-guard off: {:?}", a.agent_guard);
     assert!(!a.supervise && a.init_pid.is_none() && a.fs_root.is_none() && a.delay_run.is_none(), "PID 1 is init by its pid, not by a flag");
     assert_eq!(a.kill_after_s, 70);
 }
@@ -934,10 +1744,13 @@ fn binary_binds_three_ports() {
     assert_eq!(s, 200, "{body}");
     let h: Health = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
     assert_eq!(h.shim_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(http_sync(code, "GET", "/").0, 404);
+    assert_eq!(http_sync(code, "GET", "/").0, 401, "the code port needs the session bearer");
     let (s, _) = http_sync(hooks_addr, "POST", &format!("{PREFIX}/suspend"));
     assert_eq!(s, 200);
-    shim.wait_line(5, |l| l.starts_with("ai-env: hook suspend peer=127.0.0.1:") && l.contains("origin=loopback") && l.contains("status=200"));
+    let line = shim.wait_line(5, |l| l.starts_with("ai-env: hook suspend peer=127.0.0.1:") && l.contains("origin=loopback") && l.contains("status=200"));
+    // S6: the row's facts and the decision ride every hook line, after the S3/S4 fields.
+    let fields: Vec<&str> = line.split_whitespace().skip(3).filter_map(|w| w.split_once('=').map(|(k, _)| k)).collect();
+    assert_eq!(fields, ["peer", "local", "origin", "len", "status", "ms", "peer_uid", "ino", "st", "fam", "decision"], "{line}");
     shim.wait_line(5, |l| l.starts_with("ai-env: boot {\"pid\":"));
 }
 
@@ -1229,5 +2042,38 @@ fn a_closed_stderr_loses_log_lines_not_hooks() {
         }
         signal(shim.child.id(), Signal::SIGTERM);
         assert_eq!(wait_exit(&mut shim.child, 5).code(), Some(0), "{extra:?}: {:?}", shim.lines.lock().unwrap());
+    }
+}
+
+/// `--agent-guard log`: one `ai-env: guard` line per request on the app and
+/// code ports, with the row's facts and the decision; nothing is refused.
+#[test]
+fn binary_agent_guard_log_logs_every_side_port_request() {
+    let t = tempfile::tempdir().unwrap();
+    let shim = Shim::start(&fake_claude(t.path(), ""), &["--agent-guard", "log"]);
+    let (app, code) = (shim.addr("app"), shim.addr("code"));
+    shim.wait_line(5, |l| l.ends_with(" hook-source log agent-guard log"));
+    assert_eq!(http_sync(app, "GET", "/health").0, 200);
+    assert_eq!(http_sync(code, "GET", "/").0, 401, "logged, then the bearer");
+    for port in [app.port(), code.port()] {
+        let line = shim.wait_line(5, |l| l.starts_with(&format!("ai-env: guard port={port} peer=127.0.0.1:")));
+        assert!(line.contains(" peer_uid=") && line.contains(" ino=") && line.contains(" st=") && line.contains(" fam="), "{line}");
+        assert!(line.contains(" decision=admit") || line.contains(" decision=would-refuse:"), "log never refuses: {line}");
+    }
+}
+
+/// Off Linux there is no `/proc/net/tcp`: peer mode and `--agent-guard on`
+/// are startup errors (fail closed), never silently off.
+#[test]
+fn guard_modes_fail_closed_off_linux() {
+    if cfg!(target_os = "linux") {
+        return;
+    }
+    for flags in [["--hook-source", "peer"], ["--agent-guard", "on"]] {
+        let mut args = vec!["shim", "--claude", "/nonexistent/claude", "--app-port", "0", "--hooks-port", "0", "--code-port", "0"];
+        args.extend_from_slice(&flags);
+        let out = ai_env(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flags:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("needs Linux"), "{flags:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 }

@@ -34,6 +34,8 @@ pub struct Prekey {
 
 impl Prekey {
     pub fn new() -> Result<Self> {
+        #[cfg(test)]
+        let _no_fork = crate::test_locks::mprotecting();
         // SAFETY: memsec::malloc returns a guarded, mlocked, canaried region
         // sized for the pointee type; we fill it and immediately lock it away.
         unsafe {
@@ -74,6 +76,8 @@ impl Prekey {
 
     #[inline(never)]
     fn derive_inner(&self, info: &[u8], out: &mut [u8; 32]) -> Result<()> {
+        #[cfg(test)]
+        let _no_fork = crate::test_locks::mprotecting();
         // SAFETY: we own ptr; flip protection around the read and restore it.
         unsafe {
             if !memsec::mprotect(self.ptr, memsec::Prot::ReadOnly) {
@@ -109,6 +113,8 @@ fn scrub_stack() {
 
 impl Drop for Prekey {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let _no_fork = crate::test_locks::mprotecting();
         // SAFETY: restore access so memsec can wipe and free the region.
         unsafe {
             memsec::mprotect(self.ptr, memsec::Prot::ReadWrite);

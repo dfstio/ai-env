@@ -4,18 +4,20 @@
 //! `tls::reqwest_client()` (TLS 1.3, Amazon Root CA 1–4 only, proxy
 //! environment ignored) to `https://<bare host>/health` with the host pinned
 //! by [`endpoint_url`], the token in a sensitive `x-aws-proxy-auth` header and
-//! `x-aws-proxy-port`; a redirect is refused, never followed. [`read_health`]
+//! `x-aws-proxy-port`; a redirect is refused, never followed. `/health/detail`
+//! (S6) goes the same way with the session bearer added as a sensitive
+//! `Authorization: Bearer` header. [`read_health`]
 //! is the retrying reader every command uses (D30): it asks the control plane
 //! first, mints a 5-minute `Port(8080)` token, retries what can heal within a
 //! budget ([`Backoff`]) that also bounds the request in flight, and records
 //! what the shim reported in the VM row.
-use crate::bridge::api::{normalize_endpoint, AuthToken, EndpointClient, HealthReply, MicrovmApi, VmInfo, VmState};
+use crate::bridge::api::{normalize_endpoint, AuthToken, EndpointClient, HealthDetailReply, HealthReply, MicrovmApi, VmInfo, VmState};
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::vm::registry::{is_vm_id, update_row};
 use crate::bridge::vm::token::mint_internal;
-use crate::wire::frame::{Health, HealthStatus};
-use crate::wire::redact::scrub;
+use crate::wire::frame::{Health, HealthDetail, HealthStatus};
+use crate::wire::redact::{scrub, Secret};
 use crate::wire::time::unix_now;
 use serde::Serialize;
 use std::error::Error as StdError;
@@ -26,6 +28,10 @@ use tokio::time::{sleep, timeout, Instant};
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest `/health` body read (the shim's is a few hundred bytes).
 pub const MAX_BODY: usize = 64 * 1024;
+/// Largest `/health/detail` body read: the shim lists every listening socket
+/// of the VM (about 70 bytes each), and the agent can open listeners of its
+/// own; 1 MiB holds over 14 000 of them.
+pub const MAX_DETAIL_BODY: usize = 1024 * 1024;
 /// Bytes of a non-200 body kept (scrubbed) in [`HealthReply::body`].
 pub const MAX_ERROR_BODY: usize = 512;
 /// Longest `x-aws-proxy-error` value kept.
@@ -65,28 +71,30 @@ impl HttpsEndpoint {
     }
 }
 
-impl EndpointClient for HttpsEndpoint {
-    /// One `GET https://<endpoint>/health` ([`REQUEST_TIMEOUT`], body capped at
-    /// [`MAX_BODY`]). Any HTTP status but a redirect is `Ok` (parsed as
-    /// `reply_from_parts` describes); a 3xx is never followed and is a final
-    /// `Sdk { op: "health" }` naming the `Location` origin; connect, timeout
-    /// and reset failures are `Endpoint` (transient); a certificate or
-    /// TLS-version failure is `Sdk { op: "tls" }` (final); a host outside the
-    /// pin is refused before anything is sent (final).
-    async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
-        let url = endpoint_url(endpoint, "/health").map_err(|e| BridgeError::Sdk { op: "health", message: e.to_string() })?;
+/// What one GET came back with: the status, the headers and at most the
+/// path's cap of the body ([`MAX_BODY`], [`MAX_DETAIL_BODY`]).
+struct Fetched {
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+    truncated: bool,
+}
+
+impl HttpsEndpoint {
+    /// One `GET https://<endpoint><path>` with the endpoint token (and, for
+    /// `/health/detail`, the session bearer), every rule of
+    /// [`EndpointClient::get_health`] applied, the body read up to `max_body`
+    /// bytes; errors carry `op: "health"`.
+    async fn fetch(&self, endpoint: &str, path: &str, token: &AuthToken, port_header: u16, bearer: Option<&Secret<String>>, max_body: usize) -> Result<Fetched, BridgeError> {
+        let url = endpoint_url(endpoint, path).map_err(|e| BridgeError::Sdk { op: "health", message: e.to_string() })?;
         let value = token.value().map_err(|e| BridgeError::Sdk { op: "health", message: e.to_string() })?;
         let mut auth = reqwest::header::HeaderValue::from_str(value.expose()).map_err(|_| BridgeError::Sdk { op: "health", message: "the endpoint token is not a valid header value".into() })?;
         auth.set_sensitive(true);
-        let mut resp = self
-            .client
-            .get(&url)
-            .header("x-aws-proxy-auth", auth)
-            .header("x-aws-proxy-port", port_header.to_string())
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| transport_error(&url, &e))?;
+        let mut req = self.client.get(&url).header("x-aws-proxy-auth", auth).header("x-aws-proxy-port", port_header.to_string()).timeout(REQUEST_TIMEOUT);
+        if let Some(bearer) = bearer {
+            req = req.header(reqwest::header::AUTHORIZATION, bearer_header(bearer)?);
+        }
+        let mut resp = req.send().await.map_err(|e| transport_error(&url, &e))?;
         // The token must reach the pinned host only, so the client must never
         // follow a redirect (plan D4: `tls::reqwest_client()` with
         // `redirect::Policy::none()` and `https_only`). This check cannot undo
@@ -103,15 +111,55 @@ impl EndpointClient for HttpsEndpoint {
         let mut body = Vec::new();
         let mut truncated = false;
         while let Some(chunk) = resp.chunk().await.map_err(|e| transport_error(&url, &e))? {
-            let room = MAX_BODY - body.len();
-            if chunk.len() > room {
-                body.extend_from_slice(&chunk[..room]);
+            if keep_capped(&mut body, &chunk, max_body) {
                 truncated = true;
                 break;
             }
-            body.extend_from_slice(&chunk);
         }
-        reply_from_parts(status, &headers, &body, truncated)
+        Ok(Fetched { status, headers, body, truncated })
+    }
+}
+
+/// Append `chunk` to `body` up to `max` bytes in all; whether it did not fit.
+fn keep_capped(body: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
+    let room = max.saturating_sub(body.len());
+    body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    chunk.len() > room
+}
+
+/// `Bearer <session token>`, marked sensitive (never in a `Debug` of the request).
+fn bearer_header(bearer: &Secret<String>) -> Result<reqwest::header::HeaderValue, BridgeError> {
+    let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer.expose())).map_err(|_| BridgeError::Sdk { op: "health", message: "the session token is not a valid header value".into() })?;
+    v.set_sensitive(true);
+    Ok(v)
+}
+
+impl EndpointClient for HttpsEndpoint {
+    /// One `GET https://<endpoint>/health` ([`REQUEST_TIMEOUT`], body capped at
+    /// [`MAX_BODY`]). Any HTTP status but a redirect is `Ok` (parsed as
+    /// `reply_from_parts` describes); a 3xx is never followed and is a final
+    /// `Sdk { op: "health" }` naming the `Location` origin; connect, timeout
+    /// and reset failures are `Endpoint` (transient); a certificate or
+    /// TLS-version failure is `Sdk { op: "tls" }` (final); a host outside the
+    /// pin is refused before anything is sent (final).
+    async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
+        let f = self.fetch(endpoint, "/health", token, port_header, None, MAX_BODY).await?;
+        reply_from_parts(f.status, &f.headers, &f.body, f.truncated)
+    }
+
+    /// One `GET https://<endpoint>/health/detail` with the token headers (port
+    /// `token.port`) and `Authorization: Bearer <session token>` (S6): every
+    /// rule of [`Self::get_health`] but the body cap ([`MAX_DETAIL_BODY`]:
+    /// the listener inventory grows with the agent's sockets), with
+    /// `op: "health_detail"` on its own errors; a 200 must carry the shim's
+    /// `HealthDetail` JSON.
+    async fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &Secret<String>) -> Result<HealthDetailReply, BridgeError> {
+        let relabel = |e: BridgeError| match e {
+            BridgeError::Sdk { op: "health", message } => BridgeError::Sdk { op: "health_detail", message },
+            e => e,
+        };
+        let f = self.fetch(endpoint, "/health/detail", token, token.port, Some(bearer), MAX_DETAIL_BODY).await.map_err(relabel)?;
+        detail_from_parts(f.status, &f.headers, &f.body, f.truncated)
     }
 }
 
@@ -142,11 +190,7 @@ fn redirect_refusal(url: &str, status: u16, location: Option<&reqwest::header::H
 /// line of the reason, final); any other status keeps at most
 /// [`MAX_ERROR_BODY`] bytes of its body, scrubbed.
 fn reply_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[u8], truncated: bool) -> Result<HealthReply, BridgeError> {
-    let proxy_error = headers.get("x-aws-proxy-error").map(|v| {
-        let text: String = String::from_utf8_lossy(v.as_bytes()).chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(MAX_PROXY_ERROR).collect();
-        scrub(&text).into_owned()
-    });
-    let retry_after_s = headers.get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok());
+    let (proxy_error, retry_after_s) = (proxy_error_of(headers), retry_after_of(headers));
     if status == 200 {
         if truncated {
             return Err(BridgeError::Http { status, body: format!("the /health body exceeds {} KiB", MAX_BODY / 1024) });
@@ -157,9 +201,43 @@ fn reply_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[u
         })?;
         return Ok(HealthReply { status, proxy_error, retry_after_s, health: Some(health), body: String::new() });
     }
-    let kept = &body[..body.len().min(MAX_ERROR_BODY)];
-    let body = scrub(&String::from_utf8_lossy(kept)).into_owned();
-    Ok(HealthReply { status, proxy_error, retry_after_s, health: None, body })
+    Ok(HealthReply { status, proxy_error, retry_after_s, health: None, body: error_body(body) })
+}
+
+/// A `/health/detail` response as a [`HealthDetailReply`], by the rules of
+/// `reply_from_parts` with its own cap ([`MAX_DETAIL_BODY`]): a 200 must
+/// carry the shim's `HealthDetail` JSON.
+fn detail_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[u8], truncated: bool) -> Result<HealthDetailReply, BridgeError> {
+    let (proxy_error, retry_after_s) = (proxy_error_of(headers), retry_after_of(headers));
+    if status == 200 {
+        if truncated {
+            return Err(BridgeError::Http { status, body: format!("the /health/detail body exceeds {} KiB (it lists every listening socket of the VM: a process there may hold thousands)", MAX_DETAIL_BODY / 1024) });
+        }
+        let detail: HealthDetail = serde_json::from_slice(body).map_err(|e| {
+            let text = e.to_string();
+            BridgeError::Http { status, body: format!("unparseable /health/detail body: {}", scrub(text.lines().next().unwrap_or("unparseable"))) }
+        })?;
+        return Ok(HealthDetailReply { status, proxy_error, retry_after_s, detail: Some(detail), body: String::new() });
+    }
+    Ok(HealthDetailReply { status, proxy_error, retry_after_s, detail: None, body: error_body(body) })
+}
+
+/// `x-aws-proxy-error`: printable ASCII, at most 128 characters, scrubbed.
+fn proxy_error_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers.get("x-aws-proxy-error").map(|v| {
+        let text: String = String::from_utf8_lossy(v.as_bytes()).chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(MAX_PROXY_ERROR).collect();
+        scrub(&text).into_owned()
+    })
+}
+
+/// `Retry-After` in seconds (the HTTP-date form is ignored).
+fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers.get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// At most [`MAX_ERROR_BODY`] bytes of a non-200 body, scrubbed.
+fn error_body(body: &[u8]) -> String {
+    scrub(&String::from_utf8_lossy(&body[..body.len().min(MAX_ERROR_BODY)])).into_owned()
 }
 
 /// `e` and its sources, joined with `: `.
@@ -430,7 +508,7 @@ mod tests {
     use crate::bridge::api::{Call, FakeMicrovmApi, IdleSpec, RunSpec, ENDPOINT_SUFFIX, FAKE_IMAGE_ARN};
     use crate::bridge::vm::registry::{read_row, write_row, RowStatus, VmRow};
     use crate::errors::CliError;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
     /// Milliseconds instead of seconds: step 2 ms, budget 30 ms (for tests that run it out).
@@ -480,6 +558,7 @@ mod tests {
             boot_nonce: Some("ab".repeat(16)),
             run_hook_seen: true,
             uptime_s: 1,
+            wire: None,
         }
     }
 
@@ -572,6 +651,93 @@ mod tests {
         assert!(e.to_string().contains("unparseable /health body") && !e.to_string().contains('\n'), "{e}");
         let e = reply_from_parts(200, &HeaderMap::new(), &good, true).unwrap_err();
         assert!(e.to_string().contains("exceeds 64 KiB"), "{e}");
+    }
+
+    fn detail() -> HealthDetail {
+        HealthDetail {
+            health: health("microvm-1", HealthStatus::Ok),
+            image_version: Some("7.0".into()),
+            hook_source: "peer".into(),
+            agent_guard: "on".into(),
+            refused_peers: BTreeMap::from([("9000".to_string(), 2)]),
+            hook_peers: BTreeMap::new(),
+            hook_refusals: BTreeMap::new(),
+            sockets_open: 1,
+            sockets_authenticated: 1,
+            spawns: vec![],
+            has_credentials: false,
+            clock: None,
+            listeners: vec![],
+            listeners_omitted: 0,
+        }
+    }
+
+    #[test]
+    fn detail_replies_from_parts() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let detail = detail();
+        let good = serde_json::to_vec(&detail).unwrap();
+        let r = detail_from_parts(200, &HeaderMap::new(), &good, false).unwrap();
+        assert_eq!((r.status, r.detail), (200, Some(detail)));
+        let plain = serde_json::to_vec(&health("microvm-1", HealthStatus::Ok)).unwrap();
+        let e = detail_from_parts(200, &HeaderMap::new(), &plain, false).unwrap_err();
+        assert!(matches!(e, BridgeError::Http { status: 200, .. }) && e.to_string().contains("unparseable /health/detail body"), "a bare /health body is no detail: {e}");
+        let e = detail_from_parts(200, &HeaderMap::new(), &good, true).unwrap_err();
+        assert!(e.to_string().contains("/health/detail body exceeds 1024 KiB"), "{e}");
+        let mut h = HeaderMap::new();
+        h.insert("x-aws-proxy-error", HeaderValue::from_static("UNAUTHORIZED"));
+        h.insert("retry-after", HeaderValue::from_static("3"));
+        let secret_body = format!("session_token={}", "q".repeat(40));
+        let r = detail_from_parts(403, &h, secret_body.as_bytes(), false).unwrap();
+        assert_eq!((r.status, r.proxy_error.as_deref(), r.retry_after_s, r.detail.is_none()), (403, Some("UNAUTHORIZED"), Some(3), true));
+        assert!(!r.body.contains(&"q".repeat(40)), "scrubbed: {}", r.body);
+        let r = detail_from_parts(401, &HeaderMap::new(), &vec![b'x'; 2000], false).unwrap();
+        assert_eq!((r.status, r.proxy_error, r.body.len()), (401, None, MAX_ERROR_BODY));
+    }
+
+    /// `/health/detail` lists every listener of the VM, the agent's own too:
+    /// 5 000 of them (about 350 KiB) still fit its cap, read as `fetch` reads
+    /// a body, where `/health` keeps its 64 KiB.
+    #[test]
+    fn a_detail_with_thousands_of_listeners_fits_its_own_cap() {
+        use crate::wire::frame::ListenerInfo;
+        use reqwest::header::HeaderMap;
+        let listeners = (0..5000u16).map(|i| ListenerInfo { addr: "127.0.0.1".into(), port: 1024 + i, uid: 1000, inode: 100_000 + u64::from(i), own: false }).collect();
+        let body = serde_json::to_vec(&HealthDetail { listeners, ..detail() }).unwrap();
+        assert!(body.len() > MAX_BODY && body.len() < MAX_DETAIL_BODY, "{} bytes", body.len());
+        let read = |max: usize| {
+            let mut got = Vec::new();
+            let cut = body.chunks(16 * 1024).any(|c| keep_capped(&mut got, c, max));
+            (got, cut)
+        };
+        let (got, cut) = read(MAX_DETAIL_BODY);
+        assert!(!cut && got == body);
+        assert_eq!(detail_from_parts(200, &HeaderMap::new(), &got, cut).unwrap().detail.unwrap().listeners.len(), 5000);
+        let (got, cut) = read(MAX_BODY);
+        assert!(cut && got.len() == MAX_BODY && body.starts_with(&got), "/health's cap keeps its first 64 KiB");
+    }
+
+    #[test]
+    fn the_bearer_header_is_sensitive() {
+        let token = "bearer-header-secret-0001";
+        let v = bearer_header(&Secret::new(token.into())).unwrap();
+        assert!(v.is_sensitive());
+        assert_eq!(v.to_str().unwrap(), format!("Bearer {token}"));
+        assert!(!format!("{v:?}").contains(token));
+        assert!(matches!(bearer_header(&Secret::new("bad\nvalue".into())), Err(BridgeError::Sdk { .. })));
+    }
+
+    #[tokio::test]
+    async fn https_endpoint_detail_refuses_foreign_hosts_before_sending() {
+        let ep = HttpsEndpoint::new().unwrap();
+        let (api, id) = running().await;
+        let token = api.create_auth_token(&id, 5, 8080).await.unwrap();
+        let bearer = Secret::new("b".repeat(40));
+        for host in ["evil.example.com", "http://x.lambda-microvm.eu-central-1.on.aws", "127.0.0.1"] {
+            let e = ep.get_health_detail(host, &token, &bearer).await.unwrap_err();
+            assert!(matches!(e, BridgeError::Sdk { op: "health_detail", .. }), "final, named for the detail: {e}");
+            assert_eq!(exit(e), 7);
+        }
     }
 
     #[test]

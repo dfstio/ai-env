@@ -1,5 +1,5 @@
 //! Bridge errors, mapped onto the CLI exit taxonomy: 7 AWS/infra, 8 VM lost,
-//! 9 policy, 5 credentials unavailable, 1 everything else.
+//! 9 policy, 5 credentials unavailable, 3 cancelled, 1 everything else.
 use crate::errors::CliError;
 use crate::wire::frame::RunHookPayload;
 use std::fmt;
@@ -25,13 +25,26 @@ pub enum BridgeError {
     /// The call failed after it may have reached the service (timeout, dispatch or
     /// response failure, a 5xx): retry only with the same `client_token` (plan S4 D16).
     Ambiguous { op: &'static str, message: String },
+    /// The endpoint kept answering 429 past the reconnect budget (S6); the last `Retry-After`, if any.
+    EndpointThrottled { retry_after_s: Option<u64> },
+    /// The VM answers no `/agent` (404): an image older than S6.
+    NoAgent(String),
     // exit 5
     CredentialsUnavailable(String),
+    // exit 3
+    /// The operator pressed Ctrl-C (`lab run`: after the terminate guard ended the probe's VMs).
+    Cancelled,
     // exit 8
     Transport(String),
     Terminated(String),
     Gap { spawn_id: String, from_seq: u64 },
     Protocol(String),
+    /// The shim refused the hello (`bad_token`, `no_commitment`, `version`, `busy`) (S6).
+    HelloRefused { code: String, message: String },
+    /// A newer client attached this spawn (S6).
+    Superseded(String),
+    /// The VM is RUNNING but its shim does not answer `/agent`, or `/run` never came (S6).
+    ShimUnavailable(String),
     /// `ResourceNotFound` for a MicroVM id: it is gone (or never was).
     VmNotFound(String),
     // exit 9
@@ -47,7 +60,10 @@ pub enum BridgeError {
     MaxConcurrent(u32),
     /// A request the policy refuses (a token port outside the allowlist, a VM of another image, …).
     Policy(String),
-    // exit 1
+    // exit 1 (vm exec maps `not_found` to 127 and `exec` to 126, like a shell, and `limit` to 9)
+    /// The VM could not start the command: `code` is the shim's `spawn_err`
+    /// code (`not_found`, `exec`, `cwd`, `limit`), `message` its scrubbed text.
+    SpawnRefused { code: &'static str, message: String },
     Config(String),
     Io(std::io::Error),
     /// A lock stayed held past its budget (`workspace busy (pid N)`).
@@ -101,11 +117,24 @@ impl fmt::Display for BridgeError {
             }
             BridgeError::Endpoint(m) => write!(f, "endpoint: {m}"),
             BridgeError::Ambiguous { op, message } => write!(f, "aws {op}: {message} (the request may have reached the service)"),
+            BridgeError::EndpointThrottled { retry_after_s } => match retry_after_s {
+                Some(s) => write!(f, "endpoint throttled (HTTP 429, Retry-After {s} s) past the reconnect budget"),
+                None => f.write_str("endpoint throttled (HTTP 429) past the reconnect budget"),
+            },
+            BridgeError::NoAgent(m) => write!(f, "the VM's shim has no /agent ({m}): its image is older than S6; start a VM of the current image"),
             BridgeError::CredentialsUnavailable(m) => write!(f, "credentials unavailable: {m}"),
+            BridgeError::Cancelled => f.write_str("cancelled"),
             BridgeError::Transport(m) => write!(f, "transport: {m}"),
             BridgeError::Terminated(m) => write!(f, "microvm terminated: {m}"),
             BridgeError::Gap { spawn_id, from_seq } => write!(f, "replay gap for spawn {spawn_id} from seq {from_seq}"),
             BridgeError::Protocol(m) => write!(f, "shim protocol: {m}"),
+            BridgeError::HelloRefused { code, message } => match code.as_str() {
+                "bad_token" => write!(f, "the VM refused this Mac's session token (wrong VM or stale row): {message}"),
+                "no_commitment" => write!(f, "the VM booted without a session commitment (fail-closed /run): terminate it: {message}"),
+                _ => write!(f, "the VM refused the hello ({code}): {message}"),
+            },
+            BridgeError::Superseded(m) => write!(f, "superseded: another client attached {m}"),
+            BridgeError::ShimUnavailable(m) => write!(f, "the shim does not answer: {m}"),
             BridgeError::VmNotFound(m) => write!(f, "microvm not found: {m}"),
             BridgeError::Tripwire(m) => write!(f, "tripwire: {m}"),
             BridgeError::SettingsWidening(m) => write!(f, "repo settings widen permissions: {m}"),
@@ -132,6 +161,7 @@ impl fmt::Display for BridgeError {
             BridgeError::PayloadTooLarge(n) => write!(f, "run-hook payload of {n} bytes exceeds {}", RunHookPayload::MAX_BYTES),
             BridgeError::MaxConcurrent(n) => write!(f, "[vm].max_concurrent={n} reached"),
             BridgeError::Policy(m) => write!(f, "refused: {m}"),
+            BridgeError::SpawnRefused { code, message } => write!(f, "the VM could not start the command ({code}): {message}"),
             BridgeError::Config(m) => write!(f, "config: {m}"),
             BridgeError::Io(e) => write!(f, "{e}"),
             BridgeError::Busy(m) => write!(f, "busy: {m}"),
@@ -160,11 +190,19 @@ impl From<BridgeError> for CliError {
             | BridgeError::AccessDenied(_)
             | BridgeError::TokenRejected { .. }
             | BridgeError::Endpoint(_)
-            | BridgeError::Ambiguous { .. } => CliError::Aws(text),
+            | BridgeError::Ambiguous { .. }
+            | BridgeError::EndpointThrottled { .. }
+            | BridgeError::NoAgent(_) => CliError::Aws(text),
             BridgeError::CredentialsUnavailable(_) => CliError::AuthUnavailable(text),
-            BridgeError::Transport(_) | BridgeError::Terminated(_) | BridgeError::Gap { .. } | BridgeError::Protocol(_) | BridgeError::VmNotFound(_) => {
-                CliError::VmLost(text)
-            }
+            BridgeError::Cancelled => CliError::Cancelled,
+            BridgeError::Transport(_)
+            | BridgeError::Terminated(_)
+            | BridgeError::Gap { .. }
+            | BridgeError::Protocol(_)
+            | BridgeError::VmNotFound(_)
+            | BridgeError::HelloRefused { .. }
+            | BridgeError::Superseded(_)
+            | BridgeError::ShimUnavailable(_) => CliError::VmLost(text),
             BridgeError::Tripwire(_)
             | BridgeError::SettingsWidening(_)
             | BridgeError::EgressRequired
@@ -173,7 +211,7 @@ impl From<BridgeError> for CliError {
             | BridgeError::PayloadTooLarge(_)
             | BridgeError::MaxConcurrent(_)
             | BridgeError::Policy(_) => CliError::Policy(text),
-            BridgeError::Config(_) | BridgeError::Busy(_) => CliError::Msg(text),
+            BridgeError::Config(_) | BridgeError::Busy(_) | BridgeError::SpawnRefused { .. } => CliError::Msg(text),
             BridgeError::Io(io) => CliError::from(io),
         }
     }
@@ -313,6 +351,7 @@ mod tests {
             (BridgeError::Endpoint("e".into()), 7),
             (BridgeError::Ambiguous { op: "run_microvm", message: "timeout".into() }, 7),
             (BridgeError::CredentialsUnavailable("c".into()), 5),
+            (BridgeError::Cancelled, 3),
             (BridgeError::Transport("t".into()), 8),
             (BridgeError::Gap { spawn_id: "s".into(), from_seq: 1 }, 8),
             (BridgeError::VmNotFound("microvm-x".into()), 8),

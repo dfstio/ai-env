@@ -24,6 +24,8 @@ pub enum CliError {
     VmLost(String),          // 8 VM terminal or transport lost (TERMINATED, replay gap)
     Policy(String),          // 9 policy refusal (tripwire, egress gate, outside roots)
     BrokenPipe,              // treated as success
+    /// A remote command's own exit status, passed through silently (`vm exec`, S6 D8).
+    Exit(i32),
 }
 
 pub type Result<T> = std::result::Result<T, CliError>;
@@ -42,6 +44,7 @@ impl CliError {
             CliError::Aws(_) => 7,
             CliError::VmLost(_) => 8,
             CliError::Policy(_) => 9,
+            CliError::Exit(code) => *code,
         }
     }
 }
@@ -54,6 +57,7 @@ impl std::fmt::Display for CliError {
             | CliError::VmLost(m) | CliError::Policy(m) => f.write_str(m),
             CliError::Cancelled => f.write_str("cancelled"),
             CliError::BrokenPipe => f.write_str("broken pipe"),
+            CliError::Exit(code) => write!(f, "exit status {code}"),
         }
     }
 }
@@ -81,7 +85,8 @@ impl From<ParseError> for CliError {
 pub fn exit_on_error(prefix: &str, result: Result<()>) {
     if let Err(e) = result {
         let code = e.exit_code();
-        if code != 0 {
+        // A passed-through remote status is the remote's to explain.
+        if code != 0 && !matches!(e, CliError::Exit(_)) {
             // Never `eprintln!`: it panics when stderr is a closed pipe, which
             // would turn the documented code into 101 (PID 1 in the VM keeps
             // its exit code even when nobody reads its stderr).

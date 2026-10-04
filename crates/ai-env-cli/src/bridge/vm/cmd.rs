@@ -56,7 +56,9 @@ impl Ctx {
             eprintln!("ai-env: warning: {TRUE_ACCEPTS_NOTHING}; only no-dns passes the credential gate: in {}: {fix}{unread}", paths.config.display());
         }
         CredentialsSource::parse(&cfg.aws.credentials)?;
+        cfg.transport.validate()?;
         let knobs = vm_knobs();
+        knobs.agent_addr().map_err(CliError::Usage)?;
         announce(&knobs);
         let _ = crate::bridge::logging::init(&crate::bridge::logging::LogOpts { path: paths.cli_log(), rust_log: std::env::var("RUST_LOG").ok() });
         Ok(Ctx { paths, cfg, knobs })
@@ -240,6 +242,10 @@ enum Pre {
     None,
     Run(Box<run::RunPlan>),
     Gc(gc::GcOpts),
+    Exec(Box<crate::bridge::agent::exec::ExecPlan>),
+    Attach(Box<crate::bridge::agent::exec::AttachPlan>),
+    /// `vm health --detail`: the row whose session token is the bearer.
+    Detail(Box<VmRow>),
 }
 
 impl Pre {
@@ -305,6 +311,9 @@ impl Pre {
                 ctx.image_arn()?;
                 Pre::None
             }
+            VmCmd::Exec { id, cwd, env, detach_grace, argv } => Pre::Exec(Box::new(crate::bridge::agent::exec::check_exec(ctx, id, cwd.clone(), env, *detach_grace, argv.clone())?)),
+            VmCmd::Attach { id, spawn, from_seq } => Pre::Attach(Box::new(crate::bridge::agent::exec::check_attach(ctx, id, spawn, *from_seq)?)),
+            VmCmd::Health { id, detail: true, .. } => Pre::Detail(Box::new(crate::bridge::agent::exec::check_detail(ctx, id)?)),
             _ => Pre::None,
         })
     }
@@ -322,7 +331,10 @@ async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
         (VmCmd::Run { json, .. }, Pre::Run(plan)) => run_cmd(ctx, api, &plan, json).await,
         (VmCmd::List { all, json }, _) => list(ctx, api, all, json).await,
         (VmCmd::Status { id, json }, _) => status(ctx, api, &id, json).await,
-        (VmCmd::Health { id, json }, _) => health_cmd(ctx, api, ep, &id, json).await,
+        (VmCmd::Health { id, detail: true, json }, Pre::Detail(row)) => crate::bridge::agent::exec::health_detail(ctx, api, ep, &id, &row, json).await,
+        (VmCmd::Health { id, detail: false, json }, _) => health_cmd(ctx, api, ep, &id, json).await,
+        (VmCmd::Exec { .. }, Pre::Exec(plan)) => crate::bridge::agent::exec::run_exec(ctx, api, ep, *plan).await,
+        (VmCmd::Attach { .. }, Pre::Attach(plan)) => crate::bridge::agent::exec::run_attach(ctx, api, ep, *plan).await,
         (VmCmd::Token { id, port, minutes, reveal }, _) => token_cmd(ctx, api, &id, port, minutes, reveal).await,
         (VmCmd::Suspend { id, no_wait }, _) => suspend_resume(ctx, api, &id, true, no_wait).await,
         (VmCmd::Resume { id, no_wait }, _) => suspend_resume(ctx, api, &id, false, no_wait).await,
@@ -336,7 +348,7 @@ async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
             shell::shell(api, &id, minutes, auth).await?;
             Ok(())
         }
-        (VmCmd::Smoke { keep, json, .. }, Pre::Run(plan)) => smoke(ctx, api, ep, &plan, keep, json).await,
+        (VmCmd::Smoke { keep, json, exec, .. }, Pre::Run(plan)) => smoke(ctx, api, ep, &plan, keep, json, exec).await,
         _ => Err(CliError::Msg("internal: command/validation mismatch".into())),
     }
 }
@@ -783,7 +795,7 @@ fn ms_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, keep: bool, json: bool) -> Result<()> {
+async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, keep: bool, json: bool, exec: bool) -> Result<()> {
     warn_plan(plan);
     let steps = Steps { json };
     let t0_unix = unix_now();
@@ -797,7 +809,7 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
         if plan.idle.auto_resume { "auto" } else { "manual" },
         plan.egress
     ))?;
-    let flow = smoke_flow(ctx, api, ep, plan, &steps);
+    let flow = smoke_flow(ctx, api, ep, plan, &steps, exec);
     let outcome = tokio::select! {
         r = flow => r,
         _ = tokio::signal::ctrl_c() => Err(SmokeFail { id: None, kept_pending: None, gate: false, error: CliError::Cancelled }),
@@ -841,13 +853,7 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
     }
     // The T4.1 budgets are wall-clock facts of the real service: with a lab
     // knob (the file fake, scaled polls) they are not judged.
-    let judged = ctx.knobs.active().is_empty();
-    let within = !judged
-        || (record.get("run_to_running_ms").and_then(serde_json::Value::as_u64).is_some_and(|m| m <= RUNNING_BUDGET_MS)
-            && record.get("running_to_health_ms").and_then(serde_json::Value::as_u64).is_some_and(|m| m <= HEALTH_BUDGET_MS)
-            && record.get("terminate_to_terminated_ms").and_then(serde_json::Value::as_u64).is_none_or(|m| m <= TERMINATED_BUDGET_MS));
-    record.insert("within_budget".into(), if judged { within.into() } else { serde_json::Value::Null });
-    record.insert("ok".into(), within.into());
+    let verdict = Verdict::of(&mut record, ctx.knobs.active().is_empty());
     let summary = format!(
         "run→RUNNING {}, RUNNING→/health {}, terminate→TERMINATED {}",
         record.get("run_to_running_ms").and_then(serde_json::Value::as_u64).map_or_else(|| "-".into(), ms_s),
@@ -857,13 +863,56 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
     if json {
         outln!("{}", serde_json::Value::Object(record).to_string());
     } else {
-        outln!("smoke {}: {summary}", if within { "ok" } else { "OVER BUDGET" });
+        outln!("smoke {}: {summary}", verdict.word());
     }
     gc_hint(gc::reconcile_local(api, &ctx.paths, &plan.image_arn).await);
-    if within {
-        Ok(())
-    } else {
-        Err(CliError::Msg(format!("smoke over budget (RUNNING ≤ 10 s, /health ≤ 5 s, TERMINATED ≤ 30 s): {summary}")))
+    verdict.result(&summary)
+}
+
+/// What a smoke's finished record says: within the T4.1 budgets (when
+/// `judged`), and `--exec`'s steps that ran but did not print what was
+/// expected (`exec_ok` false), which fail the smoke once the record is out.
+struct Verdict {
+    within: bool,
+    exec_problems: Option<Vec<String>>,
+}
+
+impl Verdict {
+    /// Judge `record`, and write the verdict into it: `within_budget` (null
+    /// when not `judged`) and `ok`.
+    fn of(record: &mut serde_json::Map<String, serde_json::Value>, judged: bool) -> Verdict {
+        let within = !judged
+            || (record.get("run_to_running_ms").and_then(serde_json::Value::as_u64).is_some_and(|m| m <= RUNNING_BUDGET_MS)
+                && record.get("running_to_health_ms").and_then(serde_json::Value::as_u64).is_some_and(|m| m <= HEALTH_BUDGET_MS)
+                && record.get("terminate_to_terminated_ms").and_then(serde_json::Value::as_u64).is_none_or(|m| m <= TERMINATED_BUDGET_MS));
+        record.insert("within_budget".into(), if judged { within.into() } else { serde_json::Value::Null });
+        let exec_problems: Option<Vec<String>> = record.get("exec_ok").filter(|ok| ok.as_bool() == Some(false)).map(|_| {
+            record.get("exec_problems").and_then(serde_json::Value::as_array).map(|l| l.iter().filter_map(|p| p.as_str().map(str::to_string)).collect()).unwrap_or_default()
+        });
+        record.insert("ok".into(), (within && exec_problems.is_none()).into());
+        Verdict { within, exec_problems }
+    }
+
+    /// The summary line's word.
+    fn word(&self) -> &'static str {
+        if !self.within {
+            "OVER BUDGET"
+        } else if self.exec_problems.is_some() {
+            "FAILED (exec)"
+        } else {
+            "ok"
+        }
+    }
+
+    /// The command's result: `Ok` (exit 0), or exit 1 naming the failure.
+    fn result(self, summary: &str) -> Result<()> {
+        if !self.within {
+            return Err(CliError::Msg(format!("smoke over budget (RUNNING ≤ 10 s, /health ≤ 5 s, TERMINATED ≤ 30 s): {summary}")));
+        }
+        match self.exec_problems {
+            Some(p) => Err(CliError::Msg(format!("smoke --exec: {}", p.join("; ")))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -893,7 +942,9 @@ fn fail_with(id: &str) -> impl FnOnce(BridgeError) -> SmokeFail + '_ {
 /// egress is asserted first, before any request reaches the VM: anything but
 /// exactly what the egress requires goes through the gate's reject path
 /// (audit `vm_egress_mismatch` via `run`, terminated by `policy`, exit 9).
-async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, steps: &Steps) -> std::result::Result<(String, serde_json::Map<String, serde_json::Value>), SmokeFail> {
+/// `--exec` (S6) then runs the `/agent` steps of `exec::smoke_exec`; their
+/// verdict is in the record (`exec_ok`), which the caller judges once it is out.
+async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, steps: &Steps, exec: bool) -> std::result::Result<(String, serde_json::Map<String, serde_json::Value>), SmokeFail> {
     let selected = run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)).await.map_err(|f| {
         let gate = matches!(f.error, BridgeError::EgressMismatch(_));
         SmokeFail { id: f.started, kept_pending: f.kept_pending, gate, error: f.error.into() }
@@ -983,6 +1034,13 @@ async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E
     rec.insert("running_to_health_ms".into(), health_ms.into());
     rec.insert("health_attempts".into(), stats.attempts.into());
     rec.insert("health".into(), serde_json::to_value(&h).unwrap_or_default());
+    if exec {
+        let ran = crate::bridge::agent::exec::smoke_exec(ctx, api, ep, &row, expected_claude.as_deref()).await;
+        for step in &ran.steps {
+            say(step.line.clone())?;
+        }
+        ran.record(&mut rec);
+    }
     Ok((id, rec))
 }
 
@@ -1073,7 +1131,7 @@ fn with_note(derived: String, user: Option<&String>) -> Option<String> {
 
 fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::path::Path>, manual: Option<&str>, note: Option<String>) -> Result<()> {
     let spec = probes::spec(name).ok_or_else(|| CliError::Usage(format!("unknown probe {name:?} (ai-env lab list)")))?;
-    if !matches!(spec.stage, "S4" | "S5") {
+    if !matches!(spec.stage, "S4" | "S5" | "S6") {
         return Err(CliError::Usage(format!("{name} is a {} probe, recorded by: {}", spec.stage, spec.recorded_by)));
     }
     let paths = Paths::resolve()?;
@@ -1463,6 +1521,58 @@ mod tests {
         let far = keeper_hints(&[trail(false, Some(("us-east-1", "g3")))], &[], "microvm-x", "2026-09-30", 1_000);
         assert!(far[1].contains("g3 in us-east-1") && !far.iter().any(|h| h.contains("filter-log-events")), "{far:?}");
         assert_eq!(keeper_hints(&[trail(false, None)], &[], "microvm-x", "2026-09-30", 1_000).len(), 1, "S3 only");
+    }
+
+    /// `vm smoke --exec`'s verdict on its record: steps that all passed
+    /// (`SmokeExec::record`) within the budgets make `"ok":true` next to
+    /// `"exec_ok":true` (what `make s6-smoke` greps) and exit 0; a step that
+    /// failed makes `"ok":false` and exit 1 naming it; so do the budgets,
+    /// which a lab knob leaves unjudged; a smoke without `--exec` has no step.
+    #[test]
+    fn a_smoke_whose_exec_steps_passed_is_ok_and_exits_0() {
+        use crate::bridge::agent::exec::{SmokeExec, SmokeStep};
+        let step = |field, ok| SmokeStep { field, got: Some("x".into()), ok, line: format!("exec {field}: {}", if ok { "ok" } else { "MISMATCH" }) };
+        let record = |steps: Option<Vec<SmokeStep>>, health_ms: u64| {
+            let mut rec = serde_json::Map::new();
+            rec.insert("backend".into(), "sdk".into());
+            rec.insert("egress_ok".into(), true.into());
+            rec.insert("run_to_running_ms".into(), 4_000.into());
+            rec.insert("running_to_health_ms".into(), health_ms.into());
+            rec.insert("terminate_to_terminated_ms".into(), 3_000.into());
+            if let Some(steps) = steps {
+                SmokeExec { steps, ms: 30 }.record(&mut rec);
+            }
+            rec
+        };
+        let passed = || Some(["exec_claude", "exec_uid", "exec_curl", "exec_proxy_vars"].into_iter().map(|f| step(f, true)).collect::<Vec<_>>());
+        let mut rec = record(passed(), 900);
+        let v = Verdict::of(&mut rec, true);
+        assert_eq!(v.word(), "ok");
+        let line = serde_json::Value::Object(rec).to_string();
+        for want in [r#""backend":"sdk""#, r#""egress_ok":true"#, r#""exec_ok":true"#, r#""exec_problems":[]"#, r#""within_budget":true"#, r#""ok":true"#] {
+            assert!(line.contains(want), "{want}: {line}");
+        }
+        assert!(v.result("timings").is_ok(), "exit 0");
+
+        let mut rec = record(Some(vec![step("exec_claude", true), step("exec_uid", false)]), 900);
+        let v = Verdict::of(&mut rec, true);
+        assert_eq!((v.word(), rec["ok"].as_bool(), rec["within_budget"].as_bool()), ("FAILED (exec)", Some(false), Some(true)));
+        let e = v.result("timings").unwrap_err();
+        assert_eq!((e.exit_code(), e.to_string()), (1, "smoke --exec: exec exec_uid: MISMATCH".to_string()));
+
+        let mut rec = record(passed(), 6_000);
+        let v = Verdict::of(&mut rec, true);
+        assert_eq!((v.word(), rec["ok"].as_bool(), rec["within_budget"].as_bool()), ("OVER BUDGET", Some(false), Some(false)));
+        assert!(v.result("timings").unwrap_err().to_string().starts_with("smoke over budget"));
+        let mut rec = record(passed(), 6_000);
+        let v = Verdict::of(&mut rec, false);
+        assert_eq!((v.word(), rec["ok"].as_bool(), rec["within_budget"].is_null()), ("ok", Some(true), true), "a lab knob: the budgets are not judged");
+        assert!(v.result("timings").is_ok());
+
+        let mut rec = record(None, 900);
+        let v = Verdict::of(&mut rec, true);
+        assert_eq!((v.word(), rec["ok"].as_bool(), rec.contains_key("exec_ok")), ("ok", Some(true), false));
+        assert!(v.result("timings").is_ok());
     }
 
     #[test]

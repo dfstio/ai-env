@@ -308,6 +308,68 @@ fn make_n_of_the_part_b_targets_executes_nothing() {
     assert!(!rk.is_empty() && !rk.contains(" -k "), "runtime-key names no keystore key (ai-env run picks the container's): {rk}");
 }
 
+// ---- test-docker: both suites before the stamp, and no stamp after a failed step ----
+
+/// `make -n test-docker`: the image build, then the shim-only suite, then
+/// `docker_exec` (default features: the real `vm exec`), both `--ignored` on
+/// one thread under the same Docker variables; the stamp comes last, after
+/// both. Nothing runs. Then the recipe for real, its image targets a logged
+/// sub-make (MAKE) and its suites a logged cargo, each step failing in turn:
+/// make stops at that step and stamps nothing (a `-` prefix, an `|| true` or
+/// a `| tee` on any step would stamp a zip a step failed for); with no step
+/// failing it stamps the zip's sha256.
+#[test]
+fn test_docker_runs_both_docker_suites_before_the_stamp_and_stamps_nothing_after_a_failure() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let out = make(t.path(), &bin, &["-n", "test-docker"]).arg(format!("IMAGE_OUT={}", t.path().join("out").display())).env("FAKE_LOG", &log).bounded();
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(read(&log), "", "make -n ran a tool");
+    assert!(!t.path().join("out").exists(), "make -n wrote into IMAGE_OUT");
+    // One line per command: a continuation joined to its line.
+    let text = stdout(&out).replace("\\\n", " ");
+    let at = |want: &str| text.find(want).unwrap_or_else(|| panic!("{want} missing from the dry run: {text}"));
+    let suites = ["cargo +1.98.1 test -p ai-env-cli --no-default-features --features shim --test shim_docker -- --ignored --test-threads=1", "cargo +1.98.1 test -p ai-env-cli --test docker_exec -- --ignored --test-threads=1"];
+    let order = [at("docker build --platform linux/arm64 -t ai-env-agent:local"), at(suites[0]), at(suites[1]), at("test-docker: ok, stamped")];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "the image, shim_docker, docker_exec, then the stamp: {text}");
+    let env: Vec<&str> = suites.iter().map(|s| text.lines().find(|l| l.contains(s)).unwrap().split("cargo +1.98.1").next().unwrap().trim()).collect();
+    assert!(env[0].starts_with("AI_ENV_DOCKER_TESTS=1 ") && env[0].contains(" AI_ENV_DOCKER_IMAGE='ai-env-agent:local' "), "{env:?}");
+    assert_eq!(env[0], env[1], "both suites see the same Docker variables");
+
+    let steps = ["image-zip", "image-build-local", "shim_docker", "docker_exec"];
+    for failing in ["none", "image-zip", "image-build-local", "shim_docker", "docker_exec"] {
+        let u = tempfile::tempdir().unwrap();
+        // shasum stays real (the stamp); every other outside tool is a logged failure.
+        let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().filter(|n| !matches!(**n, "cargo" | "shasum")).map(|n| ("logged.sh", *n)).collect();
+        let bin = bin_with(u.path(), &fakes);
+        let stub = "echo \"$(basename \"$0\") $*\" >> \"$FAKE_LOG\"\ncase \" $* \" in *\" $FAIL_STEP \"*) exit 2 ;; esac\nexit 0";
+        script(&bin.join("cargo"), stub);
+        script(&bin.join("sub-make"), stub);
+        std::fs::create_dir_all(u.path().join("out")).unwrap();
+        std::fs::write(u.path().join("out/image.zip"), "a zip").unwrap();
+        let log = u.path().join("tools.log");
+        let out = make(u.path(), &bin, &["test-docker"])
+            .arg(format!("IMAGE_OUT={}", u.path().join("out").display()))
+            .arg(format!("MAKE={}", bin.join("sub-make").display()))
+            .env("FAKE_LOG", &log)
+            .env("FAIL_STEP", failing)
+            .bounded();
+        let calls = lines_of(&log);
+        let ran: Vec<&str> = calls.iter().map(|l| steps.into_iter().find(|s| l.split(' ').any(|w| w == *s)).unwrap_or(l)).collect();
+        let upto = steps.iter().position(|s| *s == failing).map_or(steps.len(), |i| i + 1);
+        assert_eq!(ran, steps[..upto], "{failing} failing: the steps in order, none after the failure: {}", all(&out));
+        let stamp = u.path().join("out/test-docker.ok");
+        if failing == "none" {
+            assert!(out.status.success(), "{}", all(&out));
+            assert_eq!(read(&stamp), format!("{}\n", ai_env_cli::bridge::egress::value_sha256("a zip")), "the stamp is the zip's sha256");
+        } else {
+            assert!(!out.status.success() && !stamp.exists(), "a failed {failing} stamped the zip: {}", all(&out));
+        }
+    }
+}
+
 // ---- claude-pin (fake curl and gpg) ----
 
 /// The Claude Code release key the Makefile pins, read from it.
@@ -1068,7 +1130,7 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
         stdout(&out)
     };
     let ai_env = "cargo +1.98.1 run -q -p ai-env-cli --bin ai-env --";
-    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY";
+    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR";
     let probe_cli = format!("{lab_unset} AI_ENV_CLI='{ai_env}'");
     let cases: Vec<(&str, Vec<String>)> = vec![
         ("connector-status", vec!["/bin/bash infra/scripts/ops.sh connector-status".into()]),
@@ -1081,6 +1143,16 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
         ("proxy-start", vec![format!("{lab_unset} {ai_env} proxy start")]),
         ("proxy-patch", vec![format!("{lab_unset} {ai_env} proxy patch")]),
         ("s5-smoke", vec![format!("{lab_unset} {ai_env} vm smoke --egress vpc --max-duration 900 --json"), "grep -q '\"backend\":\"sdk\"'".into(), "grep -q '\"egress_ok\":true'".into(), ">> target/s5/smoke.jsonl".into()]),
+        (
+            "s6-smoke",
+            vec![
+                format!("{lab_unset} {ai_env} vm smoke --egress vpc --exec --max-duration 900 --json"),
+                "grep -q '\"backend\":\"sdk\"'".into(),
+                "grep -q '\"egress_ok\":true'".into(),
+                "grep -q '\"exec_ok\":true'".into(),
+                ">> target/s6/smoke.jsonl".into(),
+            ],
+        ),
         (
             "test-egress",
             vec![
@@ -1112,6 +1184,8 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
     assert!(delete.find("ops.sh vm-guard").unwrap() < delete.find("ops.sh connector-delete").unwrap(), "vm-guard first: {delete}");
     let smoke = dry(&["s5-smoke"], &[]);
     assert!(smoke.find("smoke.jsonl").unwrap() < smoke.find("egress_ok").unwrap(), "every record is kept, then judged (as s4-smoke): {smoke}");
+    let smoke = dry(&["s6-smoke"], &[]);
+    assert!(smoke.find("smoke.jsonl").unwrap() < smoke.find("exec_ok").unwrap(), "every record is kept, then judged (as s5-smoke): {smoke}");
 
     // The switches count only on the command line.
     assert!(dry(&["proxy-stop", "YES=1"], &[]).contains(&format!("{ai_env} proxy stop --yes")));
@@ -1777,6 +1851,37 @@ fn s5_smoke_wants_three_sdk_records_that_echo_exactly_the_connector() {
     }
 }
 
+#[test]
+fn s6_smoke_wants_three_sdk_records_with_egress_and_exec_ok() {
+    let record = |backend: &str, egress_ok: bool, exec_ok: Option<bool>| {
+        let mut r = json!({"backend": backend, "id": "mvm-0123456789abcdef0", "image_version": "5", "egress_ok": egress_ok, "exec_claude": "2.1.287 (Claude Code)", "exec_uid": "1000"});
+        if let Some(ok) = exec_ok {
+            r["exec_ok"] = json!(ok);
+        }
+        r.to_string()
+    };
+    let cases = [
+        ("three good passes", record("sdk", true, Some(true)), true, "s6-smoke: 3/3 ok (target/s6/smoke.jsonl)", 3),
+        ("exec_ok false", record("sdk", true, Some(false)), false, "s6-smoke: pass 1: exec_ok is not true", 1),
+        ("no exec_ok", record("sdk", true, None), false, "s6-smoke: pass 1: exec_ok is not true", 1),
+        ("egress_ok false", record("sdk", false, Some(true)), false, "s6-smoke: pass 1: egress_ok is not true", 1),
+        ("the fake backend", record("fake", true, Some(true)), false, "s6-smoke: pass 1 did not use the SDK backend", 1),
+    ];
+    for (what, rec, ok, want, runs) in cases {
+        let t = tempfile::tempdir().unwrap();
+        let w = planted_repo(t.path(), true);
+        let bin = bin_with(t.path(), &[("ai-env.sh", "ai-env-stand-in")]);
+        let log = t.path().join("ai-env.log");
+        let out = make_in(t.path(), &bin, &w, &["s6-smoke"]).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).env("FAKE_AIENV_SMOKE", &rec).env("FAKE_AIENV_LOG", &log).bounded();
+        let text = all(&out);
+        assert_eq!(out.status.success(), ok, "{what}: {text}");
+        assert!(text.contains(want), "{what}: {text}");
+        let smokes = lines_of(&log).iter().filter(|l| l.starts_with("vm smoke --egress vpc --exec --max-duration 900 --json [AI_ENV=unset]")).count();
+        assert_eq!(smokes, runs, "{what}: {:?}", lines_of(&log));
+        assert_eq!(lines_of(&w.join("target/s6/smoke.jsonl")), vec![rec.clone(); runs], "{what}: every record is kept");
+    }
+}
+
 /// `make s3-preflight PHASE=a` with the stateful aws (seeded by `files`, under
 /// `<tmp>/aws`) and the S3 fakes; its `[..]` rows.
 fn preflight_s5(t: &Path, files: &[(&str, &str)], envs: &[(&str, &str)]) -> (Output, Vec<String>) {
@@ -1981,32 +2086,32 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
 
 #[test]
 fn the_live_s5_targets_drop_every_lab_knob() {
-    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"), ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")];
+    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"), ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1"), ("AI_ENV_BRIDGE_LAB_AGENT_ADDR", "127.0.0.1:9")];
     let t = tempfile::tempdir().unwrap();
     let w = planted_repo(t.path(), true);
     let bin = s5_bin(t.path());
     script(&bin.join("cargo"), CARGO_FAKE);
     seed_connector(t.path(), CONNECTOR, "ACTIVE");
     let stand_in = format!("AI_ENV={}", bin.join("ai-env-stand-in").display());
-    let record = json!({"backend": "sdk", "egress_ok": true}).to_string();
+    let record = json!({"backend": "sdk", "egress_ok": true, "exec_ok": true}).to_string();
     let run = |args: &[&str]| {
         let mut cmd = make_in(t.path(), &bin, &w, args);
         s5_env(&mut cmd, t.path()).arg(&stand_in).env("FAKE_AIENV_SMOKE", &record).envs(knobs).bounded()
     };
-    let live: [&[&str]; 7] = [&["s5-smoke"], &["test-egress"], &["connector-probe", "CONFIRM=create-probe-connector", "CONNECTOR_WAIT_POLL=1"], &["allowlist-reload"], &["proxy-stop"], &["proxy-start"], &["proxy-patch"]];
+    let live: [&[&str]; 8] = [&["s5-smoke"], &["s6-smoke"], &["test-egress"], &["connector-probe", "CONFIRM=create-probe-connector", "CONNECTOR_WAIT_POLL=1"], &["allowlist-reload"], &["proxy-stop"], &["proxy-start"], &["proxy-patch"]];
     for args in live {
         let out = run(args);
         assert!(out.status.success(), "{args:?}: {}", all(&out));
     }
     let c = calls(t.path());
     let children: Vec<&String> = c.iter().filter(|l| l.contains("[AI_ENV=") || l.starts_with("cargo ")).collect();
-    assert_eq!(children.len(), 3 + 2 + 1 + 4, "three smokes, cargo and the removal, the probe's lab run, the four operator calls: {children:#?}");
+    assert_eq!(children.len(), 3 + 3 + 2 + 1 + 4, "three s5 and three s6 smokes, cargo and the removal, the probe's lab run, the four operator calls: {children:#?}");
     assert!(children.iter().all(|l| !l.contains("[LAB=")), "a lab knob reached a live command: {children:#?}");
     // The control: a target that keeps the knobs hands them on, and the stand-in sees them.
     let out = run(&["check-base-image"]);
     assert!(out.status.success(), "{}", all(&out));
     let last = calls(t.path()).pop().unwrap();
-    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_ASSUME_TTY AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL]"), "{last}");
+    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_ASSUME_TTY AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL]"), "{last}");
 }
 
 #[test]

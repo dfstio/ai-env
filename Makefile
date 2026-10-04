@@ -1,6 +1,6 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws test-aws-readonly s4-smoke s5-smoke test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
+.PHONY: help build check-bins test test-aws test-aws-readonly s4-smoke s5-smoke s6-smoke test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
         claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
 
 SHELL        := /bin/bash
@@ -106,11 +106,11 @@ test: ## Unit + integration tests in all four feature sets
 
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
 # AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend).
-LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY
+LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
 # cargo hides for passing tests; one thread keeps each test's lines together.
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test; PROBES=1 re-records the live S4 probes
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture
 	@$(if $(filter 1,$(call cmdline,PROBES)),rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
@@ -136,6 +136,17 @@ s5-smoke: ## T5.1 gate: three `ai-env vm smoke --egress vpc --max-duration 900 -
 	  grep -q '"egress_ok":true' <<<"$$out" || { echo "$$out"; echo "s5-smoke: pass $$i: egress_ok is not true (the VM did not echo exactly the connector)"; exit 1; }; \
 	  echo "s5-smoke: pass $$i ok"; \
 	done; echo "s5-smoke: 3/3 ok (target/s5/smoke.jsonl)"
+
+s6-smoke: ## T6.7 gate: three `ai-env vm smoke --egress vpc --exec --max-duration 900 --json` passes (live, one Touch ID each; backend sdk, egress_ok and exec_ok true: claude --version is the image's pin, id -u is 1000, 401 through the proxy, 6 proxy variables); records appended to target/s6/smoke.jsonl
+	@mkdir -p target/s6
+	@for i in 1 2 3; do \
+	  out=$$($(LAB_UNSET) $(AI_ENV) vm smoke --egress vpc --exec --max-duration 900 --json) || { echo "$$out"; echo "s6-smoke: pass $$i failed"; exit 1; }; \
+	  printf '%s\n' "$$out" >> target/s6/smoke.jsonl; \
+	  grep -q '"backend":"sdk"' <<<"$$out" || { echo "$$out"; echo "s6-smoke: pass $$i did not use the SDK backend"; exit 1; }; \
+	  grep -q '"egress_ok":true' <<<"$$out" || { echo "$$out"; echo "s6-smoke: pass $$i: egress_ok is not true (the VM did not echo exactly the connector)"; exit 1; }; \
+	  grep -q '"exec_ok":true' <<<"$$out" || { echo "$$out"; echo "s6-smoke: pass $$i: exec_ok is not true (claude --version, id -u, the proxy or its variables: see exec_* above)"; exit 1; }; \
+	  echo "s6-smoke: pass $$i ok"; \
+	done; echo "s6-smoke: 3/3 ok (target/s6/smoke.jsonl)"
 
 # The live tests may allow github.com for workspace ai-env-test (live_egress_extra_and_removal): on every exit of the
 # recipe (success, failure, Ctrl-C) the entry is removed again, a no-op when it is absent, so a killed test never leaves
@@ -237,9 +248,9 @@ clippy: ## clippy -D warnings in every cfg world (bridge+shim, shim-only, shim-o
 	$(CARGO) clippy -p $(PKG) --all-targets --no-default-features -- -D warnings
 	$(CARGO) clippy -p ai-env-age --all-targets -- -D warnings
 
-lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; TLS/WS dialing confined to $(TLS_ALLOW); every tests/*.rs declared)
+lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); every tests/*.rs declared)
 	@bad=$$(grep -rn 'Connector::Plain' crates/$(PKG)/src || true); test -z "$$bad" || { echo "$$bad"; echo "lint: Connector::Plain is forbidden"; exit 1; }
-	@bad=$$(grep -rlE 'connect_async|client_async_tls|Connector::Rustls|use_preconfigured_tls|ClientConfig::builder|aws_smithy_http_client' crates/$(PKG)/src | grep -vE '$(TLS_ALLOW)' || true); \
+	@bad=$$(grep -rlE 'connect_async|client_async|Connector::Rustls|use_preconfigured_tls|ClientConfig::builder|aws_smithy_http_client' crates/$(PKG)/src | grep -vE '$(TLS_ALLOW)' || true); \
 	  test -z "$$bad" || { echo "$$bad"; echo "lint: TLS/WS/SDK-HTTP dialing must live in $(TLS_ALLOW)"; exit 1; }
 	@for f in crates/$(PKG)/tests/*.rs; do n=$$(basename "$$f" .rs); \
 	  grep -qE "^name *= *\"$$n\"" crates/$(PKG)/Cargo.toml || { echo "lint: $$f has no [[test]] name = \"$$n\" entry (autotests = false: it would silently never run)"; exit 1; }; done
@@ -330,11 +341,13 @@ image-build-local: ## docker build the staged context (as the platform would) in
 image-run-local: ## Run $(LOCAL_IMAGE) with its ports on 127.0.0.1:18080 (app), :19000 (hooks), :19418 (code)
 	docker run --rm -it --platform linux/arm64 --name ai-env-agent-local -p 127.0.0.1:18080:8080 -p 127.0.0.1:19000:9000 -p 127.0.0.1:19418:9418 $(LOCAL_IMAGE)
 
-test-docker: ## T3.1: image-zip + image-build-local, then the opt-in Docker tests (L1 base image + shim, L2 local image); stamps the zip for deploy
+test-docker: ## T3.1: image-zip + image-build-local, then the opt-in Docker tests (L1 base image + shim, L2 local image, and S6 T6.7: the real `vm exec` on L2 through the fake endpoint); stamps the zip for deploy
 	$(MAKE) image-zip
 	$(MAKE) image-build-local
 	AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
 	  $(CARGO) test -p $(PKG) --no-default-features --features shim --test shim_docker -- --ignored --test-threads=1
+	AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
+	  $(CARGO) test -p $(PKG) --test docker_exec -- --ignored --test-threads=1
 	@sha=$$(shasum -a 256 "$(IMAGE_ZIP)" | cut -d' ' -f1); echo "$$sha" > "$(DOCKER_STAMP)"; echo "test-docker: ok, stamped $$sha"
 
 check-base-image: ## T3.5: the pinned managed base image (baseImage in $(IMAGE_CONFIG)) is AVAILABLE
