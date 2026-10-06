@@ -113,20 +113,32 @@ fn fmt_secs(d: Duration) -> String {
     }
 }
 
-/// `Ok(stdout)` (trimmed) on exit 0, else the first stderr line (or the exit
-/// code when stderr is empty, or the spawn/timeout error).
+/// `Ok(stdout)` (trimmed) on exit 0, else the stderr line that says what
+/// went wrong ([`error_line`]; or the exit code when stderr is empty, or the
+/// spawn/timeout error).
 pub fn run_capture_cmd(cmd: Command, stdin: Option<&[u8]>, timeout: Duration) -> Result<String, String> {
     let program = cmd.get_program().to_string_lossy().into_owned();
     let c = capture(cmd, stdin, timeout)?;
     if c.success {
         return Ok(c.stdout.trim().to_string());
     }
-    let first = c.stderr.trim().lines().next().unwrap_or("").to_string();
+    let first = error_line(&c.stderr).to_string();
     if first.is_empty() {
         Err(format!("{program}: exit {}", c.code.map_or_else(|| "signal".to_string(), |code| code.to_string())))
     } else {
         Err(first)
     }
+}
+
+/// The line of a failed command's stderr that says what went wrong: the
+/// first, unless stderr is a Python traceback (a crashed aws CLI), whose
+/// error is its last unindented line (`ImportError: …`), not the header.
+fn error_line(stderr: &str) -> &str {
+    let first = stderr.trim().lines().next().unwrap_or("").trim();
+    if !first.starts_with("Traceback (most recent call last)") {
+        return first;
+    }
+    stderr.trim().lines().rev().find(|l| !l.is_empty() && !l.starts_with(char::is_whitespace) && !l.starts_with("Traceback ")).map_or(first, str::trim)
 }
 
 /// The command a probe runs: `program args…` with `CLAUDE_CODE_OAUTH_TOKEN`
@@ -1834,6 +1846,21 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2), "killed promptly: {:?}", start.elapsed());
     }
 
+    /// A crashed aws CLI prints a Python traceback: the error is its last
+    /// unindented line, not the "Traceback" header (S6 part B: a Homebrew
+    /// awscli whose `_awscrt` lost its libaws-c-s3 dylib).
+    #[test]
+    fn a_python_tracebacks_error_line_is_its_exception() {
+        let tb = "Traceback (most recent call last):\n  File \"/x/awscrt/crypto.py\", line 4, in <module>\n    import _awscrt\nImportError: dlopen(/x/_awscrt.abi3.so, 0x0002): Library not loaded: /opt/homebrew/opt/aws-c-s3/lib/libaws-c-s3.1.2.dylib\n  Referenced from: <uuid> /x/_awscrt.abi3.so\n  Reason: tried: '/opt/homebrew/opt/aws-c-s3/lib/libaws-c-s3.1.2.dylib' (no such file)\n";
+        assert_eq!(error_line(tb), "ImportError: dlopen(/x/_awscrt.abi3.so, 0x0002): Library not loaded: /opt/homebrew/opt/aws-c-s3/lib/libaws-c-s3.1.2.dylib");
+        let chained = "Traceback (most recent call last):\n  File \"a\"\nKeyError: 'x'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"b\"\nValueError: bad\n";
+        assert_eq!(error_line(chained), "ValueError: bad", "the last exception of a chain");
+        assert_eq!(error_line("Traceback (most recent call last):\n  File \"a\"\n"), "Traceback (most recent call last):", "no exception line: the header");
+        assert_eq!(error_line("first\nsecond\n"), "first");
+        assert_eq!(error_line("\n  An error occurred (ExpiredToken)\n"), "An error occurred (ExpiredToken)");
+        assert_eq!(error_line(""), "");
+    }
+
     #[cfg(unix)]
     #[test]
     fn capture_feeds_stdin_and_reports_failures() {
@@ -1844,6 +1871,8 @@ mod tests {
         assert_eq!(err, "first");
         let err = run_capture_cmd(sh("exit 4"), None, Duration::from_secs(5)).unwrap_err();
         assert_eq!(err, "/bin/sh: exit 4");
+        let err = run_capture_cmd(sh("printf 'Traceback (most recent call last):\\n  File \"x\", line 4\\n    import _awscrt\\nImportError: boom\\n' >&2; exit 1"), None, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(err, "ImportError: boom", "a crashed Python CLI: its exception, not the traceback's header");
         assert!(run_capture("/nonexistent/program-xyz", &[], Duration::from_secs(1)).unwrap_err().starts_with("/nonexistent/program-xyz: "));
     }
 

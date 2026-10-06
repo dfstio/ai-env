@@ -64,7 +64,8 @@ fn what(service: &str, args: &[&str]) -> String {
 
 /// Run [`aws_cmd`] under `timeout`, feeding `stdin` when given: `Ok(stdout)`
 /// (trimmed) on exit 0, else `Err` with the operation and the aws error's
-/// first line (or the exit code, the timeout, a missing CLI).
+/// first line — a crashed CLI's Python exception, not its traceback's header
+/// — (or the exit code, the timeout, a missing CLI).
 pub fn aws_run(service: &str, args: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> Result<String, String> {
     let cmd = aws_cmd(service, args)?;
     run_capture_cmd(cmd, stdin, timeout).map_err(|e| format!("{}: {e}", what(service, args)))
