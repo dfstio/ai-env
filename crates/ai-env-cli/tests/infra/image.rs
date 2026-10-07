@@ -1431,14 +1431,20 @@ fn probe_name(calls: &[String]) -> String {
 }
 
 /// The wait for the probe connector takes minutes (255 and 265 s live, 2 Oct 2026) and once looked like a hang: it
-/// names its limit and says it is still waiting every PROBE_PROGRESS_S (60 s; 1 s here).
+/// names its limit and says it is still waiting every PROBE_PROGRESS_S (60 s; 1 s here). The connector is held
+/// PENDING until the stand-in's `lab run` has ended (create-hold), so its five PENDING polls always fall inside the
+/// progress loop: without the hold a slow stand-in on a loaded machine outlasted them, the wait was over before the
+/// loop began, and no progress line was due (seen once in a full gate, 7 Oct 2026).
 #[test]
 fn connector_probe_says_it_is_still_waiting() {
     let t = tempfile::tempdir().unwrap();
     let bin = s5_bin(t.path());
     seed_connector(t.path(), CONNECTOR, "ACTIVE");
-    std::fs::write(t.path().join("aws/create-states"), "PENDING PENDING PENDING PENDING PENDING ACTIVE\n").unwrap();
-    let out = probe(t.path(), &bin, &[("PROBE_PROGRESS_S", "1"), ("CONNECTOR_WAIT_TIMEOUT", "60")]);
+    // A stand-in (8 s) far slower than the polls before ACTIVE (two PENDING, about 2-4 s with the fake's per-call cost):
+    // without the hold the wait would be over before the progress loop began, so this fails if the hold is dropped.
+    std::fs::write(t.path().join("aws/create-states"), "PENDING PENDING ACTIVE\n").unwrap();
+    std::fs::write(t.path().join("aws/create-hold"), "").unwrap();
+    let out = probe(t.path(), &bin, &[("PROBE_PROGRESS_S", "1"), ("CONNECTOR_WAIT_TIMEOUT", "60"), ("FAKE_AIENV_LAB_SLEEP", "8")]);
     let text = all(&out);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("(polled every 1s since the create, at most 60s;") && text.contains("connector-probe: still waiting after "), "{text}");

@@ -262,6 +262,21 @@ pub trait MicrovmApi: Send + Sync {
     /// Every version of the image (all pages).
     fn list_image_versions(&self, arn: &str) -> impl Future<Output = Result<Vec<ImageVersion>, BridgeError>> + Send;
     fn list_managed_images(&self) -> impl Future<Output = Result<Vec<ManagedImage>, BridgeError>> + Send;
+
+    /// `GetNetworkConnector` on `identifier` (an ARN or an `nc-…` id): the
+    /// connector document as the service answers it, which
+    /// `egress::ConnectorFacts::from_get` reads. The one call the SDK does not
+    /// model, so the runtime client signs it by hand (S7 D5), and the one the
+    /// credential gate needs live: the Mac compares the egress connector's
+    /// configuration now with the one the recorded `ai-env egress check`
+    /// verified.
+    ///
+    /// The default fails closed, so a client that cannot make the call can
+    /// never be mistaken for one whose facts matched.
+    fn get_network_connector(&self, identifier: &str) -> impl Future<Output = Result<serde_json::Value, BridgeError>> + Send {
+        let _ = identifier;
+        async { Err(BridgeError::Sdk { op: "get_network_connector", message: "this client cannot read a network connector".into() }) }
+    }
 }
 
 /// One `GET https://<endpoint>/health/detail` through the proxy (S6, bearer only).
@@ -362,6 +377,8 @@ pub enum Call {
     GetImage(String),
     ListImageVersions(String),
     ListImages,
+    /// `GetNetworkConnector` (S7).
+    GetConnector(String),
     Health { endpoint: String, port: u16 },
     /// `GET /health/detail` (S6).
     HealthDetail { endpoint: String, port: u16 },
@@ -468,6 +485,12 @@ pub struct FakeState {
     /// documented form: the client then backs off exponentially) (S6).
     #[serde(default = "default_retry_after_429")]
     pub retry_after_429: Option<u64>,
+    /// `GetNetworkConnector` answers, keyed by the identifier asked for — the
+    /// ARN and the `nc-…` id are separate keys, as the service accepts either.
+    /// An identifier that is not here answers `ResourceNotFoundException`, so a
+    /// test that forgot to seed one never passes the gate by accident (S7).
+    #[serde(default)]
+    pub connectors: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_retry_after_429() -> Option<u64> {
@@ -734,6 +757,15 @@ impl FakeState {
         Ok(vec![ManagedImage { arn: format!("arn:aws:lambda:{REGION}:aws:microvm-image:al2023-1") }])
     }
 
+    pub fn get_network_connector(&mut self, identifier: &str) -> Result<serde_json::Value, BridgeError> {
+        self.calls.push(Call::GetConnector(identifier.to_string()));
+        self.fail("get_connector", "get_network_connector")?;
+        self.connectors
+            .get(identifier)
+            .cloned()
+            .ok_or_else(|| BridgeError::Sdk { op: "get_network_connector", message: format!("ResourceNotFoundException: network connector {identifier} not found") })
+    }
+
     /// The proxy's part of every fake endpoint request (shared by
     /// [`Self::get_health`], [`Self::get_health_detail`] and the tests' fake
     /// `/agent` endpoint): the VM of `endpoint` and a token valid for it, for
@@ -934,6 +966,12 @@ impl FakeMicrovmApi {
     pub fn set_get_egress_echo(&self, echo: Option<Vec<String>>) {
         self.state().get_egress_echo = echo;
     }
+
+    /// What `GetNetworkConnector` answers for `identifier` (S7); any other
+    /// identifier stays `ResourceNotFoundException`.
+    pub fn set_connector(&self, identifier: &str, doc: serde_json::Value) {
+        self.state().connectors.insert(identifier.to_string(), doc);
+    }
 }
 
 impl MicrovmApi for FakeMicrovmApi {
@@ -979,6 +1017,10 @@ impl MicrovmApi for FakeMicrovmApi {
 
     async fn list_managed_images(&self) -> Result<Vec<ManagedImage>, BridgeError> {
         self.state().list_managed_images()
+    }
+
+    async fn get_network_connector(&self, identifier: &str) -> Result<serde_json::Value, BridgeError> {
+        self.state().get_network_connector(identifier)
     }
 }
 
@@ -1063,6 +1105,65 @@ mod tests {
         s.get_egress_echo = Some(vec![managed_connector_arn("INTERNET_EGRESS")]);
         assert_eq!(s.get(&a.id).unwrap().egress, vec![managed_connector_arn("INTERNET_EGRESS")], "Get only");
         assert_eq!(s.run(&spec("t5", vec![conn.clone()])).unwrap().egress, vec![conn], "Run unaffected");
+    }
+
+    /// `GetNetworkConnector` through the fake (S7): the identifier asked for
+    /// decides, an unseeded one is not found (never an empty pass), and the
+    /// call is recorded.
+    #[tokio::test]
+    async fn the_fake_answers_only_the_connectors_it_was_given() {
+        let api = FakeMicrovmApi::new();
+        let arn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
+        let doc = serde_json::json!({"Id": "nc-1", "State": "ACTIVE"});
+        api.set_connector(arn, doc.clone());
+        assert_eq!(api.get_network_connector(arn).await.unwrap(), doc);
+        let e = api.get_network_connector("nc-1").await.unwrap_err();
+        assert!(matches!(&e, BridgeError::Sdk { op: "get_network_connector", message } if message.contains("ResourceNotFoundException")), "another identifier is another key: {e}");
+        assert_eq!(api.calls(), vec![Call::GetConnector(arn.to_string()), Call::GetConnector("nc-1".to_string())]);
+    }
+
+    /// A client that does not implement the call fails closed, so it can never
+    /// be mistaken for one whose facts matched (S7).
+    #[tokio::test]
+    async fn the_default_connector_read_fails_closed() {
+        struct NoConnectors;
+        impl MicrovmApi for NoConnectors {
+            async fn run(&self, _: &RunSpec) -> Result<VmInfo, BridgeError> {
+                unimplemented!()
+            }
+            async fn get(&self, _: &str) -> Result<VmInfo, BridgeError> {
+                unimplemented!()
+            }
+            async fn suspend(&self, _: &str) -> Result<(), BridgeError> {
+                unimplemented!()
+            }
+            async fn resume(&self, _: &str) -> Result<(), BridgeError> {
+                unimplemented!()
+            }
+            async fn terminate(&self, _: &str) -> Result<(), BridgeError> {
+                unimplemented!()
+            }
+            async fn list(&self, _: Option<&str>) -> Result<Vec<VmSummary>, BridgeError> {
+                unimplemented!()
+            }
+            async fn create_auth_token(&self, _: &str, _: u16, _: u16) -> Result<AuthToken, BridgeError> {
+                unimplemented!()
+            }
+            async fn create_shell_token(&self, _: &str, _: u16) -> Result<AuthToken, BridgeError> {
+                unimplemented!()
+            }
+            async fn get_image(&self, _: &str) -> Result<ImageInfo, BridgeError> {
+                unimplemented!()
+            }
+            async fn list_image_versions(&self, _: &str) -> Result<Vec<ImageVersion>, BridgeError> {
+                unimplemented!()
+            }
+            async fn list_managed_images(&self) -> Result<Vec<ManagedImage>, BridgeError> {
+                unimplemented!()
+            }
+        }
+        let e = NoConnectors.get_network_connector("nc-1").await.unwrap_err();
+        assert!(matches!(&e, BridgeError::Sdk { op: "get_network_connector", .. }), "{e}");
     }
 
     #[test]

@@ -225,12 +225,29 @@ const canon = (v: unknown): unknown => Array.isArray(v) ? v.map(canon)
 const bucketRes = (found.get("aws:s3/bucket:Bucket") ?? [])[0] ?? EMPTY;
 const bucketName = [bucketRes.i.bucket, bucketRes.id].find((v) => known(v));
 const idOf = (r: Res) => (known(r.id) ? r.id : undefined);
+/**
+ * The egress connector's ARN as the plan knows it: a Cloud Control resource's id is its primary identifier, which for
+ * AWS::Lambda::NetworkConnector is the ARN. An id of another shape is reported rather than pasted into the expected
+ * document, where it would surface as an unexplained statement mismatch.
+ */
+const connectorArnOf = (): string | undefined => {
+    const id = idOf(one(T.connector, cfg.connectorName));
+    if (id === undefined) return undefined;
+    if (typeof id !== "string" || !id.startsWith(`arn:aws:lambda:${REGION}:`) || !id.includes(":network-connector:")) {
+        bad(`aws-native:lambda:NetworkConnector ${cfg.connectorName}: its id ${json(id).slice(0, 120)} is not a connector ARN, so runtimePolicy's ReadTheEgressConnector cannot be compared`);
+        return undefined;
+    }
+    return id;
+};
 const names: Names = {
     accountId, region: REGION, bucket: typeof bucketName === "string" ? bucketName : `${UNKNOWN}`, imageName: image.imageName, logGroup: image.logGroup,
     egress: {
         ...egressNames(cfg),
         vmSubnetId: idOf((found.get("aws:ec2/subnet:Subnet") ?? []).find((r) => r.name === NET.vms) ?? EMPTY) ?? UNKNOWN,
         vmSecurityGroupId: idOf((found.get("aws:ec2/securityGroup:SecurityGroup") ?? []).find((r) => r.name === cfg.vmSecurityGroupName) ?? EMPTY) ?? UNKNOWN,
+        // The connector's ARN, which the runtime policy names (S7 D5). On an existing stack it is the connector's
+        // own id in oldState; while the connector is being created it is unknown, the one case iamDoc accepts.
+        connectorArn: connectorArnOf() ?? UNKNOWN,
     },
 };
 /**
@@ -301,6 +318,13 @@ for (const r of found.get("aws:iam/userPolicy:UserPolicy") ?? []) {
     if (r.name !== RUNTIME_POLICY_NAME) continue;
     ref(r, "user", [(found.get("aws:iam/user:User") ?? []).find((u) => u.name === RUNTIME_USER_NAME) ?? EMPTY]);
     iamDoc(r, "policy", "runtimePolicy", () => runtimePolicy(names));
+    // ReadTheEgressConnector names the connector (S7 D5), so the document must be built from that resource: a program
+    // naming any other connector, or a wildcard, would not depend on it. As with the operator role's Deny, the
+    // dependency is what a fresh stack's preview can be held to, where the document itself is still unknown.
+    const conn = one(T.connector, cfg.connectorName);
+    if (conn !== EMPTY && !(r.deps.policy ?? []).includes(conn.urn)) {
+        bad(`${r.type} ${r.name}: policy does not depend on ${conn.urn.split("::").slice(-2).join("::")} (runtimePolicy's ReadTheEgressConnector names the egress connector)`);
+    }
 }
 const managed = new Map<string, (n: Names) => PolicyDocument>([[DEPLOY_POLICY_NAME, deployPolicy], [DEPLOY_EGRESS_POLICY_NAME, deployEgressPolicy], [DEPLOY_DNS_POLICY_NAME, deployDnsPolicy]]);
 for (const r of found.get("aws:iam/policy:Policy") ?? []) {

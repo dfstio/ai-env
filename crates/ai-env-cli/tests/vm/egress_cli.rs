@@ -708,6 +708,30 @@ fn allow_refuses_what_is_not_an_exact_host_or_a_slug_as_usage_errors() {
     assert_eq!(t.param("extras"), EXTRAS_HEADER);
 }
 
+/// S7 D2: the allowlist never carries an AWS service host — a VM reaches IMDS,
+/// and the execution role's credentials authenticate there and nowhere else.
+/// Exit 9 (policy), before the operator check and any call; `--remove` works,
+/// so one listed by hand can be taken off.
+#[test]
+fn allow_refuses_aws_service_hosts_as_a_policy_refusal() {
+    let t = Eg::new();
+    for host in ["sts.amazonaws.com", "lambda.eu-central-1.amazonaws.com", "ec2.cn-north-1.amazonaws.com.cn", "api.aws", "bed07657-5d0f-abe5-1e5e-6bc7bcb0b637.lambda-microvm.eu-central-1.on.aws", " Lambda.EU-Central-1.AmazonAWS.com. "] {
+        let o = t.run(&["egress", "allow", "ai-env", host]);
+        assert_eq!(code(&o), 9, "{host}: {}", stderr(&o));
+        assert!(stderr(&o).contains("is an AWS service host") && stderr(&o).contains("IMDS"), "{host}: {}", stderr(&o));
+        assert!(t.calls().is_empty(), "{host}: nothing is called: {:?}", t.calls());
+    }
+    assert_eq!(t.param("extras"), EXTRAS_HEADER);
+    // A host that only looks like one is allowed as usual.
+    assert_eq!(code(&t.run(&["egress", "allow", "ai-env", "notamazonaws.com"])), 0);
+    // One already listed (by hand, or from an older base allowlist) can still be removed.
+    t.set_param("extras", &format!("{EXTRAS_HEADER}sts.amazonaws.com\tai-env\n"));
+    t.reload_proves("extras", EXTRAS_HEADER);
+    let o = t.run(&["egress", "allow", "ai-env", "sts.amazonaws.com", "--remove"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(t.param("extras"), EXTRAS_HEADER);
+}
+
 /// `header`, then `host-NNNN.example.com<tail>` lines up to 4000 bytes or more (≤ 4030).
 fn near_cap(header: &str, tail: &str) -> String {
     let mut value = header.to_string();

@@ -1376,8 +1376,10 @@ struct Early {
 /// new, so the full check runs, and stderr says why — every record written
 /// before rule 1 is such a pass); the pass is bound to this very build (its
 /// `created_at` the version's `createdAt`, to the second) and to the
-/// connector's live facts (`get-network-connector`). The third value notes a
-/// DNS verdict the gate does not accept (`[egress].accept_platform_dns` as
+/// connector's live facts (`get-network-connector`); and the pass is younger
+/// than [`MAX_RECORD_AGE_S`](crate::bridge::egress::MAX_RECORD_AGE_S), the age
+/// at which the gate stops taking it (S7 D7). The third value notes a DNS
+/// verdict the gate does not accept (`[egress].accept_platform_dns` as
 /// configured now), which another check would not change.
 fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(String, VerifiedRecord, Option<String>)> {
     let image_arn = plan.image_arn.as_str();
@@ -1402,6 +1404,14 @@ fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(
         return None;
     }
     if rec.image_created_at.is_none_or(|t| (t - created).abs() > 1) {
+        return None;
+    }
+    // S7 D7: the gate takes a pass only while it is younger than MAX_RECORD_AGE_S, so `--if-needed` must check
+    // again once it ages out — otherwise the gate would say "run `ai-env egress check`" and this would skip.
+    let age = crate::wire::time::parse_rfc3339_utc(&rec.at).map(|at| crate::wire::time::unix_now().saturating_sub(at));
+    if age.is_none_or(|a| a > crate::bridge::egress::MAX_RECORD_AGE_S) {
+        let days = crate::bridge::egress::MAX_RECORD_AGE_S / (24 * 60 * 60);
+        eprintln!("egress check: the recorded pass of image version {version} ({}) is older than {days} days, which the credential gate no longer takes: checking again", rec.at);
         return None;
     }
     let doc = awscli::aws_json("lambda-core", &["get-network-connector", "--identifier", connector]).ok()?;

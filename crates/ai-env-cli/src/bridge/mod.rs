@@ -33,5 +33,6 @@ pub mod seed;
 pub mod sibling;
 pub mod tls;
 pub mod transport;
+pub mod unseal;
 pub mod vm;
 pub mod wrapper;

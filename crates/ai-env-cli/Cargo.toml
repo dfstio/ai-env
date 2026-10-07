@@ -150,6 +150,7 @@ bridge = [
     "dep:aws-config",
     "dep:aws-sdk-lambdamicrovms",
     "dep:aws-smithy-http-client",
+    "dep:aws-sigv4",
     "dep:reqwest",
     "dep:rustls",
     "dep:rustls-pki-types",
@@ -198,6 +199,7 @@ unicode-normalization = { workspace = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-lambdamicrovms = { workspace = true, optional = true }
 aws-smithy-http-client = { workspace = true, optional = true } # built by src/bridge/tls.rs only (`make lint` greps)
+aws-sigv4 = { workspace = true, optional = true } # S7: GetNetworkConnector, the one call the SDK does not model
 reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }

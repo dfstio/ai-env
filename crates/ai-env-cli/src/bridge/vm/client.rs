@@ -21,7 +21,7 @@ use crate::bridge::api::{
 };
 use crate::bridge::config::{BridgeConfig, CredentialsSource, Paths, REGION};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
-use crate::bridge::errors::{map_sdk_error, sdk_ambiguous, BridgeError};
+use crate::bridge::errors::{classify_service, map_sdk_error, sdk_ambiguous, BridgeError};
 use crate::container;
 use crate::errors::{CliError, Result};
 use crate::select::resolve_for_decrypt;
@@ -433,6 +433,10 @@ impl Intercept for RefuseProfile {
 /// runtime (the live tests) connects again there.
 pub struct SdkMicrovmApi {
     client: Client,
+    /// The credentials this client signs with, kept for the one call the SDK
+    /// does not model ([`GET_CONNECTOR_PATH`]); `None` only when the loader
+    /// resolved no provider at all.
+    credentials: Option<aws_sdk_lambdamicrovms::config::SharedCredentialsProvider>,
     /// The profile name in profile mode (for the SSO hint).
     profile: Option<String>,
     /// Why this client's profile is refused ([`PROFILE_REFUSED_ENV`],
@@ -464,7 +468,42 @@ pub async fn connect(creds: &RuntimeCreds) -> SdkMicrovmApi {
     if let Some(why) = &refusal {
         conf = conf.interceptor(RefuseProfile(why.clone()));
     }
-    SdkMicrovmApi { client: Client::from_conf(conf.build()), profile, refusal }
+    let credentials = sdk.credentials_provider();
+    SdkMicrovmApi { client: Client::from_conf(conf.build()), credentials, profile, refusal }
+}
+
+/// The REST path of `GetNetworkConnector`, from the aws CLI's own `lambda-core`
+/// model (2.37.9, API version 2026-04-30): the date in the path is the
+/// resource's, not the API's, so it is pinned here and compared with the
+/// installed model by a test. `{Identifier}` is a non-greedy label (no `/`).
+pub const GET_CONNECTOR_PATH: &str = "/2026-04-04/network-connectors/";
+
+/// The SigV4 signing name of the control plane (`lambda`, as the model's
+/// `signingName`), not the SDK's service id.
+pub const SIGNING_NAME: &str = "lambda";
+
+/// The largest `GetNetworkConnector` answer read (the `/health/detail` cap).
+const CONNECTOR_BODY_MAX: usize = 1024 * 1024;
+
+/// A connector identifier safe to place in a URL path: an ARN
+/// (`arn:aws:lambda:…:network-connector:…`) or an `nc-…` id, so letters,
+/// digits and `:._-` only. Anything else — a `/`, `%`, `?`, `#`, a space, a
+/// non-ASCII byte — is refused before the request is built, so no identifier
+/// can change the path it is pasted into.
+fn connector_path_safe(identifier: &str) -> bool {
+    !identifier.is_empty() && identifier.len() <= 2048 && identifier.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b':' | b'.' | b'_' | b'-'))
+}
+
+/// `identifier` as the path label the SDKs send: percent-encoded as
+/// `aws-smithy-http`'s `label::fmt_string` does, whose own comment says AWS
+/// services percent-encode `:` in a path and that "signing will fail if these
+/// values are not percent encoded". Of the characters [`connector_path_safe`]
+/// admits, `:` is the only one in that set, so this is exact for every
+/// identifier that reaches it — an ARN's colons become `%3A`, an `nc-…` id is
+/// unchanged. The signer then encodes the path once more (double encoding,
+/// as the SDK signs every non-S3 service), matching what the service computes.
+fn connector_path_label(identifier: &str) -> String {
+    identifier.replace(':', "%3A")
 }
 
 impl SdkMicrovmApi {
@@ -502,6 +541,91 @@ impl SdkMicrovmApi {
             self.map(OP, e)
         }
     }
+
+    /// `GetNetworkConnector`, signed by hand (S7 D5): no SDK operation models
+    /// it, so the request is built from [`GET_CONNECTOR_PATH`], SigV4-signed
+    /// with this client's own credentials ([`SIGNING_NAME`], [`REGION`]) and
+    /// sent by `tls::reqwest_client()` — the same policy as every other side
+    /// channel (Amazon roots only, https only, no proxy, no redirect). The
+    /// answer is the connector document `egress::ConnectorFacts::from_get`
+    /// reads. A refused profile fails before anything is resolved, as every
+    /// other call of such a client does.
+    async fn get_connector(&self, identifier: &str) -> std::result::Result<serde_json::Value, BridgeError> {
+        const OP: &str = "get_network_connector";
+        if let Some(why) = &self.refusal {
+            return Err(BridgeError::Config(why.clone()));
+        }
+        if !connector_path_safe(identifier) {
+            return Err(BridgeError::Validation(format!("{OP}: {identifier:?} is not a network connector ARN or id")));
+        }
+        let provider = self.credentials.as_ref().ok_or_else(|| BridgeError::CredentialsUnavailable(format!("{OP}: this client resolved no credentials provider")))?;
+        let creds = {
+            use aws_sdk_lambdamicrovms::config::ProvideCredentials as _;
+            provider.provide_credentials().await.map_err(|e| with_profile_hint(self.profile.as_deref(), BridgeError::CredentialsUnavailable(format!("{OP}: {}", scrub(&e.to_string())))))?
+        };
+        let url = format!("{CONTROL_PLANE_URL}{GET_CONNECTOR_PATH}{}", connector_path_label(identifier));
+        // `identity` is the signer's `Identity`, inferred from `.identity()`; the signer derives `host` from the URI
+        // and adds `x-amz-security-token` itself when the credentials are temporary.
+        let identity = creds.into();
+        let params = aws_sigv4::sign::v4::SigningParams::builder()
+            .identity(&identity)
+            .region(REGION)
+            .name(SIGNING_NAME)
+            .time(std::time::SystemTime::now())
+            .settings(aws_sigv4::http_request::SigningSettings::default())
+            .build()
+            .map_err(|e| BridgeError::Sdk { op: OP, message: format!("signing parameters: {e}") })?
+            .into();
+        let signable = aws_sigv4::http_request::SignableRequest::new("GET", url.as_str(), std::iter::empty(), aws_sigv4::http_request::SignableBody::Bytes(&[]))
+            .map_err(|e| BridgeError::Sdk { op: OP, message: format!("signable request: {e}") })?;
+        let (signed, _signature) = aws_sigv4::http_request::sign(signable, &params).map_err(|e| BridgeError::Sdk { op: OP, message: format!("signing: {e}") })?.into_parts();
+        let client = crate::bridge::tls::reqwest_client().map_err(|e| BridgeError::Sdk { op: "tls", message: format!("cannot build the HTTPS client: {e}") })?;
+        let mut req = client.get(&url).timeout(SDK_ATTEMPT_TIMEOUT);
+        for (name, value) in signed.headers() {
+            req = req.header(name, value);
+        }
+        let mut reply = req.send().await.map_err(|e| BridgeError::Endpoint(format!("{OP}: {}", scrub(&e.to_string()))))?;
+        let status = reply.status();
+        let errortype = reply.headers().get("x-amzn-errortype").and_then(|v| v.to_str().ok()).map(str::to_string);
+        // Bounded like `/health/detail`'s body: a connector document is a few hundred bytes.
+        let mut body = Vec::new();
+        while let Some(chunk) = reply.chunk().await.map_err(|e| BridgeError::Endpoint(format!("{OP}: reading the answer: {}", scrub(&e.to_string()))))? {
+            if body.len() + chunk.len() > CONNECTOR_BODY_MAX {
+                return Err(BridgeError::Sdk { op: OP, message: format!("the answer is larger than {CONNECTOR_BODY_MAX} bytes: refused") });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body);
+        if !status.is_success() {
+            return Err(connector_error(OP, status.as_u16(), errortype, &body));
+        }
+        serde_json::from_str(&body).map_err(|e| BridgeError::Sdk { op: OP, message: format!("the answer is not JSON: {e}") })
+    }
+}
+
+/// A non-2xx `GetNetworkConnector` answer as a [`BridgeError`], classified like
+/// an SDK service error ([`classify_service`]): the error code comes from
+/// `x-amzn-errortype` (whose value may carry a trailing `:<url>`), else the
+/// body's `__type`, else the status. The message is the body's `message`,
+/// scrubbed and bounded — never the request's headers.
+fn connector_error(op: &'static str, status: u16, errortype: Option<String>, body: &str) -> BridgeError {
+    let doc: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let field = |k: &str| doc.get(k).and_then(serde_json::Value::as_str).map(str::to_string);
+    let message = field("message").or_else(|| field("Message")).map(|m| scrub(&m).chars().take(512).collect()).unwrap_or_else(|| {
+        let text = scrub(body.trim()).into_owned();
+        if text.is_empty() { format!("HTTP {status}") } else { text.chars().take(512).collect() }
+    });
+    let code = errortype
+        .map(|v| v.split([':', '/']).next().unwrap_or(&v).trim().to_string())
+        .filter(|c| !c.is_empty())
+        .or_else(|| field("__type").map(|t| t.rsplit('#').next().unwrap_or(&t).to_string()))
+        .or_else(|| match status {
+            403 => Some("AccessDeniedException".to_string()),
+            404 => Some("ResourceNotFoundException".to_string()),
+            429 => Some("ThrottlingException".to_string()),
+            _ => None,
+        });
+    classify_service(op, code.as_deref(), message)
 }
 
 /// A service error answered with a 5xx status (the service may have acted
@@ -735,6 +859,10 @@ impl MicrovmApi for SdkMicrovmApi {
     async fn list_managed_images(&self) -> std::result::Result<Vec<ManagedImage>, BridgeError> {
         let items = self.client.list_managed_microvm_images().into_paginator().items().send().try_collect().await.map_err(|e| self.map("list_managed_microvm_images", e))?;
         Ok(items.into_iter().map(|i| ManagedImage { arn: i.image_arn }).collect())
+    }
+
+    async fn get_network_connector(&self, identifier: &str) -> std::result::Result<serde_json::Value, BridgeError> {
+        self.get_connector(identifier).await
     }
 }
 
@@ -983,11 +1111,59 @@ mod tests {
         }
     }
 
+    /// The hand-signed `GetNetworkConnector` (S7 D5): the path and signing name
+    /// are the aws CLI model's (2.37.9, `lambda-core`), the identifier can only
+    /// be an ARN or an `nc-…` id, and a non-2xx answer is classified like any
+    /// other service error. Part B compares the path with the live service.
+    #[test]
+    fn the_connector_read_is_pinned_and_its_identifier_bounded() {
+        assert_eq!(GET_CONNECTOR_PATH, "/2026-04-04/network-connectors/");
+        assert_eq!(SIGNING_NAME, "lambda");
+        assert!(GET_CONNECTOR_PATH.starts_with('/') && GET_CONNECTOR_PATH.ends_with('/'), "a path the identifier is appended to");
+        assert_eq!(format!("{CONTROL_PLANE_URL}{GET_CONNECTOR_PATH}nc-1"), "https://lambda.eu-central-1.amazonaws.com/2026-04-04/network-connectors/nc-1");
+        for ok in ["nc-0a1b2c3d4e5f60718", "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress", "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-1", "a.b_c-1:2"] {
+            assert!(connector_path_safe(ok), "{ok}");
+        }
+        // Nothing that could change the path it is pasted into, or leave the host.
+        for bad in ["", "nc-1/..", "nc 1", "nc-1?x=1", "nc-1#f", "%2e%2e", "nc-1/../../vms", "../x", "nc-1\n", "nc-é", &"n".repeat(2049)] {
+            assert!(!connector_path_safe(bad), "{bad:?}");
+        }
+        // The label is sent as the SDKs send it: an ARN's colons percent-encoded (aws-smithy-http's label set: an
+        // unencoded `:` fails the signature), an `nc-` id unchanged. The audit found the raw form first.
+        let arn = "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-f0b942fe-0612-44a7-9183-16942c532410";
+        assert_eq!(connector_path_label(arn), "arn%3Aaws%3Alambda%3Aeu-central-1%3A123456789012%3Anetwork-connector%3Anc-f0b942fe-0612-44a7-9183-16942c532410");
+        assert_eq!(connector_path_label("nc-0a1b2c3d4e5f60718"), "nc-0a1b2c3d4e5f60718");
+        // Every other character `connector_path_safe` admits is outside that set, so nothing else is touched.
+        assert_eq!(connector_path_label("a.b_c-1"), "a.b_c-1");
+        // The URL the signer and reqwest both see: no raw colon after the scheme.
+        let url = format!("{CONTROL_PLANE_URL}{GET_CONNECTOR_PATH}{}", connector_path_label(arn));
+        assert!(!url["https://".len()..].contains(':'), "{url}");
+        let signable = aws_sigv4::http_request::SignableRequest::new("GET", url.as_str(), std::iter::empty(), aws_sigv4::http_request::SignableBody::Bytes(&[]));
+        assert!(signable.is_ok(), "the encoded URL parses for signing");
+        // An error message from the service is scrubbed and bounded too, not only a non-JSON body.
+        let long = connector_error("get_network_connector", 400, None, &format!("{{\"message\":\"{}\"}}", "m".repeat(4096)));
+        assert!(long.to_string().len() < 700, "{} chars", long.to_string().len());
+        // A non-2xx: the error type header, else the body's __type, else the status.
+        let header = connector_error("get_network_connector", 403, Some("AccessDeniedException:http://internal".into()), "{\"message\":\"not authorized\"}");
+        assert!(matches!(&header, BridgeError::AccessDenied(m) if m.contains("not authorized")), "{header}");
+        assert_eq!(CliError::from(header).exit_code(), 7);
+        let typed = connector_error("get_network_connector", 400, None, "{\"__type\":\"com.amazon#ThrottlingException\",\"message\":\"slow down\"}");
+        assert!(matches!(&typed, BridgeError::Throttled(m) if m == "slow down"), "{typed}");
+        let by_status = connector_error("get_network_connector", 404, None, "{}");
+        assert!(matches!(&by_status, BridgeError::Sdk { message, .. } if message.contains("ResourceNotFoundException")), "{by_status}");
+        let no_body = connector_error("get_network_connector", 500, None, "");
+        assert!(matches!(&no_body, BridgeError::Sdk { message, .. } if message.contains("HTTP 500")), "{no_body}");
+        // A body that is not JSON is bounded and scrubbed, never echoed whole.
+        let html = connector_error("get_network_connector", 502, None, &format!("<html>{}</html>", "x".repeat(4096)));
+        let text = html.to_string();
+        assert!(text.len() < 700 && !text.contains(&"x".repeat(600)), "{} chars", text.len());
+    }
+
     #[tokio::test]
     async fn a_refused_profile_fails_every_call_before_anything_is_resolved() {
         let api = connect(&static_creds("R3S4")).await;
         let why = "AWS_ENDPOINT_URL_STS is set: refused for the test".to_string();
-        let refused = SdkMicrovmApi { client: api.client.clone(), profile: Some("ops".into()), refusal: Some(why.clone()) };
+        let refused = SdkMicrovmApi { client: api.client.clone(), credentials: api.credentials.clone(), profile: Some("ops".into()), refusal: Some(why.clone()) };
         let conf = api.client.config().to_builder().interceptor(RefuseProfile(why.clone())).build();
         let e = Client::from_conf(conf).list_microvms().customize().interceptor(StopBeforeTransmit).send().await.unwrap_err();
         assert!(matches!(e, SdkError::ConstructionFailure(_)), "refused before serialization: {}", DisplayErrorContext(&e));

@@ -73,7 +73,12 @@ const net = createEgress(egress, guard, names, tags, { aws: awsProvider, native:
 const deployNames: pulumi.Output<Names> = pulumi.all([names, net.vmSubnet.id, net.vmSecurityGroup.id]).apply(([n, vmSubnetId, vmSecurityGroupId]) => ({
     ...n, egress: { ...n.egress, vmSubnetId, vmSecurityGroupId },
 }));
-const iam = createIam(names, deployNames, tags, awsProvider);
+// The runtime policy waits for the connector itself: S7 D5 grants GetNetworkConnector on exactly that ARN
+// (ReadTheEgressConnector), and on nothing else.
+const runtimeNames: pulumi.Output<Names> = pulumi.all([names, net.connector.arn]).apply(([n, connectorArn]) => ({
+    ...n, egress: { ...n.egress, connectorArn },
+}));
+const iam = createIam(names, deployNames, runtimeNames, tags, awsProvider);
 const image = createImage(imageConfig, REGION, tags, { buildRole: iam.buildRole, buildPolicy: iam.buildPolicy, artifacts }, nativeProvider);
 const monthly = createBudget(budget, REGION, tags, awsProvider);
 

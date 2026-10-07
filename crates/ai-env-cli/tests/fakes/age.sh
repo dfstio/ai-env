@@ -14,7 +14,19 @@
 #   age-plugin-se  `--version` only
 # Environment:
 #   FAKE_AGE_LOG   when set, each call's name and argv are appended here
-#   FAKE_AGE_FAIL  encrypt|decrypt: that mode fails the way age does (exit 1)
+#   FAKE_AGE_FAIL  encrypt|decrypt: that mode fails the way age does (exit 1);
+#                  cancel: a decrypt fails as age-plugin-se does when the Touch
+#                  ID dialog is dismissed (the text is provisional until a
+#                  deliberate Cancel pins the real one in part B)
+#   FAKE_AGE_DELAY_MS  a decrypt answers only after this long (a Touch ID that
+#                  is granted slowly)
+#   FAKE_AGE_HANG  a decrypt never answers: what an unanswered dialog looks
+#                  like, for the deadline and the kill
+#   FAKE_AGE_WAIT_FILE  a decrypt blocks until this file exists (at most 30 s):
+#                  the proof that work overlaps the unseal
+#   FAKE_AGE_PIDFILE    a hanging decrypt writes its pid here and logs
+#                  `age TERM <pid>` to FAKE_AGE_LOG on SIGTERM, so a test can
+#                  see the group signal arrive
 set -u
 me=$(basename "$0")
 if [ -n "${FAKE_AGE_LOG:-}" ]; then
@@ -76,6 +88,31 @@ if [ "$mode" = d ]; then
     cat > /dev/null
     echo 'age: error: fake decryption failure' >&2
     exit 1
+  fi
+  if [ "${FAKE_AGE_FAIL:-}" = cancel ]; then
+    cat > /dev/null
+    echo 'age: error: age-plugin-se: The operation couldn.t be completed. (kSecError error -128 - User canceled the operation.)' >&2
+    exit 1
+  fi
+  if [ -n "${FAKE_AGE_PIDFILE:-}" ]; then
+    printf '%s\n' "$$" > "$FAKE_AGE_PIDFILE"
+    trap 'if [ -n "${FAKE_AGE_LOG:-}" ]; then printf "age TERM %s\n" "$$" >> "$FAKE_AGE_LOG"; fi; exit 143' TERM
+  fi
+  if [ -n "${FAKE_AGE_DELAY_MS:-}" ]; then
+    # `sleep` takes a fraction on every shell the tests run on.
+    sleep "$(awk -v ms="$FAKE_AGE_DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')"
+  fi
+  if [ -n "${FAKE_AGE_WAIT_FILE:-}" ]; then
+    waited=0
+    while [ ! -e "$FAKE_AGE_WAIT_FILE" ] && [ "$waited" -lt 3000 ]; do
+      sleep 0.01
+      waited=$((waited + 1))
+    done
+  fi
+  if [ -n "${FAKE_AGE_HANG:-}" ]; then
+    # Read stdin so the writer never blocks, then wait to be killed.
+    cat > /dev/null
+    while : ; do sleep 0.05; done
   fi
   if [ "$ids" -ne 1 ]; then
     cat > /dev/null

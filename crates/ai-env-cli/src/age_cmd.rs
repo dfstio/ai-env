@@ -92,6 +92,15 @@ impl AgeTool {
         Ok(Self { age, age_keygen, version })
     }
 
+    /// An `AgeTool` aimed at explicit binaries, for tests that must not depend
+    /// on `PATH` (no `probe()`, so no version check and no race with another
+    /// test's environment). Only `bridge::unseal`'s tests use it, so it does
+    /// not exist in the shim-only world, where it would be dead code.
+    #[cfg(all(test, feature = "bridge"))]
+    pub(crate) fn for_tests(age: PathBuf, age_keygen: PathBuf, version: (u32, u32, u32)) -> Self {
+        Self { age, age_keygen, version }
+    }
+
     #[must_use]
     pub fn plugin_se_available(&self) -> bool {
         find_in_path("age-plugin-se", &effective_path()).is_some()
@@ -203,6 +212,26 @@ impl AgeTool {
         Ok(Zeroizing::new(out))
     }
 
+    /// [`Self::decrypt_to_bytes`] with the child in its OWN process group, so
+    /// `kill` can end it and the Touch ID dialog it is waiting on (S7: an
+    /// unseal has a deadline, and `ai-env` must be able to give up on one).
+    /// The group takes `age-plugin-se` — the process that actually holds the
+    /// dialog — down with age itself.
+    ///
+    /// The classic paths keep their behaviour: only this one detaches the child
+    /// from the caller's group, which also means a terminal Ctrl-C no longer
+    /// reaches age by itself, so every caller owns those signals for the length
+    /// of the unseal and calls [`AgeKill::kill_group`] when it gives up.
+    pub fn decrypt_to_bytes_killable(
+        &self,
+        identity: &Path,
+        ciphertext: &[u8],
+        kill: &AgeKill,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let out = self.run_decrypt_with(identity, ciphertext, Stdio::piped(), Some(kill))?;
+        Ok(Zeroizing::new(out))
+    }
+
     /// Decrypt with EXACTLY ONE identity file, plaintext flowing straight to
     /// our stdout (never through ai-env's memory) — for `show`.
     pub fn decrypt_to_stdout(&self, identity: &Path, ciphertext: &[u8]) -> Result<()> {
@@ -216,18 +245,39 @@ impl AgeTool {
         ciphertext: &[u8],
         stdout: Stdio,
     ) -> Result<Vec<u8>> {
-        let mut child = self
-            .cmd()
-            .arg("-d")
+        self.run_decrypt_with(identity, ciphertext, stdout, None)
+    }
+
+    /// `run_decrypt`, optionally with the child in its own process group and
+    /// registered with `kill` ([`Self::decrypt_to_bytes_killable`]).
+    fn run_decrypt_with(
+        &self,
+        identity: &Path,
+        ciphertext: &[u8],
+        stdout: Stdio,
+        kill: Option<&AgeKill>,
+    ) -> Result<Vec<u8>> {
+        let mut cmd = self.cmd();
+        cmd.arg("-d")
             .arg("-i")
             .arg(safe_path(identity)) // the ONLY -i, by construction
             .stdin(Stdio::piped())
             .stdout(stdout)
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| CliError::Msg(format!("cannot spawn age: {e}")))?;
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        if kill.is_some() {
+            use std::os::unix::process::CommandExt as _;
+            // Its own group, so one signal reaches age and the plugin holding the dialog.
+            cmd.process_group(0);
+        }
+        // A job given up before its child exists spawns nothing (and so shows no dialog).
+        if kill.is_some_and(AgeKill::cancelled) {
+            return Err(CliError::Cancelled);
+        }
+        let mut child = cmd.spawn().map_err(|e| CliError::Msg(format!("cannot spawn age: {e}")))?;
         // Threaded stdin write — see encrypt() for the deadlock rationale.
         let stdin = child.stdin.take().expect("piped stdin");
+        let stdout_pipe = child.stdout.take();
         let payload = ciphertext.to_vec();
         let writer = std::thread::spawn(move || {
             let mut stdin = stdin;
@@ -240,13 +290,17 @@ impl AgeTool {
             let _ = stderr.read_to_end(&mut buf);
             buf
         });
+        // Hand the child over BEFORE draining stdout: that drain is where a Touch ID prompt is waited
+        // on, so `kill` must be able to reach the child throughout it (S7).
+        let holder = Holder::from(kill);
+        holder.adopt(child);
 
         // Drain stdout OURSELVES into a buffer pre-reserved to the ciphertext
         // size: decrypted output is always smaller, so the Vec NEVER
         // reallocates — `read_to_end`'s geometric growth would strew partial
         // plaintext copies across the heap (audit fix 6). The read chunk is
         // wiped after the loop.
-        let plaintext = match child.stdout.take() {
+        let plaintext = match stdout_pipe {
             Some(mut out_pipe) => {
                 use std::io::Read as _;
                 let mut out = Vec::with_capacity(ciphertext.len().max(64));
@@ -274,7 +328,7 @@ impl AgeTool {
 
         let _ = writer.join();
         let errtext = err_thread.join().unwrap_or_default();
-        let status = child.wait()?;
+        let status = holder.wait()?;
         if !status.success() {
             if let Ok(mut leaked) = plaintext {
                 use zeroize::Zeroize as _;
@@ -380,6 +434,158 @@ impl AgeTool {
         let _ = std::fs::remove_file(&fifo_path);
         drop(fifo_dir);
         result.map(Zeroizing::new)
+    }
+}
+
+/// The handle that ends one [`AgeTool::decrypt_to_bytes_killable`] early: the
+/// decrypting child runs in its own process group, and [`Self::kill_group`]
+/// signals that group, so `age` and the `age-plugin-se` process holding the
+/// Touch ID dialog go together (S7).
+///
+/// The child is reaped and signalled under the same lock — `killpg` runs with
+/// the lock held, and the waiter can only reap while holding it — so a pid the
+/// kernel has already recycled can never be signalled. The waiter polls
+/// `try_wait` (never blocking in `wait` with the lock held, which would deadlock
+/// against a concurrent kill) and takes the child out as it reaps it.
+///
+/// A kill that arrives before there is a child is remembered (`cancelled`):
+/// the decrypt then never spawns, or is killed the moment it is adopted, so no
+/// dialog appears that nobody waits for.
+#[derive(Debug, Default)]
+pub struct AgeKill {
+    state: std::sync::Mutex<Option<std::process::Child>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+/// How long [`AgeKill::kill_group`] gives the group to end on SIGTERM before
+/// SIGKILL.
+const KILL_AFTER_TERM: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often the waiter asks whether the child has exited.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+impl AgeKill {
+    #[must_use]
+    pub fn new() -> AgeKill {
+        AgeKill::default()
+    }
+
+    /// Take `child` over, so [`Self::kill_group`] can reach it from any thread.
+    /// Called before the caller starts waiting on the child's output, which is
+    /// where a Touch ID prompt is waited on.
+    fn adopt(&self, child: std::process::Child) {
+        let mut slot = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(child);
+        // A kill between the caller's `cancelled()` check and here: end the child now, nobody wants its answer.
+        // Checked under the lock, after the child is in place, so a concurrent `kill_group` either sees the child
+        // or has already set the flag this reads.
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            #[cfg(unix)]
+            if let Some(c) = slot.as_ref() {
+                // SAFETY: a plain libc call on our own unreaped child's group, under the lock.
+                unsafe { libc::killpg(i32::try_from(c.id()).unwrap_or(0), libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// Has [`Self::kill_group`] been called? The decrypt checks it before
+    /// spawning, so a job given up before its child exists spawns nothing.
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait for the adopted child and return its status. Polls rather than
+    /// blocking, so the lock is free between tries and a concurrent
+    /// [`Self::kill_group`] can never deadlock against it.
+    fn wait(&self) -> Result<std::process::ExitStatus> {
+        loop {
+            {
+                let mut slot = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(c) = slot.as_mut() else {
+                    return Err(CliError::Msg("age: the decrypting child was taken away".into()));
+                };
+                if let Some(status) = c.try_wait()? {
+                    // Reaped: drop the handle under the same lock, so no later kill can signal its pid.
+                    *slot = None;
+                    return Ok(status);
+                }
+            }
+            std::thread::sleep(REAP_POLL);
+        }
+    }
+
+    /// End the decrypt now: SIGTERM to the child's process group, then SIGKILL
+    /// after [`KILL_AFTER_TERM`] if anything is still there. Doing nothing when
+    /// the child has already been reaped. Safe to call more than once, and from
+    /// any thread.
+    pub fn kill_group(&self) {
+        // First, so a child adopted after this point is killed by `adopt` itself.
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            if !self.signal_group(libc::SIGTERM) {
+                return;
+            }
+            std::thread::sleep(KILL_AFTER_TERM);
+            self.signal_group(libc::SIGKILL);
+        }
+    }
+
+    /// Send `sig` to the unreaped child's process group (its pid, as
+    /// `process_group(0)` made it the leader) WITH THE LOCK HELD, so it cannot be
+    /// reaped — and its pid recycled — between the lookup and the signal. Even a
+    /// leader that has exited keeps the group id reserved while it is a zombie,
+    /// so the plugin it leaves behind is still reached. `false` when there is no
+    /// unreaped child.
+    #[cfg(unix)]
+    fn signal_group(&self, sig: i32) -> bool {
+        let slot = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pgid) = slot.as_ref().map(|c| i32::try_from(c.id()).unwrap_or(0)).filter(|p| *p > 0) else {
+            return false;
+        };
+        // SAFETY: a plain libc call on our own child's group, which cannot be reaped while we hold the lock.
+        unsafe { libc::killpg(pgid, sig) };
+        true
+    }
+
+    /// Is a decrypt running right now (for tests and the countdown)?
+    #[must_use]
+    pub fn running(&self) -> bool {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
+    }
+}
+
+/// Either the caller's [`AgeKill`] or a private one, so one code path serves
+/// both the killable decrypt and the classic ones: the child always lives in a
+/// holder, and only the killable form hands that holder out.
+enum Holder<'a> {
+    Shared(&'a AgeKill),
+    Local(AgeKill),
+}
+
+impl Holder<'_> {
+    fn get(&self) -> &AgeKill {
+        match self {
+            Holder::Shared(k) => k,
+            Holder::Local(k) => k,
+        }
+    }
+
+    fn adopt(&self, child: std::process::Child) {
+        self.get().adopt(child);
+    }
+
+    fn wait(&self) -> Result<std::process::ExitStatus> {
+        self.get().wait()
+    }
+}
+
+impl<'a> From<Option<&'a AgeKill>> for Holder<'a> {
+    fn from(kill: Option<&'a AgeKill>) -> Holder<'a> {
+        match kill {
+            Some(k) => Holder::Shared(k),
+            None => Holder::Local(AgeKill::new()),
+        }
     }
 }
 

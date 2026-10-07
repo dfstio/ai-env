@@ -81,6 +81,13 @@ export interface EgressNames {
      */
     vmSubnetId?: string;
     vmSecurityGroupId?: string;
+    /**
+     * The egress connector's own ARN, which likewise exists only once the stack created it: runtimePolicy grants
+     * GetNetworkConnector on exactly this one (S7 D5). Pulumi passes the connector's `arn` output, whatever form the
+     * service gives it; `print-policies` a placeholder of the same shape, so `make check-policies` simulates against
+     * the very ARN the document names.
+     */
+    connectorArn?: string;
 }
 
 export interface Names {
@@ -242,9 +249,13 @@ export const RUNTIME_IMAGE_ACTIONS = [
 export const RUNTIME_LIST_ACTIONS = ["lambda:ListMicrovms", "lambda:ListManagedMicrovmImages", "lambda:ListManagedMicrovmImageVersions"];
 /**
  * PassNetworkConnector is confirmed (S5): RunMicrovm passes the egress connector. It has no resource type in the
- * IAM service reference (like CreateMicrovmImage and the List* calls), so it can only be granted on "*". The
- * tentative GetNetworkConnector grant is gone (S5): nothing that uses the runtime key reads a connector (`ai-env
- * egress` and `infra status` call it as the operator). If T5.1's first vpc run is denied naming it, restore it.
+ * IAM service reference (like CreateMicrovmImage and the List* calls), so it can only be granted on "*".
+ *
+ * GetNetworkConnector is back in S7 (D5), on exactly the egress connector and nothing else: the credential gate
+ * compares the connector's live configuration with the one the recorded `ai-env egress check` verified, and it must
+ * do so with the runtime key, so delivering a credential never depends on the operator's profile or the Python aws
+ * CLI. It reads non-secret configuration only; creating, updating and deleting a connector, and every call on
+ * INTERNET_EGRESS or any other connector, stay implicitly denied (`make check-policies` simulates each).
  *
  * iam:PassRole on the execution role is measured necessary (S4 T4.1, 30 Sep 2026): RunMicrovm with
  * --execution-role-arn was denied iam:PassRole under `StringEquals iam:PassedToService = lambda.amazonaws.com`
@@ -267,11 +278,26 @@ export function connectorArns(n: Names): string[] {
  * other iam: action, every network connector call but PassNetworkConnector, and every ssm: and ec2: action (the
  * proxy and its parameters are the operator's).
  */
+/**
+ * The egress connector's two ARNs: the one the service reports (Pulumi's `arn` output, in the `nc-…` id form, as
+ * measured in S5) and the one the IAM service reference documents for the networkConnector resource type
+ * (`network-connector:${NetworkConnectorName}`). Both name this one connector — names are unique per account and Region —
+ * so granting on both keeps the grant exact while not depending on which form IAM matches a request against (part B
+ * shows which). Deduplicated when they coincide.
+ */
+export function egressConnectorArns(n: Names): string[] {
+    const { connectorArn, connectorName } = n.egress;
+    if (connectorArn === undefined) throw new Error("runtimePolicy: the egress connector's ARN is required (ReadTheEgressConnector, S7 D5)");
+    const byName = `arn:aws:lambda:${n.region}:${n.accountId}:network-connector:${connectorName}`;
+    return byName === connectorArn ? [connectorArn] : [connectorArn, byName];
+}
+
 export function runtimePolicy(n: Names): PolicyDocument {
     return doc(
         { Sid: "MicrovmsOfTheImage", Effect: "Allow", Action: RUNTIME_IMAGE_ACTIONS, Resource: [imageArn(n)] },
         { Sid: "ListMicrovms", Effect: "Allow", Action: RUNTIME_LIST_ACTIONS, Resource: ["*"] },
         { Sid: "PassNetworkConnector", Effect: "Allow", Action: [PASS_CONNECTOR_ACTION], Resource: ["*"] },
+        { Sid: "ReadTheEgressConnector", Effect: "Allow", Action: [GET_CONNECTOR_ACTION], Resource: egressConnectorArns(n) },
         { Sid: "PassExecutionRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, EXECUTION_ROLE_NAME)] }, // scratch:runtime
     );
 }

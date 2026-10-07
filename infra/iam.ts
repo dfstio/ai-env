@@ -33,8 +33,12 @@ function render(names: pulumi.Output<Names>, build: (n: Names) => PolicyDocument
     return names.apply((n) => JSON.stringify(build(n)));
 }
 
-/** `deployNames` adds the egress VM subnet and security group ids (the deploy policy's CreateNetworkConnector condition, S5). */
-export function createIam(names: pulumi.Output<Names>, deployNames: pulumi.Output<Names>, tags: Record<string, string>, provider: aws.Provider): Iam {
+/**
+ * Two names objects carry what exists only once the egress stack created it, so each document waits for exactly the
+ * resources it names: `deployNames` the VM subnet and security group ids (the deploy policy's CreateNetworkConnector
+ * condition, S5), `runtimeNames` the connector's ARN (the runtime policy's ReadTheEgressConnector, S7 D5).
+ */
+export function createIam(names: pulumi.Output<Names>, deployNames: pulumi.Output<Names>, runtimeNames: pulumi.Output<Names>, tags: Record<string, string>, provider: aws.Provider): Iam {
     const opts = { provider };
     const trust = JSON.stringify(lambdaTrustPolicy());
 
@@ -50,7 +54,7 @@ export function createIam(names: pulumi.Output<Names>, deployNames: pulumi.Outpu
 
     // No aws.iam.AccessKey here, ever (D23): `make runtime-key` creates and seals it.
     const runtimeUser = new aws.iam.User(RUNTIME_USER_NAME, { name: RUNTIME_USER_NAME, forceDestroy: true, tags }, opts);
-    const runtime = new aws.iam.UserPolicy(RUNTIME_POLICY_NAME, { name: RUNTIME_POLICY_NAME, user: runtimeUser.name, policy: render(names, runtimePolicy) }, opts);
+    const runtime = new aws.iam.UserPolicy(RUNTIME_POLICY_NAME, { name: RUNTIME_POLICY_NAME, user: runtimeUser.name, policy: render(runtimeNames, runtimePolicy) }, opts);
 
     const deploy = new aws.iam.Policy(DEPLOY_POLICY_NAME, {
         name: DEPLOY_POLICY_NAME, description: "ai-env deploy/destroy without administrator rights, except creating, changing or deleting this policy (attached to nothing)", policy: render(deployNames, deployPolicy), tags,

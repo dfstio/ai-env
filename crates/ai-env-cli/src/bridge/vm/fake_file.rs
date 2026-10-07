@@ -102,6 +102,10 @@ impl MicrovmApi for FileFakeMicrovmApi {
         self.with(|s| s.list_image_versions(arn))
     }
 
+    async fn get_network_connector(&self, identifier: &str) -> Result<serde_json::Value, BridgeError> {
+        self.with(|s| s.get_network_connector(identifier))
+    }
+
     async fn list_managed_images(&self) -> Result<Vec<ManagedImage>, BridgeError> {
         self.with(|s| s.list_managed_images())
     }

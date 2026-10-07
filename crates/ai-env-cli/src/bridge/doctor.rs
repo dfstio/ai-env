@@ -5,8 +5,9 @@
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
 use crate::bridge::awscli::aws_run;
-use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, EgressCfg, Paths, VmCfg, REGION, TRUE_ACCEPTS_NOTHING};
+use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, CredsCfg, EgressCfg, Paths, VmCfg, REGION, TRUE_ACCEPTS_NOTHING};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
+use crate::bridge::egress::{credential_precheck, EgressVerified};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::{base_image_verdict, read_infra_state, InfraState, CONNECTOR_NOT_IN_OUTPUTS};
 use crate::bridge::sibling::{exists_exec, find_sibling, Sibling, INSTALL_HINT};
@@ -698,21 +699,32 @@ pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
 /// line says they were not checked (the bridge.toml row already names the
 /// reason).
 #[must_use]
-pub fn rows_bridge_settings(loaded: &Result<Option<BridgeConfig>, BridgeError>, quota: Option<Result<&str, &str>>, state: &Result<Option<InfraState>, BridgeError>, dns_path: &Result<Option<(String, String)>, String>) -> Vec<DoctorLine> {
+pub fn rows_bridge_settings(
+    loaded: &Result<Option<BridgeConfig>, BridgeError>,
+    quota: Option<Result<&str, &str>>,
+    state: &Result<Option<InfraState>, BridgeError>,
+    dns_path: &Result<Option<(String, String)>, String>,
+    verified: &Result<EgressVerified, BridgeError>,
+    now: u64,
+) -> Vec<DoctorLine> {
     let why = match loaded {
         Ok(Some(cfg)) => {
+            let newest = dns_path.as_ref().map(|r| r.as_ref().map(|(v, _)| v.clone())).map_err(Clone::clone);
             return vec![
                 row_execution_role(&cfg.aws),
                 row_vm_config(&cfg.vm),
                 row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib),
                 row_egress(&cfg.egress, &cfg.aws, state),
                 row_dns_acceptance(&cfg.egress, dns_path),
-            ]
+                row_creds_settings(&cfg.creds),
+                row_credential_gate(cfg, state, verified, &newest, now),
+                row_credential_vm_role(&cfg.aws),
+            ];
         }
         Ok(None) => "no bridge.toml",
         Err(_) => "bridge.toml unparseable",
     };
-    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector and DNS acceptance not checked ({why})"))]
+    vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector, DNS acceptance, [creds] and the credential gate not checked ({why})"))]
 }
 
 /// `state/vms`: the rows by status, and whether a pending row (a
@@ -837,6 +849,86 @@ pub fn row_dns_acceptance(egress: &EgressCfg, newest: &Result<Option<(String, St
         Ok(None) => DoctorLine::row(Tag::Skip, format!("egress DNS: no dns-path verdict recorded ({acceptance})  <- ai-env lab run dns-path")),
         Ok(Some((v, ts))) if crate::bridge::egress::dns_accepted(v, egress) => DoctorLine::row(Tag::Ok, format!("egress DNS: the newest dns-path verdict {v} ({ts}) is accepted ({acceptance})")),
         Ok(Some((v, ts))) => DoctorLine::row(Tag::Warn, format!("egress DNS: the newest dns-path verdict {v} ({ts}) is NOT accepted ({acceptance}): the credential gate refuses every VM  <- ai-env lab show dns-path (its note says what replied)")),
+    }
+}
+
+/// `[creds]`, the section the credential path acts on (S7): the mode, how a
+/// secret is delivered and the Touch ID budget, or the key that would make
+/// `ai-env vm` refuse before anything is unsealed.
+#[must_use]
+pub fn row_creds_settings(creds: &CredsCfg) -> DoctorLine {
+    match creds.validate() {
+        Ok(()) => DoctorLine::row(Tag::Ok, format!("[creds] mode {}, deliver {}, key {}, Touch ID budget {} s", creds.mode, creds.deliver, creds.key, creds.unseal_timeout_s)),
+        Err(e) => DoctorLine::row(Tag::No, format!("{e}  <- fix [creds] in bridge.toml (ai-env vm and lab refuse it)")),
+    }
+}
+
+/// Would the credential gate let a credential into a fresh `vpc` VM of the
+/// image version new VMs run (S7)? Everything [`credential_precheck`] judges
+/// without an AWS call, asked of a VM built for the question: the connector, a
+/// passing `ai-env egress check` for that version with its age, and the DNS
+/// evidence. The live half ([`credential_gate`]) can only run against a real
+/// VM, so this row says what is in place, never that a delivery will happen.
+///
+/// `[!! ]` rather than `[NO ]`: nothing here breaks an uncredentialed command.
+#[must_use]
+pub fn row_credential_gate(cfg: &BridgeConfig, state: &Result<Option<InfraState>, BridgeError>, verified: &Result<EgressVerified, BridgeError>, dns_path: &Result<Option<String>, String>, now: u64) -> DoctorLine {
+    let name = "credential gate";
+    // The image and version a new VM would run, resolved as `vm run` does (`[aws].image_arn`; `[aws].image_version`:
+    // `active` is the recorded latest active version, `N` is `N.0`, `N.M` itself) — not simply the latest active
+    // version, which a pinned `[aws].image_version` overrides (the audit's finding).
+    let s = match state {
+        Ok(Some(s)) => s,
+        Ok(None) => return DoctorLine::row(Tag::Skip, format!("{name}: no state recorded (no state/infra.toml)  <- {INFRA_STATUS_HINT}")),
+        Err(e) => return DoctorLine::row(Tag::Skip, format!("{name}: state unknown (state/infra.toml unreadable: {e})  <- {INFRA_STATUS_HINT}")),
+    };
+    let image_arn = cfg.aws.image_arn.clone().filter(|a| !a.trim().is_empty()).unwrap_or_else(|| s.image_arn.clone());
+    let want = cfg.aws.image_version.trim();
+    let version = if want == "active" {
+        match s.latest_active_image_version.as_deref().filter(|v| !v.trim().is_empty()) {
+            Some(v) => v.to_string(),
+            None => return DoctorLine::row(Tag::Skip, format!("{name}: no active image version recorded  <- {INFRA_STATUS_HINT}")),
+        }
+    } else if want.contains('.') {
+        want.to_string()
+    } else {
+        format!("{want}.0")
+    };
+    let verified = match verified {
+        Ok(v) => v,
+        Err(e) => return DoctorLine::row(Tag::Warn, format!("{name}: the recorded checks cannot be read ({e}): every credential is refused  <- ai-env egress check")),
+    };
+    // A VM of the recorded version as `vm run` would make one: the row conditions hold by construction, so what
+    // this judges is the evidence on disk.
+    let row = VmRow {
+        id: String::new(),
+        image_arn,
+        image_version: version.clone(),
+        egress: crate::bridge::vm::run::Egress::Vpc.as_str().to_string(),
+        egress_gate: Some(crate::bridge::vm::registry::GATE_PASSED.to_string()),
+        shell: false,
+        ..VmRow::default()
+    };
+    match credential_precheck(cfg, &row, verified, dns_path, now) {
+        Ok(()) => DoctorLine::row(Tag::Ok, format!("{name}: in place for image version {version} (a fresh vpc VM is checked again live before any credential)")),
+        Err(r) => DoctorLine::row(Tag::Warn, format!("{name}: {} [{}]", r.why, r.condition)),
+    }
+}
+
+/// What a credentialed VM's execution role means for the credential (S7 D2):
+/// IMDSv2 inside a VM hands uid 1000 that role's keys (measured in S6 part B),
+/// so the role is kept — its policy writes the image's log group and nothing
+/// else, and the runtime logs are the evidence S7 and S8 rest on — while the
+/// proxy is what keeps those keys inside the VM (`ai-env egress allow` refuses
+/// every AWS service host). The row records the choice; it never fails.
+#[must_use]
+pub fn row_credential_vm_role(aws: &AwsCfg) -> DoctorLine {
+    match aws.execution_role_arn.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(role) => DoctorLine::row(
+            Tag::Ok,
+            format!("credentialed VMs keep the execution role {role}: its keys are readable inside the VM (IMDSv2) and work only at AWS hosts, which the allowlist never carries (plan S7 D2, v6 §9)"),
+        ),
+        None => DoctorLine::row(Tag::Ok, "credentialed VMs run without an execution role: no AWS keys inside the VM, and no runtime logs either".to_string()),
     }
 }
 
@@ -1105,7 +1197,9 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             // The newest dns-path row the credential gate will read (a row of the transcript knob never counts): its
             // verdict and when it was recorded.
             let dns_path = crate::bridge::egress::newest_dns_path_row(paths);
-            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state, &dns_path));
+            // The recorded passing checks the credential gate rests on (S7): read once, for the gate row.
+            let verified = EgressVerified::load(paths);
+            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state, &dns_path, &verified, unix_now()));
             // S5: the egress row reads only the state file; the proxy row
             // adds one operator call, for a recorded proxy and an identity.
             let described = proxy_call(arn.is_some(), recorded).map(|id| aws_run("ec2", &proxy_describe_args(id), None, Duration::from_secs(15)));
@@ -1414,15 +1508,20 @@ mod tests {
         let quota = quota_json("4");
         let active = ok(active_state());
         let newest: Result<Option<(String, String)>, String> = Ok(Some(("no-dns".to_string(), "2026-10-02T10:00:00Z".to_string())));
+        let none = Ok(EgressVerified::default());
+        let now = unix_now();
+        let settings = |loaded: &Result<Option<BridgeConfig>, BridgeError>, q: Option<Result<&str, &str>>, st: &Result<Option<InfraState>, BridgeError>, dp: &Result<Option<(String, String)>, String>| {
+            rows_bridge_settings(loaded, q, st, dp, &none, now).iter().map(text).collect::<Vec<(Tag, String)>>()
+        };
         for (loaded, why) in [(Ok(None), "no bridge.toml"), (Err(BridgeError::Config("[vm].max_concurrent: invalid type".into())), "bridge.toml unparseable")] {
-            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)), &active, &newest);
+            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)), &active, &newest, &none, now);
             let got: Vec<(Tag, String)> = rows.iter().map(text).collect();
-            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector and DNS acceptance not checked ({why})"))]);
+            assert_eq!(got, [(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector, DNS acceptance, [creds] and the credential gate not checked ({why})"))]);
             assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0, "the default [egress].require never fails a doctor without bridge.toml");
         }
         let cfg = BridgeConfig { vm: VmCfg { max_concurrent: 3, memory_mib: 2048, ..VmCfg::default() }, ..BridgeConfig::default() };
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), Some(Ok(&quota)), &active, &newest).iter().map(text).collect();
-        assert_eq!(got.len(), 5, "{got:?}");
+        let got = settings(&Ok(Some(cfg.clone())), Some(Ok(&quota)), &active, &newest);
+        assert_eq!(got.len(), 8, "{got:?}");
         assert_eq!(got[0], text(&row_execution_role(&cfg.aws)));
         assert_eq!(got[1], text(&row_vm_config(&cfg.vm)));
         assert!(got[2].0 == Tag::Warn && got[2].1.contains(" 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB"), "{got:?}");
@@ -1430,13 +1529,72 @@ mod tests {
         assert_eq!(got[3].0, Tag::No, "the defaults: require on, no connector: {got:?}");
         assert_eq!(got[4], text(&row_dns_acceptance(&cfg.egress, &newest)));
         assert_eq!(got[4].0, Tag::Ok, "{got:?}");
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg.clone())), None, &Ok(None), &Ok(None)).iter().map(text).collect();
+        // S7's three rows, in order: [creds], the gate's offline preconditions, the execution-role decision.
+        assert_eq!(got[5], text(&row_creds_settings(&cfg.creds)));
+        assert_eq!(got[5].0, Tag::Ok, "the defaults are a valid [creds]: {got:?}");
+        assert!(got[6].0 == Tag::Skip && got[6].1.contains("no active image version recorded"), "without a recorded version there is nothing to judge: {got:?}");
+        assert_eq!(got[7], text(&row_credential_vm_role(&cfg.aws)));
+        let got = settings(&Ok(Some(cfg.clone())), None, &Ok(None), &Ok(None));
         assert_eq!(got[2], (Tag::Skip, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)".to_string()));
         assert_eq!(got[4].0, Tag::Skip, "no dns-path row: {got:?}");
+        assert!(got[6].0 == Tag::Skip && got[6].1.contains("no state recorded"), "without state/infra.toml the gate row is skipped: {got:?}");
         // A configured connector with an ACTIVE recorded state: the row is [ok ].
         let cfg = BridgeConfig { aws: AwsCfg { egress_connector_arn: Some(CONNECTOR.into()), proxy_private_ip: Some("10.42.0.10".into()), ..AwsCfg::default() }, ..cfg };
-        let got: Vec<(Tag, String)> = rows_bridge_settings(&Ok(Some(cfg)), None, &active, &newest).iter().map(text).collect();
+        let versioned = ok(InfraState { latest_active_image_version: Some("5.0".into()), ..active_state() });
+        let got = settings(&Ok(Some(cfg.clone())), None, &versioned, &newest);
         assert_eq!(got[3].0, Tag::Ok, "{got:?}");
+        // The version new VMs run, with no passing check recorded for it: the row names the condition.
+        assert!(got[6].0 == Tag::Warn && got[6].1.contains("[no_record]") && got[6].1.contains("image version 5.0"), "{got:?}");
+        // The same evidence without a connector: the first condition, before any record is looked for.
+        let no_conn = BridgeConfig { aws: AwsCfg { egress_connector_arn: None, ..cfg.aws.clone() }, ..cfg.clone() };
+        let got = settings(&Ok(Some(no_conn)), None, &versioned, &newest);
+        assert!(got[6].0 == Tag::Warn && got[6].1.contains("[connector_unset]"), "{got:?}");
+        // Unreadable records refuse every credential, and the row says so without naming a condition.
+        let unreadable: Result<EgressVerified, BridgeError> = Err(BridgeError::Config("state/egress-verified.toml: bad".into()));
+        let row = text(&row_credential_gate(&cfg, &versioned, &unreadable, &Ok(Some("no-dns".into())), now));
+        assert!(row.0 == Tag::Warn && row.1.contains("cannot be read") && row.1.contains("ai-env egress check"), "{row:?}");
+    }
+
+    /// The credential-gate row when everything offline is in place, and the
+    /// execution-role row's two shapes (S7).
+    #[test]
+    fn the_credential_rows_report_what_is_in_place() {
+        use crate::bridge::egress::{ConnectorFacts, VerifiedRecord};
+        let now = unix_now();
+        let cfg = BridgeConfig { aws: AwsCfg { egress_connector_arn: Some(CONNECTOR.into()), ..AwsCfg::default() }, ..BridgeConfig::default() };
+        let state = ok(InfraState { latest_active_image_version: Some("5.0".into()), image_arn: "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent".into(), ..active_state() });
+        let mut verified = EgressVerified::default();
+        verified.record(
+            VerifiedRecord {
+                image_arn: "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent".into(),
+                image_version: "5.0".into(),
+                connector: CONNECTOR.into(),
+                at: crate::wire::time::rfc3339_utc(now),
+                dns: "no-dns".into(),
+                dns_rule: crate::bridge::egress::DNS_RULE,
+                connector_facts: ConnectorFacts { id: "nc-1".into(), network_protocol: "IPv4".into(), subnet_ids: vec!["subnet-1".into()], security_group_ids: vec!["sg-1".into()], ..ConnectorFacts::default() },
+                image_created_at: Some(1_790_000_000),
+                ..VerifiedRecord::default()
+            },
+            0,
+        );
+        let row = text(&row_credential_gate(&cfg, &state, &Ok(verified.clone()), &Ok(Some("no-dns".into())), now));
+        assert!(row.0 == Tag::Ok && row.1.contains("in place for image version 5.0") && row.1.contains("checked again live"), "{row:?}");
+        // A pinned [aws].image_version is the version a new VM runs, whatever the latest active one is: `4` is 4.0,
+        // which has no record here, so the gate would refuse it — and the row says so.
+        let pinned = BridgeConfig { aws: AwsCfg { image_version: "4".into(), ..cfg.aws.clone() }, ..cfg.clone() };
+        let row = text(&row_credential_gate(&pinned, &state, &Ok(verified.clone()), &Ok(Some("no-dns".into())), now));
+        assert!(row.0 == Tag::Warn && row.1.contains("image version 4.0") && row.1.contains("[no_record]"), "{row:?}");
+        let exact = BridgeConfig { aws: AwsCfg { image_version: "5.0".into(), ..cfg.aws.clone() }, ..cfg.clone() };
+        assert_eq!(text(&row_credential_gate(&exact, &state, &Ok(verified.clone()), &Ok(Some("no-dns".into())), now)).0, Tag::Ok);
+        // The same evidence a week and a second later: too old to stand on its own.
+        let stale = text(&row_credential_gate(&cfg, &state, &Ok(verified), &Ok(Some("no-dns".into())), now + crate::bridge::egress::MAX_RECORD_AGE_S + 1));
+        assert!(stale.0 == Tag::Warn && stale.1.contains("[record_age]"), "{stale:?}");
+        // The execution-role decision (D2), recorded either way, never a failure.
+        let with_role = text(&row_credential_vm_role(&AwsCfg { execution_role_arn: Some("arn:aws:iam::123456789012:role/ai-env-vm-exec".into()), ..AwsCfg::default() }));
+        assert!(with_role.0 == Tag::Ok && with_role.1.contains("IMDSv2") && with_role.1.contains("S7 D2"), "{with_role:?}");
+        let without = text(&row_credential_vm_role(&AwsCfg::default()));
+        assert!(without.0 == Tag::Ok && without.1.contains("no AWS keys inside the VM"), "{without:?}");
     }
 
     fn egress_toml(v: &str) -> EgressCfg {

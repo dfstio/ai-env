@@ -112,13 +112,15 @@ NotAction) echo "check-policies: AWS changed AWSLambdaNetworkConnectorOperatorPo
     ;;
 esac
 
-# ---- 3. simulate-custom-policy: the runtime principal's §9 table (S5: PassNetworkConnector only) ----
+# ---- 3. simulate-custom-policy: the runtime principal's §9 table (S5: PassNetworkConnector; S7 D5: + GetNetworkConnector on the egress connector) ----
 runtime=$(pp --name runtime)
 image=$(pp --arn image)
 exec_role=$(pp --arn execution-role)
 build_role=$(pp --arn build-role)
 egress=$(pp --arn egress)
 connector=$(pp --arn connector)
+connector_by_name=$(pp --arn connector-by-name)
+other_connector=$(pp --arn other-connector)
 proxy_param=$(pp --arn proxy-parameter)
 proxy_role=$(pp --arn proxy-role)
 operator_role=$(pp --arn operator-role)
@@ -215,9 +217,15 @@ sim implicitDeny "the runtime user itself" "$runtime_user" - \
 sim implicitDeny "the stack's roles" "$exec_role" - iam:CreateRole iam:PutRolePolicy iam:AttachRolePolicy iam:UpdateAssumeRolePolicy
 sim implicitDeny "the proxy role" "$proxy_role" - iam:PutRolePolicy iam:AttachRolePolicy iam:UpdateAssumeRolePolicy
 sim implicitDeny "the operator role" "$operator_role" - iam:PutRolePolicy iam:AttachRolePolicy iam:UpdateAssumeRolePolicy
-# S5: the runtime key reads, creates, changes and deletes no connector (GetNetworkConnectorsTentative is gone), and
-# has no hand on the proxy, its parameters or the egress network.
-sim implicitDeny "connector calls on the egress connector" "$connector" - \
+# S7 D5: the runtime key READS the egress connector (the credential gate compares its live configuration), and only
+# that one — it still creates, changes and deletes none, reaches no other connector, and has no hand on the proxy, its
+# parameters or the egress network.
+sim allowed "read the egress connector" "$connector" - lambda:GetNetworkConnector
+# The IAM service reference documents the networkConnector ARN by name, the service reports it by id: both are granted.
+sim allowed "read the egress connector by name" "$connector_by_name" - lambda:GetNetworkConnector
+sim implicitDeny "connector mutations on the egress connector" "$connector" - \
+    lambda:CreateNetworkConnector lambda:UpdateNetworkConnector lambda:DeleteNetworkConnector
+sim implicitDeny "connector calls on another connector" "$other_connector" - \
     lambda:GetNetworkConnector lambda:CreateNetworkConnector lambda:UpdateNetworkConnector lambda:DeleteNetworkConnector
 sim implicitDeny "connector calls on INTERNET_EGRESS" "$egress" - lambda:GetNetworkConnector lambda:UpdateNetworkConnector lambda:DeleteNetworkConnector
 sim implicitDeny "list connectors" "*" - lambda:ListNetworkConnectors

@@ -2,11 +2,11 @@
 // with plain node, so it and policies.ts import nothing from Pulumi).
 //
 //   node print-policies.js --account-id <12 digits> --image-config infra/image-config.json --egress-config infra/egress-config.json
-//                          [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID]
+//                          [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN]
 //       one line per document: <name> TAB <IDENTITY_POLICY|RESOURCE_POLICY> TAB <resource type or ->
 //   ... --name <name>
 //       that document as compact JSON (what validate-policy / simulate-custom-policy take)
-//   ... --arn image|execution-role|build-role|egress|connector|proxy-parameter|squid-log-group|image-log-group|runtime-user|proxy-role|operator-role|
+//   ... --arn image|execution-role|build-role|egress|connector|connector-by-name|other-connector|proxy-parameter|squid-log-group|image-log-group|runtime-user|proxy-role|operator-role|
 //             ssm-instance-policy|operator-policy
 //       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach)
 //
@@ -26,7 +26,7 @@ import {
 } from "../policies";
 
 function usage(msg: string): never {
-    process.stderr.write(`print-policies: ${msg}\nusage: print-policies --account-id <12 digits> --image-config <file> --egress-config <file> [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--name NAME | --arn KIND]\n`);
+    process.stderr.write(`print-policies: ${msg}\nusage: print-policies --account-id <12 digits> --image-config <file> --egress-config <file> [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--name NAME | --arn KIND]\n`);
     process.exit(2);
 }
 
@@ -54,6 +54,10 @@ const names: Names = {
         // Placeholders of the real shape: the ids exist only once a stack created the subnet and the group.
         vmSubnetId: args.get("vm-subnet-id") ?? "subnet-00000000000000000",
         vmSecurityGroupId: args.get("vm-security-group-id") ?? "sg-00000000000000000",
+        // Likewise the connector's ARN (S7 D5: runtimePolicy grants GetNetworkConnector on exactly it). The
+        // placeholder is in the service's own id form, so `--arn connector` and the document always name the same
+        // ARN and the simulations mean what they say.
+        connectorArn: args.get("connector-arn") ?? `arn:aws:lambda:${REGION}:${accountId}:network-connector:nc-00000000000000000`,
     },
 };
 const policies = allPolicies(names);
@@ -69,7 +73,12 @@ if (name !== undefined) {
         "execution-role": roleArn(names, EXECUTION_ROLE_NAME),
         "build-role": roleArn(names, BUILD_ROLE_NAME),
         egress: internetEgressConnectorArn(REGION),
-        connector: `arn:aws:lambda:${REGION}:${accountId}:network-connector:${egressConfig.connectorName}`,
+        // Exactly what runtimePolicy's ReadTheEgressConnector names, so the simulations prove that grant (S7 D5): the
+        // id form the service reports, and the name form the IAM service reference documents.
+        connector: names.egress.connectorArn as string,
+        "connector-by-name": `arn:aws:lambda:${REGION}:${accountId}:network-connector:${egressConfig.connectorName}`,
+        // Another connector of the same account: the Get grant must not reach it.
+        "other-connector": `arn:aws:lambda:${REGION}:${accountId}:network-connector:nc-11111111111111111`,
         "proxy-parameter": proxyParameterArn(names, "allow"),
         "squid-log-group": egressLogGroupArns(names)[0],
         "image-log-group": logGroupArns(names)[0],

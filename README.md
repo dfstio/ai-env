@@ -371,7 +371,10 @@ still get created).
   (region and endpoint pinned; the account must be the connector's), reading the stack's ids from
   `state/infra.toml`: `egress allow SLUG HOST [--remove]`, `egress suspend HOST [--restore]` (a concurrent
   write is detected after the fact from the parameter's version, never prevented; any failure after a
-  removal says `STILL ALLOWED on the proxy` and exits 7), `egress reload [--if-changed]`, `egress status` (connector, ENIs, routes, security groups,
+  removal says `STILL ALLOWED on the proxy` and exits 7; an AWS service host (`amazonaws.com`,
+  `amazonaws.com.cn`, the `.aws` domain) is refused with exit 9, and one already listed shows as drift in
+  `egress status`: a VM reads its execution role's keys from IMDS, and those keys work at AWS endpoints
+  and nowhere else), `egress reload [--if-changed]`, `egress status` (connector, ENIs, routes, security groups,
   NACL, VPC DNS and DHCP, no endpoints, NAT, peering or IPv6, the proxy serving exactly the parameters
   the stack rendered; any drift is exit 1), `egress env`, `proxy stop|start|patch`.
 - **`egress check`** starts its own `--egress vpc --shell` VM and runs, through the platform shell,

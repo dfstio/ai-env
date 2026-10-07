@@ -42,8 +42,8 @@
 //!   every command says so and names `make infra-status WRITE=1`.
 use super::ops::{self, arr, text, Invocation, Param, Wait, PATCH_EXEC_S, RELOAD, RELOAD_EXEC_S, STATUS_EXEC_S};
 use super::{
-    effective_hosts, fits_parameter, is_valid_slug, normalize_connector, normalize_host, param_name, parse_extras, parse_hosts, parse_reload_status, proxy_env, render_extras, render_suspended, value_sha256, Extra, PARAMETER_PREFIX,
-    PARAMS, PARAM_MAX_BYTES, PROXY_PORT, RESOLVERS,
+    effective_hosts, fits_parameter, is_aws_service_host, is_valid_slug, normalize_connector, normalize_host, param_name, parse_extras, parse_hosts, parse_reload_status, proxy_env, render_extras, render_suspended, value_sha256, Extra,
+    PARAMETER_PREFIX, PARAMS, PARAM_MAX_BYTES, PROXY_PORT, RESOLVERS,
 };
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::awscli::require_operator_account;
@@ -579,6 +579,13 @@ fn allow(slug: &str, host: &str, remove: bool) -> Result<()> {
         return Err(CliError::Usage(format!("egress allow: {slug:?} is not a workspace slug (1–64 of A-Z a-z 0-9 . _ -)")));
     }
     let host = normalize_host(host).map_err(|e| CliError::Usage(format!("egress allow: {e}")))?;
+    // S7 D2: a VM's own IMDS credentials (the logs-only execution role, measured in S6 part B) work at an AWS
+    // endpoint and nowhere else, so this is the one class the allowlist never carries. `--remove` still works.
+    if !remove && is_aws_service_host(&host) {
+        return Err(CliError::Policy(format!(
+            "egress allow: {host} is an AWS service host, which the allowlist never carries: a VM reaches IMDS, whose credentials (the logs-only execution role) authenticate there and nowhere else (plan S7 D2, v6 §9). Use `--remove` to take one off."
+        )));
+    }
     let ctx = Ctx::load()?;
     ctx.check_prefix()?;
     let instance = ctx.instance()?;
@@ -1488,6 +1495,17 @@ fn judge_parameters(st: Option<&BTreeMap<String, String>>, values: &BTreeMap<Str
         if let Some(e) = grammar {
             p.push(format!("{param}: {e}"));
         }
+        // S7 D2: `egress allow` refuses an AWS service host, so one in a list the proxy serves was put there another
+        // way (the shipped base allowlist, or SSM by hand). A suspended one is already denied, so it is no drift.
+        let aws: Vec<String> = match param {
+            "allow" => parse_hosts(v).unwrap_or_default().into_iter().filter(|h| is_aws_service_host(h)).collect(),
+            "extras" => parse_extras(v).unwrap_or_default().into_iter().map(|e| e.host).filter(|h| is_aws_service_host(h)).collect(),
+            _ => Vec::new(),
+        };
+        if !aws.is_empty() {
+            let fix = if param == "extras" { "ai-env egress allow <slug> <host> --remove" } else { "remove the line from infra/proxy/allow.txt and redeploy" };
+            p.push(format!("{param}: AWS service host(s) {}, where a VM's own IMDS credentials work ({fix})", aws.join(", ")));
+        }
         if !fits_parameter(v) {
             p.push(format!("{param}: {} bytes, over {PARAM_MAX_BYTES}", v.len()));
         }
@@ -2089,6 +2107,19 @@ mod tests {
         assert!(judge_parameters(None, &bad, &[]).1.contains("allow: line 1"));
         assert!(judge_parameters(None, &vals, &[param_name("suspended")]).1.contains("missing /ai-env/proxy/suspended"));
         assert_eq!(judge_parameters(None, &vals, &[]).0, Verdict::Ok);
+        // S7 D2: an AWS service host in a list the proxy serves is drift, with the remedy for the list it sits in. A
+        // suspended one is already denied, so it is none.
+        let mut base = vals.clone();
+        base.insert(param_name("allow"), param("api.anthropic.com\nsts.amazonaws.com\n"));
+        let (v, d) = judge_parameters(None, &base, &[]);
+        assert!(v == Verdict::Drift && d.contains("allow: AWS service host(s) sts.amazonaws.com, where a VM's own IMDS credentials work (remove the line from infra/proxy/allow.txt and redeploy)"), "{d}");
+        let mut extra = vals.clone();
+        extra.insert(param_name("extras"), param(&format!("{}lambda.eu-central-1.amazonaws.com\tai-env\n", super::super::EXTRAS_HEADER)));
+        let (v, d) = judge_parameters(None, &extra, &[]);
+        assert!(v == Verdict::Drift && d.contains("extras: AWS service host(s) lambda.eu-central-1.amazonaws.com, where a VM's own IMDS credentials work (ai-env egress allow <slug> <host> --remove)"), "{d}");
+        let mut only_suspended = vals.clone();
+        only_suspended.insert(param_name("suspended"), param(&format!("{}sts.amazonaws.com\n", super::super::SUSPENDED_HEADER)));
+        assert_eq!(judge_parameters(None, &only_suspended, &[]).0, Verdict::Ok, "a suspended AWS host is already denied");
     }
 
     /// `egress check` judges `proxy-github` by what squid serves: (allow ∪ extras) − suspended of the very values the

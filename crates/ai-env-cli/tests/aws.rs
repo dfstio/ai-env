@@ -1242,3 +1242,91 @@ async fn live_agent_rotation() {
     assert_eq!(reconnects, 0, "no close: the socket was replaced only by the rotation (audit: {})", no_account(&audit));
     assert_eq!(lines, 65, "every line echoed: none lost across the rotation's hello-resume and stdin resend");
 }
+
+// ---- S7: the runtime key reads the egress connector, and the credential gate passes live ----
+//
+// Part B (Mike's terminal, `make test-aws`). The first starts no VM: the runtime key's own hand-signed
+// GetNetworkConnector (D5), by the configured ARN (its colons percent-encoded on the wire) and by the bare id. The
+// second starts one vpc VM without --shell and runs the whole credential gate on what the platform reports for it,
+// with the real recorded egress checks and dns-path rows (read only). Neither needs the proxy running.
+
+use ai_env_cli::bridge::egress::{credential_gate, newest_dns_path, normalize_connector, ConnectorFacts, EgressVerified, LiveEcho};
+use ai_env_cli::bridge::vm::registry::VmRow;
+
+/// The configured egress connector, normalised (no `:N` version suffix).
+fn live_connector(live: &Live) -> String {
+    let arn = live.cfg.aws.egress_connector_arn.clone().filter(|a| !a.trim().is_empty()).expect("[aws].egress_connector_arn (make infra-status WRITE=1)");
+    normalize_connector(&arn)
+}
+
+/// GetNetworkConnector with the runtime key, as facts; a refusal names the likely cause.
+async fn connector_facts(api: &SdkMicrovmApi, identifier: &str, what: &str) -> ConnectorFacts {
+    let doc = api
+        .get_network_connector(identifier)
+        .await
+        .unwrap_or_else(|e| panic!("GetNetworkConnector by {what} with the runtime key: {} (AccessDenied: the IAM grant does not match, make deploy; a signature error: the path encoding)", no_account(&e.to_string())));
+    ConnectorFacts::from_get(&doc).unwrap_or_else(|| panic!("GetNetworkConnector by {what}: not an ACTIVE connector with complete facts: {}", no_account(&doc.to_string())))
+}
+
+#[tokio::test]
+#[ignore = "live, read-only, no VM: AI_ENV_AWS_TESTS=1 make test-aws"]
+async fn live_runtime_key_reads_the_egress_connector() {
+    if !live() {
+        return;
+    }
+    let live = live_world();
+    let api = connect(&live.creds).await;
+    let arn = live_connector(&live);
+    let id = arn.rsplit(':').next().unwrap_or_default().to_string();
+    let by_arn = connector_facts(&api, &arn, "ARN").await;
+    let by_id = connector_facts(&api, &id, "id").await;
+    eprintln!("live_runtime_key_reads_the_egress_connector: Id {}, version {:?}, {}, subnets {:?}, security groups {:?}", by_arn.id, by_arn.version, by_arn.network_protocol, by_arn.subnet_ids, by_arn.security_group_ids);
+    assert_eq!(by_arn, by_id, "one connector, whichever identifier names it");
+    assert_eq!(by_arn.id, id, "the configured ARN ends in the connector's id");
+    // What the gate compares with: the facts the newest passing egress check recorded for this connector.
+    let real = Paths::resolve().expect("the real bridge root");
+    let verified = EgressVerified::load(&real).unwrap_or_else(|e| panic!("{}", no_account(&e.to_string())));
+    let newest = verified.records.iter().filter(|r| r.connector == arn).max_by(|a, b| a.at.cmp(&b.at)).unwrap_or_else(|| panic!("no passing egress check is recorded for {} (run ai-env egress check)", no_account(&arn)));
+    eprintln!("live_runtime_key_reads_the_egress_connector: compared with the check recorded {} for image version {}", newest.at, newest.image_version);
+    assert_eq!(by_arn, newest.connector_facts, "the runtime key reads the facts the operator's check recorded");
+}
+
+#[tokio::test]
+#[ignore = "live, starts a vpc MicroVM (Mike's account): AI_ENV_AWS_TESTS=1 make test-aws"]
+async fn live_credential_gate_passes_for_a_fresh_vpc_vm() {
+    if !live() {
+        return;
+    }
+    let live = live_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    // A vpc VM without --shell: the gate refuses a --shell VM by design.
+    let flags = RunFlags { max_duration_s: Some(900), label: Some("test-gate".into()), egress: Some(vmrun::Egress::Vpc), purpose: "test", ..RunFlags::default() };
+    let plan = RunPlan::from_cfg(&live.cfg, &flags).unwrap_or_else(|e| panic!("gate run plan: {e} (make infra-status WRITE=1 records [aws].egress_connector_arn)"));
+    let (row, _, running_ms) = start(&api, &ep, &live, &guard, &plan).await;
+    // The live reads the gate takes just before a credential would be unsealed.
+    let vm = api.get(&row.id).await.unwrap_or_else(|e| panic!("{}", no_account(&e.to_string())));
+    let versions = api.list_image_versions(&vm.image_arn).await.unwrap_or_else(|e| panic!("{}", no_account(&e.to_string())));
+    let created = versions.iter().find(|v| v.version == vm.image_version).and_then(|v| v.created_at_unix);
+    let configured = live.cfg.aws.egress_connector_arn.clone().unwrap_or_default();
+    let facts = connector_facts(&api, &live_connector(&live), "ARN").await;
+    let alias = ConnectorAlias::load(&live.paths, &configured);
+    let echo = LiveEcho { connectors: &vm.egress, ingress: &vm.ingress, image: (&vm.image_arn, &vm.image_version), alias: alias.as_ref(), connector: Some(&facts), image_created_at: created };
+    eprintln!("live_credential_gate_passes_for_a_fresh_vpc_vm: {} RUNNING after {running_ms} ms; image version {}; ingress {:?}; egress {:?}", row.id, vm.image_version, vm.ingress, no_account(&vm.egress.join(", ")));
+    let real = Paths::resolve().expect("the real bridge root");
+    let verified = EgressVerified::load(&real).unwrap_or_else(|e| panic!("{}", no_account(&e.to_string())));
+    let dns = newest_dns_path(&real);
+    let now = ai_env_cli::wire::time::unix_now();
+    match credential_gate(&live.cfg, &row, &echo, &verified, &dns, now) {
+        Ok(pass) => {
+            eprintln!("live_credential_gate_passes_for_a_fresh_vpc_vm: GatePass for {} (image version {})", pass.vm_id(), pass.image_version());
+            assert_eq!(pass.vm_id(), row.id);
+            pass.check(&row.id, now).unwrap_or_else(|r| panic!("[{}] {}", r.condition, r.why));
+        }
+        Err(r) => panic!("the credential gate refused {}: [{}] {}", row.id, r.condition, no_account(&r.why)),
+    }
+    // The same VM recorded as --shell is refused by its row alone, whatever the live reads say.
+    let shell = VmRow { shell: true, ..row.clone() };
+    assert_eq!(credential_gate(&live.cfg, &shell, &echo, &verified, &dns, now).unwrap_err().condition, "shell_row");
+}

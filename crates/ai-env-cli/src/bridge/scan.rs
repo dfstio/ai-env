@@ -79,14 +79,14 @@ pub enum Profile {
 pub const MAX_COUNT: usize = 1000;
 
 /// The built-in tripwires, `(rule id, pattern)` (plan §10); they always apply.
-/// `private-key-block` and `mysql-pwd` escape one byte (`\ `, `\=`): the
-/// escape matches the same inputs, but the pattern's own text no longer
-/// matches it, so neither this file nor the compiled binary, which carries
-/// every pattern verbatim, trips the scan (S8 seeds and S9 reviews
-/// workspaces, this repo among them; unit-tested). `jwt` deviates from
-/// the §10 text (`{20}` before the dot): a fixed count there only matched a
-/// header of exactly 20 characters after `eyJ`, and the standard HS256 header
-/// has 33, so `{20,}` is what catches real tokens.
+/// `private-key-block`, `mysql-pwd` and `url-credentials` escape bytes
+/// (`\ `, `\=`, `\:\/\/`): each escape matches the same inputs, but the
+/// pattern's own text no longer matches it, so neither this file nor the
+/// compiled binary, which carries every pattern verbatim, trips the scan (S8
+/// seeds and S9 reviews workspaces, this repo among them; unit-tested). `jwt`
+/// deviates from the §10 text (`{20}` before the dot): a fixed count there only
+/// matched a header of exactly 20 characters after `eyJ`, and the standard
+/// HS256 header has 33, so `{20,}` is what catches real tokens.
 pub const DEFAULT_RULES: [(&str, &str); 9] = [
     ("anthropic-key", "sk-ant-[a-z]{2,8}[0-9]{2}-[A-Za-z0-9_-]{20}"),
     ("aws-access-key-id", "AKIA[0-9A-Z]{16}"),
@@ -98,7 +98,13 @@ pub const DEFAULT_RULES: [(&str, &str); 9] = [
     ("github-pat", "ghp_[A-Za-z0-9]{20}"),
     ("slack-token", "xox[bp]-[A-Za-z0-9-]{10}"),
     ("jwt", "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20}"),
-    ("url-credentials", "://[^/ @:]+:[^/ @]+@"),
+    // Userinfo is printable ASCII: the §10 text's `[^/ @:]` and `[^/ @]` also admit NUL and control bytes, and a
+    // binary's rodata packs unrelated literals tightly enough that `https://` plus a later `:` and a `0x40` byte
+    // read as credentials (measured on the staged shim binary, S7). The ranges are 0x21–0x7e without `/` and `@`,
+    // and without `:` before the first one; `\:\/\/` keeps the pattern's own text from matching itself. Accepted
+    // narrowing: userinfo holding raw non-ASCII bytes no longer matches (this pattern language cannot name bytes above
+    // 0x7e in a class), while percent-encoded userinfo, the valid URL form, still does.
+    ("url-credentials","\\:\\/\\/[!-.0-9;-?A-~]+:[!-.0-?A-~]+@"),
 ];
 
 // ---- pattern ----------------------------------------------------------------
@@ -1494,7 +1500,7 @@ mod tests {
         assert_eq!(DEFAULT_RULES[2].1, "-----BEGIN .*PRIVATE\\ KEY", "§10 text with an escaped space");
         assert_eq!(DEFAULT_RULES[4].1, "MYSQL_PWD\\=", "§10 text with an escaped '='");
         assert_eq!(DEFAULT_RULES[7].1, "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20}", "deviation from §10: see DEFAULT_RULES");
-        assert_eq!(DEFAULT_RULES[8].1, "://[^/ @:]+:[^/ @]+@");
+        assert_eq!(DEFAULT_RULES[8].1, "\\:\\/\\/[!-.0-9;-?A-~]+:[!-.0-?A-~]+@", "\u{a7}10 text restricted to printable userinfo, with the scheme separator escaped: see DEFAULT_RULES");
         for (id, src) in DEFAULT_RULES {
             assert!(!p(src).prefix.is_empty(), "{id} needs a literal prefix for the fast path");
         }
@@ -1520,6 +1526,8 @@ mod tests {
             // The shape of a standard HS256 token: 33 header characters after `eyJ`.
             ("jwt", format!("{}{}.{}{}.{}", "eyJ", "h".repeat(33), "eyJ", "p".repeat(60), "s".repeat(43))),
             ("url-credentials", format!("postgres{sep}{}:{}@db", "user", "pw")),
+            // Punctuation-heavy but printable userinfo still matches (the class is 0x21-0x7e without `/` and `@`).
+            ("url-credentials", format!("https{sep}{}:{}@host.test", "a.b-c_1", "p+w%21$=")),
         ]
     }
 

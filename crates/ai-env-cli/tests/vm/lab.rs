@@ -1539,12 +1539,15 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
     versions(serde_json::json!([v10(BUILD)]));
     let golden: serde_json::Value = serde_json::from_str(&fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json")).unwrap()).unwrap();
     let facts = ai_env_cli::bridge::egress::ConnectorFacts::from_get(&golden).unwrap();
+    // Relative to now, not a literal date: S7 D7 makes `--if-needed` check again once a pass is older than
+    // MAX_RECORD_AGE_S, so a fixed `at` would start failing on its own after a week.
+    let recorded_at = ai_env_cli::wire::time::rfc3339_utc(ai_env_cli::wire::time::unix_now() - 2 * 24 * 60 * 60);
     let rec = VerifiedRecord {
         image_arn: ai_env_cli::bridge::api::FAKE_IMAGE_ARN.into(),
         image_version: "1.0".into(),
         connector: CONNECTOR.into(),
         vm_id: "microvm-earlier".into(),
-        at: "2026-10-02T06:10:00Z".into(),
+        at: recorded_at.clone(),
         dns: "no-dns".into(),
         dns_rule: DNS_RULE,
         connector_facts: facts,
@@ -1560,7 +1563,7 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
     // The pass of the version new VMs run, this build, these connector facts: nothing started, three operator reads.
     let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
     assert!(skipped(&o), "{}\n{}", stdout(&o), stderr(&o));
-    assert!(stdout(&o).contains("egress check: image version 1.0, the one a new VM runs, already has a passing check with") && stdout(&o).contains("(VM microvm-earlier, 2026-10-02T06:10:00Z), bound to this build and to the connector's live facts"), "{}", stdout(&o));
+    assert!(stdout(&o).contains("egress check: image version 1.0, the one a new VM runs, already has a passing check with") && stdout(&o).contains(&format!("(VM microvm-earlier, {recorded_at}), bound to this build and to the connector's live facts")), "{}", stdout(&o));
     assert!(!stdout(&o).contains("note:"), "no-dns needs no acceptance: {}", stdout(&o));
     assert!(w.state().vms.is_empty() && shell_tokens(&w) == 0, "no VM, no shell");
     let calls = aws_calls(&w);
@@ -1572,6 +1575,18 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
     let o = check_with(&w, &["egress", "check", "--if-needed", "--json"], &t);
     let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!((doc["skipped"].as_bool(), doc["image_version"].as_str(), doc["recorded_vm"].as_str(), doc["dns_accepted"].as_bool()), (Some(true), Some("1.0"), Some("microvm-earlier"), Some(true)), "{doc}");
+    // S7 D7: a pass the credential gate would no longer take is checked again, and stderr says why. At the
+    // bound it still counts; past it, nothing is skipped. (Either side of the bound, not on it: the exact second
+    // is pinned by the gate's own unit test, which fixes `now`.)
+    let aged = |days: u64| VerifiedRecord { at: ai_env_cli::wire::time::rfc3339_utc(ai_env_cli::wire::time::unix_now() - days * 24 * 60 * 60), ..rec.clone() };
+    seed(vec![aged(6)]);
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(skipped(&o), "a pass inside the bound is still taken: {}\n{}", stdout(&o), stderr(&o));
+    seed(vec![aged(8)]);
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(stderr(&o).contains("is older than 7 days, which the credential gate no longer takes: checking again"), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("nothing started"), "an aged-out pass starts the check: {}", stdout(&o));
+    seed(vec![rec.clone()]);
     for extra in [&["--vm", "microvm-x"][..], &["--keep"][..]] {
         let mut args = vec!["egress", "check", "--if-needed"];
         args.extend_from_slice(extra);

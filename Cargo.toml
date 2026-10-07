@@ -56,6 +56,10 @@ aws-sdk-lambdamicrovms = { version = "=1.8.0", default-features = false, feature
 # The SDK's hyper-1 client, already in the graph through `default-https-client`; a direct
 # dependency so tls.rs can build it under the one TLS policy (Amazon roots, aws-lc-rs, no proxy).
 aws-smithy-http-client = { version = "=1.4.2", default-features = false, features = ["default-client", "rustls-aws-lc"] }
+# Already in the graph (the SDK signs with it); a direct dependency for the one call no SDK
+# operation covers: GetNetworkConnector, signed by hand in vm/client.rs (S7 D5). `sign-http`
+# is the http_request module; `http1` the http 1.x types the crate already uses.
+aws-sigv4 = { version = "=1.5.3", default-features = false, features = ["sign-http", "http1"] }
 
 [profile.release]
 lto = true

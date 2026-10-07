@@ -274,6 +274,21 @@ fn cli_run_outside_roots_exits_9() {
     assert_eq!(w.runs(), 0);
 }
 
+/// A `[creds]` value only the credential path acts on never blocks a command
+/// that carries no credential (the S7 audit's finding: `Ctx::load` validated
+/// `[creds]`, so a Tier-B mode or a bad budget broke `vm list` too).
+#[test]
+fn creds_settings_never_block_an_uncredentialed_command() {
+    for creds in ["mode = \"reverse-refresh\"\n", "deliver = \"stdin\"\n", "unseal_timeout_s = 5\n"] {
+        let w = World::new("");
+        let path = w.bridge().join("bridge.toml");
+        let toml = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{toml}\n[creds]\n{creds}")).unwrap();
+        let o = w.run(&["vm", "list"]);
+        assert_eq!(code(&o), 0, "{creds}: {}", stderr(&o));
+    }
+}
+
 #[test]
 fn cli_list_hides_terminated_without_all() {
     let w = World::new("");

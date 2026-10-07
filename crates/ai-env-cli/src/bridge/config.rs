@@ -399,11 +399,50 @@ pub struct CredsCfg {
     pub mode: String,
     pub deliver: String,
     pub key: String,
+    /// How long one Touch ID may take before the unseal gives up (S7;
+    /// `bridge::unseal`). The default is
+    /// [`DEFAULT_UNSEAL_TIMEOUT_S`](crate::bridge::unseal::DEFAULT_UNSEAL_TIMEOUT_S).
+    pub unseal_timeout_s: u64,
 }
 
 impl Default for CredsCfg {
     fn default() -> Self {
-        CredsCfg { mode: "setup-token".into(), deliver: "fd".into(), key: "ai-env-bridge".into() }
+        CredsCfg { mode: "setup-token".into(), deliver: "fd".into(), key: "ai-env-bridge".into(), unseal_timeout_s: crate::bridge::unseal::DEFAULT_UNSEAL_TIMEOUT_S }
+    }
+}
+
+impl CredsCfg {
+    /// The values S7 acts on, checked by the credential path before anything
+    /// is unsealed, and shown by `ai-env doctor` — never by `Ctx::load`, so a
+    /// `[creds]` value never blocks a command that carries no credential (the
+    /// audit's finding). Only the Tier-A mode is built (Tier B is a policy
+    /// refusal, exit 9, as plan S7 says), only the two delivery shapes exist,
+    /// and the Touch ID budget is within
+    /// [`UNSEAL_TIMEOUT_RANGE`](crate::bridge::unseal::UNSEAL_TIMEOUT_RANGE).
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        let bad = |key: &str, why: String| Err(BridgeError::Config(format!("[creds].{key}: {why}")));
+        match self.mode.as_str() {
+            "setup-token" => {}
+            "reverse-refresh" => return Err(BridgeError::Policy("[creds].mode \"reverse-refresh\" (Tier B) is not built: use \"setup-token\"".into())),
+            other => return bad("mode", format!("{other:?} is not a credential mode (setup-token)")),
+        }
+        if !matches!(self.deliver.as_str(), "fd" | "env") {
+            return bad("deliver", format!("{:?} is neither \"fd\" nor \"env\"", self.deliver));
+        }
+        if self.key.trim().is_empty() {
+            return bad("key", "names no keystore key".into());
+        }
+        let range = crate::bridge::unseal::UNSEAL_TIMEOUT_RANGE;
+        if !range.contains(&self.unseal_timeout_s) {
+            return bad("unseal_timeout_s", format!("{} is outside {}..={}", self.unseal_timeout_s, range.start(), range.end()));
+        }
+        Ok(())
+    }
+
+    /// The Touch ID budget as a duration.
+    #[must_use]
+    pub fn unseal_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.unseal_timeout_s)
     }
 }
 
@@ -826,6 +865,32 @@ mod tests {
         assert_eq!(c.creds.key, "ai-env-bridge");
         assert!(c.egress.require);
         assert_eq!(crate::bridge::api::region(&c).as_ref(), "eu-central-1");
+    }
+
+    /// `[creds]`, which S7 acts on: the defaults pass, and every value the
+    /// credential path would act on is refused before anything is unsealed.
+    #[test]
+    fn creds_settings_are_checked() {
+        let c = BridgeConfig::parse("").unwrap();
+        assert_eq!((c.creds.mode.as_str(), c.creds.deliver.as_str(), c.creds.unseal_timeout_s), ("setup-token", "fd", 60));
+        assert_eq!(c.creds.unseal_budget(), std::time::Duration::from_secs(60));
+        c.creds.validate().unwrap();
+        let of = |body: &str| BridgeConfig::parse(&format!("[creds]\n{body}")).unwrap().creds;
+        of("deliver = \"env\"\n").validate().unwrap();
+        of("unseal_timeout_s = 10\n").validate().unwrap();
+        of("unseal_timeout_s = 600\n").validate().unwrap();
+        let why = |body: &str| of(body).validate().unwrap_err().to_string();
+        let tier_b = of("mode = \"reverse-refresh\"\n").validate().unwrap_err();
+        assert!(matches!(&tier_b, BridgeError::Policy(m) if m.contains("Tier B) is not built")), "{tier_b}");
+        assert_eq!(crate::errors::CliError::from(tier_b).exit_code(), 9, "plan S7: Tier B is a policy refusal");
+        assert!(why("mode = \"whatever\"\n").contains("is not a credential mode"));
+        assert!(why("deliver = \"stdin\"\n").contains("neither \"fd\" nor \"env\""));
+        assert!(why("key = \" \"\n").contains("names no keystore key"));
+        for out in ["0", "9", "601", "100000"] {
+            assert!(why(&format!("unseal_timeout_s = {out}\n")).contains("outside 10..=600"), "{out}");
+        }
+        // An unknown key is still refused by the section's own deny_unknown_fields.
+        assert!(BridgeConfig::parse("[creds]\ncache = false\n").is_err());
     }
 
     #[test]
