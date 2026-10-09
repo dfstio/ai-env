@@ -141,6 +141,18 @@ pub struct VmRow {
     pub boot_nonce: Option<String>,
     pub claude_version: Option<String>,
     pub shim_version: Option<String>,
+    /// The shim's public capabilities as its last `/health` showed them (S7):
+    /// `None` until one was read, empty for an S6 shim (which cannot hold a
+    /// credential).
+    pub caps: Option<Vec<String>>,
+    /// When the setup-token was last sent to this VM (Unix seconds, S7), and
+    /// the seal id it carried. Set before the value leaves the Mac, whatever
+    /// answer comes back, and on any hit seen while it is unset: the VM's
+    /// memory, its running children and any snapshot may hold the token
+    /// until it is TERMINATED, whatever the shim's cache says now, so
+    /// `creds status` and `creds forget` list it.
+    pub credential_at: Option<u64>,
+    pub credential_tag: Option<String>,
     /// Port → expiry (Unix seconds) of the tokens minted for this VM.
     pub token_expiries: BTreeMap<String, u64>,
     /// S6.
@@ -342,23 +354,36 @@ pub fn adopt_pending_locked(paths: &Paths, client_token: &str, f: impl FnOnce(&m
 
 /// Every row in `state/vms` (id rows and pending rows), newest `created`
 /// first. Only regular files named `<id>.toml` / `pending-<uuid>.toml` are
-/// read; a row that fails to parse is skipped with a `warn!`. A pending row
+/// read; a row's name that is not a regular file (a link, a directory), or a
+/// row that fails to parse, is skipped with a `warn!`. A pending row
 /// whose `client_token` also has an id row (a crash inside
 /// [`promote_pending`]) is dropped in favour of the id row.
 pub fn list_rows(paths: &Paths) -> Result<Vec<VmRow>, BridgeError> {
+    let (rows, skipped) = list_rows_reporting(paths)?;
+    for s in skipped {
+        tracing::warn!("vm registry: skipping {s}");
+    }
+    Ok(rows)
+}
+
+/// [`list_rows`], and the rows it skipped as unreadable or unparseable, each
+/// as the error that names its path once (`<path>: <parser message>`, `<path>
+/// is a symlink; …`, `<path> is not a regular file`, `cannot open <path>:
+/// …`), for a caller that must not take a row it could not read for no row
+/// at all (S7: the VMs that may hold the setup-token). A row's name that is
+/// not a regular file is such a row too: `read_row` refuses it, so it is
+/// named here, never dropped unsaid.
+pub fn list_rows_reporting(paths: &Paths) -> Result<(Vec<VmRow>, Vec<String>), BridgeError> {
     let dir = paths.vms();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot list {}: {e}", dir.display())))),
     };
-    let mut rows = Vec::new();
+    let (mut rows, mut skipped) = (Vec::new(), Vec::new());
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".toml")) else { continue };
-        if !entry.file_type().is_ok_and(|t| t.is_file()) {
-            continue;
-        }
         let pending = stem.strip_prefix(PENDING_PREFIX);
         let valid = match pending {
             Some(token) => is_uuid(token),
@@ -368,6 +393,25 @@ pub fn list_rows(paths: &Paths) -> Result<Vec<VmRow>, BridgeError> {
             continue;
         }
         let path = dir.join(&name);
+        // A link, a directory or a FIFO under a row's name is a row `read_row` refuses (F13): named in
+        // `read_regular_file`'s words and never opened (the entry's type does not follow a link).
+        match entry.file_type() {
+            Ok(t) if t.is_file() => {}
+            Ok(t) if t.is_symlink() => {
+                skipped.push(format!("{} is a symlink; refusing to read it", path.display()));
+                continue;
+            }
+            Ok(_) => {
+                skipped.push(format!("{} is not a regular file", path.display()));
+                continue;
+            }
+            // Gone since the listing: no row, as `read_regular_file` says of a file that is not there.
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                skipped.push(format!("cannot stat {}: {e}", path.display()));
+                continue;
+            }
+        }
         match read_regular_file(&path).and_then(|t| t.map(|t| parse_row(&path, &t)).transpose()) {
             Ok(Some(mut row)) => {
                 match pending {
@@ -381,13 +425,16 @@ pub fn list_rows(paths: &Paths) -> Result<Vec<VmRow>, BridgeError> {
                 rows.push(row);
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!("vm registry: skipping {}: {e}", path.display()),
+            // Each error names the path already: said once, without its class's `config:`.
+            Err(BridgeError::Config(m)) => skipped.push(m),
+            Err(e) => skipped.push(e.to_string()),
         }
     }
     let promoted: std::collections::HashSet<String> = rows.iter().filter(|r| !r.is_pending_row()).map(|r| r.client_token.clone()).collect();
     rows.retain(|r| !(r.is_pending_row() && promoted.contains(&r.client_token)));
     rows.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.stem().cmp(&b.stem())));
-    Ok(rows)
+    skipped.sort();
+    Ok((rows, skipped))
 }
 
 /// The `--json` projection of a row: every field except `session_token`.
@@ -554,6 +601,59 @@ mod tests {
         std::os::unix::fs::symlink(p.vms().join("microvm-a.toml"), p.vms().join("microvm-c.toml")).unwrap();
         let ids: Vec<String> = list_rows(&p).unwrap().into_iter().map(|r| r.id).collect();
         assert_eq!(ids, ["microvm-b", "microvm-a"]);
+    }
+
+    /// A row that cannot be parsed is skipped by `list_rows` and named by
+    /// `list_rows_reporting`, which the holder list reads (S7): a VM whose
+    /// row is unreadable is never taken for no VM. It is named once, as
+    /// `<path>: <parser message>`, with no error class (`creds status` shows
+    /// it as it is).
+    #[test]
+    fn a_row_that_cannot_be_read_is_reported_not_only_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        write_row(&p, &row("microvm-a", "2026-09-29T10:00:00.000Z")).unwrap();
+        std::fs::write(p.vms().join("microvm-b.toml"), "status = [broken").unwrap();
+        std::fs::write(p.vms().join("notes.txt"), "").unwrap();
+        let (rows, skipped) = list_rows_reporting(&p).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["microvm-a"]);
+        assert!(skipped.len() == 1 && skipped[0].starts_with(&format!("{}: TOML parse error", p.vms().join("microvm-b.toml").display())), "{skipped:?}");
+        assert!(skipped[0].matches("microvm-b.toml").count() == 1 && !skipped[0].contains("config:"), "named once, no class: {skipped:?}");
+        assert_eq!(list_rows(&p).unwrap(), rows, "list_rows skips it");
+    }
+
+    /// F13: a row's name that is not a regular file (a symlink to a copy of
+    /// the row, which `read_row` refuses; a directory; a FIFO) is named by
+    /// `list_rows_reporting` in `read_row`'s words, each once, never dropped
+    /// unsaid (the holder list would read none for its VM); `list_rows`
+    /// still skips them, and nothing reads through the link or blocks on the
+    /// FIFO.
+    #[test]
+    fn a_row_that_is_not_a_regular_file_is_reported_not_only_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let mut a = row("microvm-a", "2026-09-29T10:00:00.000Z");
+        a.credential_at = Some(1_790_000_000);
+        write_row(&p, &a).unwrap();
+        let (link, copy) = (p.vms().join("microvm-a.toml"), dir.path().join("microvm-a.copy.toml"));
+        std::fs::rename(&link, &copy).unwrap();
+        std::os::unix::fs::symlink(&copy, &link).unwrap();
+        assert!(read_row(&p, "microvm-a").unwrap_err().to_string().ends_with("microvm-a.toml is a symlink; refusing to read it"), "read_row refuses the link");
+        std::fs::create_dir(p.vms().join("microvm-b.toml")).unwrap();
+        let fifo = std::ffi::CString::new(p.vms().join("microvm-c.toml").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo(3) with a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::fs::write(p.vms().join("notes.txt"), "").unwrap();
+        let (rows, skipped) = list_rows_reporting(&p).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+        let vms = p.vms();
+        let want = [
+            format!("{} is a symlink; refusing to read it", vms.join("microvm-a.toml").display()),
+            format!("{} is not a regular file", vms.join("microvm-b.toml").display()),
+            format!("{} is not a regular file", vms.join("microvm-c.toml").display()),
+        ];
+        assert_eq!(skipped, want, "each named once, in read_row's words");
+        assert!(list_rows(&p).unwrap().is_empty(), "list_rows skips them");
     }
 
     #[test]

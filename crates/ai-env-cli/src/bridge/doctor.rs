@@ -321,6 +321,42 @@ pub fn row_keystore_key(exists: bool, key: &str) -> DoctorLine {
     }
 }
 
+/// How long `claude auth status --json` may take: S7 plan §7 gives the row
+/// 10 s, twice the doctor's version probes, so a slow first start of the
+/// CLI is not reported as a failed login check.
+const CLAUDE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `claude auth status --json` of `claude` without the token, the API key
+/// and the config-dir variables (the default login is the one asked about),
+/// within [`CLAUDE_AUTH_TIMEOUT`].
+fn claude_auth_status(claude: &Path) -> Result<String, String> {
+    let mut cmd = Command::new(claude);
+    cmd.args(["auth", "status", "--json"]).env_remove("CLAUDE_CODE_OAUTH_TOKEN").env_remove("ANTHROPIC_API_KEY").env_remove("CLAUDE_CONFIG_DIR");
+    run_capture_cmd(cmd, None, CLAUDE_AUTH_TIMEOUT)
+}
+
+/// `loggedIn` of a `claude auth status --json` answer; nothing else of it is read.
+#[must_use]
+pub fn logged_in(json: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(json).ok()?.get("loggedIn")?.as_bool()
+}
+
+/// The Mac's own claude login (S7), informational: `claude setup-token` does
+/// not need one, and the VM never uses it. Only `loggedIn` is shown, never
+/// an account, email or organisation.
+#[must_use]
+pub fn row_claude_auth(claude: Option<&Path>, answer: Option<Result<String, String>>) -> DoctorLine {
+    match (claude, answer) {
+        (Some(p), Some(Ok(json))) => match logged_in(&json) {
+            Some(true) => DoctorLine::row(Tag::Ok, format!("claude auth: logged in ({})", p.display())),
+            Some(false) => DoctorLine::row(Tag::Skip, format!("claude auth: not logged in ({}); `claude setup-token` does not need it", p.display())),
+            None => DoctorLine::row(Tag::Warn, format!("claude auth: {} auth status --json gave no loggedIn", p.display())),
+        },
+        (Some(p), Some(Err(e))) => DoctorLine::row(Tag::Warn, format!("claude auth: {} auth status failed: {}", p.display(), crate::wire::redact::scrub(&e))),
+        _ => DoctorLine::row(Tag::Skip, "claude auth: no claude on this Mac (the bundled CLI or PATH)"),
+    }
+}
+
 /// Highest `anthropic.claude-code-<semver>-darwin-arm64` directory name; on
 /// equal versions a release beats a suffixed name, then the name decides (never
 /// the directory's listing order).
@@ -1190,6 +1226,8 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     let infra_state = match &paths {
         Ok(paths) => {
             lines.push(runtime_credentials(&paths.aws_env()));
+            // S7: the setup-token and combined.env, read without a Touch ID.
+            lines.extend(crate::bridge::setup_token::doctor_rows(paths, unix_now()));
             let state = read_infra_state(paths);
             lines.push(row_infra_state(&state, &paths.infra_state()));
             let recorded = state.as_ref().ok().and_then(Option::as_ref);
@@ -1221,6 +1259,11 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     let path_claude = find_in_path("claude", &effective_path());
     let path_out = path_claude.as_ref().and_then(|p| run_capture(&p.to_string_lossy(), &["--version"], t).ok());
     lines.push(row_path_claude(path_claude.as_deref().zip(path_out.as_deref()), bundled_out.as_deref()));
+    // S7: this Mac's own claude login, the bundled CLI before PATH's.
+    let ext_dir = home().join(".cursor").join("extensions");
+    let auth_claude = pick_bundle(&installed_extension_names(&ext_dir)).map(|(_, dir)| ext_dir.join(dir).join("resources").join("native-binary").join("claude")).filter(|p| p.is_file()).or(path_claude);
+    let auth = auth_claude.as_ref().map(|p| claude_auth_status(p));
+    lines.push(row_claude_auth(auth_claude.as_deref(), auth));
 
     let sibling = find_sibling("ai-env-claude");
     lines.push(row_sibling(&sibling));
@@ -1499,6 +1542,37 @@ mod tests {
             assert!(t.starts_with(&format!("config: {key}")) && t.ends_with("  <- fix [vm] in bridge.toml (ai-env vm and lab refuse it)"), "{t}");
             assert_eq!(crate::commands::doctor_exit_code(&[row], false), 1);
         }
+    }
+
+    /// S7: only `loggedIn` is read; an answer without it, or a failed run,
+    /// is a warning; no claude found is skipped.
+    #[test]
+    fn the_claude_auth_row_reads_logged_in_only() {
+        let p = Path::new("/Applications/claude");
+        assert_eq!(logged_in(r#"{"loggedIn":true,"email":"someone@example.com","orgId":"o"}"#), Some(true));
+        assert_eq!(logged_in("{}"), None);
+        assert_eq!(logged_in("not json"), None);
+        let (tag, t) = text(&row_claude_auth(Some(p), Some(Ok(r#"{"loggedIn":true,"email":"someone@example.com"}"#.into()))));
+        assert!(tag == Tag::Ok && !t.contains("example.com"), "{t}");
+        assert_eq!(text(&row_claude_auth(Some(p), Some(Ok(r#"{"loggedIn":false}"#.into())))).0, Tag::Skip);
+        assert_eq!(text(&row_claude_auth(Some(p), Some(Ok("{}".into())))).0, Tag::Warn);
+        assert_eq!(text(&row_claude_auth(Some(p), Some(Err("timed out".into())))).0, Tag::Warn);
+        assert_eq!(text(&row_claude_auth(None, None)).0, Tag::Skip);
+    }
+
+    /// S7 §7: the auth row waits the planned 10 s, not the doctor's 5 s
+    /// version-probe budget: a CLI that answers after 6 s is still read as
+    /// logged in, not as a failed run.
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_auth_status_waits_ten_seconds() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n[ \"$*\" = 'auth status --json' ] || exit 64\nsleep 6\necho '{\"loggedIn\":true}'\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (tag, t) = text(&row_claude_auth(Some(&claude), Some(claude_auth_status(&claude))));
+        assert!(tag == Tag::Ok && t.starts_with("claude auth: logged in"), "{t}");
     }
 
     /// An absent or unparseable bridge.toml never has its defaults reported

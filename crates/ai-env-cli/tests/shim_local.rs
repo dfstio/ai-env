@@ -11,8 +11,8 @@ use ai_env_cli::shim::hooks::{self, HookPeer, HookSource, PREFIX};
 use ai_env_cli::shim::peer::{AgentGuard, Peer, DRAIN_MAX};
 use ai_env_cli::shim::sys::{ClockMode, SysOps};
 use ai_env_cli::wire::frame::{
-    ClientInfo, Deliver, ErrorCode, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, HelloErrCode, ResumePoint, ResumeStatus, Resumed, RunHookPayload, SpawnId, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL,
-    CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
+    ClientInfo, CredentialErrCode, CredentialView, Deliver, ErrorCode, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, HelloErrCode, ResumePoint, ResumeStatus, Resumed, RunHookPayload, SpawnErrCode, SpawnId,
+    CAP_CREDENTIAL_CACHE, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -1376,7 +1376,7 @@ async fn agent_spawn_is_answered_by_the_spawn_manager() {
     s.run(true).await;
     let mut w = ws_hello_ok(s.app).await;
     let id = SpawnId::new_v7();
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None };
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None };
     send_frame(&mut w, &spawn).await;
     match next_frame(&mut w).await {
         Ok(Frame::Spawned { spawn_id, pid, .. }) => assert!(spawn_id == id && pid != 0, "{spawn_id} {pid}"),
@@ -1400,13 +1400,19 @@ async fn spawning_stack() -> (Stack, tempfile::TempDir) {
 /// tests run (the agent is this process's own uid, the home a canonical
 /// tempdir), so anything else before its `spawned` fails the test.
 async fn start(w: &mut Ws, id: &SpawnId, argv: &[&str], detach_grace_s: Option<u32>) -> (u32, Vec<Frame>) {
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s };
-    send_frame(w, &spawn).await;
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s, credential: None };
+    start_frame(w, &spawn).await
+}
+
+/// [`start`] for a `spawn` frame the caller built.
+async fn start_frame(w: &mut Ws, spawn: &Frame) -> (u32, Vec<Frame>) {
+    let id = spawn.spawn_id().expect("a spawn frame").clone();
+    send_frame(w, spawn).await;
     let mut others = Vec::new();
     loop {
         match next_frame(w).await {
-            Ok(Frame::Spawned { spawn_id, pid, .. }) if spawn_id == *id && pid != 0 => return (pid, others),
-            Ok(f) if f.spawn_id().is_some_and(|s| s != id) => others.push(f),
+            Ok(Frame::Spawned { spawn_id, pid, .. }) if spawn_id == id && pid != 0 => return (pid, others),
+            Ok(f) if f.spawn_id().is_some_and(|s| *s != id) => others.push(f),
             other => panic!("spawned for {id}, got {other:?}"),
         }
     }
@@ -1525,6 +1531,252 @@ async fn validate_v6_fails_closed_natively_under_peer_mode() {
     for v in ["V1:", "V2:", "V3:", "V4:"] {
         assert!(!b.contains(v), "only V6 fails on a clean tree: {b}");
     }
+}
+
+// ---- the credential cache (S7) --------------------------------------------------
+
+/// The name the Mac delivers the setup-token under.
+const CRED: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// A stand-in credential built at run time with a per-test tail: no token
+/// shape, nothing real, and unique enough for a leak scan to look for.
+fn dummy_value(test: &str) -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+    format!("dummy-credential-{test}-{}-{nanos}", std::process::id())
+}
+
+fn credential(value: &str, tag: Option<&str>) -> Frame {
+    Frame::Credential { name: CRED.into(), secret: Secret::new(value.to_string()), tag: tag.map(str::to_string) }
+}
+
+/// Deliver `value` on `w`: answered `credential_ok`, cached, with the tag.
+async fn deliver(w: &mut Ws, value: &str, tag: Option<&str>) {
+    send_frame(w, &credential(value, tag)).await;
+    match next_frame(w).await {
+        Ok(Frame::CredentialOk { name, cached: true, tag: t }) => assert_eq!((name.as_str(), t.as_deref()), (CRED, tag)),
+        other => panic!("credential_ok, got {other:?}"),
+    }
+}
+
+/// A new socket past hello, and what its `hello_ok` says of the cache:
+/// `has_credentials`, the caps and the view.
+async fn hello_view(app: SocketAddr) -> (Ws, bool, Vec<String>, CredentialView) {
+    let mut w = ws(app).await;
+    send_frame(&mut w, &hello(TOKEN)).await;
+    match next_frame(&mut w).await {
+        Ok(Frame::HelloOk { has_credentials, caps, credential, .. }) => (w, has_credentials, caps, credential),
+        other => panic!("hello_ok, got {other:?}"),
+    }
+}
+
+/// A `spawn` of `argv` naming `credential` and carrying `secrets` (fd delivery).
+fn spawn_with(id: &SpawnId, argv: &[&str], credential: Option<&str>, secrets: BTreeMap<String, Secret<String>>) -> Frame {
+    Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: None, credential: credential.map(str::to_string) }
+}
+
+/// The spawn's answer when it is refused: its code and message.
+async fn spawn_refused(w: &mut Ws, spawn: &Frame) -> (SpawnErrCode, String) {
+    send_frame(w, spawn).await;
+    match next_frame(w).await {
+        Ok(Frame::SpawnErr { spawn_id, code, message }) if Some(&spawn_id) == spawn.spawn_id() => (code, message),
+        other => panic!("spawn_err, got {other:?}"),
+    }
+}
+
+/// `id`'s stdout up to its exit, and the exit code; the exit is acked.
+async fn run_to_exit(w: &mut Ws, id: &SpawnId) -> (Vec<u8>, Option<i32>) {
+    let mut out = Vec::new();
+    let (seq, code) = loop {
+        match next_frame(w).await {
+            Ok(Frame::Stdout { spawn_id, data, .. }) if spawn_id == *id => out.extend(ai_env_cli::wire::chunk::decode(&data).unwrap()),
+            Ok(Frame::Exit { spawn_id, seq, code, .. }) if spawn_id == *id => break (seq, code),
+            Ok(f) if f.spawn_id().is_some() => {}
+            other => panic!("{id}'s frames, got {other:?}"),
+        }
+    };
+    send_frame(w, &Frame::Ack { spawn_id: id.clone(), seq, err_seq: 0 }).await;
+    (out, code)
+}
+
+/// `hello_ok` and `/health` advertise the cache; a delivered credential is
+/// cached and shown by name, tag and time — never its value — on a new
+/// socket's `hello_ok` and on `/health/detail`; a second delivery replaces
+/// it; `credential_forget` drops it.
+#[tokio::test]
+async fn a_delivered_credential_is_cached_and_shown_by_name_only() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let (mut w, has, caps, view) = hello_view(s.app).await;
+    assert!(!has && view == CredentialView::default(), "nothing cached yet: {view:?}");
+    assert_eq!(caps, [CAP_CREDENTIAL_CACHE]);
+    let (st, _, body) = http(s.app, "GET", "/health", b"", None).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Health>(&body).unwrap().caps, [CAP_CREDENTIAL_CACHE], "{body}");
+    let value = dummy_value("cached");
+    deliver(&mut w, &value, Some("seal-1")).await;
+    let (_second, has, _, view) = hello_view(s.app).await;
+    assert!(has, "a new socket sees the cached copy");
+    assert_eq!((view.credential_name.as_deref(), view.credential_tag.as_deref(), view.credential_holders), (Some(CRED), Some("seal-1"), 0));
+    assert!(view.credential_at.is_some(), "{view:?}");
+    let (d, body) = s.detail().await;
+    assert!(d.has_credentials && d.credential.credential_name.as_deref() == Some(CRED) && d.credential.credential_tag.as_deref() == Some("seal-1"), "{:?}", d.credential);
+    assert!(!body.contains(&value), "/health/detail ({} bytes) holds the value", body.len());
+    let newer = dummy_value("newer");
+    deliver(&mut w, &newer, None).await;
+    assert_eq!(s.state.spawns.credential().copy(CRED).map(|v| v.expose().len()), Some(newer.len()), "the second delivery replaced the first");
+    assert_eq!(s.detail().await.0.credential.credential_tag, None);
+    send_frame(&mut w, &Frame::CredentialForget { name: None }).await;
+    assert_eq!(next_frame(&mut w).await, Ok(Frame::CredentialOk { name: CRED.into(), cached: false, tag: None }));
+    let (_third, has, _, view) = hello_view(s.app).await;
+    assert!(!has && view == CredentialView::default(), "{view:?}");
+}
+
+/// A spawn naming the cached credential reads it on fd 3, byte-exact, with
+/// `<NAME>_FILE_DESCRIPTOR=3`, nothing under the name in its environment and
+/// the value under no other name either (fd-delivery's scan, and the
+/// runbook's reading of it, rest on that); named before any delivery it is
+/// `no_credential`; named together with an inline secret, `bad_request`.
+/// The cache keeps its copy for the next spawn.
+#[tokio::test]
+async fn a_spawn_naming_the_credential_reads_it_on_fd_3() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    // `$(…)` drops trailing newlines: an `x` after fd 3's bytes, cut off
+    // again, keeps them, so the value printed back is byte-exact (a stray
+    // newline would also make the scan's `grep -F` count every line).
+    let script = ["/bin/sh", "-c", "echo \"$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR\"; env | grep -c '^CLAUDE_CODE_OAUTH_TOKEN='; v=$(cat <&3; printf x); v=${v%x}; env | grep -c -F -- \"$v\"; printf %s \"$v\""];
+    let (code, message) = spawn_refused(&mut w, &spawn_with(&SpawnId::new_v7(), &script, Some(CRED), BTreeMap::new())).await;
+    assert!(code == SpawnErrCode::NoCredential && message.contains(CRED), "{code:?}: {message}");
+    let value = dummy_value("fd3");
+    deliver(&mut w, &value, None).await;
+    let inline = BTreeMap::from([("OTHER".to_string(), Secret::new(dummy_value("inline")))]);
+    let (code, message) = spawn_refused(&mut w, &spawn_with(&SpawnId::new_v7(), &script, Some(CRED), inline)).await;
+    assert_eq!(code, SpawnErrCode::BadRequest, "{message}");
+    for round in 0..2 {
+        let id = SpawnId::new_v7();
+        start_frame(&mut w, &spawn_with(&id, &script, Some(CRED), BTreeMap::new())).await;
+        let (out, code) = run_to_exit(&mut w, &id).await;
+        assert_eq!(code, Some(0), "round {round}");
+        assert!(out == format!("3\n0\n0\n{value}").into_bytes(), "round {round}: stdout of {} bytes, want the fd number, two zero counts and the {} value bytes", out.len(), value.len());
+    }
+    assert!(s.state.spawns.credential().has(), "the cache keeps its copy");
+}
+
+/// D3: `/suspend` drops the cached copy before it answers and refuses a
+/// delivery until `/resume` (`credential_err suspended`); a spawn naming the
+/// credential meanwhile is `no_credential`; `/resume` reopens the cache and
+/// drops anything there (a suspend whose hook never ran).
+#[tokio::test]
+async fn suspend_drops_the_credential_before_answering_and_resume_reopens_empty() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let value = dummy_value("suspend");
+    deliver(&mut w, &value, Some("seal-2")).await;
+    let (st, b) = hook(s.hooks, "suspend", b"{}").await;
+    assert_eq!(st, 200, "{b}");
+    assert!(!s.state.spawns.credential().has(), "gone by the time /suspend answered");
+    let (mut w, has, _, view) = hello_view(s.app).await;
+    assert!(!has && view.credential_name.is_none(), "{view:?}");
+    send_frame(&mut w, &credential(&value, None)).await;
+    match next_frame(&mut w).await {
+        Ok(Frame::CredentialErr { name, code: CredentialErrCode::Suspended, message }) => assert!(name == CRED && !message.contains(&value), "{message}"),
+        other => panic!("credential_err suspended, got {other:?}"),
+    }
+    let (code, _) = spawn_refused(&mut w, &spawn_with(&SpawnId::new_v7(), &["/bin/echo", "hi"], Some(CRED), BTreeMap::new())).await;
+    assert_eq!(code, SpawnErrCode::NoCredential);
+    assert!(!s.state.spawns.credential().has(), "the refused delivery cached nothing");
+    assert_eq!(hook(s.hooks, "resume", b"{}").await.0, 200);
+    deliver(&mut w, &value, None).await;
+    assert_eq!(hook(s.hooks, "resume", b"{}").await.0, 200, "a resume with no suspend before it");
+    assert!(!s.state.spawns.credential().has(), "a resume never keeps a copy");
+    ping(&mut w, 12).await;
+}
+
+/// `credential_holders` counts the live spawns handed a secret, from the
+/// cache or inline, on `/health/detail` and a new `hello_ok`; an exit takes
+/// its spawn off once its process group is gone (a group outliving its
+/// leader still counts, and a zombie leader may pin it until it is reaped);
+/// a spawn without a secret never counts.
+#[tokio::test]
+async fn holders_count_the_live_spawns_handed_a_secret() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    deliver(&mut w, &dummy_value("holders"), None).await;
+    let cached = SpawnId::new_v7();
+    start_frame(&mut w, &spawn_with(&cached, &["/bin/cat"], Some(CRED), BTreeMap::new())).await;
+    let inline = SpawnId::new_v7();
+    start_frame(&mut w, &spawn_with(&inline, &["/bin/cat"], None, BTreeMap::from([("X".to_string(), Secret::new(dummy_value("inline")))]))).await;
+    start(&mut w, &SpawnId::new_v7(), &["/bin/cat"], None).await;
+    assert_eq!(s.detail().await.0.credential.credential_holders, 2);
+    let (_other, _, _, view) = hello_view(s.app).await;
+    assert_eq!(view.credential_holders, 2);
+    send_frame(&mut w, &Frame::StdinEof { spawn_id: cached.clone(), seq: 0 }).await;
+    assert_eq!(run_to_exit(&mut w, &cached).await.1, Some(0));
+    let t = Instant::now();
+    let mut holders = s.detail().await.0.credential.credential_holders;
+    while holders != 1 && t.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        holders = s.detail().await.0.credential.credential_holders;
+    }
+    assert_eq!(holders, 1, "the exited spawn's group is gone within 5 s");
+    s.state.spawns.shutdown("test").await;
+}
+
+/// A malformed delivery is `credential_err bad_request` naming the field,
+/// never the value, and the socket stays up; a `credential_ok` or
+/// `credential_err` from the Mac is a protocol violation.
+#[tokio::test]
+async fn a_bad_delivery_is_refused_and_only_the_vm_answers_credentials() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    let value = dummy_value("bad");
+    for (frame, says) in [
+        (Frame::Credential { name: "1BAD".into(), secret: Secret::new(value.clone()), tag: None }, "environment name"),
+        (credential(&value, Some("not a tag")), "tag"),
+        (credential(&format!("{value}\0"), None), "NUL"),
+    ] {
+        send_frame(&mut w, &frame).await;
+        match next_frame(&mut w).await {
+            Ok(Frame::CredentialErr { code: CredentialErrCode::BadRequest, message, .. }) => assert!(message.contains(says) && !message.contains(&value), "{message}"),
+            other => panic!("credential_err bad_request, got {other:?}"),
+        }
+    }
+    ping(&mut w, 13).await;
+    assert!(!s.state.spawns.credential().has());
+    send_frame(&mut w, &Frame::CredentialOk { name: CRED.into(), cached: true, tag: None }).await;
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::Error { code: ErrorCode::BadFrame, .. })));
+    assert_eq!(next_frame(&mut w).await, Err(Some(CLOSE_PROTOCOL)));
+}
+
+/// `/terminate` drops the cached copy before it answers (`/health/detail`
+/// shows none) and closes the cache for good: after a late `/suspend` and
+/// `/resume`, which never reopen a stopping shim's cache, a copy is still
+/// refused as `draining`. (No socket can carry one any more: the cache's own
+/// refusal is the backstop, so it is checked on the cache.) The shutdown on
+/// a stop signal starts with the same `hooks::begin_stop`, so this checks its
+/// refusal too; `binary_stops_drop_the_cached_credential_first` shows it
+/// runs it.
+#[tokio::test]
+async fn terminate_drops_the_credential_before_answering_and_closes_for_good() {
+    let s = Stack::log().await;
+    s.run(true).await;
+    let mut w = ws_hello_ok(s.app).await;
+    let value = dummy_value("terminate");
+    deliver(&mut w, &value, Some("seal-4")).await;
+    let (answer, ()) = tokio::join!(hook(s.hooks, "terminate", b"{}"), async { while next_frame(&mut w).await.is_ok() {} });
+    assert_eq!(answer.0, 200, "{}", answer.1);
+    assert!(!s.state.spawns.credential().has(), "gone by the time /terminate answered");
+    let (d, body) = s.detail().await;
+    assert!(!d.has_credentials && d.credential.credential_name.is_none(), "{:?}", d.credential);
+    assert!(!body.contains(&value), "/health/detail ({} bytes) holds the value", body.len());
+    for h in ["suspend", "resume"] {
+        assert_eq!(hook(s.hooks, h, b"{}").await.0, 200, "{h}");
+        let (code, message) = s.state.spawns.credential().put(CRED, Secret::new(value.clone()), None).unwrap_err();
+        assert_eq!(code, CredentialErrCode::Draining, "after /{h}");
+        assert!(!message.contains(&value), "after /{h}: the refusal ({} bytes) holds the value", message.len());
+    }
+    assert!(!s.state.spawns.credential().has(), "nothing was cached once stopping");
 }
 
 // ---- the real binary: `ai-env shim` as the image ENTRYPOINT runs it ---------------
@@ -2075,5 +2327,71 @@ fn guard_modes_fail_closed_off_linux() {
         let out = ai_env(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{flags:?}: {}", String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stderr).contains("needs Linux"), "{flags:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+
+/// S7 through the real binary: a delivery, a spawn reading fd 3, `/suspend`,
+/// `/resume`, `/terminate`. The stderr log names the credential, its byte
+/// count and tag, and its drop on suspend; no line ever holds the value.
+#[tokio::test]
+async fn binary_credential_log_names_it_and_never_holds_the_value() {
+    let t = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(home.path()).unwrap();
+    let shim = Shim::start(&fake_claude(t.path(), ""), &["--home", home.to_str().unwrap()]);
+    let (hooks_addr, app) = (shim.addr("hooks"), shim.addr("app"));
+    assert_eq!(hook(hooks_addr, "run", &run_body("mvm-cred", Some(&payload_json("mike@mbp")))).await.0, 200);
+    let mut w = ws_hello_ok(app).await;
+    let value = dummy_value("binary");
+    deliver(&mut w, &value, Some("seal-3")).await;
+    let id = SpawnId::new_v7();
+    start_frame(&mut w, &spawn_with(&id, &["/bin/sh", "-c", "wc -c <&3"], Some(CRED), BTreeMap::new())).await;
+    let (out, code) = run_to_exit(&mut w, &id).await;
+    assert_eq!((String::from_utf8_lossy(&out).trim().to_string(), code), (value.len().to_string(), Some(0)), "fd 3's byte count");
+    for h in ["suspend", "resume", "terminate"] {
+        assert_eq!(hook(hooks_addr, h, b"{}").await.0, 200, "{h}");
+    }
+    shim.wait_line(10, |l| l.starts_with("ai-env: hook terminate ") && l.contains("status=200"));
+    let lines = shim.lines.lock().unwrap().clone();
+    let cached = format!("ai-env: credential cached name={CRED} bytes={} tag=seal-3", value.len());
+    assert!(lines.contains(&cached), "{cached:?} missing from {} lines", lines.len());
+    assert!(lines.contains(&format!("ai-env: credential forgotten name={CRED} (suspend)")), "the drop on /suspend is logged");
+    let leaks = lines.iter().filter(|l| l.contains(&value)).count();
+    assert_eq!(leaks, 0, "{leaks} stderr line(s) hold the value");
+}
+
+/// Both stops drop a cached credential first, through the real binary:
+/// `/terminate` logs `credential forgotten … (terminate)` and SIGTERM
+/// `… (stop)` (the shared `hooks::begin_stop`, whose refusal the in-process
+/// `/terminate` test checks), each before the spawns are stopped (and
+/// SIGTERM still exits 0); no stderr line ever holds the value.
+#[tokio::test]
+async fn binary_stops_drop_the_cached_credential_first() {
+    for why in ["terminate", "stop"] {
+        let t = tempfile::tempdir().unwrap();
+        let mut shim = Shim::start(&fake_claude(t.path(), ""), &[]);
+        let (hooks_addr, app) = (shim.addr("hooks"), shim.addr("app"));
+        assert_eq!(hook(hooks_addr, "run", &run_body("mvm-stop", Some(&payload_json("mike@mbp")))).await.0, 200);
+        let mut w = ws_hello_ok(app).await;
+        let value = dummy_value(why);
+        deliver(&mut w, &value, Some("seal-5")).await;
+        let end = if why == "terminate" {
+            let (answer, ()) = tokio::join!(hook(hooks_addr, "terminate", b"{}"), async { while next_frame(&mut w).await.is_ok() {} });
+            assert_eq!(answer.0, 200, "{}", answer.1);
+            "ai-env: hook terminate "
+        } else {
+            signal(shim.child.id(), nix::sys::signal::Signal::SIGTERM);
+            while next_frame(&mut w).await.is_ok() {}
+            assert_eq!(wait_exit(&mut shim.child, 10).code(), Some(0), "SIGTERM is a graceful stop");
+            "ai-env: shim stopped"
+        };
+        shim.wait_line(10, |l| l.starts_with(end));
+        let lines = shim.lines.lock().unwrap().clone();
+        let forgotten = format!("ai-env: credential forgotten name={CRED} ({why})");
+        let (forgot, stopping) = (lines.iter().position(|l| *l == forgotten), lines.iter().position(|l| l.starts_with(&format!("ai-env: spawns stopping ({why}): "))));
+        assert!(forgot.is_some() && forgot < stopping, "{why}: the copy is dropped before the spawns are stopped (lines {forgot:?} and {stopping:?} of {})", lines.len());
+        let leaks = lines.iter().filter(|l| l.contains(&value)).count();
+        assert_eq!(leaks, 0, "{why}: {leaks} stderr line(s) hold the value");
     }
 }

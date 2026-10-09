@@ -191,6 +191,7 @@ pub fn health_claiming(microvm_id: Option<&str>, owner: &str, created: &str) -> 
         run_hook_seen: true,
         uptime_s: 1,
         wire: None,
+        caps: vec![],
     }
 }
 

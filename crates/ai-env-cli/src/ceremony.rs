@@ -17,7 +17,6 @@ use crate::store::{validate_identity_file, validate_key_name, write_atomic, KeyM
 use std::fs;
 use std::io::Write;
 
-use std::process::Command;
 use zeroize::Zeroizing;
 
 pub const ACCESS_CONTROLS: [&str; 7] = [
@@ -93,8 +92,9 @@ fn create_se_identity(
 
     let result = (|| -> Result<String> {
         let identity_path = store.identity_path(name);
-        let out = Command::new(plugin)
-            .env("PATH", effective_path())
+        // As every age-family tool is started (`age_cmd::tool_cmd`): PATH
+        // with Homebrew's bin, and no credential of ai-env's environment.
+        let out = crate::age_cmd::tool_cmd(plugin)
             .arg("keygen")
             .arg(format!("--access-control={access_control}"))
             .arg("--recipient-type=tag")
@@ -578,7 +578,9 @@ fn outprint(s: &str) -> Result<()> {
 /// Zeroizing too, so its wipe cannot be optimised away.
 fn read_secret_line(f: &mut fs::File) -> Result<Zeroizing<String>> {
     use std::io::Read;
-    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(256));
+    // Allocated once at the cap below: a growing buffer would leave partial
+    // copies of the secret in freed heap at each reallocation.
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(4096));
     let mut b: Zeroizing<[u8; 1]> = Zeroizing::new([0u8; 1]);
     loop {
         match f.read(&mut b[..]) {
@@ -604,7 +606,7 @@ fn read_secret_line(f: &mut fs::File) -> Result<Zeroizing<String>> {
 /// A dup of fd 0 as a File: reading through it never touches the
 /// process-global `std::io::stdin()` buffer, which lives (un-zeroized) for
 /// the rest of the process once a secret has passed through it.
-fn stdin_file() -> Result<fs::File> {
+pub(crate) fn stdin_file() -> Result<fs::File> {
     // SAFETY: dup of fd 0; on success the new descriptor is exclusively ours.
     let fd = unsafe { libc::dup(0) };
     if fd < 0 {

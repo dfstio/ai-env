@@ -249,8 +249,29 @@ impl EgressArg {
     }
 }
 
-/// `--auth` of `ai-env vm shell`.
+/// `--deliver` of `ai-env vm exec` (S7).
 #[cfg(feature = "bridge")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeliverArg {
+    /// On fd 3, with CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3 (claude reads it once)
+    Fd,
+    /// As CLAUDE_CODE_OAUTH_TOKEN in the command's environment; needs [creds] deliver = "env", which also makes it the default
+    Env,
+}
+
+#[cfg(feature = "bridge")]
+impl DeliverArg {
+    /// The wire's delivery.
+    #[must_use]
+    pub fn deliver(self) -> crate::wire::frame::Deliver {
+        match self {
+            DeliverArg::Fd => crate::wire::frame::Deliver::Fd,
+            DeliverArg::Env => crate::wire::frame::Deliver::Env,
+        }
+    }
+}
+
+/// `--auth` of `ai-env vm shell`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ShellAuthArg {
     /// x-aws-proxy-auth + x-aws-proxy-port headers (default)
@@ -359,9 +380,26 @@ pub enum VmCmd {
         /// Seconds the command survives a lost connection before it is stopped (default 60)
         #[arg(long, value_name = "S", value_parser = clap::value_parser!(u32).range(1..=86_400))]
         detach_grace: Option<u32>,
+        /// Give the command the sealed setup-token (CLAUDE_CODE_OAUTH_TOKEN); the VM keeps a copy until it is suspended or terminated
+        #[arg(long, conflicts_with = "credential_file")]
+        with_credential: bool,
+        /// How the credential reaches the command: fd or env; the default is [creds] deliver ("fd" unless set to "env"), and env needs [creds] deliver = "env"
+        #[arg(long, value_enum, value_name = "HOW")]
+        deliver: Option<DeliverArg>,
+        /// Give this one command the token sealed in this container (never kept on the VM)
+        #[arg(long, value_name = "PATH")]
+        credential_file: Option<PathBuf>,
         /// The command and its arguments (after --)
         #[arg(last = true, required = true, value_name = "ARGV")]
         argv: Vec<String>,
+    },
+    /// Deliver the sealed setup-token to the workspace's VM ahead of time (starting one with vpc egress if it has none): later credentialed commands there need no Touch ID for it until the VM is suspended
+    Warm {
+        /// Workspace directory (under [workspaces].roots)
+        workspace: PathBuf,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
     },
     /// Reattach to a running command (the newest attachment wins; the previous client exits 8). A terminal's input feeds the command's stdin (Ctrl-D closes it for good); any other stdin is not read, and the command's stdin is left as it is
     Attach {
@@ -459,6 +497,9 @@ pub enum VmCmd {
         /// Also run `claude --version` and `id -u` over /agent (S6) and check them
         #[arg(long)]
         exec: bool,
+        /// With --exec: also deliver the sealed setup-token and run `claude -p 'Reply OK'` with it (vpc egress; S7)
+        #[arg(long, requires = "exec")]
+        with_credential: bool,
         /// One JSON record on stdout (the step lines go to stderr)
         #[arg(long)]
         json: bool,
@@ -671,6 +712,36 @@ pub enum CredsCmd {
         /// Seal even when the keystore key has no recovery recipient
         #[arg(long)]
         force: bool,
+    },
+    /// Seal the Claude setup-token (what `claude setup-token` prints) into credentials/setup-token.env; asks for it hidden
+    SetupToken {
+        /// Read one line from stdin (a pipe; a terminal is refused) instead of asking
+        #[arg(long, conflicts_with = "from_env")]
+        stdin: bool,
+        /// Read CLAUDE_CODE_OAUTH_TOKEN from the environment instead of asking
+        #[arg(long)]
+        from_env: bool,
+        /// Do not rebuild credentials/combined.env (a credentialed command then asks for Touch ID twice)
+        #[arg(long)]
+        no_combined: bool,
+        /// Seal even when the keystore key has no recovery recipient
+        #[arg(long)]
+        force: bool,
+    },
+    /// What is sealed under credentials/, without Touch ID (unless --unseal)
+    Status {
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+        /// Unseal the setup-token once (one Touch ID) and time it
+        #[arg(long)]
+        unseal: bool,
+    },
+    /// Delete the sealed setup-token, combined.env and their backups (a dry run without --yes)
+    Forget {
+        /// Delete (default: list what would be deleted)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -893,6 +964,11 @@ pub fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "bridge")]
         Cmd::Creds { cmd } => match cmd {
             CredsCmd::AwsSet { user, check, force } => crate::bridge::creds::cmd_aws_set(&store, &user, check, force),
+            CredsCmd::SetupToken { stdin, from_env, no_combined, force } => {
+                crate::bridge::setup_token::cmd_setup_token(&store, crate::bridge::setup_token::SetupTokenOpts { stdin, from_env, no_combined, force })
+            }
+            CredsCmd::Status { json, unseal } => crate::bridge::setup_token::cmd_status(&store, json, unseal),
+            CredsCmd::Forget { yes } => crate::bridge::setup_token::cmd_forget(yes),
         },
         #[cfg(feature = "bridge")]
         Cmd::Vm { cmd } => crate::bridge::vm::cmd::main(&store, cmd),
@@ -926,4 +1002,21 @@ fn doctor(store: &Keystore, file: &std::path::Path, json: bool) -> Result<()> {
         }
     };
     commands::doctor_report(&lines, json, auth_unavailable)
+}
+
+#[cfg(all(test, feature = "bridge"))]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory as _;
+
+    /// `vm exec --deliver`'s help names the real default (S7):
+    /// `[creds] deliver = "env"` makes env the default delivery, not only an
+    /// allowed one, so the help never calls fd the default outright.
+    #[test]
+    fn vm_exec_deliver_help_names_the_configured_default() {
+        let mut cli = Cli::command();
+        let exec = cli.find_subcommand_mut("vm").and_then(|vm| vm.find_subcommand_mut("exec")).expect("vm exec");
+        let help = exec.get_arguments().find(|a| a.get_id() == "deliver").and_then(clap::Arg::get_help).map(ToString::to_string).expect("--deliver has a help line");
+        assert!(help.contains("the default is [creds] deliver") && !help.contains("fd (default)"), "{help}");
+    }
 }

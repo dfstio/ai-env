@@ -12,10 +12,10 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const USER: &str = "ai-env-runtime";
-const KEY: &str = "ai-env-bridge";
+pub(crate) const USER: &str = "ai-env-runtime";
+pub(crate) const KEY: &str = "ai-env-bridge";
 /// The public SE tag recipient and X25519 recovery recipient of tests/cli.rs.
 const SE_REC: &str = "age1tag1qwww38sn08g0m3x3ue8wh33wa4vs2wcx0427jya9fjrhxa94fxjk7yz4e4r";
 const X_REC: &str = "age15csf02ez9ze9xnk3djhm497jwjysdg96tcqwpsn4m5clex767vrs5da5j0";
@@ -26,12 +26,12 @@ fn fake(name: &str) -> PathBuf {
 
 /// One temp tree: `bin/` (the fakes), `keys/` (AI_ENV_DIR), `bridge/`
 /// (AI_ENV_BRIDGE_DIR), `tmp/` (TMPDIR) and the two fake logs.
-struct Env {
+pub(crate) struct Env {
     tmp: tempfile::TempDir,
 }
 
 impl Env {
-    fn new(with_aws: bool) -> Env {
+    pub(crate) fn new(with_aws: bool) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -50,7 +50,7 @@ impl Env {
         Env { tmp }
     }
 
-    fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         self.tmp.path()
     }
 
@@ -60,7 +60,7 @@ impl Env {
 
     /// `keys/keys/<name>/` with an SE identity stub and, when `recovery`, the
     /// X25519 recovery recipient beside the tag recipient.
-    fn keystore(&self, name: &str, recovery: bool) {
+    pub(crate) fn keystore(&self, name: &str, recovery: bool) {
         let dir = self.root().join("keys").join("keys").join(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("identity.txt"), format!("# public key: {SE_REC}\nAGE-PLUGIN-SE-1FAKEFAKE\n")).unwrap();
@@ -70,32 +70,39 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut all = vec!["creds", "aws-set"];
+        let mut all = vec!["aws-set"];
+        all.extend_from_slice(args);
+        self.creds(&all)
+    }
+
+    /// `ai-env creds <args>` with the fakes on PATH and their logs (no other
+    /// fake knob: [`ai_env`] removed the developer's). A hidden paste reads
+    /// the (piped or null) stdin, never this run's terminal.
+    pub(crate) fn creds(&self, args: &[&str]) -> Command {
+        let mut all = vec!["creds"];
         all.extend_from_slice(args);
         let mut cmd = ai_env(self.root(), &all);
         cmd.env("PATH", format!("{}:/usr/bin:/bin", self.bin().display()))
             .env("TMPDIR", self.root().join("tmp"))
             .env("FAKE_AGE_LOG", self.age_log())
             .env("FAKE_AWS_LOG", self.aws_log())
-            .env_remove("FAKE_AGE_FAIL")
-            .env_remove("FAKE_AWS_KEYS")
-            .env_remove("FAKE_AWS_FAIL");
+            .env("AI_ENV_PASTE_STDIN", "1");
         cmd
     }
 
-    fn credentials(&self) -> PathBuf {
+    pub(crate) fn credentials(&self) -> PathBuf {
         self.root().join("bridge").join("credentials")
     }
 
-    fn aws_env(&self) -> PathBuf {
+    pub(crate) fn aws_env(&self) -> PathBuf {
         self.credentials().join("aws.env")
     }
 
-    fn audit(&self) -> PathBuf {
+    pub(crate) fn audit(&self) -> PathBuf {
         self.root().join("bridge").join("audit.jsonl")
     }
 
-    fn age_log(&self) -> PathBuf {
+    pub(crate) fn age_log(&self) -> PathBuf {
         self.root().join("age.log")
     }
 
@@ -103,13 +110,16 @@ impl Env {
         self.root().join("aws.log")
     }
 
-    /// The fake age's `-d`: the sealed container back to its plaintext.
-    fn open(&self, container_text: &str) -> String {
+    /// The fake age's `-d`: the sealed container back to its plaintext. Only
+    /// PATH reaches it, so no knob of the developer's shell (`FAKE_AGE_HANG`)
+    /// does; bounded like [`run`].
+    pub(crate) fn open(&self, container_text: &str) -> String {
         let c = ai_env_cli::container::read(container_text).expect("a valid ai-env container");
         let identity = self.root().join("keys").join("keys").join(KEY).join("identity.txt");
         let mut child = Command::new(self.bin().join("age"))
             .args(["-d", "-i"])
             .arg(&identity)
+            .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -117,17 +127,18 @@ impl Env {
             .spawn()
             .unwrap();
         child.stdin.take().unwrap().write_all(&c.data).unwrap();
-        let out = child.wait_with_output().unwrap();
+        let out = finish(child, RUN_LIMIT, "fake age -d");
         assert!(out.status.success(), "fake age -d: {}", stderr(&out));
         String::from_utf8(out.stdout).unwrap()
     }
 }
 
-/// Run with `input` on a pipe that is closed after writing.
-fn piped(cmd: &mut Command, input: &[u8]) -> Output {
+/// Run with `input` on a pipe that is closed after writing, bounded like
+/// [`run`].
+pub(crate) fn piped(cmd: &mut Command, input: &[u8]) -> Output {
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn ai-env");
     child.stdin.take().unwrap().write_all(input).unwrap();
-    child.wait_with_output().unwrap()
+    finish(child, RUN_LIMIT, "ai-env with a piped stdin")
 }
 
 /// A stdout whose reader is gone before the child starts: every write fails
@@ -138,41 +149,39 @@ fn closed_stdout() -> Stdio {
     Stdio::from(writer)
 }
 
+/// [`run`] with stdout a [`closed_stdout`] (only stderr is captured).
+fn run_closed_stdout(cmd: &mut Command) -> Output {
+    let child = cmd.stdout(closed_stdout()).stderr(Stdio::piped()).spawn().expect("spawn ai-env");
+    finish(child, RUN_LIMIT, "ai-env with a closed stdout")
+}
+
 /// Wait for `child`, killing it and failing the test after 30 s: a child that
 /// reads a stdin nobody writes to would otherwise hang the suite.
-fn wait_bounded(mut child: std::process::Child, what: &str) -> Output {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("{what}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+pub(crate) fn wait_bounded(child: std::process::Child, what: &str) -> Output {
+    finish(child, Duration::from_secs(30), what)
 }
 
 /// A test access key: `AKIA` + `CREDCRED` + the tag twice (20), and 40
 /// characters of the secret alphabet ending in the lowercased tag.
-struct TestKey {
-    id: String,
-    secret: String,
+pub(crate) struct TestKey {
+    pub(crate) id: String,
+    pub(crate) secret: String,
 }
 
-fn test_key(tag: &str) -> TestKey {
+pub(crate) fn test_key(tag: &str) -> TestKey {
     assert_eq!(tag.len(), 4);
     TestKey { id: format!("AKIA{}{}", "CRED".repeat(2), tag.repeat(2)), secret: format!("{}{}", "Tq8+".repeat(9), tag.to_lowercase()) }
 }
 
 /// What `aws iam create-access-key --output json` prints.
-fn key_json(user: &str, key: &TestKey, status: &str) -> String {
+pub(crate) fn key_json(user: &str, key: &TestKey, status: &str) -> String {
     format!(
         "{{\n    \"AccessKey\": {{\n        \"UserName\": \"{user}\",\n        \"AccessKeyId\": \"{}\",\n        \"Status\": \"{status}\",\n        \"SecretAccessKey\": \"{}\",\n        \"CreateDate\": \"2026-09-29T10:00:00+00:00\"\n    }}\n}}\n",
         key.id, key.secret
     )
 }
 
-fn expected_env(key: &TestKey) -> String {
+pub(crate) fn expected_env(key: &TestKey) -> String {
     format!("AWS_ACCESS_KEY_ID={}\nAWS_SECRET_ACCESS_KEY={}\n", key.id, key.secret)
 }
 
@@ -188,22 +197,40 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `needle` appears in no file anywhere under `root`.
-fn assert_nowhere(root: &Path, needle: &str, what: &str) {
+/// The length of the pieces [`holds`] looks for.
+const PIECE: usize = 16;
+
+/// Does `hay` hold `needle`, or any [`PIECE`]-byte piece of it (a truncated
+/// copy counts as much as a whole one)?
+pub(crate) fn holds(hay: &[u8], needle: &str) -> bool {
+    let w = needle.len().min(PIECE);
+    w > 0 && needle.as_bytes().windows(w).any(|piece| hay.windows(w).any(|h| h == piece))
+}
+
+/// Neither stdout nor stderr of `out` holds `needle` or a piece of it; the
+/// message names the stream, never the value.
+pub(crate) fn assert_unprinted(out: &Output, needle: &str, what: &str) {
+    for (stream, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        assert!(!holds(bytes, needle), "{what} (or a {PIECE}-byte piece of it) is in the {stream}");
+    }
+}
+
+/// `needle`, or any piece of it, appears in no file anywhere under `root`.
+pub(crate) fn assert_nowhere(root: &Path, needle: &str, what: &str) {
     let mut files = Vec::new();
     files_under(root, &mut files);
     assert!(!files.is_empty());
     for f in files {
         let bytes = fs::read(&f).unwrap();
-        assert!(!bytes.windows(needle.len()).any(|w| w == needle.as_bytes()), "{what} found in {}", f.display());
+        assert!(!holds(&bytes, needle), "{what} (or a {PIECE}-byte piece of it) found in {}", f.display());
     }
 }
 
-fn mode(p: &Path) -> u32 {
+pub(crate) fn mode(p: &Path) -> u32 {
     fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
 
-fn audit_rows(env: &Env) -> Vec<serde_json::Value> {
+pub(crate) fn audit_rows(env: &Env) -> Vec<serde_json::Value> {
     fs::read_to_string(env.audit()).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
@@ -291,16 +318,16 @@ fn creds_check_fails_on_a_closed_stdout() {
     // `--check | head -1`: the rows cannot be written, yet a failing check
     // keeps its exit class (a broken pipe alone would be exit 0).
     let env = Env::new(true);
-    let out = run(env.cmd(&["--check"]).stdout(closed_stdout()));
+    let out = run_closed_stdout(&mut env.cmd(&["--check"]));
     assert_eq!(out.status.code(), Some(5), "stderr {}", stderr(&out));
     assert!(stderr(&out).contains("ai-env keygen ai-env-bridge"), "{}", stderr(&out));
     // The class is the first failing row's, even when that row is printed last.
     env.keystore(KEY, true);
-    let out = run(env.cmd(&["--check"]).env("FAKE_AWS_KEYS", "2").stdout(closed_stdout()));
+    let out = run_closed_stdout(env.cmd(&["--check"]).env("FAKE_AWS_KEYS", "2"));
     assert_eq!(out.status.code(), Some(9), "stderr {}", stderr(&out));
     assert!(stderr(&out).contains("already has 2 access keys"), "{}", stderr(&out));
     // Every row passed: the closed pipe is the documented silent exit 0.
-    let out = run(env.cmd(&["--check"]).env("FAKE_AWS_KEYS", "1").stdout(closed_stdout()));
+    let out = run_closed_stdout(env.cmd(&["--check"]).env("FAKE_AWS_KEYS", "1"));
     assert_eq!(out.status.code(), Some(0), "stderr {}", stderr(&out));
     assert_eq!(stderr(&out), "");
 }
@@ -374,6 +401,7 @@ fn creds_rotation_backs_up_the_previous_container() {
     // create-access-key output (key number 2) straight into aws-set.
     let created = run(Command::new(env.bin().join("aws"))
         .args(["iam", "create-access-key", "--user-name", USER, "--region", "eu-central-1", "--output", "json"])
+        .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("FAKE_AWS_KEYS", "1"));
     assert!(created.status.success(), "{}", stderr(&created));
@@ -563,4 +591,48 @@ fn creds_uses_the_creds_key_from_bridge_toml() {
     let out = run(&mut env.cmd(&["--check"]));
     assert_eq!(out.status.code(), Some(5));
     assert!(stderr(&out).contains("ai-env keygen other-key"), "{}", stderr(&out));
+}
+
+/// The harness keeps the developer's fake knobs out of every `ai-env` it
+/// runs: a test that decrypts, run with `FAKE_AGE_HANG=1` in its own
+/// environment (a shell left set from trying the fake age), still passes,
+/// where every decrypt would hang. The run is a process group of its own,
+/// killed whole if it hangs all the same.
+#[test]
+fn a_developers_fake_knobs_never_reach_the_harness() {
+    use std::os::unix::process::CommandExt as _;
+    let test = "setup_token::combined_env_joins_the_runtime_key_and_the_token";
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--test-threads=1"])
+        .env("FAKE_AGE_HANG", "1")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let group = i32::try_from(child.id()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            // SAFETY: killpg(2) on the group made for the child: that test binary, its ai-env and the fake age.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+            panic!("{test} hung with the developer's FAKE_AGE_HANG=1");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success() && stdout(&out).contains("1 passed"), "exit {:?}: {}", out.status.code(), stdout(&out));
+}
+
+/// [`wait_bounded`] drains the child's stdout and stderr while it waits: a
+/// child that prints more than a pipe holds finishes at once, where an
+/// undrained pipe would block it until the limit killed it.
+#[test]
+fn a_bounded_wait_drains_what_the_child_prints() {
+    let started = std::time::Instant::now();
+    let child = Command::new("/bin/sh").args(["-c", "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let out = wait_bounded(child, "a child blocked on a full pipe");
+    assert_eq!((out.status.code(), out.stdout.len(), out.stderr.len()), (Some(0), 300_000, 300_000));
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
 }

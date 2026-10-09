@@ -1,11 +1,11 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws test-aws-readonly s4-smoke s5-smoke s6-smoke test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
+.PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
         claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
 
 SHELL        := /bin/bash
 # The switches that delete, rotate, write, pick a version, skip a gate or widen a live run (YES, KEEP, VERSION, ROTATE,
-# WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES, SYSTEMD) count only when given on the make command line (`make image-prune YES=1`;
+# WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES, SYSTEMD, CRED) count only when given on the make command line (`make image-prune YES=1`;
 # a sub-make inherits them): the same name exported in the environment is ignored. $(call cmdline,NAME) is the value, or empty.
 cmdline       = $(if $(filter command line,$(origin $(1))),$($(1)))
 STACK        ?= dev
@@ -105,15 +105,20 @@ test: ## Unit + integration tests in all four feature sets
 	$(CARGO) test -p $(PKG) --no-default-features --features bridge
 
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
-# AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend).
-LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR
+# AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend; S7: the
+# wrapper's synthetic oauth_token_refresh, and the unseal budget of its local-scratch and of every credentialed
+# vm and lab command).
+LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
 # cargo hides for passing tests; one thread keeps each test's lines together.
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes
-	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file)
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture
 	@$(if $(filter 1,$(call cmdline,PROBES)),rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
+
+test-claude: ## T7.2 (live, this Mac): the sealed setup-token drives the real claude: a stream-json session with a tool call, --resume, the Remote Control refusal, --bare not logged in (AI_ENV_CLAUDE_TESTS=1; one Touch ID; real model requests)
+	$(LAB_UNSET) AI_ENV_CLAUDE_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test claude_live -- --ignored --test-threads=1 --nocapture
 
 test-aws-readonly: ## Part A live checks, read-only (this identity, eu-central-1): TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm of an unknown id
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored readonly_ --test-threads=1 --nocapture
@@ -147,6 +152,18 @@ s6-smoke: ## T6.7 gate: three `ai-env vm smoke --egress vpc --exec --max-duratio
 	  grep -q '"exec_ok":true' <<<"$$out" || { echo "$$out"; echo "s6-smoke: pass $$i: exec_ok is not true (claude --version, id -u, the proxy or its variables: see exec_* above)"; exit 1; }; \
 	  echo "s6-smoke: pass $$i ok"; \
 	done; echo "s6-smoke: 3/3 ok (target/s6/smoke.jsonl)"
+
+s7-smoke: ## T7.4 gate: three `ai-env vm smoke --egress vpc --exec --with-credential --max-duration 900 --json` passes (live; one Touch ID each with a current combined.env): backend sdk, egress_ok, exec_ok and cred_ok true (claude -p 'Reply OK' answered OK through the endpoint and the proxy with the delivered setup-token); records appended to target/s7/smoke.jsonl
+	@mkdir -p target/s7
+	@for i in 1 2 3; do \
+	  out=$$($(LAB_UNSET) $(AI_ENV) vm smoke --egress vpc --exec --with-credential --max-duration 900 --json) || { echo "$$out"; echo "s7-smoke: pass $$i failed"; exit 1; }; \
+	  printf '%s\n' "$$out" >> target/s7/smoke.jsonl; \
+	  grep -q '"backend":"sdk"' <<<"$$out" || { echo "$$out"; echo "s7-smoke: pass $$i did not use the SDK backend"; exit 1; }; \
+	  grep -q '"egress_ok":true' <<<"$$out" || { echo "$$out"; echo "s7-smoke: pass $$i: egress_ok is not true (the VM did not echo exactly the connector)"; exit 1; }; \
+	  grep -q '"exec_ok":true' <<<"$$out" || { echo "$$out"; echo "s7-smoke: pass $$i: exec_ok is not true (see exec_problems)"; exit 1; }; \
+	  grep -q '"cred_ok":true' <<<"$$out" || { echo "$$out"; echo "s7-smoke: pass $$i: cred_ok is not true (the credentialed claude -p did not answer OK)"; exit 1; }; \
+	  echo "s7-smoke: pass $$i ok"; \
+	done; echo "s7-smoke: 3/3 ok (target/s7/smoke.jsonl)"
 
 # The live tests may allow github.com for workspace ai-env-test (live_egress_extra_and_removal): on every exit of the
 # recipe (success, failure, Ctrl-C) the entry is removed again, a no-op when it is absent, so a killed test never leaves

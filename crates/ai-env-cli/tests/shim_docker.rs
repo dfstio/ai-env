@@ -29,13 +29,19 @@
 //! and zombies, the idle sweep, the cwd rule under a symlink swap, the detach
 //! grace frozen across a suspend (a socket lost before it, or closed by it);
 //! `/validate`'s V6 self-test (before `/run`: after it, 409).
+//! S7 agent L1, the credential cache (through the same raw client): a
+//! `credential` frame the root shim caches, read byte-exact on fd 3 by a
+//! uid-1000 spawn and shown by name, tag and holders in `/health/detail`;
+//! the shim's environ, mem and maps closed to a spawn; `/suspend` dropping
+//! the cache before its 200 and `/resume` reopening it empty; the value on no
+//! file (binary ones included), command line or environment.
 //! L2: the locally built image (`make image-build-local`) with the real,
 //! pinned claude — the version gate, `/validate` (from the host and from
 //! inside), no build-time state, modes, and (S6) `claude --version` and a
 //! `setsid` escaper through `/agent`.
 //! The only claude ever executed is the pinned Linux binary inside L2.
 use ai_env_cli::wire::chunk::{decode, Chunker};
-use ai_env_cli::wire::frame::{ClientInfo, Deliver, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, RunHookPayload, Scope, Sig, SpawnErrCode, SpawnId};
+use ai_env_cli::wire::frame::{ClientInfo, CredentialErrCode, Deliver, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, RunHookPayload, Scope, Sig, SpawnErrCode, SpawnId};
 use ai_env_cli::wire::redact::Secret;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
@@ -56,7 +62,21 @@ const DOCKER_LIMIT: Duration = Duration::from_secs(120);
 
 /// `docker <args>`, killed past `limit`.
 fn docker_within(args: &[&str], limit: Duration) -> Result<Output, String> {
-    let mut child = Command::new("docker").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("docker CLI: {e}"))?;
+    docker_fed(args, None, limit)
+}
+
+/// [`docker_within`] with `input`, when given, on its stdin (then EOF): what
+/// a scan looks for goes in this way, never on an argv `/proc` would show.
+fn docker_fed(args: &[&str], input: Option<&[u8]>, limit: Duration) -> Result<Output, String> {
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    let mut child = Command::new("docker").args(args).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("docker CLI: {e}"))?;
+    // A killed child closes the pipe: the feeder's write fails and it ends.
+    let _feeder = input.map(|bytes| {
+        let (mut sink, bytes) = (child.stdin.take().expect("piped"), bytes.to_vec());
+        std::thread::spawn(move || {
+            let _ = sink.write_all(&bytes);
+        })
+    });
     let drain = |mut r: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -189,6 +209,13 @@ impl Container {
         let mut args = vec!["exec", "-u", user, &self.id[..]];
         args.extend_from_slice(cmd);
         docker(&args)
+    }
+
+    /// [`Self::exec_as`] with `input` on the command's stdin (`docker exec -i`).
+    fn exec_input(&self, user: &str, cmd: &[&str], input: &[u8]) -> Output {
+        let mut args = vec!["exec", "-i", "-u", user, &self.id[..]];
+        args.extend_from_slice(cmd);
+        docker_fed(&args, Some(input), DOCKER_LIMIT).unwrap_or_else(|e| panic!("{e}"))
     }
 
     fn sh(&self, script: &str) -> String {
@@ -719,6 +746,9 @@ struct Spec {
     cwd: Option<String>,
     env: BTreeMap<String, String>,
     secret: Option<(String, String)>,
+    /// S7: names a credential the shim cached (`spawn.credential`); its value
+    /// comes from the cache, never from this frame.
+    credential: Option<String>,
     grace: Option<u32>,
 }
 
@@ -793,7 +823,7 @@ impl Agent {
     fn spawn(&mut self, spec: &Spec) -> Result<(SpawnId, u32), (SpawnErrCode, String)> {
         let id = SpawnId::new_v7();
         let secrets = spec.secret.iter().map(|(k, v)| (k.clone(), Secret::new(v.clone()))).collect();
-        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace });
+        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone() });
         let deadline = Instant::now() + SPAWN_WAIT;
         loop {
             assert!(Instant::now() < deadline, "no answer to spawn {id} within {SPAWN_WAIT:?}");
@@ -874,6 +904,31 @@ impl Agent {
     /// `spec` without stdin: its stdout, after a clean exit 0.
     fn out(&mut self, spec: &Spec) -> String {
         self.run(spec, b"").ok(&spec.argv.join(" "))
+    }
+
+    /// S7: deliver `value` under `name` (a `credential` frame, as the Mac
+    /// would); panics unless the shim answers `credential_ok` cached with `tag`.
+    /// A mismatch prints the frame's kind, a refusal its code and the length
+    /// of its message: never a buffer the value could have reached.
+    fn deliver(&mut self, name: &str, value: &str, tag: Option<&str>) {
+        self.send(&Frame::Credential { name: name.to_string(), secret: Secret::new(value.to_string()), tag: tag.map(str::to_string) });
+        match self.next() {
+            Ok(Frame::CredentialOk { name: n, cached: true, tag: t }) => assert_eq!((n.as_str(), t.as_deref()), (name, tag), "credential_ok's name and tag"),
+            Ok(Frame::CredentialErr { code, message, .. }) => panic!("credential_ok (cached), got credential_err {code:?} (a message of {} bytes)", message.len()),
+            Ok(f) => panic!("credential_ok (cached), got {}", f.kind()),
+            Err(close) => panic!("credential_ok (cached), the socket ended ({close:?})"),
+        }
+    }
+
+    /// S7: send a `credential` frame expecting a refusal; its code and message
+    /// (which must never carry the value).
+    fn credential_refused(&mut self, name: &str, value: &str) -> (CredentialErrCode, String) {
+        self.send(&Frame::Credential { name: name.to_string(), secret: Secret::new(value.to_string()), tag: None });
+        match self.next() {
+            Ok(Frame::CredentialErr { code, message, .. }) => (code, message),
+            Ok(f) => panic!("credential_err, got {}", f.kind()),
+            Err(close) => panic!("credential_err, the socket ended ({close:?})"),
+        }
     }
 }
 
@@ -1514,6 +1569,240 @@ fn l1_validate_fails_with_the_hooks_guard_off() {
     for v in ["V1:", "V2:", "V3:", "V4:"] {
         assert!(!body.contains(v), "only V6 fails: {body}");
     }
+}
+
+// ---- S7 agent L1: the credential cache -------------------------------------------------
+//
+// The root shim caches a `credential` frame and delivers it to a uid-1000
+// spawn on fd 3; a spawn cannot read the shim's memory, environ or maps;
+// `/suspend` drops the cache before it answers; and the value is on no file,
+// command line or environment. The raw wire client ([`Agent`]) stands in for
+// the Mac here (the shim-only world has no Mac transport);
+// `tests/docker_exec.rs` drives the real `ai-env vm exec --with-credential`
+// on L2.
+
+/// The name the Mac delivers the setup-token under (the shim's env-name rule).
+const CRED: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// A stand-in credential built at run time with a per-test tail: no token
+/// shape, nothing real, and unique enough for a leak scan to look for.
+fn dummy_credential(test: &str) -> String {
+    format!("dummy-credential-{test}-{}", SpawnId::new_v7())
+}
+
+/// What [`Container::disk_hits`] runs as root, its needles on stdin: a
+/// recursive `grep -rlF` over every top-level entry but the kernel trees
+/// /proc, /sys and /dev, and over the tmpfs /dev/shm, then grep's status.
+/// Links are not followed (the top-level ones lead into /usr), devices, FIFOs
+/// and sockets are skipped, and a binary file is searched like any other (no
+/// `-I`; `LC_ALL=C` reads bytes as bytes).
+const DISK_SCAN: &str = "for p in /* /.[!.]*; do case \"$p\" in /proc|/sys|/dev) continue ;; esac; \
+                         if [ -L \"$p\" ] || [ ! -e \"$p\" ]; then continue; fi; set -- \"$@\" \"$p\"; done; \
+                         LC_ALL=C timeout 90 grep -rlF -f - -- \"$@\" /dev/shm; echo \"rc=$?\"";
+
+/// Where [`Container::disk_hits`] plants its canary.
+const CANARY_PATH: &str = "/tmp/ai-env-scan-canary";
+
+/// What [`Container::proc_hits`] runs: every process's command line and
+/// environment, an entry a line, and `refused <file>` for a read that failed
+/// on a live process. A zombie has no memory left to read (the kernel answers
+/// ESRCH: a spawn's leader waits as one until the shim reaps it), and a
+/// process gone meanwhile has none either: neither is a refusal.
+const PROC_DUMP: &str = "for d in /proc/[0-9]*; do for f in cmdline environ; do \
+                         tr '\\0' '\\n' 2>/dev/null < \"$d/$f\" || { grep -qsE '^State:[[:space:]]+[^ZX[:space:]]' \"$d/status\" && echo \"refused $d/$f\"; }; echo; done; done; true";
+
+impl Container {
+    /// Every file of the container holding one of `needles`, as
+    /// [`DISK_SCAN`] lists them (paths only). A canary, planted NUL-framed at
+    /// [`CANARY_PATH`] and looked for with them, must be the one extra hit and
+    /// grep's status 0: a scan that skipped binary files, lost its patterns,
+    /// failed or ran out of time never passes for "found nothing".
+    fn disk_hits(&self, needles: &[&str]) -> Vec<String> {
+        let canary = format!("ai-env-scan-canary-{}", SpawnId::new_v7());
+        self.sh(&format!("printf '\\0%s\\0' {canary} > {CANARY_PATH}"));
+        let mut patterns = String::new();
+        for n in needles.iter().copied().chain([canary.as_str()]) {
+            patterns.push_str(n);
+            patterns.push('\n');
+        }
+        let out = self.exec_input("0", &["sh", "-c", DISK_SCAN], patterns.as_bytes());
+        self.sh(&format!("rm -f {CANARY_PATH}"));
+        let mut hits: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        let status = hits.pop().unwrap_or_default();
+        let canaries = hits.iter().filter(|h| *h == CANARY_PATH).count();
+        assert!(status == "rc=0" && canaries == 1, "the scan did not finish clean with its canary found once ({status}, {canaries}; hits {hits:?}): {}", String::from_utf8_lossy(&out.stderr));
+        hits.retain(|h| h != CANARY_PATH);
+        hits
+    }
+
+    /// How many lines of the container's command lines and environments hold
+    /// one of `needles`. [`PROC_DUMP`] runs in a privileged exec: an agent
+    /// process's environ asks its reader for CAP_SYS_PTRACE, which root under
+    /// Docker's default capabilities lacks (`Permission denied`). The lines
+    /// are matched here, so no needle rides an argv in the container. No read
+    /// may be refused, and the dump must hold PID 1's program, a `PATH=` and
+    /// each line of `expect` (what shows it read the processes meant).
+    fn proc_hits(&self, needles: &[&str], expect: &[&str]) -> usize {
+        let out = docker(&["exec", "--privileged", "-u", "0", &self.id, "sh", "-c", PROC_DUMP]);
+        assert!(out.status.success(), "the process dump: {}", String::from_utf8_lossy(&out.stderr));
+        let dump = String::from_utf8_lossy(&out.stdout);
+        let refused: Vec<&str> = dump.lines().filter(|l| l.starts_with("refused /proc/")).collect();
+        assert!(refused.is_empty(), "the dump was refused {refused:?}");
+        for line in ["/usr/local/bin/ai-env"].iter().chain(expect) {
+            assert!(dump.lines().any(|l| l == *line), "the dump has no line {line:?} ({} lines)", dump.lines().count());
+        }
+        assert!(dump.lines().any(|l| l.starts_with("PATH=")), "the dump read no environment ({} lines)", dump.lines().count());
+        dump.lines().filter(|l| needles.iter().any(|n| l.contains(n))).count()
+    }
+}
+
+/// S7 T7.3 shape in Docker: the root shim caches a `credential` frame, and a
+/// spawn as uid 1000 (the image's agent) that names it reads the value on fd 3
+/// byte-exact — `<NAME>_FILE_DESCRIPTOR=3`, and nothing named
+/// CLAUDE_CODE_OAUTH_TOKEN in its environment. `/health/detail` shows
+/// has_credentials, the name and the tag, and counts a live credentialed spawn
+/// as a holder, and no longer once it has exited. The value never reaches the
+/// shim's log.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_credential_cached_by_root_is_delivered_to_the_uid_1000_spawn_on_fd_3() {
+    let vm = agent_l1(&[]);
+    let mut a = vm.agent();
+    let value = dummy_credential("fd3");
+    a.deliver(CRED, &value, Some("seal-dl1"));
+    let d = vm.detail();
+    assert!(d.has_credentials, "the root shim cached it");
+    assert_eq!(
+        (d.credential.credential_name.as_deref(), d.credential.credential_tag.as_deref(), d.credential.credential_holders),
+        (Some(CRED), Some("seal-dl1"), 0),
+        "the view names the credential, not its value: {:?}",
+        d.credential
+    );
+    assert!(d.credential.credential_at.is_some(), "{:?}", d.credential);
+    // A spawn (uid 1000) names the cached credential: the value is on fd 3
+    // only, delivery is named by <NAME>_FILE_DESCRIPTOR, and the variable
+    // itself is not in the environment.
+    let script = "id -u; cat <&3; echo; echo \"$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR\"; env | grep -c '^CLAUDE_CODE_OAUTH_TOKEN=' || true";
+    let out = a.out(&Spec { credential: Some(CRED.to_string()), ..Spec::argv(&["sh", "-c", script]) });
+    assert!(out == format!("1000\n{value}\n3\n0\n"), "the uid-1000 spawn read the {} value bytes on fd 3 with the var absent from its environ", value.len());
+    // A long-lived credentialed spawn is a holder while it lives.
+    let (hid, _) = a.spawn(&Spec { credential: Some(CRED.to_string()), ..Spec::argv(&["cat"]) }).unwrap_or_else(|e| panic!("holder spawn: {e:?}"));
+    let d = vm.detail();
+    assert_eq!((d.has_credentials, d.credential.credential_name.as_deref(), d.credential.credential_holders), (true, Some(CRED), 1), "one live holder: {:?}", d.credential);
+    a.feed(&hid, b"");
+    assert_eq!(a.collect(&hid).exit, ExitInfo { code: Some(0), signal: None });
+    // The exit still counts until the shim takes collect's ack, which a new
+    // HTTP request may overtake: its zombie leader keeps the group alive
+    // until it is reaped, a second after its death. Polled, as in shim_local.
+    let t = Instant::now();
+    let mut holders = vm.detail().credential.credential_holders;
+    while holders != 0 && t.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+        holders = vm.detail().credential.credential_holders;
+    }
+    assert_eq!(holders, 0, "the exited holder is off the count within 5 s");
+    assert!(!vm.c.logs().contains(&value), "the credential reached the shim's log");
+}
+
+/// S7: the cached credential lives in the shim's memory (the worker's, a
+/// child of the PID 1 supervisor). A spawn — the agent as the shim makes it,
+/// uid and gid 1000 under NO_NEW_PRIVS — cannot open either process's
+/// `/proc/<pid>/environ` or `/proc/<pid>/mem`: both are root's, 0400 and
+/// 0600, so their file mode refuses the agent before any other check. Nor
+/// its `/proc/<pid>/maps`: 0444 passes the file mode, and the kernel's ptrace
+/// access check (read mode) refuses the agent's uid, the uid rule an attach
+/// meets too. The same spawn reads its own environ and maps, so each refusal
+/// is the target's. No PTRACE_ATTACH is made (the base image has no
+/// debugger, tracer or interpreter to make one): an attach is not tested.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_agent_uid_cannot_read_the_shims_memory_or_environ() {
+    let vm = agent_l1(&[]);
+    let mut a = vm.agent();
+    let value = dummy_credential("proc");
+    a.deliver(CRED, &value, Some("seal-proc"));
+    assert!(vm.detail().has_credentials, "the worker holds the value in memory");
+    let logs = vm.c.logs();
+    let worker: u32 = logs
+        .lines()
+        .find_map(|l| l.strip_prefix("ai-env: shim worker pid "))
+        .and_then(|r| r.split(' ').next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("no worker pid line:\n{}", logs.replace(&value, &format!("<{} bytes>", value.len()))));
+    assert!(worker != 1, "the worker is a child of the PID 1 supervisor, got {worker}");
+    assert_eq!(vm.c.sh("cat /proc/1/comm"), "ai-env", "PID 1 is the root shim");
+    let nodes: Vec<String> = [1, worker].iter().flat_map(|p| ["environ", "mem", "maps"].map(|n| format!("/proc/{p}/{n}"))).collect();
+    let modes = vm.c.sh(&format!("stat -c '%a %u' {}", nodes.join(" ")));
+    assert_eq!(modes.lines().collect::<Vec<_>>(), ["400 0", "600 0", "444 0", "400 0", "600 0", "444 0"], "mode and owner of {}", nodes.join(" "));
+    // One byte of each through a spawn: dd's status, then its complaint if any.
+    let probe = format!("for n in {} /proc/self/environ /proc/self/maps; do err=$(dd if=$n of=/dev/null bs=1 count=1 status=none 2>&1); echo \"$n rc=$?${{err:+ $err}}\"; done", nodes.join(" "));
+    let out = a.out(&Spec::argv(&["sh", "-c", &probe]));
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), nodes.len() + 2, "{out}");
+    for (node, line) in nodes.iter().zip(&lines) {
+        assert!(line.starts_with(&format!("{node} rc=1 ")) && line.ends_with(": Permission denied"), "the agent opened {node}: {line}");
+    }
+    assert_eq!(lines[nodes.len()..], ["/proc/self/environ rc=0", "/proc/self/maps rc=0"], "the agent reads its own");
+    assert!(vm.detail().has_credentials, "the shim kept the value");
+}
+
+/// S7 D3 in Docker: `/suspend` (POSTed through the published hooks port, the
+/// way the platform's proxy reaches it from outside the VM's netns — the peer
+/// guard admits a remote caller with no row) drops the cached credential before
+/// its 200, so `/health/detail` reads has_credentials false; a `credential`
+/// frame sent while suspended is refused `suspended` and never carries the
+/// value; `/resume` reopens the cache empty, and it accepts a credential again.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_suspend_drops_the_cache_before_answering_and_resume_reopens_empty() {
+    let vm = agent_l1(&[]);
+    let mut a = vm.agent();
+    let value = dummy_credential("suspend");
+    a.deliver(CRED, &value, Some("seal-susp"));
+    assert!(vm.detail().has_credentials, "cached before the suspend");
+    assert_eq!(http(vm.c.port(9000), "POST", &format!("{PREFIX}/suspend"), "{}").0, 200);
+    assert!(!vm.detail().has_credentials, "the cache was dropped before /suspend answered 200");
+    // A fresh socket (the suspend closed the first): a delivery is refused `suspended`.
+    let mut b = vm.agent();
+    let (code, message) = b.credential_refused(CRED, &value);
+    assert_eq!(code, CredentialErrCode::Suspended, "a delivery while suspended");
+    assert!(!message.contains(&value), "the refusal's message ({} bytes) holds the value", message.len());
+    assert_eq!(http(vm.c.port(9000), "POST", &format!("{PREFIX}/resume"), "{}").0, 200);
+    assert!(!vm.detail().has_credentials, "resume reopens the cache empty");
+    let mut c = vm.agent();
+    c.deliver(CRED, &value, None);
+    assert!(vm.detail().has_credentials, "a delivery after resume caches again");
+    assert!(!vm.c.logs().contains(&value), "no suspend/resume path logged the value");
+    drop((a, b, c));
+}
+
+/// S7: after a delivery and a credentialed spawn, with a credentialed holder
+/// still live, the dummy is on no file of the container — binary files
+/// included, and /dev/shm ([`Container::disk_hits`], its canary found) — and
+/// on no process's command line or environment, the live holder's own
+/// included ([`Container::proc_hits`] must read its
+/// `<NAME>_FILE_DESCRIPTOR=3`): the custody path keeps the value in the
+/// shim's memory and the fd-3 pipe alone. No scan puts the value on an argv
+/// in the container: the disk scan reads it on stdin, the process dump is
+/// matched here.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_no_scan_finds_the_cached_credential_on_disk_or_in_a_cmdline() {
+    let vm = agent_l1(&[]);
+    let mut a = vm.agent();
+    let value = dummy_credential("scan");
+    a.deliver(CRED, &value, Some("seal-scan"));
+    let read = a.out(&Spec { credential: Some(CRED.to_string()), ..Spec::argv(&["sh", "-c", "cat <&3"]) });
+    assert!(read == value, "the fd-3 read returned {} bytes, not the value's {}", read.len(), value.len());
+    let (hid, _) = a.spawn(&Spec { credential: Some(CRED.to_string()), ..Spec::argv(&["cat"]) }).unwrap_or_else(|e| panic!("holder spawn: {e:?}"));
+    assert_eq!(vm.detail().credential.credential_holders, 1, "a credentialed spawn is live during the scan");
+    let on_disk = vm.c.disk_hits(&[&value]);
+    assert!(on_disk.is_empty(), "the credential is on disk in {on_disk:?}");
+    let in_procs = vm.c.proc_hits(&[&value], &[&format!("{CRED}_FILE_DESCRIPTOR=3")]);
+    assert_eq!(in_procs, 0, "the credential is on {in_procs} command line or environment line(s)");
+    eprintln!("L1 credential scan: disk 0 (canary found), command lines and environments 0 (the live holder's read)");
+    a.feed(&hid, b"");
+    a.collect(&hid);
 }
 
 // ---- L2: the locally built image ---------------------------------------------------------

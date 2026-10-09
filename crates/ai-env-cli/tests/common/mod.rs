@@ -49,9 +49,11 @@ pub const SESSION_ARGV: [&str; 16] = [
     "--replay-user-messages",
 ];
 
-/// Variables a developer's shell may carry that would steer the wrapper or
-/// the fake; removed from every harness run before the test's own `envs`.
-pub const REMOVED_ENV: [&str; 41] = [
+/// Variables a developer's shell may carry that would steer the wrapper, the
+/// fake claude or the fake age (S7's `local-scratch` login: the keystore, the
+/// token's descriptor and the unseal); removed from every harness run before
+/// the test's own `envs`.
+pub const REMOVED_ENV: [&str; 55] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -65,9 +67,13 @@ pub const REMOVED_ENV: [&str; 41] = [
     "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
     "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
     "AI_ENV_BRIDGE_LAB_AGENT_ADDR",
+    "AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS",
+    "AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS",
     "AI_ENV_BRIDGE_TRACE",
+    "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_PROJECT_DIR_NAME",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "RUST_LOG",
@@ -93,6 +99,16 @@ pub const REMOVED_ENV: [&str; 41] = [
     "FAKE_STDERR",
     "FAKE_STDOUT",
     "FAKE_ECHO_STDIN",
+    "FAKE_TOKEN_LOG",
+    "FAKE_INIT_AT_TURN",
+    "FAKE_MISS_DELAY_MS",
+    "FAKE_MISS_EXIT_DELAY_MS",
+    "FAKE_AGE_FAIL",
+    "FAKE_AGE_DELAY_MS",
+    "FAKE_AGE_HANG",
+    "FAKE_AGE_WAIT_FILE",
+    "FAKE_AGE_PIDFILE",
+    "FAKE_AGE_LOG",
 ];
 
 /// A canonical-shape uuid built from a counter (no uuid literal in the sources).

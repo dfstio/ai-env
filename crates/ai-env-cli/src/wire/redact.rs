@@ -104,30 +104,55 @@ impl Secret<Vec<u8>> {
 
 // ---- scrubber ---------------------------------------------------------------
 
-fn registry() -> &'static RwLock<Vec<String>> {
-    static REG: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+/// A registered value and how many holders registered it.
+type Registered = (zeroize::Zeroizing<String>, usize);
+
+/// The registered values, each with how many holders registered it. A value
+/// is masked until its last holder forgets it, and its copy is zeroized then
+/// (S7: a setup-token's registration ends with its handle, so the registry
+/// never outlives it as a plain copy); one nobody forgets (a session token)
+/// stays for the life of the process.
+fn registry() -> &'static RwLock<Vec<Registered>> {
+    static REG: OnceLock<RwLock<Vec<Registered>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(Vec::new()))
 }
 
 /// Register a runtime value (a token, a session secret) so `scrub` masks it
-/// wherever it appears. Values shorter than 8 bytes are ignored: masking them
-/// would shred ordinary text.
+/// wherever it appears, once more per call: two holders of one value each
+/// forget it, and the masking lasts until both have. Values shorter than 8
+/// bytes are ignored: masking them would shred ordinary text.
 pub fn register_secret(value: &str) {
     if value.len() < 8 {
         return;
     }
     let mut reg = registry().write().unwrap_or_else(|e| e.into_inner());
-    if !reg.iter().any(|v| v == value) {
-        reg.push(value.to_string());
-        reg.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    match reg.iter_mut().find(|(v, _)| v.as_str() == value) {
+        Some((_, holders)) => *holders = holders.saturating_add(1),
+        None => {
+            reg.push((zeroize::Zeroizing::new(value.to_string()), 1));
+            reg.sort_by_key(|(v, _)| std::cmp::Reverse(v.len()));
+        }
     }
+}
+
+/// One holder of `value` is done with it: when it was the last, `scrub`
+/// stops masking it and the registry's copy is zeroized. Whether it was
+/// registered.
+pub fn forget_secret(value: &str) -> bool {
+    let mut reg = registry().write().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = reg.iter().position(|(v, _)| v.as_str() == value) else { return false };
+    reg[i].1 -= 1;
+    if reg[i].1 == 0 {
+        reg.remove(i);
+    }
+    true
 }
 
 /// Minimum length of an `eyJ…` token before it is treated as a JWE/JWT.
 pub const JWE_MIN_LEN: usize = 200;
 
-const KEY_NAMES: [&str; 6] =
-    ["x-aws-proxy-auth", "authorization", "accesstoken", "git_config_value_", "oauth", "token"];
+const KEY_NAMES: [&str; 7] =
+    ["x-aws-proxy-auth", "authorization", "accesstoken", "git_config_value_", "oauth", "token", "secret"];
 
 fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
@@ -150,7 +175,7 @@ pub fn scrub(text: &str) -> Cow<'_, str> {
     let mut current: Cow<'_, str> = Cow::Borrowed(text);
     {
         let reg = registry().read().unwrap_or_else(|e| e.into_inner());
-        for v in reg.iter() {
+        for (v, _) in reg.iter() {
             if current.contains(v.as_str()) {
                 current = Cow::Owned(current.replace(v.as_str(), &format!("[redacted:len={}]", v.len())));
                 changed = true;
@@ -422,6 +447,30 @@ mod tests {
         assert_eq!(scrub("short text"), "short text");
     }
 
+    /// S7: a forgotten value is masked no more and its registry copy is gone.
+    #[test]
+    fn forget_secret_ends_the_masking() {
+        let value = format!("forgettable-{}", "Q".repeat(12));
+        register_secret(&value);
+        assert!(!scrub(&format!("x {value} y")).contains(&value));
+        assert!(forget_secret(&value));
+        assert_eq!(scrub(&format!("x {value} y")), format!("x {value} y"));
+        assert!(!forget_secret(&value), "already forgotten");
+    }
+
+    /// S7: a value two holders registered stays masked until both forgot it,
+    /// so one holder's end never unmasks it for another.
+    #[test]
+    fn a_value_is_forgotten_with_its_last_holder() {
+        let value = format!("held-twice-{}", "R".repeat(12));
+        let masked = || !scrub(&format!("x {value} y")).contains(&value);
+        register_secret(&value);
+        register_secret(&value);
+        assert!(forget_secret(&value) && masked(), "one holder left: still masked");
+        assert!(forget_secret(&value) && !masked(), "the last holder is gone: masked no more");
+        assert!(!forget_secret(&value), "its copy is gone");
+    }
+
     #[test]
     fn scrub_key_shaped_names() {
         // Built at runtime so no `token=<16+ chars>` literal sits in the source.
@@ -440,6 +489,17 @@ mod tests {
             assert!(out.contains("[redacted:len="), "{line} -> {out}");
         }
         assert_eq!(scrub("port=8080 owner=mike"), "port=8080 owner=mike");
+    }
+
+    /// S7: a `secret` key is masked too: the credential frame's JSON form and
+    /// an assignment, whatever the value's shape.
+    #[test]
+    fn scrub_a_secret_key() {
+        let value = format!("v{}", "9".repeat(20));
+        for line in [format!("{{\"t\":\"credential\",\"name\":\"X\",\"secret\":\"{value}\"}}"), format!("client_secret={value}")] {
+            let out = scrub(&line);
+            assert!(!out.contains(&value) && out.contains("[redacted:len="), "{line} -> {out}");
+        }
     }
 
     #[test]

@@ -52,7 +52,7 @@ use crate::shim::peer::{drain, Peer, PeerFacts};
 pub use crate::shim::spawn::ConnGen;
 use crate::shim::spawn::{Outbox, SpawnRequest};
 use crate::wire::frame::{
-    ClientInfo, ErrorCode, Frame, HelloErrCode, ResumePoint, SpawnId, WireError, CLOSE_GOING_AWAY, CLOSE_HELLO_DEADLINE, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, CLOSE_WIRE_VERSION, CONTROL_FRAME_MAX, HELLO_DEADLINE, IDLE_DEFAULT_S,
+    ClientInfo, CredentialErrCode, ErrorCode, Frame, HelloErrCode, ResumePoint, SpawnErrCode, SpawnId, WireError, CAP_CREDENTIAL_CACHE, CLOSE_GOING_AWAY, CLOSE_HELLO_DEADLINE, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, CLOSE_WIRE_VERSION, CONTROL_FRAME_MAX, HELLO_DEADLINE, IDLE_DEFAULT_S,
     IDLE_MAX_S, IDLE_MIN_S, MAX_UNAUTHENTICATED, SEND_TIMEOUT, WIRE_VERSION, WS_MAX_MESSAGE,
 };
 use crate::wire::redact::Secret;
@@ -593,11 +593,13 @@ impl Session {
             image_version: self.state.image_version.clone(),
             boot_nonce: h.boot_nonce.unwrap_or_default(),
             owner: h.owner,
-            has_credentials: false,
+            has_credentials: self.state.spawns.credential().has(),
             uptime_s: h.uptime_s,
             run_hook_seen: h.run_hook_seen,
             spawns,
             resumed,
+            caps: vec![CAP_CREDENTIAL_CACHE.to_string()],
+            credential: self.state.spawns.credential_view(),
         };
         self.state.agents.authenticate(gen);
         self.authenticated = true;
@@ -623,15 +625,35 @@ impl Session {
         let spawns = &state.spawns;
         match frame {
             Frame::Spawn { .. } => match SpawnRequest::from_frame(frame) {
-                Some(req) => {
+                Some(mut req) => {
                     let id = req.spawn_id.clone();
                     // Before the manager knows the spawn: its frames wait for this answer.
                     self.unannounced.add(&id);
-                    let reply = spawns.spawn(gen, req).await;
+                    // S7: a named credential comes from the cache, as the spawn's one-shot secret.
+                    let reply = match self.resolve_credential(&mut req) {
+                        Ok(()) => spawns.spawn(gen, req).await,
+                        Err((code, message)) => Frame::SpawnErr { spawn_id: id.clone(), code, message },
+                    };
                     self.queue(Cmd::Answer(id, reply)).await
                 }
                 None => self.violation(ErrorCode::BadFrame, None).await,
             },
+            Frame::Credential { name, secret, tag } => {
+                let reply = if state.is_draining() {
+                    Frame::CredentialErr { name, code: CredentialErrCode::Draining, message: "the shim is stopping".into() }
+                } else {
+                    match spawns.credential().put(&name, secret, tag.clone()) {
+                        Ok(()) => Frame::CredentialOk { name, cached: true, tag },
+                        Err((code, message)) => Frame::CredentialErr { name, code, message },
+                    }
+                };
+                self.send(reply).await
+            }
+            Frame::CredentialForget { name } => {
+                let had = spawns.credential().cached_name();
+                spawns.credential().forget(name.as_deref(), "credential_forget");
+                self.send(Frame::CredentialOk { name: name.or(had).unwrap_or_default(), cached: false, tag: None }).await
+            }
             Frame::Stdin { spawn_id, seq, data } => match crate::wire::chunk::decode(&data) {
                 Ok(bytes) => {
                     let r = spawns.stdin(gen, &spawn_id, seq, bytes);
@@ -668,7 +690,35 @@ impl Session {
             | Frame::Exit { .. }
             | Frame::Pong { .. }
             | Frame::Event { .. }
-            | Frame::Error { .. } => self.violation(ErrorCode::BadFrame, None).await,
+            | Frame::Error { .. }
+            | Frame::CredentialOk { .. }
+            | Frame::CredentialErr { .. } => self.violation(ErrorCode::BadFrame, None).await,
+        }
+    }
+
+    /// A spawn naming a credential (S7): its value from the cache, as the
+    /// request's one secret, so the spawn manager delivers it on the one path
+    /// it has (fd 3, or the environment). Never together with an inline
+    /// secret; a name the cache does not hold — never delivered, or wiped by a
+    /// suspend since — is `no_credential`, and the Mac delivers it again.
+    /// By name alone: one slot holds one seal, so a `credential` another
+    /// session put there between this one's hit and its spawn is what the
+    /// spawn gets. That copy passed the gate for this VM too; at worst, if
+    /// Anthropic refuses it, the refusal is recorded against this spawn's
+    /// seal, which costs a re-seal, never a token outside the gate. A
+    /// `--credential-file` spawn names none: its value rides inline (S6's
+    /// `spawn.secrets`), and so does any re-send of it.
+    fn resolve_credential(&self, req: &mut SpawnRequest) -> Result<(), (SpawnErrCode, String)> {
+        let Some(name) = req.credential.take() else { return Ok(()) };
+        if !req.secrets.is_empty() {
+            return Err((SpawnErrCode::BadRequest, "a spawn names a credential and carries a secret: at most one".into()));
+        }
+        match self.state.spawns.credential().copy(&name) {
+            Some(value) => {
+                req.secrets.insert(name, value);
+                Ok(())
+            }
+            None => Err((SpawnErrCode::NoCredential, format!("no credential {name} is cached on this VM (none was delivered since it last ran)"))),
         }
     }
 
@@ -1142,7 +1192,7 @@ mod tests {
         let s = state(true);
         let mut c = hello_ok(&s, FAST).await;
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec![], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec![], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None };
         send(&mut c, &spawn).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::SpawnErr { spawn_id, .. }) if spawn_id == id));
         let unknown = SpawnId::new_v7();
@@ -1239,7 +1289,7 @@ mod tests {
         let (held, mut queued) = mpsc::channel(CONTROL_QUEUE);
         let mut reader = Session { state: s.clone(), gen, tx: held, unannounced, authenticated: true, idle: Duration::from_secs(60), idle_unit: FAST.idle_unit, deadline: Instant::now() + Duration::from_secs(60), summary: String::new() };
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None };
         assert!(matches!(reader.on_frame(spawn).await, Flow::Continue));
         let until = Instant::now() + Duration::from_secs(5);
         while s.spawns.status(None).iter().all(|st| st.exit.is_none()) {

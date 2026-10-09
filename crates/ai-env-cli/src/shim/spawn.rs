@@ -135,6 +135,10 @@ pub struct SpawnRequest {
     pub secrets: std::collections::BTreeMap<String, crate::wire::redact::Secret<String>>,
     pub deliver: crate::wire::frame::Deliver,
     pub detach_grace_s: Option<u32>,
+    /// `spawn.credential` (S7): the name of a cached credential. The `/agent`
+    /// connection resolves it from the shim's cache into `secrets` before the
+    /// spawn manager sees the request, so delivery is the one tested path.
+    pub credential: Option<String>,
 }
 
 impl SpawnRequest {
@@ -142,7 +146,7 @@ impl SpawnRequest {
     #[must_use]
     pub fn from_frame(f: Frame) -> Option<SpawnRequest> {
         match f {
-            Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s } => Some(SpawnRequest { spawn_id, argv, cwd, env, secrets, deliver: deliver_secret, detach_grace_s }),
+            Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential } => Some(SpawnRequest { spawn_id, argv, cwd, env, secrets, deliver: deliver_secret, detach_grace_s, credential }),
             _ => None,
         }
     }
@@ -153,14 +157,15 @@ impl std::fmt::Debug for SpawnRequest {
         let argv0 = short(self.argv.first().map_or("", |a| basename(a)));
         write!(
             f,
-            "SpawnRequest({}, argv0={argv0}, argc={}, cwd={}, env={}, secrets={}, deliver={:?}, detach_grace_s={:?})",
+            "SpawnRequest({}, argv0={argv0}, argc={}, cwd={}, env={}, secrets={}, deliver={:?}, detach_grace_s={:?}, credential={:?})",
             short(&self.spawn_id.0),
             self.argv.len(),
             if self.cwd.is_some() { "set" } else { "home" },
             self.env.len(),
             self.secrets.len(),
             self.deliver,
-            self.detach_grace_s
+            self.detach_grace_s,
+            self.credential
         )
     }
 }
@@ -176,7 +181,7 @@ const RESERVED_ENV: [&str; 3] = ["HOME", "PATH", "CLAUDE_CONFIG_DIR"];
 const CWD_MAX_BYTES: usize = 4096;
 /// Largest secret delivered on fd 3: it is written into the pipe before the
 /// child exists, so it must fit the pipe buffer (≥ 16 KiB everywhere).
-const SECRET_FD_MAX_BYTES: usize = 4096;
+pub(crate) const SECRET_FD_MAX_BYTES: usize = 4096;
 /// After the leader died the stdout reader may read this far past the window
 /// (backpressure protects nothing any more; critic M1) ...
 const DRAIN_PAST_WINDOW_BYTES: u64 = 1024 * 1024;
@@ -273,6 +278,10 @@ enum Ending {
 struct Spawn {
     /// The basename of argv[0].
     argv0: String,
+    /// It was handed a secret (S7): while its leader, or a process of its
+    /// group, lives, its memory may hold that value
+    /// ([`SpawnManager::credential_holders`]).
+    holds_secret: bool,
     /// The leader's pid, which is also the group id (setsid).
     pid: u32,
     started_at: String,
@@ -533,6 +542,10 @@ struct Inner {
     clock_started: AtomicBool,
     /// `shutdown` or `terminate` finished: outboxes never wake again.
     shut: AtomicBool,
+    /// The shim's one-slot credential cache (S7): here so the clock's jump
+    /// guard reaches it (the clock runs from the first hello: a copy is
+    /// cached only over a connection past it).
+    credential: crate::shim::credential::CredentialCache,
 }
 
 impl Inner {
@@ -601,11 +614,13 @@ impl Inner {
 
     /// One wake of the clock at `now`, the previous one at `last`: more than
     /// [`JUMP`] between them went unseen (the VM was suspended without
-    /// `/suspend`, or the monotonic clock leapt at resume), and the graces
+    /// `/suspend`, or the monotonic clock leapt at resume), so the cached
+    /// credential goes (S7; `/resume` is the main backstop) and the graces
     /// that ran through it get the excess back; then what is due fires.
     fn woke(&self, last: Instant, now: Instant) {
         let gap = now.saturating_duration_since(last);
         if gap > JUMP {
+            self.credential.forget(None, "clock jump");
             self.extend_graces(last, gap.saturating_sub(TICK));
         }
         self.tick(now);
@@ -725,7 +740,7 @@ pub struct SpawnManager {
 
 impl SpawnManager {
     /// No task starts here (a runtime may not exist yet): the clock starts
-    /// with the first spawn.
+    /// with the first hello ([`Self::attach`]) or spawn.
     #[must_use]
     pub fn new(opts: SpawnOpts) -> SpawnManager {
         SpawnManager {
@@ -737,6 +752,7 @@ impl SpawnManager {
                 clock_wake: Arc::new(Notify::new()),
                 clock_started: AtomicBool::new(false),
                 shut: AtomicBool::new(false),
+                credential: crate::shim::credential::CredentialCache::new(),
             }),
         }
     }
@@ -836,6 +852,7 @@ impl SpawnManager {
         drop(cmd);
         // The parent's read end: the child has its own on fd 3.
         drop(pipe);
+        let holds_secret = !secrets.is_empty();
         // The shim's copy of the secret (zeroized on drop).
         drop(secrets);
         let mut child = spawned.map_err(|e| spawn_error(&e, &req.argv[0], &cwd_text, opts))?;
@@ -847,6 +864,7 @@ impl SpawnManager {
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let record = Spawn {
             argv0: argv0.clone(),
+            holds_secret,
             pid,
             started_at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()),
             grace: Duration::from_secs(u64::from(req.detach_grace_s.unwrap_or(DETACH_GRACE_EXEC_S))),
@@ -896,7 +914,7 @@ impl SpawnManager {
         Ok(Frame::Spawned { spawn_id: id, pid, pgid: pid, claude_version: None })
     }
 
-    /// The clock task, once a runtime exists (the first spawn).
+    /// The clock task, once a runtime exists (the first hello or spawn).
     fn start_clock(&self) {
         if !self.inner.clock_started.swap(true, Ordering::SeqCst) {
             tokio::spawn(run_clock(Arc::downgrade(&self.inner), self.inner.clock_wake.clone()));
@@ -934,8 +952,36 @@ impl SpawnManager {
             }
         }
         self.inner.bump();
+        // From the first hello, not the first spawn (S7): a credential is
+        // cached only over a connection past hello (`vm warm`'s with no spawn
+        // at all), and the jump guard must reach it. Until a spawn the clock
+        // costs one idle wake a second.
+        self.start_clock();
         self.inner.clock_wake.notify_one();
         out
+    }
+
+    /// Live spawns that were handed a secret (S7: `credential_holders`): their
+    /// memory, and any snapshot taken while they live, still holds it. A spawn
+    /// whose leader died counts while a process of its group lives on
+    /// ([`group_alive`], as `/health/detail` shows it): that process may hold
+    /// what the leader was handed.
+    #[must_use]
+    pub fn credential_holders(&self) -> u32 {
+        let n = self.inner.lock().spawns.values().filter(|s| s.holds_secret && (s.leader.is_none() || group_alive(s.pid))).count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// The shim's credential cache (S7).
+    #[must_use]
+    pub fn credential(&self) -> &crate::shim::credential::CredentialCache {
+        &self.inner.credential
+    }
+
+    /// What `hello_ok` and `/health/detail` show of the cache and its holders.
+    #[must_use]
+    pub fn credential_view(&self) -> crate::wire::frame::CredentialView {
+        self.inner.credential.view(self.credential_holders())
     }
 
     /// Every spawn, as seen from `conn` (`attached` = to another connection).
@@ -956,7 +1002,7 @@ impl SpawnManager {
                     Ending::Grace(g) => (Some(g.remaining(now).as_secs()), g.since.is_none()),
                     Ending::Expired | Ending::Final => (Some(0), false),
                 };
-                SpawnDetail { status: s.status(id, None), started_at: s.started_at.clone(), detach_left_s, frozen }
+                SpawnDetail { status: s.status(id, None), started_at: s.started_at.clone(), detach_left_s, frozen, group_alive: group_alive(s.pid) }
             })
             .collect()
     }
@@ -1419,6 +1465,23 @@ fn killpg(pgid: u32, sig: i32) {
     }
 }
 
+/// Whether a process of group `pgid` still exists (`/health/detail`'s
+/// `group_alive`, S7 D6): `kill(-pgid, 0)` succeeds, or is refused (EPERM).
+/// Signal 0 delivers nothing, so unlike [`killpg`] it may ask after the
+/// leader was reaped: a reused group id can then only read alive (a needless
+/// `vm terminate` hint), never gone. On Linux a zombie leader counts too,
+/// until its watcher reaps it (after the group's KILL, [`GROUP_KILL_AFTER`]
+/// after its death).
+fn group_alive(pgid: u32) -> bool {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else { return false };
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: plain integers; signal 0 only checks that the group exists.
+    let rc = unsafe { libc::killpg(pgid, 0) };
+    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Block until the leader `pid` has exited, WITHOUT reaping it: `None` when
 /// it cannot be waited for (reaped by someone else: the group is not pinned).
 fn wait_exited(pid: libc::pid_t) -> Option<ExitInfo> {
@@ -1672,7 +1735,7 @@ fn check_request(req: &SpawnRequest) -> Result<(), String> {
 }
 
 /// An environment name: `[A-Za-z_][A-Za-z0-9_]*`, and none the shim sets itself.
-fn check_name(k: &str) -> Result<(), String> {
+pub(crate) fn check_name(k: &str) -> Result<(), String> {
     let valid = k.bytes().next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
     if !valid {
         return Err(format!("environment name \"{}\" is not [A-Za-z_][A-Za-z0-9_]*", short(k)));
@@ -1772,7 +1835,7 @@ mod tests {
     }
 
     fn req(argv: &[&str]) -> SpawnRequest {
-        SpawnRequest { spawn_id: SpawnId::new_v7(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver: Deliver::Fd, detach_grace_s: None }
+        SpawnRequest { spawn_id: SpawnId::new_v7(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver: Deliver::Fd, detach_grace_s: None, credential: None }
     }
 
     async fn start(m: &SpawnManager, conn: ConnGen, r: SpawnRequest) -> (SpawnId, u32) {
@@ -1946,6 +2009,7 @@ mod tests {
         use crate::wire::frame::Chunk;
         let mut s = Spawn {
             argv0: "x".into(),
+            holds_secret: false,
             pid: 0,
             started_at: String::new(),
             grace: Duration::ZERO,
@@ -2150,6 +2214,65 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&c.out), "ready\ngot-term\n", "TERM reached the group when the leader died");
         let (_, info, _, truncated) = c.exited();
         assert_eq!((info.code, truncated), (Some(0), false));
+    }
+
+    /// `/health/detail`'s `group_alive` (S7 D6) asks the group, not the
+    /// leader: a member that ignores TERM keeps it true once its leader has
+    /// died (`alive` false), until the group's KILL; then it reads false.
+    #[tokio::test]
+    async fn group_alive_outlives_the_leader_until_the_groups_kill() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let mut c = Client::new(&m, 1);
+        let member = "trap '' TERM; echo ready; while :; do sleep 0.05; done";
+        let (id, _) = start(&m, 1, req(&["sh", "-c", &format!("sh -c \"{member}\" & read -r line; exit 0")])).await;
+        assert!(c.until(WAIT, |c| c.out == b"ready\n").await, "the member's trap is set");
+        let d = m.detail();
+        assert!(d[0].status.alive && d[0].group_alive, "{d:?}");
+        m.stdin(1, &id, 1, b"go\n".to_vec()).unwrap();
+        let mut first_dead = None;
+        assert!(
+            wait_until(WAIT, || {
+                first_dead = m.detail().into_iter().next().filter(|d| !d.status.alive);
+                first_dead.is_some()
+            })
+            .await,
+            "the leader exits"
+        );
+        let d = first_dead.unwrap();
+        assert!(d.group_alive, "the member ignored the group's TERM: the group outlives its leader: {d:?}");
+        assert!(wait_until(Duration::from_secs(5), || m.detail().first().is_none_or(|d| !d.group_alive)).await, "the group's KILL ended it");
+    }
+
+    /// F15: `credential_holders` counts a spawn handed a secret while its
+    /// leader lives and, once the leader died, while a process of its group
+    /// lives on (here a member that ignores the group's TERM until its KILL):
+    /// that process may hold the secret, as `/health/detail`'s `group_alive`
+    /// says. After the group's KILL it counts no more. The secret is built at
+    /// run time.
+    #[tokio::test]
+    async fn a_dead_leaders_live_group_still_counts_as_a_holder() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let mut c = Client::new(&m, 1);
+        let member = "trap '' TERM; echo ready; while :; do sleep 0.05; done";
+        let mut r = req(&["sh", "-c", &format!("sh -c \"{member}\" & read -r line; exit 0")]);
+        r.secrets.insert("X".into(), Secret::new(format!("{}-{}", "dummy", "value-of-the-holders-test")));
+        let (id, _) = start(&m, 1, r).await;
+        assert!(c.until(WAIT, |c| c.out == b"ready\n").await, "the member's trap is set");
+        assert_eq!(m.credential_holders(), 1, "its leader lives");
+        m.stdin(1, &id, 1, b"go\n".to_vec()).unwrap();
+        let mut seen = None;
+        assert!(
+            wait_until(WAIT, || {
+                seen = m.detail().into_iter().next().filter(|d| !d.status.alive).map(|d| (d.group_alive, m.credential_holders()));
+                seen.is_some()
+            })
+            .await,
+            "the leader exits"
+        );
+        assert_eq!(seen, Some((true, 1)), "the leader died, its group lives on: still a holder");
+        assert!(wait_until(Duration::from_secs(5), || m.credential_holders() == 0).await, "the group's KILL ended it: no holder left");
     }
 
     /// A leader's watcher acts only on its own record. The id is registered
@@ -2612,6 +2735,20 @@ mod tests {
         assert_eq!(Grace::new(s(5), true, t0).deadline(), None, "a grace started while suspended is frozen");
     }
 
+    /// S7: a wake after a gap the clock did not see drops the cached
+    /// credential (a suspend without `/suspend`); an ordinary wake keeps it.
+    #[test]
+    fn the_jump_guard_drops_the_cached_credential() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        m.credential().put("A_TOKEN", Secret::new("dummy-value".into()), None).unwrap();
+        let last = Instant::now();
+        m.inner.woke(last, last + JUMP);
+        assert!(m.credential().has(), "a gap of JUMP is not a jump");
+        m.inner.woke(last, last + JUMP + Duration::from_millis(1));
+        assert!(!m.credential().has(), "dropped on the jump");
+    }
+
     /// The clock's wake after a gap it did not see (more than JUMP; the
     /// instants are made up, so nothing waits): a grace running when the
     /// clock last looked gets the unseen time back; one whose socket loss was
@@ -2681,6 +2818,26 @@ mod tests {
         };
         assert!(left > Duration::from_secs(2) && left <= Duration::from_secs(4), "{left:?}");
         assert_eq!(m.live(), 1);
+    }
+
+    /// S7: the clock starts with the first hello (`attach`), not the first
+    /// spawn, so its jump guard drops a credential cached on a VM that never
+    /// spawned (what `vm warm` leaves). Real time, as above: the test blocks
+    /// its runtime's only thread for more than JUMP after the delivery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_jump_guard_drops_a_credential_cached_before_any_spawn() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        assert!(m.attach(1, &[]).is_empty(), "a hello resuming nothing");
+        let value = format!("dummy-before-any-spawn-{}", std::process::id());
+        m.credential().put("A_TOKEN", Secret::new(value.clone()), None).unwrap();
+        // The clock looks once, then sees nothing for JUMP + 2 s.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::thread::sleep(JUMP + Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(m.live(), 0, "no spawn ran");
+        assert!(!m.credential().has(), "the jump guard dropped the copy");
+        assert!(!LOG.lock().unwrap().iter().any(|l| l.contains(&value)), "a logged line holds the value");
     }
 
     /// A grace longer than JUMP runs out on time: the clock wakes every

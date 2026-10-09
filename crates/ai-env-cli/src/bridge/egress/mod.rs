@@ -797,7 +797,7 @@ pub fn acceptance_line(verdict: &str, egress: &EgressCfg) -> String {
 }
 
 /// What the credential gate compares with, read live by its caller (S7) just
-/// before the credential is unsealed: the VM's egress and ingress as
+/// before the credential is sent: the VM's egress and ingress as
 /// `GetMicrovm` reports them, the image and version it reports, the configured
 /// connector's Id alias ([`ConnectorAlias::load`]) when known, the connector's
 /// facts from a `GetNetworkConnector` made now
@@ -865,7 +865,9 @@ pub struct GatePass {
 /// How long a [`GatePass`] stands before its caller must gate again: long
 /// enough for an unseal (Touch ID, [`crate::bridge::config::CredsCfg`]'s
 /// timeout is 60 s by default) and the dial, short enough that the live facts
-/// it rests on are still the ones in force.
+/// it rests on are still the ones in force. `credential::prepare` gates again
+/// (no new prompt) once its pass is past half of it, so the session's dial
+/// always starts with at least 45 s left.
 pub const GATE_PASS_MAX_AGE_S: u64 = 90;
 
 impl GatePass {
@@ -887,6 +889,14 @@ impl GatePass {
     #[must_use]
     pub fn at_unix(&self) -> u64 {
         self.at_unix
+    }
+
+    /// A pass for `vm_id` minted at `at_unix`, for the delivery tests only:
+    /// outside tests only [`credential_gate`] mints one.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_tests(vm_id: &str, at_unix: u64) -> GatePass {
+        GatePass { vm_id: vm_id.into(), image_version: "6.0".into(), connector: "nc-test".into(), at_unix }
     }
 
     /// Does this pass still stand for `vm_id` at `now_unix`? A pass for another
@@ -948,13 +958,14 @@ pub fn credential_precheck(cfg: &BridgeConfig, row: &VmRow, verified: &EgressVer
 
 /// May a credential enter the VM of `row`? Everything [`credential_precheck`]
 /// judges, then what only a live read can (S7 calls this after the runtime key
-/// is in hand and BEFORE the credential is unsealed, so a refusal costs no
-/// Touch ID): `GetMicrovm` reports the row's own image and version; its egress
-/// echo is exactly the configured connector; its ingress echo is exactly
-/// `HTTP_INGRESS` (never `SHELL_INGRESS`, whatever the row says); the
-/// connector's facts now are the ones the recorded check verified (Id, Version
-/// when answered, network protocol, subnet, security group); and the image
-/// version is the same build (`created_at`).
+/// is in hand and before the credential is sent; without a current
+/// `combined.env` also before the token is unsealed, so a refusal costs it no
+/// Touch ID of its own): `GetMicrovm` reports the row's own image and
+/// version; its egress echo is exactly the configured connector; its ingress
+/// echo is exactly `HTTP_INGRESS` (never `SHELL_INGRESS`, whatever the row
+/// says); the connector's facts now are the ones the recorded check verified
+/// (Id, Version when answered, network protocol, subnet, security group); and
+/// the image version is the same build (`created_at`).
 ///
 /// The [`GatePass`] it mints is the only proof of this, and is what a caller
 /// must hold to put a secret on the wire.

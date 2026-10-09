@@ -26,8 +26,10 @@ pub const MAX_ROW_BYTES: usize = 64 * 1024;
 /// here is a fingerprint of the launcher, never a credential (a unit test
 /// keeps `TOKEN|KEY|SECRET|PASSWORD|AUTH|CREDENTIAL` out of this list).
 /// Presence or absence of anything else (`CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`,
-/// `CLAUDECODE`, `NODE_OPTIONS`) is read from `env_names`.
-pub const CENSUS_VALUE_ALLOWLIST: [&str; 19] = [
+/// `CLAUDECODE`, `NODE_OPTIONS`) is read from `env_names` — so is S7's
+/// `AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS`, kept out by that rule: what it
+/// found is the end row's `synthetic_oauth:` part.
+pub const CENSUS_VALUE_ALLOWLIST: [&str; 20] = [
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_AGENT_SDK_VERSION",
     "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
@@ -48,6 +50,8 @@ pub const CENSUS_VALUE_ALLOWLIST: [&str; 19] = [
     "AI_ENV_BRIDGE_LAB_STDOUT_NOISE",
     "AI_ENV_BRIDGE_LAB_DELAY_INIT_MS",
     "AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS",
+    // S7: the local-scratch unseal's budget (the row then explains a timeout note).
+    "AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS",
 ];
 
 /// One census line. `end`/`exit` are absent on the start row of every

@@ -54,6 +54,34 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
+/// What `age` and `age-keygen` never inherit (S7): the credentials ai-env
+/// itself handles. `creds setup-token --from-env` reads the setup-token from
+/// this process's environment, and a decrypt (age-plugin-se and its Touch ID
+/// dialog with it) may wait a minute; neither tool has any use for a
+/// credential, and a same-uid reader of their environment would find it.
+pub const CHILD_ENV_REMOVED: [&str; 5] = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"];
+
+/// `program` (age or age-keygen) as every call here starts it: PATH with
+/// Homebrew's bin, so age finds its plugin, and none of [`CHILD_ENV_REMOVED`].
+/// The rest of the environment is inherited, as the plugin's dialog needs.
+/// Crate-wide, so a tool of the age family started elsewhere (the ceremony's
+/// `age-plugin-se keygen`) can be started the same way.
+pub(crate) fn tool_cmd(program: &Path) -> Command {
+    let mut c = Command::new(program);
+    c.env("PATH", effective_path());
+    for name in CHILD_ENV_REMOVED {
+        c.env_remove(name);
+    }
+    c
+}
+
+/// `age --version`, the probe's check.
+fn version_cmd(age: &Path) -> Command {
+    let mut c = tool_cmd(age);
+    c.arg("--version");
+    c
+}
+
 /// Rewrite a leading-dash path so it can never be parsed as a flag.
 fn safe_path(p: &Path) -> PathBuf {
     if p.to_string_lossy().starts_with('-') {
@@ -76,8 +104,7 @@ impl AgeTool {
                 "`age-keygen` is not installed — run: brew install age".into(),
             )
         })?;
-        let out = Command::new(&age)
-            .arg("--version")
+        let out = version_cmd(&age)
             .output()
             .map_err(|e| CliError::Msg(format!("cannot run age: {e}")))?;
         let version_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -106,10 +133,15 @@ impl AgeTool {
         find_in_path("age-plugin-se", &effective_path()).is_some()
     }
 
+    /// The `age` binary this tool runs (S7: the touchid-gui probe runs it
+    /// detached itself, as S8's prewarm will).
+    #[must_use]
+    pub fn age_path(&self) -> &Path {
+        &self.age
+    }
+
     fn cmd(&self) -> Command {
-        let mut c = Command::new(&self.age);
-        c.env("PATH", effective_path());
-        c
+        tool_cmd(&self.age)
     }
 
     /// Encrypt via `age -R recipients.txt` (native tag support — no plugin,
@@ -342,8 +374,7 @@ impl AgeTool {
     /// `age-keygen`: a fresh X25519 identity. Returns (secret identity line,
     /// public recipient). The secret only ever lives in a `Zeroizing` buffer.
     pub fn keygen_x25519(&self) -> Result<(Zeroizing<String>, String)> {
-        let out = Command::new(&self.age_keygen)
-            .env("PATH", effective_path())
+        let out = tool_cmd(&self.age_keygen)
             .output()
             .map_err(|e| CliError::Msg(format!("cannot run age-keygen: {e}")))?;
         if !out.status.success() {
@@ -372,8 +403,7 @@ impl AgeTool {
     /// `age-keygen -y`: identity line -> recipient, fed through a PIPE (the
     /// identity never touches disk).
     pub fn identity_to_recipient(&self, identity_line: &str) -> Result<String> {
-        let mut child = Command::new(&self.age_keygen)
-            .env("PATH", effective_path())
+        let mut child = tool_cmd(&self.age_keygen)
             .arg("-y") // with no INPUT, age-keygen -y reads the identity from stdin
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -634,4 +664,143 @@ fn classify_failure(stderr: &[u8], what: &str) -> CliError {
         "age {what} failed: {}",
         if detail.is_empty() { text.trim().to_string() } else { detail }
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The builders every call here starts `age` and `age-keygen` with (S7):
+    /// each removes the credentials ai-env handles, whatever this process's
+    /// environment holds; PATH is set, everything else inherited (the plugin
+    /// inherits age's). The calls themselves are held to it by
+    /// `no_call_that_starts_age_or_age_keygen_hands_it_a_credential`.
+    #[test]
+    fn age_and_age_keygen_never_inherit_a_credential() {
+        let tool = AgeTool { age: "/bin/sh".into(), age_keygen: "/bin/sh".into(), version: (1, 3, 2) };
+        for (what, cmd) in [("age", tool.cmd()), ("age --version", version_cmd(&tool.age)), ("age-keygen", tool_cmd(&tool.age_keygen))] {
+            let envs: Vec<(String, Option<String>)> = cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
+            for name in CHILD_ENV_REMOVED {
+                assert!(envs.iter().any(|(k, v)| k == name && v.is_none()), "{what} would inherit {name}");
+            }
+            assert!(envs.iter().any(|(k, v)| k == "PATH" && v.is_some()), "{what}: PATH is set");
+            assert_eq!(envs.len(), CHILD_ENV_REMOVED.len() + 1, "{what}: nothing else is changed");
+        }
+        assert!(version_cmd(&tool.age).get_args().eq(["--version"]), "the probe asks the version only");
+    }
+
+    /// Set only in the environment of the call-site test's child half: the
+    /// directory of its fakes, their log and its files.
+    const CALL_SITES_DIR: &str = "AI_ENV_TEST_AGE_CALL_SITES";
+
+    /// F28: no call here that starts `age` or `age-keygen` hands it a
+    /// credential ai-env handles, whatever ai-env's own environment holds:
+    /// the version probe, both encrypts, the four decrypts (to memory,
+    /// killable, to stdout, with an identity string) and age-keygen's two.
+    /// The test runs itself again as its child half, whose environment holds
+    /// a dummy for each of [`CHILD_ENV_REMOVED`] (built here) and whose PATH
+    /// finds logging fakes first: each logs which of those it sees set (never
+    /// a value), then answers as the tool would. The child makes every call;
+    /// this half reads the log: every call is in it, none saw a variable, and
+    /// no dummy is in the log, the child's output or any file it left.
+    #[test]
+    fn no_call_that_starts_age_or_age_keygen_hands_it_a_credential() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Some(dir) = std::env::var_os(CALL_SITES_DIR) {
+            every_call_site(Path::new(&dir));
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let (bin, log) = (d.path().join("bin"), d.path().join("env.log"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let (recipient, identity) = (format!("age1{}", "f28q".repeat(14)), format!("{}-{}-{}-1{}", "AGE", "SECRET", "KEY", "F28QCALLSITES".repeat(4)));
+        std::fs::write(d.path().join("recipients.txt"), format!("{recipient}\n")).unwrap();
+        std::fs::write(d.path().join("identity.txt"), format!("# public key: {recipient}\n{identity}\n")).unwrap();
+        // Which of the variables the tool sees set, by name: `NAME=set` or `NAME=`.
+        let seen: Vec<String> = CHILD_ENV_REMOVED.iter().map(|n| format!("{n}=${{{n}+set}}")).collect();
+        let logged = |tool: &str| format!("printf '%s %s %s\\n' {tool} \"${{1:-none}}\" \"{}\" >> '{}'", seen.join(" "), log.display());
+        let fake_age = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/age.sh");
+        let scripts = [
+            ("age", format!("#!/bin/sh\n{}\nexec /bin/sh '{fake_age}' \"$@\"\n", logged("age"))),
+            (
+                "age-keygen",
+                format!(
+                    "#!/bin/sh\n{}\nif [ \"${{1:-}}\" = -y ]; then cat >/dev/null; echo '{recipient}'; exit 0; fi\necho 'Public key: {recipient}' >&2\nprintf '# created: 2026-10-08T00:00:00Z\\n# public key: {recipient}\\n{identity}\\n'\n",
+                    logged("age-keygen")
+                ),
+            ),
+        ];
+        for (name, text) in scripts {
+            std::fs::write(bin.join(name), text).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The dummies the child's environment holds, built here: a setup-token, an API key, a runtime key and a session token.
+        let dummies = [format!("sk-ant-oat01-{}F28a", "Cs7_".repeat(20)), format!("sk-ant-api03-{}F28b", "Cs7_".repeat(20)), format!("AKIA{}", "F28C".repeat(4)), format!("{}f28d", "Cs7+".repeat(9)), format!("session-{}F28e", "Cs7x".repeat(16))];
+        let name = format!("{}::no_call_that_starts_age_or_age_keygen_hands_it_a_credential", module_path!().split_once("::").map_or("", |(_, m)| m));
+        let (out_path, err_path) = (d.path().join("child.out"), d.path().join("child.err"));
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name.as_str(), "--test-threads=1"]).env(CALL_SITES_DIR, d.path()).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("FAKE_") {
+                cmd.env_remove(&k);
+            }
+        }
+        for (var, value) in CHILD_ENV_REMOVED.iter().zip(&dummies) {
+            cmd.env(var, value);
+        }
+        let mut child = cmd.stdin(Stdio::null()).stdout(std::fs::File::create(&out_path).unwrap()).stderr(std::fs::File::create(&err_path).unwrap()).spawn().unwrap();
+        let t = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if t.elapsed() > std::time::Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child half ran past 60 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (out, err) = (std::fs::read_to_string(&out_path).unwrap_or_default(), std::fs::read_to_string(&err_path).unwrap_or_default());
+        // Every file the child left (its log, its output), and its fakes: none holds a dummy.
+        let mut files = vec![d.path().to_path_buf()];
+        while let Some(p) = files.pop() {
+            if p.is_dir() {
+                files.extend(std::fs::read_dir(&p).unwrap().flatten().map(|e| e.path()));
+            } else if let Ok(bytes) = std::fs::read(&p) {
+                for (var, value) in CHILD_ENV_REMOVED.iter().zip(&dummies) {
+                    assert!(!bytes.windows(value.len()).any(|w| w == value.as_bytes()), "{} holds {var}'s dummy ({} bytes)", p.display(), value.len());
+                }
+            }
+        }
+        assert!(status.success(), "the child half failed ({status}): {out}\n{err}");
+        assert!(out.contains("1 passed"), "the child half ran the calls: {out}");
+        let lines: Vec<String> = std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+        let calls = |tool: &str, first: &str| lines.iter().filter(|l| l.starts_with(&format!("{tool} {first} "))).count();
+        assert_eq!(
+            [calls("age", "--version"), calls("age", "-e"), calls("age", "-d"), calls("age-keygen", "none"), calls("age-keygen", "-y")],
+            [1, 2, 4, 1, 1],
+            "the probe, both encrypts, the four decrypts, age-keygen and age-keygen -y: {lines:?}"
+        );
+        assert_eq!(lines.len(), 9, "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains("=set")), "a call saw a credential set: {lines:?}");
+    }
+
+    /// The call-site test's child half: every call here that starts `age` or
+    /// `age-keygen`, against the fakes and files in `dir`, each checked to
+    /// answer as the tool does.
+    fn every_call_site(dir: &Path) {
+        let tool = AgeTool::probe().unwrap_or_else(|e| panic!("probe: {e}"));
+        let (recipients, identity) = (dir.join("recipients.txt"), dir.join("identity.txt"));
+        let plain: &[u8] = b"the F28 call sites' plaintext";
+        let sealed = tool.encrypt(&recipients, plain).unwrap_or_else(|e| panic!("encrypt: {e}"));
+        let streamed = tool.encrypt_streaming(&recipients, |w| Ok(w.write_all(plain)?)).unwrap_or_else(|e| panic!("encrypt_streaming: {e}"));
+        assert!(tool.decrypt_to_bytes(&identity, &sealed).unwrap_or_else(|e| panic!("decrypt_to_bytes: {e}")).as_slice() == plain);
+        assert!(tool.decrypt_to_bytes_killable(&identity, &streamed, &AgeKill::new()).unwrap_or_else(|e| panic!("decrypt_to_bytes_killable: {e}")).as_slice() == plain);
+        tool.decrypt_to_stdout(&identity, &sealed).unwrap_or_else(|e| panic!("decrypt_to_stdout: {e}"));
+        let line = std::fs::read_to_string(&identity).unwrap().lines().next_back().unwrap_or_default().to_string();
+        assert!(tool.decrypt_with_identity_string(&line, &sealed).unwrap_or_else(|e| panic!("decrypt_with_identity_string: {e}")).as_slice() == plain);
+        let (secret, recipient) = tool.keygen_x25519().unwrap_or_else(|e| panic!("keygen_x25519: {e}"));
+        assert_eq!(tool.identity_to_recipient(&secret).unwrap_or_else(|e| panic!("identity_to_recipient: {e}")), recipient);
+    }
 }

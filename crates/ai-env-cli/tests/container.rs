@@ -73,3 +73,28 @@ fn size_cap_math_stays_under_dockers_line_limit() {
         "MAX_PLAINTEXT too large for docker --env-file"
     );
 }
+
+/// S7: the metadata line is one comment just before the marker; without
+/// notes the text is exactly `write`'s; the container still reads and is
+/// still a dotenv file every reader parses the same; bad notes are refused.
+#[test]
+fn annotated_containers_carry_one_inert_meta_line() {
+    let blob = fake_age_blob();
+    assert_eq!(container::write_annotated(&blob, &[]).unwrap(), container::write(&blob));
+    let text = container::write_annotated(&blob, &[("kind", "setup-token"), ("chars", "108"), ("sealed", "2026-10-07T12:00:00Z")]).unwrap();
+    let classic = container::write(&blob);
+    let meta_line = "# ai-env-meta: kind=setup-token chars=108 sealed=2026-10-07T12:00:00Z\n";
+    assert_eq!(text, classic.replacen("AI_ENV=1\n", &format!("{meta_line}AI_ENV=1\n"), 1));
+    assert_eq!(container::read(&text).unwrap().data, blob);
+    let meta = container::meta(&text);
+    assert_eq!(meta.len(), 3);
+    assert_eq!((meta["kind"].as_str(), meta["chars"].as_str(), meta["sealed"].as_str()), ("setup-token", "108", "2026-10-07T12:00:00Z"));
+    assert!(container::meta(&classic).is_empty());
+    for bad in [("Kind", "x"), ("kind", "two words"), ("kind", ""), ("kind", "a\"b"), ("kind", "a$b"), ("kind", "a#b"), ("", "x")] {
+        assert!(container::write_annotated(&blob, &[bad]).is_err(), "{bad:?}");
+    }
+    // A hand-edited line: plain pairs are read, the rest skipped, the first of a repeated key wins.
+    let edited = text.replace(meta_line, "# ai-env-meta: kind=a junk Bad=x kind=b chars=7\n");
+    let meta = container::meta(&edited);
+    assert_eq!((meta.get("kind").map(String::as_str), meta.get("chars").map(String::as_str), meta.len()), (Some("a"), Some("7"), 2));
+}

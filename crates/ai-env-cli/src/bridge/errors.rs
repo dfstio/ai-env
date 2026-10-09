@@ -30,6 +30,12 @@ pub enum BridgeError {
     /// The VM answers no `/agent` (404): an image older than S6.
     NoAgent(String),
     // exit 5
+    /// S7: the VM's credential cache no longer holds the seal a delivery
+    /// expected it to hold (it went after it was checked), and no unsealed
+    /// value is in hand: nothing was started. No caller retries (a retry
+    /// inside `vm exec` could lose piped stdin already read); the message
+    /// tells the operator to run the command again, which unseals the token.
+    CredentialMissing(String),
     CredentialsUnavailable(String),
     // exit 3
     /// The operator pressed Ctrl-C (`lab run`: after the terminate guard ended the probe's VMs).
@@ -68,6 +74,11 @@ pub enum BridgeError {
     Io(std::io::Error),
     /// A lock stayed held past its budget (`workspace busy (pid N)`).
     Busy(String),
+    // its own exit code
+    /// A failure the CLI side already classified (S7: a credential step inside
+    /// a `lab run` probe): its own exit code and text, so a missing key stays 4
+    /// and a stopped unseal 130 or 143, never 1 with a `config:` line.
+    Cli(CliError),
 }
 
 /// What the S5 egress echo gate found: the VM `id` echoed `echoed` where its
@@ -123,6 +134,7 @@ impl fmt::Display for BridgeError {
             },
             BridgeError::NoAgent(m) => write!(f, "the VM's shim has no /agent ({m}): its image is older than S6; start a VM of the current image"),
             BridgeError::CredentialsUnavailable(m) => write!(f, "credentials unavailable: {m}"),
+            BridgeError::CredentialMissing(m) => write!(f, "credential not on the VM: {m}"),
             BridgeError::Cancelled => f.write_str("cancelled"),
             BridgeError::Transport(m) => write!(f, "transport: {m}"),
             BridgeError::Terminated(m) => write!(f, "microvm terminated: {m}"),
@@ -165,6 +177,7 @@ impl fmt::Display for BridgeError {
             BridgeError::Config(m) => write!(f, "config: {m}"),
             BridgeError::Io(e) => write!(f, "{e}"),
             BridgeError::Busy(m) => write!(f, "busy: {m}"),
+            BridgeError::Cli(e) => write!(f, "{e}"),
         }
     }
 }
@@ -193,7 +206,7 @@ impl From<BridgeError> for CliError {
             | BridgeError::Ambiguous { .. }
             | BridgeError::EndpointThrottled { .. }
             | BridgeError::NoAgent(_) => CliError::Aws(text),
-            BridgeError::CredentialsUnavailable(_) => CliError::AuthUnavailable(text),
+            BridgeError::CredentialsUnavailable(_) | BridgeError::CredentialMissing(_) => CliError::AuthUnavailable(text),
             BridgeError::Cancelled => CliError::Cancelled,
             BridgeError::Transport(_)
             | BridgeError::Terminated(_)
@@ -213,6 +226,7 @@ impl From<BridgeError> for CliError {
             | BridgeError::Policy(_) => CliError::Policy(text),
             BridgeError::Config(_) | BridgeError::Busy(_) | BridgeError::SpawnRefused { .. } => CliError::Msg(text),
             BridgeError::Io(io) => CliError::from(io),
+            BridgeError::Cli(e) => e,
         }
     }
 }
@@ -363,6 +377,8 @@ mod tests {
             (BridgeError::Config("bad".into()), 1),
             (BridgeError::Busy("pid 1".into()), 1),
             (BridgeError::Io(std::io::Error::other("io")), 1),
+            (BridgeError::Cli(CliError::NoKey("k".into())), 4),
+            (BridgeError::Cli(CliError::Exit(143)), 143),
         ];
         for (e, code) in cases {
             let text = e.to_string();

@@ -9,6 +9,7 @@ pub mod fake_file;
 pub mod gc;
 pub mod health;
 pub mod lab;
+pub mod lab_mac;
 pub mod lock;
 pub mod registry;
 pub mod run;

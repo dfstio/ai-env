@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod api;
 pub mod audit;
+pub mod authwatch;
 pub mod awscli;
 pub mod census;
 pub mod config;
@@ -30,7 +31,9 @@ pub mod registry;
 pub mod route;
 pub mod scan;
 pub mod seed;
+pub mod setup_token;
 pub mod sibling;
+pub mod signals;
 pub mod tls;
 pub mod transport;
 pub mod unseal;

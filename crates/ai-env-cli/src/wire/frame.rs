@@ -69,6 +69,21 @@ pub const GROUP_KILL_AFTER: Duration = Duration::from_secs(1);
 /// Each frame send times out after this (both ends).
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
+// ---- capabilities (S7) ----------------------------------------------------------------
+
+/// The capability a shim names in `hello_ok.caps` (and `/health`) when it
+/// holds a delivered credential in its one-slot cache and spawns from it. The
+/// Mac sends a `credential` frame, or a `spawn` naming one, only to a shim that
+/// names this: an older shim would answer `credential` with `unknown_frame`
+/// after the secret had crossed, and would run a credentialed spawn without it.
+/// Rule for later changes: anything the receiver must act on is gated by a cap;
+/// a field it may ignore is not.
+pub const CAP_CREDENTIAL_CACHE: &str = "credential_cache";
+
+/// Longest `credential.tag` (an opaque, non-secret seal id the Mac chooses:
+/// `[A-Za-z0-9-]`).
+pub const CREDENTIAL_TAG_MAX: usize = 64;
+
 // ---- close codes ---------------------------------------------------------------------
 
 pub const CLOSE_NORMAL: u16 = 1000;
@@ -209,8 +224,50 @@ pub enum SpawnErrCode {
     /// The program exists but could not be started (not executable, a bad interpreter).
     Exec,
     Draining,
+    /// `spawn.credential` names a credential the shim's cache does not hold
+    /// (never delivered, or wiped by a suspend since) (S7).
+    NoCredential,
     #[serde(other)]
     Other,
+}
+
+/// Why the shim refused a `credential` frame (S7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialErrCode {
+    /// A malformed name, an empty, oversized or NUL-bearing value, a bad tag.
+    BadRequest,
+    /// The shim is stopping.
+    Draining,
+    /// A `/suspend` is under way or done: nothing is cached until `/resume`.
+    Suspended,
+    #[serde(other)]
+    Other,
+}
+
+/// What the shim's credential cache shows (S7), in `hello_ok` and
+/// `/health/detail`: the name and tag of the copy it holds — never the value —
+/// when it was cached, and how many live spawns were handed a secret. Every
+/// field is left out when empty, so an exchange without credentials is
+/// byte-identical to S6's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CredentialView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_tag: Option<String>,
+    /// RFC 3339 UTC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_at: Option<String>,
+    /// Live spawns that were handed a secret (cached or one-shot): their
+    /// memory, and any snapshot taken while they live, still holds it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub credential_holders: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,12 +385,18 @@ pub enum Frame {
         image_version: Option<String>,
         boot_nonce: String,
         owner: Option<String>,
+        /// The shim's cache holds a deliverable copy right now (S7; false after any suspend).
         has_credentials: bool,
         uptime_s: u64,
         run_hook_seen: bool,
         spawns: Vec<SpawnStatus>,
         /// One per `hello.resume` entry; replay follows for every `ok`.
         resumed: Vec<Resumed>,
+        /// What this shim can do beyond wire v1's core ([`CAP_CREDENTIAL_CACHE`]); absent from an S6 shim.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        caps: Vec<String>,
+        #[serde(flatten)]
+        credential: CredentialView,
     },
     HelloErr {
         code: HelloErrCode,
@@ -354,6 +417,13 @@ pub enum Frame {
         deliver_secret: Deliver,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detach_grace_s: Option<u32>,
+        /// The name of a credential the shim's cache holds, delivered to this
+        /// spawn per `deliver_secret` (S7). Never together with `secrets`. Only
+        /// the name rides here, so a re-sent `spawn` that names the cached
+        /// credential never carries its value (a `--credential-file` spawn
+        /// carries its secret in `secrets`, re-sends included).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
     },
     Spawned {
         spawn_id: SpawnId,
@@ -452,6 +522,35 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_id: Option<SpawnId>,
     },
+    /// Mac → VM (S7): put one credential in the shim's one-slot cache, for
+    /// spawns that name it. Sent only to a shim with [`CAP_CREDENTIAL_CACHE`],
+    /// on its own frame so it is never part of a `spawn` the session re-sends.
+    Credential {
+        name: String,
+        secret: Secret<String>,
+        /// An opaque, non-secret seal id, so the Mac can tell a cached copy of
+        /// the token it holds now from one of a token it has since replaced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+    },
+    /// VM → Mac: the `credential` is cached (`cached: true`), or a
+    /// `credential_forget` dropped it (`false`).
+    CredentialOk {
+        name: String,
+        cached: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+    },
+    CredentialErr {
+        name: String,
+        code: CredentialErrCode,
+        message: String,
+    },
+    /// Mac → VM: drop the cached credential (`name` absent: whatever is cached).
+    CredentialForget {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for Frame {
@@ -461,9 +560,9 @@ impl std::fmt::Debug for Frame {
             Frame::Hello { client, resume, idle_s, .. } => write!(f, "{kind}(client={} {}, resume={}, idle_s={idle_s:?})", client.name, client.version, resume.len()),
             Frame::HelloOk { wire, spawns, resumed, run_hook_seen, .. } => write!(f, "{kind}(wire={wire}, spawns={}, resumed={}, run_hook_seen={run_hook_seen})", spawns.len(), resumed.len()),
             Frame::HelloErr { code, .. } => write!(f, "{kind}({code:?})"),
-            Frame::Spawn { spawn_id, argv, env, secrets, deliver_secret, .. } => {
+            Frame::Spawn { spawn_id, argv, env, secrets, deliver_secret, credential, .. } => {
                 let argv0 = argv.first().map(|a| a.rsplit('/').next().unwrap_or(a)).unwrap_or("");
-                write!(f, "{kind}({spawn_id}, argv0={argv0}, argc={}, env={}, secrets={}, deliver={deliver_secret:?})", argv.len(), env.len(), secrets.len())
+                write!(f, "{kind}({spawn_id}, argv0={argv0}, argc={}, env={}, secrets={}, deliver={deliver_secret:?}, credential={credential:?})", argv.len(), env.len(), secrets.len())
             }
             Frame::Spawned { spawn_id, pid, pgid, .. } => write!(f, "{kind}({spawn_id}, pid={pid}, pgid={pgid})"),
             Frame::SpawnErr { spawn_id, code, .. } => write!(f, "{kind}({spawn_id}, {code:?})"),
@@ -479,6 +578,11 @@ impl std::fmt::Debug for Frame {
             Frame::Ping { ts } | Frame::Pong { ts } => write!(f, "{kind}({ts})"),
             Frame::Event { kind: k, .. } => write!(f, "{kind}({k:?})"),
             Frame::Error { code, spawn_id, .. } => write!(f, "{kind}({code:?}, spawn={})", spawn_id.as_ref().map_or("-", |s| s.0.as_str())),
+            // The name and the length, never the value.
+            Frame::Credential { name, secret, tag } => write!(f, "{kind}({name}, {} bytes, tag={tag:?})", secret.expose().len()),
+            Frame::CredentialOk { name, cached, tag } => write!(f, "{kind}({name}, cached={cached}, tag={tag:?})"),
+            Frame::CredentialErr { name, code, .. } => write!(f, "{kind}({name}, {code:?})"),
+            Frame::CredentialForget { name } => write!(f, "{kind}({name:?})"),
         }
     }
 }
@@ -545,8 +649,9 @@ impl From<serde_json::Error> for WireError {
 }
 
 /// Every `t` this build knows.
-pub const KINDS: [&str; 20] = [
-    "hello", "hello_ok", "hello_err", "spawn", "spawned", "spawn_err", "stdin", "stdin_eof", "stdin_ack", "signal", "detach", "stdout", "stderr", "ack", "exit", "ping", "pong", "event", "error", "_",
+pub const KINDS: [&str; 24] = [
+    "hello", "hello_ok", "hello_err", "spawn", "spawned", "spawn_err", "stdin", "stdin_eof", "stdin_ack", "signal", "detach", "stdout", "stderr", "ack", "exit", "ping", "pong", "event", "error",
+    "credential", "credential_ok", "credential_err", "credential_forget", "_",
 ];
 
 impl Frame {
@@ -573,6 +678,10 @@ impl Frame {
             Frame::Pong { .. } => "pong",
             Frame::Event { .. } => "event",
             Frame::Error { .. } => "error",
+            Frame::Credential { .. } => "credential",
+            Frame::CredentialOk { .. } => "credential_ok",
+            Frame::CredentialErr { .. } => "credential_err",
+            Frame::CredentialForget { .. } => "credential_forget",
         }
     }
 
@@ -770,6 +879,13 @@ pub struct Health {
     /// older image, whose `/agent` upgrade answers 404.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire: Option<u8>,
+    /// As `hello_ok.caps` (S7), so this Mac can record what a VM's shim can do
+    /// before any command needs it; absent from an older image. `vm run`
+    /// reads no `/health`: a `/health` refresh (`vm health`, `vm warm`, `vm
+    /// smoke`, `egress check`, the live probes) and `credential::cached_on_vm`'s
+    /// `/health/detail` record the caps in the VM's row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
 }
 
 /// The last peer of one runtime hook, as the guard saw it.
@@ -812,6 +928,16 @@ pub struct SpawnDetail {
     /// Seconds left of the detach grace (None while attached, or frozen while suspended).
     pub detach_left_s: Option<u64>,
     pub frozen: bool,
+    /// A process of the spawn's group still exists (the shim's `kill(-pgid,
+    /// 0)`; S7 D6, the child-gone check after a refused credential's stop):
+    /// `alive` is the leader alone. Left out when false, so a detail without
+    /// it reads as before; an older shim never says it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_alive: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// `GET /health/detail` (bearer only): what `/health` says plus the guard,
@@ -839,6 +965,8 @@ pub struct HealthDetail {
     pub sockets_authenticated: u32,
     pub spawns: Vec<SpawnDetail>,
     pub has_credentials: bool,
+    #[serde(flatten)]
+    pub credential: CredentialView,
     /// The last clock report (`/run` or `/resume`), as logged.
     pub clock: Option<serde_json::Value>,
     /// At most [`LISTENERS_MAX`], the agent uid's own last.
@@ -887,6 +1015,8 @@ mod tests {
                 run_hook_seen: true,
                 spawns: vec![status()],
                 resumed: vec![Resumed { spawn_id: sid(), status: ResumeStatus::Ok }],
+                caps: vec![CAP_CREDENTIAL_CACHE.into()],
+                credential: CredentialView { credential_name: Some("CLAUDE_CODE_OAUTH_TOKEN".into()), credential_tag: Some("seal-1".into()), credential_at: Some("2026-10-07T10:00:00Z".into()), credential_holders: 1 },
             },
             Frame::HelloErr { code: HelloErrCode::BadToken, message: "no".into() },
             Frame::Spawn {
@@ -897,6 +1027,7 @@ mod tests {
                 secrets: BTreeMap::from([("CLAUDE_CODE_OAUTH_TOKEN".to_string(), Secret::new("dummy-secret-value".to_string()))]),
                 deliver_secret: Deliver::Fd,
                 detach_grace_s: Some(60),
+                credential: None,
             },
             Frame::Spawned { spawn_id: sid(), pid: 42, pgid: 42, claude_version: Some("2.1.287".into()) },
             Frame::SpawnErr { spawn_id: sid(), code: SpawnErrCode::Exec, message: "boom".into() },
@@ -913,17 +1044,22 @@ mod tests {
             Frame::Pong { ts: 1 },
             Frame::Event { kind: EventKind::WipRef, at: "2026-09-19T08:00:00Z".into(), reference: Some("refs/wip/1".into()) },
             Frame::Error { code: ErrorCode::Superseded, message: "x".into(), spawn_id: Some(sid()) },
+            Frame::Credential { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), secret: Secret::new("dummy-credential-value".into()), tag: Some("seal-1".into()) },
+            Frame::CredentialOk { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), cached: true, tag: Some("seal-1".into()) },
+            Frame::CredentialErr { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), code: CredentialErrCode::Suspended, message: "suspended".into() },
+            Frame::CredentialForget { name: None },
         ]
     }
 
     #[test]
     fn roundtrip_every_variant() {
         let all = every_variant();
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), 23);
         let mut kinds: Vec<&str> = all.iter().map(Frame::kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 19, "one sample per kind");
+        assert_eq!(kinds.len(), 23, "one sample per kind");
+        assert_eq!(KINDS.len(), 24, "every kind and the _ sentinel");
         for k in &kinds {
             assert!(KINDS.contains(k), "{k} is listed in KINDS");
         }
@@ -966,6 +1102,52 @@ mod tests {
         assert_eq!(Frame::Ack { spawn_id: sid(), seq: 3, err_seq: 1 }.to_json(), format!("{{\"v\":1,\"t\":\"ack\",\"spawn_id\":\"{SID}\",\"seq\":3,\"err_seq\":1}}"));
     }
 
+    /// The S7 frames on the wire, and an S6 peer's frames still read the same:
+    /// every new field is left out when empty, and an older shim's `hello_ok`
+    /// and `/health` parse with no caps and an empty credential view.
+    #[test]
+    fn credential_frames_and_caps_are_additive() {
+        assert_eq!(
+            Frame::Credential { name: "X_TOKEN".into(), secret: Secret::new("v".into()), tag: Some("t-1".into()) }.to_json(),
+            "{\"v\":1,\"t\":\"credential\",\"name\":\"X_TOKEN\",\"secret\":\"v\",\"tag\":\"t-1\"}"
+        );
+        assert_eq!(Frame::CredentialForget { name: None }.to_json(), "{\"v\":1,\"t\":\"credential_forget\"}");
+        assert_eq!(Frame::CredentialOk { name: "X_TOKEN".into(), cached: false, tag: None }.to_json(), "{\"v\":1,\"t\":\"credential_ok\",\"name\":\"X_TOKEN\",\"cached\":false}");
+        let err = Frame::from_json("{\"v\":1,\"t\":\"credential_err\",\"name\":\"X\",\"code\":\"from_the_future\",\"message\":\"m\"}").unwrap();
+        assert!(matches!(err, Frame::CredentialErr { code: CredentialErrCode::Other, .. }));
+        let no_cred = Frame::from_json(&format!("{{\"v\":1,\"t\":\"spawn_err\",\"spawn_id\":\"{SID}\",\"code\":\"no_credential\",\"message\":\"m\"}}")).unwrap();
+        assert!(matches!(no_cred, Frame::SpawnErr { code: SpawnErrCode::NoCredential, .. }));
+        // A spawn naming a credential carries the name only.
+        let spawn = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: Some("X_TOKEN".into()) };
+        assert!(spawn.to_json().ends_with(",\"credential\":\"X_TOKEN\"}"), "{}", spawn.to_json());
+        // An S6 shim's hello_ok: no caps, no view; and it serialises back without them.
+        let s6 = "{\"v\":1,\"t\":\"hello_ok\",\"wire\":1,\"shim_version\":\"0.1.0\",\"claude_version\":null,\"microvm_id\":null,\"image_version\":null,\"boot_nonce\":\"n\",\"owner\":null,\"has_credentials\":false,\"uptime_s\":1,\"run_hook_seen\":true,\"spawns\":[],\"resumed\":[]}";
+        let f = Frame::from_json(s6).unwrap();
+        let Frame::HelloOk { caps, credential, .. } = &f else { panic!("hello_ok") };
+        assert!(caps.is_empty() && *credential == CredentialView::default());
+        assert_eq!(f.to_json(), s6, "byte-identical for an S6 peer");
+        // /health: an older shim's document has no caps; a new one names them.
+        let old: Health = serde_json::from_str("{\"status\":\"ok\",\"shim_version\":\"0.1.0\",\"claude_version\":null,\"microvm_id\":null,\"owner\":null,\"created\":null,\"boot_nonce\":null,\"run_hook_seen\":true,\"uptime_s\":3,\"wire\":1}").unwrap();
+        assert!(old.caps.is_empty());
+        let new = Health { caps: vec![CAP_CREDENTIAL_CACHE.into()], ..old };
+        assert!(serde_json::to_string(&new).unwrap().ends_with(",\"caps\":[\"credential_cache\"]}"));
+    }
+
+    /// `/health/detail`'s `group_alive` (S7 D6) is additive: left out when
+    /// false, so a detail without it is byte-identical to before, and an
+    /// older shim's spawn (no field) reads as false.
+    #[test]
+    fn group_alive_is_additive() {
+        let d = SpawnDetail { status: status(), started_at: "2026-10-08T08:00:00Z".into(), detach_left_s: None, frozen: false, group_alive: false };
+        let before = format!("{},\"started_at\":\"2026-10-08T08:00:00Z\",\"detach_left_s\":null,\"frozen\":false}}", serde_json::to_string(&status()).unwrap().trim_end_matches('}'));
+        assert_eq!(serde_json::to_string(&d).unwrap(), before, "no group_alive while false");
+        assert_eq!(serde_json::from_str::<SpawnDetail>(&before).unwrap(), d, "an older shim's spawn reads as false");
+        let alive = SpawnDetail { group_alive: true, ..d };
+        let json = serde_json::to_string(&alive).unwrap();
+        assert!(json.ends_with(",\"frozen\":false,\"group_alive\":true}"), "{json}");
+        assert_eq!(serde_json::from_str::<SpawnDetail>(&json).unwrap(), alive);
+    }
+
     #[test]
     fn rejects_v2_and_names_an_unknown_kind() {
         assert!(matches!(Frame::from_json("{\"v\":2,\"t\":\"ping\",\"ts\":1}").unwrap_err(), WireError::Version(2)));
@@ -988,7 +1170,7 @@ mod tests {
     fn debug_never_shows_data_secrets_or_arguments() {
         for f in every_variant() {
             let d = format!("{f:?}");
-            for secret in ["fake-session-token", "dummy-secret-value", "--version", "type", "AP8=", "warn", "C.UTF-8", "/Users/mike/Documents"] {
+            for secret in ["fake-session-token", "dummy-secret-value", "dummy-credential-value", "--version", "type", "AP8=", "warn", "C.UTF-8", "/Users/mike/Documents"] {
                 assert!(!d.contains(secret), "{} leaks {secret:?}: {d}", f.kind());
             }
             assert!(d.starts_with(f.kind()), "{d}");
@@ -1032,6 +1214,59 @@ mod tests {
         }
         assert_eq!(stdout, stdin);
         assert_eq!(stdin, b"hello\n\x00\xff\n");
+    }
+
+    /// The golden credentialed conversation (S7,
+    /// tests/fixtures/wire/cred-golden.jsonl): a miss (the `credential` frame,
+    /// then the spawn naming it), a hit (a `hello_ok` showing the cached seal,
+    /// a spawn by name only), a second client's view while that spawn holds
+    /// the token, and the cache's other answers (`credential_forget`,
+    /// `no_credential`, `suspended`). Every line parses as v1 and serialises
+    /// back byte-identically, each kind comes from the side that sends it,
+    /// every S7 shape is there, and the stand-in secret (no token shape) rides
+    /// only the `credential` frames: no spawn carries one, and no frame's
+    /// `Debug` shows it. Messages name the line by its number in the file
+    /// (from 1, as an editor counts), never print it.
+    #[test]
+    fn golden_credential_conversation_round_trips() {
+        let text = include_str!("../../tests/fixtures/wire/cred-golden.jsonl");
+        let mut frames = Vec::new();
+        let mut secrets: Vec<String> = Vec::new();
+        let (mut miss, mut held, mut forgot, mut no_credential, mut suspended) = (false, false, false, false, false);
+        for (i, line) in text.lines().enumerate() {
+            let n = i + 1;
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("line {n}: {e}"));
+            let dir = v["dir"].as_str().unwrap_or_default().to_string();
+            // The frame's own text, in its original key order (`{"dir":…,"frame":<frame>}`).
+            let raw = line.split_once(",\"frame\":").and_then(|(_, rest)| rest.strip_suffix('}')).unwrap_or_else(|| panic!("line {n}: no frame"));
+            let f = Frame::from_json(raw).unwrap_or_else(|e| panic!("line {n}: {e}"));
+            assert!(f.to_json() == raw, "line {n} ({}): not byte-identical once re-serialised", f.kind());
+            match (dir.as_str(), &f) {
+                ("mac", Frame::Credential { secret, .. }) => secrets.push(secret.expose().clone()),
+                ("mac", Frame::Spawn { secrets: inline, credential, .. }) => assert!(inline.is_empty() && credential.as_deref() == Some("CLAUDE_CODE_OAUTH_TOKEN"), "line {n}: a spawn names the credential, never carries it"),
+                ("mac", Frame::Hello { .. } | Frame::StdinEof { .. } | Frame::Ack { .. } | Frame::CredentialForget { .. }) => {}
+                ("vm", Frame::HelloOk { caps, has_credentials, credential, .. }) => {
+                    assert!(caps.iter().any(|c| c == CAP_CREDENTIAL_CACHE), "line {n}: an S7 shim offers {CAP_CREDENTIAL_CACHE}");
+                    miss |= !*has_credentials && *credential == CredentialView::default();
+                    held |= *has_credentials && credential.credential_tag.is_some() && credential.credential_at.is_some() && credential.credential_holders > 0;
+                }
+                ("vm", Frame::CredentialOk { cached, .. }) => forgot |= !*cached,
+                ("vm", Frame::SpawnErr { code, .. }) => no_credential |= *code == SpawnErrCode::NoCredential,
+                ("vm", Frame::CredentialErr { code, .. }) => suspended |= *code == CredentialErrCode::Suspended,
+                ("vm", Frame::Spawned { .. } | Frame::Stdout { .. } | Frame::Exit { .. }) => {}
+                _ => panic!("line {n}: {dir} does not send {}", f.kind()),
+            }
+            frames.push(f);
+        }
+        assert!(miss && held && forgot && no_credential && suspended, "every S7 shape: miss {miss}, held {held}, forgot {forgot}, no_credential {no_credential}, suspended {suspended}");
+        for kind in ["credential", "credential_ok", "credential_err", "credential_forget"] {
+            assert!(frames.iter().any(|f| f.kind() == kind), "{kind} missing");
+        }
+        // One stand-in secret, with no token shape, in exactly the `credential` lines; no `Debug` shows it.
+        let secret = secrets.first().expect("a credential frame");
+        assert!(secrets.iter().all(|s| s == secret) && !secret.starts_with("sk-ant-"), "one stand-in of {} bytes, no token shape", secret.len());
+        assert_eq!(text.lines().filter(|l| l.contains(secret.as_str())).count(), secrets.len(), "only the credential frames carry it");
+        assert!(frames.iter().all(|f| !format!("{f:?}").contains(secret.as_str())), "a frame's Debug shows the secret");
     }
 
     #[test]
@@ -1146,6 +1381,7 @@ mod tests {
             run_hook_seen: false,
             uptime_s: 3,
             wire: None,
+            caps: vec![],
         };
         let s = serde_json::to_string(&h).unwrap();
         assert!(s.starts_with("{\"status\":\"ok\",\"shim_version\":\"0.1.0\""), "{s}");

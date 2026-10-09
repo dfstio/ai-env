@@ -294,6 +294,7 @@ impl ShimState {
             run_hook_seen: run.seen,
             uptime_s: since.elapsed().as_secs(),
             wire: Some(WIRE_VERSION),
+            caps: vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.to_string()],
         }
     }
 
@@ -314,7 +315,8 @@ impl ShimState {
             sockets_open: open,
             sockets_authenticated: authenticated,
             spawns: self.spawns.detail(),
-            has_credentials: false,
+            has_credentials: self.spawns.credential().has(),
+            credential: self.spawns.credential_view(),
             clock: self.last_clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
             listeners,
             listeners_omitted,

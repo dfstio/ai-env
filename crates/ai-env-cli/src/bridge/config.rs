@@ -91,6 +91,21 @@ impl Paths {
         self.credentials().join("aws.env")
     }
 
+    /// `credentials/setup-token.env`: the Claude setup-token (S7 `creds setup-token`).
+    #[must_use]
+    pub fn setup_token_env(&self) -> PathBuf {
+        self.credentials().join("setup-token.env")
+    }
+
+    /// `credentials/combined.env`: both of the above in one container (S7 D4,
+    /// container mode only), so a credentialed command costs one Touch ID.
+    /// Derived: rebuilt by `creds setup-token` and `creds aws-set`, used only
+    /// while the source hashes it records match.
+    #[must_use]
+    pub fn combined_env(&self) -> PathBuf {
+        self.credentials().join("combined.env")
+    }
+
     /// `state/infra.toml`: what `ai-env infra status --write` learned from the stack
     /// (image state and versions, zip hash, bucket, log group) for doctor.
     #[must_use]
@@ -136,6 +151,13 @@ impl Paths {
     #[must_use]
     pub fn egress_lock(&self) -> PathBuf {
         self.root.join("state").join("egress.lock")
+    }
+
+    /// `state/creds.toml`: what is known against sealed credential containers
+    /// (S7: a setup-token Anthropic refused, by seal id).
+    #[must_use]
+    pub fn creds_state(&self) -> PathBuf {
+        self.root.join("state").join("creds.toml")
     }
 
     /// `state/egress-verified.toml`: the passing `ai-env egress check` runs, one

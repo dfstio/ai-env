@@ -24,7 +24,7 @@
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::transport::{dial_agent, AgentDial, AgentSocket, DialError};
-use crate::wire::frame::{ClientInfo, Frame, HelloErrCode, ResumePoint, Resumed, SpawnStatus, WireError, SEND_TIMEOUT};
+use crate::wire::frame::{ClientInfo, CredentialView, Frame, HelloErrCode, ResumePoint, Resumed, SpawnStatus, WireError, SEND_TIMEOUT};
 use crate::wire::redact::{scrub, Secret};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -58,6 +58,10 @@ pub struct HelloOk {
     pub spawns: Vec<SpawnStatus>,
     /// One per `hello.resume` entry; replay follows for every `ok`.
     pub resumed: Vec<Resumed>,
+    /// What the shim can do beyond wire v1's core (S7: `credential_cache`); empty from an S6 shim.
+    pub caps: Vec<String>,
+    /// What the shim's credential cache shows (S7).
+    pub credential: CredentialView,
 }
 
 /// One socket: the sending and the receiving half.
@@ -152,8 +156,8 @@ impl AgentConn {
         let client = ClientInfo { name: "ai-env".into(), version: env!("CARGO_PKG_VERSION").into(), host: crate::bridge::vm::owner() };
         self.send(&Frame::Hello { session_token: session_token.clone(), client, resume, idle_s }).await?;
         match self.recv().await? {
-            Some(Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed }) => {
-                Ok(HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed })
+            Some(Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, caps, credential }) => {
+                Ok(HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, caps, credential })
             }
             Some(Frame::HelloErr { code, message }) => {
                 let _ = tokio::time::timeout(CLOSE_WAIT, async { while let Ok(Some(_)) = self.recv().await {} }).await;
@@ -332,8 +336,9 @@ impl Trace {
 }
 
 /// The frame's JSON with every value that may carry data or a secret
-/// replaced by `[masked:<len>]`: chunk `text`/`b64`, `session_token`, the
-/// values of `secrets` and `env`, and argv past argv[0].
+/// replaced by `[masked:<len>]`: chunk `text`/`b64`, `session_token`, a
+/// `credential` frame's `secret` (S7), the values of `secrets` and `env`, and
+/// argv past argv[0].
 fn masked(frame: &Frame) -> serde_json::Value {
     use serde_json::Value;
     let mut v: Value = serde_json::from_str(&frame.to_json()).unwrap_or(Value::Null);
@@ -342,7 +347,7 @@ fn masked(frame: &Frame) -> serde_json::Value {
         *x = Value::String(format!("[masked:{len}]"));
     };
     if let Some(map) = v.as_object_mut() {
-        for key in ["text", "b64", "session_token"] {
+        for key in ["text", "b64", "session_token", "secret"] {
             if let Some(x) = map.get_mut(key) {
                 mask(x);
             }
@@ -407,6 +412,8 @@ mod tests {
             run_hook_seen: true,
             spawns: vec![],
             resumed: vec![Resumed { spawn_id: SpawnId("0192f1e0-2b7c-7c3a-9a1b-4d5e6f708192".into()), status: ResumeStatus::Gap }],
+            caps: vec![],
+            credential: Default::default(),
         }
     }
 
@@ -532,11 +539,13 @@ mod tests {
             secrets: BTreeMap::from([("SOME_NAME".to_string(), Secret::new("dummy-secret-value".to_string()))]),
             deliver_secret: Deliver::Fd,
             detach_grace_s: None,
+            credential: None,
         };
         let out = Frame::Stdout { spawn_id: sid.clone(), seq: 3, data: Chunk { text: Some("private output".into()), b64: None } };
         let bin = Frame::Stdin { spawn_id: sid, seq: 4, data: Chunk { text: None, b64: Some("AP8K".into()) } };
-        let all = [masked(&hello), masked(&spawn), masked(&out), masked(&bin)].map(|v| v.to_string()).join("\n");
-        for leak in ["trace-session-token", "--print", "the prompt", "C.UTF-8", "dummy-secret-value", "private output", "AP8K"] {
+        let cred = Frame::Credential { name: "SOME_NAME".into(), secret: Secret::new("dummy-credential-value".into()), tag: Some("seal-1".into()) };
+        let all = [masked(&hello), masked(&spawn), masked(&out), masked(&bin), masked(&cred)].map(|v| v.to_string()).join("\n");
+        for leak in ["trace-session-token", "--print", "the prompt", "C.UTF-8", "dummy-secret-value", "private output", "AP8K", "dummy-credential-value"] {
             assert!(!all.contains(leak), "{leak}: {all}");
         }
         assert_eq!(masked(&spawn)["argv"], serde_json::json!(["/usr/bin/claude", "[masked:7]", "[masked:10]"]));
@@ -544,6 +553,7 @@ mod tests {
         assert_eq!(masked(&out)["text"], "[masked:14]");
         assert_eq!(masked(&out)["seq"], 3);
         assert_eq!(masked(&hello)["session_token"], "[masked:19]");
+        assert_eq!((masked(&cred)["secret"].as_str(), masked(&cred)["name"].as_str(), masked(&cred)["tag"].as_str()), (Some("[masked:22]"), Some("SOME_NAME"), Some("seal-1")));
     }
 
     #[test]

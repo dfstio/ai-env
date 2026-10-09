@@ -116,7 +116,9 @@ pub enum Mode {
     /// Mac's own config dir (writer validated via `AI_ENV_BRIDGE_MIRROR_ROOT`).
     LocalChild,
     /// Pipe the session to a local child whose `CLAUDE_CONFIG_DIR` is a
-    /// per-session scratch dir (resume seeding; needs a token — S7).
+    /// per-session scratch dir (resume seeding). The child has no login of its
+    /// own: S7 hands it the sealed setup-token on fd 3 (`pump::scratch_login`),
+    /// and without one it runs logged out.
     LocalScratch,
     /// Parsed, not implemented until S8: behaves as `Passthrough` + a census note.
     Remote,

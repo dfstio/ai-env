@@ -952,3 +952,50 @@ fn doctor_json_shape_matches_process_exit() {
     assert!(texts.contains(&".env is encrypted"), "{texts:?}");
     assert!(!shim.argv_log().contains("-d "), "doctor must never decrypt: {}", shim.argv_log());
 }
+
+/// No credential in ai-env's environment reaches `age`, `age-keygen` or
+/// `age-plugin-se` as the keygen ceremony starts them: `keys restore
+/// --new-recovery --rekey` starts all three (age-keygen -y on the old
+/// identity's paste, the plugin's keygen, age-keygen for the new recovery
+/// identity and -y on its paste-back, age for the self-test and the sweep).
+/// A wrapper in front of each fake logs which of `CHILD_ENV_REMOVED`'s names
+/// it was given, never a value: ai-env had all five, with stand-in values,
+/// and no tool got one (the plugin's keygen got all five before it was
+/// started as every age-family tool is, `age_cmd::tool_cmd`).
+#[test]
+fn ceremony_tools_never_inherit_a_credential() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let names = ai_env_cli::age_cmd::CHILD_ENV_REMOVED;
+    let shim = Shim::new();
+    let seen = shim.dir.path().join("env.log");
+    let fields: String = names.iter().map(|n| format!(" {n}=${{{n}+set}}")).collect();
+    for name in ["age", "age-keygen", "age-plugin-se"] {
+        let real = shim.dir.path().join(format!("real-{name}"));
+        fs::rename(shim.dir.path().join(name), &real).unwrap();
+        let wrapper = format!("#!/bin/sh\necho \"{name}{fields}\" >> '{}'\nexec /bin/sh '{}' \"$@\"\n", seen.display(), real.display());
+        fs::write(shim.dir.path().join(name), wrapper).unwrap();
+        fs::set_permissions(shim.dir.path().join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let work = tempfile::tempdir().unwrap();
+    let keystore = work.path().join("ks");
+    fs::create_dir_all(&keystore).unwrap();
+    fs::write(work.path().join(".env"), fixture_container()).unwrap();
+    // Stand-ins, no credential's shape: only whether each name is set is read.
+    let values: Vec<String> = names.iter().map(|n| format!("{}-ceremony-stand-in", n.to_ascii_lowercase())).collect();
+    let envs: Vec<(&str, &str)> = names.iter().zip(&values).map(|(n, v)| (*n, v.as_str())).collect();
+    let out = run_ai_env_stdin_env(
+        &shim,
+        &keystore,
+        work.path(),
+        &["keys", "restore", "rkey", "--new-recovery", "--rekey", "."],
+        "AGE-SECRET-KEY-1FAKEOLDIDENTITY\nAGE-SECRET-KEY-1FAKENEWRECOVERY\n",
+        &envs,
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = fs::read_to_string(&seen).unwrap();
+    for tool in ["age ", "age-keygen ", "age-plugin-se "] {
+        assert!(log.lines().any(|l| l.starts_with(tool)), "{tool}was started: {log}");
+    }
+    let given: Vec<&str> = log.lines().filter(|l| l.contains("=set")).collect();
+    assert!(given.is_empty(), "a tool was given a credential's name: {given:?}");
+}

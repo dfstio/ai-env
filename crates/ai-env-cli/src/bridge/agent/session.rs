@@ -60,6 +60,30 @@
 //! - **End.** `exit` is delivered as `SpawnEvent::Exit`; once the consumer
 //!   marked every chunk this session delivered (at most `dead_after`) the
 //!   exit's seq is acked, which releases the spawn, and the socket is closed 1000.
+//! - **Credential** (S7, [`super::Delivery`], for its own VM and a new spawn
+//!   only, exit 9). On each `hello_ok` before the spawn goes out, the gate
+//!   pass must still stand (else exit 9, nothing more sent: run the command
+//!   again) and the shim must offer `credential_cache` (else exit 7: an
+//!   older image). A cache holding the delivery's name and tag is a hit: the
+//!   spawn just names it. On a miss the value goes out first in its own
+//!   `credential` frame (the shim handles frames in order, so the `spawn`
+//!   right behind it finds it cached); without a value in hand the session
+//!   ends with `CredentialMissing` (exit 5) before any spawn, and nothing
+//!   retries: the message says to run the command again, which unseals the
+//!   token. `no_credential` (the cache emptied in between) delivers once
+//!   more, a second is exit 8; never for a one-shot spawn (a protocol error),
+//!   whose value never rides a cacheable frame. `credential_err suspended`
+//!   is waited out as a suspend and delivered once more; a second, after the
+//!   VM ran again, is exit 8 (its cache stays closed). The VM's row names it
+//!   as a holder (`credential_at`) before the value leaves the Mac, and on
+//!   every hit or running spawn seen if it does not yet; the audit row
+//!   `credential_deliver` means acknowledged (`credential_ok`). The value is
+//!   dropped once the spawn runs: at `spawned`, or on a reattach that finds
+//!   it running (the shim never sends `spawned` again). A
+//!   `--credential-file` delivery rides that one `spawn` inline instead
+//!   (recorded at `spawned`), as S6's `spawn.secrets` did: a spawn sent again
+//!   after a lost socket carries it again, to the same VM only, which starts
+//!   an id at most once.
 //! - **Records.** Audit rows `endpoint_429` (retry_after, waited_ms: the wait
 //!   the 429 set; written at the 429, before that wait, so also when the 429
 //!   ends the session or a detach cuts its wait short), `agent_reconnect`
@@ -67,7 +91,8 @@
 //!   `SpawnEvent::Note` lines for the operator, each loss, reattach or spawn
 //!   sent again followed by a `SpawnEvent::Link`; TRACE in `conn`.
 use super::conn::{close_text, Activity, AgentConn, AgentReceiver, AgentSender, HelloOk, Trace, CLOSE_WAIT};
-use super::{AgentEnv, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnIo, SpawnOutcome, SpawnSpec, Start};
+use super::credential::{record_holder, Held};
+use super::{AgentEnv, Delivery, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnIo, SpawnOutcome, SpawnSpec, Start};
 use crate::bridge::api::{AuthToken, EndpointClient, HealthReply, MicrovmApi, VmInfo, VmState, APP_PORT};
 use crate::bridge::config::{Keepalive, Rotation};
 use crate::bridge::errors::BridgeError;
@@ -75,15 +100,17 @@ use crate::bridge::transport::DialError;
 use crate::bridge::vm::cmd::audit_event;
 use crate::bridge::vm::token::mint;
 use crate::wire::chunk::{decode, raw_len, Chunker};
-use crate::wire::frame::{Chunk, Deliver, ErrorCode, EventKind, Frame, ResumePoint, ResumeStatus, Scope, Sig, SpawnErrCode, SpawnId, SpawnStatus, CLOSE_NORMAL, STDERR_BUFFER_BYTES, STDIN_WINDOW_BYTES};
-use crate::wire::redact::scrub;
+use crate::wire::frame::{
+    Chunk, CredentialErrCode, Deliver, ErrorCode, EventKind, Frame, ResumePoint, ResumeStatus, Scope, Sig, SpawnErrCode, SpawnId, SpawnStatus, CAP_CREDENTIAL_CACHE, CLOSE_NORMAL, STDERR_BUFFER_BYTES, STDIN_WINDOW_BYTES,
+};
+use crate::wire::redact::{scrub, Secret};
 use futures_util::future::BoxFuture;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 /// [`super::run_spawn`]'s body (see the module doc).
-pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo) -> Result<SpawnOutcome, BridgeError> {
+pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo, delivery: Option<Delivery>) -> Result<SpawnOutcome, BridgeError> {
     // D1, for every caller (`vm exec` and `vm attach` refuse such rows before any call too).
     if env.target.shell {
         return Err(BridgeError::Policy(format!(
@@ -91,9 +118,16 @@ pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, sta
             env.target.vm_id
         )));
     }
+    // S7, for every caller too: a delivery goes only to the VM its pass was minted for, with a new spawn.
+    if let Some(d) = &delivery {
+        d.check_target(&env.target.vm_id)?;
+        if !matches!(start, Start::New(_)) {
+            return Err(BridgeError::Policy("a credential goes only with a new spawn".into()));
+        }
+    }
     crate::wire::redact::register_secret(env.target.session_token.expose());
     let token = mint_token(env).await?;
-    let mut session = Session { env, io, trace: Trace::from_env(env.paths), token, st: State::new(start), attached: false, paused: false, control_open: true };
+    let mut session = Session { env, io, trace: Trace::from_env(env.paths), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery, cred_retried: false, cred_suspended: false };
     session.run().await
 }
 
@@ -111,7 +145,8 @@ enum End {
 
 /// What a socket's reader task reports.
 enum Inbound {
-    Frame(Frame),
+    /// Boxed: `hello_ok` makes a [`Frame`] large, the other variants are a `String`.
+    Frame(Box<Frame>),
     /// The socket ended (the peer's Close, EOF, a read error): why.
     Ended(String),
     /// Input the wire forbids (binary, malformed, another version).
@@ -177,7 +212,7 @@ async fn read_all(mut rx: AgentReceiver, sink: mpsc::UnboundedSender<Inbound>) {
     loop {
         let report = match rx.recv().await {
             Ok(Some(frame)) => {
-                let _ = sink.send(Inbound::Frame(frame));
+                let _ = sink.send(Inbound::Frame(Box::new(frame)));
                 continue;
             }
             Ok(None) => Inbound::Ended(format!("the socket closed{}", close_text(rx.close_frame().as_ref()))),
@@ -509,6 +544,12 @@ struct Session<'e, 'a, A: MicrovmApi, E: EndpointClient> {
     /// socket any moment): spawn frames wait for the new socket.
     paused: bool,
     control_open: bool,
+    /// The credential the new spawn gets (S7).
+    delivery: Option<Delivery>,
+    /// `no_credential` was answered by delivering again once.
+    cred_retried: bool,
+    /// `credential_err suspended` was waited out once: a second ends the session.
+    cred_suspended: bool,
 }
 
 impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
@@ -773,6 +814,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
     async fn adopt(&mut self, ok: &HelloOk, link: &mut Link) -> Result<(), BridgeError> {
         if self.st.phase == Phase::ToSpawn {
             self.no_pending_detach()?;
+            self.offer_credential(ok, link).await?;
             self.send_spawn(link).await;
             return Ok(());
         }
@@ -795,6 +837,12 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 if !self.st.started {
                     let (pid, pgid) = found.map_or((0, 0), |s| (s.pid, s.pgid));
                     self.started(pid, pgid, None);
+                    // `spawned` died with its socket (and maybe the `credential_ok`
+                    // before it): the spawn runs, so the VM holds the credential.
+                    if let Some(d) = &self.delivery {
+                        record_holder(self.env.paths, self.vm(), d.tag(), Held::Seen);
+                    }
+                    self.spawn_has_its_copy();
                 }
                 self.flush(link).await;
                 Ok(())
@@ -808,6 +856,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             ResumeStatus::Unknown if self.st.phase == Phase::SpawnSent => {
                 self.no_pending_detach()?;
                 self.st.resent = true;
+                self.offer_credential(ok, link).await?;
                 self.send_spawn(link).await;
                 Ok(())
             }
@@ -815,19 +864,90 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         }
     }
 
+    /// Before a `spawn` that names the delivery's credential (or carries a
+    /// one-shot value): the pass must still stand, then hit or miss on the
+    /// cache `ok` describes; on a miss its own `credential` frame goes out
+    /// first (see the module doc).
+    async fn offer_credential(&mut self, ok: &HelloOk, link: &mut Link) -> Result<(), BridgeError> {
+        let Some(d) = &self.delivery else { return Ok(()) };
+        d.still_gated(crate::wire::time::unix_now(), self.st.resent)?;
+        if d.one_shot() {
+            return Ok(());
+        }
+        if !ok.caps.iter().any(|c| c == CAP_CREDENTIAL_CACHE) {
+            return Err(BridgeError::Endpoint(format!(
+                "{} runs a shim that cannot hold a credential (image version {}, no {CAP_CREDENTIAL_CACHE} capability): start a VM of the current image",
+                self.vm(),
+                ok.image_version.as_deref().unwrap_or("unknown")
+            )));
+        }
+        let hit = ok.has_credentials && ok.credential.credential_name.as_deref() == Some(d.name()) && ok.credential.credential_tag.as_deref() == Some(d.tag());
+        if hit {
+            tracing::info!("vm {}: the VM holds credential {} (tag {}): not sent", self.vm(), d.name(), d.tag());
+            // Its row names it, even if the delivery that put it there was never recorded.
+            record_holder(self.env.paths, self.vm(), d.tag(), Held::Seen);
+            return Ok(());
+        }
+        self.send_credential(link).await
+    }
+
+    /// The delivery's `credential` frame, or `CredentialMissing` without a value.
+    async fn send_credential(&mut self, link: &mut Link) -> Result<(), BridgeError> {
+        let vm = self.vm().to_string();
+        let Some(d) = &self.delivery else { return Ok(()) };
+        let Some(secret) = d.frame_secret() else {
+            return Err(d.missing(&vm, "nothing was started; run the command again"));
+        };
+        let frame = Frame::Credential { name: d.name().to_string(), secret, tag: Some(d.tag().to_string()) };
+        // Recorded before it leaves: an answer lost with the socket must not leave the VM unlisted.
+        record_holder(self.env.paths, &vm, d.tag(), Held::Sent);
+        link.send(&frame).await;
+        Ok(())
+    }
+
     async fn send_spawn(&mut self, link: &mut Link) {
         let Some(spec) = &self.st.spec else { return };
+        let (secrets, credential, deliver_secret) = match &self.delivery {
+            Some(d) if d.one_shot() => (d.frame_secret().map(|v| BTreeMap::from([(d.name().to_string(), v)])).unwrap_or_default(), None, d.deliver()),
+            Some(d) => (BTreeMap::new(), Some(d.name().to_string()), d.deliver()),
+            None => (BTreeMap::<String, Secret<String>>::new(), None, Deliver::Fd),
+        };
+        // A one-shot value rides this spawn: recorded before it leaves, as a `credential` frame is.
+        if let Some(d) = self.delivery.as_ref().filter(|_| !secrets.is_empty()) {
+            record_holder(self.env.paths, self.vm(), d.tag(), Held::Sent);
+        }
         let frame = Frame::Spawn {
             spawn_id: self.st.id.clone(),
             argv: spec.argv.clone(),
             cwd: spec.cwd.clone(),
             env: spec.env.clone(),
-            secrets: BTreeMap::new(),
-            deliver_secret: Deliver::Fd,
+            secrets,
+            deliver_secret,
             detach_grace_s: spec.detach_grace_s,
+            credential,
         };
         link.send(&frame).await;
         self.st.phase = Phase::SpawnSent;
+    }
+
+    /// `credential_ok`, or a one-shot spawn that started: the VM acknowledged
+    /// the credential, so the audit says so (its row named it before it left).
+    fn credential_delivered(&self, source: &str) {
+        if let Some(d) = &self.delivery {
+            super::credential::record_delivery(self.env.paths, self.vm(), Some(&self.st.id.to_string()), d, source);
+        }
+    }
+
+    /// The spawn runs (`spawned`, or a reattach that found it running), so it
+    /// has its copy: a one-shot delivery is recorded as acknowledged, once
+    /// (while it still holds its value), and ours is dropped (zeroized).
+    fn spawn_has_its_copy(&mut self) {
+        if self.delivery.as_ref().is_some_and(|d| d.one_shot() && d.holds_value()) {
+            self.credential_delivered("file");
+        }
+        if let Some(d) = &mut self.delivery {
+            d.drop_value();
+        }
     }
 
     // ---- serving one socket ---------------------------------------------------------------
@@ -852,7 +972,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             tokio::select! {
                 m = link.inbound.recv() => match m {
                     Some(Inbound::Frame(frame)) => {
-                        if let Some(end) = self.on_frame(frame, link, &mut rot.superseded).await? {
+                        if let Some(end) = self.on_frame(*frame, link, &mut rot.superseded).await? {
                             return Ok(end);
                         }
                     }
@@ -961,7 +1081,42 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 if !self.st.started {
                     self.started(pid, pgid, claude_version);
                 }
+                self.spawn_has_its_copy();
                 self.flush(link).await;
+            }
+            Frame::CredentialOk { name, cached: true, .. } if self.delivery.as_ref().is_some_and(|d| d.name() == name) => self.credential_delivered("sealed"),
+            Frame::CredentialOk { .. } => {}
+            // A second refusal for a suspend after the VM ran again: its cache stays
+            // closed (no `/resume` reached the shim), and waiting again would only
+            // send the value again, without end.
+            Frame::CredentialErr { code: CredentialErrCode::Suspended, .. } if self.cred_suspended => {
+                let vm = self.vm();
+                return Err(BridgeError::Transport(format!(
+                    "{vm} refused the credential as suspending again after GetMicrovm said it runs: its shim's credential cache stays closed until a /resume reaches it, so nothing was started (`ai-env vm suspend {vm}`, then `ai-env vm resume {vm}`, reopens it; or start a new VM); run the command again"
+                )));
+            }
+            // The cache closed for a suspend: the spawn behind it found nothing, and the reattach delivers once more.
+            Frame::CredentialErr { code: CredentialErrCode::Suspended, .. } => {
+                self.cred_suspended = true;
+                return Ok(Some(End::Suspended));
+            }
+            Frame::CredentialErr { code: CredentialErrCode::Draining, .. } => return Err(BridgeError::Terminated(format!("{} is stopping: it accepts no credential", self.vm()))),
+            Frame::CredentialErr { name, code, message } => {
+                return Err(BridgeError::Protocol(format!("the shim refused credential {name} ({}): {}", wire_name(&code), scrub(&message))));
+            }
+            // The cache emptied between the delivery and the spawn (a suspend in
+            // between). Never for a one-shot spawn, which names no credential: its
+            // value never rides a frame the shim caches (that answer is a protocol error below).
+            Frame::SpawnErr { code: SpawnErrCode::NoCredential, .. } if self.delivery.as_ref().is_some_and(|d| !d.one_shot()) => {
+                if self.cred_retried {
+                    return Err(BridgeError::Transport(format!("{} dropped the credential twice before spawn {} started: run the command again", self.vm(), self.st.id)));
+                }
+                self.cred_retried = true;
+                if let Some(d) = &self.delivery {
+                    d.still_gated(crate::wire::time::unix_now(), true)?;
+                }
+                self.send_credential(link).await?;
+                self.send_spawn(link).await;
             }
             Frame::SpawnErr { spawn_id, code, message } => {
                 // The re-sent spawn's id is taken: the first `spawn` reached the VM
@@ -1121,9 +1276,11 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
     async fn rotated(&mut self, link: &mut Link, rotated: Rotated) -> Result<(), BridgeError> {
         // stdin acks the old socket already read still count.
         while let Ok(m) = link.inbound.try_recv() {
-            if let Inbound::Frame(Frame::StdinAck { spawn_id, seq }) = m {
-                if spawn_id == self.st.id {
-                    self.st.stdin_acked(seq);
+            if let Inbound::Frame(f) = m {
+                if let Frame::StdinAck { spawn_id, seq } = *f {
+                    if spawn_id == self.st.id {
+                        self.st.stdin_acked(seq);
+                    }
                 }
             }
         }
@@ -1448,6 +1605,7 @@ mod tests {
     use crate::bridge::api::{Call, FakeMicrovmApi, IdleSpec, RunSpec, FAKE_IMAGE_ARN, TOKEN_HEADER};
     use crate::bridge::config::Paths;
     use crate::bridge::transport::AgentDial;
+    use crate::bridge::vm::registry::{RowStatus, VmRow};
     use crate::errors::CliError;
     use crate::wire::frame::{HelloErrCode, Resumed, ACK_EVERY_BYTES, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED};
     use crate::wire::redact::Secret;
@@ -1727,6 +1885,8 @@ mod tests {
             run_hook_seen: true,
             spawns,
             resumed,
+            caps: vec![],
+            credential: Default::default(),
         }
     }
 
@@ -1755,7 +1915,7 @@ mod tests {
     /// A session as `run` builds it (a fresh token), before its first socket.
     async fn session<'e, 'a>(env: &'e AgentEnv<'a, FakeMicrovmApi, FakeMicrovmApi>, io: SpawnIo, start: Start) -> Session<'e, 'a, FakeMicrovmApi, FakeMicrovmApi> {
         let token = mint_token(env).await.unwrap();
-        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true }
+        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false }
     }
 
     /// A socket to the rig's endpoint with the session's token, and the endpoint's end of it.
@@ -3449,5 +3609,699 @@ mod tests {
             r.step
         }).collect();
         assert_eq!(steps.last(), Some(&p.backoff_max), "the step doubles up to backoff_max: {steps:?}");
+    }
+
+    // ---- S7: credential delivery ---------------------------------------------------------
+
+    const CRED_NAME: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+    const CRED_TAG: &str = "seal0123456789ab";
+
+    /// A stand-in credential, built at run time.
+    fn cred_value() -> String {
+        format!("dummy-credential-{}", "v".repeat(24))
+    }
+
+    /// The delivery's parts: the test credential, with `secret` in hand or not.
+    fn parts(secret: Option<String>, one_shot: bool) -> super::super::DeliveryParts {
+        super::super::DeliveryParts { name: CRED_NAME.into(), tag: CRED_TAG.into(), deliver: Deliver::Fd, secret: secret.map(Secret::new), one_shot }
+    }
+
+    /// A delivery to the rig's VM behind a fresh test pass.
+    fn delivery(rig: &Rig, secret: Option<String>, one_shot: bool) -> super::super::Delivery {
+        let now = crate::wire::time::unix_now();
+        let pass = crate::bridge::egress::GatePass::for_tests(&rig.vm.id, now);
+        super::super::Delivery::new(&pass, &rig.vm.id, now, parts(secret, one_shot)).unwrap()
+    }
+
+    /// A delivery of the test credential (`secret` in hand or not,
+    /// `one_shot` or not), built 5 s into a pass minted `age_s` ago (it stood then).
+    fn aged(rig: &Rig, age_s: u64, secret: Option<String>, one_shot: bool) -> super::super::Delivery {
+        let now = crate::wire::time::unix_now();
+        let pass = crate::bridge::egress::GatePass::for_tests(&rig.vm.id, now - age_s);
+        super::super::Delivery::new(&pass, &rig.vm.id, now - age_s + 5, parts(secret, one_shot)).unwrap()
+    }
+
+    /// A `hello_ok` from an S7 shim whose cache holds `held` (name, tag), if anything.
+    fn hello_ok_s7(held: Option<(&str, &str)>) -> Frame {
+        hello_ok_s7_with(vec![], vec![], held)
+    }
+
+    /// [`hello_ok_s7`] with these spawns and answers to the resume.
+    fn hello_ok_s7_with(spawns: Vec<SpawnStatus>, resumed: Vec<Resumed>, held: Option<(&str, &str)>) -> Frame {
+        let Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, uptime_s, run_hook_seen, .. } = hello_ok(vec![], vec![]) else { unreachable!() };
+        let credential = crate::wire::frame::CredentialView { credential_name: held.map(|h| h.0.to_string()), credential_tag: held.map(|h| h.1.to_string()), credential_at: held.map(|_| "2026-10-07T12:00:00Z".to_string()), credential_holders: 0 };
+        Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials: held.is_some(), uptime_s, run_hook_seen, spawns, resumed, caps: vec![CAP_CREDENTIAL_CACHE.to_string()], credential }
+    }
+
+    /// A `hello_ok` frame as `adopt` takes it.
+    fn ok_of(f: Frame) -> HelloOk {
+        let Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, caps, credential } = f else { panic!("not a hello_ok") };
+        HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, caps, credential }
+    }
+
+    /// A registry row for the rig's VM (the rig writes none; a holder is recorded in it).
+    fn seed_row(rig: &Rig) {
+        let row = VmRow { id: rig.vm.id.clone(), status: RowStatus::Running, client_token: "0192f1e0-0000-7000-8000-0000000000a1".into(), ..VmRow::default() };
+        crate::bridge::vm::registry::write_row(&rig.paths, &row).unwrap();
+    }
+
+    /// The rig's VM's row as it is now.
+    fn row_of(rig: &Rig) -> VmRow {
+        crate::bridge::vm::registry::read_row(&rig.paths, &rig.vm.id).unwrap().unwrap()
+    }
+
+    /// The row as one whose holder record failed (or a delivery before S7's fix wave): no `credential_at`.
+    fn unrecord(rig: &Rig) {
+        crate::bridge::vm::registry::update_row(&rig.paths, &rig.vm.id, |r| r.credential_at = None).unwrap();
+    }
+
+    /// No file under the rig's root (the audit, the rows, the CLI log) holds the stand-in credential.
+    fn assert_value_off_disk(rig: &Rig) {
+        let value = cred_value();
+        let (mut todo, mut leaks) = (vec![rig.paths.root.clone()], Vec::new());
+        while let Some(dir) = todo.pop() {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => todo.push(e.path()),
+                    Ok(t) if t.is_file() && std::fs::read(e.path()).is_ok_and(|b| b.windows(value.len()).any(|w| w == value.as_bytes())) => leaks.push(e.path()),
+                    _ => {}
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "{} files hold the value: {leaks:?}", leaks.len());
+    }
+
+    /// The spawn is answered `spawned`, then exits 0.
+    async fn run_and_exit(ws: &mut Ws, id: &SpawnId) {
+        put(ws, &Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None }).await;
+        put(ws, &exit0(id, 1)).await;
+    }
+
+    /// A miss: the value goes out in its own `credential` frame, then a
+    /// `spawn` naming it with no secret of its own; `credential_ok` records
+    /// the delivery in the audit.
+    #[tokio::test]
+    async fn a_cache_miss_sends_the_credential_then_the_spawn_naming_it() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let value = cred_value();
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(None)).await;
+                match frame(&mut ws).await {
+                    Frame::Credential { name, secret, tag } => assert!(name == CRED_NAME && secret.expose() == &value && tag.as_deref() == Some(CRED_TAG), "{name} {tag:?}"),
+                    other => panic!("the credential first, got {other:?}"),
+                }
+                let Frame::Spawn { spawn_id, secrets, credential, deliver_secret, .. } = frame(&mut ws).await else { panic!("no spawn") };
+                assert!(secrets.is_empty() && credential.as_deref() == Some(CRED_NAME) && deliver_secret == Deliver::Fd, "{credential:?}");
+                put(&mut ws, &Frame::CredentialOk { name: CRED_NAME.into(), cached: true, tag: Some(CRED_TAG.into()) }).await;
+                run_and_exit(&mut ws, &spawn_id).await;
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(value.clone()), false))), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(result.unwrap().exit.code, Some(0));
+            let rows = rig.audit("credential_deliver");
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!((rows[0]["detail"]["name"].as_str(), rows[0]["detail"]["tag"].as_str(), rows[0]["detail"]["source"].as_str()), (Some(CRED_NAME), Some(CRED_TAG), Some("sealed")));
+            assert!(!rows[0].to_string().contains(&value));
+        })
+        .await;
+    }
+
+    /// A hit: the VM's cache holds this name and tag, so only the spawn goes
+    /// out — with no value even in hand, and nothing recorded as delivered.
+    #[tokio::test]
+    async fn a_cache_hit_sends_only_the_spawn() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(Some((CRED_NAME, CRED_TAG)))).await;
+                let Frame::Spawn { spawn_id, secrets, credential, .. } = frame(&mut ws).await else { panic!("the spawn alone") };
+                assert!(secrets.is_empty() && credential.as_deref() == Some(CRED_NAME));
+                run_and_exit(&mut ws, &spawn_id).await;
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, None, false))), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(result.unwrap().exit.code, Some(0));
+            assert!(rig.audit("credential_deliver").is_empty());
+        })
+        .await;
+    }
+
+    /// Another tag in the cache (a token sealed since) is a miss; with no
+    /// value in hand the session ends `CredentialMissing` (exit 5) before any
+    /// spawn goes out, and its message tells the operator to run the command
+    /// again (which unseals the token): nothing retries it.
+    #[tokio::test]
+    async fn a_predicted_hit_that_misses_ends_before_the_spawn() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(Some((CRED_NAME, "another-seal")))).await;
+                // Nothing more: the socket closes without a spawn.
+                let next = tokio::time::timeout(LIMIT, ws.next()).await.expect("the socket ends");
+                assert!(!matches!(next, Some(Ok(Message::Text(_)))), "no frame after hello_ok: {next:?}");
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, None, false))), consume(cio, None, Duration::ZERO), shim);
+            let e = result.unwrap_err();
+            assert!(matches!(&e, BridgeError::CredentialMissing(m) if m.contains(CRED_TAG)), "{e}");
+            let cli = CliError::from(e);
+            assert_eq!(cli.exit_code(), 5);
+            assert!(cli.to_string().contains("nothing was started; run the command again, which unseals the token"), "{cli}");
+        })
+        .await;
+    }
+
+    /// An S6 shim (no `credential_cache`) gets no credential: exit 7 before
+    /// any frame carries it.
+    #[tokio::test]
+    async fn a_shim_without_the_cache_gets_no_credential() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let value = cred_value();
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok(vec![], vec![])).await;
+                let next = tokio::time::timeout(LIMIT, ws.next()).await.expect("the socket ends");
+                assert!(!matches!(next, Some(Ok(Message::Text(_)))), "no frame after hello_ok: {next:?}");
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(value), false))), consume(cio, None, Duration::ZERO), shim);
+            let e = result.unwrap_err();
+            assert!(e.to_string().contains("cannot hold a credential"), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 7);
+        })
+        .await;
+    }
+
+    /// `no_credential` (the cache emptied between the delivery and the
+    /// spawn): delivered once more with the same spawn; a second is exit 8.
+    #[tokio::test]
+    async fn no_credential_delivers_once_more_then_gives_up() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(None)).await;
+                let mut ids = Vec::new();
+                for _ in 0..2 {
+                    assert!(matches!(frame(&mut ws).await, Frame::Credential { .. }), "a credential first");
+                    let Frame::Spawn { spawn_id, .. } = frame(&mut ws).await else { panic!("then the spawn") };
+                    put(&mut ws, &Frame::SpawnErr { spawn_id: spawn_id.clone(), code: SpawnErrCode::NoCredential, message: "no credential".into() }).await;
+                    ids.push(spawn_id);
+                }
+                assert_eq!(ids[0], ids[1], "the same spawn, which never started");
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(cred_value()), false))), consume(cio, None, Duration::ZERO), shim);
+            let e = result.unwrap_err();
+            assert!(e.to_string().contains("dropped the credential twice"), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 8);
+        })
+        .await;
+    }
+
+    /// `--credential-file`: the value rides that one spawn inline (S6's
+    /// path, any shim), never a `credential` frame. The VM's row names it as
+    /// a holder before that spawn leaves the Mac (M1: unless `spawned` is
+    /// lost, the only record of it, since no cache hit names it later), and
+    /// the audit records the delivery when the spawn starts.
+    #[tokio::test]
+    async fn a_one_shot_credential_rides_its_spawn_inline() {
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let value = cred_value();
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok(vec![], vec![])).await;
+                let Frame::Spawn { spawn_id, secrets, credential, .. } = frame(&mut ws).await else { panic!("the spawn alone") };
+                assert!(credential.is_none() && secrets.len() == 1 && secrets.get(CRED_NAME).is_some_and(|v| v.expose() == &value));
+                let row = row_of(&rig);
+                assert_eq!((row.credential_at.is_some(), row.credential_tag.as_deref()), (true, Some(CRED_TAG)), "recorded before the value left");
+                run_and_exit(&mut ws, &spawn_id).await;
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(value.clone()), true))), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(result.unwrap().exit.code, Some(0));
+            let rows = rig.audit("credential_deliver");
+            assert_eq!((rows.len(), rows[0]["detail"]["source"].as_str()), (1, Some("file")));
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// A delivery gated for another VM, or with a reattach, never starts a session.
+    #[tokio::test]
+    async fn a_delivery_goes_only_to_its_own_vm_with_a_new_spawn() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let now = crate::wire::time::unix_now();
+            let pass = crate::bridge::egress::GatePass::for_tests("microvm-other", now);
+            let parts = || super::super::DeliveryParts { name: CRED_NAME.into(), tag: CRED_TAG.into(), deliver: Deliver::Fd, secret: Some(Secret::new(cred_value())), one_shot: false };
+            let e = super::super::Delivery::new(&pass, &rig.vm.id, now, parts()).unwrap_err();
+            assert_eq!(CliError::from(e).exit_code(), 9, "a pass for another VM");
+            let stale = crate::bridge::egress::GatePass::for_tests(&rig.vm.id, now - crate::bridge::egress::GATE_PASS_MAX_AGE_S - 1);
+            assert_eq!(CliError::from(super::super::Delivery::new(&stale, &rig.vm.id, now, parts()).unwrap_err()).exit_code(), 9, "a pass too old");
+            let other = super::super::Delivery::new(&pass, "microvm-other", now, parts()).unwrap();
+            let (sio, _cio) = spawn_channels(8);
+            let e = super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(other)).await.unwrap_err();
+            assert!(matches!(&e, BridgeError::Policy(m) if m.contains("microvm-other")), "{e}");
+            let (sio, _cio) = spawn_channels(8);
+            let attach = Start::Attach { spawn_id: SpawnId::new_v7(), from_seq: None, err_from_seq: None };
+            let e = super::super::run_spawn_with(&env, attach, sio, Some(delivery(&rig, Some(cred_value()), false))).await.unwrap_err();
+            assert!(matches!(&e, BridgeError::Policy(m) if m.contains("new spawn")), "{e}");
+            assert!(rig.endpoint.attempts().is_empty(), "nothing dialed");
+        })
+        .await;
+    }
+
+    // ---- S7 fix wave: delivery ----------------------------------------------------------
+
+    /// M1: the VM's row names it as a holder before the value leaves the
+    /// Mac, so a socket lost before `credential_ok` and `spawned` never
+    /// leaves it unlisted; and the reattach that sees it hold the seal (the
+    /// spawn found running, or a hit for the spawn sent again) fills a row
+    /// that names no delivery (wiped here after the send, as a record that
+    /// failed). Nothing was acknowledged: no `credential_deliver` row.
+    #[tokio::test]
+    async fn a_delivery_whose_answers_were_lost_still_lists_the_vm() {
+        for resumed in [ResumeStatus::Ok, ResumeStatus::Unknown] {
+            bounded(async {
+                let rig = rig(true).await;
+                seed_row(&rig);
+                let env = rig.env(policy());
+                let (sio, cio) = spawn_channels(8);
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    assert!(matches!(frame(&mut ws1).await, Frame::Hello { .. }));
+                    put(&mut ws1, &hello_ok_s7(None)).await;
+                    assert!(matches!(frame(&mut ws1).await, Frame::Credential { .. }), "the credential first");
+                    let Frame::Spawn { spawn_id: id, .. } = frame(&mut ws1).await else { panic!("then the spawn") };
+                    let row = row_of(&rig);
+                    assert_eq!((row.credential_at.is_some(), row.credential_tag.as_deref()), (true, Some(CRED_TAG)), "recorded before the value left");
+                    unrecord(&rig);
+                    // Cut (no Close) before `credential_ok` and `spawned`.
+                    drop(ws1);
+                    let mut ws2 = rig.endpoint.next().await;
+                    let Frame::Hello { resume, .. } = frame(&mut ws2).await else { panic!("no hello") };
+                    assert_eq!(resume.len(), 1, "the hello resumes the spawn");
+                    let held = Some((CRED_NAME, CRED_TAG));
+                    if resumed == ResumeStatus::Ok {
+                        put(&mut ws2, &hello_ok_s7_with(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }], held)).await;
+                        put(&mut ws2, &exit0(&id, 1)).await;
+                    } else {
+                        put(&mut ws2, &hello_ok_s7_with(vec![], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Unknown }], held)).await;
+                        let Frame::Spawn { spawn_id, secrets, credential, .. } = frame(&mut ws2).await else { panic!("the spawn alone, again: a hit") };
+                        assert!(spawn_id == id && secrets.is_empty() && credential.as_deref() == Some(CRED_NAME));
+                        run_and_exit(&mut ws2, &id).await;
+                    }
+                    ws2
+                };
+                let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(cred_value()), false))), consume(cio, None, Duration::ZERO), shim);
+                assert_eq!(result.unwrap().exit.code, Some(0), "{resumed:?}");
+                let row = row_of(&rig);
+                assert_eq!((row.credential_at.is_some(), row.credential_tag.as_deref()), (true, Some(CRED_TAG)), "named again on the reattach ({resumed:?})");
+                assert!(rig.audit("credential_deliver").is_empty(), "nothing was acknowledged ({resumed:?})");
+                assert_value_off_disk(&rig);
+            })
+            .await;
+        }
+    }
+
+    /// M5, M32: the Mac's copy goes once the spawn runs: at `spawned`, and
+    /// on a reattach that finds it running after `spawned` was lost with its
+    /// socket (the shim never sends it again). A one-shot delivery is
+    /// recorded there, once (`credential_deliver`, source file); the running
+    /// spawn fills a row that names no delivery yet.
+    #[tokio::test]
+    async fn the_macs_copy_goes_once_the_spawn_runs_or_is_found_running() {
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            for (one_shot, found) in [(false, false), (true, false), (false, true), (true, true)] {
+                let what = format!("one_shot={one_shot}, found={found}");
+                let (sio, _cio) = spawn_channels(8);
+                let mut s = session(&env, sio, Start::New(cat_spec())).await;
+                s.delivery = Some(delivery(&rig, Some(cred_value()), one_shot));
+                s.st.phase = Phase::SpawnSent;
+                let (mut link, _ws) = link_to(&rig, &s).await;
+                let id = s.st.id.clone();
+                let spawned = || Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None };
+                let before = rig.audit("credential_deliver").len();
+                if found {
+                    unrecord(&rig);
+                    let ok = ok_of(hello_ok_s7_with(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }], Some((CRED_NAME, CRED_TAG))));
+                    s.adopt(&ok, &mut link).await.unwrap();
+                    assert!(row_of(&rig).credential_at.is_some(), "the running spawn names the VM ({what})");
+                } else {
+                    s.on_frame(spawned(), &mut link, &mut false).await.unwrap();
+                }
+                assert!(s.st.phase == Phase::Running && s.st.started, "{what}");
+                assert!(!s.delivery.as_ref().unwrap().holds_value(), "the value is dropped ({what})");
+                let rows = rig.audit("credential_deliver");
+                assert_eq!(rows.len() - before, usize::from(one_shot), "{what}");
+                if one_shot {
+                    assert_eq!(rows.last().unwrap()["detail"]["source"], "file", "{what}");
+                }
+                // A later `spawned` (or reattach) records nothing more.
+                s.on_frame(spawned(), &mut link, &mut false).await.unwrap();
+                assert_eq!(rig.audit("credential_deliver").len(), rows.len(), "{what}");
+            }
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M6: neither the value nor a spawn naming the credential leaves the
+    /// Mac on a gate pass older than its life (90 s): a VM that answers only
+    /// once the pass aged (here a delivery built 5 s into a pass now 100 s
+    /// old) gets no frame after `hello_ok`, from a session (a miss with the
+    /// value in hand; a hit, whose spawn would name the cached copy; a
+    /// one-shot spawn, which would carry the value inline) or from `vm
+    /// warm`; exit 9, saying nothing was sent and to run the command again;
+    /// the row names no holder.
+    #[tokio::test]
+    async fn a_pass_that_aged_before_the_vm_answered_sends_nothing() {
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let r = &rig;
+            let shim = move |held: Option<(&'static str, &'static str)>| async move {
+                let mut ws = r.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(held)).await;
+                let next = tokio::time::timeout(LIMIT, ws.next()).await.expect("the socket ends");
+                assert!(!matches!(next, Some(Ok(Message::Text(_)))), "no frame after hello_ok (hit={})", held.is_some());
+                ws
+            };
+            let refused = |e: BridgeError, what: &str| {
+                assert!(matches!(&e, BridgeError::Policy(m) if m.contains("ready for it (a slow") && m.contains("so nothing was sent; run the command again")), "{what}: {e}");
+                assert_eq!(CliError::from(e).exit_code(), 9, "{what}");
+            };
+            let value = || Some(cred_value());
+            for (secret, one_shot, held) in [(value(), false, None), (None, false, Some((CRED_NAME, CRED_TAG))), (value(), true, None)] {
+                let what = format!("value={}, one_shot={one_shot}, hit={}", secret.is_some(), held.is_some());
+                let (sio, cio) = spawn_channels(8);
+                let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(aged(&rig, 100, secret, one_shot))), consume(cio, None, Duration::ZERO), shim(held));
+                refused(result.unwrap_err(), &what);
+            }
+            let (warmed, _ws) = tokio::join!(super::super::credential::deliver_only(&env, aged(&rig, 100, value(), false)), shim(None));
+            refused(warmed.unwrap_err(), "vm warm");
+            assert!(row_of(&rig).credential_at.is_none(), "nothing left the Mac");
+            assert!(rig.audit("credential_deliver").is_empty());
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M6: nor after a reconnect once the pass aged (a lost socket, a
+    /// suspend waited out): neither the spawn sent again for a resume
+    /// answered `unknown` (after a miss, for a hit, or a one-shot spawn with
+    /// its value inline) nor the redelivery `no_credential` asks for goes
+    /// out: exit 9 each, nothing on the socket, and the message says that
+    /// nothing MORE was sent (the first spawn went out: the VM may hold a copy).
+    #[tokio::test]
+    async fn a_pass_that_aged_while_reconnecting_sends_nothing_again() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let value = || Some(cred_value());
+            let hit = Some((CRED_NAME, CRED_TAG));
+            // (the spawn sent again, or `no_credential`'s redelivery; the value; one-shot; what the cache holds)
+            for (resend, secret, one_shot, held) in [(true, value(), false, None), (true, None, false, hit), (true, value(), true, None), (false, value(), false, None)] {
+                let what = format!("resend={resend}, value={}, one_shot={one_shot}, hit={}", secret.is_some(), held.is_some());
+                let (sio, _cio) = spawn_channels(8);
+                let mut s = session(&env, sio, Start::New(cat_spec())).await;
+                s.delivery = Some(aged(&rig, 100, secret, one_shot));
+                s.st.phase = Phase::SpawnSent;
+                let (mut link, mut ws) = link_to(&rig, &s).await;
+                let id = s.st.id.clone();
+                let e = if resend {
+                    let ok = ok_of(hello_ok_s7_with(vec![], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Unknown }], held));
+                    s.adopt(&ok, &mut link).await.unwrap_err()
+                } else {
+                    let refused = Frame::SpawnErr { spawn_id: id.clone(), code: SpawnErrCode::NoCredential, message: "no credential".into() };
+                    s.on_frame(refused, &mut link, &mut false).await.err().expect("refused")
+                };
+                assert!(matches!(&e, BridgeError::Policy(m) if m.contains("ready for it again") && m.contains("so nothing more was sent (the VM may still hold the copy it had") && !m.contains("nothing was sent")), "{what}: {e}");
+                assert_eq!(CliError::from(e).exit_code(), 9, "{what}");
+                drop(link);
+                let next = tokio::time::timeout(LIMIT, ws.next()).await.expect("the socket ends");
+                assert!(!matches!(next, Some(Ok(Message::Text(_)))), "nothing went out ({what})");
+            }
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M6, the rule `prepare` gates again by (`fresh_enough`): a pass with at
+    /// least half its life left is kept (no extra reads); one past half its
+    /// life (an 89 s old pass) is not, nor is one that no longer stands (too
+    /// old, another VM's, a clock that went backwards). That `prepare` itself
+    /// gates again on it: the shim_bridge_local test
+    /// `prepare_gates_again_once_its_pass_is_past_half_its_life`.
+    #[test]
+    fn fresh_enough_keeps_only_a_pass_with_half_its_life_left() {
+        use crate::bridge::egress::{GatePass, GATE_PASS_MAX_AGE_S};
+        let (fresh, now, vm) = (super::super::credential::fresh_enough, 1_000_000, "microvm-1");
+        let aged = |age: u64| GatePass::for_tests(vm, now - age);
+        for age in [0, 30, GATE_PASS_MAX_AGE_S / 2] {
+            assert!(fresh(&aged(age), vm, now), "{age} s old: kept");
+        }
+        for age in [GATE_PASS_MAX_AGE_S / 2 + 1, 89, GATE_PASS_MAX_AGE_S, GATE_PASS_MAX_AGE_S + 1] {
+            assert!(!fresh(&aged(age), vm, now), "{age} s old: gated again");
+        }
+        assert!(!fresh(&aged(0), "microvm-other", now), "another VM's pass");
+        assert!(!fresh(&GatePass::for_tests(vm, now + 5), vm, now), "a clock that went backwards");
+    }
+
+    /// M13: `credential_err suspended` is waited out as a suspend and
+    /// delivered once more; a second while GetMicrovm says RUNNING (the
+    /// shim's cache stays closed: no `/resume` reached it) ends the session,
+    /// exit 8, naming `vm resume` and another run: two deliveries, never a loop.
+    #[tokio::test]
+    async fn credential_err_suspended_again_while_the_vm_runs_ends_the_session() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let sent = std::sync::atomic::AtomicUsize::new(0);
+            let shim = async {
+                for n in 0..3 {
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(n < 2, "a third socket: the value would go out again, without bound");
+                    assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok_s7(None)).await;
+                    assert!(matches!(frame(&mut ws).await, Frame::Credential { .. }), "a credential first");
+                    sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Frame::Spawn { spawn_id, .. } = frame(&mut ws).await else { panic!("then the spawn") };
+                    // What the shim answers while its cache is closed for a suspend.
+                    put(&mut ws, &Frame::CredentialErr { name: CRED_NAME.into(), code: CredentialErrCode::Suspended, message: "closed for a suspend".into() }).await;
+                    put(&mut ws, &Frame::SpawnErr { spawn_id, code: SpawnErrCode::NoCredential, message: "no credential".into() }).await;
+                }
+            };
+            let session = async { tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(cred_value()), false))), consume(cio, None, Duration::ZERO)).0 };
+            let result = tokio::select! {
+                r = session => r,
+                () = shim => unreachable!("the shim ran out of sockets"),
+            };
+            let e = result.unwrap_err();
+            assert!(matches!(&e, BridgeError::Transport(m) if m.contains("`ai-env vm resume ") && m.contains("run the command again")), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 8);
+            assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 2, "delivered once more, then no more");
+            assert_eq!(rig.endpoint.attempts().len(), 2);
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M40: a `no_credential` answer to a one-shot (`--credential-file`)
+    /// spawn, which names no credential, is a protocol error (exit 8): its
+    /// value never rides a `credential` frame, which the shim would cache.
+    #[tokio::test]
+    async fn no_credential_for_a_one_shot_spawn_never_sends_its_value_to_the_cache() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(None)).await;
+                let Frame::Spawn { spawn_id, secrets, credential, .. } = frame(&mut ws).await else { panic!("the spawn alone") };
+                assert!(credential.is_none() && secrets.len() == 1, "the value inline");
+                put(&mut ws, &Frame::SpawnErr { spawn_id, code: SpawnErrCode::NoCredential, message: "no credential".into() }).await;
+                let next = tokio::time::timeout(LIMIT, ws.next()).await.expect("the socket ends");
+                assert!(!matches!(next, Some(Ok(Message::Text(_)))), "nothing more went out");
+                ws
+            };
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, Some(cred_value()), true))), consume(cio, None, Duration::ZERO), shim);
+            let e = result.unwrap_err();
+            assert!(matches!(&e, BridgeError::Protocol(m) if m.contains("no_credential")), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 8);
+            assert!(rig.audit("credential_deliver").is_empty());
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M39: `session::run` itself (whoever calls it) and `vm warm`'s
+    /// delivery refuse a delivery gated for another VM, and the session one
+    /// with a reattach, as `run_spawn_with` does: exit 9, nothing minted or dialed.
+    #[tokio::test]
+    async fn a_delivery_for_another_vm_reaches_no_session_and_no_warm_socket() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let other = || {
+                let now = crate::wire::time::unix_now();
+                super::super::Delivery::new(&crate::bridge::egress::GatePass::for_tests("microvm-other", now), "microvm-other", now, parts(Some(cred_value()), false)).unwrap()
+            };
+            let (sio, _cio) = spawn_channels(8);
+            let e = super::run(&env, Start::New(cat_spec()), sio, Some(other())).await.unwrap_err();
+            assert!(matches!(&e, BridgeError::Policy(m) if m.contains("microvm-other")), "{e}");
+            let (sio, _cio) = spawn_channels(8);
+            let attach = Start::Attach { spawn_id: SpawnId::new_v7(), from_seq: None, err_from_seq: None };
+            let e = super::run(&env, attach, sio, Some(delivery(&rig, Some(cred_value()), false))).await.unwrap_err();
+            assert!(matches!(&e, BridgeError::Policy(m) if m.contains("new spawn")), "{e}");
+            let e = super::super::credential::deliver_only(&env, other()).await.unwrap_err();
+            assert!(matches!(&e, BridgeError::Policy(m) if m.contains("microvm-other")), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 9);
+            assert_eq!(rig.calls(|c| matches!(c, Call::Token { .. })), 0, "no token minted");
+            assert!(rig.endpoint.attempts().is_empty(), "nothing dialed");
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M1: `vm warm` names the VM in its row before the value leaves, so an
+    /// answer lost with the socket (exit 8) never leaves it unlisted, with
+    /// no `credential_deliver` (nothing acknowledged); the next `vm warm`
+    /// finds it held and fills a row that names no delivery (wiped here, as
+    /// a record that failed).
+    #[tokio::test]
+    async fn warm_records_the_vm_before_the_value_leaves_and_on_a_hit() {
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(None)).await;
+                assert!(matches!(frame(&mut ws).await, Frame::Credential { .. }));
+                // Cut before `credential_ok`.
+            };
+            let (r, ()) = tokio::join!(super::super::credential::deliver_only(&env, delivery(&rig, Some(cred_value()), false)), shim);
+            assert_eq!(CliError::from(r.unwrap_err()).exit_code(), 8);
+            let row = row_of(&rig);
+            assert_eq!((row.credential_at.is_some(), row.credential_tag.as_deref()), (true, Some(CRED_TAG)));
+            assert!(rig.audit("credential_deliver").is_empty(), "nothing was acknowledged");
+            unrecord(&rig);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(Some((CRED_NAME, CRED_TAG)))).await;
+                ws
+            };
+            let (r, _ws) = tokio::join!(super::super::credential::deliver_only(&env, delivery(&rig, None, false)), shim);
+            assert_eq!(r.unwrap(), super::super::credential::Warmed::AlreadyHeld);
+            assert!(row_of(&rig).credential_at.is_some(), "the hit names it again");
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M44: `vm warm`'s socket waits out what the session waits out: 503
+    /// `not_run`, a 429 (its Retry-After, audited `endpoint_429`), 503
+    /// `busy` and `hello_err busy`, on one token; then it delivers. The
+    /// Mac's copy is gone once the frame went out (M32).
+    #[tokio::test]
+    async fn warm_waits_out_not_run_a_429_and_busy_then_delivers() {
+        bounded(async {
+            let rig = rig(true).await;
+            rig.endpoint.refuse(refusal(503, &[], r#"{"status":"not_run"}"#));
+            rig.endpoint.refuse(refusal(429, &[("retry-after", "3")], ""));
+            rig.endpoint.refuse(refusal(503, &[], r#"{"status":"busy"}"#));
+            let env = rig.env(policy());
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &Frame::HelloErr { code: HelloErrCode::Busy, message: "too many sockets without a hello".into() }).await;
+                drop(ws);
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(None)).await;
+                assert!(matches!(frame(&mut ws).await, Frame::Credential { .. }));
+                put(&mut ws, &Frame::CredentialOk { name: CRED_NAME.into(), cached: true, tag: Some(CRED_TAG.into()) }).await;
+                ws
+            };
+            let mut d = delivery(&rig, Some(cred_value()), false);
+            let (r, _ws) = tokio::join!(super::super::credential::warm(&env, &mut d), shim);
+            assert_eq!(r.unwrap(), super::super::credential::Warmed::Delivered);
+            assert!(!d.holds_value(), "the Mac keeps no copy once it went out");
+            let a = rig.endpoint.attempts();
+            assert_eq!(a.iter().map(|a| a.status).collect::<Vec<_>>(), vec![503, 429, 503, 101, 101]);
+            assert!(a[2].at - a[1].at >= Duration::from_millis(30), "the 429's Retry-After: {:?}", a[2].at - a[1].at);
+            assert_eq!(rig.audit("endpoint_429").len(), 1);
+            assert_eq!(rig.calls(|c| matches!(c, Call::Token { .. })), 1, "one token throughout");
+            assert_eq!(rig.audit("credential_deliver").len(), 1);
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
+    /// M44: and gives up as the session does: `not_run` past
+    /// `not_run_budget` is exit 8, 429s past `reconnect_budget` exit 7.
+    #[tokio::test]
+    async fn warm_gives_up_past_its_budgets() {
+        bounded(async {
+            let not_run = rig(true).await;
+            for _ in 0..200 {
+                not_run.endpoint.refuse(refusal(503, &[], r#"{"status":"not_run"}"#));
+            }
+            let mut p = policy();
+            p.not_run_budget = Duration::from_millis(200);
+            let e = super::super::credential::deliver_only(&not_run.env(p), delivery(&not_run, Some(cred_value()), false)).await.unwrap_err();
+            assert!(matches!(&e, BridgeError::ShimUnavailable(m) if m.contains("not_run")), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 8);
+            assert_value_off_disk(&not_run);
+            let throttled = rig(true).await;
+            for _ in 0..100 {
+                throttled.endpoint.refuse(refusal(429, &[("retry-after", "1")], ""));
+            }
+            let mut p = policy();
+            p.reconnect_budget = Duration::from_millis(300);
+            let e = super::super::credential::deliver_only(&throttled.env(p), delivery(&throttled, Some(cred_value()), false)).await.unwrap_err();
+            assert!(matches!(e, BridgeError::EndpointThrottled { retry_after_s: Some(1) }), "{e}");
+            assert_eq!(CliError::from(e).exit_code(), 7);
+            assert_value_off_disk(&throttled);
+        })
+        .await;
     }
 }

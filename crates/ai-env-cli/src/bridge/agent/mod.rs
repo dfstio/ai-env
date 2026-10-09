@@ -31,8 +31,9 @@ use crate::bridge::api::{EndpointClient, MicrovmApi};
 use crate::bridge::config::{Keepalive, Paths, Rotation, TransportCfg};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::transport::AgentDial;
+use crate::bridge::egress::GatePass;
 use crate::bridge::vm::registry::VmRow;
-use crate::wire::frame::{Sig, SpawnId};
+use crate::wire::frame::{Deliver, Sig, SpawnId};
 use crate::wire::redact::Secret;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +42,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
 pub mod conn;
+pub mod credential;
 pub mod exec;
 pub mod session;
 
@@ -162,6 +164,171 @@ impl std::fmt::Debug for SpawnSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let argv0 = self.argv.first().map_or("", |a| a.rsplit('/').next().unwrap_or(a));
         write!(f, "SpawnSpec(argv0={argv0}, argc={}, env={}, cwd={}, detach_grace_s={:?})", self.argv.len(), self.env.len(), if self.cwd.is_some() { "set" } else { "default" }, self.detach_grace_s)
+    }
+}
+
+/// What a credential delivery is made of (S7); [`Delivery::new`] binds it
+/// to a gate pass.
+pub struct DeliveryParts {
+    /// The name the shim caches it under and the spawn names
+    /// (`CLAUDE_CODE_OAUTH_TOKEN`).
+    pub name: String,
+    /// The seal id: a VM whose cache holds this tag holds this credential.
+    pub tag: String,
+    pub deliver: Deliver,
+    /// The unsealed value, or `None` when the VM's cache is expected to hold
+    /// it. A miss then ends the session with
+    /// [`BridgeError::CredentialMissing`] (exit 5) before any spawn; nothing
+    /// retries it (a retry inside `vm exec` could lose piped stdin already
+    /// read), so the message tells the operator to run the command again,
+    /// which unseals the token.
+    pub secret: Option<Secret<String>>,
+    /// `--credential-file`: sent inline with this spawn only (S6's
+    /// `spawn.secrets`), never cached on the VM.
+    pub one_shot: bool,
+}
+
+/// A credential for a new spawn (S7). It is built only from a [`GatePass`]
+/// for its VM that still stands, and keeps that pass: no frame that carries
+/// the value or names the credential (a fresh one, or the copy the shim
+/// caches) goes out once the pass is older than its life (S7 §4,
+/// `Delivery::still_gated`), so a VM that answers only minutes later (a
+/// slow reconnect, a suspend waited out) gets nothing on an old gate. On a
+/// cache miss the value goes out in its own `credential` frame, never in a
+/// `spawn` the session may send again; only a `--credential-file` value
+/// (`one_shot`) rides its spawn inline, as S6's `spawn.secrets` did, so a
+/// spawn sent again after a lost socket carries it again, to the same VM
+/// only, which starts an id at most once. The session drops the value once
+/// the spawn runs (`spawned`, or a reattach that finds it running). `Debug`
+/// shows the name, the tag and whether a value is held, never the value.
+pub struct Delivery {
+    vm_id: String,
+    pass: GatePass,
+    parts: DeliveryParts,
+    /// The value is registered with the scrubber ([`Delivery::keep_masked`])
+    /// until it is dropped.
+    masked: bool,
+}
+
+impl Delivery {
+    /// The delivery of `parts` to `vm_id`, if `pass` stands for that VM at
+    /// `now_unix` (else the gate's refusal, exit 9).
+    pub fn new(pass: &GatePass, vm_id: &str, now_unix: u64, parts: DeliveryParts) -> Result<Delivery, BridgeError> {
+        pass.check(vm_id, now_unix).map_err(|r| r.policy(vm_id))?;
+        if parts.one_shot && parts.secret.is_none() {
+            return Err(BridgeError::CredentialMissing("a one-spawn credential needs its value".into()));
+        }
+        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false })
+    }
+
+    /// Keep the value masked by the scrubber until this delivery drops it
+    /// ([`Delivery::drop_value`], or the delivery's own drop): for a token of
+    /// a shape the scrubber's rules do not mask whole (an unrecognised
+    /// prefix), whose registration otherwise ends with its `SetupToken`
+    /// handle, which `credential::prepare` drops before the value is sent
+    /// (M46). The registry counts holders: this is one more.
+    pub(crate) fn keep_masked(&mut self) {
+        if let Some(s) = self.parts.secret.as_ref().filter(|_| !self.masked) {
+            crate::wire::redact::register_secret(s.expose());
+            self.masked = true;
+        }
+    }
+
+    /// The pass still stands at `now_unix`: checked before every frame that
+    /// carries the value or names the credential. Exit 9 otherwise, with
+    /// nothing (more) sent: the command run again gates again. `again`: this
+    /// delivery's spawn went out before (it is sent again, or redelivered),
+    /// so the message must not say that nothing reached the VM.
+    pub(crate) fn still_gated(&self, now_unix: u64, again: bool) -> Result<(), BridgeError> {
+        self.pass.check(&self.vm_id, now_unix).map_err(|r| match r.condition {
+            "pass_age" => BridgeError::Policy(format!(
+                "no credential for {}: its credential gate passed more than {} s before the VM was ready for it{} (a slow connection, or a suspend waited out), so {}; run the command again",
+                self.vm_id,
+                crate::bridge::egress::GATE_PASS_MAX_AGE_S,
+                if again { " again" } else { "" },
+                if again { "nothing more was sent (the VM may still hold the copy it had: `ai-env creds status` lists it)" } else { "nothing was sent" }
+            )),
+            _ => r.policy(&self.vm_id),
+        })
+    }
+
+    /// The delivery goes only to the VM its pass was minted for (exit 9),
+    /// whoever hands it to a session or to `vm warm`'s socket.
+    pub(crate) fn check_target(&self, vm_id: &str) -> Result<(), BridgeError> {
+        if self.vm_id != vm_id {
+            return Err(BridgeError::Policy(format!("a credential gated for {} cannot go to {vm_id}", self.vm_id)));
+        }
+        Ok(())
+    }
+
+    /// [`BridgeError::CredentialMissing`] for `vm`, whose cache no longer
+    /// holds this seal while no value is in hand: the copy went after it was
+    /// checked. `then` says what was not done and what to run again.
+    pub(crate) fn missing(&self, vm: &str, then: &str) -> BridgeError {
+        BridgeError::CredentialMissing(format!(
+            "{vm} no longer holds {} (seal {}): its copy went after it was checked (a suspend, or another seal delivered, in between) and no value was in hand: {then}, which unseals the token",
+            self.parts.name, self.parts.tag
+        ))
+    }
+
+    #[must_use]
+    pub fn vm_id(&self) -> &str {
+        &self.vm_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.parts.name
+    }
+
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.parts.tag
+    }
+
+    #[must_use]
+    pub fn deliver(&self) -> Deliver {
+        self.parts.deliver
+    }
+
+    #[must_use]
+    pub fn one_shot(&self) -> bool {
+        self.parts.one_shot
+    }
+
+    /// Whether the unsealed value is still held.
+    #[must_use]
+    pub fn holds_value(&self) -> bool {
+        self.parts.secret.is_some()
+    }
+
+    /// A copy of the value for one frame (zeroized with it).
+    pub(crate) fn frame_secret(&self) -> Option<Secret<String>> {
+        self.parts.secret.as_ref().map(|s| Secret::new(s.expose().clone()))
+    }
+
+    /// The spawn runs, or the value went out for good: dropped (zeroized),
+    /// and its masking with it when this delivery kept one.
+    pub(crate) fn drop_value(&mut self) {
+        if let Some(s) = self.parts.secret.take() {
+            if std::mem::take(&mut self.masked) {
+                crate::wire::redact::forget_secret(s.expose());
+            }
+        }
+    }
+}
+
+impl Drop for Delivery {
+    /// A value still held goes as [`Delivery::drop_value`] drops it, so a
+    /// masking this delivery kept never outlives it.
+    fn drop(&mut self) {
+        self.drop_value();
+    }
+}
+
+impl std::fmt::Debug for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Delivery({}, {} tag={}, {:?}, value={}, one_shot={})", self.vm_id, self.parts.name, self.parts.tag, self.parts.deliver, if self.holds_value() { "held" } else { "none" }, self.parts.one_shot)
     }
 }
 
@@ -349,7 +516,15 @@ pub struct AgentEnv<'a, A: MicrovmApi, E: EndpointClient> {
 /// VM refused the spawn; a `--shell` row's target is refused before any
 /// mint or dial (`Policy`, exit 9: see [`AgentTarget::shell`]).
 pub async fn run_spawn<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo) -> Result<SpawnOutcome, BridgeError> {
-    session::run(env, start, io).await
+    session::run(env, start, io, None).await
+}
+
+/// [`run_spawn`] with a credential for the new spawn (S7): the session
+/// delivers it on a cache miss and names it in the `spawn`. A delivery for
+/// another VM than the target, or with a reattach, is refused (exit 9;
+/// `session::run` checks it, for every caller).
+pub async fn run_spawn_with<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo, delivery: Option<Delivery>) -> Result<SpawnOutcome, BridgeError> {
+    session::run(env, start, io, delivery).await
 }
 
 #[cfg(test)]
@@ -377,6 +552,43 @@ mod tests {
             assert_eq!((p.ack_bytes, p.ack_every), (ACK_EVERY_BYTES, ACK_EVERY), "knob {knob:?}");
         }
         assert_eq!((ACK_EVERY_BYTES, ACK_EVERY), (1024 * 1024, Duration::from_millis(250)), "plan D3: 1 MiB or 250 ms");
+    }
+
+    /// M46: a delivery that keeps its value masked is one more holder of its
+    /// registration with the scrubber: the value stays masked after the
+    /// token's own handle forgot it, until the delivery drops the value (at
+    /// `spawned`), or the delivery itself goes still holding it (a failed
+    /// session); a second `keep_masked` registers nothing more, and a
+    /// delivery that keeps none registers nothing.
+    #[test]
+    fn a_kept_masking_lasts_as_long_as_the_deliverys_value() {
+        use crate::wire::redact::{forget_secret, register_secret, scrub};
+        let masked = |v: &str| !scrub(&format!("x {v} y")).contains(v);
+        let now = 1_790_000_000;
+        let pass = GatePass::for_tests("microvm-1", now);
+        let delivery = |v: &str| {
+            let parts = DeliveryParts { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), tag: "seal".into(), deliver: Deliver::Fd, secret: Some(Secret::new(v.to_string())), one_shot: false };
+            Delivery::new(&pass, "microvm-1", now, parts).unwrap()
+        };
+        let value = format!("odd-shape-delivery-{}", "M4".repeat(12));
+        // The token's handle registered it (as `parse_token` does for an unrecognised shape).
+        register_secret(&value);
+        let mut d = delivery(&value);
+        d.keep_masked();
+        d.keep_masked();
+        assert!(forget_secret(&value), "the handle's registration ends with the handle");
+        assert!(masked(&value), "the delivery keeps it masked");
+        d.drop_value();
+        assert!(!masked(&value) && !forget_secret(&value), "forgotten with the delivery's value, once");
+        let failed = format!("odd-shape-delivery-{}", "N5".repeat(12));
+        let mut d = delivery(&failed);
+        d.keep_masked();
+        assert!(masked(&failed));
+        drop(d);
+        assert!(!masked(&failed) && !forget_secret(&failed), "forgotten with the delivery");
+        let plain = format!("odd-shape-delivery-{}", "P6".repeat(12));
+        drop(delivery(&plain));
+        assert!(!masked(&plain), "nothing kept, nothing registered");
     }
 
     #[test]

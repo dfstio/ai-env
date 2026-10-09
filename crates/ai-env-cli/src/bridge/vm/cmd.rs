@@ -144,12 +144,14 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| CliError::Msg(format!("cannot start the async runtime: {e}")))
 }
 
-/// One audit row (`actor=cli` first); a failure to write is a warning, never fatal.
+/// One audit row (`actor=cli` first); a failure to write is a warning, never
+/// fatal, and never a panic (`signals::say`): a command may audit after a
+/// stop that closed its terminal.
 pub fn audit_event(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
     let mut d = audit::detail(pairs);
     d.insert("actor".into(), "cli".into());
     if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(event, None, d)) {
-        eprintln!("ai-env: warning: audit row {event} not written: {e}");
+        crate::bridge::signals::say(&format!("ai-env: warning: audit row {event} not written: {e}"));
     }
 }
 
@@ -223,13 +225,39 @@ fn gc_hint(items: std::result::Result<Vec<gc::GcItem>, BridgeError>) {
 
 /// `ai-env vm …`.
 pub fn main(store: &Keystore, cmd: VmCmd) -> Result<()> {
+    // Before anything could listen: a signal ignored when ai-env started stays ignored (`signals`).
+    crate::bridge::signals::note_dispositions();
     let ctx = Ctx::load()?;
     // Everything that can be refused without AWS is refused before the Touch ID.
     let pre = Pre::check(&ctx, &cmd)?;
+    // Only `vm exec` knows that the setup-token's own prompt is one `vm warm` could have taken ahead of time.
+    let token_prompt = matches!(&pre, Pre::Exec(plan) if plan.credential.as_ref().is_some_and(|c| c.file.is_none()));
     let rt = runtime()?;
     let result = rt.block_on(async {
-        let b = backend(store, &ctx).await?;
-        with_backend!(&b, |api, ep| dispatch(&ctx, api, ep, cmd, pre).await)
+        // S7: a credentialed exec may get the token with the runtime key (one Touch ID, D4). A credentialed
+        // command listens for its stop signals from here to its end (`signals`): once an unseal has listened,
+        // a signal with nobody listening would be lost, never the end of the process.
+        let (b, supply) = match &pre {
+            Pre::Exec(plan) if plan.credential.is_some() => {
+                let cred = plan.credential.as_ref().expect("checked above");
+                crate::bridge::signals::Stops::take()?.keep();
+                let (b, token) = crate::bridge::agent::credential::backend_for_credential(store, &ctx, cred).await?;
+                (b, Some(crate::bridge::agent::credential::CredentialSupply { store, token }))
+            }
+            Pre::Warm(_, cred) | Pre::Smoke(_, Some(cred)) => {
+                crate::bridge::signals::Stops::take()?.keep();
+                let (b, token) = crate::bridge::agent::credential::backend_for_credential(store, &ctx, cred).await?;
+                (b, Some(crate::bridge::agent::credential::CredentialSupply { store, token }))
+            }
+            _ => (backend(store, &ctx).await?, None),
+        };
+        with_backend!(&b, |api, ep| dispatch(&ctx, api, ep, cmd, pre, supply).await).map_err(|e| {
+            if token_prompt && crate::bridge::unseal::is_deadline(&e) {
+                crate::bridge::creds::with_note(e, "nothing was started; `ai-env vm warm <workspace>` delivers the token to that workspace's VM ahead of time, so a command there needs no Touch ID for it")
+            } else {
+                e
+            }
+        })
     });
     // `vm shell` leaves a blocking stdin read on the pool after the remote
     // closed; dropping the runtime would wait for the next key press.
@@ -246,6 +274,10 @@ enum Pre {
     Attach(Box<crate::bridge::agent::exec::AttachPlan>),
     /// `vm health --detail`: the row whose session token is the bearer.
     Detail(Box<VmRow>),
+    /// `vm warm` (S7): the workspace's run plan and the setup-token's seal.
+    Warm(Box<run::RunPlan>, crate::bridge::agent::credential::CredentialPlan),
+    /// `vm smoke`: its run plan, and the setup-token's seal with `--with-credential` (S7).
+    Smoke(Box<run::RunPlan>, Option<crate::bridge::agent::credential::CredentialPlan>),
 }
 
 impl Pre {
@@ -277,11 +309,20 @@ impl Pre {
                 }
                 Pre::Run(Box::new(run::RunPlan::from_cfg(&ctx.cfg, &flags)?))
             }
-            VmCmd::Smoke { max_duration, no_execution_role, egress, .. } => {
-                let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &smoke_flags(*max_duration, *no_execution_role, egress.map(EgressArg::egress)))?;
+            VmCmd::Smoke { max_duration, no_execution_role, egress, with_credential, .. } => {
+                let egress = match (egress.map(EgressArg::egress), *with_credential) {
+                    (Some(run::Egress::Internet), true) => return Err(BridgeError::Policy("vm smoke --with-credential: a credential never enters a VM with internet egress (use --egress vpc)".into()).into()),
+                    (None, true) => Some(run::Egress::Vpc),
+                    (e, _) => e,
+                };
+                let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &smoke_flags(*max_duration, *no_execution_role, egress))?;
                 // The smoke's own client token: its failure paths terminate exactly this run's VM.
                 plan.client_token = Some(uuid::Uuid::now_v7().to_string());
-                Pre::Run(Box::new(plan))
+                let cred = if *with_credential { Some(sealed_token_plan(ctx)?) } else { None };
+                if cred.is_some() {
+                    provisional_gate(ctx, &plan)?;
+                }
+                Pre::Smoke(Box::new(plan), cred)
             }
             VmCmd::Terminate { id: Some(id), all: false, yes, .. } => {
                 if !registry::is_vm_id(id) {
@@ -311,11 +352,142 @@ impl Pre {
                 ctx.image_arn()?;
                 Pre::None
             }
-            VmCmd::Exec { id, cwd, env, detach_grace, argv } => Pre::Exec(Box::new(crate::bridge::agent::exec::check_exec(ctx, id, cwd.clone(), env, *detach_grace, argv.clone())?)),
+            VmCmd::Exec { id, cwd, env, detach_grace, with_credential, deliver, credential_file, argv } => {
+                let cred = crate::bridge::agent::credential::CredentialFlags { with_credential: *with_credential, deliver: deliver.map(crate::cli::DeliverArg::deliver), file: credential_file.clone() };
+                Pre::Exec(Box::new(crate::bridge::agent::exec::check_exec(ctx, id, cwd.clone(), env, *detach_grace, argv.clone(), &cred)?))
+            }
             VmCmd::Attach { id, spawn, from_seq } => Pre::Attach(Box::new(crate::bridge::agent::exec::check_attach(ctx, id, spawn, *from_seq)?)),
+            VmCmd::Warm { workspace, .. } => {
+                let flags = run::RunFlags { workspace: Some(workspace.clone()), egress: Some(run::Egress::Vpc), purpose: "operator", wait: true, ..run::RunFlags::default() };
+                let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags)?;
+                // Its own client token, as the smoke's: a stop while `select` runs still finds the VM it started.
+                plan.client_token = Some(uuid::Uuid::now_v7().to_string());
+                let cred = sealed_token_plan(ctx)?;
+                provisional_gate(ctx, &plan)?;
+                Pre::Warm(Box::new(plan), cred)
+            }
             VmCmd::Health { id, detail: true, .. } => Pre::Detail(Box::new(crate::bridge::agent::exec::check_detail(ctx, id)?)),
             _ => Pre::None,
         })
+    }
+}
+
+/// What a command that will deliver the sealed setup-token to a VM it has
+/// not chosen yet (`vm warm`, `vm smoke --with-credential`) can check before
+/// the Touch ID about the token: `[creds]`, a sealed token, its seal not
+/// refused. The gate's local half follows ([`provisional_gate`]); the chosen
+/// VM's own row is checked once it is chosen (`credential::check`).
+fn sealed_token_plan(ctx: &Ctx) -> Result<crate::bridge::agent::credential::CredentialPlan> {
+    use crate::bridge::creds::{aws_env_state, AwsEnvState};
+    ctx.cfg.creds.validate()?;
+    let token = ctx.paths.setup_token_env();
+    match aws_env_state(&token) {
+        AwsEnvState::Sealed => {}
+        AwsEnvState::Absent => return Err(CliError::AuthUnavailable(format!("{} does not exist: seal it with `ai-env creds setup-token`", token.display()))),
+        AwsEnvState::NotSealed(why) => return Err(CliError::AuthUnavailable(format!("{} {why}: seal it with `ai-env creds setup-token`", token.display()))),
+    }
+    let tag = crate::bridge::agent::credential::seal_tag(&token).ok_or_else(|| CliError::AuthUnavailable(format!("{} cannot be read", token.display())))?;
+    crate::bridge::agent::credential::refuse_rejected(&ctx.paths, &tag)?;
+    let deliver = if ctx.cfg.creds.deliver == "env" { crate::wire::frame::Deliver::Env } else { crate::wire::frame::Deliver::Fd };
+    Ok(crate::bridge::agent::credential::CredentialPlan { deliver, file: None, tag })
+}
+
+/// The gate's local half before the Touch ID of a command that chooses its
+/// VM after it (`vm warm`, `vm smoke --with-credential`, and `lab run`'s
+/// credential probes on the VM they would start), as the doctor's
+/// credential gate row judges it: `credential_precheck` on the row `plan`
+/// would make (vpc, its echo gate passed, no `--shell`, the configured
+/// execution role) for the image version it would run. A pinned `N.M` is
+/// that version and `N` is `N` or `N.0`, as `vm run` reads them. `active` is
+/// resolved live only after the Touch ID, so it is the active version
+/// `state/infra.toml` records for this image, the one the doctor's row
+/// judges. When that file records none, any version a passing check is
+/// recorded for will do, and the live gate judges the VM's own. Refused
+/// (exit 9, audited `half=local`) when no candidate passes: what it refuses
+/// the live gate would refuse too, unless `state/infra.toml` lags a deploy,
+/// which the refusal says. The refusal it reports (and audits) is that of
+/// the candidate that got furthest ([`precheck_stage`]), the later one on a
+/// tie (F4): `N`, which has a record only when the service lists `N` itself,
+/// never hides what stops `N.0` (the version the doctor's row judges), and
+/// the fallback names the most recently recorded version, never the oldest.
+/// `credential::check` judges the chosen VM's own row afterwards.
+fn provisional_gate(ctx: &Ctx, plan: &run::RunPlan) -> Result<()> {
+    use crate::bridge::egress::{credential_precheck, newest_dns_path, normalize_connector, EgressVerified};
+    let verified = EgressVerified::load(&ctx.paths)?;
+    let dns = newest_dns_path(&ctx.paths);
+    let want = plan.want_version.trim();
+    let mut versions = Vec::new();
+    // `active` judged on the version state/infra.toml records (a refusal then says how to update that file).
+    let mut recorded_active = false;
+    if want == "active" {
+        let state = crate::bridge::infra::read_infra_state(&ctx.paths).ok().flatten().filter(|s| s.image_arn.trim() == plan.image_arn);
+        match state.and_then(|s| s.latest_active_image_version).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+            Some(v) => {
+                versions.push(v);
+                recorded_active = true;
+            }
+            None => {
+                // Records hold the connector normalised (a `:N` qualifier dropped), as the gate compares it.
+                let configured = normalize_connector(ctx.cfg.aws.egress_connector_arn.as_deref().unwrap_or_default());
+                versions.extend(verified.records.iter().filter(|r| r.image_arn == plan.image_arn && r.connector == configured).map(|r| r.image_version.clone()));
+            }
+        }
+    } else if want.contains('.') {
+        versions.push(want.to_string());
+    } else {
+        versions.extend([want.to_string(), format!("{want}.0")]);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    versions.retain(|v| seen.insert(v.clone()));
+    if versions.is_empty() {
+        // `active` with nothing recorded anywhere: the refusal says no check is recorded.
+        versions.push(want.to_string());
+    }
+    let now = unix_now();
+    let mut refused: Option<(String, crate::bridge::egress::GateRefusal)> = None;
+    for version in versions {
+        let row = VmRow {
+            image_arn: plan.image_arn.clone(),
+            image_version: version.clone(),
+            egress: run::Egress::Vpc.as_str().to_string(),
+            egress_gate: Some(registry::GATE_PASSED.to_string()),
+            egress_connectors: plan.egress_connectors.clone(),
+            shell: false,
+            execution_role: plan.execution_role_arn.clone(),
+            ..VmRow::default()
+        };
+        match credential_precheck(&ctx.cfg, &row, &verified, &dns, now) {
+            Ok(()) => return Ok(()),
+            Err(r) => {
+                if refused.as_ref().is_none_or(|(_, kept)| precheck_stage(r.condition) >= precheck_stage(kept.condition)) {
+                    refused = Some((version, r));
+                }
+            }
+        }
+    }
+    let (version, r) = refused.expect("one version at least");
+    audit_event(&ctx.paths, "credential_gate", &[("id", "-".into()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "local".into()), ("image_version", version.clone())]);
+    let whose = if recorded_active {
+        " (the active version state/infra.toml records; after a deploy, `make infra-status WRITE=1` records the new one)"
+    } else if want == "active" {
+        " (state/infra.toml records no active version of this image: `make infra-status WRITE=1` records it)"
+    } else {
+        ""
+    };
+    Err(BridgeError::Policy(format!("no credential for a vpc VM of image version {version}{whose}: {} (nothing was unsealed or started)", r.why)).into())
+}
+
+/// How far `credential_precheck` got before it refused with `condition`, in
+/// its own order: no record for the version, then the record's time and
+/// age, then its DNS rule and verdict, then the newest dns-path verdict,
+/// which every version shares. What it judges before the record (the
+/// configuration, the row) is alike for every candidate.
+fn precheck_stage(condition: &str) -> u8 {
+    match condition {
+        "no_record" => 0,
+        "record_time" | "record_age" => 1,
+        "dns_rule" | "dns_record" => 2,
+        _ => 3,
     }
 }
 
@@ -325,7 +497,7 @@ fn smoke_flags(max_duration: u32, no_execution_role: bool, egress: Option<run::E
     run::RunFlags { max_duration_s: Some(max_duration), label: Some("smoke".into()), no_execution_role, egress, wait: true, purpose: "smoke", imply_internet: true, ..run::RunFlags::default() }
 }
 
-async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, cmd: VmCmd, pre: Pre) -> Result<()> {
+async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, cmd: VmCmd, pre: Pre, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
     match (cmd, pre) {
         (VmCmd::Images { json, managed }, _) => images(ctx, api, json, managed).await,
         (VmCmd::Run { json, .. }, Pre::Run(plan)) => run_cmd(ctx, api, &plan, json).await,
@@ -333,8 +505,9 @@ async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
         (VmCmd::Status { id, json }, _) => status(ctx, api, &id, json).await,
         (VmCmd::Health { id, detail: true, json }, Pre::Detail(row)) => crate::bridge::agent::exec::health_detail(ctx, api, ep, &id, &row, json).await,
         (VmCmd::Health { id, detail: false, json }, _) => health_cmd(ctx, api, ep, &id, json).await,
-        (VmCmd::Exec { .. }, Pre::Exec(plan)) => crate::bridge::agent::exec::run_exec(ctx, api, ep, *plan).await,
+        (VmCmd::Exec { .. }, Pre::Exec(plan)) => crate::bridge::agent::exec::run_exec(ctx, api, ep, *plan, supply).await,
         (VmCmd::Attach { .. }, Pre::Attach(plan)) => crate::bridge::agent::exec::run_attach(ctx, api, ep, *plan).await,
+        (VmCmd::Warm { json, .. }, Pre::Warm(plan, _)) => warm(ctx, api, ep, &plan, json, supply).await,
         (VmCmd::Token { id, port, minutes, reveal }, _) => token_cmd(ctx, api, &id, port, minutes, reveal).await,
         (VmCmd::Suspend { id, no_wait }, _) => suspend_resume(ctx, api, &id, true, no_wait).await,
         (VmCmd::Resume { id, no_wait }, _) => suspend_resume(ctx, api, &id, false, no_wait).await,
@@ -348,7 +521,7 @@ async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
             shell::shell(api, &id, minutes, auth).await?;
             Ok(())
         }
-        (VmCmd::Smoke { keep, json, exec, .. }, Pre::Run(plan)) => smoke(ctx, api, ep, &plan, keep, json, exec).await,
+        (VmCmd::Smoke { keep, json, exec, .. }, Pre::Smoke(plan, _)) => smoke(ctx, api, ep, &plan, keep, json, exec, supply).await,
         _ => Err(CliError::Msg("internal: command/validation mismatch".into())),
     }
 }
@@ -467,20 +640,14 @@ async fn retry_gate_terminate<A: MicrovmApi>(ctx: &Ctx, api: &A, mut f: run::Sel
     f
 }
 
-async fn run_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: bool) -> Result<()> {
-    warn_plan(plan);
-    if plan.egress == run::Egress::Vpc {
-        match connector_state_line(&ctx.paths, plan.egress_connectors.first().map(String::as_str)) {
-            Some((true, w)) => eprintln!("ai-env: warning: {w}"),
-            Some((false, h)) => eprintln!("ai-env: {h}"),
-            None => {}
-        }
-    }
+/// SELECT_VM for `vm run` and `vm warm`, a failure carrying what to do
+/// about a VM it may have left (terminate it, or `vm gc` a kept pending row).
+async fn select<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan) -> Result<run::Selected> {
     let selected = match run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)).await {
         Ok(s) => Ok(s),
         Err(f) => Err(retry_gate_terminate(ctx, api, f).await),
     };
-    let selected = selected.map_err(|f| {
+    selected.map_err(|f| {
         let hint = match (&f.started, &f.kept_pending) {
             (Some(id), _) => format!("{id} may still be running: ai-env vm terminate {id}"),
             (None, Some(p)) => format!("the pending row {} is kept: ai-env vm gc", p.stem()),
@@ -492,7 +659,112 @@ async fn run_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: b
         } else {
             crate::bridge::creds::with_note(e, &hint)
         }
-    })?;
+    })
+}
+
+/// `vm warm <workspace>` (S7): the workspace's VM (started with vpc egress
+/// when it has none), its `/health` (which records the shim's caps), the
+/// credential's local and live gate, and the setup-token delivered with no
+/// spawn (`credential::deliver_only`), unless the VM holds it already.
+///
+/// A stop signal (`signals`) ends it at once, the delivery included: 130
+/// after SIGINT, 143 after SIGTERM or SIGHUP, an unseal's dialog closed, and
+/// a VM it started named (it keeps running, and the next warm reuses it):
+/// one that a RunMicrovm in flight at the stop made is adopted first, as the
+/// smoke adopts its own, after a line that says it is looked for and for how
+/// long (a second stop gives that up; [`warm_stopped`]). Before the
+/// delivery nothing was delivered. A delivery under way is given up where it
+/// stands; the delivery names the VM in its row before its `credential`
+/// frame leaves, so the row then says whether the VM may hold the token, as
+/// `creds status` does: any delivery the row records, of this seal or an
+/// earlier one, is named with `ai-env vm terminate`.
+async fn warm<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, json: bool, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
+    use crate::bridge::agent::credential::{self, CredentialFlags, Warmed};
+    use crate::bridge::signals::{say, stoppable, Stops};
+    let supply = supply.ok_or_else(|| CliError::Msg("internal: vm warm without its keystore".into()))?;
+    warn_plan(plan);
+    // How far back the adoption sweep after a stop looks for the VM this warm's RunMicrovm made.
+    let t0_unix = unix_now();
+    let mut stops = Stops::take()?;
+    // The VM `select` started for this warm, once known: every failure and every stop names it.
+    let started = std::cell::RefCell::new(None::<String>);
+    let kept = warm_kept;
+    let started_note = |e: CliError| match started.borrow().as_deref() {
+        Some(id) => crate::bridge::creds::with_note(e, &kept(id)),
+        None => e,
+    };
+    let ready = async {
+        let (row, vm, reused) = match select(ctx, api, plan).await? {
+            run::Selected::Started { row, vm, .. } => {
+                *started.borrow_mut() = Some(vm.id.clone());
+                (row, vm, false)
+            }
+            run::Selected::Reused { row, vm, .. } => (row, vm, true),
+        };
+        health::read_health(api, ep, &ctx.paths, &vm.id, ctx.backoff()).await?;
+        let row = registry::read_row(&ctx.paths, &vm.id)?.unwrap_or(row);
+        let flags = CredentialFlags { with_credential: true, ..CredentialFlags::default() };
+        let cred = credential::check(&ctx.cfg, &ctx.paths, &row, &[], &flags)?.ok_or_else(|| CliError::Msg("internal: no credential plan".into()))?;
+        let delivery = credential::prepare(ctx, api, ep, &row, &vm, &cred, supply).await?.delivery;
+        let env = crate::bridge::agent::exec::agent_env(ctx, api, ep, &row, Some(&vm))?;
+        Ok::<_, CliError>((vm, reused, cred, env, delivery))
+    };
+    let (vm, reused, cred, env, delivery) = match stoppable(&mut stops, ready).await {
+        Ok(r) => r.map_err(started_note)?,
+        Err(stop) => {
+            let known = started.borrow().clone();
+            return Err(warm_stopped(ctx, api, ep, plan, known, t0_unix, stop, stops.next()).await);
+        }
+    };
+    // The dial, the hello and the frame's answer can each take tens of seconds: a stop drops the delivery where
+    // it stands. One that came before the frame left sends nothing; for one after, the row already names the VM.
+    let warmed = match stoppable(&mut stops, credential::deliver_only(&env, delivery)).await {
+        Ok(r) => r.map_err(|e| started_note(e.into()))?,
+        Err(stop) => {
+            // As `creds status` reads the row (F14): any delivery it records, whatever its seal, may be held; a row
+            // that cannot be read may be too. Only a row that names this seal can say this run sent it.
+            let what = match registry::read_row(&ctx.paths, &vm.id) {
+                Ok(Some(r)) if r.credential_at.is_some() && r.credential_tag.as_deref() == Some(cred.tag.as_str()) => {
+                    format!("{} may hold the setup-token (seal {}), as its row records: `ai-env vm terminate {}` clears it", vm.id, cred.tag, vm.id)
+                }
+                Ok(Some(r)) if r.credential_at.is_some() => format!(
+                    "nothing was delivered by this run, but {} may hold a token sent to it earlier (seal {}, as its row records): `ai-env vm terminate {}` clears it",
+                    vm.id,
+                    r.credential_tag.as_deref().unwrap_or("unknown"),
+                    vm.id
+                ),
+                Ok(_) => "nothing was delivered".to_string(),
+                Err(e) => format!("{}'s row cannot be read ({e}), so it may hold a token sent to it earlier: `ai-env vm terminate {}` clears it", vm.id, vm.id),
+            };
+            say(&format!("ai-env: {} ({}) while the setup-token was being delivered to {}: the delivery was given up; {what}", stop.word(), stop.name(), vm.id));
+            if let Some(id) = started.borrow().as_deref() {
+                say(&format!("ai-env: {}", kept(id)));
+            }
+            return Err(CliError::Exit(stop.status()));
+        }
+    };
+    let word = match warmed {
+        Warmed::Delivered => "delivered",
+        Warmed::AlreadyHeld => "already_held",
+    };
+    if json {
+        return json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag }));
+    }
+    let how = if warmed == Warmed::Delivered { "now holds" } else { "already held" };
+    outln!("{} {how} the setup-token (seal {}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
+    Ok(())
+}
+
+async fn run_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: bool) -> Result<()> {
+    warn_plan(plan);
+    if plan.egress == run::Egress::Vpc {
+        match connector_state_line(&ctx.paths, plan.egress_connectors.first().map(String::as_str)) {
+            Some((true, w)) => eprintln!("ai-env: warning: {w}"),
+            Some((false, h)) => eprintln!("ai-env: {h}"),
+            None => {}
+        }
+    }
+    let selected = select(ctx, api, plan).await?;
     let (row, vm, reused, resumed, run_ms, running_ms) = match selected {
         run::Selected::Started { row, vm, run_ms, running_ms } => (row, vm, false, false, run_ms, running_ms),
         run::Selected::Reused { row, vm, resumed } => (row, vm, true, resumed, 0, 0),
@@ -795,7 +1067,8 @@ fn ms_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, keep: bool, json: bool, exec: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, keep: bool, json: bool, exec: bool, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
     warn_plan(plan);
     let steps = Steps { json };
     let t0_unix = unix_now();
@@ -809,32 +1082,45 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
         if plan.idle.auto_resume { "auto" } else { "manual" },
         plan.egress
     ))?;
-    let flow = smoke_flow(ctx, api, ep, plan, &steps, exec);
-    let outcome = tokio::select! {
-        r = flow => r,
-        _ = tokio::signal::ctrl_c() => Err(SmokeFail { id: None, kept_pending: None, gate: false, error: CliError::Cancelled }),
+    // A stop signal (`signals`) drops the flow (an unseal it waits on closes its dialog as it goes); the VM it
+    // started is ended below. Ctrl-C is the smoke's cancel (exit 3); SIGTERM or SIGHUP end it the same way, then 143.
+    let mut stops = crate::bridge::signals::Stops::take()?;
+    let flow = smoke_flow(ctx, api, ep, plan, &steps, exec, supply);
+    let outcome = match crate::bridge::signals::stoppable(&mut stops, flow).await {
+        Ok(r) => r,
+        Err(stop) => {
+            let error = if stop == crate::bridge::signals::Stop::Int {
+                CliError::Cancelled
+            } else {
+                crate::bridge::signals::say(&format!("ai-env: {} ({}): ending the smoke and its VM", stop.word(), stop.name()));
+                CliError::Exit(stop.status())
+            };
+            Err(SmokeFail { id: None, kept_pending: None, gate: false, error })
+        }
     };
     // The rows this smoke may have written carry its own client token, never another run's.
     let own_token = plan.client_token.as_deref().unwrap_or_default();
     let (id, record) = match outcome {
         Ok(ok) => (ok.0, Some(ok.1)),
         Err(fail) => {
-            // Terminate whatever this smoke started (plan S4 D26), then report the failure.
+            // Terminate whatever this smoke started (plan S4 D26), then report the failure. These lines may come
+            // after a caught SIGHUP, with the terminal gone: `say`, never a panic that would cost the exit (F3).
+            use crate::bridge::signals::say;
             let id = match (fail.id.clone(), &fail.kept_pending) {
                 (Some(id), _) => Some((id, fail.gate)),
-                (None, Some(pending)) => adopt(ctx, api, ep, pending, t0_unix).await,
-                (None, None) => sweep_own(ctx, api, ep, own_token, t0_unix).await,
+                (None, Some(pending)) => adopt(ctx, api, ep, pending, t0_unix, SMOKE_SWEEP).await,
+                (None, None) => sweep_own(ctx, api, ep, own_token, t0_unix, SMOKE_SWEEP).await,
             };
             match id {
                 // A VM that failed the S5 egress gate is never kept, --keep or not.
                 Some((id, true)) => match run::terminate_and_record(api, &ctx.paths, &id, "policy", Some(ctx.poll(run::Poll::SETTLE))).await {
-                    Ok(_) => eprintln!("smoke: terminated {id}: it failed the egress gate{}", if keep { " (--keep never keeps such a VM)" } else { "" }),
-                    Err(e) => eprintln!("smoke: could not terminate {id}, which failed the egress gate: {e} — run: ai-env vm terminate {id} (or ai-env vm gc --yes)"),
+                    Ok(_) => say(&format!("smoke: terminated {id}: it failed the egress gate{}", if keep { " (--keep never keeps such a VM)" } else { "" })),
+                    Err(e) => say(&format!("smoke: could not terminate {id}, which failed the egress gate: {e} — run: ai-env vm terminate {id} (or ai-env vm gc --yes)")),
                 },
-                Some((id, false)) if keep => eprintln!("smoke: --keep: {id} left running (ai-env vm terminate {id})"),
+                Some((id, false)) if keep => say(&format!("smoke: --keep: {id} left running (ai-env vm terminate {id})")),
                 Some((id, false)) => match run::terminate_and_record(api, &ctx.paths, &id, "smoke", Some(ctx.poll(run::Poll::SETTLE))).await {
-                    Ok(_) => eprintln!("smoke: terminated {id} after the failure"),
-                    Err(e) => eprintln!("smoke: could not terminate {id}: {e} — run: ai-env vm terminate {id}"),
+                    Ok(_) => say(&format!("smoke: terminated {id} after the failure")),
+                    Err(e) => say(&format!("smoke: could not terminate {id}: {e} — run: ai-env vm terminate {id}")),
                 },
                 None => {}
             }
@@ -944,7 +1230,15 @@ fn fail_with(id: &str) -> impl FnOnce(BridgeError) -> SmokeFail + '_ {
 /// (audit `vm_egress_mismatch` via `run`, terminated by `policy`, exit 9).
 /// `--exec` (S6) then runs the `/agent` steps of `exec::smoke_exec`; their
 /// verdict is in the record (`exec_ok`), which the caller judges once it is out.
-async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, steps: &Steps, exec: bool) -> std::result::Result<(String, serde_json::Map<String, serde_json::Value>), SmokeFail> {
+async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(
+    ctx: &Ctx,
+    api: &A,
+    ep: &E,
+    plan: &run::RunPlan,
+    steps: &Steps,
+    exec: bool,
+    supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>,
+) -> std::result::Result<(String, serde_json::Map<String, serde_json::Value>), SmokeFail> {
     let selected = run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)).await.map_err(|f| {
         let gate = matches!(f.error, BridgeError::EgressMismatch(_));
         SmokeFail { id: f.started, kept_pending: f.kept_pending, gate, error: f.error.into() }
@@ -1040,52 +1334,86 @@ async fn smoke_flow<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E
             say(step.line.clone())?;
         }
         ran.record(&mut rec);
+        // S7: the credentialed step, on the row `/health` just gave its caps.
+        if let Some(supply) = supply {
+            let row = registry::read_row(&ctx.paths, &id).ok().flatten().unwrap_or(row);
+            let cred = crate::bridge::agent::exec::smoke_credential(ctx, api, ep, &row, &vm, supply).await;
+            say(cred.line.clone())?;
+            cred.record(&mut rec);
+        }
     }
     Ok((id, rec))
 }
 
+/// Who looks for its own VM after a failure or a stop ([`sweep_own`]): the
+/// start of its lines, what made the VM it looks for, the purpose its
+/// adoption's egress audit names, and, for an operator waiting on a stop,
+/// how a second one gives the sweep up (said with how long the sweep may
+/// poll, before it does; the smoke says nothing then).
+#[derive(Debug, Clone, Copy)]
+struct Sweeper {
+    says: &'static str,
+    run: &'static str,
+    purpose: &'static str,
+    skip: &'static str,
+}
+
+/// The smoke's sweep (plan S4 D26).
+const SMOKE_SWEEP: Sweeper = Sweeper { says: "smoke:", run: "the ambiguous RunMicrovm", purpose: "smoke", skip: "" };
+
+/// `vm warm`'s, after a stop that came while its `select` ran (F20).
+const WARM_SWEEP: Sweeper = Sweeper {
+    says: "ai-env:",
+    run: "the RunMicrovm in flight at the stop",
+    purpose: "operator",
+    skip: "a second Ctrl-C or stop signal gives the search up and keeps its pending row for `ai-env vm gc`",
+};
+
 /// The VM a kept pending row stands for, by the adoption sweep, and whether
-/// it failed the S5 egress gate: `Adopted` is terminated by the caller, and
-/// so is a VM the sweep's egress gate rejected but could not terminate (by
-/// `policy`, `--keep` or not); `NoMatch` and `Unresolved` leave the row for
-/// `ai-env vm gc` and never terminate anything (the VMs may be another
-/// run's).
-async fn adopt<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pending: &VmRow, since_unix: u64) -> Option<(String, bool)> {
-    match run::adopt_after_ambiguous_for(api, ep, &ctx.paths, pending, since_unix, ctx.poll(run::Poll::RUNNING), "smoke").await {
+/// it failed the S5 egress gate: `Adopted` is terminated by the caller (the
+/// smoke; `vm warm` names it), and so is a VM the sweep's egress gate
+/// rejected but could not terminate (by `policy`, `--keep` or not);
+/// `NoMatch` and `Unresolved` leave the row for `ai-env vm gc` and never
+/// terminate anything (the VMs may be another run's). Its lines may come
+/// after SIGHUP, with the terminal gone: `say`, never a panic (F3).
+async fn adopt<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pending: &VmRow, since_unix: u64, who: Sweeper) -> Option<(String, bool)> {
+    use crate::bridge::signals::say;
+    let (says, ran) = (who.says, who.run);
+    match run::adopt_after_ambiguous_for(api, ep, &ctx.paths, pending, since_unix, ctx.poll(run::Poll::RUNNING), who.purpose).await {
         Ok(run::Adoption::Adopted(id)) => {
-            eprintln!("smoke: the ambiguous RunMicrovm started {id} (adopted)");
+            say(&format!("{says} {ran} started {id} (adopted)"));
             Some((id, false))
         }
         Err(BridgeError::EgressMismatch(m)) if !m.terminated => {
-            eprintln!("smoke: the ambiguous RunMicrovm started {}, which failed the egress gate and is not confirmed terminated", m.id);
+            say(&format!("{says} {ran} started {}, which failed the egress gate and is not confirmed terminated", m.id));
             Some((m.id.clone(), true))
         }
         Err(e @ BridgeError::EgressMismatch(_)) => {
-            eprintln!("smoke: the ambiguous RunMicrovm's VM failed the egress gate: {e}");
+            say(&format!("{says} {ran}'s VM failed the egress gate: {e}"));
             None
         }
         Ok(run::Adoption::NoMatch) => {
-            eprintln!("smoke: no VM of this run is visible; the pending row {} is kept for `ai-env vm gc`", pending.stem());
+            say(&format!("{says} no VM of this run is visible; the pending row {} is kept for `ai-env vm gc`", pending.stem()));
             None
         }
         Ok(run::Adoption::Unresolved(ids)) => {
-            eprintln!("smoke: VMs that may be this run's could not be asked ({}); nothing terminated — run `ai-env vm gc` later", ids.join(", "));
+            say(&format!("{says} VMs that may be this run's could not be asked ({}); nothing terminated — run `ai-env vm gc` later", ids.join(", ")));
             None
         }
         Err(e) => {
-            eprintln!("smoke: the adoption sweep failed: {e}; run `ai-env vm gc`");
+            say(&format!("{says} the adoption sweep failed: {e}; run `ai-env vm gc`"));
             None
         }
     }
 }
 
 /// After a failure without a VM id or kept row, and after Ctrl-C: the VM of
-/// THIS smoke, found only through the rows carrying its own client token
-/// (an id row → that VM, failed the egress gate when its row says
-/// `mismatch`; a pending row → the adoption sweep). Another run's rows never
-/// match, and a failure before the pending row was written (MaxConcurrent, a
-/// busy lock) finds nothing.
-async fn sweep_own<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, client_token: &str, since_unix: u64) -> Option<(String, bool)> {
+/// THIS smoke (or stopped `vm warm`), found only through the rows carrying
+/// its own client token (an id row → that VM, failed the egress gate when
+/// its row says `mismatch`; a pending row → the adoption sweep). Another
+/// run's rows never match, and a failure before the pending row was written
+/// (MaxConcurrent, a busy lock) finds nothing.
+async fn sweep_own<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, client_token: &str, since_unix: u64, who: Sweeper) -> Option<(String, bool)> {
     if client_token.is_empty() {
         return None;
     }
@@ -1095,15 +1423,76 @@ async fn sweep_own<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E,
         return Some((r.id.clone(), r.egress_gate.as_deref() == Some(registry::GATE_MISMATCH)));
     }
     match mine.iter().find(|r| r.is_pending_row()) {
-        Some(p) => adopt(ctx, api, ep, p, since_unix).await,
+        Some(p) => {
+            // The sweep may poll for up to RunMicrovm's own budget: an operator waiting on a stop is told so first.
+            if !who.skip.is_empty() {
+                let budget = ctx.poll(run::Poll::RUNNING).budget;
+                let budget = if budget >= std::time::Duration::from_secs(1) { format!("{} s", budget.as_secs()) } else { format!("{} ms", budget.as_millis()) };
+                crate::bridge::signals::say(&format!("{} looking for the VM {} may have started, for up to {budget} ({})", who.says, who.run, who.skip));
+            }
+            adopt(ctx, api, ep, p, since_unix, who).await
+        }
         None => None,
     }
+}
+
+/// After a stop of `vm warm` before its `select` returned: the VM that
+/// `select` may have started, found as the smoke finds its own
+/// ([`sweep_own`]). Once RunMicrovm made it, its id row names it; while that
+/// call was in flight only its pending row does, and the adoption sweep
+/// adopts and records the VM (F20), so the next warm reuses it instead of
+/// starting a second; the sweep says first that it looks, for how long, and
+/// how to give it up. A second stop (`again`) gives the sweep up, saying the
+/// pending row is kept for `ai-env vm gc`.
+async fn warm_own_vm<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, client_token: &str, since_unix: u64, again: impl std::future::Future<Output = crate::bridge::signals::Stop>) -> Option<(String, bool)> {
+    tokio::select! {
+        biased;
+        stop = again => {
+            crate::bridge::signals::say(&format!(
+                "ai-env: {} ({}) again: the search for the VM a RunMicrovm in flight may have started is given up; its pending row is kept: `ai-env vm gc` adopts the VM while it runs",
+                stop.word(),
+                stop.name()
+            ));
+            None
+        }
+        found = sweep_own(ctx, api, ep, client_token, since_unix, WARM_SWEEP) => found,
+    }
+}
+
+/// What `vm warm` says of a VM it started, which keeps running.
+fn warm_kept(id: &str) -> String {
+    format!("{id} was started for this workspace and keeps running: `ai-env vm warm` again reuses it, `ai-env vm terminate {id}` ends it")
+}
+
+/// `vm warm` stopped by `stop` before its delivery: says nothing was
+/// delivered, then names the VM this warm started, which keeps running:
+/// `started`, once `select` returned it; else what a stop inside `select`
+/// leaves under the warm's client token, the id row of a VM it started or,
+/// while RunMicrovm was in flight, only its pending row, whose VM is
+/// adopted ([`warm_own_vm`], which `again`, a second stop, cuts short). All
+/// warm's stop does there; the error it exits with.
+#[allow(clippy::too_many_arguments)]
+async fn warm_stopped<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, started: Option<String>, since_unix: u64, stop: crate::bridge::signals::Stop, again: impl std::future::Future<Output = crate::bridge::signals::Stop>) -> CliError {
+    use crate::bridge::signals::say;
+    say(&format!("ai-env: {} ({}) before the setup-token was sent: nothing was delivered", stop.word(), stop.name()));
+    let own = match started {
+        Some(id) => Some((id, false)),
+        None => warm_own_vm(ctx, api, ep, plan.client_token.as_deref().unwrap_or_default(), since_unix, again).await,
+    };
+    match own {
+        Some((id, false)) => say(&format!("ai-env: {}", warm_kept(&id))),
+        Some((id, true)) => say(&format!("ai-env: {id} was started for this workspace and failed the egress gate: `ai-env vm terminate {id}` (or `ai-env vm gc --yes`) ends it")),
+        None => {}
+    }
+    CliError::Exit(stop.status())
 }
 
 // ---- `ai-env lab …` -------------------------------------------------------------------------
 
 /// `ai-env lab …`.
 pub fn lab_main(store: &Keystore, cmd: LabCmd) -> Result<()> {
+    // Before anything could listen: a signal ignored when ai-env started stays ignored (`signals`).
+    crate::bridge::signals::note_dispositions();
     match cmd {
         LabCmd::List { json } => probes::cmd_list(json),
         LabCmd::Show { probe, json } => probes::cmd_show(&probe, json),
@@ -1131,7 +1520,9 @@ fn with_note(derived: String, user: Option<&String>) -> Option<String> {
 
 fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::path::Path>, manual: Option<&str>, note: Option<String>) -> Result<()> {
     let spec = probes::spec(name).ok_or_else(|| CliError::Usage(format!("unknown probe {name:?} (ai-env lab list)")))?;
-    if !matches!(spec.stage, "S4" | "S5" | "S6") {
+    // Only the probes `lab run` records: the S1 census, the S3 deploy and S7's setup-token-prefix (recorded
+    // by `creds setup-token`) are refused, naming their recorder.
+    if !spec.recorded_by.starts_with("ai-env lab run") {
         return Err(CliError::Usage(format!("{name} is a {} probe, recorded by: {}", spec.stage, spec.recorded_by)));
     }
     let paths = Paths::resolve()?;
@@ -1193,10 +1584,32 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
         let id = id.ok_or_else(|| CliError::Usage("cloudtrail-payload needs the id of a VM this ai-env started".into()))?;
         return cloudtrail(&paths, spec, id, log, note.as_ref());
     }
-    // The live probes: their own VMs, the runtime key.
+    // S7's Mac probes: no VM, no AWS call, no runtime key.
+    if spec.source == probes::Source::Mac {
+        let cfg = BridgeConfig::load(&paths)?.unwrap_or_default();
+        let (verdict, derived) = match name {
+            "touchid-gui" => crate::bridge::vm::lab_mac::touchid_gui(store, &cfg)?,
+            "oauth-t1" => crate::bridge::vm::lab_mac::oauth_t1(store, &paths, &cfg)?,
+            other => return Err(CliError::Msg(format!("{other} is not a Mac probe this build runs (internal)"))),
+        };
+        return probes::record(&paths, &probes::stamped(&paths, spec, &verdict, with_note(derived, note.as_ref())));
+    }
+    // The live probes: their own VMs, the runtime key; S7's credential probes also the setup-token (one Touch ID
+    // for both with a current combined.env).
     let ctx = Ctx::load()?;
     let rt = runtime()?;
+    let credentialed = matches!(name, "fd-delivery" | "init-budget");
     let outcome = rt.block_on(async {
+        if credentialed {
+            let cred = sealed_token_plan(&ctx)?;
+            // The gate's local half on the VM the probe would start, before any Touch ID, as `vm warm` judges its own.
+            provisional_gate(&ctx, &lab::cred_plan(&ctx, name)?)?;
+            // The command listens for its stop signals from here to its end, as `vm main`'s credentialed commands do.
+            crate::bridge::signals::Stops::take()?.keep();
+            let (b, token) = crate::bridge::agent::credential::backend_for_credential(store, &ctx, &cred).await?;
+            let supply = crate::bridge::agent::credential::CredentialSupply { store, token };
+            return with_backend!(&b, |api, ep| lab::run_probe_with(&ctx, api, ep, name, id, Some(supply)).await.map_err(CliError::from));
+        }
         let b = backend(store, &ctx).await?;
         with_backend!(&b, |api, ep| lab::run_probe(&ctx, api, ep, name, id).await.map_err(CliError::from))
     })?;
@@ -1584,5 +1997,211 @@ mod tests {
         let gone = registry::VmRow { status: RowStatus::Terminated, ..live.clone() };
         assert_eq!(wall_left_cell("(terminated)", Some(&gone), 900), "-");
         assert_eq!(wall_left_cell("RUNNING", None, 900), "-");
+    }
+
+    /// The in-memory fake, but its first RunMicrovm makes the VM and then
+    /// never answers: a stop comes while the call is in flight (`made` says
+    /// when the VM exists).
+    struct InFlight {
+        inner: crate::bridge::api::FakeMicrovmApi,
+        armed: std::sync::atomic::AtomicBool,
+        made: tokio::sync::Notify,
+    }
+
+    impl MicrovmApi for InFlight {
+        async fn run(&self, spec: &crate::bridge::api::RunSpec) -> std::result::Result<VmInfo, BridgeError> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.inner.run(spec).await?;
+                self.made.notify_one();
+                std::future::pending::<()>().await;
+            }
+            self.inner.run(spec).await
+        }
+
+        async fn get(&self, id: &str) -> std::result::Result<VmInfo, BridgeError> {
+            self.inner.get(id).await
+        }
+
+        async fn suspend(&self, id: &str) -> std::result::Result<(), BridgeError> {
+            self.inner.suspend(id).await
+        }
+
+        async fn resume(&self, id: &str) -> std::result::Result<(), BridgeError> {
+            self.inner.resume(id).await
+        }
+
+        async fn terminate(&self, id: &str) -> std::result::Result<(), BridgeError> {
+            self.inner.terminate(id).await
+        }
+
+        async fn list(&self, image_arn: Option<&str>) -> std::result::Result<Vec<crate::bridge::api::VmSummary>, BridgeError> {
+            self.inner.list(image_arn).await
+        }
+
+        async fn create_auth_token(&self, id: &str, minutes: u16, port: u16) -> std::result::Result<crate::bridge::api::AuthToken, BridgeError> {
+            self.inner.create_auth_token(id, minutes, port).await
+        }
+
+        async fn create_shell_token(&self, id: &str, minutes: u16) -> std::result::Result<crate::bridge::api::AuthToken, BridgeError> {
+            self.inner.create_shell_token(id, minutes).await
+        }
+
+        async fn get_image(&self, arn: &str) -> std::result::Result<crate::bridge::api::ImageInfo, BridgeError> {
+            self.inner.get_image(arn).await
+        }
+
+        async fn list_image_versions(&self, arn: &str) -> std::result::Result<Vec<crate::bridge::api::ImageVersion>, BridgeError> {
+            self.inner.list_image_versions(arn).await
+        }
+
+        async fn list_managed_images(&self) -> std::result::Result<Vec<crate::bridge::api::ManagedImage>, BridgeError> {
+            self.inner.list_managed_images().await
+        }
+    }
+
+    impl EndpointClient for InFlight {
+        async fn get_health(&self, endpoint: &str, token: &crate::bridge::api::AuthToken, port_header: u16) -> std::result::Result<crate::bridge::api::HealthReply, BridgeError> {
+            self.inner.get_health(endpoint, token, port_header).await
+        }
+    }
+
+    /// The context of a warm in `dir` (its `work/ws` workspace created), the
+    /// lab backoff knob as given.
+    fn warm_ctx(dir: &std::path::Path, backoff: Option<&str>) -> Ctx {
+        std::fs::create_dir_all(dir.join("work").join("ws")).unwrap();
+        let text = format!("[aws]\nimage_arn = \"{}\"\n[workspaces]\nroots = [{:?}]\n", crate::bridge::api::FAKE_IMAGE_ARN, dir.join("work"));
+        Ctx { paths: Paths::from_root_and_env(dir.join("bridge"), None), cfg: BridgeConfig::parse(&text).unwrap(), knobs: crate::bridge::lab::parse_vm_knobs(None, None, backoff) }
+    }
+
+    /// The plan `vm warm` makes for the workspace in `dir`: reuse, wait, a
+    /// client token of its own (a new one on each call).
+    fn warm_plan(ctx: &Ctx, dir: &std::path::Path) -> run::RunPlan {
+        let flags = run::RunFlags { workspace: Some(dir.join("work").join("ws")), egress: Some(run::Egress::Internet), max_duration_s: Some(3600), purpose: "operator", wait: true, ..run::RunFlags::default() };
+        let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags).unwrap_or_else(|e| panic!("plan: {e}"));
+        plan.client_token = Some(uuid::Uuid::now_v7().to_string());
+        plan
+    }
+
+    /// `select` for `plan` until its RunMicrovm made the VM, then dropped as
+    /// `stoppable` drops it on a stop: only the pending row of the plan's
+    /// client token records the VM. Its id.
+    async fn in_flight(api: &InFlight, ctx: &Ctx, plan: &run::RunPlan) -> String {
+        tokio::select! {
+            biased;
+            () = api.made.notified() => {}
+            r = run::select_vm_detailed(api, &ctx.paths, plan, ctx.poll(run::Poll::RUNNING)) => panic!("select ended before the stop (ok: {})", r.is_ok()),
+        }
+        let token = plan.client_token.clone().unwrap_or_default();
+        let mine: Vec<VmRow> = registry::list_rows(&ctx.paths).unwrap().into_iter().filter(|r| r.client_token == token).collect();
+        assert!(mine.len() == 1 && mine[0].is_pending_row(), "only the pending row records the VM the call made: {mine:?}");
+        let made: Vec<String> = api.inner.state().vms.values().filter(|v| !v.state.is_terminal()).map(|v| v.id.clone()).collect();
+        assert_eq!(made.len(), 1, "RunMicrovm made the VM");
+        made[0].clone()
+    }
+
+    /// Set only in the environment of the F20 test's child half.
+    const WARM_STOP_CHILD: &str = "AI_ENV_TEST_WARM_STOP";
+
+    /// F20: `vm warm` stopped while its RunMicrovm is in flight (the call made
+    /// the VM; only the pending row of the warm's own client token records
+    /// it). Its stop ([`warm_stopped`], all that warm's stop arm does) says
+    /// nothing was delivered, then that it looks for the VM and for how long,
+    /// adopts it as the smoke adopts its own and records it, and names it as
+    /// kept: the next warm of the workspace reuses it instead of starting a
+    /// second; exit 130. A second stop while it looks gives the search up,
+    /// saying so, and keeps the pending row for `ai-env vm gc`; the exit is
+    /// the first stop's (143 after SIGHUP). The test runs itself again as its
+    /// child half, which makes the stops (a dropped `select`, as `stoppable`
+    /// drops it, with no signal: other tests of a process listen for them)
+    /// and checks the rows; this half reads the `ai-env:` lines the child
+    /// said on its stderr.
+    #[test]
+    fn a_warm_stopped_while_run_microvm_is_in_flight_adopts_the_vm_it_made() {
+        if std::env::var_os(WARM_STOP_CHILD).is_some() {
+            warm_stopped_in_flight();
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let (out_path, err_path) = (d.path().join("child.out"), d.path().join("child.err"));
+        let name = format!("{}::a_warm_stopped_while_run_microvm_is_in_flight_adopts_the_vm_it_made", module_path!().split_once("::").map_or("", |(_, m)| m));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.as_str(), "--test-threads=1"])
+            .env(WARM_STOP_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&out_path).unwrap())
+            .stderr(std::fs::File::create(&err_path).unwrap())
+            .spawn()
+            .unwrap();
+        let t = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if t.elapsed() > std::time::Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child half ran past 60 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (out, err) = (std::fs::read_to_string(&out_path).unwrap_or_default(), std::fs::read_to_string(&err_path).unwrap_or_default());
+        assert!(status.success() && out.contains("1 passed"), "the child half failed ({status}): {out}\n{err}");
+        let said: Vec<&str> = err.lines().filter(|l| l.starts_with("ai-env:")).collect();
+        let id = said.iter().find_map(|l| l.strip_prefix("ai-env: the RunMicrovm in flight at the stop started ")?.strip_suffix(" (adopted)")).unwrap_or_else(|| panic!("no adoption said: {said:?}"));
+        let looking = |budget: &str| format!("ai-env: looking for the VM the RunMicrovm in flight at the stop may have started, for up to {budget} (a second Ctrl-C or stop signal gives the search up and keeps its pending row for `ai-env vm gc`)");
+        assert_eq!(
+            said,
+            [
+                "ai-env: interrupted (SIGINT) before the setup-token was sent: nothing was delivered".to_string(),
+                looking("60 ms"),
+                format!("ai-env: the RunMicrovm in flight at the stop started {id} (adopted)"),
+                format!("ai-env: {id} was started for this workspace and keeps running: `ai-env vm warm` again reuses it, `ai-env vm terminate {id}` ends it"),
+                "ai-env: terminated (SIGHUP) before the setup-token was sent: nothing was delivered".to_string(),
+                looking("60 s"),
+                "ai-env: interrupted (SIGINT) again: the search for the VM a RunMicrovm in flight may have started is given up; its pending row is kept: `ai-env vm gc` adopts the VM while it runs".to_string(),
+            ]
+        );
+    }
+
+    /// The F20 test's child half: two warms stopped while their RunMicrovm
+    /// is in flight, the second stopped again while its VM is looked for.
+    fn warm_stopped_in_flight() {
+        use crate::bridge::signals::Stop;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // One stop: the VM is looked for (60 ms, the lab backoff's scale), adopted, recorded and named.
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = warm_ctx(dir.path(), Some("1"));
+            let api = InFlight { inner: crate::bridge::api::FakeMicrovmApi::new(), armed: true.into(), made: tokio::sync::Notify::new() };
+            api.inner.set_auto_advance(true);
+            let first = warm_plan(&ctx, dir.path());
+            let t0 = unix_now();
+            let made = in_flight(&api, &ctx, &first).await;
+            let e = warm_stopped(&ctx, &api, &api, &first, None, t0, Stop::Int, std::future::pending::<Stop>()).await;
+            assert!(matches!(e, CliError::Exit(130)), "{e}");
+            let row = registry::read_row(&ctx.paths, &made).unwrap().expect("adopted: its id row is written");
+            assert_eq!(Some(row.client_token), first.client_token, "under this warm's client token");
+            assert!(registry::list_rows(&ctx.paths).unwrap().iter().all(|r| !r.is_pending_row()), "no pending row is left");
+            let next = run::select_vm_detailed(&api, &ctx.paths, &warm_plan(&ctx, dir.path()), ctx.poll(run::Poll::RUNNING)).await.unwrap_or_else(|f| panic!("the next warm: {}", f.error));
+            assert!(matches!(&next, run::Selected::Reused { vm, .. } if vm.id == made), "the next warm reuses it: {next:?}");
+            let live: Vec<String> = api.inner.state().vms.values().filter(|v| !v.state.is_terminal()).map(|v| v.id.clone()).collect();
+            assert_eq!(live, [made], "no second VM");
+            // A stop, and a second while the VM (which stays PENDING) is looked for, for up to 60 s: given up.
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = warm_ctx(dir.path(), None);
+            let api = InFlight { inner: crate::bridge::api::FakeMicrovmApi::new(), armed: true.into(), made: tokio::sync::Notify::new() };
+            api.inner.set_auto_advance(false);
+            let first = warm_plan(&ctx, dir.path());
+            let t0 = unix_now();
+            let made = in_flight(&api, &ctx, &first).await;
+            let again = async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Stop::Int
+            };
+            let e = warm_stopped(&ctx, &api, &api, &first, None, t0, Stop::Hup, again).await;
+            assert!(matches!(e, CliError::Exit(143)), "{e}");
+            let rows = registry::list_rows(&ctx.paths).unwrap();
+            assert!(rows.len() == 1 && rows[0].is_pending_row() && registry::read_row(&ctx.paths, &made).unwrap().is_none(), "the pending row is kept, nothing adopted: {rows:?}");
+        });
     }
 }

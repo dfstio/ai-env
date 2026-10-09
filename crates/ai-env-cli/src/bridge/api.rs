@@ -491,6 +491,16 @@ pub struct FakeState {
     /// test that forgot to seed one never passes the gate by accident (S7).
     #[serde(default)]
     pub connectors: BTreeMap<String, serde_json::Value>,
+    /// The `caps` every VM's `/health` names (S7): empty models an S6 shim
+    /// (image 5.0), `credential_cache` an S7 one.
+    #[serde(default)]
+    pub health_caps: Vec<String>,
+    /// The file-backed fake's next `GetMicrovm` answers this many ms late,
+    /// awaited outside its lock as a slow call is; that call takes it (0 from
+    /// then on). A process test stops a command while it waits (S7: a
+    /// credentialed `vm exec` drops a GetMicrovm in flight at once).
+    #[serde(default)]
+    pub park_get_ms: u64,
 }
 
 fn default_retry_after_429() -> Option<u64> {
@@ -851,6 +861,7 @@ impl FakeState {
             sockets_authenticated: 0,
             spawns: Vec::new(),
             has_credentials: false,
+            credential: crate::wire::frame::CredentialView::default(),
             clock: None,
             listeners: Vec::new(),
             listeners_omitted: 0,
@@ -873,6 +884,7 @@ impl FakeState {
             run_hook_seen: true,
             uptime_s: 1,
             wire: Some(crate::wire::frame::WIRE_VERSION),
+            caps: self.health_caps.clone(),
         }
     }
 }

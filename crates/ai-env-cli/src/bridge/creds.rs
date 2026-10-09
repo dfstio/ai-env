@@ -333,7 +333,7 @@ fn check_recovery(store: &Keystore, name: &str, force: bool) -> Check {
         Some(_) => Ok(format!("key {name} has a recovery recipient")),
         None if force => Ok(format!("key {name} has NO recovery recipient (accepted by --force)")),
         None => Err(CliError::Policy(format!(
-            "key {name:?} has no recovery recipient: if this Mac's Secure Enclave key is lost, the sealed AWS key goes with it; use a key created with a recovery identity, or pass --force to accept that"
+            "key {name:?} has no recovery recipient: if this Mac's Secure Enclave key is lost, what is sealed to it goes with it; use a key created with a recovery identity, or pass --force to accept that"
         ))),
     }
 }
@@ -358,8 +358,9 @@ fn writable(dir: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
-/// Largest `credentials/aws.env` read to classify it: a sealed access key is
-/// about 1 KiB, and a container's payload is capped at 128 KiB anyway.
+/// Largest credentials file read to classify it: a sealed access key or
+/// setup-token is about 1 KiB, and a container's payload is capped at 128 KiB
+/// anyway.
 const MAX_SEALED: u64 = 256 * 1024;
 
 /// What sits at `credentials/aws.env`, as [`aws_env_state`] sees it.
@@ -378,8 +379,10 @@ pub enum AwsEnvState {
 /// (a symlink or a non-regular file is never opened), then one
 /// `O_NOFOLLOW|O_NONBLOCK` open that must still be a regular file, read up
 /// to [`MAX_SEALED`] bytes and checked with [`container::detect`]. Shared by
-/// `creds aws-set` (the target check before sealing) and doctor's runtime
-/// credentials row, so the two never disagree about a plaintext key there.
+/// every sealing command (the target check before sealing), the unseal paths
+/// and doctor's rows, for every file under `credentials/` (S7:
+/// `setup-token.env`, `combined.env`), so none of them disagree about a
+/// plaintext credential there.
 #[must_use]
 pub fn aws_env_state(path: &Path) -> AwsEnvState {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -407,7 +410,7 @@ pub fn aws_env_state(path: &Path) -> AwsEnvState {
         return not(format!("cannot be read ({e})"));
     }
     if bytes.len() as u64 > MAX_SEALED {
-        return not(format!("is larger than {} KiB, not a sealed access key", MAX_SEALED / 1024));
+        return not(format!("is larger than {} KiB, not a sealed credential", MAX_SEALED / 1024));
     }
     match std::str::from_utf8(&bytes) {
         Ok(text) if container::detect(text) => AwsEnvState::Sealed,
@@ -420,14 +423,20 @@ pub fn aws_env_state(path: &Path) -> AwsEnvState {
 /// plaintext file there would be copied into the backup and spread). Symlinks
 /// are refused: the rename would replace the link and the backup would read
 /// another file.
+#[cfg(test)]
 fn check_target(paths: &Paths) -> Check {
+    check_target_file(paths, &paths.aws_env())
+}
+
+/// [`check_target`] for any file under `credentials/` (S7: the setup-token
+/// and the derived `combined.env`).
+pub(crate) fn check_target_file(paths: &Paths, target: &Path) -> Check {
     let dir = paths.credentials();
-    let target = paths.aws_env();
     match std::fs::symlink_metadata(&dir) {
         Ok(m) if m.file_type().is_symlink() => Err(CliError::Msg(format!("{} is a symlink: refusing to seal credentials through it", dir.display()))),
         Ok(m) if !m.is_dir() => Err(CliError::Msg(format!("{} is not a directory", dir.display()))),
         Ok(_) if !writable(&dir) => Err(CliError::Msg(format!("{} is not writable", dir.display()))),
-        Ok(_) => match aws_env_state(&target) {
+        Ok(_) => match aws_env_state(target) {
             AwsEnvState::Sealed => Ok(format!("{} exists: backed up before it is replaced", target.display())),
             AwsEnvState::Absent => Ok(format!("{} (new)", target.display())),
             AwsEnvState::NotSealed(why) => Err(CliError::Msg(format!("{} exists but {why}: move it away (and rotate whatever it holds) before sealing", target.display()))),
@@ -498,11 +507,17 @@ fn check_iam_keys(user: &str) -> Check {
 
 /// The rows both modes share: keystore key, recovery recipient, age, target.
 fn preflight(store: &Keystore, paths: &Paths, key_name: &str, force: bool) -> (Vec<Check>, Option<AgeTool>) {
-    let (age_row, age) = check_age();
-    (vec![check_key(store, key_name), check_recovery(store, key_name, force), age_row, check_target(paths)], age)
+    preflight_for(store, paths, key_name, &paths.aws_env(), force)
 }
 
-fn key_name(paths: &Paths) -> Result<String> {
+/// [`preflight`] for sealing `target`.
+pub(crate) fn preflight_for(store: &Keystore, paths: &Paths, key_name: &str, target: &Path, force: bool) -> (Vec<Check>, Option<AgeTool>) {
+    let (age_row, age) = check_age();
+    (vec![check_key(store, key_name), check_recovery(store, key_name, force), age_row, check_target_file(paths, target)], age)
+}
+
+/// `[creds].key` from bridge.toml (default `ai-env-bridge`).
+pub(crate) fn key_name(paths: &Paths) -> Result<String> {
     Ok(BridgeConfig::load(paths)?.unwrap_or_default().creds.key)
 }
 
@@ -510,7 +525,7 @@ fn key_name(paths: &Paths) -> Result<String> {
 
 /// Make `dir` a real 0700 directory: created (parents too) when absent,
 /// refused when it is a symlink or not a directory, tightened when wider.
-fn ensure_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.file_type().is_symlink() => bail!("{} is a symlink: refusing to seal credentials through it", dir.display()),
@@ -559,41 +574,55 @@ fn backup_existing_at(target: &Path, unix: u64) -> Result<PathBuf> {
 }
 
 /// What sealing left on disk.
-struct Sealed {
-    path: PathBuf,
-    backup: Option<PathBuf>,
+pub(crate) struct Sealed {
+    pub(crate) path: PathBuf,
+    pub(crate) backup: Option<PathBuf>,
+    /// hex(sha256) of the container text written: what a `combined.env`
+    /// built from it records (F2), never a later read of a file another
+    /// command may have sealed anew.
+    pub(crate) sha256: String,
 }
 
 /// Preflight, encrypt [`render_env`] to the key's recipients, sanity-check the
 /// ciphertext, back up an existing container, write the new one atomically.
 fn seal(store: &Keystore, paths: &Paths, key_name: &str, key: &AccessKey, force: bool) -> Result<Sealed> {
-    let (rows, age) = preflight(store, paths, key_name, force);
+    let plaintext = render_env(key);
+    seal_file(store, paths, key_name, &paths.aws_env(), plaintext.as_bytes(), &[key.secret.expose().as_bytes()], &[], force)
+}
+
+/// Seal `plaintext` into `target` under `credentials/`: the preflight for
+/// that file, encryption to the key's recipients, a check that none of
+/// `secrets` came back in the clear, a backup of an existing container, and
+/// an atomic write of the new one with `notes` as its metadata line
+/// ([`container::write_annotated`]; none gives the classic text).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_file(store: &Keystore, paths: &Paths, key_name: &str, target: &Path, plaintext: &[u8], secrets: &[&[u8]], notes: &[(&str, &str)], force: bool) -> Result<Sealed> {
+    let (rows, age) = preflight_for(store, paths, key_name, target, force);
     if let Some(e) = rows.into_iter().find_map(std::result::Result::err) {
         return Err(e);
     }
     let Some(age) = age else { bail!("age is not available") };
-    let ciphertext = {
-        let plaintext = render_env(key);
-        age.encrypt(&store.recipients_path(key_name), plaintext.as_bytes())?
-    };
-    let secret = key.secret.expose().as_bytes();
-    if ciphertext.windows(secret.len()).any(|w| w == secret) {
+    let ciphertext = age.encrypt(&store.recipients_path(key_name), plaintext)?;
+    if secrets.iter().any(|s| !s.is_empty() && ciphertext.windows(s.len()).any(|w| w == *s)) {
         bail!("age returned the secret in the clear (is the `age` on PATH the real tool?): nothing written");
     }
-    let text = container::write(&ciphertext);
+    let text = container::write_annotated(&ciphertext, notes)?;
     container::read(&text).map_err(|e| CliError::Msg(format!("age output is not an age file ({e}): nothing written")))?;
     ensure_private_dir(&paths.credentials())?;
-    let target = paths.aws_env();
-    let backup = match std::fs::symlink_metadata(&target) {
+    let backup = match std::fs::symlink_metadata(target) {
         Ok(m) if m.file_type().is_symlink() => bail!("{} is a symlink: refusing to replace it", target.display()),
         Ok(m) if !m.is_file() => bail!("{} is not a regular file", target.display()),
-        Ok(_) => Some(backup_existing(&target)?),
+        Ok(_) => Some(backup_existing(target)?),
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => bail!("cannot stat {}: {e}", target.display()),
     };
     // write_atomic: 0600 temp file in the same directory, fsync, rename.
-    write_atomic(&target, text.as_bytes())?;
-    Ok(Sealed { path: target, backup })
+    write_atomic(target, text.as_bytes())?;
+    let sha256 = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(text.as_bytes()))
+    };
+    Ok(Sealed { path: target.to_path_buf(), backup, sha256 })
 }
 
 /// `--check`: every row printed, exit 0 only when all pass, else the class of
@@ -660,6 +689,12 @@ pub fn cmd_aws_set(store: &Keystore, user: &str, check: bool, force: bool) -> Re
     if let Some(bak) = &sealed.backup {
         outln!("previous container kept as {}", bak.display());
     }
+    // S7 D4: a sealed setup-token is joined with the new key in combined.env
+    // (one Touch ID to read the token); a failure there never fails the seal.
+    // It records the hash of the text sealed here, whatever aws.env holds by
+    // then (F2: a second `creds aws-set` may seal anew while the lines above
+    // are written).
+    crate::bridge::setup_token::after_aws_set(store, &paths, &name, &key.id, key.secret.expose(), &sealed.sha256, force);
     Ok(())
 }
 
@@ -893,7 +928,7 @@ mod tests {
         assert_eq!(aws_env_state(&p), not("is not an ai-env container (plaintext?)"), "not UTF-8");
         // A container padded past the cap is refused unread beyond it.
         std::fs::write(&p, format!("{}{sealed}", "#\n".repeat(usize::try_from(MAX_SEALED).unwrap()))).unwrap();
-        assert_eq!(aws_env_state(&p), not("is larger than 256 KiB, not a sealed access key"));
+        assert_eq!(aws_env_state(&p), not("is larger than 256 KiB, not a sealed credential"));
         std::fs::remove_file(&p).unwrap();
         // A symlink, even to a container.
         let elsewhere = d.path().join("elsewhere.env");

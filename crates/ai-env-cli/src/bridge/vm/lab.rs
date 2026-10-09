@@ -5,10 +5,12 @@
 //! clock-after-resume 2400 s with 1500 s suspended (e5 max idle 60 s,
 //! clock-after-resume on vpc), in-vm-firewall a default and a `--shell` VM),
 //! measures, and terminates every VM it started on every path — success,
-//! failure, error or Ctrl-C — before the verdict is recorded (a Ctrl-C
-//! records nothing and exits 3).
+//! failure, error or a stop signal — before the verdict is recorded (a stop
+//! records nothing: Ctrl-C exits 3, SIGTERM or SIGHUP 143, as `vm smoke`
+//! does).
 use crate::bridge::agent::conn::{AgentConn, HelloOk};
-use crate::bridge::agent::{run_spawn, spawn_channels, AgentEnv, AgentTarget, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnSpec, Start};
+use crate::bridge::agent::credential::{self, CredentialFlags, CredentialPlan, CredentialSupply};
+use crate::bridge::agent::{run_spawn, run_spawn_with, spawn_channels, AgentEnv, AgentTarget, Delivery, DeliveryParts, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnSpec, Start};
 use crate::bridge::api::{AuthToken, EndpointClient, HealthDetailReply, IdleSpec, MicrovmApi, VmInfo, VmState, APP_PORT};
 use crate::bridge::awscli;
 use crate::bridge::errors::BridgeError;
@@ -59,14 +61,27 @@ impl Started {
 
 /// Run the live probe `name`; `arg` is its positional argument (the
 /// connector ARN of `connector-pending`, already validated by `lab run`). A
-/// Ctrl-C ends the probe, never the terminate guard: the VMs it started (and
-/// one its cut caught starting, [`sweep_own`]) are ended, then `Cancelled`
-/// (exit 3) and nothing is recorded.
+/// stop signal ends the probe, never the terminate guard: the VMs it started
+/// (and one its cut caught starting, [`sweep_own`]) are ended, nothing is
+/// recorded, and the command exits as `vm smoke` does: `Cancelled` (3) after
+/// Ctrl-C, 143 after SIGTERM or SIGHUP. Whatever the probe was waiting on goes
+/// with it, an unseal's Touch ID dialog included (closed as it is dropped).
 pub async fn run_probe<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str, arg: Option<&str>) -> Result<ProbeOutcome, BridgeError> {
+    run_probe_with(ctx, api, ep, name, arg, None).await
+}
+
+/// [`run_probe`] with the credential the S7 probes deliver (`fd-delivery`,
+/// `init-budget`); the same terminate guard.
+pub async fn run_probe_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str, arg: Option<&str>, supply: Option<CredentialSupply<'_>>) -> Result<ProbeOutcome, BridgeError> {
     let since = unix_now();
     let mut started = Started::default();
+    let mut supply = supply;
     let probe = async {
+        let mut need = || supply.take().ok_or_else(|| BridgeError::Config(format!("{name} delivers the setup-token: it needs the keystore (internal)")));
         match name {
+            // S7: the credential's own probes.
+            "fd-delivery" => fd_delivery(ctx, api, ep, &mut started, need()?).await,
+            "init-budget" => init_budget(ctx, api, ep, &mut started, need()?).await,
             "payload-size" => payload_size(ctx, api, ep, &mut started).await,
             "no-traffic-before-run" => no_traffic_before_run(ctx, api, ep, &mut started).await,
             "snapshot-uniqueness" => snapshot_uniqueness(ctx, api, ep, &mut started).await,
@@ -84,27 +99,34 @@ pub async fn run_probe<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep:
             other => Err(BridgeError::Config(format!("{other} is not a live probe"))),
         }
     };
-    // Polled first, so the handler is in place before the probe's first call (a Ctrl-C is never the default death).
-    let result = tokio::select! {
-        biased;
-        _ = tokio::signal::ctrl_c() => Err(BridgeError::Cancelled),
-        r = probe => r,
+    // The listeners exist before the probe's first call, so a stop is never the default death; they are the ones
+    // `lab run` kept since its Touch ID (`signals`), and a signal ignored when ai-env started gets none.
+    let mut stops = crate::bridge::signals::Stops::take().map_err(|e| BridgeError::Config(e.to_string()))?;
+    let result = match crate::bridge::signals::stoppable(&mut stops, probe).await {
+        Ok(r) => r,
+        Err(crate::bridge::signals::Stop::Int) => Err(BridgeError::Cancelled),
+        Err(stop) => {
+            crate::bridge::signals::say(&format!("lab: {} ({}): ending every VM this probe started", stop.word(), stop.name()));
+            sweep_own(ctx, api, ep, &mut started, since).await;
+            Err(BridgeError::Cli(crate::errors::CliError::Exit(stop.status())))
+        }
     };
     if matches!(result, Err(BridgeError::Cancelled)) {
-        eprintln!("lab: cancelled: ending every VM this probe started");
+        crate::bridge::signals::say("lab: cancelled: ending every VM this probe started");
         sweep_own(ctx, api, ep, &mut started, since).await;
     }
-    // The terminate guard: every VM this probe started, whatever happened.
+    // The terminate guard: every VM this probe started, whatever happened. Its lines never panic (`say`): after a
+    // SIGHUP from a closed terminal every write to stderr fails, and an `eprintln!` there cost every later VM.
     for id in &started.ids {
         match run::terminate_and_record(api, &ctx.paths, id, "probe", Some(run::Poll::SETTLE.scaled(ctx.knobs.backoff_ms))).await {
-            Ok(_) => eprintln!("lab: terminated {id}"),
-            Err(e) => eprintln!("lab: could not terminate {id}: {e} — run: ai-env vm terminate {id}"),
+            Ok(_) => crate::bridge::signals::say(&format!("lab: terminated {id}")),
+            Err(e) => crate::bridge::signals::say(&format!("lab: could not terminate {id}: {e} — run: ai-env vm terminate {id}")),
         }
     }
     result
 }
 
-/// After a Ctrl-C: the VMs of this probe's runs that `started` does not hold
+/// After a stop: the VMs of this probe's runs that `started` does not hold
 /// yet (the cut came between RunMicrovm and the id), found only through the
 /// rows carrying the probe's own client tokens, as `vm smoke` finds its own:
 /// a live id row is that VM; a pending row goes through the adoption sweep.
@@ -551,8 +573,9 @@ fn agent_dial(ctx: &Ctx) -> AgentDial {
     AgentDial { local: ctx.knobs.agent_addr().ok().flatten() }
 }
 
-/// The refusal an S6 probe returns under the file-backed fake (exit 9): there
-/// is no shim behind the fake's endpoint, so the agent transport cannot run.
+/// The refusal an S6 probe returns under the file-backed fake (exit 9), and
+/// an S7 credential probe unless the platform is emulated: there is no shim
+/// behind the fake's endpoint, so the agent transport cannot run.
 fn s6_fake_refusal(name: &str) -> BridgeError {
     BridgeError::Policy(format!("lab run {name}: the file-backed fake has no shim behind its endpoint (AI_ENV_BRIDGE_LAB_FAKE_API is set): the agent transport needs the real service"))
 }
@@ -644,6 +667,16 @@ async fn exec_agent<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, 
 /// [`exec_agent`], keeping what arrived when the session ends in an error:
 /// (stdout, stderr, pid, the exit or that error).
 async fn exec_agent_partial<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spec: SpawnSpec, stdin: Vec<u8>) -> (Vec<u8>, Vec<u8>, Option<u32>, Result<RemoteExit, BridgeError>) {
+    exec_agent_partial_with(env, spec, stdin, None).await
+}
+
+/// [`exec_agent`] with a credential for the spawn (S7).
+async fn exec_agent_with<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spec: SpawnSpec, stdin: Vec<u8>, delivery: Option<Delivery>) -> Result<(Vec<u8>, Vec<u8>, Option<u32>, RemoteExit), BridgeError> {
+    let (out, err, pid, exit) = exec_agent_partial_with(env, spec, stdin, delivery).await;
+    Ok((out, err, pid, exit?))
+}
+
+async fn exec_agent_partial_with<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spec: SpawnSpec, stdin: Vec<u8>, delivery: Option<Delivery>) -> (Vec<u8>, Vec<u8>, Option<u32>, Result<RemoteExit, BridgeError>) {
     let (io, c) = spawn_channels(16);
     let feed = c.input.clone();
     let feeder = tokio::spawn(async move {
@@ -674,7 +707,7 @@ async fn exec_agent_partial<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_,
         }
         (out, err, pid)
     });
-    let outcome = run_spawn(env, Start::New(spec), io).await;
+    let outcome = run_spawn_with(env, Start::New(spec), io, delivery).await;
     drop(c.input);
     drop(c.control);
     feeder.abort();
@@ -851,7 +884,7 @@ async fn e1<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
     let expiry_ms = i64::try_from(token.expires_at_unix).unwrap_or(i64::MAX / 1000) * 1000;
     let (mut conn, _ok) = open_hello(&dial, &target, token.value()?, vec![], Some(3600), wait).await?;
     let sid = SpawnId::new_v7();
-    conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(300) }).await?;
+    conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(300), credential: None }).await?;
     let pid1 = await_spawned(&mut conn, &sid, Duration::from_secs(30)).await?;
     let (cut, silent) = e1_hold(&mut conn, expiry_ms, Duration::from_secs(240), Duration::from_secs(20), crate::wire::frame::DEAD_AFTER).await;
     conn.close(CLOSE_NORMAL).await;
@@ -1005,7 +1038,7 @@ async fn e5<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
         let tok = token::mint(api, &ctx.paths, &vm.id, APP_PORT, 60).await?;
         let (mut conn, _) = open_hello(&dial, &target, tok.value()?, vec![], Some(3600), wait).await?;
         let sid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sleep".into(), "3600".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60) }).await?;
+        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sleep".into(), "3600".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
         let _ = await_spawned(&mut conn, &sid, Duration::from_secs(30)).await;
         tokio::time::sleep(phase).await;
         drop(conn);
@@ -1045,7 +1078,7 @@ async fn e5<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
         let tok = token::mint(api, &ctx.paths, &vm.id, APP_PORT, 60).await?;
         let (mut conn, _) = open_hello(&dial, &target, tok.value()?, vec![], Some(3600), wait).await?;
         let sid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sh".into(), "-c".into(), "while true; do echo tick; sleep 10; done".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60) }).await?;
+        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sh".into(), "-c".into(), "while true; do echo tick; sleep 10; done".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
         let until = Instant::now() + phase;
         while Instant::now() < until {
             // Drain VM→Mac frames without acking; a closed socket (suspend) ends the drain.
@@ -1230,7 +1263,7 @@ async fn reattach_gap<A: MicrovmApi>(ctx: &Ctx, api: &A, dial: &AgentDial, targe
         let tok = token::mint(api, &ctx.paths, id, APP_PORT, 5).await?;
         let (mut conn, _) = open_hello(dial, target, tok.value()?, vec![], Some(3600), wait).await?;
         let gsid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: gsid.clone(), argv: vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 200000 ]; do echo g-$i; i=$((i+1)); done; sleep 120".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60) }).await?;
+        conn.send(&Frame::Spawn { spawn_id: gsid.clone(), argv: vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 200000 ]; do echo g-$i; i=$((i+1)); done; sleep 120".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
         await_spawned(&mut conn, &gsid, Duration::from_secs(30)).await?;
         // Ack up to a high seq so the shim trims past seq 1, until the output quiets.
         let mut hi = 0u64;
@@ -1268,7 +1301,7 @@ async fn reattach_window_kill<A: MicrovmApi>(ctx: &Ctx, api: &A, dial: &AgentDia
         let tok = token::mint(api, &ctx.paths, id, APP_PORT, 5).await?;
         let (mut conn, _) = open_hello(dial, target, tok.value()?, vec![], Some(3600), wait).await?;
         let wsid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: wsid.clone(), argv: vec!["sh".into(), "-c".into(), "head -c 20000000 /dev/zero | tr '\\0' X".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60) }).await?;
+        conn.send(&Frame::Spawn { spawn_id: wsid.clone(), argv: vec!["sh".into(), "-c".into(), "head -c 20000000 /dev/zero | tr '\\0' X".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
         await_spawned(&mut conn, &wsid, Duration::from_secs(30)).await?;
         // Read up to the window WITHOUT acking so it fills and the shim stops reading the child.
         let mut got = 0u64;
@@ -1372,7 +1405,7 @@ async fn clock_after_resume<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
 /// bracket t0..t1): the stdout text and both instants.
 async fn conn_exec(conn: &mut AgentConn, argv: &[&str], budget: Duration) -> Result<(String, SystemTime, SystemTime), BridgeError> {
     let sid = SpawnId::new_v7();
-    let spec = Frame::Spawn { spawn_id: sid.clone(), argv: argv.iter().map(|s| (*s).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(30) };
+    let spec = Frame::Spawn { spawn_id: sid.clone(), argv: argv.iter().map(|s| (*s).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(30), credential: None };
     let t0 = SystemTime::now();
     conn.send(&spec).await?;
     let (mut out, mut t1, mut got) = (String::new(), t0, false);
@@ -1975,12 +2008,387 @@ fn seed_request(url: &str, token: &AuthToken) -> Result<reqwest::Request, Bridge
     Ok(req)
 }
 
+
+// ---- S7: fd-delivery and init-budget -------------------------------------------------------------
+//
+// Under the file-backed fake these two run only when the platform is
+// emulated (`VmKnobs::emulated_platform`: the agent address knob too, where
+// a test serves a shim behind a fake endpoint that runs the VM and posts its
+// suspend, resume and terminate hooks), so `ai-env lab run` drives them
+// offline end to end; with the fake alone they refuse as the S6 probes do.
+// The fake answers `/health/detail` from its own state, not the shim's.
+
+/// One marked line each, printed whatever the count's command did:
+/// `@@environ <n>`, how many environ entries carry the token's name or a
+/// value of its kind (as [`ENVIRON_SCAN`] counts them: with fd delivery the
+/// spawn holds neither), and `@@fd3 <bytes>`, how many bytes fd 3 holds.
+/// The environ is the shell's own (`/proc/$$`, the shell's pid inside
+/// `$(…)` too): a
+/// `/proc/self/environ` redirect is opened before `tr`'s exec and read by
+/// `tr` after it, when the address space it names is gone and Linux reads it
+/// as empty, so every count was 0. `env` where there is no /proc (the
+/// offline tests on macOS).
+const FD_SCAN: &str = "echo \"@@environ $( { tr '\\0' '\\n' </proc/$$/environ || env; } 2>/dev/null | grep -c -e OAUTH_TOKEN= -e =sk-ant- )\"; echo \"@@fd3 $(wc -c <&3)\"";
+
+/// [`FD_SCAN`]'s two counts, each read by its own mark (`wc -c` may pad
+/// its count): a line missing or holding no count (`grep` did not run, the
+/// scan never ran) leaves its count unread (`None`; the environ count's is
+/// the verdict's `gap:fd-scan`), never another line's count in its place,
+/// where fd 3's bytes would read as that many environ entries with the
+/// token's name or a value of its kind (a false custody failure). fd 3 not
+/// open: `wc` printed nothing, the byte count alone is unread.
+fn fd_scan_counts(out: &str) -> (Option<u64>, Option<u64>) {
+    let count = |mark: &str| marker(out, mark).and_then(|v| v.trim().parse::<u64>().ok());
+    (count("environ"), count("fd3"))
+}
+
+/// While claude runs with the token on fd 3 (v6 T7.3: "a second exec scans
+/// every claude environ"): every environment the agent's uid can read —
+/// claude's own (`$1`, its pid), its children's, and this scan's, which
+/// holds none — counted for entries with the token's name or a value of its
+/// kind: `<1 when claude's own was among them> <environments read>
+/// <entries>`. Where there is no /proc (a test's shim on a Mac) nothing can
+/// be read: `no-proc <pid> <its ps state>`, so a test still sees which pid
+/// the scan was told and that it ran while that process did. Counts only:
+/// no value leaves its pipe. An environment that reads empty (its process
+/// gone meanwhile) is not one read.
+const ENVIRON_SCAN: &str = "[ -d /proc/self ] || { echo \"no-proc $1 $(ps -o stat= -p \"$1\" 2>/dev/null)\"; exit 0; }; own=0; n=0; t=0; for f in /proc/[0-9]*/environ; do e=$(tr '\\0' '\\n' 2>/dev/null <\"$f\" | grep -c ''); [ \"$e\" -gt 0 ] 2>/dev/null || continue; n=$((n + 1)); t=$((t + $(tr '\\0' '\\n' 2>/dev/null <\"$f\" | grep -c -e OAUTH_TOKEN= -e =sk-ant-))); [ \"$f\" = \"/proc/$1/environ\" ] && own=1; done; echo \"$own $n $t\"";
+
+/// claude as a stream-json host drives it (S8's shape).
+const HOST: [&str; 7] = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
+
+/// What fd-delivery's claude is asked as a stream-json host: `initialize`,
+/// then one user message.
+const ASK_INITIALIZE: &str = r#"{"type":"control_request","request_id":"fd-delivery-1","request":{"subtype":"initialize"}}"#;
+const ASK_OK: &str = r#"{"type":"user","message":{"role":"user","content":"Reply with exactly OK"},"parent_tool_use_id":null,"session_id":"default"}"#;
+
+/// A credential call's failure, as a probe's error: its own exit code and
+/// text pass through (a missing key stays 4, as `vm exec` exits), and a
+/// dismissed dialog (3) is the lab's cancel, which also sweeps the probe's
+/// runs.
+fn bridge_err(e: crate::errors::CliError) -> BridgeError {
+    match e {
+        crate::errors::CliError::Cancelled => BridgeError::Cancelled,
+        e => BridgeError::Cli(e),
+    }
+}
+
+/// The run flags of a credential probe's VM: its own (`probe:<name>`, 900
+/// s), on vpc egress, without `--shell`.
+fn cred_flags(name: &str) -> run::RunFlags {
+    let mut f = flags(name, 900, None, None, true);
+    f.egress = Some(run::Egress::Vpc);
+    f.imply_internet = false;
+    f
+}
+
+/// A credential probe's own credential flags: the setup-token on fd 3,
+/// whatever `[creds] deliver` says (fd is always allowed). fd-delivery
+/// measures fd delivery (under `deliver = "env"` its scan spawn would hold
+/// the token in its environment and fd 3 closed, blamed on the shim), and
+/// init-budget's cold spawn then gets the token as its warm one does.
+fn probe_credential_flags() -> CredentialFlags {
+    CredentialFlags { with_credential: true, deliver: Some(Deliver::Fd), ..CredentialFlags::default() }
+}
+
+/// The VM a credential probe starts, planned from the configuration alone
+/// (vpc, no `--shell`, the configured image and version, its own label):
+/// what [`cred_start`] runs, and what `lab run` judges the gate's local half
+/// on before any Touch ID (cmd.rs's provisional gate, the one `vm warm` and
+/// `vm smoke --with-credential` use), so a refusal there names the VM this
+/// probe would have started. A missing connector refuses the plan itself
+/// (exit 9).
+pub fn cred_plan(ctx: &Ctx, name: &str) -> Result<run::RunPlan, BridgeError> {
+    plan(ctx, &cred_flags(name))
+}
+
+/// A vpc VM for a credential probe, its row read again (with the caps its
+/// `/health` recorded) and the credential's local checks passed on it. Under
+/// the fake, only an emulated platform goes on (see this section's head).
+async fn cred_start<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str, started: &mut Started) -> Result<(VmInfo, VmRow, AgentTarget, ProbeOutcome, CredentialPlan), BridgeError> {
+    let p = cred_plan(ctx, name)?;
+    let (vm, row, target, out) = s6_start(ctx, api, ep, &p, started).await?;
+    if ctx.knobs.fake_api.is_some() && !ctx.knobs.emulated_platform() {
+        return Err(s6_fake_refusal(name));
+    }
+    let row = registry::read_row(&ctx.paths, &vm.id)?.unwrap_or(row);
+    let plan = credential::check(&ctx.cfg, &ctx.paths, &row, &[], &probe_credential_flags()).map_err(bridge_err)?.ok_or_else(|| BridgeError::Config("no credential plan (internal)".into()))?;
+    Ok((vm, row, target, out, plan))
+}
+
+/// A delivery that expects the VM to hold the token (no value), under a
+/// fresh gate pass; `deliver` says how the spawn gets it.
+async fn held<A: MicrovmApi>(ctx: &Ctx, api: &A, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, deliver: Deliver) -> Result<Delivery, BridgeError> {
+    let pass = credential::gate(&ctx.cfg, &ctx.paths, api, row, vm).await.map_err(bridge_err)?;
+    let parts = DeliveryParts { name: crate::bridge::setup_token::TOKEN_VAR.into(), tag: plan.tag.clone(), deliver, secret: None, one_shot: false };
+    Delivery::new(&pass, &row.id, unix_now(), parts)
+}
+
+/// A spawn of `argv` with the proxy variables of a vpc row.
+fn cred_spec(ctx: &Ctx, row: &VmRow, argv: &[&str]) -> SpawnSpec {
+    SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: crate::bridge::agent::exec::spawn_env(ctx, row, &[]), detach_grace_s: Some(60) }
+}
+
+/// Whether the first complete stream-json `result` line in `buf` is an
+/// answer (no error); `None` until one came.
+fn result_answer(buf: &str) -> Option<bool> {
+    let complete = &buf[..=buf.rfind('\n')?];
+    complete.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find(|v| v["type"] == "result").map(|v| v["is_error"].as_bool() == Some(false))
+}
+
+/// What [`ENVIRON_SCAN`] printed, judged, and its words for the note:
+/// entries holding the token, wherever they were read, are counted;
+/// otherwise claude's own environment read clean is `Read(0)`, and not read
+/// is a gap. `no-proc` is not judged on the emulated platform alone (its
+/// shim runs on a Mac); anywhere else it is unread, never a pass. Its words
+/// name the pid the scan was told and whether that process still ran (a
+/// state `ps` printed that is no zombie's).
+fn claude_environ(scan: &[u8], emulated: bool) -> (probes::ClaudeEnviron, String) {
+    use probes::ClaudeEnviron::{NotJudged, Read, Unread};
+    let text = String::from_utf8_lossy(scan);
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix("no-proc") {
+        let mut words = rest.split_whitespace();
+        let pid = words.next().unwrap_or("?");
+        let ran = if words.next().is_some_and(|state| !state.starts_with('Z')) { "running" } else { "gone" };
+        let seen = format!("claude's pid {pid} {ran} at the scan");
+        return if emulated { (NotJudged, format!("not judged (no /proc where the emulated platform's shim runs: {seen})")) } else { (Unread, format!("unread (no /proc: {seen})")) };
+    }
+    match text.split_whitespace().map(str::parse::<u64>).collect::<Result<Vec<_>, _>>().as_deref() {
+        Ok(&[own, read, held]) => {
+            let judged = if held > 0 {
+                Read(held)
+            } else if own == 1 {
+                Read(0)
+            } else {
+                Unread
+            };
+            (judged, format!("{held} entries with the token in {read} read, claude's own {}", if own == 1 { "among them" } else { "not among them" }))
+        }
+        _ => (Unread, "unread".into()),
+    }
+}
+
+/// claude in stream-json host mode with `delivery`, asked to reply OK
+/// ([`ASK_INITIALIZE`], [`ASK_OK`]) and judged on its first `result` line:
+/// both of fd-delivery's attempts ask this way, so they differ in the
+/// delivery alone (a claude that fails as a host fails both, never
+/// env-only). With `scan`, once that result came, while claude still runs
+/// (its stdin open), [`ENVIRON_SCAN`] runs as a second spawn with no
+/// credential, told claude's pid; then claude's stdin closes. (Whether the
+/// result is an answer, and the scan's output: `None` without `scan` or a
+/// result.)
+async fn host_ask<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, env: &AgentEnv<'_, A, E>, row: &VmRow, delivery: Delivery, scan: bool) -> Result<(bool, Option<Result<Vec<u8>, BridgeError>>), BridgeError> {
+    let (io, c) = spawn_channels(4);
+    let input = c.input.clone();
+    let mut events = c.events;
+    let consumed = c.consumed.clone();
+    for line in [ASK_INITIALIZE, ASK_OK] {
+        let _ = input.send(SpawnInput::Stdin(format!("{line}\n").into_bytes())).await;
+    }
+    let session = run_spawn_with(env, Start::New(cred_spec(ctx, row, &HOST)), io, Some(delivery));
+    let watch = async {
+        let (mut buf, mut pid, mut answer, mut scanned) = (String::new(), None, None, None);
+        while let Some(ev) = events.recv().await {
+            match ev {
+                SpawnEvent::Started { pid: p, .. } => pid = Some(p),
+                SpawnEvent::Stdout { seq, bytes } => {
+                    consumed.stdout_done(seq);
+                    if answer.is_some() {
+                        continue;
+                    }
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    if let Some(ok) = result_answer(&buf) {
+                        answer = Some(ok);
+                        if scan {
+                            // claude still runs, its stdin open: every environment the agent can read, its own included.
+                            let claude = pid.map_or_else(|| "0".to_string(), |p: u32| p.to_string());
+                            scanned = Some(exec_agent(env, cred_spec(ctx, row, &["sh", "-c", ENVIRON_SCAN, "sh", &claude]), Vec::new()).await.map(|(out, ..)| out));
+                        }
+                        let _ = input.send(SpawnInput::StdinEof).await;
+                    }
+                }
+                SpawnEvent::Stderr { seq, .. } => consumed.stderr_done(seq),
+                _ => {}
+            }
+        }
+        (answer, scanned)
+    };
+    let (outcome, (answer, scanned)) = tokio::join!(session, watch);
+    drop(c.control);
+    outcome?;
+    Ok((answer == Some(true), scanned))
+}
+
+/// `/health/detail`'s `has_credentials`, read with the row's session token.
+async fn holds_credential<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo) -> Option<bool> {
+    let bearer = Secret::new(row.session_token.clone().unwrap_or_default());
+    register_secret(bearer.expose());
+    let token = token::mint_internal(api, &ctx.paths, &row.id).await.ok()?;
+    let endpoint = Some(vm.endpoint.clone()).filter(|e| !e.is_empty()).or_else(|| row.endpoint.clone()).unwrap_or_default();
+    ep.get_health_detail(&endpoint, &token, &bearer).await.ok()?.detail.map(|d| d.has_credentials)
+}
+
+/// fd-delivery (T7.3): see the catalog's text.
+async fn fd_delivery<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, started: &mut Started, supply: CredentialSupply<'_>) -> Result<ProbeOutcome, BridgeError> {
+    let (vm, row, target, mut out, plan) = cred_start(ctx, api, ep, "fd-delivery", started).await?;
+    let prepared = credential::prepare(ctx, api, ep, &row, &vm, &plan, supply).await.map_err(bridge_err)?;
+    let policy = RunPolicy::from_cfg(&ctx.cfg.transport, &row, ctx.knobs.backoff_ms);
+    let env = AgentEnv { api, ep, paths: &ctx.paths, target, policy, dial: agent_dial(ctx) };
+    let (scan, _, _, _) = exec_agent_with(&env, cred_spec(ctx, &row, &["sh", "-c", FD_SCAN]), Vec::new(), Some(prepared.delivery)).await?;
+    let (in_environ, fd_bytes) = fd_scan_counts(&String::from_utf8_lossy(&scan));
+    // claude with the fd alone; while it still runs, every environment it and its children have is read.
+    let fd = held(ctx, api, &row, &vm, &plan, Deliver::Fd).await?;
+    let (via_fd, scanned) = host_ask(ctx, &env, &row, fd, true).await?;
+    let (environ, environ_words) = match scanned {
+        Some(Ok(out)) => claude_environ(&out, ctx.knobs.emulated_platform()),
+        Some(Err(e)) => (probes::ClaudeEnviron::Unread, format!("unread ({e})")),
+        None => (probes::ClaudeEnviron::Unread, "unread (claude gave no result)".into()),
+    };
+    // Only to tell env-only apart, asked the same way: this one claude gets the token in its environment, whatever
+    // [creds] deliver says (the catalog's text and the note say so).
+    let via_env = if via_fd {
+        None
+    } else {
+        let d = held(ctx, api, &row, &vm, &plan, Deliver::Env).await?;
+        Some(host_ask(ctx, &env, &row, d, false).await?.0)
+    };
+    // D3 live: a suspend empties the VM's copy; the resume keeps it empty.
+    api.suspend(&vm.id).await?;
+    run::wait_for_state(api, &vm.id, &VmState::Suspended, run::Poll::SETTLE.scaled(ctx.knobs.backoff_ms)).await?;
+    api.resume(&vm.id).await?;
+    run::wait_for_state(api, &vm.id, &VmState::Running, run::Poll::RUNNING.scaled(ctx.knobs.backoff_ms)).await?;
+    let after = holds_credential(ctx, api, ep, &row, &vm).await;
+    // The file-backed fake answers from its own state: its `false` says nothing of the shim (a test asserts on the shim).
+    let whose = if ctx.knobs.fake_api.is_some() { " (the fake API's /health/detail, not the shim's)" } else { "" };
+    out.verdict = probes::verdict_fd_delivery(in_environ, fd_bytes, via_fd, via_env, environ, after);
+    out.note = format!(
+        "{}: environ entries with the token's name or a value of its kind {}, fd 3 {} bytes; claude via fd {}, its environments while it ran: {environ_words}; via env {}; has_credentials after a suspend and a resume: {}{whose}",
+        vm.id,
+        in_environ.map_or_else(|| "?".into(), |n| n.to_string()),
+        fd_bytes.map_or_else(|| "?".into(), |n| n.to_string()),
+        if via_fd { "answered" } else { "did not answer" },
+        via_env.map_or_else(|| "not tried".to_string(), |ok| format!("(the token put in that one claude's environment, to classify) {}", if ok { "answered" } else { "did not answer" })),
+        after.map_or_else(|| "unread".into(), |h| h.to_string())
+    );
+    Ok(out)
+}
+
+/// When one host-mode spawn's answer to `initialize` came, from when the
+/// spawn was sent, and when its session ended: claude's stdin closes at the
+/// answer, and what follows (its exit, the socket's close) is no part of
+/// the budget.
+struct InitTimes {
+    sent: Instant,
+    answered: Instant,
+    ended: Instant,
+}
+
+/// One spawn sent `initialize` as a stream-json host would, its stdin closed
+/// once it answered: the [`InitTimes`].
+async fn time_to_init<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spec: SpawnSpec, delivery: Delivery) -> Result<InitTimes, BridgeError> {
+    let (io, c) = spawn_channels(4);
+    let input = c.input.clone();
+    let mut events = c.events;
+    let consumed = c.consumed.clone();
+    let _ = input.send(SpawnInput::Stdin(b"{\"type\":\"control_request\",\"request_id\":\"init-budget-1\",\"request\":{\"subtype\":\"initialize\"}}\n".to_vec())).await;
+    let sent = Instant::now();
+    let session = run_spawn_with(env, Start::New(spec), io, Some(delivery));
+    let watch = async {
+        let mut buf = String::new();
+        let mut at = None;
+        while let Some(ev) = events.recv().await {
+            match ev {
+                SpawnEvent::Stdout { seq, bytes } => {
+                    consumed.stdout_done(seq);
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    if at.is_none() && buf.contains("\"control_response\"") && buf.contains("init-budget-1") {
+                        at = Some(Instant::now());
+                        let _ = input.send(SpawnInput::StdinEof).await;
+                    }
+                }
+                SpawnEvent::Stderr { seq, .. } => consumed.stderr_done(seq),
+                _ => {}
+            }
+        }
+        at
+    };
+    let (outcome, at) = tokio::join!(session, watch);
+    let ended = Instant::now();
+    drop(c.control);
+    outcome?;
+    let answered = at.ok_or_else(|| BridgeError::Protocol("claude never answered initialize".into()))?;
+    Ok(InitTimes { sent, answered, ended })
+}
+
+/// How long this command's own unseal of the setup-token took, its Touch ID
+/// wait included: the `ms` of the newest successful `credential_unseal`
+/// row this process audited for `source` (`combined`: with the runtime key,
+/// before the probe began; `setup-token`: in `prepare`, for the VM `vm`).
+/// `None` when there is none to read.
+fn own_unseal_ms(paths: &crate::bridge::config::Paths, source: &str, vm: Option<&str>) -> Option<u128> {
+    let me = u64::from(std::process::id());
+    let rows = crate::bridge::audit::read_rows(&paths.audit(), Some(256)).ok()?;
+    rows.iter()
+        .rev()
+        .find(|r| r["event"] == "credential_unseal" && r["pid"].as_u64() == Some(me) && r["detail"]["source"] == source && r["detail"]["outcome"] == "ok" && vm.is_none_or(|v| r["detail"]["id"] == v))
+        .and_then(|r| r["detail"]["ms"].as_str()?.parse().ok())
+}
+
+/// init-budget (T7.7): see the catalog's text. The budgets are judged on
+/// the answers to `initialize`; cold also counts the token's unseal, Touch
+/// ID wait included, wherever it came (plan S7 §7's cold path): with a
+/// current `combined.env` it came before the VM was started, so its own
+/// audit row gives it and it is added (unread, the verdict is `gap:unseal`).
+async fn init_budget<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, started: &mut Started, supply: CredentialSupply<'_>) -> Result<ProbeOutcome, BridgeError> {
+    let t0 = Instant::now();
+    let (vm, row, target, mut out, plan) = cred_start(ctx, api, ep, "init-budget", started).await?;
+    let running = t0.elapsed().as_millis();
+    let tg = Instant::now();
+    let prepared = credential::prepare(ctx, api, ep, &row, &vm, &plan, supply).await.map_err(bridge_err)?;
+    let gate = tg.elapsed().as_millis();
+    let policy = RunPolicy::from_cfg(&ctx.cfg.transport, &row, ctx.knobs.backoff_ms);
+    let env = AgentEnv { api, ep, paths: &ctx.paths, target, policy, dial: agent_dial(ctx) };
+    let cold = time_to_init(&env, cred_spec(ctx, &row, &HOST), prepared.delivery).await?;
+    let tw = Instant::now();
+    let d = held(ctx, api, &row, &vm, &plan, Deliver::Fd).await?;
+    let gate_warm = tw.elapsed().as_millis();
+    let warm = time_to_init(&env, cred_spec(ctx, &row, &HOST), d).await?;
+    let ms = |later: Instant, earlier: Instant| later.saturating_duration_since(earlier).as_millis();
+    let to_answer = ms(cold.answered, t0);
+    let (cold_ms, unseal, token) = match prepared.source {
+        "combined" => match own_unseal_ms(&ctx.paths, "combined", None) {
+            Some(u) => (Some(u + to_answer), format!("the token's unseal {u} ms (combined: the one Touch ID for the runtime key and the token, before the VM was started), "), String::new()),
+            None => (None, "the token's unseal: not read (no credential_unseal row of this command: combined, before the VM was started), ".to_string(), String::new()),
+        },
+        "setup-token" => {
+            let own = own_unseal_ms(&ctx.paths, "setup-token", Some(&vm.id)).map_or_else(|| "not read".to_string(), |u| format!("{u} ms"));
+            (Some(to_answer), String::new(), format!(" (of which the token's unseal, its own Touch ID, {own}, while the runtime key's Touch ID before the VM is not counted)"))
+        }
+        other => (Some(to_answer), String::new(), format!(" (the token {other}: nothing unsealed, and the runtime key's Touch ID before the VM is not counted)")),
+    };
+    let warm_ms = ms(warm.answered, tw);
+    out.verdict = probes::verdict_init_budget(cold_ms, warm_ms);
+    out.note = format!(
+        "{}: cold {} ms, the sum of {unseal}RUNNING and /health {running}, the gate and the token {gate}{token}, the delivery and spawn to the initialize answer {}; warm {warm_ms} ms: the gate {gate_warm}, then {} to the answer; not counted, each session's close after its answer: {} and {} ms; budgets {} and {} ms",
+        vm.id,
+        cold_ms.map_or_else(|| "?".into(), |c| c.to_string()),
+        ms(cold.answered, cold.sent),
+        ms(warm.answered, warm.sent),
+        ms(cold.ended, cold.answered),
+        ms(warm.ended, warm.answered),
+        probes::INIT_COLD_BUDGET_MS,
+        probes::INIT_WARM_BUDGET_MS
+    );
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         dns_path_note, drained_by_forged_hook, e0_sockets, e1_hold, e5_http_phase, e5_reconnect, e5_resume, firewall_agent_script, firewall_shell_flags, firewall_shell_script, foreign_listeners, guard_mode, judge_firewall, judge_foreign, judge_rst, markers, open_hello,
         platform_shell_note, platform_shell_script, proc_net_addr, refused_8080, seed_request, shell8022_note, transport, upgraded, AgentConn, AgentDial, AgentTarget, AuthToken, BridgeError, Ctx, Duration, Frame, HealthDetailReply, Instant, MicrovmApi, Secret, UpgradeAuth,
-        HealthDetail, VmInfo, VmState, APP_PORT, FIREWALL_COMMON, FIREWALL_FOREIGN, FIREWALL_RST, REATTACH_PRODUCER,
+        HealthDetail, VmInfo, VmState, APP_PORT, FD_SCAN, FIREWALL_COMMON, FIREWALL_FOREIGN, FIREWALL_RST, REATTACH_PRODUCER,
     };
     use crate::bridge::api::{EndpointClient, FakeMicrovmApi, HealthReply, IdleSpec, ImageInfo, ImageVersion, ManagedImage, RunSpec, VmSummary, FAKE_IMAGE_ARN, TOKEN_HEADER};
     use crate::bridge::config::{BridgeConfig, Paths};
@@ -2358,7 +2766,7 @@ mod tests {
                             break;
                         }
                         if let Ok(Frame::Hello { .. }) = Frame::try_from(msg) {
-                            let ok = Frame::HelloOk { wire: 1, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, image_version: None, boot_nonce: "0".repeat(32), owner: None, has_credentials: false, uptime_s: 1, run_hook_seen: true, spawns: vec![], resumed: vec![] };
+                            let ok = Frame::HelloOk { wire: 1, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, image_version: None, boot_nonce: "0".repeat(32), owner: None, has_credentials: false, uptime_s: 1, run_hook_seen: true, spawns: vec![], resumed: vec![], caps: vec![], credential: Default::default() };
                             let _ = ws.send(Message::from(&ok)).await;
                         }
                     }
@@ -2562,7 +2970,7 @@ mod tests {
             endpoint.fake.set_state(&id, VmState::Running);
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let _ = ws.next().await; // the hello
-            let ok = Frame::HelloOk { wire: 1, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, image_version: None, boot_nonce: "0".repeat(32), owner: None, has_credentials: false, uptime_s: 1, run_hook_seen: true, spawns: vec![], resumed: vec![] };
+            let ok = Frame::HelloOk { wire: 1, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, image_version: None, boot_nonce: "0".repeat(32), owner: None, has_credentials: false, uptime_s: 1, run_hook_seen: true, spawns: vec![], resumed: vec![], caps: vec![], credential: Default::default() };
             ws.send(Message::from(&ok)).await.unwrap();
             while let Some(Ok(_)) = ws.next().await {}
         });
@@ -2764,5 +3172,263 @@ mod tests {
         let sf = firewall_shell_flags();
         assert!(sf.shell, "the --shell VM must pass SHELL_INGRESS");
         assert!(sf.egress.is_none(), "no egress qualifier: the default egress applies, as for the default VM");
+    }
+
+    /// fd-delivery's scan counts the token's name in the environment the
+    /// spawn's shell was started with, and fd 3's bytes: a `/bin/sh` started
+    /// with and without the variable (a stand-in value), fd 3 holding 7
+    /// bytes. On a Mac it reads `env`, on Linux `/proc/$$/environ`; the
+    /// `/proc/self/environ` redirect it replaced printed 0 for both, on either.
+    #[test]
+    fn the_fd_scan_counts_the_tokens_name_in_the_spawns_environment() {
+        let scan = |with: bool| {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.arg("-c").arg(format!("exec 3<<EOF\nabcdef\nEOF\n{FD_SCAN}")).env_clear().env("PATH", "/usr/bin:/bin").env("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "3");
+            if with {
+                c.env("CLAUDE_CODE_OAUTH_TOKEN", "x".repeat(16));
+            }
+            let o = c.output().expect("/bin/sh runs");
+            super::fd_scan_counts(&String::from_utf8_lossy(&o.stdout))
+        };
+        assert_eq!(scan(false), (Some(0), Some(7)), "nothing under the name");
+        assert_eq!(scan(true), (Some(1), Some(7)), "the variable is counted");
+    }
+
+    /// fd-delivery's scan also counts an entry holding a value of the
+    /// token's kind under any other name (`=sk-ant-`, as the scan while
+    /// claude runs does), so its first count of 0 rules out the token under
+    /// another name, not only under its own. A stand-in value built at run
+    /// time; fd 3 holds 7 bytes.
+    #[test]
+    fn the_fd_scan_counts_a_value_of_the_tokens_kind_under_any_name() {
+        let value = format!("{}{}{}", "sk-", "ant-", "oat01-fd-scan-kind");
+        let o = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("exec 3<<EOF\nabcdef\nEOF\n{FD_SCAN}"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "3")
+            .env("X", &value)
+            .output()
+            .expect("/bin/sh runs");
+        assert_eq!(super::fd_scan_counts(&String::from_utf8_lossy(&o.stdout)), (Some(1), Some(7)), "the value under X is counted");
+    }
+
+    /// The scan's two counts are read each by its own mark: a line missing
+    /// or holding no count leaves that count unread (the environ count's is
+    /// `gap:fd-scan`), never fd 3's byte count put in its place (it read as
+    /// that many environ entries with the token's name: a false
+    /// `fd-unread:the-token-was-in-the-environ`); a Mac's padded `wc` is no
+    /// matter, and fd 3 not open leaves its byte count alone unread.
+    #[test]
+    fn the_fd_scans_counts_are_read_each_by_its_own_mark() {
+        assert_eq!(super::fd_scan_counts("@@environ 0\n@@fd3 108\n"), (Some(0), Some(108)));
+        assert_eq!(super::fd_scan_counts("@@environ 0\n@@fd3      108\n"), (Some(0), Some(108)), "a Mac's wc pads its count");
+        assert_eq!(super::fd_scan_counts("@@environ 1\n@@fd3 108\n"), (Some(1), Some(108)));
+        assert_eq!(super::fd_scan_counts("@@environ 0\n@@fd3 \n"), (Some(0), None), "fd 3 not open: wc printed nothing");
+        assert_eq!(super::fd_scan_counts(""), (None, None), "a scan that printed nothing");
+        assert_eq!(super::fd_scan_counts("@@environ \n@@fd3 108\n"), (None, Some(108)), "grep did not run: the environ count stays unread");
+        assert_eq!(super::fd_scan_counts("@@fd3 108\n"), (None, Some(108)), "no environ line at all");
+        assert_eq!(super::fd_scan_counts("108\n"), (None, None), "a bare count is neither");
+    }
+
+    /// The real scan with no `grep` to run (a PATH of `tr`, `env` and `wc`
+    /// alone; `/bin/sh` prints `grep: command not found`): its environ count
+    /// is unread, so fd-delivery reads `gap:fd-scan` (run it again), never fd
+    /// 3's byte count taken for that many environ entries with the token's
+    /// name (`fd-unread:the-token-was-in-the-environ`, a custody failure
+    /// routed as a shim bug). With fd 3 closed, the byte count alone is
+    /// unread: `fd-unread:fd-3-was-empty`, as before.
+    #[test]
+    fn the_fd_scan_never_takes_fd_3s_bytes_for_its_environ_count() {
+        use crate::bridge::probes::{verdict_fd_delivery, ClaudeEnviron};
+        let dir = tempfile::tempdir().unwrap();
+        for tool in ["tr", "env", "wc"] {
+            let found = ["/usr/bin", "/bin"].iter().map(|d| std::path::Path::new(d).join(tool)).find(|p| p.is_file()).expect("the tool on this host");
+            std::os::unix::fs::symlink(found, dir.path().join(tool)).unwrap();
+        }
+        let scan = |fd3: &str, path: &std::ffi::OsStr| {
+            let o = std::process::Command::new("/bin/sh").arg("-c").arg(format!("{fd3}\n{FD_SCAN}")).env_clear().env("PATH", path).output().expect("/bin/sh runs");
+            super::fd_scan_counts(&String::from_utf8_lossy(&o.stdout))
+        };
+        let no_grep = scan("exec 3<<EOF\nabcdef\nEOF", dir.path().as_os_str());
+        assert_eq!(no_grep, (None, Some(7)), "grep did not run: the environ count unread, fd 3's 7 bytes read");
+        let verdict = |(in_environ, fd_bytes)| verdict_fd_delivery(in_environ, fd_bytes, true, None, ClaudeEnviron::Read(0), Some(false));
+        assert_eq!(verdict(no_grep), "gap:fd-scan");
+        let closed = scan("exec 3<&-", std::ffi::OsStr::new("/usr/bin:/bin"));
+        assert_eq!(closed, (Some(0), None), "fd 3 closed: its byte count alone unread");
+        assert_eq!(verdict(closed), "fd-unread:fd-3-was-empty");
+    }
+
+    /// The documentation account's made-up egress connector.
+    const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
+
+    /// A world for a credential probe's local checks: the fake image at
+    /// `version`, the connector, a passing `egress check` for each of
+    /// `records` (version, recorded that many seconds ago) and, with `dns`, a
+    /// `no-dns` dns-path row.
+    fn precheck_ctx(dir: &std::path::Path, version: &str, records: &[(&str, u64)], dns: bool) -> Ctx {
+        use crate::bridge::egress::{normalize_connector, EgressVerified, VerifiedRecord, DNS_NONE, DNS_RULE};
+        let paths = Paths::from_root_and_env(dir.to_path_buf(), None);
+        let mut cfg = BridgeConfig::default();
+        cfg.aws.image_arn = Some(FAKE_IMAGE_ARN.into());
+        cfg.aws.egress_connector_arn = Some(CONNECTOR.into());
+        cfg.aws.image_version = version.into();
+        let now = crate::wire::time::unix_now();
+        let at = |ago: u64| crate::wire::time::rfc3339_utc(now - ago);
+        let records = records.iter().map(|(v, ago)| VerifiedRecord { image_arn: FAKE_IMAGE_ARN.into(), image_version: (*v).into(), connector: normalize_connector(CONNECTOR), at: at(*ago), dns: DNS_NONE.into(), dns_rule: DNS_RULE, ..VerifiedRecord::default() }).collect();
+        EgressVerified { records, ..EgressVerified::default() }.save(&paths).unwrap();
+        if dns {
+            std::fs::create_dir_all(paths.probes().parent().unwrap()).unwrap();
+            std::fs::write(paths.probes(), format!("{}\n", serde_json::json!({ "probe": "dns-path", "verdict": DNS_NONE, "ts": at(60) }))).unwrap();
+        }
+        Ctx { paths, cfg, knobs: VmKnobs::default() }
+    }
+
+    /// The VM a credential probe starts, which `lab run` judges before any
+    /// Touch ID, is planned from the configuration alone: vpc egress through
+    /// the configured connector, no `--shell`, the configured image and
+    /// version as asked, the probe's own label. Without a connector the plan
+    /// itself is refused (exit 9), before anything is unsealed.
+    #[test]
+    fn a_credential_probes_vm_is_planned_from_the_configuration() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ctx = precheck_ctx(d.path(), "6", &[], false);
+        let p = super::cred_plan(&ctx, "fd-delivery").unwrap();
+        assert_eq!((p.egress, p.shell, p.image_arn.as_str(), p.want_version.as_str(), p.label.as_deref()), (crate::bridge::vm::run::Egress::Vpc, false, FAKE_IMAGE_ARN, "6", Some("probe:fd-delivery")));
+        assert_eq!(p.egress_connectors, [CONNECTOR]);
+        ctx.cfg.aws.egress_connector_arn = None;
+        assert_eq!(super::cred_plan(&ctx, "init-budget").map_err(|e| crate::errors::CliError::from(e).exit_code()).err(), Some(9));
+    }
+
+    /// A credential probe delivers on fd whatever `[creds] deliver` says:
+    /// under `deliver = "env"` the plan the probes act on is fd, where `vm
+    /// exec`'s own default follows `[creds]` (fd-delivery's scan spawn would
+    /// then hold the token in its environment, with fd 3 closed).
+    #[test]
+    fn a_credential_probe_delivers_on_fd_whatever_creds_says() {
+        use crate::bridge::agent::credential::{check, CredentialFlags};
+        use crate::wire::frame::Deliver;
+        let d = tempfile::tempdir().unwrap();
+        let mut ctx = precheck_ctx(d.path(), "active", &[("6.0", 3600)], true);
+        ctx.cfg.creds.deliver = "env".into();
+        let sealed = ctx.paths.setup_token_env();
+        std::fs::create_dir_all(sealed.parent().unwrap()).unwrap();
+        std::fs::write(&sealed, crate::container::write(b"age-encryption.org/v1\n-> x\n--- y\n")).unwrap();
+        let row = super::VmRow { id: "microvm-probe".into(), image_arn: FAKE_IMAGE_ARN.into(), image_version: "6.0".into(), egress: "vpc".into(), egress_gate: Some("passed".into()), ..super::VmRow::default() };
+        assert_eq!(check(&ctx.cfg, &ctx.paths, &row, &[], &super::probe_credential_flags()).unwrap().unwrap().deliver, Deliver::Fd);
+        let exec_default = CredentialFlags { with_credential: true, ..CredentialFlags::default() };
+        assert_eq!(check(&ctx.cfg, &ctx.paths, &row, &[], &exec_default).unwrap().unwrap().deliver, Deliver::Env, "vm exec's default follows [creds]");
+    }
+
+    /// What the environment scan printed, judged: a token wherever it was
+    /// read counts; claude's own environment read clean is `Read(0)`; claude's
+    /// own not read, unreadable output, or no /proc on a VM is a gap; no /proc
+    /// is not judged on the emulated platform alone (a Mac runs its shim), and
+    /// its words name the pid the scan was told and whether it still ran (a
+    /// zombie, or no state at all, has not).
+    #[test]
+    fn the_environment_scan_is_judged_from_its_counts() {
+        use crate::bridge::probes::ClaudeEnviron::{NotJudged, Read, Unread};
+        assert_eq!(super::claude_environ(b"1 7 0\n", false).0, Read(0));
+        assert_eq!(super::claude_environ(b"1 7 2\n", false).0, Read(2));
+        assert_eq!(super::claude_environ(b"0 7 1\n", false).0, Read(1), "a token read anywhere counts");
+        assert_eq!(super::claude_environ(b"0 7 0\n", false).0, Unread, "claude's own was not read");
+        assert_eq!(super::claude_environ(b"", false).0, Unread);
+        assert_eq!(super::claude_environ(b"1 x 0", false).0, Unread);
+        assert_eq!(super::claude_environ(b"1 7", false).0, Unread);
+        assert_eq!(super::claude_environ(b"no-proc 4242 Ss\n", false), (Unread, "unread (no /proc: claude's pid 4242 running at the scan)".to_string()), "a VM always has /proc");
+        assert_eq!(super::claude_environ(b"no-proc 4242 Ss\n", true), (NotJudged, "not judged (no /proc where the emulated platform's shim runs: claude's pid 4242 running at the scan)".to_string()));
+        assert!(super::claude_environ(b"no-proc 4242 \n", true).1.ends_with("claude's pid 4242 gone at the scan)"), "no state: no such process");
+        assert!(super::claude_environ(b"no-proc 4242 Z\n", true).1.ends_with("claude's pid 4242 gone at the scan)"), "a zombie has exited");
+        assert_eq!(super::claude_environ(b"no-proc\n", true).0, NotJudged);
+        assert_eq!(super::claude_environ(b"1 7 0\n", false).1, "0 entries with the token in 7 read, claude's own among them");
+    }
+
+    /// The environment scan reads another process's environment where there
+    /// is /proc (Linux, as on a VM): a stand-in process whose environment
+    /// holds the token's name counts, and its pid marks claude's own as read;
+    /// where there is none (a Mac) it names the pid it was told and that
+    /// process's state, judged running while it runs and gone once it was
+    /// reaped. Stand-in values only.
+    #[test]
+    fn the_environment_scan_reads_another_process_where_there_is_proc() {
+        let scan = |pid: u32| {
+            let o = std::process::Command::new("/bin/sh").arg("-c").arg(super::ENVIRON_SCAN).arg("sh").arg(pid.to_string()).env_clear().env("PATH", "/usr/bin:/bin").output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let mut stand_in = std::process::Command::new("/bin/sleep").arg("30").env_clear().env("CLAUDE_CODE_OAUTH_TOKEN", "x".repeat(16)).spawn().unwrap();
+        let pid = stand_in.id();
+        let out = scan(pid);
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
+        if std::path::Path::new("/proc/self").is_dir() {
+            let n: Vec<u64> = out.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+            assert!(n.len() == 3 && n[0] == 1 && n[2] >= 1, "claude's own read, its entry counted: {out}");
+        } else {
+            assert!(out.starts_with(&format!("no-proc {pid} ")), "{out}");
+            assert!(super::claude_environ(out.as_bytes(), true).1.ends_with(&format!("claude's pid {pid} running at the scan)")), "{out}");
+            let gone = scan(pid);
+            assert!(super::claude_environ(gone.as_bytes(), true).1.ends_with(&format!("claude's pid {pid} gone at the scan)")), "reaped: {gone}");
+        }
+    }
+
+    /// A credential step's failure keeps its exit class through a probe's
+    /// error and back to the CLI's: 3, 5, 7, 8 and 9 come out as they went in
+    /// (a VM lost while its credential was delivered stays 8, not 1), and so
+    /// do the classes no `BridgeError` of their own carries (M54): a missing
+    /// key 4, a corrupt container 6, a usage error 2, a stopped unseal's 130
+    /// and 143, each with its own text (no `config:` before it).
+    #[test]
+    fn a_credential_steps_failure_keeps_its_class_in_a_probe() {
+        use crate::errors::CliError;
+        let classes = [
+            CliError::Cancelled,
+            CliError::AuthUnavailable("a".into()),
+            CliError::Aws("b".into()),
+            CliError::VmLost("c".into()),
+            CliError::Policy("d".into()),
+            CliError::NoKey("e".into()),
+            CliError::Corrupt("f".into()),
+            CliError::Usage("g".into()),
+            CliError::Exit(130),
+            CliError::Exit(143),
+        ];
+        for e in classes {
+            let (class, text) = (e.exit_code(), e.to_string());
+            let back = CliError::from(super::bridge_err(e));
+            assert_eq!((back.exit_code(), back.to_string()), (class, text));
+        }
+    }
+
+    /// A stream-json result is taken only from a complete line, and is an
+    /// answer only without an error.
+    #[test]
+    fn a_host_result_is_read_from_complete_lines() {
+        assert_eq!(super::result_answer(""), None);
+        assert_eq!(super::result_answer("{\"type\":\"system\"}\n{\"type\":\"result\",\"is_error\":false"), None, "not a complete line yet");
+        assert_eq!(super::result_answer("{\"type\":\"system\"}\n{\"type\":\"result\",\"is_error\":false,\"result\":\"OK\"}\n"), Some(true));
+        assert_eq!(super::result_answer("{\"type\":\"result\",\"is_error\":true}\n"), Some(false));
+    }
+
+    /// init-budget's unseal leg is this command's own audit row of that
+    /// source: another process's row, a failed unseal, or another VM's is
+    /// not it, and the newest of its own wins.
+    #[test]
+    fn the_unseal_leg_is_this_commands_own_audit_row() {
+        use crate::bridge::audit::{append, detail, AuditRow};
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().to_path_buf(), None);
+        let row = |pairs: &[(&str, &str)]| AuditRow::new("credential_unseal", None, detail(&pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect::<Vec<_>>()));
+        assert_eq!(super::own_unseal_ms(&paths, "combined", None), None);
+        append(&paths.audit(), &row(&[("source", "combined"), ("ms", "1200"), ("outcome", "ok")])).unwrap();
+        append(&paths.audit(), &AuditRow { pid: std::process::id() + 1, ..row(&[("source", "combined"), ("ms", "9000"), ("outcome", "ok")]) }).unwrap();
+        append(&paths.audit(), &row(&[("source", "combined"), ("ms", "7000"), ("outcome", "exit 3")])).unwrap();
+        append(&paths.audit(), &row(&[("id", "microvm-a"), ("source", "setup-token"), ("ms", "800"), ("outcome", "ok")])).unwrap();
+        assert_eq!(super::own_unseal_ms(&paths, "combined", None), Some(1200));
+        assert_eq!(super::own_unseal_ms(&paths, "setup-token", Some("microvm-a")), Some(800));
+        assert_eq!(super::own_unseal_ms(&paths, "setup-token", Some("microvm-b")), None);
+        append(&paths.audit(), &row(&[("source", "combined"), ("ms", "1300"), ("outcome", "ok")])).unwrap();
+        assert_eq!(super::own_unseal_ms(&paths, "combined", None), Some(1300), "the newest");
     }
 }

@@ -131,6 +131,65 @@ pub fn write(ciphertext: &[u8]) -> String {
     )
 }
 
+/// Start of the metadata comment a sealing command may add (S7): facts
+/// recorded at sealing — a token's kind prefix, its length, when it was
+/// sealed, the hashes of the files a derived container was built from. A
+/// comment is not authenticated (anyone who can write the file can edit it),
+/// so readers show it as recorded and use it for staleness checks, never to
+/// decide what a container holds.
+pub const META_PREFIX: &str = "# ai-env-meta: ";
+
+fn meta_key_ok(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 32 && k.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+fn meta_value_ok(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 128 && v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:+/=,-".contains(&c))
+}
+
+/// [`write`] with one `# ai-env-meta: k=v …` line just before the marker.
+/// Keys are `[a-z0-9_]`, values printable without space, quote, `#`, `$` or
+/// backslash, so the line stays one inert comment for every dotenv reader.
+/// No notes gives exactly [`write`]'s text.
+pub fn write_annotated(ciphertext: &[u8], notes: &[(&str, &str)]) -> Result<String> {
+    let classic = write(ciphertext);
+    if notes.is_empty() {
+        return Ok(classic);
+    }
+    let mut line = String::from(META_PREFIX);
+    for (i, (k, v)) in notes.iter().enumerate() {
+        if !meta_key_ok(k) || !meta_value_ok(v) {
+            return Err(CliError::Msg(format!("container metadata {k:?}: not a plain key=value")));
+        }
+        if i > 0 {
+            line.push(' ');
+        }
+        line.push_str(k);
+        line.push('=');
+        line.push_str(v);
+    }
+    let marker = format!("\n{MARKER_LINE}\n");
+    let at = classic.find(&marker).map(|i| i + 1).ok_or_else(|| CliError::Msg("container text without its marker".into()))?;
+    Ok(format!("{}{line}\n{}", &classic[..at], &classic[at..]))
+}
+
+/// The `k=v` pairs of every [`META_PREFIX`] line (the first of a repeated
+/// key wins); pairs that are not plain `k=v` are skipped.
+#[must_use]
+pub fn meta(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines().filter_map(|l| strip_cr(l).strip_prefix(META_PREFIX)) {
+        for pair in line.split(' ') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if meta_key_ok(k) && meta_value_ok(v) {
+                    out.entry(k.to_string()).or_insert_with(|| v.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Names of container variables that `ai-env run` strips from the child env.
 pub const CONTAINER_VARS: [&str; 5] =
     ["AI_ENV", "AI_ENV_VERSION", "AI_ENV_CIPHER", "AI_ENV_README", "AI_ENV_DATA"];

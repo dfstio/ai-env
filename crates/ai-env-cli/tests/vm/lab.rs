@@ -19,7 +19,8 @@
 //! recorded, not judged, and said so — suspended, or not proved, it is
 //! judged, and OPEN. S6: the agent-transport probes refuse under the fake
 //! and end their VMs; a Ctrl-C during a live probe still ends every VM it
-//! started (exit 3, nothing recorded).
+//! started (exit 3, nothing recorded), SIGTERM and SIGHUP too (exit 143), and
+//! a SIGINT ignored when `lab run` started stays ignored.
 use super::cli::{code, stderr, stdout, World};
 use crate::common::CONNECTOR;
 use ai_env_cli::bridge::api::{Call, FakeFailure};
@@ -492,6 +493,10 @@ fn lab_unknown_probe_exit_2_and_s1_s3_probes_point_to_their_command() {
     let o = w.run(&["lab", "run", "entrypoint"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("ai-env wrapper census --record-probes"), "{}", stderr(&o));
+    // S7: the setup-token's prefix is recorded by the command that seals it.
+    let o = w.run(&["lab", "run", "setup-token-prefix"]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("recorded by: ai-env creds setup-token"), "{}", stderr(&o));
 }
 
 #[test]
@@ -505,7 +510,7 @@ fn probe_rows_of_the_old_schema_parse_in_lab_list() {
     let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entry = list.as_array().unwrap().iter().find(|r| r["probe"] == "entrypoint").unwrap();
     assert_eq!(entry["last_verdict"], "claude-vscode");
-    assert_eq!(list.as_array().unwrap().len(), 21, "S1/S3 3, S4 9, S5 2, S6 7");
+    assert_eq!(list.as_array().unwrap().len(), 26, "S1/S3 3, S4 9, S5 2, S6 7, S7 5");
 }
 
 #[test]
@@ -1828,6 +1833,31 @@ fn lab_list_shows_the_seven_s6_probes() {
     assert_eq!(rows.iter().filter(|r| r["stage"] == "S6").count(), 7, "exactly seven S6 probes");
 }
 
+/// `lab list` shows the five S7 probes with their planned source, recorder
+/// and exact expectation, nothing recorded yet: fd-delivery passes only on
+/// fd-honoured (never env-only), touchid-gui only on prompted (never
+/// terminal-only), init-budget only within the budget.
+#[test]
+fn lab_list_shows_the_five_s7_probes() {
+    let w = World::new("");
+    let o = w.run(&["lab", "list", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let rows = list.as_array().unwrap();
+    for (name, source, expected, recorder) in [
+        ("fd-delivery", "live", "fd-honoured", "ai-env lab run fd-delivery"),
+        ("oauth-t1", "mac", "recorded", "ai-env lab run oauth-t1"),
+        ("setup-token-prefix", "mac", "recorded", "ai-env creds setup-token"),
+        ("touchid-gui", "mac", "prompted", "ai-env lab run touchid-gui (from Cursor's integrated terminal)"),
+        ("init-budget", "live", "within-budget", "ai-env lab run init-budget"),
+    ] {
+        let r = rows.iter().find(|r| r["probe"] == name).unwrap_or_else(|| panic!("{name} missing from lab list"));
+        assert_eq!((r["stage"].as_str(), r["source"].as_str(), r["expected"].as_str(), r["recorded_by"].as_str()), (Some("S7"), Some(source), Some(expected), Some(recorder)), "{name}: {r}");
+        assert!(r["last_verdict"].is_null(), "{name}: nothing recorded yet");
+    }
+    assert_eq!(rows.iter().filter(|r| r["stage"] == "S7").count(), 5, "exactly five S7 probes");
+}
+
 /// Under the file-backed fake there is no shim behind the endpoint: each S6
 /// probe starts its own VM, refuses clearly (exit 9), records nothing, and
 /// leaves no VM running (the terminate guard ends it).
@@ -1868,8 +1898,26 @@ fn lab_s6_probes_refuse_stray_arguments() {
 /// captured), its polls scaled to 200 ms a second: long enough to be
 /// interrupted mid-probe.
 fn lab_in_background(w: &World, probe: &str) -> std::process::Child {
+    lab_in_background_ignoring(w, probe, &[])
+}
+
+/// [`lab_in_background`] with SIGINT, SIGTERM and SIGHUP at their default
+/// actions, as at a terminal (a `cargo test &` would hand SIGINT down
+/// ignored), but those in `ignored` at `SIG_IGN`, as `nohup` or a script's
+/// background job leaves them.
+fn lab_in_background_ignoring(w: &World, probe: &str, ignored: &'static [libc::c_int]) -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
     let mut c = w.cmd(&["lab", "run", probe]);
     c.env("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "200").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    // SAFETY: runs in the forked child before exec; signal(2) is async-signal-safe and the slice is static.
+    unsafe {
+        c.pre_exec(move || {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::signal(sig, if ignored.contains(&sig) { libc::SIG_IGN } else { libc::SIG_DFL });
+            }
+            Ok(())
+        });
+    }
     c.spawn().expect("spawn ai-env")
 }
 
@@ -1884,9 +1932,14 @@ fn wait_for(w: &World, what: &str, seen: impl Fn(&ai_env_cli::bridge::api::FakeS
 
 /// A moment later, Ctrl-C (SIGINT) to `child`; then its output.
 fn interrupt(child: std::process::Child) -> std::process::Output {
+    stop_with(child, libc::SIGINT)
+}
+
+/// A moment later, `sig` to `child`; then its output.
+fn stop_with(child: std::process::Child, sig: libc::c_int) -> std::process::Output {
     std::thread::sleep(std::time::Duration::from_millis(300));
     // SAFETY: kill(2) on our own child's pid, not yet reaped.
-    assert_eq!(unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGINT) }, 0);
+    assert_eq!(unsafe { libc::kill(i32::try_from(child.id()).unwrap(), sig) }, 0);
     finished(child)
 }
 
@@ -1922,5 +1975,220 @@ fn lab_ctrl_c_while_its_vm_starts_ends_that_vm_too() {
     assert_eq!(code(&o), 3, "{}\n{}", stdout(&o), stderr(&o));
     assert!(stderr(&o).contains("lab: terminated microvm-"), "{}", stderr(&o));
     no_vm_left(&w);
+    assert!(rows(&w, "e0").is_empty(), "nothing recorded");
+}
+
+/// SIGTERM or SIGHUP during a live probe (a closed terminal tab sends
+/// SIGHUP) ends it as Ctrl-C does, never its terminate guard: the probe's
+/// VM is terminated and nothing is recorded, with a line saying so and exit
+/// 143, as `vm smoke` exits. (Both used to keep their default and kill `lab
+/// run` first, leaving the VM to its maximum duration.) Here stderr is a
+/// pipe still read; with the terminal itself gone:
+/// `lab_sighup_from_a_closed_terminal_ends_every_vm_with_143`.
+#[test]
+fn lab_sigterm_and_sighup_end_the_probes_vm_with_143() {
+    for (sig, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP")] {
+        let w = World::new("");
+        w.update(|s| s.pre_run_health = 1_000_000);
+        let child = lab_in_background(&w, "no-traffic-before-run");
+        wait_for(&w, "/health of the probe's VM", |s| s.calls.iter().any(|c| matches!(c, Call::Health { .. })));
+        let o = stop_with(child, sig);
+        assert_eq!(code(&o), 143, "{name}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains(&format!("lab: terminated ({name}): ending every VM this probe started")) && stderr(&o).contains("lab: terminated microvm-"), "{name}: {}", stderr(&o));
+        no_vm_left(&w);
+        assert!(rows(&w, "no-traffic-before-run").is_empty(), "{name}: nothing recorded");
+    }
+}
+
+/// SIGTERM or SIGHUP while the probe's VM is still starting (RunMicrovm
+/// answered, the VM is not RUNNING yet, so the probe holds no id): as after
+/// Ctrl-C, the VM is found through the rows of the probe's own client token
+/// and ended too, and `lab run` exits 143 with its line, recording nothing.
+#[test]
+fn lab_sigterm_or_sighup_while_its_vm_starts_ends_that_vm_too() {
+    for (sig, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP")] {
+        let w = World::new("");
+        w.update(|s| s.auto_advance = false);
+        let child = lab_in_background(&w, "e0");
+        wait_for(&w, "RunMicrovm", |s| !s.vms.is_empty());
+        let o = stop_with(child, sig);
+        assert_eq!(code(&o), 143, "{name}: {}\n{}", stdout(&o), stderr(&o));
+        assert!(stderr(&o).contains(&format!("lab: terminated ({name}): ending every VM this probe started")) && stderr(&o).contains("lab: terminated microvm-"), "{name}: {}", stderr(&o));
+        no_vm_left(&w);
+        assert!(rows(&w, "e0").is_empty(), "{name}: nothing recorded");
+    }
+}
+
+/// A SIGINT ignored when `lab run` started (`nohup`, a script's background
+/// job) stays ignored, as ssh leaves it: the probe runs on to its verdict and
+/// records it, its VM ended. (Tokio's Ctrl-C listener used to replace the
+/// `SIG_IGN` and cancel the probe.)
+#[test]
+fn lab_an_ignored_sigint_stays_ignored() {
+    let w = World::new("");
+    // About a second of asks without /run, then /run: the probe ends by itself.
+    w.update(|s| s.pre_run_health = 20);
+    let child = lab_in_background_ignoring(&w, "no-traffic-before-run", &[libc::SIGINT]);
+    wait_for(&w, "/health of the probe's VM", |s| s.calls.iter().any(|c| matches!(c, Call::Health { .. })));
+    let o = interrupt(child);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(!stderr(&o).contains("lab: cancelled"), "{}", stderr(&o));
+    assert_eq!(rows(&w, "no-traffic-before-run").pop().unwrap()["verdict"], "health-before-run");
+    no_vm_left(&w);
+}
+
+// ---- S7 fix wave 2: a SIGHUP from a closed terminal (F3) ----------------------------------------
+
+/// `c` started as a session leader whose controlling terminal, stdout and
+/// stderr are a fresh pty, SIGINT, SIGTERM and SIGHUP at their defaults,
+/// stdin null: the caller holds the only master (non-blocking). Both ends
+/// close on exec, so no other child of this test binary holds the terminal
+/// open after the caller closes it.
+pub(super) fn spawn_on_pty(mut c: std::process::Command) -> (std::process::Child, libc::c_int) {
+    use std::os::unix::process::CommandExt as _;
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills the two fds it is given; no name, termios or winsize.
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+    // SAFETY: fcntl on the two fds openpty just returned.
+    unsafe {
+        assert_eq!(libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+        assert_eq!(libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+        assert_eq!(libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK), 0);
+    }
+    c.stdin(std::process::Stdio::null());
+    // SAFETY: runs in the forked child before exec: setsid, ioctl, dup2 and signal are async-signal-safe.
+    unsafe {
+        c.pre_exec(move || {
+            if libc::setsid() == -1 || libc::ioctl(slave, libc::c_ulong::from(libc::TIOCSCTTY), 0) == -1 || libc::dup2(slave, 1) == -1 || libc::dup2(slave, 2) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+    let child = c.spawn().expect("spawn ai-env");
+    // SAFETY: this process's own copy of the slave, no longer needed.
+    unsafe { libc::close(slave) };
+    (child, master)
+}
+
+/// What the terminal shows now: a non-blocking read of `master` to EAGAIN or EIO.
+pub(super) fn pty_drain(master: libc::c_int) -> String {
+    let (mut out, mut buf) = (Vec::new(), [0u8; 4096]);
+    loop {
+        // SAFETY: a read into this buffer from the non-blocking master the caller holds.
+        let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        let Ok(n) = usize::try_from(n) else { break };
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `child`'s status, within 60 s (killed and failed past them).
+pub(super) fn exited_within_a_minute(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let t = std::time::Instant::now();
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        if t.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ai-env did not end within 60 s of the stop");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// F3: the terminal closes (its pty's master closed: SIGHUP to `lab run`,
+/// the session leader, and every later write to the terminal fails with
+/// EIO) while snapshot-uniqueness's two VMs start. As the README and the
+/// module doc promise, every VM it started is ended and it exits 143,
+/// recording nothing: the terminate guard's lines never panic. (Its
+/// `eprintln!` panicked at the first: exit 101, the second VM left to run
+/// out its 900 s.)
+#[test]
+fn lab_sighup_from_a_closed_terminal_ends_every_vm_with_143() {
+    let w = World::new("");
+    w.update(|s| s.auto_advance = false);
+    let mut c = w.cmd(&["lab", "run", "snapshot-uniqueness"]);
+    c.env("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "200");
+    let (mut child, master) = spawn_on_pty(c);
+    wait_for(&w, "both RunMicrovm calls", |s| s.vms.len() >= 2);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let shown = pty_drain(master);
+    // SAFETY: the only master: closing it hangs the terminal up.
+    unsafe { libc::close(master) };
+    let status = exited_within_a_minute(&mut child);
+    let st = w.state();
+    let vms: Vec<String> = st.vms.values().map(|v| format!("{} {}", v.id, v.state.as_str())).collect();
+    let alive: Vec<&String> = st.vms.values().filter(|v| !v.state.is_terminal()).map(|v| &v.id).collect();
+    assert_eq!(vms.len(), 2, "the probe's two VMs: {vms:?}");
+    assert_eq!((status.code(), alive), (Some(143), Vec::<&String>::new()), "143, every VM ended: {vms:?}; the terminal showed {shown:?} before the hangup");
+    assert!(rows(&w, "snapshot-uniqueness").is_empty(), "nothing recorded");
+}
+
+/// F3: the terminal closes while snapshot-uniqueness's two VMs start, and
+/// the guard's first terminate is refused (AccessDenied): its line for that
+/// VM never panics either, so the other VM is still ended and `lab run`
+/// exits 143, recording nothing; the refused VM alone is left (for `ai-env
+/// vm terminate`; the line naming it went to the closed terminal). (Its
+/// `eprintln!` panicked: exit 101, the other VM left to run out its 900 s
+/// too.)
+#[test]
+fn lab_sighup_from_a_closed_terminal_still_ends_the_rest_after_a_refused_terminate() {
+    let w = World::new("");
+    // Taken by the first TerminateMicrovm, the guard's: nothing else terminates before the stop.
+    w.update(|s| {
+        s.auto_advance = false;
+        s.failures.push_back(FakeFailure { kind: "access_denied".into(), message: "not allowed".into(), on: Some("terminate".into()), after_effect: false });
+    });
+    let mut c = w.cmd(&["lab", "run", "snapshot-uniqueness"]);
+    c.env("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "200");
+    let (mut child, master) = spawn_on_pty(c);
+    wait_for(&w, "both RunMicrovm calls", |s| s.vms.len() >= 2);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let shown = pty_drain(master);
+    // SAFETY: the only master: closing it hangs the terminal up.
+    unsafe { libc::close(master) };
+    let status = exited_within_a_minute(&mut child);
+    let st = w.state();
+    let vms: Vec<String> = st.vms.values().map(|v| format!("{} {}", v.id, v.state.as_str())).collect();
+    let alive = st.vms.values().filter(|v| !v.state.is_terminal()).count();
+    assert_eq!(vms.len(), 2, "the probe's two VMs: {vms:?}");
+    assert!(st.failures.is_empty(), "the refusal was taken by a terminate: {vms:?}");
+    assert_eq!((status.code(), alive), (Some(143), 1), "143, the refused VM alone left: {vms:?}; the terminal showed {shown:?} before the hangup");
+    assert!(rows(&w, "snapshot-uniqueness").is_empty(), "nothing recorded");
+}
+
+/// F3: a Ctrl-C once the reader of `lab run`'s stderr is gone (`ai-env lab
+/// run e0 2>&1 | head -1`: every later write to stderr fails with EPIPE)
+/// while the probe's VM starts: the cancel line never panics, so the VM is
+/// still found and ended and `lab run` exits 3 (Cancelled), recording
+/// nothing. (Its `eprintln!` panicked: exit 101, the VM left to run out its
+/// maximum duration.)
+#[test]
+fn lab_ctrl_c_with_stderr_a_closed_pipe_ends_the_vm_with_3() {
+    use std::io::BufRead as _;
+    let w = World::new("");
+    w.update(|s| s.auto_advance = false);
+    let mut child = lab_in_background(&w, "e0");
+    // Its first line (the lab knobs' banner) read, then the reader dropped.
+    let mut first = String::new();
+    std::io::BufReader::new(child.stderr.take().unwrap()).read_line(&mut first).unwrap();
+    wait_for(&w, "RunMicrovm", |s| !s.vms.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: kill(2) on our own child's pid, not yet reaped.
+    assert_eq!(unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGINT) }, 0);
+    let status = exited_within_a_minute(&mut child);
+    let st = w.state();
+    let vms: Vec<String> = st.vms.values().map(|v| format!("{} {}", v.id, v.state.as_str())).collect();
+    let alive: Vec<&String> = st.vms.values().filter(|v| !v.state.is_terminal()).map(|v| &v.id).collect();
+    assert_eq!((status.code(), alive), (Some(3), Vec::<&String>::new()), "exit 3, the VM ended: {vms:?}; stderr's first line {first:?}");
     assert!(rows(&w, "e0").is_empty(), "nothing recorded");
 }

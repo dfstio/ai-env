@@ -48,7 +48,7 @@ use crate::shim::health::ShimState;
 use crate::shim::peer::{self, Decision, PeerFacts};
 use crate::shim::state::{Claim, RunRecord};
 use crate::shim::sys;
-use crate::wire::frame::{EventKind, Frame, HookPeerSeen, RunHookPayload, CLOSE_GOING_AWAY};
+use crate::wire::frame::{CredentialErrCode, EventKind, Frame, HookPeerSeen, RunHookPayload, CLOSE_GOING_AWAY};
 use axum::body::Bytes;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -417,6 +417,8 @@ async fn run(State(state): State<Arc<ShimState>>, body: Bytes) -> Response {
 }
 
 async fn resume(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
+    // First: no credential survives a suspend, even one whose hook never ran (S7).
+    state.spawns.credential().reopen("resume");
     // Bounded: a stuck clock step must not eat the 30 s resume budget.
     let s = state.clone();
     let report = tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || sys::clock_report(s.sys.as_ref(), "resume", s.opts.clock, None))).await;
@@ -431,16 +433,30 @@ async fn resume(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
 
-/// Freeze the detach graces, then tell every `/agent` socket and close it
-/// (no socket survives a suspend), then answer.
+/// Drop the cached credential and close the cache until `/resume` (S7), then
+/// freeze the detach graces, then tell every `/agent` socket and close it (no
+/// socket survives a suspend), then answer.
 async fn suspend(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
+    // First: the cached credential goes before the snapshot can take it, and none is accepted until /resume (S7).
+    state.spawns.credential().close(CredentialErrCode::Suspended, "suspend");
     state.spawns.freeze();
     state.agents.close_all_with(CLOSE_GOING_AWAY, "suspend", Some(event(EventKind::HookSuspend))).await;
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
 
-async fn terminate(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
+/// The first step of both stops, `/terminate` and the shutdown (a stop
+/// signal, or init gone): the cached credential goes and the cache closes
+/// for good (S7), then the shim drains (new `/agent` upgrades and
+/// `credential` frames are refused). One function, so the shutdown runs what
+/// `/terminate`'s tests check.
+pub(crate) fn begin_stop(state: &ShimState, why: &str) {
+    state.spawns.credential().close(CredentialErrCode::Draining, why);
     state.set_draining();
+}
+
+async fn terminate(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
+    // First: the cached credential goes, and none is accepted from here on (S7).
+    begin_stop(&state, "terminate");
     state.agents.close_all_with(CLOSE_GOING_AWAY, "terminate", Some(event(EventKind::HookTerminate))).await;
     if tokio::time::timeout(SHUTDOWN_WAIT, state.spawns.terminate()).await.is_err() {
         errln!("ai-env: stopping the spawns on terminate did not finish within {} s", SHUTDOWN_WAIT.as_secs());

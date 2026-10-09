@@ -132,6 +132,19 @@ pub fn runtime_credentials(store: &Keystore, paths: &Paths, cfg: &BridgeConfig) 
 }
 
 fn unseal(store: &Keystore, paths: &Paths, key_name: &str) -> Result<RuntimeCreds> {
+    let (id, secret) = unseal_runtime_key(store, paths, key_name)?;
+    Ok(static_creds(&id, &secret))
+}
+
+/// The runtime key unsealed some other way (S7: from `combined.env`).
+#[must_use]
+pub fn static_creds(id: &str, secret: &str) -> RuntimeCreds {
+    RuntimeCreds::Static(Credentials::new(id, secret, None, None, CONTAINER_PROVIDER))
+}
+
+/// The runtime key sealed in `credentials/aws.env` (one Touch ID): its id and
+/// zeroizing secret, both registered with the scrubber.
+pub fn unseal_runtime_key(store: &Keystore, paths: &Paths, key_name: &str) -> Result<(String, Zeroizing<String>)> {
     let path = paths.aws_env();
     match aws_env_state(&path) {
         AwsEnvState::Sealed => {}
@@ -148,9 +161,9 @@ fn unseal(store: &Keystore, paths: &Paths, key_name: &str) -> Result<RuntimeCred
     let key = resolve_for_decrypt(store, Some(key_name), &cont)?;
     let age = AgeTool::probe()?;
     let plain = age.decrypt_to_bytes(&store.identity_path(&key), &cont.data)?;
-    let (id, secret) = parse_runtime_env(&plain)?;
+    let pair = parse_runtime_env(&plain)?;
     drop(plain);
-    Ok(RuntimeCreds::Static(Credentials::new(id, secret.as_str(), None, None, CONTAINER_PROVIDER)))
+    Ok(pair)
 }
 
 /// Parse the plaintext `creds aws-set` sealed (`creds::render_env`): exactly

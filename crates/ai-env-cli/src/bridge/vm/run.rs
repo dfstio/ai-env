@@ -687,26 +687,27 @@ fn apply_echo(row: &mut VmRow, vm: &VmInfo, fallback_start: u64, now: u64) {
 }
 
 /// Append one audit row with `actor=cli`; a failed write is a warning (the
-/// action it records already happened).
+/// action it records already happened), never a panic (`signals::say`): a
+/// terminate after a stop that closed the terminal audits here.
 pub(crate) fn audit_event(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
     let mut all: Vec<(&str, String)> = vec![("actor", "cli".to_string())];
     all.extend(pairs.iter().cloned());
     let row = AuditRow::new(event, None, audit::detail(&all));
     if let Err(e) = audit::append(&paths.audit(), &row) {
         tracing::warn!("audit {event}: {e}");
-        eprintln!("ai-env: warning: audit row {event} not written: {e}");
+        crate::bridge::signals::say(&format!("ai-env: warning: audit row {event} not written: {e}"));
     }
 }
 
 /// [`update_or_write`] after the fact; a failure is a warning (what it
-/// records already happened). Returns the row as written, else `row` with
-/// `f` applied.
+/// records already happened), never a panic (`signals::say`). Returns the row
+/// as written, else `row` with `f` applied.
 fn update_or_warn(paths: &Paths, row: &VmRow, f: impl Fn(&mut VmRow)) -> VmRow {
     match update_or_write(paths, row, &f) {
         Ok(disk) => disk,
         Err(e) => {
             tracing::warn!("vm row {}: {e}", row.stem());
-            eprintln!("ai-env: warning: vm row {} not updated: {e}", row.stem());
+            crate::bridge::signals::say(&format!("ai-env: warning: vm row {} not updated: {e}", row.stem()));
             let mut mem = row.clone();
             f(&mut mem);
             mem
@@ -808,22 +809,25 @@ fn record_pass(paths: &Paths, row: &VmRow, expected: &ExpectedEcho) -> VmRow {
 /// as `(none planned)`). `terminated` is whether `TerminateMicrovm` was
 /// accepted (a row write that failed after it does not count against it).
 /// Returns the error (exit 9); when not terminated, the caller keeps the id.
+/// Its warnings never panic (`signals::say`): the adoption sweep of a
+/// stopped command reaches it after the stop.
 pub(crate) async fn reject_echo<A: MicrovmApi>(api: &A, paths: &Paths, id: &str, expected: Option<&ExpectedEcho>, echoed: &[String], via: &str, purpose: &str) -> BridgeError {
+    use crate::bridge::signals::say;
     if let Err(e) = registry::update_row(paths, id, |r| r.egress_gate = Some(GATE_MISMATCH.to_string())) {
         tracing::warn!("vm row {id}: egress_gate mismatch not recorded: {e}");
-        eprintln!("ai-env: warning: vm row {id}: the egress mismatch not recorded: {e}");
+        say(&format!("ai-env: warning: vm row {id}: the egress mismatch not recorded: {e}"));
     }
     let terminated = match request_terminate(api, paths, id, "policy").await {
         Ok(recorded) => {
             if let Err(e) = recorded {
                 tracing::warn!("vm row {id}: the policy termination not recorded: {e}");
-                eprintln!("ai-env: warning: vm row {id}: terminated, but the row was not updated: {e}");
+                say(&format!("ai-env: warning: vm row {id}: terminated, but the row was not updated: {e}"));
             }
             true
         }
         Err(e) => {
             tracing::warn!("egress gate: terminating {id}: {e}");
-            eprintln!("ai-env: warning: egress mismatch: terminating {id} failed: {e}");
+            say(&format!("ai-env: warning: egress mismatch: terminating {id} failed: {e}"));
             false
         }
     };
@@ -1600,7 +1604,8 @@ async fn promote_adopted<A: MicrovmApi>(api: &A, paths: &Paths, pending: &VmRow,
             r.egress_gate = Some(GATE_MISMATCH.to_string());
         }) {
             tracing::warn!("vm row {}: the egress mismatch not recorded: {e}", vm.id);
-            eprintln!("ai-env: warning: vm row {} not written (egress mismatch): {e}", vm.id);
+            // Never a panic: the sweep of a stopped command gets here after the stop.
+            crate::bridge::signals::say(&format!("ai-env: warning: vm row {} not written (egress mismatch): {e}", vm.id));
         }
         return Err(reject_echo(api, paths, &vm.id, expected.as_ref(), &vm.egress, via, purpose).await);
     }
@@ -1668,5 +1673,73 @@ mod tests {
         assert_eq!(status_of(&VmState::Suspending), RowStatus::Suspended);
         assert_eq!(status_of(&VmState::Terminating), RowStatus::Terminated);
         assert_eq!(status_of(&VmState::Unknown("X".into())), RowStatus::Unknown);
+    }
+
+    /// Set only in the environment of the child half of
+    /// `warnings_of_a_failed_local_write_never_panic`: its directory.
+    const BROKEN_STDERR_DIR: &str = "AI_ENV_TEST_BROKEN_STDERR";
+
+    /// The warnings of a local write that failed may come after a caught
+    /// stop, when the terminal is gone (`vm exec` after its pump; the
+    /// terminate of `vm smoke`, `lab run` and `vm warm`; the adoption sweep):
+    /// `record_rejection`'s (`state/creds.toml`), both `audit_event`s,
+    /// `update_or_warn`'s, `reject_echo`'s three and `promote_adopted`'s go
+    /// through `signals::say`, never `eprintln!`, which panics when stderr
+    /// cannot be written and turns the ending into exit 101. The test runs
+    /// itself again as its child half, with no output capture and stderr a
+    /// pipe whose reader is gone (every write fails, as on a hung-up
+    /// terminal), and every write those warnings report made to fail (the
+    /// audit log, a VM row, a pending row and `state/creds.toml` are
+    /// directories): the child makes each call, and passes only if none
+    /// panicked.
+    #[test]
+    fn warnings_of_a_failed_local_write_never_panic() {
+        if let Some(dir) = std::env::var_os(BROKEN_STDERR_DIR) {
+            warn_with_stderr_gone(Path::new(&dir));
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let name = format!("{}::warnings_of_a_failed_local_write_never_panic", module_path!().split_once("::").map_or("", |(_, m)| m));
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name.as_str(), "--test-threads=1", "--nocapture"]).env(BROKEN_STDERR_DIR, d.path()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(writer);
+        let child = {
+            // Held across the spawn, as every fork of these tests holds it (`test_locks`).
+            let _fork = crate::test_locks::forking();
+            cmd.spawn().unwrap()
+        };
+        // This process's copy of the write end closed: the child's stderr is the only one.
+        drop(cmd);
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A filter that matches nothing passes too: the count says it ran.
+        assert!(out.status.success() && stdout.contains("test result: ok. 1 passed"), "{stdout}");
+    }
+
+    /// The child half: every write the warnings report made to fail, then
+    /// each call made, with stderr unwritable.
+    fn warn_with_stderr_gone(dir: &Path) {
+        let paths = Paths::from_root_and_env(dir.join("bridge"), None);
+        let (id, token) = ("microvm-warnings0001", "00000000-0000-4000-8000-0000000000aa");
+        for blocked in [paths.audit(), paths.creds_state(), registry::row_path(&paths, id).unwrap(), registry::pending_path(&paths, token).unwrap()] {
+            std::fs::create_dir_all(blocked).unwrap();
+        }
+        crate::bridge::agent::credential::record_rejection(&paths, id, "seal0123456789ab", "text");
+        audit_event(&paths, "vm_test", &[]);
+        let row = VmRow { id: id.into(), ..VmRow::default() };
+        update_or_warn(&paths, &row, |r| r.status = RowStatus::Terminated);
+        let api = api::FakeMicrovmApi::new();
+        let vm = VmInfo { id: id.into(), state: VmState::Running, endpoint: String::new(), image_arn: String::new(), image_version: String::new(), started_at_unix: None, max_duration_s: 900, state_reason: None, execution_role_arn: None, idle: None, ingress: Vec::new(), egress: Vec::new(), terminated_at_unix: None };
+        let pending = VmRow { client_token: token.into(), ..VmRow::default() };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // The fake does not know the VM: its terminate counts as done, and the row update fails.
+            let _ = reject_echo(&api, &paths, id, None, &[], "run", "test").await;
+            api.fail_on("terminate", BridgeError::AccessDenied("refused".into()), false);
+            let _ = reject_echo(&api, &paths, id, None, &[], "run", "test").await;
+            // A row without egress expects no echo: a mismatch, whose pending row cannot be read.
+            let _ = promote_adopted(&api, &paths, &pending, &vm, "sweep", "test").await;
+        });
     }
 }

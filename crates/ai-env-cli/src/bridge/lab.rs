@@ -120,9 +120,9 @@ pub fn pump_knobs() -> PumpKnobs {
 
 // ---- S4: `ai-env vm` / `lab` knobs ---------------------------------------------------
 
-/// The S4 knob names (and S6's agent address), for the banner and the test
-/// harnesses' scrub lists.
-pub const VM_KNOBS: [&str; 4] = ["AI_ENV_BRIDGE_LAB_FAKE_API", "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "AI_ENV_BRIDGE_LAB_BACKOFF_MS", "AI_ENV_BRIDGE_LAB_AGENT_ADDR"];
+/// The S4 knob names (and S6's agent address, S7's unseal budget), for the
+/// banner and the test harnesses' scrub lists.
+pub const VM_KNOBS: [&str; 5] = ["AI_ENV_BRIDGE_LAB_FAKE_API", "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "AI_ENV_BRIDGE_LAB_BACKOFF_MS", "AI_ENV_BRIDGE_LAB_AGENT_ADDR", crate::bridge::pump::UNSEAL_TIMEOUT_KNOB];
 
 /// The S4 knobs `ai-env vm` and `ai-env lab` honour (debug builds only).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -142,6 +142,13 @@ pub struct VmKnobs {
     /// endpoint) instead of `wss://<endpoint>:443`. Honoured only together
     /// with the fake API; see [`VmKnobs::agent_addr`].
     pub agent_addr: Option<String>,
+    /// `AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS=<n>` (S7): the budget of every
+    /// unseal a credentialed `vm` or `lab` command makes, in place of
+    /// `[creds].unseal_timeout_s` (whose range starts at 10 s), as the
+    /// wrapper's own knob of that name does for `local-scratch`: a deadline
+    /// test reaches its deadline in a second or two. Whole seconds read best
+    /// (the deadline and the countdown say seconds).
+    pub unseal_timeout: Option<Duration>,
 }
 
 impl VmKnobs {
@@ -163,6 +170,9 @@ impl VmKnobs {
         if self.agent_addr.is_some() {
             out.push(VM_KNOBS[3]);
         }
+        if self.unseal_timeout.is_some() {
+            out.push(VM_KNOBS[4]);
+        }
         out
     }
 
@@ -181,10 +191,22 @@ impl VmKnobs {
             _ => Err(format!("{}={raw:?}: expected a loopback ip:port", VM_KNOBS[3])),
         }
     }
+
+    /// Is the platform emulated: the fake API with a valid agent address, so
+    /// `/agent` reaches a test's shim behind a fake endpoint that also plays
+    /// the platform's hooks (`tests/common/fake_endpoint.rs`)? Only S7's
+    /// credential probes take that for the service (`vm::lab`); every other
+    /// live probe still refuses the fake. Never true in release builds, whose
+    /// knobs are all off.
+    #[must_use]
+    pub fn emulated_platform(&self) -> bool {
+        self.fake_api.is_some() && matches!(self.agent_addr(), Ok(Some(_)))
+    }
 }
 
 /// Pure parser over the three S4 raw values (unset = `None`); anything
-/// unparseable is off. The S6 agent address is set by [`vm_knobs`].
+/// unparseable is off. The S6 agent address and the S7 unseal budget are set
+/// by [`vm_knobs`].
 #[must_use]
 pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: Option<&str>) -> VmKnobs {
     VmKnobs {
@@ -192,6 +214,7 @@ pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: 
         fake_api_unseal: unseal.map(str::trim) == Some("1"),
         backoff_ms: backoff_ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| *ms > 0),
         agent_addr: None,
+        unseal_timeout: None,
     }
 }
 
@@ -200,7 +223,11 @@ pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: 
 #[must_use]
 pub fn vm_knobs() -> VmKnobs {
     let get = |k: &str| std::env::var(k).ok();
-    VmKnobs { agent_addr: get(VM_KNOBS[3]).filter(|v| !v.trim().is_empty()), ..parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref()) }
+    VmKnobs {
+        agent_addr: get(VM_KNOBS[3]).filter(|v| !v.trim().is_empty()),
+        unseal_timeout: crate::bridge::pump::parse_ms_knob(get(VM_KNOBS[4]).as_deref()),
+        ..parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref())
+    }
 }
 
 /// Release builds: every knob off, whatever the environment says.
@@ -276,6 +303,30 @@ mod tests {
             assert!(with(true, bad).agent_addr().is_err(), "{bad}");
         }
         assert_eq!(with(true, "127.0.0.1:1").active(), vec![VM_KNOBS[0], VM_KNOBS[3]]);
+    }
+
+    /// The S7 unseal budget is the wrapper's knob of that name, read as
+    /// every `_MS` knob is, and announced when set: a `vm` command run with
+    /// it never passes for the real service's budget.
+    #[test]
+    fn the_unseal_budget_knob_is_the_wrappers_and_is_announced() {
+        assert_eq!(VM_KNOBS[4], crate::bridge::pump::UNSEAL_TIMEOUT_KNOB);
+        assert_eq!(crate::bridge::pump::parse_ms_knob(Some("2000")), Some(Duration::from_secs(2)));
+        let k = VmKnobs { unseal_timeout: Some(Duration::from_secs(2)), ..VmKnobs::default() };
+        assert_eq!(k.active(), vec![VM_KNOBS[4]]);
+        assert_eq!(parse_vm_knobs(None, None, None).unseal_timeout, None, "set by vm_knobs alone");
+    }
+
+    /// The emulated platform takes the fake API and a valid agent address
+    /// together: neither alone, nor an address the knob refuses.
+    #[test]
+    fn the_platform_is_emulated_only_with_the_fake_api_and_a_valid_agent_addr() {
+        let knobs = |fake: bool, addr: Option<&str>| VmKnobs { fake_api: fake.then(|| std::path::PathBuf::from("/f.json")), agent_addr: addr.map(str::to_string), ..VmKnobs::default() };
+        assert!(knobs(true, Some("127.0.0.1:18080")).emulated_platform());
+        assert!(!knobs(true, None).emulated_platform(), "the fake alone has no shim behind it");
+        assert!(!knobs(false, Some("127.0.0.1:18080")).emulated_platform(), "the address alone is never the real service's");
+        assert!(!knobs(true, Some("10.0.0.5:18080")).emulated_platform(), "not loopback");
+        assert!(!VmKnobs::default().emulated_platform(), "release builds: every knob off");
     }
 
     #[cfg(debug_assertions)]

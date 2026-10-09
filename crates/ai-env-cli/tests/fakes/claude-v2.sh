@@ -1,5 +1,6 @@
 #!/bin/sh
-# Fake `claude` v2 for the S2 pump tests (hoststate, mirror, race). POSIX sh
+# Fake `claude` v2 for the S2 pump tests (hoststate, mirror, race) and the S7
+# local-scratch tests in wrapper.rs (FAKE_TOKEN_LOG). POSIX sh
 # + sed; runs under macOS /bin/sh (bash 3.2 in sh mode). Hard-linked into a
 # tempdir by tests/common/mod.rs and spawned by ai-env-claude as the piped
 # child. It speaks just enough of the stream-json protocol: every
@@ -19,8 +20,15 @@
 #                             like the CLI's resume miss (stderr line + error result, exit 1)
 #                             before reading stdin
 #   FAKE_RESUME_FAIL_AFTER_ACK=1  the same miss, but only after answering initialize
+#   FAKE_MISS_DELAY_MS        ms: that after-ack miss waits this long first (S7: a miss
+#                             later than the wrapper's grace for one)
+#   FAKE_MISS_EXIT_DELAY_MS   ms: a resume miss waits this long between its result line and
+#                             its exit (S7: a child still exiting when the wrapper's grace ends)
 #   FAKE_MISS_AFTER_INIT=1    the same miss (stderr line + error result, exit 1) right
 #                             after the init frame: the host has seen the init
+#   FAKE_INIT_AT_TURN=1       the init frame, and everything that follows it below, comes
+#                             with the first user turn instead of after initialize: the real
+#                             CLI emits system/init once per turn
 #   FAKE_IGNORE_CONTROL_GEN   in that generation control requests are logged, never answered
 #   FAKE_EXIT_AFTER_INIT      <code>:<msg>: right after the init frame, msg on stderr, exit code
 #   FAKE_STDOUT_FILE          cat'ed to stdout right after the init frame
@@ -41,6 +49,11 @@
 #                             (it outlives the fake: its reader sees no EOF at the exit)
 #   FAKE_EXIT                 exit code at stdin EOF (default 0)
 #   FAKE_STDERR               printed once to stderr at start
+#   FAKE_TOKEN_LOG            S7: append "gen <n> source=<fd|env|none|fd-unreadable|fd-invalid>
+#                             len=<n> sha8=<first 8 hex of its sha256|-> fdvar=<n|unset|invalid>
+#                             envvar=<present|absent>": the token as the CLI would take it
+#                             (CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR's fd, read at start,
+#                             else CLAUDE_CODE_OAUTH_TOKEN), described, never written anywhere
 
 sleeper=""
 streamer=""
@@ -99,6 +112,35 @@ if [ -n "${FAKE_ENV_LOG:-}" ]; then
   printf 'gen %s CLAUDE_CONFIG_DIR=%s SECURESTORAGE=%s pid=%s\n' "$gen" "$ccd" "$ss" "$$" >> "$FAKE_ENV_LOG"
 fi
 
+# The token, as the CLI would take it: the descriptor first, else the variable.
+# Only its source, length and a hash prefix are logged; the shell variable is
+# cleared right after, and the value only ever travels through a pipe to shasum.
+if [ -n "${FAKE_TOKEN_LOG:-}" ]; then
+  tok=""
+  src=none
+  fdvar=unset
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR+x}" ]; then
+    case "$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" in
+      ''|*[!0-9]*) src=fd-invalid; fdvar=invalid ;;
+      *)
+        fdvar=$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
+        if tok=$(eval "cat <&$fdvar" 2>/dev/null); then src=fd; else src=fd-unreadable; tok=""; fi
+        ;;
+    esac
+  elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    tok=$CLAUDE_CODE_OAUTH_TOKEN
+    src=env
+  fi
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN+x}" ]; then envvar=present; else envvar=absent; fi
+  sha8=-
+  if [ -n "$tok" ]; then
+    sha8=$(printf '%s' "$tok" | shasum -a 256 2>/dev/null | cut -c1-8)
+    if [ -z "$sha8" ]; then sha8=-; fi
+  fi
+  printf 'gen %s source=%s len=%s sha8=%s fdvar=%s envvar=%s\n' "$gen" "$src" "${#tok}" "$sha8" "$fdvar" "$envvar" >> "$FAKE_TOKEN_LOG"
+  tok=""
+fi
+
 if [ -n "${FAKE_STDERR:-}" ]; then
   printf '%s\n' "$FAKE_STDERR" >&2
 fi
@@ -131,6 +173,9 @@ fi
 resume_miss() {
   printf 'No conversation found with session ID: %s\n' "$resume" >&2
   printf '{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"%s","total_cost_usd":0,"usage":{},"modelUsage":{},"permission_denials":[],"uuid":"x","errors":["No conversation found with session ID: %s"],"result_index":0}\n' "$other_sid" "$resume"
+  if [ -n "${FAKE_MISS_EXIT_DELAY_MS:-}" ]; then
+    sleep "$((FAKE_MISS_EXIT_DELAY_MS / 1000)).$(printf '%03d' $((FAKE_MISS_EXIT_DELAY_MS % 1000)))"
+  fi
   exit 1
 }
 
@@ -201,9 +246,14 @@ on_control_request() {
     *'"subtype":"initialize"'*)
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"pid":%s}}}\n' "$id" "$$"
       if [ "$fail_after_ack" = "1" ]; then
+        if [ -n "${FAKE_MISS_DELAY_MS:-}" ]; then
+          sleep "$((FAKE_MISS_DELAY_MS / 1000)).$(printf '%03d' $((FAKE_MISS_DELAY_MS % 1000)))"
+        fi
         resume_miss
       fi
-      emit_init
+      if [ "${FAKE_INIT_AT_TURN:-0}" != "1" ]; then
+        emit_init
+      fi
       ;;
     *)
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
@@ -213,6 +263,9 @@ on_control_request() {
 
 turns=0
 on_user() {
+  if [ "${FAKE_INIT_AT_TURN:-0}" = "1" ]; then
+    emit_init
+  fi
   turns=$((turns + 1))
   if [ -n "${FAKE_NEW_SESSION_AFTER:-}" ] && [ "$turns" -eq $((FAKE_NEW_SESSION_AFTER + 1)) ]; then
     sid=$clear_sid

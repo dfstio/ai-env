@@ -144,13 +144,16 @@ ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi out
 ai-env infra  base-image [--name al2023-1] [--version 1]  # the pinned managed base image is AVAILABLE
 ai-env infra  versions-diff --before F --after F [--record-probe]   # image versions around a deploy (bridge feature)
 ai-env creds  aws-set [--user ai-env-runtime] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin
+ai-env creds  setup-token [--stdin|--from-env] [--no-combined] [--force]   # seal the Claude setup-token (asked for hidden) (S7)
+ai-env creds  status [--json] [--unseal] | forget [--yes]  # what is sealed, without Touch ID / delete the token and its copies
 ai-env vm     images [--managed] | list [--all] | status ID | health ID   # MicroVMs of the ai-env image (bridge feature)
 ai-env vm     run [--workspace PATH] [--max-duration S] [--egress internet|vpc] [--shell] [--json] …
 ai-env vm     token ID [--port 8080|8082|9418] [--minutes M] [--reveal]   # the value only with --reveal
 ai-env vm     suspend ID | resume ID | terminate ID|--all [--yes] | gc [--yes] [--include-orphans AGE]
 ai-env vm     shell ID [--auth header|subprotocol]         # experimental: the platform shell (VM started with --shell)
-ai-env vm     smoke [--max-duration 900] [--keep] [--exec] [--json]   # run → RUNNING → /health (→ exec checks) → terminate, with timings
-ai-env vm     exec ID [--cwd P] [--env K=V]… [--detach-grace S] -- CMD ARGS…   # run as the agent over /agent; stdio byte-exact, the command's exit status (S6)
+ai-env vm     smoke [--max-duration 900] [--keep] [--exec [--with-credential]] [--json]   # run → RUNNING → /health (→ exec checks → a credentialed claude -p) → terminate, with timings
+ai-env vm     exec ID [--cwd P] [--env K=V]… [--detach-grace S] [--with-credential | --credential-file P] [--deliver fd|env] -- CMD ARGS…   # run as the agent over /agent; stdio byte-exact, the command's exit status (S6; the credential S7)
+ai-env vm     warm WORKSPACE [--json]                      # deliver the sealed setup-token to the workspace's VM ahead of time (S7)
 ai-env vm     attach ID --spawn UUID [--from-seq N]       # reattach to a running command (the newest client wins)
 ai-env vm     health ID --detail [--json]                  # /health/detail with the session bearer: guard, sockets, spawns, listeners
 ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]   # probes → lab/probes.jsonl
@@ -169,10 +172,13 @@ file where a container was expected · `7` AWS/infra API failure · `8` MicroVM 
 lost · `9` policy refusal (tripwire, egress gate, workspace outside the approved roots). `vm exec`
 exits with the remote command's own status (128 + N when a signal killed it; 127 when the VM has no
 such program, 126 when it cannot run it and 1 when the working directory cannot be made, each with an
-`ai-env: vm exec:` line); its own failures keep 7/8/9 and print an `ai-env:` line (9 also when the
-VM already runs 8 commands). After SIGTERM or SIGHUP it exits 143, after a Ctrl-C before the command
-started (or a second one while the connection is down) 130, and after a closed stdout 0, whatever the
-command did.
+`ai-env: vm exec:` line); its own failures keep 7/8/9 (with a credential also 3, 4 and 5: see
+Credentials) and print an `ai-env:` line (9 also when the VM already runs 8 commands), and a
+credentialed `claude` whose delivered token Anthropic refuses ends with 5 and such a line instead of
+its own status. No stop signal after the refusal changes that 5. The line is the last write to
+stderr: a signal that cuts the last output short leaves it a second more, and a stderr nobody reads
+gets none. After SIGTERM or SIGHUP it exits 143, after a Ctrl-C before the command started (or a
+second one while the connection is down) 130, and after a closed stdout 0, whatever the command did.
 
 `ai-env doctor` exits `1` when any row is `[NO ]` and `5` when AWS credentials are unavailable;
 every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings) never
@@ -206,8 +212,25 @@ still execs exactly as above. The pump:
   MCP servers, …) and replays them into a respawned child without the extension noticing;
 - `local-scratch` runs the child with its own `CLAUDE_CONFIG_DIR` under
   `~/.config/ai-env/bridge/state/scratch/`, seeds it with the Mac transcript before `--resume`, and
-  retries once when the child reports `No conversation found with session ID:` (the child is logged
-  out unless `CLAUDE_CODE_OAUTH_TOKEN` is set — S7 delivers it);
+  retries once when the child reports `No conversation found with session ID:`;
+- `local-scratch` also logs that child in (S7), since it has no login of its own: a
+  `CLAUDE_CODE_OAUTH_TOKEN` in the extension's environment is passed on; otherwise the sealed
+  setup-token is unsealed before the child starts, one Touch ID per piped invocation (Cursor's config
+  probe, whose arguments are a chat's, included), with the countdown on the wrapper's stderr starting
+  from 50 s at most (Cursor's 60 s `initialize` window minus 10 s), whatever `[creds].unseal_timeout_s`
+  says above that. The token reaches the child on fd 3 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3`),
+  or in its environment with `[creds] deliver = "env"`; a scratch child never inherits a
+  `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`. The wrapper drops its copy once the child is spawned, or,
+  for a `--resume`, at most 2 s after the child answered `initialize` (its one seed retry may need it),
+  unless the child reported a resume miss or exited by then: the copy then goes once the seed retry's
+  respawn has it, or when the session ends.
+  No sealed token, a refused one (or a `state/creds.toml` that cannot be read, which may record a
+  refusal), a dismissed dialog or the deadline gives one note line and a logged-out child, never a
+  failed session; a signal during the wait closes the dialog and ends the wrapper (130 for Ctrl-C, 143
+  for SIGTERM and SIGHUP). The unseal is audited `credential_unseal`, and
+  the census end row notes `credential:` with `fd`, `env`, `inherited` or `none` (how the generation
+  that served the session was logged in: `none` when the seed retry respawned the child after the
+  copy was dropped);
 - writes `logs/wrapper.log`, a second census row with `end`/`exit` (`ai-env wrapper census` shows
   `exit=… dur=…`), `audit.jsonl` rows for retries, and one `state/sessions/<uuid>.toml` per chat
   (`ai-env session list|show|forget`; rows hold digests and a summary, never request bodies);
@@ -215,8 +238,15 @@ still execs exactly as above. The pump:
   within 1 s of a SIGTERM.
 
 Debug builds also honour the lab knobs `AI_ENV_BRIDGE_LAB_EXIT=<code>:<msg>:after-init`,
-`AI_ENV_BRIDGE_LAB_IGNORE_EOF=1|2`, `AI_ENV_BRIDGE_LAB_STDOUT_NOISE=1` and
-`AI_ENV_BRIDGE_LAB_DELAY_INIT_MS=<n>` (compiled out of release builds).
+`AI_ENV_BRIDGE_LAB_IGNORE_EOF=1|2`, `AI_ENV_BRIDGE_LAB_STDOUT_NOISE=1`,
+`AI_ENV_BRIDGE_LAB_DELAY_INIT_MS=<n>`, and from S7 `AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS=<n>` (once the
+session is initialized the pump sends the extension one `oauth_token_refresh` request of its own,
+waits at most n ms, never forwards the answer, and records its class in the end row as
+`synthetic_oauth:<class>`, which `ai-env wrapper census --record-probes` puts in the
+`stock-ext-oauth` row's note) and `AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS=<n>` (the `local-scratch`
+unseal's budget in ms, in place of `[creds].unseal_timeout_s`; the same knob budgets a credentialed
+`vm` or `lab` command's unseals: see Credentials). All are compiled out of release builds, and the
+live make targets also drop the two S7 knobs.
 
 ### The MicroVM image and its infrastructure (stage S3)
 
@@ -296,7 +326,9 @@ endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code
   the image version live (`active` = the latest SUCCESSFUL/ACTIVE), writes a pending row under
   `state/vms/` before `RunMicrovm` and waits for RUNNING (60 s; a VM that does not get there is
   terminated). Without an egress connector (S5) it needs an explicit, audited `--egress internet`;
-  `vm smoke` and `lab run` imply it because no credential ever enters those VMs.
+  `vm smoke` and `lab run` imply it for the VMs they start without a credential. Those that deliver
+  one (`vm smoke --exec --with-credential`, the S7 probes `fd-delivery` and `init-budget`) start a
+  vpc VM: a credential never enters an internet one.
 - `--workspace PATH` holds `state/workspaces/<slug>.lock` until the VM is RUNNING and reuses the
   workspace's VM when its image, egress and shell setting match and enough wall time is left;
   `[vm] max_concurrent` is counted across workspaces (ListMicrovms ∪ the registry) under
@@ -434,7 +466,8 @@ the shim's `/agent` WebSocket through the MicroVM endpoint (`wss://<endpoint>/ag
 60-minute `Port(8080)` token). stdin, stdout and stderr cross as raw byte chunks of at most 64 KiB (text,
 or base64 when not UTF-8): no lines on the wire, so binary output and a 20 MiB line arrive byte-exact.
 The exit status is the command's own (128 + N for a signal); ai-env's own failures keep 7/8/9 with an
-`ai-env:` line, the only way to tell them from a remote 7, 8 or 9.
+`ai-env:` line, the only way to tell them from a remote 7, 8 or 9 (from S7 a credentialed `claude` whose
+token Anthropic refuses ends with 5 and such a line too: Credentials).
 
 - **Sessions outlive sockets.** The VM numbers every stdout chunk and keeps it until the Mac acks it
   (an 8 MiB credit window: a reader that stops reading pauses the command, nothing is dropped); stderr
@@ -508,7 +541,8 @@ The exit status is the command's own (128 + N for a signal); ai-env's own failur
   loss, the guest clock after a 15-minute suspension, and whether the agent reaches anything privileged
   in the VM (`guarded`, `exposed:<port>`, or `gap:<checks>` when a check could not run; IMDS, the
   setuid inventory and the platform shell's listener in the note). Ctrl-C during `lab run` still
-  terminates every VM the probe started, then exits 3.
+  terminates every VM the probe started, then exits 3 (from S7 SIGTERM and SIGHUP do the same, then
+  exit 143).
 
 ```sh
 make test-docker               # + the agent in Docker: uid 1000, NO_NEW_PRIVS, groups, the sweep, the peer guard, /validate V6, and the real `vm exec` on the built image through the fake endpoint
@@ -520,6 +554,145 @@ ai-env vm exec ID -- claude --version
 Debug builds also honour `AI_ENV_BRIDGE_LAB_AGENT_ADDR=127.0.0.1:<port>` together with the fake API:
 `/agent` is then dialed in plain `ws://` at that loopback address (the tests' fake endpoint). Without the
 fake API, or for any other address, it is refused; release builds compile it out.
+
+### Credentials (stage S7)
+
+`ai-env creds setup-token` seals a Claude setup-token (what `claude setup-token` prints after a browser
+login: an inference-only OAuth token, valid for a year) into `credentials/setup-token.env`, an ai-env
+container sealed to `[creds].key` like the runtime key. It asks for the token hidden on the terminal
+(`--stdin` takes exactly one line from a pipe and refuses a terminal; `--from-env` reads
+`CLAUDE_CODE_OAUTH_TOKEN`); an API key (`sk-ant-api…`) is refused. What is recorded about the token, in
+the container's metadata line and the audit row, is its kind prefix (`sk-ant-oat01-`), its length and
+when it was sealed, never more. Clear the terminal's scrollback and the clipboard afterwards (after
+`--stdin` also any file or shell history line that held it; after `--from-env`, unset the variable
+instead): the command reminds you.
+
+- **One Touch ID per credentialed command.** In container mode the runtime key is a Touch ID of its
+  own. `creds setup-token` and `creds aws-set` therefore also write `credentials/combined.env`: both
+  credentials in one container, recording the hashes of the two files it was built from, so `vm exec
+  --with-credential` unseals both with one prompt. When either source changes, `combined.env` is out of
+  date and is not used: the token costs a second prompt until `creds setup-token` (or `make
+  runtime-key`) rebuilds it. A rebuild removes the old one before its prompt, so one that cannot finish
+  (that prompt dismissed or interrupted) never leaves a copy of a replaced credential behind; a
+  dismissed one says so. One whose source another command sealed anew (or forgot) while it waited
+  builds none from what that replaced, and says so. The seal itself still succeeds (`creds setup-token`
+  writes its audit row and its `setup-token-prefix` probe row before the rebuild). `--credential-file`
+  always costs two Touch IDs: the runtime key, then the file's own container. `creds status` shows
+  which case holds, without a prompt.
+- **Delivery.** `ai-env vm exec ID --with-credential -- claude -p '…'` runs the credential gate before
+  the token is sent. Without a Touch ID: a vpc VM whose egress echo gate passed, not a `--shell` VM, a
+  shim that can hold a credential (once its `/health` was read), a passing `egress check` recorded for
+  its image version within 7 days, an accepted dns-path verdict. Then the runtime key's Touch ID, and
+  with it the live checks: the egress echo, an ingress of exactly `HTTP_INGRESS`, the connector's facts
+  and the image build. With a current `combined.env` that one Touch ID has unsealed the token as well,
+  before any AWS call: it waits in ai-env's memory for the gate and is dropped unsent when the gate
+  refuses. Without one, the token is unsealed only once the gate passed, and only when the VM does not
+  hold it already. It goes in its own `credential` frame to the VM's shim, which keeps one copy in
+  memory and hands it to the command on fd 3 (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3`; claude reads
+  it once), or, under `[creds] deliver = "env"`, in its environment (see Environment delivery). A later
+  credentialed command on the same VM finds that copy: the token is not sent again, and without a
+  current `combined.env` not even unsealed. `vm warm WORKSPACE` delivers ahead of time (starting the
+  workspace's VM with vpc egress if it has none), so a later command needs no Touch ID for the token.
+  `vm warm`, `vm smoke --with-credential` and the credential probes (`lab run fd-delivery` and
+  `init-budget`) choose their VM after the Touch ID: before it they check the gate's local half on the
+  row a run would make, for the image version the configuration names (for `active`, the one
+  `state/infra.toml` records), then the chosen VM's own row; with a current `combined.env` the token
+  waits in memory while that VM starts (and, in the smoke, through its exec steps).
+  `--credential-file PATH` gives one command the token sealed in another container; it is never kept
+  on the VM.
+- **How long the VM holds it.** The shim's copy is dropped on `/suspend` (before the platform takes its
+  snapshot), on `/resume` as a backstop, on `/terminate` and at shutdown. A command already running keeps
+  its own copy, and so does any snapshot taken while it ran: until the VM is TERMINATED it may hold the
+  token, whatever `has_credentials` says. `creds status` and `creds forget` list the VMs that may hold
+  it: each VM is recorded before the token leaves the Mac for it, as is any VM later seen holding it. A
+  VM registry row they cannot read is listed too, as one whose VM may hold it (`[!! ]` in
+  `creds status`, `holders_unreadable` in its `--json`), so the list never reads none while one exists.
+  `vm health ID --detail` shows the shim's copy (name, seal and time, never the value) and how many
+  running commands were handed a secret; a command whose leader exited while a process of its group
+  runs on still counts, and reads `group` under ALIVE.
+- **Copies that are not zeroized.** ai-env's own copies of the token (the unsealed plaintext, the
+  `credential` frame's value, the shim's cache) are zeroized when dropped. Some are freed without that,
+  as the design accepts: the frame's JSON text, the WebSocket and TLS buffers it passes through
+  (tungstenite, rustls), serde's scratch space and the kernel's pages of the fd-3 pipe (with environment
+  delivery also the environment the shim, or the wrapper, builds for the child). They stay in freed
+  memory of the Mac process and of the shim until reused: one more reason a snapshot taken after a
+  delivery may hold the token until the VM is TERMINATED.
+- **Environment delivery.** `[creds] deliver = "env"` both allows `--deliver env` and makes it the
+  default: `vm exec --with-credential` or `--credential-file` without `--deliver`,
+  `vm smoke --with-credential` and the wrapper's `local-scratch` child then get the token in their
+  environment, readable by everything they start; `--deliver fd` still puts it on fd 3. Without that
+  setting (the default is `deliver = "fd"`) fd delivery is the default and `--deliver env` is refused
+  (exit 9).
+- **A rejected token.** `vm exec --with-credential` watches only a command whose program (the first word
+  after `--`, by its basename) is `claude` itself: one started through `sh -c`, `env` or another wrapper
+  is not watched, its status passes through and nothing is recorded. Two signs count as Anthropic
+  refusing the token (HTTP 401). With `--output-format stream-json --verbose` claude prints its own
+  retries: at the third `api_retry` with HTTP 401 since its last answer (a model reply or an answered
+  turn starts the count again; a reply over 64 KiB is read by its first 512 bytes), `vm exec` stops
+  the command (TERM to its group, KILL 3 s later, then `detach final`), then checks for at most 5 s
+  that it and its process group are gone, naming `ai-env vm terminate` when it cannot see that. In any
+  output format, a line that starts with claude's 401 message (or an error result saying it),
+  followed by exit 1, counts too; that command has ended by itself, and nothing is stopped. Either way
+  `vm exec` exits 5 with an `ai-env:` line saying what it saw, written last on stderr (a later
+  SIGTERM, SIGHUP or Ctrl-C keeps the 5; a SIGTERM or SIGHUP during the stop, or any of the three
+  during the check, leaves the last output at most 3 s, as a stop does; a stderr nobody reads gets no
+  line), audits `credential_rejected`, and never starts the command again; `vm smoke --with-credential`
+  records a refused `claude -p` the same way. The rejection is recorded against the sealed container:
+  credentialed commands then refuse at once (exit 5, no Touch ID) until `creds setup-token` seals a new
+  token. That record is `state/creds.toml`: one that cannot be read refuses them too (exit 5, naming
+  it, since which tokens were refused is then unknown), the wrapper's `local-scratch` child then runs
+  logged out, and `creds status` and doctor show it as a warning. A refused `--credential-file`
+  container with a seal of its own blocks only itself; the sealed setup-token is not affected. A byte
+  copy of `setup-token.env` has the sealed token's seal, so its refusal is the sealed token's.
+- **Forgetting.** `creds forget` lists, then with `--yes` deletes, `setup-token.env`, `combined.env` and
+  their backups; `aws.env` stays. It cannot revoke the token: revoke it on Anthropic's side (which page
+  does it is not recorded here yet: Mike fills it in from part B), in the Anthropic account that
+  created it. Terminate the VMs it names.
+- **Touch ID and signals.** Every Touch ID of a credentialed command (the runtime key's too) shows a
+  countdown and has a deadline, `[creds].unseal_timeout_s` (default 60, 10–600). A dismissed dialog is 3;
+  no answer in time is 5 (`vm exec` names `vm warm` for the token's own prompt, which a warm VM spares);
+  Ctrl-C while waiting closes the dialog (130), SIGTERM or SIGHUP too (143). From the first Touch ID on, a
+  credentialed `vm exec` (until its command starts) or `vm warm` (to its end) stops at once on any of
+  the three, with an `ai-env:` line. `vm exec` then sends nothing. `vm warm` gives its delivery up where
+  it stands: the VM is recorded as one that may hold the token before the token leaves, so the line
+  says whether it may, as `creds status` does. A `vm warm` stopped while its RunMicrovm is in flight
+  first looks for the VM that call may have started, saying so and for how long (up to 60 s; a second
+  stop gives the search up and keeps the pending row for `ai-env vm gc`), then names it. Once past
+  their first Touch ID, `vm smoke` and the live `lab run` probes end the VMs they started and exit 3 on
+  Ctrl-C, 143 on SIGTERM or SIGHUP; the Mac probes `touchid-gui` and `oauth-t1` keep the signals'
+  default actions. A signal ignored when ai-env started stays ignored.
+- **Exit codes.** A gate refusal is 9, naming its condition and what to run. So is a gate pass older
+  than 90 s by the time the VM was ready: nothing was sent (on a re-send, nothing more); run the command
+  again. A VM whose shim cannot hold a credential (an image before S7) is 7, and never costs the token a
+  Touch ID of its own. No sealed token, or a rejected one, is 5; so is a token sealed anew while the
+  command ran (nothing is sent; one sealed anew before its own unseal is refused before its Touch ID),
+  and a VM that no longer holds the token when none is in hand (its line says to run the command
+  again). A shim whose credential cache stays closed after the VM runs again
+  is 8. An unseal only checks that `[creds].key` exists (else 4): a key that did not seal the file
+  fails inside age (1), and a credentials file that is not an ai-env container is 5, not 6; `creds status`
+  names the key that opens each file. `lab run fd-delivery` and `init-budget` keep the exit code of a
+  credential step that fails, as `vm exec` would (a missing key stays 4).
+
+```sh
+ai-env creds setup-token        # paste what `claude setup-token` printed (hidden); rebuilds combined.env with one Touch ID
+ai-env creds status             # what is sealed, combined.env against its sources, the credential gate's local preconditions,
+                                #   a recorded refusal, the VMs that may hold the token: no Touch ID
+ai-env vm exec ID --with-credential -- claude -p 'Reply with exactly OK' --output-format json
+ai-env vm warm ~/work/project   # deliver ahead of time
+make test-claude                # T7.2 on this Mac: the token drives the real claude (real model requests)
+make s7-smoke                   # three `vm smoke --egress vpc --exec --with-credential` passes: exec_ok and cred_ok true
+make test-aws CRED=1            # + live_credential_*: two answers with one delivery, a garbage token refused (exit 5), no internet VM;
+                                #   Touch IDs: the test process's, one per answer, two for the garbage token's --credential-file (the runtime key, the file)
+```
+
+Debug builds also honour `AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS=<n>` here (the wrapper's knob of that
+name): every unseal a credentialed `vm` or `lab` command makes (the runtime key alone or with the
+token in `combined.env`, the setup-token, a `--credential-file`) then has n ms in place of
+`[creds].unseal_timeout_s`, so a test reaches the deadline in a second or two. Like the S4 knobs it
+is announced on stderr and marks the `--json` records (`"backend":"sdk+knobs"` against the real
+service, whose smoke budgets are then not judged); the Mac probes ignore it, the live Makefile
+targets drop it, and release builds compile it out.
+
 
 ### Access-control policies (`keygen --access-control`)
 

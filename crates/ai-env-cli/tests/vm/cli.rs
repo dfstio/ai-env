@@ -73,7 +73,7 @@ impl World {
             .stdin(Stdio::null());
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy().to_string();
-            if k.starts_with("AWS_") || k.starts_with("PULUMI_") || k.starts_with("AI_ENV_BRIDGE_LAB_") {
+            if k.starts_with("AWS_") || k.starts_with("PULUMI_") || k.starts_with("AI_ENV_BRIDGE_LAB_") || k.starts_with("CLAUDE_CODE_") {
                 c.env_remove(&k);
             }
         }
@@ -172,6 +172,7 @@ pub fn foreign_vm(n: u64, owner: Option<&str>, state: VmState, age_s: i64) -> (V
         run_hook_seen: true,
         uptime_s: 1,
         wire: None,
+        caps: vec![],
     });
     (vm, health)
 }
@@ -1022,6 +1023,22 @@ fn cli_run_retries_the_terminate_of_a_vm_that_failed_the_gate() {
     assert!(!stderr(&o).contains("may still be running"), "{}", stderr(&o));
     none_alive(&w, "the run's retry");
     assert_eq!(terminated_by(&w), ["policy"]);
+}
+
+/// The S7 runbook (B7, B9–B10) takes the VM id from `vm run --egress vpc
+/// --json` with `sed -n 's/^  "id": "\(microvm-[^"]*\)".*/\1/p'`: exactly one
+/// stdout line starts with two spaces and `"id": "microvm-` (the record's
+/// own; the row inside it is indented further), and it carries the id of the
+/// VM the run started.
+#[test]
+fn cli_run_json_has_the_one_id_line_the_runbook_reads() {
+    let w = World::new("");
+    with_connector(&w);
+    let o = run_pinned(&w, &["vm", "run", "--egress", "vpc", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let id = json(&o)["id"].as_str().unwrap().to_string();
+    let lines: Vec<String> = stdout(&o).lines().filter(|l| l.starts_with("  \"id\": \"microvm-")).map(str::to_string).collect();
+    assert_eq!(lines, [format!("  \"id\": \"{id}\",")], "{}", stdout(&o));
 }
 
 #[test]

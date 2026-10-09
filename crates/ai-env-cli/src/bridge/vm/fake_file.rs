@@ -67,7 +67,12 @@ impl MicrovmApi for FileFakeMicrovmApi {
     }
 
     async fn get(&self, id: &str) -> Result<VmInfo, BridgeError> {
-        self.with(|s| s.get(id))
+        let (park, answer) = self.with(|s| Ok((std::mem::take(&mut s.park_get_ms), s.get(id))))?;
+        if park > 0 {
+            // A process test's slow GetMicrovm (`FakeState::park_get_ms`): the answer comes late, awaited unlocked.
+            tokio::time::sleep(std::time::Duration::from_millis(park)).await;
+        }
+        answer
     }
 
     async fn suspend(&self, id: &str) -> Result<(), BridgeError> {

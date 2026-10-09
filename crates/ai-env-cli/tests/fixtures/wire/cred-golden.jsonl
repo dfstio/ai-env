@@ -1,0 +1,22 @@
+{"dir":"mac","frame":{"v":1,"t":"hello","session_token":"golden-session-token","client":{"name":"ai-env","version":"0.1.0","host":"mike@mbp"},"resume":[],"idle_s":90}}
+{"dir":"vm","frame":{"v":1,"t":"hello_ok","wire":1,"shim_version":"0.1.0","claude_version":"2.1.288","microvm_id":"microvm-00000000-0000-4000-8000-000000000001","image_version":"6.0","boot_nonce":"00112233445566778899aabbccddeeff","owner":"mike@mbp","has_credentials":false,"uptime_s":1,"run_hook_seen":true,"spawns":[],"resumed":[],"caps":["credential_cache"]}}
+{"dir":"mac","frame":{"v":1,"t":"credential","name":"CLAUDE_CODE_OAUTH_TOKEN","secret":"golden-placeholder-not-a-token","tag":"0123456789abcdef"}}
+{"dir":"mac","frame":{"v":1,"t":"spawn","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193","argv":["claude","-p","Reply OK"],"env":{},"deliver_secret":"fd","credential":"CLAUDE_CODE_OAUTH_TOKEN"}}
+{"dir":"vm","frame":{"v":1,"t":"credential_ok","name":"CLAUDE_CODE_OAUTH_TOKEN","cached":true,"tag":"0123456789abcdef"}}
+{"dir":"vm","frame":{"v":1,"t":"spawned","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193","pid":4242,"pgid":4242,"claude_version":"2.1.288"}}
+{"dir":"mac","frame":{"v":1,"t":"stdin_eof","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193","seq":0}}
+{"dir":"vm","frame":{"v":1,"t":"stdout","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193","seq":1,"text":"OK\n"}}
+{"dir":"vm","frame":{"v":1,"t":"exit","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193","seq":2,"code":0,"signal":null,"stderr_dropped":0,"stdout_truncated":false}}
+{"dir":"mac","frame":{"v":1,"t":"ack","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193","seq":2,"err_seq":0}}
+{"dir":"mac","frame":{"v":1,"t":"hello","session_token":"golden-session-token","client":{"name":"ai-env","version":"0.1.0","host":"mike@mbp"},"resume":[],"idle_s":90}}
+{"dir":"vm","frame":{"v":1,"t":"hello_ok","wire":1,"shim_version":"0.1.0","claude_version":"2.1.288","microvm_id":"microvm-00000000-0000-4000-8000-000000000001","image_version":"6.0","boot_nonce":"00112233445566778899aabbccddeeff","owner":"mike@mbp","has_credentials":true,"uptime_s":30,"run_hook_seen":true,"spawns":[],"resumed":[],"caps":["credential_cache"],"credential_name":"CLAUDE_CODE_OAUTH_TOKEN","credential_tag":"0123456789abcdef","credential_at":"2026-10-08T10:00:01Z"}}
+{"dir":"mac","frame":{"v":1,"t":"spawn","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708194","argv":["claude","-p","Reply OK"],"env":{},"deliver_secret":"fd","credential":"CLAUDE_CODE_OAUTH_TOKEN"}}
+{"dir":"vm","frame":{"v":1,"t":"spawned","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708194","pid":4250,"pgid":4250,"claude_version":"2.1.288"}}
+{"dir":"mac","frame":{"v":1,"t":"hello","session_token":"golden-session-token","client":{"name":"ai-env","version":"0.1.0","host":"mike@mbp"},"resume":[],"idle_s":90}}
+{"dir":"vm","frame":{"v":1,"t":"hello_ok","wire":1,"shim_version":"0.1.0","claude_version":"2.1.288","microvm_id":"microvm-00000000-0000-4000-8000-000000000001","image_version":"6.0","boot_nonce":"00112233445566778899aabbccddeeff","owner":"mike@mbp","has_credentials":true,"uptime_s":31,"run_hook_seen":true,"spawns":[{"spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708194","argv0":"claude","pid":4250,"pgid":4250,"alive":true,"attached":true,"out_seq":0,"out_from":1,"err_seq":0,"in_seq":0,"stdin_closed":false}],"resumed":[],"caps":["credential_cache"],"credential_name":"CLAUDE_CODE_OAUTH_TOKEN","credential_tag":"0123456789abcdef","credential_at":"2026-10-08T10:00:01Z","credential_holders":1}}
+{"dir":"mac","frame":{"v":1,"t":"credential_forget","name":"CLAUDE_CODE_OAUTH_TOKEN"}}
+{"dir":"vm","frame":{"v":1,"t":"credential_ok","name":"CLAUDE_CODE_OAUTH_TOKEN","cached":false}}
+{"dir":"mac","frame":{"v":1,"t":"spawn","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708195","argv":["claude","-p","Reply OK"],"env":{},"deliver_secret":"fd","credential":"CLAUDE_CODE_OAUTH_TOKEN"}}
+{"dir":"vm","frame":{"v":1,"t":"spawn_err","spawn_id":"0192f1e0-2b7c-7c3a-9a1b-4d5e6f708195","code":"no_credential","message":"no credential CLAUDE_CODE_OAUTH_TOKEN is cached on this VM (none was delivered since it last ran)"}}
+{"dir":"mac","frame":{"v":1,"t":"credential","name":"CLAUDE_CODE_OAUTH_TOKEN","secret":"golden-placeholder-not-a-token","tag":"0123456789abcdef"}}
+{"dir":"vm","frame":{"v":1,"t":"credential_err","name":"CLAUDE_CODE_OAUTH_TOKEN","code":"suspended","message":"the VM is suspending: nothing is cached until it resumes"}}

@@ -63,6 +63,33 @@ pub fn probe_verdicts(row: &serde_json::Value) -> Vec<ProbeRow> {
     vec![row("entrypoint", entrypoint, "claude-vscode"), row("stock-ext-oauth", if has_oauth { "present" } else { "absent" }.to_string(), "absent")]
 }
 
+/// The second half of `stock-ext-oauth` (S7): the class a piped session
+/// recorded for the pump's synthetic `oauth_token_refresh` (the end row's
+/// `synthetic_oauth:` part, with `AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS`; the
+/// stock extension answers `error(getOAuthToken callback is not provided.)`).
+/// Only rows of extension version `ext` count — the verdicts' own `ext` —
+/// so an answer the previous extension gave is never stamped with the new
+/// version. The newest answer wins over a newer `none` or `unsent`: Cursor's
+/// config probe may close before the extension answers.
+fn synthetic_answer(rows: &[serde_json::Value], ext: Option<&str>) -> Option<String> {
+    let classes: Vec<&str> = rows
+        .iter()
+        .rev()
+        .filter(|r| r.get("ext").and_then(|e| e.as_str()) == ext)
+        .filter_map(|r| r.get("note")?.as_str()?.split("; ").find_map(|p| p.strip_prefix("synthetic_oauth:")))
+        .collect();
+    classes.iter().find(|c| !matches!(**c, "none" | "unsent")).or_else(|| classes.first()).map(|c| (*c).to_string())
+}
+
+/// Put the synthetic answer, when the census holds one for the verdicts'
+/// extension version, in the `stock-ext-oauth` row's note.
+fn note_synthetic_answer(verdicts: &mut [ProbeRow], rows: &[serde_json::Value]) {
+    let Some(row) = verdicts.iter_mut().find(|v| v.probe == "stock-ext-oauth") else { return };
+    if let Some(class) = synthetic_answer(rows, row.ext.as_deref()) {
+        row.note = Some(format!("the extension answered the synthetic oauth_token_refresh with {class}"));
+    }
+}
+
 /// A census row that went through the session classifier: `route` is
 /// `remote`, or the reason is one of the two demoted session reasons.
 fn is_session_row(row: &serde_json::Value) -> bool {
@@ -70,20 +97,25 @@ fn is_session_row(row: &serde_json::Value) -> bool {
     field("route") == "remote" || matches!(field("reason"), "outside_roots" | "unconfigured")
 }
 
-/// `--record-probes`: derive the verdicts from the newest session row, print
-/// a diff against the last recorded row of each probe, append every row to
+/// `--record-probes`: derive the verdicts from the newest session row (and,
+/// S7, the synthetic answer into `stock-ext-oauth`'s note), print a diff
+/// against the last recorded row of each probe, append every row to
 /// `lab/probes.jsonl` (one `write` each), and fail AFTER writing when any
 /// verdict differs from its expectation.
 fn record_probes(paths: &Paths, rows: &[serde_json::Value]) -> Result<()> {
     let Some(session) = rows.iter().rev().find(|r| is_session_row(r)) else {
         bail!("no session row in the census yet — open a Cursor chat with the wrapper installed");
     };
-    let verdicts = probe_verdicts(session);
+    let mut verdicts = probe_verdicts(session);
+    note_synthetic_answer(&mut verdicts, rows);
     let probes_path = paths.probes();
     let mut failed = Vec::new();
     for v in &verdicts {
         let holds = append_row(&probes_path, v)?;
         outln!("recorded {}={} (expected {})", v.probe, v.verdict, v.expected);
+        if let Some(note) = &v.note {
+            outln!("  {note}");
+        }
         if !holds {
             failed.push(format!("{}={} (expected {})", v.probe, v.verdict, v.expected));
         }
@@ -836,6 +868,46 @@ mod tests {
         assert_eq!(rows[1].verdict, "absent");
         assert!(is_session_row(&bare));
         assert!(!is_session_row(&serde_json::json!({"route": "local", "reason": "subcommand:auth"})));
+    }
+
+    /// The synthetic answer of the pump's lab knob lands in `stock-ext-oauth`'s
+    /// note: the newest answer of the verdicts' extension version, never
+    /// shadowed by a newer `none` or `unsent` (a config probe), never one an
+    /// older extension gave, and no note when no session recorded one.
+    #[test]
+    fn the_synthetic_answer_goes_into_the_stock_ext_oauth_note() {
+        let end_of = |ext: &str, note: &str| serde_json::json!({"ext": ext, "route": "local", "reason": "unconfigured", "end": 2, "note": note});
+        // session_row's extension version.
+        let end = |note: &str| end_of("2.1.278", note);
+        let stock = "error(getOAuthToken callback is not provided.)";
+        let rows = vec![
+            end("mode:local-child; end:eof; synthetic_oauth:null"),
+            end(&format!("mode:local-child; end:eof; synthetic_oauth:{stock}")),
+            end("mode:local-child; end:eof; synthetic_oauth:none"),
+            end("mode:local-child; end:eof; synthetic_oauth:unsent"),
+            end("mode:local-child; end:eof"),
+        ];
+        let ext = Some("2.1.278");
+        assert_eq!(synthetic_answer(&rows, ext).as_deref(), Some(stock));
+        let mut verdicts = probe_verdicts(&session_row(&[]));
+        note_synthetic_answer(&mut verdicts, &rows);
+        assert_eq!(verdicts[0].note, None, "entrypoint is untouched");
+        assert_eq!(verdicts[1].note.as_deref(), Some(format!("the extension answered the synthetic oauth_token_refresh with {stock}").as_str()));
+        assert_eq!(verdicts[1].verdict, "absent", "the verdict is still the env names'");
+        // Rows are oldest first: with only `none` (row 2) and `unsent` (row 3), the newest is `unsent`.
+        assert_eq!(synthetic_answer(&rows[2..], ext).as_deref(), Some("unsent"), "only none or unsent: the newest");
+        assert_eq!(synthetic_answer(&rows[4..], ext), None);
+        let mut verdicts = probe_verdicts(&session_row(&[]));
+        note_synthetic_answer(&mut verdicts, &rows[4..]);
+        assert!(verdicts.iter().all(|v| v.note.is_none()));
+        // An answer from another extension version, however new, is not this version's.
+        let mut mixed = rows.clone();
+        mixed.push(end_of("2.1.290", "mode:local-child; end:eof; synthetic_oauth:token(len=108)"));
+        assert_eq!(synthetic_answer(&mixed, ext).as_deref(), Some(stock));
+        let only_other = vec![end_of("2.1.270", &format!("mode:local-child; end:eof; synthetic_oauth:{stock}"))];
+        let mut verdicts = probe_verdicts(&session_row(&[]));
+        note_synthetic_answer(&mut verdicts, &only_other);
+        assert!(verdicts.iter().all(|v| v.note.is_none()), "no note from an older extension's answer");
     }
 
     #[test]

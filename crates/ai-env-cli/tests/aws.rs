@@ -545,15 +545,21 @@ impl Drop for VmGuard {
         let (creds, paths) = (self.creds.clone(), self.paths.clone());
         let _ = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async {
+            // Every VM first, then what happened: with the terminal gone (SIGHUP) a print panics, and must not cost a VM.
+            let said = rt.block_on(async {
                 let api = connect(&creds).await;
+                let mut said = Vec::new();
                 for id in ids {
-                    match vmrun::terminate_and_record(&api, &paths, &id, "test", Some(Poll::SETTLE)).await {
-                        Ok(_) => eprintln!("guard: terminated {id}"),
-                        Err(e) => eprintln!("guard: could not terminate {id}: {} — run: ai-env vm terminate {id} --yes (the test's row lived in a temp root)", no_account(&e.to_string())),
-                    }
+                    said.push(match vmrun::terminate_and_record(&api, &paths, &id, "test", Some(Poll::SETTLE)).await {
+                        Ok(_) => format!("guard: terminated {id}"),
+                        Err(e) => format!("guard: could not terminate {id}: {} — run: ai-env vm terminate {id} --yes (the test's row lived in a temp root)", no_account(&e.to_string())),
+                    });
                 }
+                said
             });
+            for line in said {
+                eprintln!("{line}");
+            }
         })
         .join();
     }
@@ -1329,4 +1335,465 @@ async fn live_credential_gate_passes_for_a_fresh_vpc_vm() {
     // The same VM recorded as --shell is refused by its row alone, whatever the live reads say.
     let shell = VmRow { shell: true, ..row.clone() };
     assert_eq!(credential_gate(&live.cfg, &shell, &echo, &verified, &dns, now).unwrap_err().condition, "shell_row");
+}
+
+// ---- S7: credentials end to end (AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1: make test-aws CRED=1) ----
+//
+// These run the real `ai-env vm exec` (this Mac's keystore, PATH and Touch
+// ID: one for the test process (`LIVE_CREDS`), then one per command with a
+// current combined.env, two for `--credential-file` (the runtime key, then
+// the file)) against a VM the test started in its temp bridge root, which
+// also holds copies of the sealed setup-token, combined.env, the egress
+// records and the dns-path rows.
+// They make real model requests with the operator's token (T7.4), and refuse
+// a garbage token the test seals itself to this Mac's recipients without a
+// prompt (T7.5).
+//
+// Their VMs may hold the operator's real token, and every record of that
+// (rows, audit) lives only in the temporary root, unknown to `creds status`
+// and `creds forget`: so each test terminates its VMs on every path its
+// process lives through. A failed assertion or a command past its limit
+// unwinds into the `VmGuard`; a Ctrl-C, SIGTERM or SIGHUP (the terminal
+// closed) is caught once ([`Interrupts`]), stops the running command, fails
+// the test the same way and then ends the run, and no print on that way
+// out can stop it (the terminal may be gone). Each test names the VM that
+// may receive the token, with the command that ends it should the process
+// die first (a second signal, SIGKILL). Each ends with a sweep for a token
+// in the clear.
+
+use ai_env_cli::wire::redact::scrub;
+use std::io::Write as _;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
+
+/// The signal that interrupted a credential test (0: none).
+static CRED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Only records the signal: an atomic store is async-signal-safe.
+extern "C" fn record_cred_signal(sig: libc::c_int) {
+    CRED_SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// SIGINT, SIGTERM and SIGHUP caught once while a credential test runs (the
+/// next one takes its default course at once; one ignored at the start
+/// stays ignored), the previous dispositions restored when it drops. Made
+/// first in each test, so it drops last: after the `VmGuard` has terminated
+/// the test's VMs, a caught signal ends the run instead of moving on to the
+/// next test.
+struct Interrupts {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Interrupts {
+    fn catch() -> Interrupts {
+        CRED_SIGNAL.store(0, Ordering::SeqCst);
+        let mut caught = Interrupts { previous: Vec::new() };
+        let handler: extern "C" fn(libc::c_int) = record_cred_signal;
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: sigaction(2) on zeroed (valid) structs; the handler only stores to an atomic.
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &raw mut old) != 0 || old.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = handler as libc::sighandler_t;
+                act.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
+                libc::sigemptyset(&raw mut act.sa_mask);
+                if libc::sigaction(sig, &raw const act, std::ptr::null_mut()) == 0 {
+                    caught.previous.push((sig, old));
+                }
+            }
+        }
+        caught
+    }
+}
+
+impl Drop for Interrupts {
+    fn drop(&mut self) {
+        for (sig, old) in self.previous.drain(..).rev() {
+            // SAFETY: restores a disposition sigaction(2) itself returned.
+            unsafe { libc::sigaction(sig, &raw const old, std::ptr::null_mut()) };
+        }
+        let sig = CRED_SIGNAL.load(Ordering::SeqCst);
+        if sig != 0 {
+            // Not `eprintln!`: after a SIGHUP every write to the terminal fails, and a panic here would skip the exit.
+            let _ = writeln!(std::io::stderr(), "interrupted by signal {sig}: the guard has dealt with the test's VMs (above); ending the run");
+            std::process::exit(128 + sig);
+        }
+    }
+}
+
+/// Offline: while [`Interrupts`] lives, a SIGINT, a SIGTERM and a SIGHUP are
+/// each recorded instead of ending the process, once (the next would take
+/// its default course), and its drop puts the previous dispositions back. A
+/// signal this run ignores stays ignored and is skipped.
+#[test]
+fn interrupts_record_each_signal_once_and_restore_the_dispositions() {
+    // SAFETY: sigaction(2) only reads into a zeroed (valid) struct here.
+    let disposition = |sig: libc::c_int| unsafe {
+        let mut now: libc::sigaction = std::mem::zeroed();
+        assert_eq!(libc::sigaction(sig, std::ptr::null(), &raw mut now), 0);
+        now.sa_sigaction
+    };
+    let sigs = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+    let before = sigs.map(disposition);
+    let handler: extern "C" fn(libc::c_int) = record_cred_signal;
+    let caught = Interrupts::catch();
+    // Each raised only when caught (else it would end this run) and taken back at once, so neither the drop nor a failed assertion ends this run; judged after the drop.
+    let mut seen = Vec::new();
+    for (sig, was) in sigs.into_iter().zip(before) {
+        if was == libc::SIG_IGN {
+            eprintln!("skipped: signal {sig} is ignored in this run, so it stays ignored");
+            continue;
+        }
+        let installed = disposition(sig) == handler as libc::sighandler_t;
+        // SAFETY: raise(3) runs the handler on this thread; it only stores to an atomic.
+        let raised = installed && unsafe { libc::raise(sig) } == 0;
+        seen.push((sig, raised, CRED_SIGNAL.swap(0, Ordering::SeqCst), disposition(sig)));
+    }
+    drop(caught);
+    for (sig, raised, recorded, after_one) in seen {
+        assert!(raised, "signal {sig} is caught (else raising it would end this run)");
+        assert_eq!(recorded, sig, "signal {sig} recorded, and the process lives on");
+        assert_eq!(after_one, libc::SIG_DFL, "a second signal {sig} takes its default course");
+    }
+    assert_eq!(sigs.map(disposition), before, "the previous dispositions are back");
+}
+
+/// Offline: a caught signal ends the run with 128 + its number even when
+/// nothing can be printed any more (the terminal closed: SIGHUP, then every
+/// write to it fails), where a panicking print would let the next test
+/// start. The test runs itself again as a child, with `--nocapture` and a
+/// stderr nobody reads; the child raises SIGHUP under [`Interrupts`] and
+/// drops it.
+#[test]
+fn a_caught_signal_ends_the_run_with_nowhere_to_print() {
+    use std::os::unix::process::CommandExt as _;
+    const TEST: &str = "a_caught_signal_ends_the_run_with_nowhere_to_print";
+    // The child's mark: its parent's pid, which no exported value matches.
+    const PARENT: &str = "AI_ENV_TEST_INTERRUPTS_PARENT";
+    if std::env::var(PARENT).ok() == Some(std::os::unix::process::parent_id().to_string()) {
+        let caught = Interrupts::catch();
+        // SAFETY: raise(3) runs the handler on this thread; it only stores to an atomic.
+        unsafe { libc::raise(libc::SIGHUP) };
+        drop(caught);
+        panic!("the run went on after a caught SIGHUP");
+    }
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args([TEST, "--exact", "--nocapture", "--test-threads=1"]).env(PARENT, std::process::id().to_string()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(writer);
+    // As from a terminal: a `nohup` above this run would hand SIGHUP down ignored.
+    // SAFETY: runs in the forked child before exec; signal(2) is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child run of {TEST} hung");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(128 + libc::SIGHUP), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+/// How long one `ai-env` command of a credential test may run (a Touch ID,
+/// and a model's answer through the VM).
+const CRED_COMMAND_LIMIT: Duration = Duration::from_secs(300);
+
+/// Says which VM may now receive the operator's token, and what ends it if
+/// this process dies before its `VmGuard` can (its row lives only in the
+/// test's temporary root).
+fn announce_holder(test: &str, id: &str) {
+    eprintln!("{test}: {id} may receive the setup-token; the guard terminates it when the test ends, and if this run is killed first: ai-env vm terminate {id} --yes");
+}
+
+/// How many setup-tokens in the clear `hay` holds: `sk-ant-oat01-` then 20
+/// or more token characters, the part B leak grep (B15). The test cannot
+/// know the sealed token's value without one more Touch ID, so its shape is
+/// what is looked for.
+fn token_shapes(hay: &[u8]) -> usize {
+    const MARK: &[u8] = b"sk-ant-oat01-";
+    let tail = |c: &u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-');
+    (0..hay.len().saturating_sub(MARK.len() + 19)).filter(|&i| hay[i..].starts_with(MARK) && hay[i + MARK.len()..i + MARK.len() + 20].iter().all(tail)).count()
+}
+
+/// Offline: the credential tests' sweep counts what part B's leak grep
+/// matches (the kind marker and 20 or more token characters) and nothing
+/// less: the setup-token's metadata line and a masked token are no tokens.
+#[test]
+fn token_shapes_are_what_the_leak_grep_matches() {
+    let tok = format!("sk-ant-oat01-{}", "Xy9_".repeat(5));
+    assert_eq!(token_shapes(format!("a {tok} b").as_bytes()), 1);
+    assert_eq!(token_shapes(tok.as_bytes()), 1, "at the very end");
+    assert_eq!(token_shapes(&tok.as_bytes()[..tok.len() - 1]), 0, "19 characters");
+    assert_eq!(token_shapes(format!("{tok}\n{tok}").as_bytes()), 2);
+    assert_eq!(token_shapes(b"# ai-env-meta: kind=setup-token prefix=sk-ant-oat01- chars=108"), 0);
+    assert_eq!(token_shapes(b"sk-ant-[redacted:len=108]"), 0);
+}
+
+/// No setup-token in the clear in any output of the test's commands nor in
+/// any file under its temporary root (rows, audit, the CLI log, state), and
+/// none of `known` (values the test made itself), whole or as a 16-byte
+/// piece. Places are named, never values.
+fn sweep_live(live: &Live, outs: &[&std::process::Output], known: &[&str]) {
+    let check = |hay: &[u8], place: &str| {
+        assert_eq!(token_shapes(hay), 0, "setup-tokens in the clear in {place}");
+        for value in known {
+            let v = value.as_bytes();
+            let w = v.len().min(16);
+            assert!(!v.windows(w).any(|piece| hay.windows(w).any(|h| h == piece)), "a value the test made (or a 16-byte piece of it) in {place}");
+        }
+    };
+    for (n, out) in outs.iter().enumerate() {
+        check(&out.stdout, &format!("the stdout of command {}", n + 1));
+        check(&out.stderr, &format!("the stderr of command {}", n + 1));
+    }
+    let mut dirs = vec![live.paths.root.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.is_dir() {
+                dirs.push(path);
+            } else if meta.is_file() {
+                check(&std::fs::read(&path).unwrap_or_default(), &path.display().to_string());
+            }
+        }
+    }
+}
+
+fn cred_live() -> bool {
+    if !live() {
+        return false;
+    }
+    if std::env::var("AI_ENV_CREDENTIAL_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_CREDENTIAL_TESTS=1 too (make test-aws CRED=1) to deliver the setup-token");
+    false
+}
+
+/// [`live_world`] with the credential files and the gate's records copied too.
+fn cred_world() -> Live {
+    let live = live_world();
+    let real = Paths::resolve().expect("the real bridge root");
+    for (from, to) in [
+        (real.setup_token_env(), live.paths.setup_token_env()),
+        (real.combined_env(), live.paths.combined_env()),
+        (real.egress_verified(), live.paths.egress_verified()),
+        (real.probes(), live.paths.probes()),
+    ] {
+        if from.exists() {
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+    assert!(live.paths.setup_token_env().exists(), "no sealed setup-token: run `ai-env creds setup-token` first");
+    live
+}
+
+/// `ai-env <args>` in the test's bridge root, as the operator runs it (lab
+/// knobs removed); its stderr is shown with tokens and account ids masked.
+/// Bounded and interruptible: past [`CRED_COMMAND_LIMIT`], or 10 s after a
+/// caught signal (one from the terminal reached the command too), it gets
+/// SIGTERM (it closes a Touch ID dialog and detaches on its own), then
+/// SIGKILL 5 s later, and the test fails, so its `VmGuard` acts.
+fn ai_env_live(live: &Live, args: &[&str]) -> std::process::Output {
+    use std::io::Read;
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let what = args.iter().take(3).copied().collect::<Vec<_>>().join(" ");
+    assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "interrupted before ai-env {what}");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env"));
+    cmd.args(args).env("AI_ENV_BRIDGE_DIR", &live.paths.root).env_remove("AI_ENV_BRIDGE_CONFIG").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy().to_string();
+        if k.starts_with("AI_ENV_BRIDGE_LAB_") || k.starts_with("CLAUDE_CODE_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let started = Instant::now();
+    let mut child = cmd.spawn().expect("ai-env runs");
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let (mut asked, mut termed) = (None::<Instant>, None::<Instant>);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for ai-env") {
+            break status;
+        }
+        if asked.is_none() && CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
+            asked = Some(Instant::now());
+        }
+        let due = started.elapsed() > CRED_COMMAND_LIMIT || asked.is_some_and(|t| t.elapsed() > Duration::from_secs(10));
+        match termed {
+            None if due => {
+                // SAFETY: kill(2) on our own child, which try_wait just saw running (not reaped).
+                unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGTERM) };
+                termed = Some(Instant::now());
+            }
+            Some(t) if t.elapsed() > Duration::from_secs(5) => {
+                let _ = child.kill();
+                break child.wait().expect("reap ai-env");
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let out = std::process::Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() };
+    eprintln!("ai-env {what}: exit {:?} in {} ms\n{}", out.status.code(), started.elapsed().as_millis(), no_account(&scrub(&String::from_utf8_lossy(&out.stderr))));
+    let sig = CRED_SIGNAL.load(Ordering::SeqCst);
+    assert_eq!(sig, 0, "interrupted during ai-env {what}: the guard terminates the test's VMs");
+    assert!(termed.is_none(), "ai-env {what} ran past {CRED_COMMAND_LIMIT:?} and was stopped");
+    out
+}
+
+fn vpc_plan(live: &Live) -> RunPlan {
+    let flags = RunFlags { max_duration_s: Some(900), label: Some("test-cred".into()), egress: Some(vmrun::Egress::Vpc), purpose: "test", ..RunFlags::default() };
+    RunPlan::from_cfg(&live.cfg, &flags).unwrap_or_else(|e| panic!("vpc run plan: {e}"))
+}
+
+/// The JSON result `claude -p --output-format json` printed: (is_error, result).
+fn claude_json(stdout: &[u8]) -> (Option<bool>, String) {
+    let v: serde_json::Value = String::from_utf8_lossy(stdout).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or_default();
+    (v["is_error"].as_bool(), v["result"].as_str().unwrap_or_default().to_string())
+}
+
+/// T7.4: a credentialed `claude -p` answers OK through the endpoint and the
+/// proxy, twice on one VM, with one delivery: the second finds the VM's copy.
+/// No token in the clear in either command's output or the temporary root.
+#[tokio::test]
+#[ignore = "live, starts a MicroVM and asks the model: AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+async fn live_credential_claude_answers_ok_twice_with_one_delivery() {
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = cred_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    let (row, _, running_ms) = start(&api, &ep, &live, &guard, &vpc_plan(&live)).await;
+    eprintln!("live_credential_claude_answers_ok_twice_with_one_delivery: {} RUNNING after {running_ms} ms", row.id);
+    announce_holder("live_credential_claude_answers_ok_twice_with_one_delivery", &row.id);
+    let ask = ["vm", "exec", row.id.as_str(), "--with-credential", "--", "claude", "-p", "Reply with exactly OK", "--output-format", "json"];
+    let mut outs = Vec::new();
+    for round in 1..=2 {
+        let out = ai_env_live(&live, &ask);
+        assert_eq!(out.status.code(), Some(0), "round {round}");
+        let (is_error, result) = claude_json(&out.stdout);
+        assert_eq!(is_error, Some(false), "round {round}");
+        assert!(result.trim().trim_end_matches('.').eq_ignore_ascii_case("ok"), "round {round}: the answer is {} characters", result.len());
+        outs.push(out);
+    }
+    let rows = ai_env_cli::bridge::audit::read_rows(&live.paths.audit(), None).unwrap();
+    let delivered = rows.iter().filter(|r| r["event"] == "credential_deliver" && r["detail"]["id"] == row.id).count();
+    assert_eq!(delivered, 1, "one delivery for two commands");
+    sweep_live(&live, &outs.iter().collect::<Vec<_>>(), &[]);
+}
+
+/// T7.5, the GO/NO-GO rehearsal: a garbage token (sealed here to this Mac's
+/// recipients, no prompt) given with `--credential-file` is refused by
+/// Anthropic: exit 5 (stopped at the third retry 401, or ended by itself
+/// with its 401 text), no claude left on the VM. Neither the garbage token
+/// nor any other is in the clear in the output or the temporary root. What
+/// B7 keeps for part B is printed first, before any assertion, so a run whose
+/// words the watch missed still shows them (B14 repeats B7 here): claude's
+/// `api_retry` lines and its last `result` line, scrubbed and cut to 400
+/// characters each, and how the `credential_rejected` rows say it was seen.
+#[tokio::test]
+#[ignore = "live, starts a MicroVM: AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+async fn live_credential_garbage_token_is_refused_with_exit_5() {
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = cred_world();
+    let key = live.cfg.creds.key.clone();
+    let store = ai_env_cli::store::Keystore::resolve(None).expect("keystore");
+    let garbage = format!("sk-ant-oat01-{}", "Gq7_".repeat(24));
+    let sealed = ai_env_cli::age_cmd::AgeTool::probe().unwrap().encrypt(&store.recipients_path(&key), format!("CLAUDE_CODE_OAUTH_TOKEN={garbage}\n").as_bytes()).unwrap();
+    let file = live.paths.root.join("garbage.env");
+    std::fs::write(&file, ai_env_cli::container::write(&sealed)).unwrap();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    let (row, _, _) = start(&api, &ep, &live, &guard, &vpc_plan(&live)).await;
+    announce_holder("live_credential_garbage_token_is_refused_with_exit_5", &row.id);
+    let path = file.display().to_string();
+    let out = ai_env_live(&live, &["vm", "exec", row.id.as_str(), "--credential-file", &path, "--", "claude", "-p", "Reply OK", "--output-format", "stream-json", "--verbose"]);
+    // B7's kept output, first: claude's own words to a refused token, even from a run an assertion below fails.
+    let rows = ai_env_cli::bridge::audit::read_rows(&live.paths.audit(), None).unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    let cut = |line: &str| scrub(line).chars().take(400).collect::<String>();
+    for line in said.lines().filter(|l| l.contains("\"api_retry\"")) {
+        eprintln!("live_credential_garbage_token_is_refused_with_exit_5: api_retry line: {}", cut(line));
+    }
+    if let Some(last) = said.lines().rev().find(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["type"] == "result")) {
+        eprintln!("live_credential_garbage_token_is_refused_with_exit_5: last result line: {}", cut(last));
+    }
+    let how: Vec<&str> = rows.iter().filter(|r| r["event"] == "credential_rejected").filter_map(|r| r["detail"]["how"].as_str()).collect();
+    eprintln!("live_credential_garbage_token_is_refused_with_exit_5: exit {:?}, credential_rejected how={}", out.status.code(), how.join(","));
+    assert_eq!(out.status.code(), Some(5), "a refused token is exit 5");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Anthropic refused the delivered setup-token"), "the ai-env line names the refusal");
+    // No claude left: /health/detail with the row's session token (no Touch ID).
+    let bearer = Secret::new(row.session_token.clone().unwrap_or_default());
+    let token = ai_env_cli::bridge::vm::token::mint_internal(&api, &live.paths, &row.id).await.unwrap();
+    let t = std::time::Instant::now();
+    loop {
+        let detail = ep.get_health_detail(&row.endpoint.clone().unwrap_or_default(), &token, &bearer).await.unwrap().detail.unwrap();
+        if detail.spawns.iter().all(|s| !s.status.alive) {
+            eprintln!("live_credential_garbage_token_is_refused_with_exit_5: no live spawn after {} ms", t.elapsed().as_millis());
+            break;
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "a claude still runs 5 s after the refusal");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(rows.iter().any(|r| r["event"] == "credential_rejected"), "audited");
+    sweep_live(&live, &[&out], &[&garbage[13..]]);
+}
+
+/// T7.5: a credential never enters a VM with internet egress: exit 9 from
+/// the local half of the gate, before any Touch ID. Shown by what an unseal
+/// leaves, not by the time taken (the operator may answer a prompt quickly):
+/// no `credential_unseal` audit row, no countdown and no runtime-key line.
+#[tokio::test]
+#[ignore = "live, starts a MicroVM: AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+async fn live_credential_never_enters_an_internet_vm() {
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = cred_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    let flags = RunFlags { max_duration_s: Some(900), label: Some("test-cred".into()), egress: Some(vmrun::Egress::Internet), purpose: "test", ..RunFlags::default() };
+    let plan = RunPlan::from_cfg(&live.cfg, &flags).unwrap();
+    let (row, _, _) = start(&api, &ep, &live, &guard, &plan).await;
+    let t = Instant::now();
+    let out = ai_env_live(&live, &["vm", "exec", row.id.as_str(), "--with-credential", "--", "true"]);
+    assert_eq!(out.status.code(), Some(9));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not vpc"));
+    let rows = ai_env_cli::bridge::audit::read_rows(&live.paths.audit(), None).unwrap();
+    assert!(!rows.iter().any(|r| r["event"] == "credential_unseal"), "no unseal was audited");
+    assert!(!err.contains("waiting for Touch ID") && !err.contains("ai-env: runtime key") && !err.contains("ai-env: profile "), "refused before any Touch ID: no countdown and no runtime-key line");
+    assert!(t.elapsed() < Duration::from_secs(10), "refused at once");
+    sweep_live(&live, &[&out], &[]);
 }

@@ -11,13 +11,19 @@
 //! Why a budget at all: S8's wrapper must answer Cursor within its initialize
 //! window, and `vm exec` must not hang a terminal for ever. Exit codes follow
 //! D8 and `errors.rs`: a dismissed dialog is 3 (cancelled), a budget that ran
-//! out is 5 (auth unavailable, with `ai-env vm warm` as the way to pay the
-//! Touch ID ahead of time), a missing plugin 5, the wrong key 4.
+//! out is 5 (auth unavailable, with the caller's advice:
+//! [`UnsealJob::with_deadline`]), a missing plugin 5. A key the keystore does
+//! not hold is 4, decided before any job starts (`select::resolve_for_decrypt`);
+//! an identity `age` itself cannot use fails with age's own error, exit 1.
 //!
 //! Signals stay the caller's: `process_group(0)` means a terminal Ctrl-C no
-//! longer reaches `age`, so whoever owns SIGINT calls [`UnsealJob::kill`].
+//! longer reaches `age`, so whoever owns SIGINT ends the job
+//! ([`UnsealJob::kill`], or the `stop` of [`UnsealJob::wait_or`]). Giving up
+//! any other way closes the dialog too: dropping the job, even before its
+//! child exists, or dropping the future of `wait_or`.
 use crate::age_cmd::{AgeKill, AgeTool};
 use crate::errors::{CliError, Result};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -34,6 +40,17 @@ pub const UNSEAL_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 10..=600;
 const COUNTDOWN_EVERY_S: u64 = 10;
 /// …and once more when this little is left, whatever the interval.
 const COUNTDOWN_LAST_S: u64 = 5;
+/// What the deadline's failure advises unless its caller knows more ([`UnsealJob::with_deadline`]).
+const DEADLINE_ADVICE: &str = "answer the dialog sooner or raise [creds].unseal_timeout_s";
+/// How the deadline's failure begins ([`is_deadline`]).
+const DEADLINE_HEAD: &str = "no Touch ID within ";
+
+/// Whether `e` is an unseal's deadline (exit 5): a caller adds what only it
+/// knows, as `vm exec` does with the way to pay the token's prompt ahead of time.
+#[must_use]
+pub fn is_deadline(e: &CliError) -> bool {
+    matches!(e, CliError::AuthUnavailable(m) if m.starts_with(DEADLINE_HEAD))
+}
 
 /// Should the countdown speak after `elapsed_s` of `budget_s`? At once, every
 /// [`COUNTDOWN_EVERY_S`], and at [`COUNTDOWN_LAST_S`] left — never twice for
@@ -68,6 +85,8 @@ pub struct UnsealJob {
     killed: std::sync::atomic::AtomicBool,
     /// Who speaks in the countdown: `ai-env`, or `ai-env-claude` for S8's wrapper.
     prefix: &'static str,
+    /// What the deadline's failure says after `what` stayed sealed.
+    advice: String,
 }
 
 impl UnsealJob {
@@ -87,12 +106,13 @@ impl UnsealJob {
             // The receiver is gone when the caller gave up; the plaintext is dropped (and zeroized) here.
             let _ = tx.send(out);
         });
+        let advice = DEADLINE_ADVICE.to_string();
         if let Err(e) = spawned {
             let (tx2, rx2) = mpsc::channel();
             let _ = tx2.send(Err(CliError::Msg(format!("cannot start the unseal thread: {e}"))));
-            return UnsealJob { rx: rx2, kill, started: Instant::now(), budget, what, killed: std::sync::atomic::AtomicBool::new(false), prefix: "ai-env" };
+            return UnsealJob { rx: rx2, kill, started: Instant::now(), budget, what, killed: std::sync::atomic::AtomicBool::new(false), prefix: "ai-env", advice };
         }
-        UnsealJob { rx, kill, started: Instant::now(), budget, what, killed: std::sync::atomic::AtomicBool::new(false), prefix: "ai-env" }
+        UnsealJob { rx, kill, started: Instant::now(), budget, what, killed: std::sync::atomic::AtomicBool::new(false), prefix: "ai-env", advice }
     }
 
     /// Speak as `prefix` in the countdown (S8's wrapper passes `ai-env-claude`).
@@ -102,12 +122,29 @@ impl UnsealJob {
         self
     }
 
+    /// What the deadline's failure says after `what` stayed sealed, in
+    /// place of "answer the dialog sooner or raise [creds].unseal_timeout_s":
+    /// only the caller knows whether anything was started yet, and whether
+    /// `ai-env vm warm` could have spared this prompt.
+    #[must_use]
+    pub fn with_deadline(mut self, advice: impl Into<String>) -> UnsealJob {
+        self.advice = advice.into();
+        self
+    }
+
     /// End the decrypt now, closing the Touch ID dialog with it. For the
     /// caller's own signal handling; [`Self::wait`] does it on the deadline and
     /// `Drop` on abandonment.
     pub fn kill(&self) {
         self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
         self.kill.kill_group();
+    }
+
+    /// A handle that ends this job's decrypt from elsewhere: an async
+    /// caller's signal handler, while [`Self::wait`] runs on a blocking thread.
+    #[must_use]
+    pub fn kill_handle(&self) -> Arc<AgeKill> {
+        Arc::clone(&self.kill)
     }
 
     /// Is the decrypt still running?
@@ -124,9 +161,9 @@ impl UnsealJob {
 
     /// Wait for the plaintext, calling `tick` with each countdown line
     /// ([`countdown_at`]). On the budget the group is killed and the failure is
-    /// exit 5, naming `ai-env vm warm` as the way to pay the Touch ID ahead of
-    /// time; a dismissed dialog is exit 3 and a wrong key exit 4, as
-    /// `age_cmd::classify_failure` decides.
+    /// exit 5 with the caller's advice ([`Self::with_deadline`]); a dismissed
+    /// dialog is exit 3, a missing plugin 5 and any other age failure exit 1
+    /// with age's own error, as `age_cmd::classify_failure` decides.
     pub fn wait(self, mut tick: impl FnMut(&str)) -> Result<Zeroizing<Vec<u8>>> {
         let budget_s = self.budget.as_secs().max(1);
         let mut said: Option<u64> = None;
@@ -146,10 +183,7 @@ impl UnsealJob {
                     return done;
                 }
                 self.kill();
-                return Err(CliError::AuthUnavailable(format!(
-                    "no Touch ID within {budget_s} s, so {} was not unsealed and nothing was started (answer the dialog sooner, raise [creds].unseal_timeout_s, or run `ai-env vm warm <workspace>` to pay it ahead of time)",
-                    self.what
-                )));
+                return Err(CliError::AuthUnavailable(format!("{DEADLINE_HEAD}{budget_s} s, so {} stayed sealed ({})", self.what, self.advice)));
             }
             match self.rx.recv_timeout(left.min(Duration::from_secs(1))) {
                 Ok(done) => return done,
@@ -162,13 +196,56 @@ impl UnsealJob {
             }
         }
     }
+
+    /// [`Self::wait`] for an async caller: on the blocking pool, its countdown
+    /// on stderr, ended early by `stop` (the group killed first, then `Err`
+    /// with what `stop` gave; a stop that comes with the answer wins, and the
+    /// plaintext is dropped). Dropping the returned future kills the group as
+    /// well: the job itself lives on the blocking thread, so an outer select
+    /// or timeout that gave up on its caller would otherwise leave the dialog
+    /// up until the budget ran out, and a runtime's shutdown waiting for it.
+    pub async fn wait_or<S>(self, stop: impl Future<Output = S>) -> std::result::Result<Result<Zeroizing<Vec<u8>>>, S> {
+        let close = CloseOnDrop(Some(self.kill_handle()));
+        let what = self.what.clone();
+        let wait = tokio::task::spawn_blocking(move || self.wait(crate::bridge::signals::say));
+        tokio::pin!(stop);
+        let out = tokio::select! {
+            biased;
+            s = &mut stop => Err(s),
+            joined = wait => Ok(joined.unwrap_or_else(|e| Err(CliError::Msg(format!("the unseal of {what} failed: {e}"))))),
+        };
+        if out.is_ok() {
+            // Answered: the child is reaped, nothing is left to close.
+            close.disarm();
+        }
+        out
+    }
+}
+
+/// Kills one job's decrypt group when dropped while armed ([`UnsealJob::wait_or`]).
+struct CloseOnDrop(Option<Arc<AgeKill>>);
+
+impl CloseOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(kill) = self.0.take() {
+            kill.kill_group();
+        }
+    }
 }
 
 impl Drop for UnsealJob {
     fn drop(&mut self) {
-        // An abandoned job must not leave a dialog on screen; a job that already killed its own decrypt
-        // does not run the ladder again.
-        if !self.killed.load(std::sync::atomic::Ordering::SeqCst) && self.kill.running() {
+        // An abandoned job must not leave a dialog on screen, even one dropped before its child exists:
+        // `kill_group` marks the kill first, so that decrypt never spawns, or is killed as it is adopted
+        // (with no child, or one already reaped, it returns at once). A job that already killed its own
+        // decrypt does not run the ladder again.
+        if !self.killed.load(std::sync::atomic::Ordering::SeqCst) {
             self.kill.kill_group();
         }
     }
@@ -257,18 +334,22 @@ mod tests {
         assert!(left[0].contains("6 s left"), "{lines:?}");
     }
 
+    /// The deadline is exit 5 and kills the whole group; its failure says what
+    /// stayed sealed and only the caller's advice ([`UnsealJob::with_deadline`]):
+    /// no fixed `vm warm` hint, no fixed "nothing was started" (M55).
     #[test]
     fn an_unanswered_prompt_hits_the_budget_exits_5_and_the_group_is_killed() {
         let dir = tempfile::tempdir().unwrap();
         let (pidfile, log) = (dir.path().join("age.pid"), dir.path().join("age.log"));
         let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1"), ("FAKE_AGE_PIDFILE", &pidfile.display().to_string()), ("FAKE_AGE_LOG", &log.display().to_string())]);
         let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
-        let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(2), "the setup token");
+        let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(2), "the setup token").with_deadline("nothing was delivered; THE CALLER'S ADVICE");
         let mut lines = Vec::new();
         let e = job.wait(|l| lines.push(l.to_string())).unwrap_err();
         assert_eq!(e.exit_code(), 5, "{e}");
-        let text = e.to_string();
-        assert!(text.contains("no Touch ID within 2 s") && text.contains("the setup token") && text.contains("nothing was started") && text.contains("ai-env vm warm"), "{text}");
+        assert!(is_deadline(&e), "{e}");
+        assert_eq!(e.to_string(), "no Touch ID within 2 s, so the setup token stayed sealed (nothing was delivered; THE CALLER'S ADVICE)");
+        assert!(!is_deadline(&CliError::AuthUnavailable("the sealed token was refused".into())) && !is_deadline(&CliError::Msg(e.to_string())), "only an exit-5 deadline");
         assert!(!lines.is_empty(), "it said it was waiting: {lines:?}");
         // The group signal reached the child: its own TERM trap logged it, and the pid is gone.
         let logged = std::fs::read_to_string(&log).unwrap_or_default();
@@ -284,6 +365,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("the decrypting process group {pgid} is still alive");
+    }
+
+    /// Without a caller's advice the deadline says only what is true wherever
+    /// an unseal runs: answer sooner, or allow more time.
+    #[test]
+    fn the_default_deadline_advice_names_no_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1")]);
+        let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
+        let e = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(1), "the runtime key").wait(|_| {}).unwrap_err();
+        assert_eq!(e.to_string(), "no Touch ID within 1 s, so the runtime key stayed sealed (answer the dialog sooner or raise [creds].unseal_timeout_s)");
     }
 
     #[test]
@@ -347,12 +439,8 @@ mod tests {
         let (identity, ct) = sealed(&age, dir.path(), b"ABANDONED\n");
         let pid = {
             let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(30), "the test container");
-            let mut spun = 0_u32;
-            while !pidfile.exists() && spun < 500 {
-                std::thread::sleep(Duration::from_millis(10));
-                spun += 1;
-            }
-            let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+            // Its pid once written: the file exists, empty, before the pid is in it.
+            let pid = decrypt_group(&pidfile);
             drop(job);
             pid
         };
@@ -364,5 +452,96 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("the abandoned decrypt {pid} is still alive");
+    }
+
+    /// The process group the fake's hanging decrypt wrote to `pidfile` (it is
+    /// the group's leader), once written (within 5 s): the shell creates the
+    /// file before it writes the pid, so an empty read is waited past.
+    fn decrypt_group(pidfile: &std::path::Path) -> i32 {
+        for _ in 0..250 {
+            if let Some(pgid) = std::fs::read_to_string(pidfile).ok().and_then(|t| t.trim().parse().ok()) {
+                return pgid;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the fake decrypt never started");
+    }
+
+    /// Whether group `pgid` is gone within 2 s; one still alive is killed
+    /// here, so a failing test leaves no fake dialog behind.
+    fn group_ends(pgid: i32) -> bool {
+        for _ in 0..100 {
+            // SAFETY: a plain existence check; signal 0 sends nothing.
+            if unsafe { libc::killpg(pgid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: the test's own fake decrypt group, still alive.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        false
+    }
+
+    /// A job dropped before its child exists cancels it (M43): the decrypt
+    /// never spawns, or is killed as it is adopted, so no dialog appears that
+    /// nobody waits for. The drop comes microseconds after the start, before
+    /// the thread could spawn and adopt the hanging fake.
+    #[test]
+    fn a_job_dropped_before_its_child_exists_leaves_no_decrypt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pidfile, log) = (dir.path().join("age.pid"), dir.path().join("age.log"));
+        let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1"), ("FAKE_AGE_PIDFILE", &pidfile.display().to_string()), ("FAKE_AGE_LOG", &log.display().to_string())]);
+        let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
+        drop(UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(30), "the setup token"));
+        std::thread::sleep(Duration::from_millis(1500));
+        if let Some(pgid) = std::fs::read_to_string(&pidfile).ok().and_then(|t| t.trim().parse::<i32>().ok()) {
+            assert!(group_ends(pgid), "a job dropped before its child existed left decrypt group {pgid} running");
+        }
+    }
+
+    /// Dropping the future of [`UnsealJob::wait_or`] closes the dialog (M8):
+    /// an outer select or timeout that gives up on its caller kills the group
+    /// at once, never at the budget, and the runtime then shuts down without
+    /// waiting for the blocking thread.
+    #[test]
+    fn a_dropped_async_wait_closes_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("age.pid");
+        let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1"), ("FAKE_AGE_PIDFILE", &pidfile.display().to_string())]);
+        let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
+        let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(30), "the setup token");
+        let pgid = decrypt_group(&pidfile);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let given_up = rt.block_on(async { tokio::time::timeout(Duration::from_millis(300), job.wait_or(std::future::pending::<()>())).await });
+        assert!(given_up.is_err(), "the wait was given up by the timeout");
+        assert!(group_ends(pgid), "the dropped wait left decrypt group {pgid} on screen");
+        let t = Instant::now();
+        drop(rt);
+        assert!(t.elapsed() < Duration::from_secs(3), "the runtime's shutdown waited {:?} for the blocking wait", t.elapsed());
+    }
+
+    /// `stop` ends the wait early: the group is killed first, and `Err` carries
+    /// what `stop` gave (the caller's signal), never a plaintext.
+    #[test]
+    fn a_stop_ends_the_async_wait_and_kills_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("age.pid");
+        let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1"), ("FAKE_AGE_PIDFILE", &pidfile.display().to_string())]);
+        let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
+        let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(30), "the setup token");
+        let pgid = decrypt_group(&pidfile);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stopped = rt.block_on(job.wait_or(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            130
+        }));
+        assert_eq!(stopped.err(), Some(130));
+        assert!(group_ends(pgid), "the stop left decrypt group {pgid} running");
+        // Answered before any stop: the plaintext.
+        let other = tempfile::tempdir().unwrap();
+        let age = fake_age(other.path(), &[]);
+        let (identity, ct) = sealed(&age, other.path(), b"ANSWERED\n");
+        let answered = rt.block_on(UnsealJob::start(age, identity, ct, Duration::from_secs(30), "the setup token").wait_or(std::future::pending::<i32>()));
+        assert_eq!(&answered.ok().unwrap().unwrap()[..], b"ANSWERED\n");
     }
 }

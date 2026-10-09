@@ -33,6 +33,7 @@ macro_rules! errln {
 pub mod agent;
 pub mod auth;
 pub mod code;
+pub mod credential;
 pub mod health;
 pub mod hooks;
 pub mod init;
@@ -308,7 +309,8 @@ async fn stop_on_signal_or_orphan(state: Arc<health::ShimState>, stop: tokio::sy
         }
     };
     errln!("ai-env: shim stopping ({why})");
-    state.set_draining();
+    // First: the cached credential goes, and none is accepted from here on (S7).
+    hooks::begin_stop(&state, "stop");
     // Upgraded sockets are not tracked by axum's graceful shutdown: close them,
     // then stop every spawn's process group, before the servers end.
     state.agents.close_all(crate::wire::frame::CLOSE_GOING_AWAY, "stopping").await;

@@ -494,6 +494,8 @@ fn record_health(paths: &Paths, id: &str, h: &Health) {
                 row.claude_version.clone_from(&h.claude_version);
             }
             row.shim_version = Some(h.shim_version.clone());
+            // S7: what this shim can do (empty: an S6 shim, which cannot hold a credential).
+            row.caps = Some(h.caps.clone());
         })?;
         Ok(())
     };
@@ -559,6 +561,7 @@ mod tests {
             run_hook_seen: true,
             uptime_s: 1,
             wire: None,
+            caps: vec![],
         }
     }
 
@@ -669,6 +672,7 @@ mod tests {
             clock: None,
             listeners: vec![],
             listeners_omitted: 0,
+            credential: Default::default(),
         }
     }
 
@@ -813,9 +817,23 @@ mod tests {
         assert_eq!(row.boot_nonce, h.boot_nonce);
         assert_eq!(row.claude_version.as_deref(), Some("2.1.284"));
         assert_eq!(row.shim_version.as_deref(), Some("0.1.0"));
+        assert_eq!(row.caps, Some(vec![]), "the fake answers as an S6 shim by default");
         let exp = *row.token_expiries.get("8080").expect("the internal token's expiry is recorded");
         assert!(exp >= unix_now() + 290);
         assert_eq!(api.calls()[1..3], [Call::Get(id.clone()), Call::Token { id: id.clone(), minutes: 5, port: 8080 }], "GetMicrovm first, then one 5-minute Port(8080) token");
+    }
+
+    /// S7: the caps an S7 shim reports are recorded, so `vm exec
+    /// --with-credential` can refuse an older image before any Touch ID.
+    #[tokio::test]
+    async fn health_records_the_shims_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let (api, id) = running().await;
+        api.state().health_caps = vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.to_string()];
+        write_row(&p, &VmRow { id: id.clone(), status: RowStatus::Running, client_token: "01926f2e-0000-7000-8000-0000000000b2".into(), ..VmRow::default() }).unwrap();
+        read_health(&api, &api, &p, &id, fast()).await.unwrap();
+        assert_eq!(read_row(&p, &id).unwrap().unwrap().caps, Some(vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.to_string()]));
     }
 
     #[tokio::test]

@@ -1130,7 +1130,7 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
         stdout(&out)
     };
     let ai_env = "cargo +1.98.1 run -q -p ai-env-cli --bin ai-env --";
-    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR";
+    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS";
     let probe_cli = format!("{lab_unset} AI_ENV_CLI='{ai_env}'");
     let cases: Vec<(&str, Vec<String>)> = vec![
         ("connector-status", vec!["/bin/bash infra/scripts/ops.sh connector-status".into()]),
@@ -1153,6 +1153,19 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
                 ">> target/s6/smoke.jsonl".into(),
             ],
         ),
+        (
+            "s7-smoke",
+            vec![
+                format!("{lab_unset} {ai_env} vm smoke --egress vpc --exec --with-credential --max-duration 900 --json"),
+                "grep -q '\"backend\":\"sdk\"'".into(),
+                "grep -q '\"egress_ok\":true'".into(),
+                "grep -q '\"exec_ok\":true'".into(),
+                "grep -q '\"cred_ok\":true'".into(),
+                ">> target/s7/smoke.jsonl".into(),
+            ],
+        ),
+        ("test-claude", vec![format!("{lab_unset} AI_ENV_CLAUDE_TESTS=1 cargo +1.98.1 test -p ai-env-cli --features bridge --test claude_live -- --ignored --test-threads=1 --nocapture")]),
+        ("test-aws", vec![format!("{lab_unset} AI_ENV_AWS_TESTS=1 "), "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored --test-threads=1 --nocapture".into()]),
         (
             "test-egress",
             vec![
@@ -1186,6 +1199,8 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
     assert!(smoke.find("smoke.jsonl").unwrap() < smoke.find("egress_ok").unwrap(), "every record is kept, then judged (as s4-smoke): {smoke}");
     let smoke = dry(&["s6-smoke"], &[]);
     assert!(smoke.find("smoke.jsonl").unwrap() < smoke.find("exec_ok").unwrap(), "every record is kept, then judged (as s5-smoke): {smoke}");
+    let smoke = dry(&["s7-smoke"], &[]);
+    assert!(smoke.find("smoke.jsonl").unwrap() < smoke.find("\"backend\":\"sdk\"").unwrap(), "every record is kept before its first judge (as s6-smoke): {smoke}");
 
     // The switches count only on the command line.
     assert!(dry(&["proxy-stop", "YES=1"], &[]).contains(&format!("{ai_env} proxy stop --yes")));
@@ -1195,6 +1210,10 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
     let no_systemd = dry(&["test-proxy", "SYSTEMD=0"], &[]);
     assert!(no_systemd.contains("AI_ENV_PROXY_TESTS=1 cargo +1.98.1 test") && !no_systemd.contains("AI_ENV_PROXY_SYSTEMD"), "{no_systemd}");
     assert!(dry(&["test-proxy"], &[("SYSTEMD", "0")]).contains("AI_ENV_PROXY_SYSTEMD=1"), "SYSTEMD=0 in the environment is ignored");
+    // CRED=1 (S7) adds the live credential tests, whose Touch IDs and model requests a stray export must never start.
+    assert!(!dry(&["test-aws"], &[]).contains("AI_ENV_CREDENTIAL_TESTS"));
+    assert!(dry(&["test-aws", "CRED=1"], &[]).contains("AI_ENV_CREDENTIAL_TESTS=1 cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored"));
+    assert!(!dry(&["test-aws"], &[("CRED", "1")]).contains("AI_ENV_CREDENTIAL_TESTS"), "CRED=1 in the environment is ignored");
 
     // deploy: check-policies, one preview, the gate, then everything that was there, then the S5 steps.
     let text = dry(&["deploy"], &[]);
@@ -1888,6 +1907,42 @@ fn s6_smoke_wants_three_sdk_records_with_egress_and_exec_ok() {
     }
 }
 
+/// s7-smoke (T7.4's gate) runs the credentialed smoke three times and wants
+/// each record from the SDK backend with egress_ok, exec_ok and cred_ok true:
+/// a credential step that failed, or never ran (no cred_ok), stops it at that
+/// pass, and every record is kept before it is judged.
+#[test]
+fn s7_smoke_wants_three_sdk_records_with_exec_and_cred_ok() {
+    let record = |backend: &str, egress_ok: bool, exec_ok: bool, cred_ok: Option<bool>| {
+        let mut r = json!({"backend": backend, "id": "mvm-0123456789abcdef0", "image_version": "6", "egress_ok": egress_ok, "exec_ok": exec_ok});
+        if let Some(ok) = cred_ok {
+            r["cred_ok"] = json!(ok);
+        }
+        r.to_string()
+    };
+    let cases = [
+        ("three good passes", record("sdk", true, true, Some(true)), true, "s7-smoke: 3/3 ok (target/s7/smoke.jsonl)", 3),
+        ("cred_ok false", record("sdk", true, true, Some(false)), false, "s7-smoke: pass 1: cred_ok is not true", 1),
+        ("no cred_ok", record("sdk", true, true, None), false, "s7-smoke: pass 1: cred_ok is not true", 1),
+        ("exec_ok false", record("sdk", true, false, Some(true)), false, "s7-smoke: pass 1: exec_ok is not true", 1),
+        ("egress_ok false", record("sdk", false, true, Some(true)), false, "s7-smoke: pass 1: egress_ok is not true", 1),
+        ("the fake backend", record("fake", true, true, Some(true)), false, "s7-smoke: pass 1 did not use the SDK backend", 1),
+    ];
+    for (what, rec, ok, want, runs) in cases {
+        let t = tempfile::tempdir().unwrap();
+        let w = planted_repo(t.path(), true);
+        let bin = bin_with(t.path(), &[("ai-env.sh", "ai-env-stand-in")]);
+        let log = t.path().join("ai-env.log");
+        let out = make_in(t.path(), &bin, &w, &["s7-smoke"]).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).env("FAKE_AIENV_SMOKE", &rec).env("FAKE_AIENV_LOG", &log).bounded();
+        let text = all(&out);
+        assert_eq!(out.status.success(), ok, "{what}: {text}");
+        assert!(text.contains(want), "{what}: {text}");
+        let smokes = lines_of(&log).iter().filter(|l| l.starts_with("vm smoke --egress vpc --exec --with-credential --max-duration 900 --json [AI_ENV=unset]")).count();
+        assert_eq!(smokes, runs, "{what}: {:?}", lines_of(&log));
+        assert_eq!(lines_of(&w.join("target/s7/smoke.jsonl")), vec![rec.clone(); runs], "{what}: every record is kept");
+    }
+}
+
 /// `make s3-preflight PHASE=a` with the stateful aws (seeded by `files`, under
 /// `<tmp>/aws`) and the S3 fakes; its `[..]` rows.
 fn preflight_s5(t: &Path, files: &[(&str, &str)], envs: &[(&str, &str)]) -> (Output, Vec<String>) {
@@ -2092,32 +2147,34 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
 
 #[test]
 fn the_live_s5_targets_drop_every_lab_knob() {
-    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"), ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1"), ("AI_ENV_BRIDGE_LAB_AGENT_ADDR", "127.0.0.1:9")];
+    // S7 adds the wrapper's two knobs (the synthetic oauth_token_refresh, the unseal budget of local-scratch and of
+    // credentialed vm and lab commands).
+    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"), ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1"), ("AI_ENV_BRIDGE_LAB_AGENT_ADDR", "127.0.0.1:9"), ("AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS", "300"), ("AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS", "1500")];
     let t = tempfile::tempdir().unwrap();
     let w = planted_repo(t.path(), true);
     let bin = s5_bin(t.path());
     script(&bin.join("cargo"), CARGO_FAKE);
     seed_connector(t.path(), CONNECTOR, "ACTIVE");
     let stand_in = format!("AI_ENV={}", bin.join("ai-env-stand-in").display());
-    let record = json!({"backend": "sdk", "egress_ok": true, "exec_ok": true}).to_string();
+    let record = json!({"backend": "sdk", "egress_ok": true, "exec_ok": true, "cred_ok": true}).to_string();
     let run = |args: &[&str]| {
         let mut cmd = make_in(t.path(), &bin, &w, args);
         s5_env(&mut cmd, t.path()).arg(&stand_in).env("FAKE_AIENV_SMOKE", &record).envs(knobs).bounded()
     };
-    let live: [&[&str]; 8] = [&["s5-smoke"], &["s6-smoke"], &["test-egress"], &["connector-probe", "CONFIRM=create-probe-connector", "CONNECTOR_WAIT_POLL=1"], &["allowlist-reload"], &["proxy-stop"], &["proxy-start"], &["proxy-patch"]];
+    let live: [&[&str]; 11] = [&["s5-smoke"], &["s6-smoke"], &["s7-smoke"], &["test-egress"], &["test-claude"], &["test-aws", "CRED=1"], &["connector-probe", "CONFIRM=create-probe-connector", "CONNECTOR_WAIT_POLL=1"], &["allowlist-reload"], &["proxy-stop"], &["proxy-start"], &["proxy-patch"]];
     for args in live {
         let out = run(args);
         assert!(out.status.success(), "{args:?}: {}", all(&out));
     }
     let c = calls(t.path());
     let children: Vec<&String> = c.iter().filter(|l| l.contains("[AI_ENV=") || l.starts_with("cargo ")).collect();
-    assert_eq!(children.len(), 3 + 3 + 2 + 1 + 4, "three s5 and three s6 smokes, cargo and the removal, the probe's lab run, the four operator calls: {children:#?}");
+    assert_eq!(children.len(), 3 + 3 + 3 + 2 + 1 + 1 + 1 + 4, "three s5, s6 and s7 smokes, test-egress's cargo and removal, test-claude's and test-aws's cargo, the probe's lab run, the four operator calls: {children:#?}");
     assert!(children.iter().all(|l| !l.contains("[LAB=")), "a lab knob reached a live command: {children:#?}");
     // The control: a target that keeps the knobs hands them on, and the stand-in sees them.
     let out = run(&["check-base-image"]);
     assert!(out.status.success(), "{}", all(&out));
     let last = calls(t.path()).pop().unwrap();
-    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_ASSUME_TTY AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL]"), "{last}");
+    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_ASSUME_TTY AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS]"), "{last}");
 }
 
 #[test]

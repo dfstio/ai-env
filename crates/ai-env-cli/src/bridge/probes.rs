@@ -144,6 +144,8 @@ pub enum Source {
     AwsCli,
     /// A live pass, then a `--log FILE` pass that pairs the run reports.
     LiveThenLog,
+    /// This Mac only (S7): no VM, no AWS call, no runtime key.
+    Mac,
 }
 
 impl Source {
@@ -156,6 +158,7 @@ impl Source {
             Source::Live => "live",
             Source::AwsCli => "aws-cli",
             Source::LiveThenLog => "live+log",
+            Source::Mac => "mac",
         }
     }
 }
@@ -194,9 +197,9 @@ pub struct ProbeSpec {
 
 /// Every probe the stages record (plan §7), S1 and S3 included so `lab list`
 /// shows the whole picture.
-pub const CATALOG: [ProbeSpec; 21] = [
+pub const CATALOG: [ProbeSpec; 26] = [
     ProbeSpec { name: "entrypoint", stage: "S1", source: Source::Census, expect: Expect::Exact("claude-vscode"), recorded_by: "ai-env wrapper census --record-probes", what: "CLAUDE_CODE_ENTRYPOINT the extension sets for the wrapper" },
-    ProbeSpec { name: "stock-ext-oauth", stage: "S1", source: Source::Census, expect: Expect::Exact("absent"), recorded_by: "ai-env wrapper census --record-probes", what: "whether the stock extension advertises OAuth refresh" },
+    ProbeSpec { name: "stock-ext-oauth", stage: "S1", source: Source::Census, expect: Expect::Exact("absent"), recorded_by: "ai-env wrapper census --record-probes", what: "whether the stock extension advertises OAuth refresh (CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH among a session's environment names); S7's second half in the note: with the debug-build knob AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS the wrapper's pump sends the extension one oauth_token_refresh of its own once the session is initialized, the census end row records the class of the answer (synthetic_oauth:<class>; the stock extension answers error(getOAuthToken callback is not provided.)), and --record-probes puts it in this row's note" },
     ProbeSpec { name: "image-version-delete", stage: "S3", source: Source::Deploy, expect: Expect::Exact("kept"), recorded_by: "make deploy RECORD_PROBE=1", what: "whether an image update deletes earlier versions" },
     ProbeSpec { name: "hooks-port", stage: "S4", source: Source::Log, expect: Expect::Exact("9000"), recorded_by: "ai-env lab run hooks-port --log FILE", what: "the local port runtime hooks arrive on (= the configured hooks.port)" },
     ProbeSpec { name: "hooks-source-ip", stage: "S4", source: Source::Log, expect: Expect::Exact("loopback"), recorded_by: "ai-env lab run hooks-source-ip --log FILE", what: "where runtime hooks come from" },
@@ -221,6 +224,11 @@ pub const CATALOG: [ProbeSpec; 21] = [
     ProbeSpec { name: "reattach", stage: "S6", source: Source::Live, expect: Expect::Exact("no-loss-same-pid"), recorded_by: "ai-env lab run reattach", what: "a client-side cut mid-stream (stdin closed; the producer outlives the cut and the D22 ladder), then a reattach: no line lost or doubled, the same pid, the producer ran to its end (exit 0); a stale from_seq; a full window, a kill, then an attach (reattach ms in the note)" },
     ProbeSpec { name: "clock-after-resume", stage: "S6", source: Source::Live, expect: Expect::AnyOf(&["within-2s"]), recorded_by: "ai-env lab run clock-after-resume", what: "the guest clock against the Mac after at least 15 min suspended (vpc egress): within-2s, else the offset; the monotonic jump and the time to the first proxied success in the note" },
     ProbeSpec { name: "in-vm-firewall", stage: "S6", source: Source::Live, expect: Expect::Exact("guarded"), recorded_by: "ai-env lab run in-vm-firewall", what: "whether the agent uid can reach the VM's privileged listeners: forged hooks via 127.0.0.1 and the VM's own address (resume first, terminate last), the close-before-lookup trick, an RST-aborted GET /health via the VM's own address on 8080 (under agent_guard on the guard's refusal count must rise by two per connection; under log or off it is not judged), 8080/9418 judged by the guard mode in the note (agent_guard on: 403; tree B's log or off: GET /health may answer the public summary, a bearer path must answer 401 or 403), every listener the shim does not own dialed where it listens (8022 on a --shell VM), NoNewPrivs, setuid inventory, IMDS, nf_tables; the endpoint's bearer-less PUT /seed and /health/detail; guarded, exposed:<port>, or gap:<checks> when a check could not run (vm-address, listeners, rst-abort)" },
+    ProbeSpec { name: "fd-delivery", stage: "S7", source: Source::Live, expect: Expect::Exact("fd-honoured"), recorded_by: "ai-env lab run fd-delivery", what: "whether claude on the VM takes the setup-token from CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR, custody included: a spawn given the token on fd 3 (always fd, whatever [creds] deliver says) has none in its environ and reads it whole on fd 3 (byte count in the note); claude -p in stream-json host mode answers with the fd alone, and while it still runs a second spawn reads every environment the agent's uid can (claude's own and its children's) for the token's name or a value of its kind; then a suspend and a resume, after which /health/detail's has_credentials must read false. Only when claude did not answer with the fd alone does the probe ask once more, the same way (so the two differ in the delivery alone), with the token in that one claude's environment (whatever [creds] deliver says), to tell env-only apart, on the probe's own VM, which it terminates. fd-honoured, env-only (claude answered only with the token in its environment), fd-unread:<why>, kept-after-resume (the VM still held the token after the resume), claude-environ:<n> (n environment entries held it while claude ran with the fd), or gap:<checks> (fd-scan, claude-environ, has-credentials: a custody check that could not be read is no pass; an unread fd-scan, the first spawn's environ count, also leaves claude's answers unjudged)" },
+    ProbeSpec { name: "oauth-t1", stage: "S7", source: Source::Mac, expect: Expect::Recorded, recorded_by: "ai-env lab run oauth-t1", what: "the real CLI's OAuth refresh on this Mac (stream-json host mode with the extension's entrypoint, CLAUDE_CODE_ENTRYPOINT=claude-vscode, and CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH=1, which the stock extension never sets and Tier B (S12) adds: the CLI asks its host for a refresh only with both; a refused token): when it asks for a refresh, what a valid, a null and no reply do and how long each takes, and whether CLAUDE_CODE_OAUTH_401_WAIT_MS is honoured (a null reply with it at 5000: the result at least that much later); with no reply its stdin stays open, so an exit would be its own: none is expected, and that run ends at its 150 s bound, since CLAUDE_CODE_AUTH_FAIL_EXIT_MS acts only for a remote child (CLAUDE_CODE_REMOTE_SESSION_ID), which ai-env's CLI never is (it is not set); the valid reply is the sealed setup-token (one Touch ID), skipped when none is sealed, vm exec would refuse to unseal it (Anthropic refused that seal) or no run asked for a refresh: then it is never unsealed or sent; the CLI's path and version in the note, nothing of the image in the row; the closing encodes AUTH_TIMERS from it" },
+    ProbeSpec { name: "setup-token-prefix", stage: "S7", source: Source::Mac, expect: Expect::Recorded, recorded_by: "ai-env creds setup-token", what: "the kind prefix of the sealed setup-token (sk-ant-oat01-), observed at sealing, never validated" },
+    ProbeSpec { name: "touchid-gui", stage: "S7", source: Source::Mac, expect: Expect::Exact("prompted"), recorded_by: "ai-env lab run touchid-gui (from Cursor's integrated terminal)", what: "whether age-plugin-se shows its Touch ID dialog to processes Cursor started: an unseal in the terminal, then one from a detached setsid child without a terminal (S8's prewarm): prompted, terminal-only, or failed:<why>" },
+    ProbeSpec { name: "init-budget", stage: "S7", source: Source::Live, expect: Expect::Exact("within-budget"), recorded_by: "ai-env lab run init-budget", what: "how long a credentialed claude takes to answer initialize (stream-json host mode), judged on the answer (each session's close after it is noted, not counted): cold, the sum of the token's unseal (its Touch ID wait: with a current combined.env the one Touch ID lab run takes for the runtime key and the token, before the VM is started; without one the token's own, after the gate, while the runtime key's own Touch ID before the VM is not counted), RunMicrovm to RUNNING and /health, the gate, and the delivery and spawn to the answer; warm (the VM holds the token), the gate and the spawn to the answer. Against 30 s and 5 s: within-budget, over:<cold|warm>, or gap:unseal (the combined unseal's time could not be read); each leg in the note" },
 ];
 
 /// The catalog entry of `name`.
@@ -231,9 +239,16 @@ pub fn spec(name: &str) -> Option<&'static ProbeSpec> {
 
 /// A row for `spec` stamped now, with the image's claude version and active
 /// image version from `state/infra.toml` when recorded (live probes
-/// overwrite them with what `/health` and the VM row say).
+/// overwrite them with what `/health` and the VM row say). A Mac probe's row
+/// carries none of them: it measured this Mac (its own CLI, age-plugin-se,
+/// the sealed token), never the image, and a row stamped with the image's
+/// claude version would key what oauth-t1 found to a CLI it never ran (its
+/// note names the one it did).
 #[must_use]
 pub fn stamped(paths: &crate::bridge::config::Paths, spec: &ProbeSpec, verdict: &str, note: Option<String>) -> ProbeRow {
+    if spec.source == Source::Mac {
+        return ProbeRow { note, ..ProbeRow::new(spec.name, spec.stage, verdict, &spec.expect.expectation()) };
+    }
     let infra = crate::bridge::infra::read_infra_state(paths).ok().flatten();
     let claude = infra.as_ref().and_then(|s| s.claude_version.clone());
     ProbeRow {
@@ -1087,6 +1102,109 @@ pub fn verdict_in_vm_firewall(exposures: &[u16], gaps: &[&str]) -> String {
     "guarded".to_string()
 }
 
+// ---- S7: the credential probes' verdict renderers (pure; `vm/lab.rs` and `vm/lab_mac.rs` feed them) ----
+
+/// What fd-delivery's second spawn read while claude ran with the token on
+/// fd 3 (v6 T7.3: "a second exec scans every claude environ").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeEnviron {
+    /// Claude's own environment was among those read (or one read held the
+    /// token anyway); this many entries, over all of them, held the token's
+    /// name or a value of its kind.
+    Read(u64),
+    /// Claude's own environment was not read (the scan failed, or claude had
+    /// already exited): a gap, never a pass.
+    Unread,
+    /// Not judged: there is no `/proc` where the shim runs, which only a
+    /// test's emulated platform has (its shim runs on a Mac), never a VM.
+    NotJudged,
+}
+
+/// fd-delivery's verdict (T7.3), from the scan spawn (`in_environ`: its
+/// environ entries with the token's name or a value of its kind, `None` when
+/// its output held no such count; `fd_bytes`: what fd 3 held), whether
+/// claude answered with the fd alone (`via_fd`) and, only when it did not,
+/// with the token in its environment (`via_env`), what was read of the
+/// environments while claude ran with the fd, and `has_credentials` after a
+/// suspend and a resume. A
+/// custody failure outranks how claude took the token: `kept-after-resume`
+/// (D3: the VM still held it), then the scan's own `fd-unread:<why>` (the
+/// shim's side), then `claude-environ:<n>` (fd delivery, yet n entries held
+/// it while claude ran). A scan whose environ count could not be read
+/// leaves the shim's side unknown, whatever fd 3 held, so claude's answers
+/// cannot be judged against it: then `gap:fd-scan` (with any other check
+/// that could not be read) — run it again, never a shim bug's
+/// `fd-unread:fd-3-was-empty`. Then `env-only` or
+/// `fd-unread:claude-answered-neither-way`; and `fd-honoured` only with
+/// every custody check read, else `gap:<checks>` (`fd-scan`,
+/// `claude-environ`, `has-credentials`): a check that could not be read is
+/// no pass.
+#[must_use]
+pub fn verdict_fd_delivery(in_environ: Option<u64>, fd_bytes: Option<u64>, via_fd: bool, via_env: Option<bool>, environ: ClaudeEnviron, after_resume: Option<bool>) -> String {
+    if after_resume == Some(true) {
+        return "kept-after-resume".to_string();
+    }
+    match in_environ {
+        Some(n) if n > 0 => return "fd-unread:the-token-was-in-the-environ".to_string(),
+        Some(_) if !fd_bytes.is_some_and(|b| b > 0) => return "fd-unread:fd-3-was-empty".to_string(),
+        _ => {}
+    }
+    if let ClaudeEnviron::Read(n) = environ {
+        if n > 0 {
+            return format!("claude-environ:{n}");
+        }
+    }
+    let gaps: Vec<&str> = [(in_environ.is_none(), "fd-scan"), (environ == ClaudeEnviron::Unread, "claude-environ"), (after_resume.is_none(), "has-credentials")].into_iter().filter(|(gap, _)| *gap).map(|(_, name)| name).collect();
+    if in_environ.is_none() {
+        return format!("gap:{}", gaps.join(","));
+    }
+    match (via_fd, via_env) {
+        (false, Some(true)) => return "env-only".to_string(),
+        (false, _) => return "fd-unread:claude-answered-neither-way".to_string(),
+        (true, _) => {}
+    }
+    if gaps.is_empty() {
+        "fd-honoured".to_string()
+    } else {
+        format!("gap:{}", gaps.join(","))
+    }
+}
+
+/// touchid-gui's verdict once the terminal unseal answered: `prompted` when
+/// the detached one (S8's prewarm shape) answered too, else `terminal-only`,
+/// which never passes (tree B).
+#[must_use]
+pub fn verdict_touchid_gui(detached_ok: bool) -> &'static str {
+    if detached_ok {
+        "prompted"
+    } else {
+        "terminal-only"
+    }
+}
+
+/// A credentialed claude's init budgets (plan S7): cold, the token's unseal
+/// then RunMicrovm to the answer to `initialize`; warm, on a VM that holds the token.
+pub const INIT_COLD_BUDGET_MS: u128 = 30_000;
+pub const INIT_WARM_BUDGET_MS: u128 = 5_000;
+
+/// init-budget's verdict on the times to claude's `initialize` answer:
+/// `over:<cold|warm|cold,warm>` past [`INIT_COLD_BUDGET_MS`] or
+/// [`INIT_WARM_BUDGET_MS`] (a budget met exactly passes), else `gap:unseal`
+/// when the cold figure is unknown (`None`: the combined unseal's time could
+/// not be read, so the cold path's Touch ID could not be counted), else
+/// `within-budget`.
+#[must_use]
+pub fn verdict_init_budget(cold_ms: Option<u128>, warm_ms: u128) -> String {
+    let over: Vec<&str> = [(cold_ms.is_some_and(|c| c > INIT_COLD_BUDGET_MS), "cold"), (warm_ms > INIT_WARM_BUDGET_MS, "warm")].into_iter().filter(|(o, _)| *o).map(|(_, n)| n).collect();
+    if !over.is_empty() {
+        return format!("over:{}", over.join(","));
+    }
+    if cold_ms.is_none() {
+        return "gap:unseal".to_string();
+    }
+    "within-budget".to_string()
+}
+
 // ---- `ai-env lab list|show` ---------------------------------------------------------------
 
 /// `ai-env lab list [--json]`: every probe with its last recorded verdict.
@@ -1163,8 +1281,12 @@ mod tests {
         assert_eq!(back.ext.as_deref(), Some("2.1.282"));
     }
 
+    /// The catalog's names are unique, its S4–S6 probes are the planned ones,
+    /// and each S7 probe has its planned source and exact expectation: a
+    /// loosened one (fd-delivery taking env-only, touchid-gui taking
+    /// terminal-only, init-budget taking an over) fails here.
     #[test]
-    fn catalog_names_are_unique_and_cover_the_nine_s4_two_s5_and_seven_s6_probes() {
+    fn catalog_names_are_unique_and_cover_the_nine_s4_two_s5_seven_s6_and_five_s7_probes() {
         let names: std::collections::BTreeSet<&str> = CATALOG.iter().map(|p| p.name).collect();
         assert_eq!(names.len(), CATALOG.len());
         assert_eq!(CATALOG.iter().filter(|p| p.stage == "S4").count(), 9);
@@ -1172,6 +1294,17 @@ mod tests {
         assert_eq!(CATALOG.iter().filter(|p| p.stage == "S6").map(|p| p.name).collect::<Vec<_>>(), ["e0", "e1", "e5", "frames", "reattach", "clock-after-resume", "in-vm-firewall"]);
         assert_eq!(spec("dns-path").unwrap().expect.expectation().render(), crate::bridge::egress::DNS_NONE);
         assert_eq!(spec("cloudtrail-payload").unwrap().expect.expectation().render(), "any-of:not-logged|hidden|absent|commitment-only");
+        let s7: Vec<(&str, Source, String)> = CATALOG.iter().filter(|p| p.stage == "S7").map(|p| (p.name, p.source, p.expect.expectation().render())).collect();
+        assert_eq!(
+            s7,
+            [
+                ("fd-delivery", Source::Live, "fd-honoured".to_string()),
+                ("oauth-t1", Source::Mac, "recorded".to_string()),
+                ("setup-token-prefix", Source::Mac, "recorded".to_string()),
+                ("touchid-gui", Source::Mac, "prompted".to_string()),
+                ("init-budget", Source::Live, "within-budget".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1654,6 +1787,91 @@ mod tests {
         assert_eq!(spec("in-vm-firewall").unwrap().expect.expectation().render(), "guarded");
         assert_eq!(phase_outcome(true), "kept");
         assert_eq!(phase_outcome(false), "suspended");
+    }
+
+    /// The S7 verdicts against the catalog: fd-delivery passes only when fd 3
+    /// carried the token alone, claude answered with it, and every custody
+    /// check was read clean (a cache kept across a suspend and a resume, a
+    /// token in an environment while claude ran, or a check that could not be
+    /// read never passes, and neither does env-only; a scan whose environ
+    /// count could not be read is `gap:fd-scan`, to run again, not a shim
+    /// bug's `fd-unread:fd-3-was-empty`, whatever fd 3 held); touchid-gui's
+    /// terminal-only never passes; init-budget's thresholds are 30 s and 5 s,
+    /// met exactly passes, and an unread cold figure is a gap.
+    #[test]
+    fn s7_verdict_renderers() {
+        let holds = |probe: &str, verdict: &str| expectation_holds(&spec(probe).unwrap().expect.expectation().render(), verdict);
+        let fd = |in_environ, fd_bytes, via_fd, via_env, environ, after| verdict_fd_delivery(in_environ, fd_bytes, via_fd, via_env, environ, after);
+        let (clean, unread, here) = (ClaudeEnviron::Read(0), ClaudeEnviron::Unread, ClaudeEnviron::NotJudged);
+        assert_eq!(fd(Some(0), Some(108), true, None, clean, Some(false)), "fd-honoured");
+        assert!(holds("fd-delivery", "fd-honoured"));
+        assert_eq!(fd(Some(0), Some(108), true, None, here, Some(false)), "fd-honoured", "not judged where there is no /proc (the emulated platform only)");
+        let env_only = fd(Some(0), Some(108), false, Some(true), clean, Some(false));
+        assert_eq!(env_only, "env-only");
+        assert!(!holds("fd-delivery", &env_only), "env-only is never a pass");
+        assert_eq!(fd(Some(0), Some(108), false, Some(false), clean, Some(false)), "fd-unread:claude-answered-neither-way");
+        assert_eq!(fd(Some(0), Some(108), false, None, clean, Some(false)), "fd-unread:claude-answered-neither-way", "env not tried");
+        assert_eq!(fd(Some(1), None, true, None, clean, Some(false)), "fd-unread:the-token-was-in-the-environ");
+        assert_eq!(fd(Some(0), Some(0), true, None, clean, Some(false)), "fd-unread:fd-3-was-empty");
+        assert_eq!(fd(Some(0), None, true, None, clean, Some(false)), "fd-unread:fd-3-was-empty", "the environ read, no byte count: fd 3 was not open");
+        // The scan's environ count unread: the shim's side unknown, a gap to run again (never a shim bug's fd-3-was-empty).
+        assert_eq!(fd(None, None, true, None, clean, Some(false)), "gap:fd-scan", "a scan that printed nothing");
+        assert_eq!(fd(None, Some(108), true, None, clean, Some(false)), "gap:fd-scan", "though fd 3 held bytes");
+        assert!(!holds("fd-delivery", "gap:fd-scan"));
+        assert_eq!(fd(None, Some(108), false, Some(true), clean, Some(false)), "gap:fd-scan", "claude's answers are not judged against an unknown shim side: never env-only");
+        assert_eq!(fd(None, Some(108), false, Some(false), clean, Some(false)), "gap:fd-scan", "nor neither-way");
+        assert_eq!(fd(None, Some(108), true, None, unread, None), "gap:fd-scan,claude-environ,has-credentials");
+        assert_eq!(fd(None, Some(108), true, None, ClaudeEnviron::Read(1), Some(false)), "claude-environ:1", "a custody failure outranks the gap");
+        assert_eq!(fd(None, None, true, None, clean, Some(true)), "kept-after-resume");
+        // D3 and the environments: custody failures outrank how claude took the token.
+        let kept = fd(Some(0), Some(108), true, None, clean, Some(true));
+        assert_eq!(kept, "kept-after-resume");
+        assert!(!holds("fd-delivery", &kept), "a cache kept across a suspend and a resume is no pass");
+        assert_eq!(fd(Some(1), None, false, Some(true), ClaudeEnviron::Read(2), Some(true)), "kept-after-resume", "it outranks everything");
+        let held = fd(Some(0), Some(108), true, None, ClaudeEnviron::Read(2), Some(false));
+        assert_eq!(held, "claude-environ:2");
+        assert!(!holds("fd-delivery", &held), "a token in an environment while claude ran on the fd is no pass");
+        assert_eq!(fd(Some(0), Some(108), false, Some(true), ClaudeEnviron::Read(1), Some(false)), "claude-environ:1", "it outranks env-only");
+        assert_eq!(fd(Some(1), None, true, None, ClaudeEnviron::Read(1), Some(false)), "fd-unread:the-token-was-in-the-environ", "the shim's own side is named first");
+        // A custody check that could not be read: a gap, never fd-honoured.
+        assert_eq!(fd(Some(0), Some(108), true, None, clean, None), "gap:has-credentials");
+        assert_eq!(fd(Some(0), Some(108), true, None, unread, Some(false)), "gap:claude-environ");
+        let gaps = fd(Some(0), Some(108), true, None, unread, None);
+        assert_eq!(gaps, "gap:claude-environ,has-credentials");
+        assert!(!holds("fd-delivery", &gaps));
+        assert_eq!(fd(Some(0), Some(108), false, Some(true), unread, None), "env-only", "a gap matters only to a pass");
+        // touchid-gui.
+        assert_eq!(verdict_touchid_gui(true), "prompted");
+        assert!(holds("touchid-gui", verdict_touchid_gui(true)));
+        assert_eq!(verdict_touchid_gui(false), "terminal-only");
+        assert!(!holds("touchid-gui", verdict_touchid_gui(false)), "terminal-only is never prompted");
+        // init-budget.
+        assert_eq!((INIT_COLD_BUDGET_MS, INIT_WARM_BUDGET_MS), (30_000, 5_000));
+        assert_eq!(verdict_init_budget(Some(30_000), 5_000), "within-budget", "a budget met exactly passes");
+        assert!(holds("init-budget", &verdict_init_budget(Some(30_000), 5_000)));
+        assert_eq!(verdict_init_budget(Some(30_001), 5_000), "over:cold");
+        assert_eq!(verdict_init_budget(Some(30_000), 5_001), "over:warm");
+        assert_eq!(verdict_init_budget(Some(30_001), 5_001), "over:cold,warm");
+        assert!(!holds("init-budget", &verdict_init_budget(Some(1_000), 5_001)));
+        assert_eq!(verdict_init_budget(None, 4_000), "gap:unseal");
+        assert!(!holds("init-budget", "gap:unseal"));
+        assert_eq!(verdict_init_budget(None, 5_001), "over:warm", "a known over outranks the gap");
+    }
+
+    /// A Mac probe's row (S7) carries nothing of the image, which it never
+    /// measured; a live probe's row still starts from the recorded image.
+    #[test]
+    fn a_mac_probes_row_carries_nothing_of_the_image() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = crate::bridge::config::Paths::from_root_and_env(d.path().to_path_buf(), None);
+        std::fs::create_dir_all(paths.infra_state().parent().unwrap()).unwrap();
+        std::fs::write(paths.infra_state(), "latest_active_image_version = \"6.0\"\nclaude_version = \"2.1.288\"\n").unwrap();
+        for probe in ["oauth-t1", "touchid-gui", "setup-token-prefix"] {
+            let row = stamped(&paths, spec(probe).unwrap(), "v", Some("n".into()));
+            assert_eq!((row.claude, row.ext, row.image_version, row.note.as_deref()), (None, None, None, Some("n")), "{probe}");
+        }
+        let live = stamped(&paths, spec("fd-delivery").unwrap(), "v", None);
+        assert_eq!((live.claude.as_deref(), live.image_version.as_deref()), (Some("2.1.288"), Some("6.0")));
     }
 
     #[test]
