@@ -35,27 +35,31 @@
 //! A reply can be long: claude prints each content block as an `assistant`
 //! line of its own, so a Write of a large file is one line over [`LINE_MAX`].
 //! Such a line is never parsed whole: its first [`HEAD_MAX`] bytes decide,
-//! read as stream-json prints a reply (claude 2.1.288: `type` first, then the
-//! API's message, whose `model` comes before its content). It is progress
-//! when it starts `{"type":"assistant"` and names a model other than
-//! `<synthetic>` before the cut, with no `"error"` there, or starts
-//! `{"type":"result"` with `"is_error":false` before the cut. Any other long
-//! line (an echoed user message, the init line) clears nothing; the CLI's own
-//! error lines are short, and read whole. (B7's error `result` on 2.1.296
-//! starts `{"duration_api_ms":`, its `type` after its `result`: an answered
-//! one printed in that order and over [`LINE_MAX`] clears nothing, while the
-//! reply before it still does. A line read whole is judged whatever its key
-//! order.)
+//! read as stream-json prints a reply (`type` first, then the API's message,
+//! whose `model` comes before its content: claude 2.1.288's order, and
+//! 2.1.296's as B16 printed it, `model` the message's first key at byte 31
+//! and `content` at byte 131). It is progress when it starts
+//! `{"type":"assistant"` and names a model other than `<synthetic>` before
+//! the cut, with no `"error"` there, or starts `{"type":"result"` with
+//! `"is_error":false` before the cut. Any other long line (an echoed user
+//! message, the init line) clears nothing; the CLI's own error lines are
+//! short, and read whole. claude 2.1.296 prints a `result` starting
+//! `{"duration_api_ms":`, its `type` after its `result` (B7's error result
+//! and B16's answered one, whose `is_error` comes at byte 1503 of 1804, past
+//! the cut), so that second start matches none of its results: an answered
+//! one over [`LINE_MAX`] clears nothing, while the reply before it still
+//! does, which is accepted. A line read whole is judged whatever its key
+//! order.
 //!
 //! A line that is a JSON array is read as a run's messages: each object in
 //! it is judged as a line of its own would be, in order, and anything else
-//! in it is nothing. claude's `--output-format json --verbose` is expected
-//! to print its messages so, as one line at the run's end; that shape is
-//! unmeasured (B7 ran json without `--verbose`), to be pinned once a run
-//! shows it. The limit is judged at the line's end, as for any line: the
-//! run is over by then, so a reply after a third retry in the same array is
-//! a recovery, not a stop due before it. An array over [`LINE_MAX`] is
-//! passed over as any long line is, and its head shows no progress.
+//! in it is nothing. claude's `--output-format json --verbose` prints its
+//! messages so, as one line at the run's end: pinned from B16 on 2.1.296
+//! (below), one array of the messages a stream-json run prints one per
+//! line. The limit is judged at the line's end, as for any line: the run is
+//! over by then, so a reply after a third retry in the same array is a
+//! recovery, not a stop due before it. An array over [`LINE_MAX`] is passed
+//! over as any long line is, and its head shows no progress.
 //!
 //! Never evidence: 429, 5xx, a connection error, the egress proxy's own 403
 //! or any other 4xx but 401 (as text, or as a result's `api_error_status`),
@@ -73,10 +77,26 @@
 //! alone, and exited 1. A `-p` run so ends on its result before the third
 //! retry: the result 401 refuses it, and the text 401 would on its own.
 //! Those lines, trimmed, are `tests/fixtures/claude/refused-*-2.1.296.*`,
-//! which this module's tests read (`target/s7/b7-stream.jsonl` and
-//! `b7-result.json` keep them whole). B14 repeats the run as
+//! which this module's tests read, and are kept nowhere else: B7's rerun
+//! (the GO) wrote over `target/s7/b7-stream.jsonl` and `b7-result.json`,
+//! which hold the rerun's lines whole, the same shape (`retry_delay_ms` 524
+//! and 1247 where the first run's were 507 and 1246). B14 repeats the run as
 //! `live_credential_garbage_token_is_refused_with_exit_5`, which prints the
-//! same lines. [`AUTH_TIMERS`] is not B7's: the `oauth-t1` row sets it.
+//! same lines. [`AUTH_TIMERS`] is not B7's: it is the `oauth-t1` row's (B11).
+//!
+//! **Pinned from B16** (the same day): claude 2.1.296, Cursor's bundled one
+//! on the Mac, given the valid sealed setup-token by `ai-env run` with a
+//! throwaway config dir. With `-p … --output-format stream-json --verbose`
+//! it printed its init line, the reply (an `assistant` line, its message's
+//! keys in the order above, no `error`), a `rate_limit_event` line and the
+//! answered `result` (`is_error` false, starting `{"duration_api_ms":`);
+//! with `--output-format json --verbose` it printed its run's four messages,
+//! the same kinds in the same order, as one array on one line. The
+//! `rate_limit_event` line is nothing, as any line of another type: neither
+//! progress nor evidence. Those lines, trimmed, are
+//! `tests/fixtures/claude/valid-*-2.1.296.*`, which this module's tests read
+//! (`target/s7/valid-stream.jsonl` and `valid-json-verbose.json` keep them
+//! whole).
 
 /// Retry 401s with no progress between them before the command is stopped.
 /// Pinned from B7 (claude 2.1.296): a `-p` run gives up after two auth
@@ -86,11 +106,29 @@
 /// exited). The limit stops what retries on: a long session whose requests
 /// all fail (S8's pump).
 pub const RETRY_LIMIT: u32 = 3;
-/// The CLI's own auth timers (S7, the `oauth-t1` probe): how long it waits
-/// on a 401 before it asks for a refresh, and before it gives up. "unmeasured"
-/// until the part B closing encodes them from the `oauth-t1` row, keyed to the
-/// image's claude version; S8's wrapper reads them.
-pub const AUTH_TIMERS: &str = "unmeasured";
+/// The CLI's own auth timers, as the `oauth-t1` row measured them (S7 B11,
+/// 11 Oct 2026; `plans/s7-measurements.md`), keyed to the claude version
+/// they name (`claude`, 2.1.296): a new one is measured again with
+/// `ai-env lab run oauth-t1` before they are trusted for it. S8's wrapper
+/// and S12's refresh relay read them: S8 is to compare `claude` with the
+/// version of the CLI it runs, a different version being unmeasured until
+/// `oauth-t1` runs again. No test ties `claude` to `image/claude.lock`:
+/// `make claude-update` moves that pin often.
+/// Measured, run as `claude-vscode` with `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH=1`
+/// and a token Anthropic refuses: the CLI asked for a refresh at the first
+/// 401, 0.96-1.44 s after the spawn (its start-up and that request: no wait
+/// of its own); with no answer the turn failed 30.0 s after the ask, and the
+/// CLI did not exit while its stdin stayed open (killed at the probe's 150 s
+/// bound); a null answer failed the turn 1.1 s after the ask, and 1.1 s
+/// after its stdin closed the CLI exited 1; `CLAUDE_CODE_OAUTH_401_WAIT_MS=5000`
+/// moved the ask 5.0 s later, and the null answer's failed turn to 5.0 s
+/// after the ask; a valid answer brought the reply 2.3 s after the ask, and
+/// exit 0. These agree with what S7 read from 2.1.288's bytes (the 401 wait
+/// 0 outside a remote session; the host's answer awaited 30 s). The 60 s
+/// wait in a remote session and `CLAUDE_CODE_AUTH_FAIL_EXIT_MS` (600 s by
+/// those bytes, past the probe's bound) stay unmeasured: ai-env's CLI is
+/// never a remote child.
+pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.296", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
 /// Longest line inspected; a longer one is passed over, its head aside.
 pub const LINE_MAX: usize = 64 * 1024;
 /// What is kept of a line passed over: its first bytes, which tell a model
@@ -107,6 +145,26 @@ pub const HEAD_MAX: usize = 512;
 /// message alone, an API key's refusal, an expired token's): like the
 /// first, each is matched only at a start and counts only with exit 1.
 pub const TEXT_SIGNATURES: [&str; 4] = ["Failed to authenticate. API Error: 401", "API Error: 401", "Invalid API key", "OAuth token has expired"];
+
+/// The CLI's auth timers for one claude version ([`AUTH_TIMERS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthTimers {
+    /// The version measured: `claude --version`'s first word for the CLI
+    /// `oauth-t1` ran (Cursor's bundled one on the Mac; `image/claude.lock`
+    /// pinned the same on 11 Oct 2026, but nothing keeps the two equal).
+    pub claude: &'static str,
+    /// The wait after a 401 before the CLI asks its host for a refresh, with
+    /// `CLAUDE_CODE_OAUTH_401_WAIT_MS` unset, outside a remote session
+    /// (ai-env sets it only in `oauth-t1`'s knob run).
+    pub oauth_401_wait_ms: u64,
+    /// How long the CLI awaits its host's answer to `oauth_token_refresh`
+    /// before it fails the turn with an `is_error` result.
+    pub refresh_answer_timeout_ms: u64,
+    /// Whether a CLI that is not a remote child (no
+    /// `CLAUDE_CODE_REMOTE_SESSION_ID`, which ai-env never sets) exits of its
+    /// own accord after a failed turn while its stdin stays open.
+    pub exits_while_stdin_open: bool,
+}
 
 /// Which stream a chunk came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,7 +298,7 @@ impl AuthWatch {
             return;
         }
         match serde_json::from_str::<serde_json::Value>(text) {
-            // `--output-format json --verbose` (unmeasured, the module doc): a run's messages, in order.
+            // `--output-format json --verbose` (pinned from B16, the module doc): a run's messages, in order.
             Ok(serde_json::Value::Array(messages)) => messages.iter().for_each(|m| self.message(m)),
             Ok(m) => self.message(&m),
             Err(_) => {}
@@ -535,6 +593,9 @@ mod tests {
             assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{shown}");
             assert_eq!(w.retries(), if progress { 0 } else { 2 }, "{shown}");
             assert_eq!(w.feed(Stream::Stdout, r401.as_bytes()) == Verdict::Rejected, !progress, "{shown}");
+            let mut alone = AuthWatch::new();
+            alone.feed(Stream::Stdout, line.as_bytes());
+            assert!(!alone.rejected_at_exit(Some(1)), "{shown}: never evidence");
         }
     }
 
@@ -555,12 +616,24 @@ mod tests {
     /// `tests/fixtures/claude/README.md` says how.
     const B7_STREAM: &str = include_str!("../../tests/fixtures/claude/refused-stream-json-2.1.296.jsonl");
     const B7_JSON: &str = include_str!("../../tests/fixtures/claude/refused-json-2.1.296.json");
+    /// B16's kept output (claude 2.1.296 with the valid setup-token), trimmed
+    /// the same way.
+    const B16_STREAM: &str = include_str!("../../tests/fixtures/claude/valid-stream-json-2.1.296.jsonl");
+    const B16_JSON: &str = include_str!("../../tests/fixtures/claude/valid-json-verbose-2.1.296.json");
 
     /// Line `i` of B7's stream-json run, with its `\n`: 0 init, 1 and 2 the
     /// retries, 3 the `<synthetic>` reply, 4 the result.
     fn b7_line(i: usize) -> String {
         let lines: Vec<&str> = B7_STREAM.lines().collect();
         assert_eq!(lines.len(), 5, "B7's stream: init, two retries, the reply, the result");
+        format!("{}\n", lines[i])
+    }
+
+    /// Line `i` of B16's stream-json run, with its `\n`: 0 init, 1 the reply,
+    /// 2 the `rate_limit_event` line, 3 the answered result.
+    fn b16_line(i: usize) -> String {
+        let lines: Vec<&str> = B16_STREAM.lines().collect();
+        assert_eq!(lines.len(), 4, "B16's stream: init, the reply, the rate_limit_event line, the result");
         format!("{}\n", lines[i])
     }
 
@@ -708,22 +781,23 @@ mod tests {
     }
 
     /// `lines` as one JSON array on one line, the shape claude's
-    /// `--output-format json --verbose` is expected to print (the module doc).
+    /// `--output-format json --verbose` prints (B16, the module doc).
     fn array(lines: &[String]) -> String {
         format!("[{}]\n", lines.iter().map(|l| l.trim_end()).collect::<Vec<_>>().join(","))
     }
 
-    /// An array line is read message by message (unmeasured: B7 ran json
-    /// without `--verbose`, so B7's five messages stand in for that run). In
-    /// one array they count as they do on five lines: the retries 1 and 2,
-    /// then the result 401, a refusal with exit 1 (as text), none with exit 0
-    /// or 2, in any chunking. Each message is judged as its own line would
-    /// be: B7's result answered (`is_error` false) after the retries, or
-    /// followed by an answered turn, is no refusal, and a string or a number
-    /// in the array (B7's text, 401) is nothing. The limit is judged at the
-    /// array's end, the run being over: three retries then a reply stop
-    /// nothing, three with only the result after them stop it once. An array
-    /// over `LINE_MAX` counts nothing, as any long line.
+    /// An array line is read message by message (the shape B16 pinned on a
+    /// valid run, which `b16s_json_verbose_run_is_read_message_by_message`
+    /// reads; B7 ran json without `--verbose`, so B7's five messages stand in
+    /// for a refused run). In one array they count as they do on five lines:
+    /// the retries 1 and 2, then the result 401, a refusal with exit 1 (as
+    /// text), none with exit 0 or 2, in any chunking. Each message is judged
+    /// as its own line would be: B7's result answered (`is_error` false)
+    /// after the retries, or followed by an answered turn, is no refusal, and
+    /// a string or a number in the array (B7's text, 401) is nothing. The
+    /// limit is judged at the array's end, the run being over: three retries
+    /// then a reply stop nothing, three with only the result after them stop
+    /// it once. An array over `LINE_MAX` counts nothing, as any long line.
     #[test]
     fn a_json_verbose_array_is_read_message_by_message() {
         let b7: Vec<String> = (0..5).map(b7_line).collect();
@@ -760,6 +834,140 @@ mod tests {
         let mut w = AuthWatch::new();
         assert_eq!(w.feed(Stream::Stdout, long.as_bytes()), Verdict::Watching);
         assert!(!w.rejected_at_exit(Some(1)), "an array over LINE_MAX counts nothing");
+    }
+
+    /// B16's stream-json run, as claude 2.1.296 printed it with a valid
+    /// token: nothing in it is counted, line by line or read whole in chunks
+    /// of 1 or 64 bytes, and it is no refusal at exit 0 or 1.
+    #[test]
+    fn b16s_stream_json_run_is_no_refusal() {
+        assert!(b16_line(0).contains("\"subtype\":\"init\"") && b16_line(1).starts_with("{\"type\":\"assistant\"") && b16_line(2).starts_with("{\"type\":\"rate_limit_event\"") && b16_line(3).contains("\"is_error\":false"), "the fixture's lines in B16's order");
+        for code in [Some(0), Some(1)] {
+            let mut w = AuthWatch::new();
+            for i in 0..4 {
+                assert_eq!(w.feed(Stream::Stdout, b16_line(i).as_bytes()), Verdict::Watching, "line {i}");
+                assert_eq!(w.retries(), 0, "line {i}");
+            }
+            assert!(!w.rejected_at_exit(code), "exit {code:?}");
+            for size in [1, 64] {
+                let mut pieces = AuthWatch::new();
+                assert!(B16_STREAM.as_bytes().chunks(size).all(|c| pieces.feed(Stream::Stdout, c) == Verdict::Watching), "chunks of {size}");
+                assert!(pieces.retries() == 0 && !pieces.rejected_at_exit(code), "chunks of {size}, exit {code:?}");
+            }
+        }
+    }
+
+    /// B16's reply is progress: two retry 401s, the reply, then one more
+    /// leave one counted (no stop, and no refusal at exit 1), while three
+    /// with no line between them stop the command.
+    #[test]
+    fn b16s_reply_is_progress() {
+        let (r401, reply) = (retry(401, "authentication_failed"), b16_line(1));
+        let mut w = AuthWatch::new();
+        for (line, retries) in [(&r401, 1), (&r401, 2), (&reply, 0), (&r401, 1)] {
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{line}");
+            assert_eq!(w.retries(), retries, "{line}");
+        }
+        assert!(!w.rejected_at_exit(Some(1)));
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, format!("{r401}{r401}{r401}").as_bytes()), Verdict::Rejected);
+    }
+
+    /// B16's answered result, read whole, is progress whatever its key order
+    /// (`type` after `result`, `api_error_status` null): two retry 401s and
+    /// a text 401 before it leave nothing counted, and exit 1 is no refusal.
+    #[test]
+    fn b16s_answered_result_is_progress() {
+        let (r401, answered) = (retry(401, "authentication_failed"), b16_line(3));
+        assert!(answered.starts_with("{\"duration_api_ms\":") && answered.contains("\"api_error_status\":null,\"result\":\"OK\",\"type\":\"result\""), "B16's key order");
+        let mut w = AuthWatch::new();
+        w.feed(Stream::Stdout, format!("{r401}{r401}API Error: 401 nope\n").as_bytes());
+        assert_eq!(w.feed(Stream::Stdout, answered.as_bytes()), Verdict::Watching);
+        assert!(w.retries() == 0 && !w.rejected_at_exit(Some(1)));
+    }
+
+    /// The head rule over B16's real key order (the module doc): its reply,
+    /// lengthened past LINE_MAX by its text (its first bytes as printed, the
+    /// model at byte 31), clears the count; the same line naming the
+    /// `<synthetic>` model, or with an `"error"` key in its head, clears
+    /// nothing, and neither does its answered result lengthened so (it
+    /// starts `{"duration_api_ms":`). That is accepted: in B16's run the
+    /// reply before that result still clears the retries. None is counted.
+    #[test]
+    fn the_head_rule_reads_b16s_key_order() {
+        let r401 = retry(401, "authentication_failed");
+        let reply = padded(&b16_line(1), "\"text\":\"");
+        assert!(reply.starts_with("{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet-5-5\",") && reply.find("\"model\"") == Some(31), "B16's first bytes");
+        let synthetic = swap(&reply, "\"model\":\"claude-sonnet-5-5\"", "\"model\":\"<synthetic>\"");
+        let error = swap(&reply, "\"message\":{", "\"error\":\"authentication_failed\",\"message\":{");
+        assert!(error[..HEAD_MAX].contains("\"model\":\"claude-sonnet-5-5\""), "the model still in the head");
+        let result = padded(&b16_line(3), "\"result\":\"");
+        for (line, progress) in [(&reply, true), (&synthetic, false), (&error, false), (&result, false)] {
+            assert!(line.trim_end().len() > LINE_MAX, "passed over");
+            let shown = &line[..80];
+            let mut w = AuthWatch::new();
+            w.feed(Stream::Stdout, format!("{r401}{r401}").as_bytes());
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{shown}");
+            assert_eq!(w.retries(), if progress { 0 } else { 2 }, "{shown}");
+            assert_eq!(w.feed(Stream::Stdout, r401.as_bytes()) == Verdict::Rejected, !progress, "{shown}");
+            let mut alone = AuthWatch::new();
+            alone.feed(Stream::Stdout, line.as_bytes());
+            assert!(!alone.rejected_at_exit(Some(1)), "{shown}: never evidence");
+        }
+        let mut w = AuthWatch::new();
+        w.feed(Stream::Stdout, format!("{r401}{r401}{}{}{}{result}", b16_line(0), b16_line(1), b16_line(2)).as_bytes());
+        assert_eq!(w.retries(), 0, "the reply before the long result cleared the count");
+        assert!(!w.rejected_at_exit(Some(1)));
+    }
+
+    /// B16's `rate_limit_event` line is nothing. Not progress: two retry 401s
+    /// before it stay counted and a third after it stops the command, and
+    /// B7's result 401 before it is still a refusal with exit 1. Not
+    /// evidence: alone, then exit 1, it is no refusal.
+    #[test]
+    fn b16s_rate_limit_event_is_nothing() {
+        let (r401, event) = (retry(401, "authentication_failed"), b16_line(2));
+        let mut w = AuthWatch::new();
+        w.feed(Stream::Stdout, format!("{r401}{r401}").as_bytes());
+        assert_eq!(w.feed(Stream::Stdout, event.as_bytes()), Verdict::Watching);
+        assert_eq!(w.retries(), 2);
+        assert_eq!(w.feed(Stream::Stdout, r401.as_bytes()), Verdict::Rejected);
+        let mut w = AuthWatch::new();
+        w.feed(Stream::Stdout, format!("{}{event}", b7_line(4)).as_bytes());
+        assert!(w.rejected_at_exit(Some(1)));
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, event.as_bytes()), Verdict::Watching);
+        assert!(w.retries() == 0 && !w.rejected_at_exit(Some(1)));
+    }
+
+    /// B16's json `--verbose` run: one line, the array of its run's four
+    /// messages (init, the reply, `rate_limit_event`, the answered result),
+    /// judged message by message: after two retry 401s it clears them, and
+    /// it is no refusal at exit 1, read whole or in chunks of 1 or 64 bytes.
+    #[test]
+    fn b16s_json_verbose_run_is_read_message_by_message() {
+        let v: serde_json::Value = serde_json::from_str(B16_JSON).unwrap();
+        let types: Vec<&str> = v.as_array().map(|a| a.iter().filter_map(|m| m["type"].as_str()).collect()).unwrap_or_default();
+        assert!(B16_JSON.lines().count() == 1 && B16_JSON.ends_with("]\n") && types == ["system", "assistant", "rate_limit_event", "result"], "{types:?}");
+        let r401 = retry(401, "authentication_failed");
+        let mut w = AuthWatch::new();
+        w.feed(Stream::Stdout, format!("{r401}{r401}").as_bytes());
+        assert_eq!(w.feed(Stream::Stdout, B16_JSON.as_bytes()), Verdict::Watching);
+        assert_eq!(w.retries(), 0, "the array's reply clears them");
+        assert!(!w.rejected_at_exit(Some(1)));
+        let out = format!("{r401}{r401}{B16_JSON}");
+        for size in [1, 64] {
+            let mut pieces = AuthWatch::new();
+            assert!(out.as_bytes().chunks(size).all(|c| pieces.feed(Stream::Stdout, c) == Verdict::Watching), "chunks of {size}");
+            assert!(pieces.retries() == 0 && !pieces.rejected_at_exit(Some(1)), "chunks of {size}");
+        }
+    }
+
+    /// AUTH_TIMERS is what `oauth-t1` measured (S7 B11, claude 2.1.296): a
+    /// changed value comes from a new measurement, for the version it names.
+    #[test]
+    fn auth_timers_are_what_oauth_t1_measured() {
+        assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.296", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
     }
 
     proptest::proptest! {

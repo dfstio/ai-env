@@ -568,7 +568,7 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     }
     // 9. Always: what changes for Cursor and how to undo it.
     outln!();
-    outln!("claudeCode.disableLoginPrompt is left alone (set it only once the bridge delivers credentials, S7).");
+    outln!("claudeCode.disableLoginPrompt is left alone (set it only once S8 runs Cursor's sessions in MicroVMs with the delivered credential).");
     outln!("Wrapped setups start in Manual mode: the extension now passes --permission-mode {mode} on every spawn (choose with --permission-mode).");
     outln!("Reload the Cursor window for the setting to take effect.");
     outln!("With a wrapper set the extension stops following CLAUDE_CONFIG_DIR changes. Cursor still updates the extension and its bundled claude (turn off Auto Update for the Claude Code extension to keep a version); make claude-update brings the image to it.");

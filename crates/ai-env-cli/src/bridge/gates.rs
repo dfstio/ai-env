@@ -497,7 +497,8 @@ pub fn merge_manual(mut fresh: Vec<GateResult>, existing_md: Option<&str>) -> Ve
             continue;
         }
         if let Some((observed, status, date)) = existing.get(row.id) {
-            let stock = observed.is_empty() || observed == "…" || *observed == row.observed;
+            // Compared as written: the file holds the fresh text through `cell` (escaped, masked).
+            let stock = observed.is_empty() || observed == "…" || cell(observed) == cell(&row.observed);
             let hand_recorded = !stock || matches!(status, GateStatus::Pass | GateStatus::Fail);
             if hand_recorded {
                 row.observed = observed.clone();
@@ -547,8 +548,55 @@ pub fn trailer(existing_md: &str) -> Option<String> {
     }
 }
 
+/// `s` with every run of exactly 12 ASCII digits, an AWS account id (in G7's
+/// ARN, or in the aws CLI's text), replaced by `<acct>`; a longer or shorter
+/// run of digits is left alone.
+fn mask_account_ids(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let end = rest[start..].find(|c: char| !c.is_ascii_digit()).map_or(rest.len(), |n| start + n);
+        out.push_str(&rest[..start]);
+        out.push_str(if end - start == 12 { "<acct>" } else { &rest[start..end] });
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One table cell, safe in a Markdown preview: account ids masked
+/// ([`mask_account_ids`]), then `<` and `>` outside code spans written
+/// `&lt;` and `&gt;` (the aws CLI's `<AccessDeniedException>` is otherwise
+/// raw HTML, which can drop the table), a pipe escaped and a newline a
+/// space. A code span is a pair of single backticks, kept as is (an entity
+/// in it would show as written); an unmatched backtick is literal text, and
+/// what follows it is not code. A cell with a run of two or more backticks,
+/// or a backslash before one, has no code span: a preview pairs those
+/// otherwise, so every `<` and `>` in it is written as an entity. A cell
+/// written so comes back unchanged (its pipes read back by [`parse`]), so a
+/// row kept from the file stays verbatim.
 fn cell(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ")
+    let s = mask_account_ids(s);
+    let ticks = s.matches('`').count();
+    let spans = !s.contains("``") && !s.contains("\\`");
+    let (mut seen, mut code) = (0, false);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '`' => {
+                seen += 1;
+                // The 1st, 3rd, … open a span, but the last of an odd count opens nothing.
+                code = spans && seen % 2 == 1 && seen < ticks;
+                out.push(c);
+            }
+            '<' if !code => out.push_str("&lt;"),
+            '>' if !code => out.push_str("&gt;"),
+            '|' => out.push_str("\\|"),
+            '\n' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[must_use]
@@ -562,10 +610,11 @@ pub fn render(rows: &[GateResult], trailer: Option<&str>) -> String {
     md.push_str("| Gate | Command | Expected | Observed | Status | Date |\n|---|---|---|---|---|---|\n");
     for r in rows {
         md.push_str(&format!(
-            "| {} {} | `{}` | {} | {} | {} | {} |\n",
+            "| {} {} | {} | {} | {} | {} | {} |\n",
             r.id,
             r.name,
-            cell(&r.command),
+            // One code span: G1's `<repo>` in it is kept as is.
+            cell(&format!("`{}`", r.command)),
             cell(&r.expected),
             cell(&r.observed),
             r.status.glyph(),
@@ -697,6 +746,89 @@ mod tests {
         assert_eq!(parsed["G1"].1, GateStatus::Pass);
         assert_eq!(parsed["G8"].0, "x | y");
         assert_eq!(parsed["G8"].1, GateStatus::Skipped);
+    }
+
+    /// G2's Observed on 11 Oct 2026: the aws CLI's `<AccessDeniedException>`
+    /// is written as entities, never as raw HTML (which a Markdown preview
+    /// swallows, and in some the table with it).
+    #[test]
+    fn a_cell_writes_the_aws_clis_angle_brackets_as_entities() {
+        let g2 = "eu-central-1: al2023-1 listed; eu-west-3: aws: [ERROR]: An error occurred (403) when calling the ListManagedMicrovmImages operation: <AccessDeniedException>";
+        assert_eq!(cell(g2), "eu-central-1: al2023-1 listed; eu-west-3: aws: [ERROR]: An error occurred (403) when calling the ListManagedMicrovmImages operation: &lt;AccessDeniedException&gt;");
+    }
+
+    /// G7's Observed on 11 Oct 2026 named the account in an ARN: a run of
+    /// exactly 12 digits is masked anywhere in a cell (in a code span too,
+    /// where `<acct>` stays as it is); 11 or 13 digits are no account id.
+    #[test]
+    fn a_cell_masks_account_ids() {
+        let g7 = "aws: [ERROR]: An error occurred (InvalidInput) when calling the SimulatePrincipalPolicy operation: Invalid ARN provided in the request: arn:aws:iam::123456789012:root";
+        assert_eq!(cell(g7), "aws: [ERROR]: An error occurred (InvalidInput) when calling the SimulatePrincipalPolicy operation: Invalid ARN provided in the request: arn:aws:iam::&lt;acct&gt;:root");
+        assert_eq!(cell("arn:aws:iam::123456789012:user/example: iam:CreateUser=allowed"), "arn:aws:iam::&lt;acct&gt;:user/example: iam:CreateUser=allowed");
+        assert_eq!(cell("123456789012"), "&lt;acct&gt;", "the whole cell");
+        assert_eq!(cell("`123456789012`"), "`<acct>`", "in a code span");
+        for kept in ["1234567890123 ms", "after 12345678901 ms", "rustc 1.98.1 (48a229cea 2026-09-01)"] {
+            assert_eq!(cell(kept), kept);
+        }
+    }
+
+    /// A code span (a pair of single backticks) is kept as is; an unmatched
+    /// backtick is literal, and what follows it is not code. A pipe is
+    /// escaped everywhere, in a code span too, and a newline is a space.
+    #[test]
+    fn a_cell_keeps_code_spans_and_escapes_pipes() {
+        assert_eq!(cell("ran `claude <x>` once"), "ran `claude <x>` once");
+        assert_eq!(cell("`<a>` then ` <b>"), "`<a>` then ` &lt;b&gt;", "the third backtick is unmatched");
+        assert_eq!(cell("a ` <b> c"), "a ` &lt;b&gt; c");
+        assert_eq!(cell("`<b>``"), "`&lt;b&gt;``", "a run of two closes no single backtick");
+        assert_eq!(cell("\\`<b>`"), "\\`&lt;b&gt;`", "an escaped backtick opens no span");
+        assert_eq!(cell("x | `y | z`"), "x \\| `y \\| z`");
+        assert_eq!(cell("a\nb"), "a b");
+    }
+
+    /// The command is one code span: G1's `<repo>` in it is kept as is, and
+    /// the pipe in G2's is escaped, as before.
+    #[test]
+    fn render_writes_the_command_as_one_code_span() {
+        let mut g1 = row("G1", GateStatus::Pass, "ok");
+        g1.command = "cargo +1.98.1 fetch --locked --quiet --manifest-path <repo>/Cargo.toml".into();
+        let mut g2 = row("G2", GateStatus::Pass, "ok");
+        g2.command = "aws lambda-microvms list-managed-microvm-images --region eu-central-1 | --region eu-west-3".into();
+        let md = render(&[g1, g2], None);
+        assert!(md.contains("| G1 n | `cargo +1.98.1 fetch --locked --quiet --manifest-path <repo>/Cargo.toml` | e | ok | ✓ | 2026-09-19 |\n"), "{md}");
+        assert!(md.contains("| G2 n | `aws lambda-microvms list-managed-microvm-images --region eu-central-1 \\| --region eu-west-3` | e | ok | ✓ | 2026-09-19 |\n"), "{md}");
+    }
+
+    /// A row kept from the file (a hand record, or a skipped gate's last
+    /// one) is written back verbatim: a code span keeps its `<…>`, an entity
+    /// is not escaped again, a pipe is read back and escaped again.
+    #[test]
+    fn a_kept_row_is_written_back_verbatim() {
+        let hand = "ran `ai-env lab run touchid-gui <from Cursor>` | prompted; aws said &lt;AccessDeniedException&gt;";
+        let md = render(&[row("G8", GateStatus::Pass, hand)], None);
+        let line = "| G8 n | `c` | e | ran `ai-env lab run touchid-gui <from Cursor>` \\| prompted; aws said &lt;AccessDeniedException&gt; | ✓ | 2026-09-19 |";
+        assert!(md.lines().any(|l| l == line), "{md}");
+        let merged = merge_manual(vec![row("G8", GateStatus::Manual, "manual")], Some(&md));
+        assert_eq!((merged[0].observed.as_str(), merged[0].status), (hand, GateStatus::Pass), "a record, read back");
+        assert_eq!(render(&merged, None), md, "and written back as it was");
+    }
+
+    /// A skipped G7 (no identity) keeps its last record, as any skipped gate
+    /// does, but no account id in it: a record an older ai-env wrote unmasked
+    /// is masked on the way out. The tool's own skipped text, escaped in the
+    /// file, is still its placeholder: today's row, not the old one.
+    #[test]
+    fn a_skipped_g7_keeps_its_last_record_masked() {
+        let unmasked = render(&[row("G7", GateStatus::Manual, "x")], None).replace("| x |", "| arn:aws:iam::123456789012:root: iam:CreateUser=implicitDeny |");
+        let skipped = row("G7", GateStatus::Skipped, "no identity: aws: [ERROR]: <ExpiredToken>");
+        let merged = merge_manual(vec![skipped.clone()], Some(&unmasked));
+        assert_eq!((merged[0].observed.as_str(), merged[0].status), ("arn:aws:iam::123456789012:root: iam:CreateUser=implicitDeny", GateStatus::Manual), "the last record");
+        let md = render(&merged, None);
+        assert!(md.contains("| arn:aws:iam::&lt;acct&gt;:root: iam:CreateUser=implicitDeny |") && !md.contains("123456789012"), "{md}");
+        let mut today = skipped.clone();
+        today.date = "2026-10-12".into();
+        let merged = merge_manual(vec![today], Some(&render(&[skipped], None)));
+        assert_eq!((merged[0].status, merged[0].date.as_str()), (GateStatus::Skipped, "2026-10-12"), "the tool's own text is no record");
     }
 
     #[test]

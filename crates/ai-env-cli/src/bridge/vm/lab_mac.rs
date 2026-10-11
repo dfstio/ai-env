@@ -29,8 +29,9 @@
 //!   unsealed or sent: the valid reply is then skipped, loudly, as it is when
 //!   none of the first three runs asked for a refresh (it could never be
 //!   sent: no Touch ID for it). It makes real requests to Anthropic; every
-//!   run has an empty config dir and HOME of its own. The closing encodes
-//!   `authwatch::AUTH_TIMERS` from its row.
+//!   run has an empty config dir and HOME of its own. `authwatch::AUTH_TIMERS`
+//!   holds what its row measured (S7 B11, claude 2.1.296): a new claude
+//!   version is measured again here before the timers are trusted for it.
 use crate::age_cmd::{effective_path, AgeTool};
 use crate::bridge::config::{BridgeConfig, Paths};
 use crate::errors::{CliError, Result};
@@ -257,11 +258,14 @@ fn refused_token() -> String {
 /// does under Cursor.
 const ENTRYPOINT: &str = "claude-vscode";
 
-/// `CLAUDE_CODE_OAUTH_401_WAIT_MS` for the knob run: once the host's refresh
-/// failed (here a null reply), the CLI waits this long for a rotated token in
-/// its environment before it gives up — for any child (its default is 0
+/// `CLAUDE_CODE_OAUTH_401_WAIT_MS` for the knob run: after a 401 the CLI
+/// waits this long before it asks its host for a refresh, and once that
+/// refresh failed (here a null reply) it waits this long for a rotated token
+/// in its environment before it gives up — for any child (its default is 0
 /// outside a remote session) — so, honoured, that run's result comes at
-/// least this much after the null run's.
+/// least this much after the null run's. Both waits were measured (S7 B11,
+/// claude 2.1.296): the ask 5.0 s later than the null run's, the failed
+/// turn 5.0 s after it, against the null run's 1.1 s.
 const WAIT_401_MS: &str = "5000";
 
 /// How long the harness keeps reading once the CLI exited (or was killed):

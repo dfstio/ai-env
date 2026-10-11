@@ -637,8 +637,8 @@ instead): the command reminds you.
   S7's B7; `API Error: 401`, `Invalid API key` and `OAuth token has expired` are kept from before B7,
   unmeasured, for plain text without that prefix). That command has ended by itself, and nothing is
   stopped. On claude 2.1.296 a `claude -p` gives up after two retries, so this second sign is the one
-  that ends it, in stream-json as in json. With `--output-format json --verbose` claude is expected to
-  print the run's messages as one JSON array (a shape S7 has not measured): each is read as a line of
+  that ends it, in stream-json as in json. With `--output-format json --verbose` claude prints the
+  run's messages as one JSON array on one line (S7's B16, on claude 2.1.296): each is read as a line of
   its own would be, if the array is at most 64 KiB. Either way
   `vm exec` exits 5 with an `ai-env:` line saying what it saw, written last on stderr (a later
   SIGTERM, SIGHUP or Ctrl-C keeps the 5; a SIGTERM or SIGHUP during the stop, or any of the three
