@@ -533,7 +533,8 @@ impl Ending {
 }
 
 /// S7 D6: the delivered credential was refused. `how` is the audit's
-/// (`retries` or `text`); `end` is what `vm exec` saw of the command's end.
+/// (`retries`, or `text` for a text 401 or a result 401: `authwatch`); `end`
+/// is what `vm exec` saw of the command's end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rejected {
     how: &'static str,
@@ -550,7 +551,9 @@ enum RejectedEnd {
     /// `vm exec` sent the stop but did not see it end (the lines before say
     /// what may still run, and `vm terminate`).
     Unconfirmed,
-    /// It exited by itself (a text 401, then a failing exit).
+    /// It exited by itself (a text or result 401, then exit 1, as claude
+    /// 2.1.296's `-p` does after two retries; or retries read at its exit,
+    /// then a failing one).
     Exited,
 }
 
@@ -755,8 +758,8 @@ async fn pump<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start:
     };
     // S7 D6: the watch stopped it, and the child-gone check looks for it
     // (its exit coming back is not enough: the group may outlive the
-    // leader); or it ended by itself after a text 401 (or after the retries,
-    // read once the session had ended) with a failing status.
+    // leader); or it ended by itself after a text or result 401 (or after
+    // the retries, read once the session had ended) with a failing status.
     let rejected = if matches!(ending, Some(Ending::CredentialRejected)) {
         // `None`: another signal ended the wait, and nothing is confirmed
         // then. Signals first: one sent during TERM's wait (still pending)

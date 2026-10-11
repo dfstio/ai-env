@@ -4,18 +4,24 @@
 //! output bytes always pass through unchanged, and nothing here decides what
 //! reaches the operator.
 //!
-//! Two kinds of evidence, both from the lines the command prints:
+//! Three kinds of evidence, all from the lines the command prints:
 //! - **A retry 401.** A stream-json `system` line of subtype `api_retry`
 //!   whose `error` is `authentication_failed` or whose status is 401. Claude
 //!   retries those itself; at the [`RETRY_LIMIT`]th since the command's last
 //!   progress the watch says [`Verdict::Rejected`] and `vm exec` stops the
 //!   command (TERM to its group) instead of letting it retry on.
+//! - **A result 401.** A `result` line with `is_error` true and
+//!   `api_error_status` 401, whatever its `result` says: the status the CLI
+//!   reports, not its wording, tells it.
 //! - **A text 401.** A line starting with one of [`TEXT_SIGNATURES`], or a
-//!   `{"type":"result","is_error":true}` line whose `result` starts with one.
-//!   It counts only when the command then exits 1 ([`AuthWatch::rejected_at_exit`]):
-//!   a 401 the command recovered from is no rejection.
+//!   `{"type":"result","is_error":true}` line whose `result` starts with one:
+//!   for output that carries no status (plain text, or a CLI that reports none).
 //!
-//! **Progress clears both**: an `assistant` line that is not an API error
+//! A result 401 or a text 401 counts only when the command then exits 1
+//! ([`AuthWatch::rejected_at_exit`]): a 401 the command recovered from is no
+//! rejection. `vm exec` audits either as `text`.
+//!
+//! **Progress clears all three**: an `assistant` line that is not an API error
 //! (no `error`, not the CLI's `<synthetic>` message) is a model reply, and a
 //! `result` that is not `is_error` is an answered turn; either shows the token
 //! works. The retries counted are therefore those with no progress between
@@ -35,21 +41,50 @@
 //! `<synthetic>` before the cut, with no `"error"` there, or starts
 //! `{"type":"result"` with `"is_error":false` before the cut. Any other long
 //! line (an echoed user message, the init line) clears nothing; the CLI's own
-//! error lines are short, and read whole.
+//! error lines are short, and read whole. (B7's error `result` on 2.1.296
+//! starts `{"duration_api_ms":`, its `type` after its `result`: an answered
+//! one printed in that order and over [`LINE_MAX`] clears nothing, while the
+//! reply before it still does. A line read whole is judged whatever its key
+//! order.)
 //!
-//! Never evidence: 429, 5xx, a connection error, the egress proxy's own 403,
-//! or a line over [`LINE_MAX`] bytes (its head shows progress, no more). The
-//! signatures and the `api_retry` shape are version-pinned and provisional
-//! until part B sees a real refusal. No probe records them (the `oauth-t1`
-//! row keeps only refresh timings and the result's flags, from which part B
-//! sets [`AUTH_TIMERS`]): B7's garbage-token run is the step that sees
-//! claude's own words, and its kept output pins them, [`TEXT_SIGNATURES`]
-//! from the result text in `target/s7/b7-result.json` and the retry shape
-//! from the `api_retry` lines in `target/s7/b7-stream.jsonl` (B16). B14
-//! repeats that run as `live_credential_garbage_token_is_refused_with_exit_5`,
-//! which prints the same lines.
+//! A line that is a JSON array is read as a run's messages: each object in
+//! it is judged as a line of its own would be, in order, and anything else
+//! in it is nothing. claude's `--output-format json --verbose` is expected
+//! to print its messages so, as one line at the run's end; that shape is
+//! unmeasured (B7 ran json without `--verbose`), to be pinned once a run
+//! shows it. The limit is judged at the line's end, as for any line: the
+//! run is over by then, so a reply after a third retry in the same array is
+//! a recovery, not a stop due before it. An array over [`LINE_MAX`] is
+//! passed over as any long line is, and its head shows no progress.
+//!
+//! Never evidence: 429, 5xx, a connection error, the egress proxy's own 403
+//! or any other 4xx but 401 (as text, or as a result's `api_error_status`),
+//! or a line over [`LINE_MAX`] bytes (its head shows progress, no more).
+//!
+//! **Pinned from B7** (S7 part B, 11 Oct 2026), no longer provisional: claude
+//! 2.1.296 given a garbage setup-token on fd 3 on a vpc MicroVM. With
+//! `-p … --output-format stream-json --verbose` it printed its init line, two
+//! `api_retry` lines (`attempt` 1 and 2 of `max_retries` 10, `error_status`
+//! 401, `error` `authentication_failed`), a `<synthetic>` assistant line
+//! carrying the refusal's text (no progress), then an error `result` with
+//! `api_error_status` 401 and the text
+//! `Failed to authenticate. API Error: 401 OAuth access token is invalid.`,
+//! and exited 1; with `--output-format json` it printed the same `result`
+//! alone, and exited 1. A `-p` run so ends on its result before the third
+//! retry: the result 401 refuses it, and the text 401 would on its own.
+//! Those lines, trimmed, are `tests/fixtures/claude/refused-*-2.1.296.*`,
+//! which this module's tests read (`target/s7/b7-stream.jsonl` and
+//! `b7-result.json` keep them whole). B14 repeats the run as
+//! `live_credential_garbage_token_is_refused_with_exit_5`, which prints the
+//! same lines. [`AUTH_TIMERS`] is not B7's: the `oauth-t1` row sets it.
 
 /// Retry 401s with no progress between them before the command is stopped.
+/// Pinned from B7 (claude 2.1.296): a `-p` run gives up after two auth
+/// retries (its `api_retry` lines say `max_retries` 10, yet it printed two),
+/// so the limit is never reached there and the result rule ends it at the
+/// exit (a result 401, then exit 1: `vm exec` exits 5 saying the command
+/// exited). The limit stops what retries on: a long session whose requests
+/// all fail (S8's pump).
 pub const RETRY_LIMIT: u32 = 3;
 /// The CLI's own auth timers (S7, the `oauth-t1` probe): how long it waits
 /// on a 401 before it asks for a refresh, and before it gives up. "unmeasured"
@@ -61,9 +96,17 @@ pub const LINE_MAX: usize = 64 * 1024;
 /// What is kept of a line passed over: its first bytes, which tell a model
 /// reply or an answered turn (progress) by how they start (the module doc).
 pub const HEAD_MAX: usize = 512;
-/// How a refused credential reads in claude's own text (provisional, see the
-/// module doc). Matched at the start of a line, after leading whitespace.
-pub const TEXT_SIGNATURES: [&str; 3] = ["API Error: 401", "Invalid API key", "OAuth token has expired"];
+/// How a refused credential reads in claude's own text. Matched at the start
+/// of a line, or of an `is_error` result's `result`, after leading
+/// whitespace. Pinned from B7 on claude 2.1.296 (the module doc), no longer
+/// provisional: its refusal's text starts
+/// `Failed to authenticate. API Error: 401`, which no part-A signature
+/// matches at the start, hence the first. The three part-A signatures are
+/// kept, unmeasured (no S7 run printed a line or a result starting with
+/// one), for plain text the CLI may print without B7's prefix (its 401
+/// message alone, an API key's refusal, an expired token's): like the
+/// first, each is matched only at a start and counts only with exit 1.
+pub const TEXT_SIGNATURES: [&str; 4] = ["Failed to authenticate. API Error: 401", "API Error: 401", "Invalid API key", "OAuth token has expired"];
 
 /// Which stream a chunk came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +141,8 @@ pub struct AuthWatch {
     err: Partial,
     /// Retry 401s since the last progress (see the module doc).
     retries: u32,
-    /// A text 401 since the last progress.
+    /// A text 401 or a result 401 since the last progress (one flag: both
+    /// count only with exit 1, and are audited alike).
     text_401: bool,
     said: bool,
 }
@@ -148,10 +192,11 @@ impl AuthWatch {
         }
     }
 
-    /// The command exited with `code`: was it refused? A text 401 with exit
-    /// 1, or [`RETRY_LIMIT`] retry 401s with no progress after them and an
-    /// exit other than 0 (a command that exits 0 recovered). A last line
-    /// without a newline counts too (a long one by its head).
+    /// The command exited with `code`: was it refused? A text 401 or a
+    /// result 401 with exit 1, or [`RETRY_LIMIT`] retry 401s with no progress
+    /// after them and an exit other than 0 (a command that exits 0
+    /// recovered). A last line without a newline counts too (a long one by
+    /// its head).
     #[must_use]
     pub fn rejected_at_exit(&mut self, code: Option<i32>) -> bool {
         for stream in [Stream::Stdout, Stream::Stderr] {
@@ -182,6 +227,8 @@ impl AuthWatch {
         }
     }
 
+    /// One whole line: a text 401 by how it starts, else one JSON message or
+    /// an array of them (the module doc); anything else is nothing.
     fn line(&mut self, line: &[u8]) {
         let Ok(text) = std::str::from_utf8(line) else { return };
         let text = text.trim_start();
@@ -189,20 +236,32 @@ impl AuthWatch {
             self.text_401 = true;
             return;
         }
-        if !text.starts_with('{') {
+        if !text.starts_with(['{', '[']) {
             return;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return };
+        match serde_json::from_str::<serde_json::Value>(text) {
+            // `--output-format json --verbose` (unmeasured, the module doc): a run's messages, in order.
+            Ok(serde_json::Value::Array(messages)) => messages.iter().for_each(|m| self.message(m)),
+            Ok(m) => self.message(&m),
+            Err(_) => {}
+        }
+    }
+
+    /// One message, a line of its own or an object in an array line (any
+    /// key order); anything but an object is nothing.
+    fn message(&mut self, v: &serde_json::Value) {
         let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
         match field("type") {
             Some("system") if field("subtype") == Some("api_retry") => {
+                // B7's (2.1.296) carry both `error_status` 401 and `error` `authentication_failed`: either counts.
                 let status = ["error_status", "status"].iter().find_map(|k| v.get(*k).and_then(serde_json::Value::as_u64));
                 if field("error") == Some("authentication_failed") || status == Some(401) {
                     self.retries += 1;
                 }
             }
             Some("result") => match v.get("is_error").and_then(serde_json::Value::as_bool) {
-                Some(true) if field("result").is_some_and(|r| starts_with_signature(r.trim_start())) => self.text_401 = true,
+                // A result 401 (the status, whatever the words), else a text 401 in its `result`.
+                Some(true) if v.get("api_error_status").and_then(serde_json::Value::as_u64) == Some(401) || field("result").is_some_and(|r| starts_with_signature(r.trim_start())) => self.text_401 = true,
                 Some(false) => self.progress(),
                 _ => {}
             },
@@ -490,6 +549,217 @@ mod tests {
             w.feed(Stream::Stdout, last.trim_end().as_bytes());
             assert_eq!(w.rejected_at_exit(Some(1)), refused, "{}", &last[..40]);
         }
+    }
+
+    /// B7's kept output (claude 2.1.296 to a refused setup-token), trimmed:
+    /// `tests/fixtures/claude/README.md` says how.
+    const B7_STREAM: &str = include_str!("../../tests/fixtures/claude/refused-stream-json-2.1.296.jsonl");
+    const B7_JSON: &str = include_str!("../../tests/fixtures/claude/refused-json-2.1.296.json");
+
+    /// Line `i` of B7's stream-json run, with its `\n`: 0 init, 1 and 2 the
+    /// retries, 3 the `<synthetic>` reply, 4 the result.
+    fn b7_line(i: usize) -> String {
+        let lines: Vec<&str> = B7_STREAM.lines().collect();
+        assert_eq!(lines.len(), 5, "B7's stream: init, two retries, the reply, the result");
+        format!("{}\n", lines[i])
+    }
+
+    /// B7's refusal text, as claude printed it in its result.
+    fn b7_text() -> String {
+        let v: serde_json::Value = serde_json::from_str(B7_JSON).unwrap();
+        v["result"].as_str().unwrap().to_string()
+    }
+
+    /// `line` with its first `from` replaced by `to` (which must be there:
+    /// a variant that silently kept B7's line would prove nothing).
+    fn swap(line: &str, from: &str, to: &str) -> String {
+        assert!(line.contains(from), "{from} is not in {line}");
+        line.replacen(from, to, 1)
+    }
+
+    /// B7's stream-json run, line by line, as claude 2.1.296 printed it to a
+    /// refused token: the init line is nothing; the two `api_retry` 401s are
+    /// counted, below the limit (no stop, and no refusal without what
+    /// follows them); the `<synthetic>` reply carrying the refusal clears
+    /// nothing; the error result makes it a refusal with exit 1, the exit
+    /// claude gave, audited as text (two retries are not the limit), and
+    /// none with exit 0. Any chunking says the same, and a turn answered
+    /// after the result would clear it.
+    #[test]
+    fn b7s_stream_json_run_is_refused_with_exit_1_only() {
+        assert!(b7_line(0).contains("\"subtype\":\"init\"") && b7_line(3).contains("\"model\":\"<synthetic>\"") && b7_line(4).contains("\"api_error_status\":401"), "the fixture's lines in B7's order");
+        let mut w = AuthWatch::new();
+        for (i, retries) in [(0, 0), (1, 1), (2, 2), (3, 2), (4, 2)] {
+            let line = b7_line(i);
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "line {i}");
+            assert_eq!(w.retries(), retries, "line {i}");
+        }
+        assert!(w.rejected_at_exit(Some(1)), "the result 401, then exit 1");
+        assert!(w.retries() < RETRY_LIMIT, "audited as text: two retries are not the limit");
+        let mut retries_only = AuthWatch::new();
+        retries_only.feed(Stream::Stdout, format!("{}{}{}{}", b7_line(0), b7_line(1), b7_line(2), b7_line(3)).as_bytes());
+        assert!(!retries_only.rejected_at_exit(Some(1)), "without its result, B7's run is no refusal: two retries are below the limit");
+        let mut at_0 = AuthWatch::new();
+        at_0.feed(Stream::Stdout, B7_STREAM.as_bytes());
+        assert!(!at_0.rejected_at_exit(Some(0)), "exit 0 is a recovery");
+        for size in [1, 7, 64, 4096] {
+            let mut pieces = AuthWatch::new();
+            assert!(B7_STREAM.as_bytes().chunks(size).all(|c| pieces.feed(Stream::Stdout, c) == Verdict::Watching), "chunks of {size}");
+            assert!(pieces.rejected_at_exit(Some(1)) && pieces.retries() == 2, "chunks of {size}");
+        }
+        let mut answered = AuthWatch::new();
+        answered.feed(Stream::Stdout, format!("{B7_STREAM}{ANSWERED}").as_bytes());
+        assert!(!answered.rejected_at_exit(Some(1)), "a turn answered after the result 401: an exit 1 later is something else");
+    }
+
+    /// B7's json run: its one result object, then exit 1, is a refusal (as
+    /// text: no retry was printed); with exit 0, another failing exit or a
+    /// signal it is none.
+    #[test]
+    fn b7s_json_run_is_refused_with_exit_1_only() {
+        for code in [Some(1), Some(0), Some(2), Some(143), None] {
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(Stream::Stdout, B7_JSON.as_bytes()), Verdict::Watching);
+            assert_eq!(w.retries(), 0);
+            assert_eq!(w.rejected_at_exit(code), code == Some(1), "exit {code:?}");
+        }
+    }
+
+    /// The result rule reads the status, not the words: B7's result whose
+    /// `result` no signature starts (reworded, or absent) is still a refusal
+    /// with exit 1. The text rule needs no status: that result without its
+    /// `api_error_status` is one by B7's words alone. With neither, it is
+    /// nothing.
+    #[test]
+    fn a_result_401_is_told_by_its_status_and_a_text_401_by_its_words() {
+        let (result, text) = (b7_line(4), b7_text());
+        let other = "Your session could not be verified.";
+        let no_status = swap(&result, ",\"api_error_status\":401", "");
+        for (line, refused) in [
+            (swap(&result, &text, other), true),
+            (swap(&result, &format!(",\"result\":\"{text}\""), ""), true),
+            (no_status.clone(), true),
+            (swap(&no_status, &text, other), false),
+        ] {
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{line}");
+            assert_eq!(w.rejected_at_exit(Some(1)), refused, "{line}");
+        }
+    }
+
+    /// B7's text as a plain-text run prints its refusal, on either stream,
+    /// indented, or as a last line without a newline: a refusal with exit 1,
+    /// none with exit 0.
+    #[test]
+    fn b7s_text_on_a_line_of_its_own_counts_only_with_exit_1() {
+        let text = b7_text();
+        for (stream, line) in [(Stream::Stdout, format!("{text}\n")), (Stream::Stderr, format!("  {text}\n")), (Stream::Stdout, text.clone())] {
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(stream, line.as_bytes()), Verdict::Watching, "{line}");
+            assert!(w.rejected_at_exit(Some(1)), "{line}");
+            let mut at_0 = AuthWatch::new();
+            at_0.feed(stream, line.as_bytes());
+            assert!(!at_0.rejected_at_exit(Some(0)), "exit 0 is a recovery: {line}");
+        }
+    }
+
+    /// Where B7's words and status never make a refusal, each read on a
+    /// watch of its own and followed by exit 1: a model's answer quoting the
+    /// text (a reply line, mid-line in plain text), B7's result with
+    /// `is_error` false (an answered turn, whatever its status), an error
+    /// result whose `api_error_status` is not 401 (a 4xx that is no auth
+    /// refusal: 400, a prompt too long; 404; 407, a proxy's; 413; 429; a 5xx:
+    /// 500, 529; or the egress proxy's 403, worded as B7's was or not), the
+    /// proxy's 403 as plain text, and B7's result over `LINE_MAX` (never
+    /// evidence).
+    #[test]
+    fn b7s_words_and_status_count_nowhere_else() {
+        let (result, text) = (b7_line(4), b7_text());
+        let answered = swap(&result, "\"is_error\":true", "\"is_error\":false");
+        let mut lines = vec![
+            format!("{{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-x\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"),
+            format!("the model said: {text}\n"),
+            answered.clone(),
+            swap(&answered, ",\"api_error_status\":401", ""),
+            "Failed to authenticate. API Error: 403 Forbidden (the proxy)\n".to_string(),
+            padded(&result, "\"terminal_reason\":\""),
+        ];
+        for (status, words) in [
+            (400, "API Error: 400 invalid_request_error: prompt is too long"),
+            (404, "API Error: 404 not_found_error"),
+            (407, "API Error: 407 Proxy Authentication Required"),
+            (413, "API Error: 413 request_too_large"),
+            (429, "API Error: 429 rate_limit_error"),
+            (500, "API Error: 500 api_error"),
+            (529, "API Error: 529 overloaded_error"),
+            (403, "API Error: 403 Forbidden"),
+            (403, "Failed to authenticate. API Error: 403 Forbidden"),
+        ] {
+            lines.push(swap(&swap(&result, "\"api_error_status\":401", &format!("\"api_error_status\":{status}")), &text, words));
+        }
+        for line in lines {
+            // Far enough to show a result's status and the start of its words.
+            let shown = &line[..line.len().min(160)];
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{shown}");
+            assert_eq!(w.retries(), 0, "{shown}");
+            assert!(!w.rejected_at_exit(Some(1)), "{shown}");
+        }
+    }
+
+    /// `lines` as one JSON array on one line, the shape claude's
+    /// `--output-format json --verbose` is expected to print (the module doc).
+    fn array(lines: &[String]) -> String {
+        format!("[{}]\n", lines.iter().map(|l| l.trim_end()).collect::<Vec<_>>().join(","))
+    }
+
+    /// An array line is read message by message (unmeasured: B7 ran json
+    /// without `--verbose`, so B7's five messages stand in for that run). In
+    /// one array they count as they do on five lines: the retries 1 and 2,
+    /// then the result 401, a refusal with exit 1 (as text), none with exit 0
+    /// or 2, in any chunking. Each message is judged as its own line would
+    /// be: B7's result answered (`is_error` false) after the retries, or
+    /// followed by an answered turn, is no refusal, and a string or a number
+    /// in the array (B7's text, 401) is nothing. The limit is judged at the
+    /// array's end, the run being over: three retries then a reply stop
+    /// nothing, three with only the result after them stop it once. An array
+    /// over `LINE_MAX` counts nothing, as any long line.
+    #[test]
+    fn a_json_verbose_array_is_read_message_by_message() {
+        let b7: Vec<String> = (0..5).map(b7_line).collect();
+        let run = array(&b7);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(run.trim_end()).ok().and_then(|v| v.as_array().map(Vec::len)), Some(5), "one valid array line");
+        for code in [Some(1), Some(0), Some(2)] {
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(Stream::Stdout, run.as_bytes()), Verdict::Watching, "exit {code:?}");
+            assert_eq!(w.retries(), 2, "exit {code:?}");
+            assert_eq!(w.rejected_at_exit(code), code == Some(1), "exit {code:?}");
+        }
+        for size in [1, 64] {
+            let mut pieces = AuthWatch::new();
+            assert!(run.as_bytes().chunks(size).all(|c| pieces.feed(Stream::Stdout, c) == Verdict::Watching), "chunks of {size}");
+            assert!(pieces.rejected_at_exit(Some(1)), "chunks of {size}");
+        }
+        let answered = swap(&b7[4], "\"is_error\":true", "\"is_error\":false");
+        for lines in [vec![b7[1].clone(), b7[2].clone(), answered], vec![b7[4].clone(), ANSWERED.to_string()], vec![format!("\"{}\"", b7_text()), "401".to_string()]] {
+            let line = array(&lines);
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{line}");
+            assert_eq!(w.retries(), 0, "{line}");
+            assert!(!w.rejected_at_exit(Some(1)), "{line}");
+        }
+        let r401 = retry(401, "authentication_failed");
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, array(&[r401.clone(), r401.clone(), r401.clone(), ASSISTANT.to_string()]).as_bytes()), Verdict::Watching, "a reply after the third: a recovery");
+        assert!(!w.rejected_at_exit(Some(1)));
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, array(&[r401.clone(), r401.clone(), r401.clone(), b7[4].clone()]).as_bytes()), Verdict::Rejected);
+        assert!(w.rejected_at_exit(Some(1)) && w.retries() == RETRY_LIMIT, "audited as retries");
+        let long = array(&[padded(&b7[0], "\"model\":\""), b7[4].clone()]);
+        assert!(long.trim_end().len() > LINE_MAX, "passed over");
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, long.as_bytes()), Verdict::Watching);
+        assert!(!w.rejected_at_exit(Some(1)), "an array over LINE_MAX counts nothing");
     }
 
     proptest::proptest! {

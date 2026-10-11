@@ -631,8 +631,15 @@ instead): the command reminds you.
   turn starts the count again; a reply over 64 KiB is read by its first 512 bytes), `vm exec` stops
   the command (TERM to its group, KILL 3 s later, then `detach final`), then checks for at most 5 s
   that it and its process group are gone, naming `ai-env vm terminate` when it cannot see that. In any
-  output format, a line that starts with claude's 401 message (or an error result saying it),
-  followed by exit 1, counts too; that command has ended by itself, and nothing is stopped. Either way
+  output format, claude's own 401 at its end, followed by exit 1, counts too: an error result whose
+  `api_error_status` is 401, whatever its wording, or a line (or an error result's text) that starts
+  with claude's 401 message (`Failed to authenticate. API Error: 401`, as claude 2.1.296 words it in
+  S7's B7; `API Error: 401`, `Invalid API key` and `OAuth token has expired` are kept from before B7,
+  unmeasured, for plain text without that prefix). That command has ended by itself, and nothing is
+  stopped. On claude 2.1.296 a `claude -p` gives up after two retries, so this second sign is the one
+  that ends it, in stream-json as in json. With `--output-format json --verbose` claude is expected to
+  print the run's messages as one JSON array (a shape S7 has not measured): each is read as a line of
+  its own would be, if the array is at most 64 KiB. Either way
   `vm exec` exits 5 with an `ai-env:` line saying what it saw, written last on stderr (a later
   SIGTERM, SIGHUP or Ctrl-C keeps the 5; a SIGTERM or SIGHUP during the stop, or any of the three
   during the check, leaves the last output at most 3 s, as a stop does; a stderr nobody reads gets no

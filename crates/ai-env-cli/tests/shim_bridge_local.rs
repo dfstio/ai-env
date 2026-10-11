@@ -5562,3 +5562,192 @@ fn signals_that_end_a_refusals_check_bound_its_last_flush() {
     let rows = w.audit("credential_rejected");
     assert_eq!((rows.len(), rows[0]["detail"]["how"].as_str()), (1, Some("retries")));
 }
+
+// ---- S7 B7: the 401 watch pinned to claude 2.1.296, and its stdin wait ----
+
+/// B7's kept output, trimmed (tests/fixtures/claude/README.md): what claude
+/// 2.1.296 printed to a refused setup-token with `--output-format stream-json
+/// --verbose`, and with `--output-format json`.
+const B7_STREAM: &str = include_str!("fixtures/claude/refused-stream-json-2.1.296.jsonl");
+const B7_JSON: &str = include_str!("fixtures/claude/refused-json-2.1.296.json");
+
+/// A `claude` that answers as 2.1.296 did in B7: it reads the token on fd 3
+/// (its byte count goes to `$HOME/fd3`, never the token), prints B7's lines
+/// exactly (with `--output-format json` that run's one result, else the
+/// stream-json run's) and exits 1. Each start adds a line to `$HOME/starts`,
+/// as [`REFUSED_CLAUDE`]'s do ([`starts`]); `--version` (the smoke's first
+/// step) only prints a version line.
+fn b7_claude() -> String {
+    format!(
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo '2.1.296 (Claude Code)'; exit 0; }}\necho start >> \"$HOME/starts\"\nwc -c <&3 | tr -d ' ' > \"$HOME/fd3\"\ncase \" $* \" in\n  *\" --output-format json \"*) cat <<'B7'\n{B7_JSON}B7\n    ;;\n  *) cat <<'B7'\n{B7_STREAM}B7\n    ;;\nesac\nexit 1\n"
+    )
+}
+
+/// The bytes [`b7_claude`] read on fd 3, as it wrote their count.
+fn fd3_bytes(w: &World) -> usize {
+    std::fs::read_to_string(w.root.join("home").join("fd3")).unwrap_or_default().trim().parse().unwrap_or(0)
+}
+
+/// B7 offline, through the binary: `vm exec --with-credential` runs a
+/// `claude` that prints exactly what 2.1.296 printed to a refused token in
+/// stream-json (two `api_retry` 401s, the `<synthetic>` reply, the error
+/// result with `api_error_status` 401) and exits 1. Two retries never reach
+/// the stop; the result 401 and exit 1 make it exit 5, its line saying the
+/// command exited; claude's output passes through unchanged; one
+/// `credential_rejected` row, `how=text`; claude started once, having read
+/// the whole token on fd 3, and the next credentialed command refuses at
+/// once, with no Touch ID and no start. The token is nowhere in either's
+/// output or under the world's root.
+#[test]
+fn b7s_stream_json_refusal_is_exit_5_through_vm_exec() {
+    let token = setup_token("B7s");
+    let w = World::credentialed_with(&token, Some(&b7_claude()));
+    let ask = ["--with-credential", "--", "claude", "-p", "Reply OK", "--output-format", "stream-json", "--verbose"];
+    let o = run(w.cred_exec(&ask), None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 5, "{err}");
+    assert_eq!(text(&o.stdout), B7_STREAM, "claude's output passed through unchanged");
+    assert!(err.contains("ai-env: Anthropic refused the delivered setup-token (HTTP 401): the command exited and is not started again; seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`"), "{err}");
+    assert!(!err.contains("stopping the command") && !err.contains("was stopped"), "two retries never reach the stop: {err}");
+    let rows = w.audit("credential_rejected");
+    assert_eq!((rows.len(), rows[0]["detail"]["how"].as_str()), (1, Some("text")));
+    assert_eq!((starts(&w), fd3_bytes(&w)), (1, token.len()), "claude started once and read the whole token on fd 3");
+    let before = w.decrypts();
+    let o = run(w.cred_exec(&ask), None);
+    assert_token_nowhere(&w, &o, &token);
+    assert_eq!(code(&o), 5, "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("was refused by Anthropic") && text(&o.stderr).contains("ai-env creds setup-token"), "{}", text(&o.stderr));
+    assert_eq!(w.decrypts(), before, "a known-bad seal costs no Touch ID");
+    assert_eq!(starts(&w), 1, "never started again");
+}
+
+/// B7's second exec offline: a `--credential-file` container with a seal of
+/// its own, as B7's garbage containers had, given to a `claude` that prints
+/// what 2.1.296 printed with `--output-format json` (the error result alone,
+/// `api_error_status` 401) and exits 1: exit 5, the line naming that file
+/// and saying the command exited, claude's output unchanged, one
+/// `credential_rejected` row (`how=text`), one start, the whole token read
+/// on fd 3. The refused token is in no output, and neither token is under
+/// the world's root.
+#[test]
+fn b7s_json_refusal_of_a_credential_file_is_exit_5_through_vm_exec() {
+    let refused = setup_token("B7j");
+    let w = World::credentialed_with(&refused, Some(&b7_claude()));
+    let file = w.root.join("garbage2.env");
+    std::fs::copy(w.root.join("bridge").join("credentials").join("setup-token.env"), &file).unwrap();
+    // The setup-token is sealed anew with another token: the file keeps a seal of its own.
+    let sealed = setup_token("B7k");
+    let o = run(w.sealed_cmd(&["creds", "setup-token", "--stdin", "--no-combined"]), Some(format!("{sealed}\n").into_bytes()));
+    assert!(o.status.success(), "creds setup-token: {}", text(&o.stderr));
+    let path = file.display().to_string();
+    let o = run(w.cred_exec(&["--credential-file", &path, "--", "claude", "-p", "Reply OK", "--output-format", "json"]), None);
+    assert_token_nowhere(&w, &o, &refused);
+    assert_token_off_disk(&w, &sealed);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 5, "{err}");
+    assert_eq!(text(&o.stdout), B7_JSON, "claude's output passed through unchanged");
+    assert!(err.contains(&format!("ai-env: Anthropic refused the delivered setup-token from {path} (HTTP 401): the command exited and is not started again; commands given that container now refuse at once")), "{err}");
+    let rows = w.audit("credential_rejected");
+    assert_eq!((rows.len(), rows[0]["detail"]["how"].as_str()), (1, Some("text")));
+    assert_eq!((starts(&w), fd3_bytes(&w)), (1, refused.len()), "claude started once and read the whole token on fd 3");
+}
+
+/// `vm smoke --with-credential`'s credential step reads its `claude -p …
+/// --output-format json` with `vm exec`'s watch: one that answers as 2.1.296
+/// did to a refused token (B7's json run: the error result with
+/// `api_error_status` 401, then exit 1) fails the step naming the refusal,
+/// is audited (`how=text`) and recorded against the seal, so the next smoke
+/// refuses before any VM or Touch ID (exit 5). claude started once, having
+/// read the whole token on fd 3. The token is nowhere in either's output or
+/// under the world's root.
+#[test]
+fn a_smoke_whose_claude_answers_as_b7s_did_records_the_refusal() {
+    let token = setup_token("B7m");
+    let w = World::platform(Some(&b7_claude()));
+    w.seed_credentials(&token, "1.0");
+    let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    let rec: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}\n{err}", text(&o.stdout)));
+    assert_eq!((rec["cred_ok"].as_bool(), rec["cred_is_error"].as_bool()), (Some(false), Some(true)), "{err}");
+    assert!(err.contains("(credential: setup-token): exit 1, Anthropic refused the delivered setup-token (HTTP 401), which is recorded"), "{err}");
+    let rows = w.audit("credential_rejected");
+    assert_eq!((rows.len(), rows[0]["detail"]["how"].as_str()), (1, Some("text")));
+    assert_eq!((starts(&w), fd3_bytes(&w)), (1, token.len()), "claude started once and read the whole token on fd 3");
+    let (decrypts, vms) = (w.decrypts(), w.fake().vms.len());
+    let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
+    assert_token_nowhere(&w, &o, &token);
+    assert_eq!(code(&o), 5, "{}", text(&o.stderr));
+    assert_eq!((w.decrypts(), w.fake().vms.len(), starts(&w)), (decrypts, vms, 1), "refused before any Touch ID, VM or start");
+}
+
+/// A `claude` whose `-p` waits for its stdin's end as 2.1.296 does when that
+/// stdin is not a terminal (B7's stderr said so: nothing was typed into the
+/// terminal `vm exec` forwarded): at most 3 s, then claude's warning on
+/// stderr. It answers `OK` when the end came in time and `waited` when it did
+/// not; `--version` prints a version line (the smoke's first step).
+const STDIN_WAITING_CLAUDE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo '2.1.296 (Claude Code)' ;;
+  -p)
+    ended="$HOME/stdin-ended.$$"
+    # A background job's stdin is /dev/null without job control: it gets the script's own, through fd 4.
+    exec 4<&0
+    ( cat >/dev/null; : > "$ended" ) <&4 >/dev/null 2>&1 &
+    exec 4<&-
+    i=0
+    while [ ! -e "$ended" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    if [ -e "$ended" ]; then
+      said=OK
+    else
+      said=waited
+      echo 'Warning: no stdin data received in 3s, proceeding without it. If piping from a slow command, redirect stdin explicitly: < /dev/null to skip, or wait longer.' >&2
+    fi
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$said" ;;
+esac
+"#;
+
+/// The S7 path that owns a `claude -p` spawn with nothing to read:
+/// `vm smoke --with-credential`'s credential step gives it an empty stdin,
+/// closed at once (`capture` queues the EOF before the spawn), so it never
+/// waits as B7's claude did. Here a `claude` that waits as 2.1.296 does
+/// ([`STDIN_WAITING_CLAUDE`]) answers OK: `cred_ok`. The token is nowhere in
+/// the output or under the world's root.
+#[test]
+fn the_smoke_credential_steps_claude_finds_its_stdin_closed() {
+    let token = setup_token("B7t");
+    let w = World::platform(Some(STDIN_WAITING_CLAUDE));
+    w.seed_credentials(&token, "1.0");
+    let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    let rec: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}\n{err}", text(&o.stdout)));
+    assert_eq!((rec["cred_ok"].as_bool(), rec["cred_is_error"].as_bool()), (Some(true), Some(false)), "{err}");
+    assert!(err.contains("(credential: setup-token): exit 0, answered OK"), "claude found its stdin closed in time: {err}");
+}
+
+/// `vm exec` forwards its own stdin as it is (S6 D8), so the runbook's
+/// by-hand `vm exec … -- claude -p …` lines give claude the terminal's: with
+/// nothing typed, a `claude` that waits as 2.1.296 does
+/// ([`STDIN_WAITING_CLAUDE`]) waits its 3 s and warns, as B7's did (here an
+/// open pipe nobody writes stands for that terminal). The same command with
+/// `</dev/null` closes claude's stdin at once: an answer, no warning.
+#[test]
+fn vm_exec_forwards_an_open_silent_stdin_and_dev_null_closes_it_at_once() {
+    let w = World::new_with(Some(STDIN_WAITING_CLAUDE), &[]);
+    let ask = ["--", "claude", "-p", "Reply OK", "--output-format", "json"];
+    let o = run(w.exec(&ask), None);
+    let (out, err) = (text(&o.stdout), text(&o.stderr));
+    assert_eq!(code(&o), 0, "{err}");
+    assert!(out.contains("\"result\":\"OK\"") && !err.contains("no stdin data received"), "</dev/null: {out}\n{err}");
+    let mut child = w.exec(&ask).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    // Held open and never written: a terminal where nothing is typed.
+    let held = child.stdin.take();
+    let (out, err) = (read_all(child.stdout.take().unwrap()), read_all(child.stderr.take().unwrap()));
+    let status = wait_bounded(&mut child);
+    drop(held);
+    let (out, err) = (text(&out.join().unwrap()), text(&err.join().unwrap()));
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.contains("\"result\":\"waited\"") && err.contains("Warning: no stdin data received in 3s"), "an open, silent stdin: {out}\n{err}");
+}
