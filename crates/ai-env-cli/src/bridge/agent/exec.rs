@@ -798,10 +798,11 @@ async fn pump<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start:
     let result = match rejected {
         // S7 D6: ai-env's own failure (exit 5), saying what it saw of the end.
         // Its line is stderr's last piece, written by stderr's writer like the
-        // rest: a stderr nobody reads holds that thread, never the exit, and
-        // the 5 is silent. A `--credential-file` container with a seal of its
-        // own is named, with advice about it (a byte copy of setup-token.env
-        // is the sealed token's seal).
+        // rest: a stderr nobody reads holds that thread, and the exit until a
+        // stop signal bounds the last flush (below); the 5 is then silent. A
+        // `--credential-file` container with a seal of its own is named, with
+        // advice about it (a byte copy of setup-token.env is the sealed
+        // token's seal).
         Some(r) => {
             let own = credential.and_then(|c| c.file.as_deref().filter(|_| super::credential::seal_tag(&env.paths.setup_token_env()).as_deref() != Some(c.tag.as_str())));
             err.line(format!("ai-env: {}", rejected_text(r, own)));

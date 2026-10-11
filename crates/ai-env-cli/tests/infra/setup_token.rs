@@ -519,6 +519,21 @@ fn status_needs_no_touch_id_and_forget_lists_before_it_deletes() {
     assert_nowhere(env.root(), &key.secret, "the runtime secret");
 }
 
+/// `creds forget --yes` deletes the backups of `combined.env` too, not only
+/// those of `setup-token.env`. `seal_combined` removes `combined.env` before
+/// it seals, but a rebuild racing another can find one written in between,
+/// and `seal_file` then keeps it as a backup, which holds the token.
+#[test]
+fn forget_deletes_a_backup_of_combined_env_too() {
+    let env = Env::new(false);
+    fs::create_dir_all(env.credentials()).unwrap();
+    let bak = env.credentials().join("combined.env.1700000000.bak");
+    fs::write(&bak, "a sealed copy").unwrap();
+    let out = run(&mut env.creds(&["forget", "--yes"]));
+    ok(&out);
+    assert!(stdout(&out).contains(&format!("deleting {}", bak.display())) && !bak.exists(), "{}", shown(&stdout(&out)));
+}
+
 /// `creds status` shows the credential gate's local preconditions for the
 /// image version new VMs run, as doctor judges them with no AWS call (no
 /// state recorded: skipped; a version without a passing check: `no_record`,

@@ -1662,6 +1662,24 @@ async fn a_spawn_naming_the_credential_reads_it_on_fd_3() {
     assert!(s.state.spawns.credential().has(), "the cache keeps its copy");
 }
 
+/// A spawn names the cached credential or carries an inline secret, never
+/// both: `bad_request` whatever the cache holds and whatever the names. Not
+/// `no_credential` before any delivery; and once the credential is cached,
+/// an inline secret under its own name (which the spawn manager's
+/// one-secret rule cannot see once the cached copy took its place) is
+/// refused, never run with the cached value instead.
+#[tokio::test]
+async fn a_spawn_naming_the_credential_never_carries_a_secret_too() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let both = || spawn_with(&SpawnId::new_v7(), &["/bin/echo", "hi"], Some(CRED), BTreeMap::from([(CRED.to_string(), Secret::new(dummy_value("both-inline")))]));
+    let (code, message) = spawn_refused(&mut w, &both()).await;
+    assert_eq!(code, SpawnErrCode::BadRequest, "nothing cached: {message}");
+    deliver(&mut w, &dummy_value("both-cached"), None).await;
+    let (code, message) = spawn_refused(&mut w, &both()).await;
+    assert_eq!(code, SpawnErrCode::BadRequest, "cached: {message}");
+}
+
 /// D3: `/suspend` drops the cached copy before it answers and refuses a
 /// delivery until `/resume` (`credential_err suspended`); a spawn naming the
 /// credential meanwhile is `no_credential`; `/resume` reopens the cache and

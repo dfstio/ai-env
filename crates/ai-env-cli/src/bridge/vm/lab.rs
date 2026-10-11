@@ -3260,6 +3260,28 @@ mod tests {
         assert_eq!(verdict(closed), "fd-unread:fd-3-was-empty");
     }
 
+    /// fd-delivery's scan reads the environment of the shell's own pid
+    /// (`/proc/$$/environ`), never through a `/proc/self/environ` redirect:
+    /// Linux opens that one before `tr`'s exec and reads it as empty after
+    /// it, so every count was 0. A stand-in /proc under a temp dir, as Linux
+    /// shows it to each: the shell's pid holds the token's name (a stand-in
+    /// value), `self` reads empty. The scan counts that one entry, and fd 3's
+    /// 7 bytes.
+    #[test]
+    fn the_fd_scan_reads_the_environ_of_the_shells_own_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proc");
+        std::fs::create_dir_all(root.join("self")).unwrap();
+        std::fs::write(root.join("self").join("environ"), b"").unwrap();
+        let environ = dir.path().join("environ");
+        std::fs::write(&environ, format!("CLAUDE_CODE_OAUTH_TOKEN={}\0PATH=/usr/bin:/bin\0", "x".repeat(16))).unwrap();
+        assert_eq!(FD_SCAN.matches("/proc/").count(), 1, "one /proc path to stand in for");
+        let scan = FD_SCAN.replace("/proc/", &format!("{}/", root.display()));
+        let script = format!("mkdir -p '{r}'/$$ && cp '{e}' '{r}'/$$/environ || exit 9\nexec 3<<EOF\nabcdef\nEOF\n{scan}", r = root.display(), e = environ.display());
+        let o = std::process::Command::new("/bin/sh").arg("-c").arg(script).env_clear().env("PATH", "/usr/bin:/bin").output().expect("/bin/sh runs");
+        assert_eq!(super::fd_scan_counts(&String::from_utf8_lossy(&o.stdout)), (Some(1), Some(7)), "the environ of the shell's own pid");
+    }
+
     /// The documentation account's made-up egress connector.
     const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
 

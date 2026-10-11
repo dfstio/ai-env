@@ -4237,6 +4237,37 @@ mod tests {
         .await;
     }
 
+    /// `vm warm` on a VM whose cache holds the credential's name under
+    /// another seal (a token sealed since: a rotated token) misses, as the
+    /// session's own hit check does: the value goes out in its own
+    /// `credential` frame and the delivery is recorded, never `AlreadyHeld`
+    /// on the name alone, which would leave the VM with the old token.
+    #[tokio::test]
+    async fn warm_delivers_when_the_cache_holds_another_seal() {
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let value = cred_value();
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(Some((CRED_NAME, "another-seal")))).await;
+                match frame(&mut ws).await {
+                    Frame::Credential { name, secret, tag } => assert!(name == CRED_NAME && secret.expose() == &value && tag.as_deref() == Some(CRED_TAG), "{name} {tag:?}"),
+                    other => panic!("the credential, got {other:?}"),
+                }
+                put(&mut ws, &Frame::CredentialOk { name: CRED_NAME.into(), cached: true, tag: Some(CRED_TAG.into()) }).await;
+                ws
+            };
+            let (r, _ws) = tokio::join!(super::super::credential::deliver_only(&env, delivery(&rig, Some(value.clone()), false)), shim);
+            assert_eq!(r.unwrap(), super::super::credential::Warmed::Delivered);
+            assert_eq!(rig.audit("credential_deliver").len(), 1);
+            assert_value_off_disk(&rig);
+        })
+        .await;
+    }
+
     /// M44: `vm warm`'s socket waits out what the session waits out: 503
     /// `not_run`, a 429 (its Retry-After, audited `endpoint_429`), 503
     /// `busy` and `hello_err busy`, on one token; then it delivers. The

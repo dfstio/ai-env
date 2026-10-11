@@ -2425,6 +2425,85 @@ esac
     assert_eq!((w.decrypts(), w.fake().vms.len()), (decrypts, vms), "refused before any Touch ID or VM");
 }
 
+/// The credential step's `cred_ok` wants claude's exit status as well as its
+/// answer: a claude that answers OK (no 401, so nothing is refused) and then
+/// exits 3 fails the step (`cred_ok` false, `cred_is_error` false), its line
+/// naming the status. The token is nowhere in the output or under the
+/// world's root.
+#[test]
+fn a_smoke_whose_claude_answers_ok_then_fails_fails_the_credential_step() {
+    const CLAUDE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo '2.1.284 (Claude Code)' ;;
+  -p) cat <&3 >/dev/null; printf '{"type":"result","subtype":"success","is_error":false,"result":"OK"}\n'; exit 3 ;;
+esac
+"#;
+    let token = setup_token("Xs");
+    let w = World::platform(Some(CLAUDE));
+    w.seed_credentials(&token, "1.0");
+    let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    let rec: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}\n{err}", text(&o.stdout)));
+    assert_eq!((rec["cred_ok"].as_bool(), rec["cred_is_error"].as_bool()), (Some(false), Some(false)), "{err}");
+    assert!(err.contains("(credential: setup-token): exit 3, answered OK"), "{err}");
+}
+
+/// The credential step fails when the token's unseal does: here its Touch
+/// ID dialog is dismissed, after the runtime key's was answered. `cred_ok`
+/// is false, with no `cred_is_error` and the token's source `none`; the
+/// step's line says it was cancelled, and nothing is delivered. The token is
+/// nowhere in the output or under the world's root.
+#[test]
+fn a_smoke_whose_token_unseal_is_dismissed_fails_the_credential_step() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let token = setup_token("Xt");
+    let w = World::platform(None);
+    w.seed_credentials(&token, "1.0");
+    // In front of the world's fake age: every decrypt after the next one (the runtime key's) is a dismissed dialog.
+    let real = w.root.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::copy(w.bin().join("age"), real.join("age")).unwrap();
+    let wrapper = format!(
+        "#!/bin/sh\nn=$(grep -c '^age -d ' \"$FAKE_AGE_LOG\" 2>/dev/null)\nif [ \"${{1:-}}\" = -d ] && [ \"${{n:-0}}\" -gt {} ]; then\n  FAKE_AGE_FAIL=cancel\n  export FAKE_AGE_FAIL\nfi\nexec /bin/sh '{}' \"$@\"\n",
+        w.decrypts(),
+        real.join("age").display()
+    );
+    std::fs::write(w.bin().join("age"), wrapper).unwrap();
+    std::fs::set_permissions(w.bin().join("age"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    let rec: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}\n{err}", text(&o.stdout)));
+    assert_eq!((rec["cred_ok"].as_bool(), rec["cred_is_error"].is_null(), rec["cred_token"].as_str()), (Some(false), true, Some("none")), "{err}");
+    assert!(err.contains("smoke: exec claude -p 'Reply OK' --output-format json (credential): cancelled"), "{err}");
+    assert!(w.audit("credential_deliver").is_empty(), "nothing delivered");
+}
+
+/// The smoke's record keeps flags, never what claude answered: a claude that
+/// answers with the token it was given (no OK) fails the credential step,
+/// and neither the record (stdout), nor the step's line (stderr), nor any
+/// file under the world's root holds the token.
+#[test]
+fn a_smoke_never_keeps_what_claude_answered() {
+    const CLAUDE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo '2.1.284 (Claude Code)' ;;
+  -p) printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' "$(cat <&3)" ;;
+esac
+"#;
+    let token = setup_token("Xu");
+    let w = World::platform(Some(CLAUDE));
+    w.seed_credentials(&token, "1.0");
+    let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    let rec: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{e}: {}\n{err}", text(&o.stdout)));
+    assert_eq!((rec["cred_ok"].as_bool(), rec["cred_is_error"].as_bool()), (Some(false), Some(false)), "{err}");
+    assert!(err.contains("(credential: setup-token): exit 0, answered something else"), "{err}");
+    assert_eq!(w.audit("credential_deliver").len(), 1, "the token reached claude");
+}
+
 /// M14 through the binary: a credentialed `claude` (stream-json) whose
 /// requests each meet one transient retry 401 and then answer is never
 /// stopped: its own status (0) and every line pass through, nothing is
@@ -2950,6 +3029,22 @@ mod unseal_fixes {
         assert_eq!(code(&o), 4, "{}", text(&o.stderr));
         assert_eq!(w.decrypts(), before, "no Touch ID without the key");
         assert!(w.audit("credential_deliver").is_empty() && w.spawn_ids().is_empty());
+    }
+
+    /// A dismissed Touch ID dialog is the operator's answer, never a prompt
+    /// to ask again: `vm exec --with-credential` whose dialog is dismissed
+    /// exits 3 after that one decrypt.
+    #[test]
+    fn a_dismissed_dialog_is_never_asked_again() {
+        let token = setup_token("Zd");
+        let w = World::credentialed(&token);
+        let before = w.decrypts();
+        let mut cancelled = w.cred_exec(&["--with-credential", "--", "true"]);
+        cancelled.env("FAKE_AGE_FAIL", "cancel");
+        let o = run(cancelled, None);
+        assert_token_nowhere(&w, &o, &token);
+        assert_eq!(code(&o), 3, "{}", text(&o.stderr));
+        assert_eq!(w.decrypts() - before, 1, "one dialog, dismissed, and no second one");
     }
 
     /// M56 and M55: without combined.env the runtime key's prompt has the same
@@ -3735,6 +3830,37 @@ fn lab_oauth_t1_never_replies_with_a_refused_seal() {
     assert!(note.contains("; valid: refresh@"), "{note}");
 }
 
+/// S7 G8: touchid-gui's verdict is what its detached unseal did. Run from a
+/// process named Cursor (a link to /bin/sh), as the probe requires, with the
+/// fake age, which answers the terminal's unseal (stdin to stdout) but never
+/// the detached one's shape (`-o FILE`): `lab run touchid-gui` records
+/// terminal-only, never prompted, and exits 1 (not the expectation). No VM,
+/// no AWS call; the token is in no output.
+#[test]
+fn lab_touchid_gui_records_terminal_only_when_the_detached_unseal_fails() {
+    let token = setup_token("Tg");
+    let w = World::bare(None);
+    w.seed_credentials(&token, "1.0");
+    let cursor = w.root.join("Cursor");
+    std::os::unix::fs::symlink("/bin/sh", &cursor).unwrap();
+    let probe = w.sealed_cmd(&["lab", "run", "touchid-gui"]);
+    let mut c = Command::new(&cursor);
+    c.arg("-c").arg("\"$0\" \"$@\"; exit $?").arg(probe.get_program()).args(probe.get_args());
+    for (k, v) in probe.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    let o = run(c, None);
+    assert_token_nowhere(&w, &o, &token);
+    let err = text(&o.stderr);
+    assert_eq!(code(&o), 1, "{err}");
+    assert!(err.contains("probe verdict differs from the expectation: touchid-gui=terminal-only (expected prompted)"), "{err}");
+    let row = probe_row(&w, "touchid-gui").expect("a touchid-gui row");
+    assert_eq!(row["verdict"], "terminal-only", "{}", row["note"]);
+}
+
 /// S7: a SIGTERM while a credential probe's own unseal waits for Touch ID
 /// (without combined.env the token is a second Touch ID, after the VM
 /// started) exits 143, as `vm exec` does for the same stop, never 1 with a
@@ -4043,9 +4169,10 @@ mod integration_fixes {
 
 // ---- S7 fix wave 2: gate ----
 
-/// The gate fixer's tests of the second fix wave (F2, F3, F4, F7, F8, F13,
-/// F14, F16, F19), in a module of their own: their helpers and imports stay
-/// theirs. F20's and F28's are unit tests (`vm::cmd`, `age_cmd`).
+/// The gate fixer's tests of the second fix wave (F2, F4, F7, F8, F13, F14,
+/// F16, F19), in a module of their own: their helpers and imports stay
+/// theirs. F20's and F28's are unit tests (`vm::cmd`, `age_cmd`); F3's `vm
+/// smoke` hangup test is in tests/vm/cli.rs, on tests/vm/lab.rs's pty harness.
 mod fix_wave_2_gate {
     use super::*;
     use ai_env_cli::bridge::agent::credential::{prepare, seal_tag, CredentialPlan, CredentialSupply};
@@ -4924,64 +5051,6 @@ mod fix_wave_2_gate {
         assert_eq!(exit, Some(130), "{err}");
         assert!(holders(&w).contains(&id), "creds status lists the VM");
         assert!(err.contains(&format!("nothing was delivered by this run, but {id} may hold a token sent to it earlier (seal {f}, as its row records): `ai-env vm terminate {id}` clears it")), "{err}");
-    }
-
-    /// `c` started as a session leader whose controlling terminal, stdout and
-    /// stderr are a fresh pty (stdin null; SIGINT, SIGTERM and SIGHUP at
-    /// their defaults): the child and the pty's master, which only the test
-    /// holds (both ends close on exec), non-blocking.
-    fn on_a_terminal(mut c: Command) -> (Child, libc::c_int) {
-        use std::os::unix::process::CommandExt as _;
-        let (mut master, mut slave) = (0, 0);
-        // SAFETY: openpty fills the two fds it is given; no name, termios or window size.
-        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
-        // SAFETY: fcntl on the two fds openpty just returned.
-        unsafe {
-            assert_eq!(libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC), 0);
-            assert_eq!(libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC), 0);
-            assert_eq!(libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK), 0);
-        }
-        c.stdin(Stdio::null());
-        // SAFETY: in the forked child before exec: setsid, ioctl, dup2 and signal are async-signal-safe.
-        unsafe {
-            c.pre_exec(move || {
-                if libc::setsid() == -1 || libc::ioctl(slave, libc::c_ulong::from(libc::TIOCSCTTY), 0) == -1 || libc::dup2(slave, 1) == -1 || libc::dup2(slave, 2) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                    libc::signal(sig, libc::SIG_DFL);
-                }
-                Ok(())
-            });
-        }
-        let child = c.spawn().unwrap();
-        // SAFETY: our own copy of the slave.
-        unsafe { libc::close(slave) };
-        (child, master)
-    }
-
-    /// F3: the terminal closes (its pty's master: SIGHUP to its session, and
-    /// every later write to it fails with EIO) while `vm smoke`'s VM starts.
-    /// The smoke ends its VM and exits 143, as after SIGTERM: none of its
-    /// lines after the stop panics on the dead terminal (the first one did,
-    /// and the exit was 101).
-    #[test]
-    fn a_smoke_whose_terminal_closes_ends_its_vm_with_143() {
-        let w = World::bare(None);
-        // The VM stays PENDING: the smoke waits for RUNNING.
-        w.update_fake(|s| s.auto_advance = false);
-        let (mut child, master) = on_a_terminal(w.cmd(&["vm", "smoke"]));
-        wait_for("RunMicrovm", || !w.fake().vms.is_empty());
-        std::thread::sleep(Duration::from_millis(500));
-        // What the terminal shows so far, read so its buffer never holds the smoke up.
-        let mut buf = [0u8; 4096];
-        // SAFETY: reads into our buffer from the non-blocking master we hold.
-        while unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        // SAFETY: the only master: closing it hangs the terminal up.
-        unsafe { libc::close(master) };
-        let status = wait_bounded(&mut child);
-        let alive: Vec<String> = w.fake().vms.values().filter(|v| !v.state.is_terminal()).map(|v| v.id.clone()).collect();
-        assert_eq!((status.code(), alive), (Some(143), Vec::<String>::new()), "143, and its VM ended");
     }
 }
 

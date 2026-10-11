@@ -1922,7 +1922,7 @@ fn lab_in_background_ignoring(w: &World, probe: &str, ignored: &'static [libc::c
 }
 
 /// Wait (at most 30 s) until the fake's state shows `what`.
-fn wait_for(w: &World, what: &str, seen: impl Fn(&ai_env_cli::bridge::api::FakeState) -> bool) {
+pub(super) fn wait_for(w: &World, what: &str, seen: impl Fn(&ai_env_cli::bridge::api::FakeState) -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !seen(&w.state()) {
         assert!(std::time::Instant::now() < deadline, "no {what} within 30 s");

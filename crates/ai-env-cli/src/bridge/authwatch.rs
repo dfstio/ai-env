@@ -297,6 +297,17 @@ mod tests {
         }
     }
 
+    /// An error result is a text 401 only when its `result` starts with a
+    /// signature: one that merely mentions a signature further on (here a
+    /// failure quoting what a fetch said) refuses nothing, even with exit 1.
+    #[test]
+    fn an_error_result_that_only_mentions_a_signature_is_no_refusal() {
+        let line = "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"the fetch said: API Error: 401\"}\n";
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching);
+        assert!(!w.rejected_at_exit(Some(1)));
+    }
+
     /// A text 401 counts only with exit 1, on either stream, also as a
     /// result line or a last line without a newline.
     #[test]
@@ -314,6 +325,18 @@ mod tests {
             let mut at_0 = AuthWatch::new();
             at_0.feed(stream, text.as_bytes());
             assert!(!at_0.rejected_at_exit(Some(0)), "exit 0 is a recovery: {text}");
+        }
+    }
+
+    /// A text 401 is a refusal only with exit 1, the status claude gives it:
+    /// the same line followed by another failing exit (2, 143 after a stop,
+    /// a signal with no code) is something else, and refuses nothing.
+    #[test]
+    fn a_text_401_with_another_failing_exit_is_no_refusal() {
+        for code in [Some(2), Some(143), None] {
+            let mut w = AuthWatch::new();
+            assert_eq!(w.feed(Stream::Stderr, b"API Error: 401 nope\n"), Verdict::Watching);
+            assert!(!w.rejected_at_exit(code), "exit {code:?}");
         }
     }
 

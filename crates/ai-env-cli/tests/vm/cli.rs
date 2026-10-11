@@ -403,6 +403,34 @@ fn cli_smoke_adopts_after_ambiguous_run_failure() {
     assert!(st.vms.values().all(|v| v.state.is_terminal()), "the VM the ambiguous call created is found and terminated: {}", stderr(&o));
 }
 
+/// F3: the terminal closes (its pty's master: SIGHUP to its session, and
+/// every later write to it fails with EIO) while `vm smoke`'s VM starts.
+/// The smoke ends its VM and exits 143, as after SIGTERM: none of its lines
+/// after the stop panics on the dead terminal (the first one did, and the
+/// exit was 101). On lab.rs's pty harness, as `lab run`'s hangup tests.
+#[test]
+fn cli_smoke_whose_terminal_closes_ends_its_vm_with_143() {
+    use super::lab::{exited_within_a_minute, pty_drain, spawn_on_pty, wait_for};
+    let w = World::new("");
+    // The VM stays PENDING: the smoke waits for RUNNING, its polls scaled to
+    // 200 ms a second (60 s become 12 s), so the hangup comes mid-wait.
+    w.update(|s| s.auto_advance = false);
+    let mut c = w.cmd(&["vm", "smoke"]);
+    c.env("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "200");
+    let (mut child, master) = spawn_on_pty(c);
+    wait_for(&w, "RunMicrovm", |s| !s.vms.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // What the terminal shows so far, read so its buffer never holds the smoke up.
+    let shown = pty_drain(master);
+    // SAFETY: the only master: closing it hangs the terminal up.
+    unsafe { libc::close(master) };
+    let status = exited_within_a_minute(&mut child);
+    let st = w.state();
+    let vms: Vec<String> = st.vms.values().map(|v| format!("{} {}", v.id, v.state.as_str())).collect();
+    let alive: Vec<&String> = st.vms.values().filter(|v| !v.state.is_terminal()).map(|v| &v.id).collect();
+    assert_eq!((status.code(), alive), (Some(143), Vec::<&String>::new()), "143, and its VM ended: {vms:?}; the terminal showed {shown:?} before the hangup");
+}
+
 #[test]
 fn cli_outputs_never_contain_a_token_or_session_token() {
     let w = World::new("");

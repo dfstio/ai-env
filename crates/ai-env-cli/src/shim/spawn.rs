@@ -2490,6 +2490,35 @@ mod tests {
         assert_eq!(c.exited().1, ExitInfo { code: None, signal: Some(15) });
     }
 
+    /// A signal frame reaches every process of the group, not only its
+    /// leader. The leader ignores TERM (`trap '' TERM`, set once its
+    /// background job was started, so the job keeps TERM's default action),
+    /// waits for the job, then on stdin: it outlives the TERM frame, so its
+    /// death, whose group TERM would end the job as well, cannot stand in for
+    /// the frame. Within 3 s of a TERM frame the job is dead (the leader's
+    /// `wait` says 143: TERM) while the leader still runs; a KILL frame then
+    /// ends the leader (exit signal 9) and nothing is left running.
+    #[tokio::test]
+    async fn a_term_frame_reaches_a_member_while_the_leader_ignores_it() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let mut c = Client::new(&m, 1);
+        let (id, leader) = start(&m, 1, req(&["sh", "-c", "sleep 100 & trap '' TERM; echo $!; wait $!; echo $?; read -r line"])).await;
+        assert!(c.until(WAIT, |c| c.out.ends_with(b"\n")).await, "the job started and the leader's trap is set");
+        let job: u32 = String::from_utf8_lossy(&c.out).trim().parse().unwrap();
+        m.signal(1, &id, Sig::Term).unwrap();
+        let ended = c.until(Duration::from_secs(3), |c| c.out.iter().filter(|b| **b == b'\n').count() == 2).await;
+        assert!(ended, "the job {job} outlived the TERM frame by 3 s: stdout {:?}", String::from_utf8_lossy(&c.out));
+        assert_eq!(String::from_utf8_lossy(&c.out), format!("{job}\n143\n"), "the leader's wait: the job died of the TERM");
+        assert!(gone(job), "the leader reaped the job");
+        let s = &m.status(None)[0];
+        assert!(s.alive && c.exit.is_none() && !gone(leader), "the leader ignores TERM and runs on: {s:?}");
+        m.signal(1, &id, Sig::Kill).unwrap();
+        assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        assert_eq!(c.exited().1, ExitInfo { code: None, signal: Some(9) }, "the leader ran on until the KILL frame");
+        assert!(wait_until(Duration::from_secs(5), || gone(leader)).await, "the KILL frame ended the group: its leader was reaped");
+    }
+
     /// A signal the shim ignores is not ignored by its spawns: SIGUSR2,
     /// ignored in this process for the test, still kills the child.
     #[tokio::test]
