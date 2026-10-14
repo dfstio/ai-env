@@ -9,7 +9,8 @@
 //! shim with the `x-aws-proxy-*` headers stripped (the platform strips them
 //! too). Every attempt is recorded with the status the client got. Its own
 //! thread runs a current-thread runtime, so sync and async tests use it
-//! alike. Shared by `tests/shim_bridge_local.rs`, `tests/vm/exec_cli.rs` and `tests/docker_exec.rs` (`#[path]`).
+//! alike. Shared by `tests/shim_bridge_local.rs`, `tests/vm/exec_cli.rs` and `tests/docker_exec.rs` (`#[path]`),
+//! and by the remote rig as `common::fake_endpoint` (S8, `tests/common/remote.rs`).
 //!
 //! Opt-in (S7, [`FakeEndpoint::start_platform`]): the endpoint also plays the
 //! platform's hook client for the shim, so a test no longer posts the hooks
@@ -32,6 +33,18 @@
 //! are; between requests the bridge looks every [`BRIDGE_TICK`] (a test can
 //! stop that, [`FakeEndpoint::ticking`]). One shim stands for one VM: a
 //! second VM's `/run` gets the shim's 409.
+//!
+//! Per-port routing (S8, [`FakeEndpoint::start_routed`]): after the token
+//! check, a request goes to the upstream its `x-aws-proxy-port` names (the
+//! shim's app port for 8080, its code port for 9418); a port with no route
+//! answers 502 `BAD_GATEWAY`, as the proxy does when nothing listens there,
+//! and is recorded like any other. Every attempt records its port, and
+//! [`FakeEndpoint::script_port`] scripts one port's requests (a hold, a 5xx,
+//! a cut mid-body). A request's body goes up as it comes, while the answer's
+//! head is awaited (a `PUT /seed` is read whole before its 201). One request
+//! per connection: one that does not upgrade goes up with `Connection:
+//! close`, so a client's pooled connection never carries a second request
+//! past the check, the script and the record.
 #![allow(dead_code)]
 
 use ai_env_cli::bridge::api::{AuthToken, Call, FakeState, VmState, TOKEN_HEADER};
@@ -76,6 +89,13 @@ pub enum Action {
     Delay { by: Duration },
     /// `Forward` once the test called [`FakeEndpoint::release`] (a redial held back meanwhile).
     Held,
+    /// `Forward`, then both sides are cut once `bytes` of the request's body
+    /// (what the client sends past its head) went up: an upload cut mid-body.
+    /// The client gets no answer (status 0).
+    CutRequestAfter { bytes: u64 },
+    /// `Forward`, then both sides are cut once `bytes` of the answer's body
+    /// (past its head) reached the client: a download cut mid-body.
+    CutResponseAfter { bytes: u64 },
 }
 
 impl Action {
@@ -98,6 +118,8 @@ pub struct Attempt {
     /// so none slips in between); for a request answered before that, how
     /// many by then. 0 without the platform.
     pub hooks: usize,
+    /// The request's `x-aws-proxy-port`; 0 when it named none (or no head came).
+    pub port: u16,
 }
 
 /// One runtime hook the endpoint posted to the shim as the platform
@@ -183,10 +205,29 @@ impl Platform {
 /// Told before each platform hook is posted: the VM and the hook's name.
 type BeforeHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+/// Where a checked request goes.
+enum Upstream {
+    /// Every port to one listener ([`FakeEndpoint::start`]).
+    One(SocketAddr),
+    /// Each port to its own listener; any other port has none (502).
+    Ports(BTreeMap<u16, SocketAddr>),
+}
+
+impl Upstream {
+    fn for_port(&self, port: u16) -> Option<SocketAddr> {
+        match self {
+            Upstream::One(addr) => Some(*addr),
+            Upstream::Ports(routes) => routes.get(&port).copied(),
+        }
+    }
+}
+
 struct Shared {
     fake: PathBuf,
-    upstream: SocketAddr,
+    upstream: Upstream,
     script: Mutex<VecDeque<Action>>,
+    /// Per port: actions for that port's next requests, taken before [`Shared::script`]'s.
+    port_scripts: Mutex<BTreeMap<u16, VecDeque<Action>>>,
     attempts: Mutex<Vec<Attempt>>,
     /// Bumped by [`FakeEndpoint::cut_all`]: every forwarded connection ends.
     cut: tokio::sync::watch::Sender<u64>,
@@ -217,7 +258,7 @@ impl FakeEndpoint {
     /// tokens against the file-backed fake at `fake`.
     #[must_use]
     pub fn start(fake: &Path, upstream: SocketAddr) -> FakeEndpoint {
-        FakeEndpoint::launch(fake, upstream, None)
+        FakeEndpoint::launch(fake, Upstream::One(upstream), None)
     }
 
     /// [`FakeEndpoint::start`], also the platform's hook client for the shim
@@ -225,10 +266,20 @@ impl FakeEndpoint {
     /// hook bridge, each hook recorded ([`FakeEndpoint::hooks`]).
     #[must_use]
     pub fn start_platform(fake: &Path, upstream: SocketAddr, hooks: SocketAddr) -> FakeEndpoint {
-        FakeEndpoint::launch(fake, upstream, Some(hooks))
+        FakeEndpoint::launch(fake, Upstream::One(upstream), Some(hooks))
     }
 
-    fn launch(fake: &Path, upstream: SocketAddr, hooks: Option<SocketAddr>) -> FakeEndpoint {
+    /// The S8 endpoint: [`FakeEndpoint::start`] with a request routed, once
+    /// its token passed the check, by its `x-aws-proxy-port` to that port's
+    /// listener in `routes` (`(8080, app)`, `(9418, code)`); any other port
+    /// answers 502 `BAD_GATEWAY` and is recorded. With `hooks`, also the
+    /// platform's hook client for that shim ([`FakeEndpoint::start_platform`]).
+    #[must_use]
+    pub fn start_routed(fake: &Path, routes: &[(u16, SocketAddr)], hooks: Option<SocketAddr>) -> FakeEndpoint {
+        FakeEndpoint::launch(fake, Upstream::Ports(routes.iter().copied().collect()), hooks)
+    }
+
+    fn launch(fake: &Path, upstream: Upstream, hooks: Option<SocketAddr>) -> FakeEndpoint {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake endpoint");
         listener.set_nonblocking(true).expect("nonblocking listener");
         let addr = listener.local_addr().expect("the endpoint's address");
@@ -236,6 +287,7 @@ impl FakeEndpoint {
             fake: fake.to_path_buf(),
             upstream,
             script: Mutex::new(VecDeque::new()),
+            port_scripts: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(Vec::new()),
             cut: tokio::sync::watch::channel(0).0,
             released: tokio::sync::watch::channel(false).0,
@@ -288,6 +340,13 @@ impl FakeEndpoint {
     /// Queue `actions` for the next connections, in order.
     pub fn script(&self, actions: impl IntoIterator<Item = Action>) {
         self.shared.script.lock().unwrap().extend(actions);
+    }
+
+    /// Queue `actions` for the next requests whose `x-aws-proxy-port` is
+    /// `port`, in order: another port's requests never take them, and they
+    /// go before what [`FakeEndpoint::script`] queued.
+    pub fn script_port(&self, port: u16, actions: impl IntoIterator<Item = Action>) {
+        self.shared.port_scripts.lock().unwrap().entry(port).or_default().extend(actions);
     }
 
     /// Every connection so far, in order.
@@ -370,12 +429,22 @@ impl Head {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
-    /// The head with every `x-aws-proxy-*` header removed (as the platform forwards it).
+    /// The `x-aws-proxy-port` the request names; 0 for none.
+    fn port(&self) -> u16 {
+        self.header("x-aws-proxy-port").and_then(|p| p.parse().ok()).unwrap_or(0)
+    }
+
+    /// The head with every `x-aws-proxy-*` header removed (as the platform
+    /// forwards it); a request that does not upgrade also has its
+    /// `Connection` headers replaced by `Connection: close` (one request per
+    /// connection).
     fn stripped(&self) -> Vec<u8> {
+        let upgrade = self.header("upgrade").is_some();
         let text = String::from_utf8_lossy(&self.raw);
         let mut out = String::new();
         for line in text.split("\r\n") {
-            if line.to_ascii_lowercase().starts_with("x-aws-proxy-") {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("x-aws-proxy-") || (!upgrade && lower.starts_with("connection:")) {
                 continue;
             }
             out.push_str(line);
@@ -385,12 +454,16 @@ impl Head {
         while out.ends_with("\r\n\r\n\r\n") {
             out.truncate(out.len() - 2);
         }
+        if !upgrade {
+            out.truncate(out.len() - 2);
+            out.push_str("Connection: close\r\n\r\n");
+        }
         out.into_bytes()
     }
 }
 
 /// Read up to the end of a head (`\r\n\r\n`), at most [`HEAD_MAX`] bytes.
-async fn read_head(s: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
+async fn read_head(s: &mut (impl AsyncRead + Unpin)) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -416,8 +489,17 @@ fn parse(raw: Vec<u8>, rest: Vec<u8>) -> Head {
     Head { raw, path, headers, rest }
 }
 
-fn record(shared: &Shared, status: u16, path: &str, hooks: usize) {
-    shared.attempts.lock().unwrap().push(Attempt { at: Instant::now(), status, path: path.to_string(), hooks });
+fn record(shared: &Shared, status: u16, path: &str, port: u16, hooks: usize) {
+    shared.attempts.lock().unwrap().push(Attempt { at: Instant::now(), status, path: path.to_string(), hooks, port });
+}
+
+/// The action for a request to `port`: that port's script first, then the
+/// shared one, else `Forward`.
+fn next_action(shared: &Shared, port: u16) -> Action {
+    if let Some(action) = shared.port_scripts.lock().unwrap().get_mut(&port).and_then(VecDeque::pop_front) {
+        return action;
+    }
+    shared.script.lock().unwrap().pop_front().unwrap_or(Action::Forward)
 }
 
 /// How many platform hooks were posted so far (each answer awaited).
@@ -533,31 +615,44 @@ async fn enter(shared: &Shared, p: &mut Platform, vm: &str) {
     post_platform_hook(shared, hooks, vm, "run", &body).await;
 }
 
+/// How a forwarded request ends besides both sides' own end ([`Action`]).
+#[derive(Default)]
+struct Cuts {
+    /// `ForwardThenCut`: this long after the answer's head.
+    after: Option<Duration>,
+    /// `ForwardUntil`: before the answer's bytes that hold it; either side's end ends both.
+    until: Option<String>,
+    /// `CutRequestAfter`: once this much of the request's body went up.
+    request_bytes: Option<u64>,
+    /// `CutResponseAfter`: once this much of the answer's body came back.
+    response_bytes: Option<u64>,
+}
+
 async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
     let Some((raw, rest)) = read_head(&mut client).await else {
-        record(&shared, 0, "", posted(&shared));
+        record(&shared, 0, "", 0, posted(&shared));
         return;
     };
     let head = parse(raw, rest);
-    let action = shared.script.lock().unwrap().pop_front().unwrap_or(Action::Forward);
-    let (cut_after, until) = match action {
+    let port = head.port();
+    let action = next_action(&shared, port);
+    let mut cuts = Cuts::default();
+    match action {
         Action::Respond { status, headers, body } => {
-            record(&shared, status, &head.path, posted(&shared));
+            record(&shared, status, &head.path, port, posted(&shared));
             answer(&mut client, status, &headers, &body).await;
             return;
         }
-        Action::ForwardThenCut { after } => (Some(after), None),
-        Action::ForwardUntil { ref text } => (None, Some(text.clone())),
-        Action::Delay { by } => {
-            tokio::time::sleep(by).await;
-            (None, None)
-        }
+        Action::ForwardThenCut { after } => cuts.after = Some(after),
+        Action::ForwardUntil { ref text } => cuts.until = Some(text.clone()),
+        Action::Delay { by } => tokio::time::sleep(by).await,
         Action::Held => {
             let _ = shared.released.subscribe().wait_for(|r| *r).await;
-            (None, None)
         }
-        Action::Forward | Action::HoldThenResume { .. } => (None, None),
-    };
+        Action::CutRequestAfter { bytes } => cuts.request_bytes = Some(bytes),
+        Action::CutResponseAfter { bytes } => cuts.response_bytes = Some(bytes),
+        Action::Forward | Action::HoldThenResume { .. } => {}
+    }
     // As the platform: the hooks the fake's state owes the shim go before the check, and its
     // auto-resume or a VM's first request before the request goes on.
     let mut platform = match &shared.platform {
@@ -570,7 +665,7 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
     let vm = match check(&shared, &head).await {
         Ok(vm) => vm,
         Err((status, proxy_error)) => {
-            record(&shared, status, &head.path, posted(&shared));
+            record(&shared, status, &head.path, port, posted(&shared));
             answer(&mut client, status, &[("x-aws-proxy-error".into(), proxy_error)], "").await;
             return;
         }
@@ -585,69 +680,155 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
             *shared.resumes.lock().unwrap() += 1;
         }
     }
-    let Ok(Ok(mut upstream)) = tokio::time::timeout(STEP_LIMIT, TcpStream::connect(shared.upstream)).await else {
-        record(&shared, 502, &head.path, answered);
+    // A port nothing listens on, or a listener that is gone: the proxy's 502.
+    let connected = match shared.upstream.for_port(port) {
+        Some(target) => tokio::time::timeout(STEP_LIMIT, TcpStream::connect(target)).await.ok().and_then(Result::ok),
+        None => None,
+    };
+    let Some(mut upstream) = connected else {
+        record(&shared, 502, &head.path, port, answered);
         answer(&mut client, 502, &[("x-aws-proxy-error".into(), "BAD_GATEWAY".into())], "").await;
         return;
     };
     let _ = upstream.set_nodelay(true);
-    let mut sent = head.stripped();
-    sent.extend_from_slice(&head.rest);
-    if upstream.write_all(&sent).await.is_err() {
-        record(&shared, 0, &head.path, answered);
-        return;
-    }
-    // The upstream's answer head goes back first: its status is the attempt's.
-    let Some((reply, more)) = read_head(&mut upstream).await else {
-        record(&shared, 0, &head.path, answered);
-        return;
-    };
-    let status = String::from_utf8_lossy(&reply).split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    record(&shared, status, &head.path, answered);
-    if client.write_all(&reply).await.is_err() || client.write_all(&more).await.is_err() {
-        return;
-    }
-    let mut cut = shared.cut.subscribe();
-    let timer = async {
-        match cut_after {
-            Some(d) => tokio::time::sleep(d).await,
-            None => std::future::pending().await,
-        }
-    };
-    match until {
-        None => tokio::select! {
-            _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
-            () = timer => {}
-            _ = cut.changed() => {}
-        },
-        Some(text) => {
-            let ((mut from_client, mut to_client), (mut from_upstream, mut to_upstream)) = (client.split(), upstream.split());
-            tokio::select! {
-                _ = tokio::io::copy(&mut from_client, &mut to_upstream) => {}
-                () = copy_until(&mut from_upstream, &mut to_client, text.as_bytes()) => {}
-                () = timer => {}
-                _ = cut.changed() => {}
-            }
-        }
-    }
+    forward(&mut client, &mut upstream, &head, &shared, (port, answered), &cuts).await;
     // Dropping both streams cuts the connection on both sides.
 }
 
-/// Copy `from` to `to` until `from` sends bytes holding `text` (those are
-/// not written), or either side ends.
-async fn copy_until(from: &mut (impl AsyncRead + Unpin), to: &mut (impl AsyncWrite + Unpin), text: &[u8]) {
+/// Forward one checked request (`at`: its port and the hooks answered
+/// before it went on) to `upstream`: its head, stripped, and its body as it
+/// comes while the answer's head is awaited; that head back (its status is
+/// the attempt's); then both ways until both sides ended (`until`: until
+/// either did) or a cut: one of `cuts`, or [`FakeEndpoint::cut_all`] once the
+/// answer's head was back.
+async fn forward(client: &mut TcpStream, upstream: &mut TcpStream, head: &Head, shared: &Shared, at: (u16, usize), cuts: &Cuts) {
+    let (port, answered) = at;
+    let path = head.path.as_str();
+    let mut up_left = cuts.request_bytes;
+    let rest = match up_left {
+        Some(n) => &head.rest[..head.rest.len().min(usize::try_from(n).unwrap_or(usize::MAX))],
+        None => &head.rest[..],
+    };
+    let mut sent = head.stripped();
+    sent.extend_from_slice(rest);
+    if upstream.write_all(&sent).await.is_err() {
+        record(shared, 0, path, port, answered);
+        return;
+    }
+    if let Some(left) = up_left.as_mut() {
+        *left -= rest.len() as u64;
+        if *left == 0 {
+            record(shared, 0, path, port, answered);
+            return;
+        }
+    }
+    let either = cuts.until.is_some();
+    let (mut from_client, mut to_client) = client.split();
+    let (mut from_upstream, mut to_upstream) = upstream.split();
+    let mut up = std::pin::pin!(pump(&mut from_client, &mut to_upstream, up_left, None));
+    let mut up_end = None;
+    // The upstream's answer head goes back first: its status is the attempt's.
+    let reply = {
+        let mut reply = std::pin::pin!(read_head(&mut from_upstream));
+        loop {
+            tokio::select! {
+                h = &mut reply => break h,
+                e = &mut up, if up_end.is_none() => {
+                    if e == End::Cut {
+                        record(shared, 0, path, port, answered);
+                        return;
+                    }
+                    up_end = Some(e);
+                }
+            }
+        }
+    };
+    let Some((reply, more)) = reply else {
+        record(shared, 0, path, port, answered);
+        return;
+    };
+    let status = String::from_utf8_lossy(&reply).split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    record(shared, status, path, port, answered);
+    let mut down_left = cuts.response_bytes;
+    let more = match down_left {
+        Some(n) => &more[..more.len().min(usize::try_from(n).unwrap_or(usize::MAX))],
+        None => &more[..],
+    };
+    if to_client.write_all(&reply).await.is_err() || to_client.write_all(more).await.is_err() {
+        return;
+    }
+    if let Some(left) = down_left.as_mut() {
+        *left -= more.len() as u64;
+        if *left == 0 {
+            return;
+        }
+    }
+    let mut cut = shared.cut.subscribe();
+    let mut timer = std::pin::pin!(async {
+        match cuts.after {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending().await,
+        }
+    });
+    let mut down = std::pin::pin!(pump(&mut from_upstream, &mut to_client, down_left, cuts.until.as_deref().map(str::as_bytes)));
+    let mut down_end = None;
+    loop {
+        let ended = [up_end, down_end];
+        if ended.contains(&Some(End::Cut)) || ended.iter().all(Option::is_some) || (either && ended.iter().any(Option::is_some)) {
+            return;
+        }
+        tokio::select! {
+            e = &mut up, if up_end.is_none() => up_end = Some(e),
+            e = &mut down, if down_end.is_none() => down_end = Some(e),
+            () = &mut timer => return,
+            _ = cut.changed() => return,
+        }
+    }
+}
+
+/// How one direction of a forwarded connection ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// Its source ended; the other side's write half was shut down.
+    Eof,
+    /// A cut: a byte limit reached, the `until` text seen, or a read or write failed.
+    Cut,
+}
+
+/// Copy `from` to `to` until `from` ends ([`End::Eof`], `to` shut down, as
+/// `copy_bidirectional` does) or a cut ([`End::Cut`]): `limit` bytes went
+/// (no more of that read is written), `from` sent bytes holding `until` (none
+/// of that read is written, as for a text split across two reads), or a
+/// read or write failed.
+async fn pump(from: &mut (impl AsyncRead + Unpin), to: &mut (impl AsyncWrite + Unpin), mut limit: Option<u64>, until: Option<&[u8]>) -> End {
     let mut buf = vec![0u8; 64 * 1024];
-    // What came last, for a `text` split across two reads.
+    // What came last, for an `until` split across two reads.
     let mut seen = Vec::new();
     loop {
         let n = match from.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) => {
+                let _ = to.shutdown().await;
+                return End::Eof;
+            }
             Ok(n) => n,
+            Err(_) => return End::Cut,
         };
-        seen.extend_from_slice(&buf[..n]);
-        if seen.windows(text.len()).any(|w| w == text) || to.write_all(&buf[..n]).await.is_err() {
-            return;
+        if let Some(text) = until.filter(|t| !t.is_empty()) {
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(text.len()).any(|w| w == text) {
+                return End::Cut;
+            }
+            seen.drain(..seen.len().saturating_sub(text.len()));
         }
-        seen.drain(..seen.len().saturating_sub(text.len()));
+        let take = limit.map_or(n, |l| n.min(usize::try_from(l).unwrap_or(usize::MAX)));
+        if to.write_all(&buf[..take]).await.is_err() {
+            return End::Cut;
+        }
+        if let Some(l) = limit.as_mut() {
+            *l -= take as u64;
+            if *l == 0 {
+                return End::Cut;
+            }
+        }
     }
 }

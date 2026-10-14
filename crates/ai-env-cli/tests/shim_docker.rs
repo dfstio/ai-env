@@ -35,6 +35,11 @@
 //! the shim's environ, mem and maps closed to a spawn; `/suspend` dropping
 //! the cache before its 200 and `/resume` reopening it empty; the value on no
 //! file (binary ones included), command line or environment.
+//! S8 L1, the workspace helper as the agent on Linux: a transcript `PUT
+//! /transcript` writes (0600, the agent's, in 0700 directories it made), a
+//! symlink the agent planted refused with 409; and with a script standing
+//! for the helper (`--helper`), a helper past its budget has its session
+//! ended (`/proc` and pidfds), and one running holds the idle sweep off.
 //! L2: the locally built image (`make image-build-local`) with the real,
 //! pinned claude — the version gate, `/validate` (from the host and from
 //! inside), no build-time state, modes, and (S6) `claude --version` and a
@@ -422,8 +427,13 @@ fn with_flags(mut argv: Vec<String>, flags: &[(&str, &str)]) -> Vec<String> {
 /// `--gid`), `--claude` set to the fake, then `flags` set (replaced or
 /// appended).
 fn l1(conf: &str, docker_args: &[&str], flags: &[(&str, &str)]) -> (Container, tempfile::TempDir) {
+    l1_with(fake_dir(conf), docker_args, flags)
+}
+
+/// [`l1`] with its fake dir made by the test (which may add to it before
+/// the container mounts it at /opt/fake).
+fn l1_with(fake: tempfile::TempDir, docker_args: &[&str], flags: &[(&str, &str)]) -> (Container, tempfile::TempDir) {
     require_enabled();
-    let fake = fake_dir(conf);
     let shipped = entrypoint();
     assert_eq!(shipped.first().map(String::as_str), Some("/usr/local/bin/ai-env"), "the shim is mounted where the ENTRYPOINT runs it: {shipped:?}");
     assert!(shipped.iter().any(|a| a == "--claude"), "--claude in the ENTRYPOINT: {shipped:?}");
@@ -714,9 +724,14 @@ fn agent_l1(flags: &[(&str, &str)]) -> Vm {
 /// [`agent_l1`] up to `/ready`, before any `/run`: the build VM the
 /// platform's `/validate` runs on (it answers 409 once `/run` was accepted).
 fn agent_l1_ready(flags: &[(&str, &str)]) -> (Container, tempfile::TempDir) {
+    agent_l1_ready_with(fake_dir(&format!("VERSION={}\n", lock_version())), flags)
+}
+
+/// [`agent_l1_ready`] with its fake dir made by the test ([`l1_with`]).
+fn agent_l1_ready_with(fake: tempfile::TempDir, flags: &[(&str, &str)]) -> (Container, tempfile::TempDir) {
     let image = std::fs::canonicalize(Path::new(REPO).join("image")).unwrap();
     let image_mount = format!("{}:/opt/image:ro", image.display());
-    let (c, fake) = l1(&format!("VERSION={}\n", lock_version()), &["-v", &image_mount], flags);
+    let (c, fake) = l1_with(fake, &["-v", &image_mount], flags);
     c.sh(SEED);
     wait_ready(&c, 20);
     (c, fake)
@@ -1803,6 +1818,230 @@ fn l1_no_scan_finds_the_cached_credential_on_disk_or_in_a_cmdline() {
     eprintln!("L1 credential scan: disk 0 (canary found), command lines and environments 0 (the live holder's read)");
     a.feed(&hid, b"");
     a.collect(&hid);
+}
+
+// ---- S8 agent L1: the workspace helper as the agent ---------------------------------------
+//
+// The shim's helper is this very binary (`ai-env shim-io`, `current_exe` of
+// the mounted shim), started as the agent for each workspace route; the
+// transcript routes run it on the app port behind the session bearer. Two
+// tests replace it with a script (`--helper`, mounted with the fake claude)
+// to drive what the real helper never does on purpose: overstay its budget,
+// and run long while a spawn ends.
+
+/// The slug a transcript's rel starts with (the picker's, of `/Users/mike/w`).
+const SLUG: &str = "-Users-mike-w";
+
+/// A transcript's rel: `<slug>/<a session's uuid n>.jsonl`.
+fn transcript_rel(slug: &str, n: u64) -> String {
+    format!("{slug}/0199d2a0-0000-7000-8000-{n:012x}.jsonl")
+}
+
+impl Vm {
+    /// `method path` on the app port from the host, with the session bearer: (status, body).
+    fn app(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+        http_with(self.c.port(8080), method, path, &format!("Authorization: Bearer {}\r\n", self.token), body)
+    }
+}
+
+/// A refusal's code (a 4xx or 5xx body of the workspace routes).
+fn refusal_code(body: &str) -> String {
+    serde_json::from_str::<ai_env_cli::wire::workspace::WsRefusal>(body).unwrap_or_else(|e| panic!("a refusal ({e}): {body}")).code
+}
+
+/// T8.4's upload on Linux: `PUT /transcript` (the bearer, `Content-Length`)
+/// has the agent's helper write the transcript under the agent's
+/// `.claude/projects`: 201 `written` with its size and sha256; the file
+/// 0600, the agent's (1000:1000), its two directories made 0700 by the
+/// agent, no temp file left beside it, and nothing under `/Users/mike`
+/// anyone's but the agent's. `GET /transcript` then names it present, with
+/// the same size and sha256.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_transcript_put_is_0600_owned_by_the_agent() {
+    use ai_env_cli::wire::workspace::{TranscriptReply, TranscriptStat, TranscriptWrite};
+    use sha2::Digest as _;
+    let vm = agent_l1(&[]);
+    let rel = transcript_rel(SLUG, 1);
+    let body = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"earlier\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"noted\"}}\n";
+    let sha = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+    let (s, reply) = vm.app("PUT", &format!("/transcript?rel={rel}"), body);
+    assert_eq!(s, 201, "{reply}\n{}", vm.c.logs());
+    let reply: TranscriptReply = serde_json::from_str(&reply).unwrap_or_else(|e| panic!("{e}: {reply}"));
+    assert_eq!((reply.outcome, reply.size, reply.sha256.as_str()), (TranscriptWrite::Written, body.len() as u64, sha.as_str()));
+    let (projects, file) = ("/Users/mike/.claude/projects", format!("/Users/mike/.claude/projects/{rel}"));
+    assert_eq!(vm.c.sh(&format!("stat -c '%a %u:%g' '{file}'")), "600 1000:1000", "the transcript is the agent's, 0600");
+    let dirs = vm.c.sh(&format!("stat -c '%a %u:%g %n' {projects} {projects}/{SLUG}"));
+    assert_eq!(dirs, format!("700 1000:1000 {projects}\n700 1000:1000 {projects}/{SLUG}"), "the directories the agent made");
+    assert_eq!(vm.c.sh(&format!("cat '{file}'")), body.trim_end(), "the bytes sent");
+    assert_eq!(vm.c.sh(&format!("ls -A {projects}/{SLUG}")), rel.split_once('/').map(|(_, f)| f).unwrap_or_default(), "no temp file left beside it");
+    let stray = vm.c.exec_as("0", &["bash", "-c", NOT_THE_AGENTS]);
+    assert!(stray.status.success() && stray.stdout.is_empty(), "paths under /Users/mike that are not the agent's:\n{}", String::from_utf8_lossy(&stray.stdout));
+    let (s, stat) = vm.app("GET", &format!("/transcript?rel={rel}"), "");
+    assert_eq!(s, 200, "{stat}");
+    let stat: TranscriptStat = serde_json::from_str(&stat).unwrap_or_else(|e| panic!("{e}: {stat}"));
+    assert_eq!((stat.present, stat.size, stat.sha256.as_deref()), (true, body.len() as u64, Some(sha.as_str())));
+    assert!(vm.c.logs().lines().any(|l| l.starts_with("ai-env: workspace transcript-put status=201 ")), "{}", vm.c.logs());
+}
+
+/// T8.6's symlink on Linux, for a transcript: the agent planted a link
+/// where the helper writes, once at a slug's directory (to a directory of
+/// its own) and once at a transcript's own name (to a file of its own).
+/// `PUT` and `GET /transcript` of either are 409 `symlink_component`;
+/// nothing went through a link (the directory stays empty, the file keeps
+/// its bytes), no temp file is left anywhere, and nothing under
+/// `/Users/mike` is anyone's but the agent's.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_symlink_planted_by_the_agent_makes_put_transcript_409() {
+    let vm = agent_l1(&[]);
+    let (linked_dir, linked_file) = (transcript_rel(SLUG, 1), transcript_rel("-Users-mike-x", 2));
+    vm.c.sh_as(
+        "1000",
+        &format!(
+            "mkdir -p /Users/mike/.claude/projects/-Users-mike-x /tmp/ai-env-s8-planted && printf 'the agent\\n' > /tmp/ai-env-s8-target \
+             && ln -s /tmp/ai-env-s8-planted /Users/mike/.claude/projects/{SLUG} && ln -s /tmp/ai-env-s8-target /Users/mike/.claude/projects/{linked_file}"
+        ),
+    );
+    for (rel, what) in [(&linked_dir, "a linked slug directory"), (&linked_file, "a linked transcript")] {
+        let (s, body) = vm.app("PUT", &format!("/transcript?rel={rel}"), "{\"type\":\"user\"}\n");
+        assert_eq!((s, refusal_code(&body).as_str()), (409, "symlink_component"), "PUT through {what}: {body}");
+        let (s, body) = vm.app("GET", &format!("/transcript?rel={rel}"), "");
+        assert_eq!((s, refusal_code(&body).as_str()), (409, "symlink_component"), "GET through {what}: {body}");
+    }
+    assert_eq!(vm.c.sh("ls -A /tmp/ai-env-s8-planted"), "", "nothing went through the linked directory");
+    assert_eq!(vm.c.sh("cat /tmp/ai-env-s8-target"), "the agent", "nothing went through the linked file");
+    assert_eq!(vm.c.sh("find / -xdev -name '.ai-env-*.tmp' 2>/dev/null; true"), "", "no temp file left");
+    let stray = vm.c.exec_as("0", &["bash", "-c", NOT_THE_AGENTS]);
+    assert!(stray.status.success() && stray.stdout.is_empty(), "paths under /Users/mike that are not the agent's:\n{}", String::from_utf8_lossy(&stray.stdout));
+}
+
+/// A script standing for `ai-env shim-io` that never answers and ignores
+/// TERM: it leaves a `sleep` in its own group (the helper leads it: the
+/// shim's `setsid`) and one leading a group of its own in its session
+/// (bash job control: the image has no perl for W3's `setpgrp`), as a git
+/// run does (`gitrun` gives each its own group), each pid in /tmp.
+const OVERSTAYING_HELPER: &str = "#!/bin/bash
+sleep 300 &
+echo $! > /tmp/ai-env-s8-group.pid
+set -m
+sleep 300 &
+echo $! > /tmp/ai-env-s8-own.pid
+set +m
+trap '' TERM
+wait
+";
+
+/// A script standing for `ai-env shim-io` that writes its pid, waits for
+/// /tmp/ai-env-s8-go, then answers its settings capture.
+const WAITING_HELPER: &str = "#!/bin/bash
+echo $$ > /tmp/ai-env-s8-helper.pid
+while [ ! -e /tmp/ai-env-s8-go ]; do sleep 0.1; done
+printf '%s\\n' '{\"ok\":true,\"reply\":{\"path\":\"/Users/mike/w\",\"files\":[],\"at\":\"2026-10-12T00:00:00Z\"}}'
+";
+
+/// [`agent_l1`] with `script` as the shim's helper (`--helper`, beside the fake claude).
+fn helper_vm(script: &str) -> Vm {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = fake_dir(&format!("VERSION={}\n", lock_version()));
+    let helper = fake.path().join("helper");
+    std::fs::write(&helper, script).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (c, fake) = agent_l1_ready_with(fake, &[("--helper", "/opt/fake/helper")]);
+    Vm::started(c, Some(fake), 20)
+}
+
+impl Container {
+    /// The number in `file` once it holds one (written by the agent), within 10 s.
+    fn pid_in(&self, file: &str) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(pid) = self.sh(&format!("cat {file} 2>/dev/null; true")).parse() {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "{file} never held a pid:\n{}", self.logs());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `pid`'s process group and session (`/proc/<pid>/stat`).
+    fn group_and_session(&self, pid: u32) -> (u32, u32) {
+        let stat = self.sh(&format!("cat /proc/{pid}/stat"));
+        let fields: Vec<u32> = stat.rsplit_once(") ").map(|(_, rest)| rest.split_whitespace().skip(2).take(2).filter_map(|f| f.parse().ok()).collect()).unwrap_or_default();
+        match fields[..] {
+            [group, session] => (group, session),
+            _ => panic!("no group and session in {stat:?}"),
+        }
+    }
+}
+
+/// W3's open point 9 on Linux: a helper past its budget has its group and
+/// what it left of its session ended, the session found through `/proc` and
+/// each process signalled through a pidfd. The helper ([`OVERSTAYING_HELPER`],
+/// as in W3's native test) left two sleeps: one in its group, one leading a
+/// group of its own in its session. `GET /settings` (its budget 10 s) answers
+/// 504 `timeout` once the shim has TERMed the helper's group, KILLed it 2 s
+/// later, then ended the one process left in the session. Both sleeps are
+/// gone: the one in the group dies of the group's TERM and bash reaps it;
+/// the one leading its own group, orphaned by the helper's KILL, is ended
+/// with the session and reaped by init.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_helper_past_its_budget_has_its_session_ended() {
+    use ai_env_cli::shim::asagent::KILL_AFTER;
+    use ai_env_cli::wire::workspace::budget;
+    let vm = helper_vm(OVERSTAYING_HELPER);
+    let (app, bearer) = (vm.c.port(8080), format!("Authorization: Bearer {}\r\n", vm.token));
+    let started = Instant::now();
+    let asked = std::thread::spawn(move || http_with(app, "GET", "/settings?path=/Users/mike/w", &bearer, ""));
+    let (in_group, own) = (vm.c.pid_in("/tmp/ai-env-s8-group.pid"), vm.c.pid_in("/tmp/ai-env-s8-own.pid"));
+    let ((group, session), (own_group, own_session)) = (vm.c.group_and_session(in_group), vm.c.group_and_session(own));
+    assert_eq!((group, own_session), (session, session), "the first sleep is in the helper's group, the helper leading its session; the second in that session");
+    assert_eq!(own_group, own, "the second sleep leads a group of its own");
+    let (s, body) = asked.join().expect("the request's thread");
+    let took = started.elapsed();
+    assert_eq!((s, refusal_code(&body).as_str()), (504, "timeout"), "{body}");
+    assert!(took < budget::SETTINGS + 2 * KILL_AFTER + Duration::from_secs(3), "the helper's end took {took:?}");
+    let logs = vm.c.wait_log(10, "process(es) in its session: TERM, KILL");
+    let line = |needle: &str| logs.lines().find(|l| l.starts_with("ai-env: workspace helper settings pid=") && l.ends_with(needle)).map(str::to_string);
+    assert!(line("outlived its budget: TERM, KILL").is_some(), "the group ended past the budget:\n{logs}");
+    assert!(line("left 1 process(es) in its session: TERM, KILL").is_some(), "the session's one process ended:\n{logs}");
+    for pid in [in_group, own] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vm.c.alive(pid) {
+            assert!(Instant::now() < deadline, "{pid} outlived the helper:\n{}", vm.c.logs());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    vm.c.wait_log(5, &format!("ai-env: init: reaped orphan {own} "));
+}
+
+/// The idle sweep on Linux (root): a helper running as the agent when a
+/// spawn ends holds the sweep off and lives on; once it ends, the sweep that
+/// was due runs. The helper ([`WAITING_HELPER`]) runs `GET /settings`
+/// meanwhile a spawn leaves a job in a group of its own (bash job control)
+/// and exits: the shim logs the sweep held off by one helper, and the job
+/// and the helper are alive. The helper is let go: its answer reaches the
+/// client (200), and a sweep then kills the job (SIGKILL, reaped by init).
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_running_helper_holds_off_the_idle_sweep() {
+    let vm = helper_vm(WAITING_HELPER);
+    let (app, bearer) = (vm.c.port(8080), format!("Authorization: Bearer {}\r\n", vm.token));
+    let asked = std::thread::spawn(move || http_with(app, "GET", "/settings?path=/Users/mike/w", &bearer, ""));
+    let helper = vm.c.pid_in("/tmp/ai-env-s8-helper.pid");
+    let swept = sweeps(&vm.c.logs()).len();
+    let (out, err, exit) = vm.run(&["bash", "-c", "set -m; sleep 300 & echo $!; exit 0"], b"");
+    assert_eq!(exit, ExitInfo { code: Some(0), signal: None }, "{}", String::from_utf8_lossy(&err));
+    let job: u32 = String::from_utf8_lossy(&out).trim().parse().unwrap_or_else(|e| panic!("{e}: {:?}", String::from_utf8_lossy(&out)));
+    let logs = vm.c.wait_log(10, "ai-env: idle sweep held off: 1 workspace helper(s) running");
+    assert_eq!(sweeps(&logs).len(), swept, "no sweep while the helper runs:\n{logs}");
+    assert!(vm.c.alive(job) && vm.c.alive(helper), "the job and the helper live on:\n{logs}");
+    vm.c.sh("touch /tmp/ai-env-s8-go");
+    let (s, body) = asked.join().expect("the request's thread");
+    assert_eq!(s, 200, "the helper's answer reached the client: {body}");
+    assert_swept(&vm.c, &out);
+    assert!(sweeps(&vm.c.logs()).len() > swept, "a sweep ran once no helper lived:\n{}", vm.c.logs());
 }
 
 // ---- L2: the locally built image ---------------------------------------------------------

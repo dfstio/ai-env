@@ -11,7 +11,28 @@
 //! The tempdir is canonicalized up front (`/var` → `/private/var` on macOS),
 //! so `HOME`, the projects root and every `filePath` agree lexically — as they
 //! do under a real `HOME`.
+//!
+//! S8 (phase 0): a test body runs on either [`Link`]. [`on_links!`] turns
+//! one body into `<name>::local` and, with the shim feature, `<name>::remote`;
+//! [`Prepared::spawn_on`] spawns the wrapper on the link it is given: `Local`
+//! is [`Prepared::spawn`], `Remote` the wrapper in remote mode against the
+//! tempdir's `remote::RemoteRig` (`tests/common/remote.rs`, with the routed
+//! `fake_endpoint` and the shared `green_world`; the shim feature only). The
+//! fake git (`tests/fakes/git.sh`) is installed by [`install_fake_git`] and
+//! read back by [`git_calls`].
 #![allow(dead_code)]
+
+/// Every wait on a child bounded (S8 phase 4): `run_within`, `finish_within`.
+pub mod bounded;
+/// The tests' MicroVM endpoint (S6), routed per port for the remote rig (S8).
+#[cfg(feature = "shim")]
+pub mod fake_endpoint;
+/// S7's seeded green vpc world, shared (S8).
+#[cfg(feature = "shim")]
+pub mod green_world;
+/// The remote link's rig (S8).
+#[cfg(feature = "shim")]
+pub mod remote;
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -28,6 +49,8 @@ use std::time::{Duration, Instant};
 pub const FAKE_V2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/claude-v2.sh");
 /// The S1 exec fake (`tests/wrapper.rs`), hard-linked the same way.
 pub const FAKE_V1: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/claude.sh");
+/// S8's fake git: a logging passthrough to the real git ([`install_fake_git`]).
+pub const FAKE_GIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/git.sh");
 
 /// The session argv of extension 2.1.282's chat spawn.
 pub const SESSION_ARGV: [&str; 16] = [
@@ -50,14 +73,20 @@ pub const SESSION_ARGV: [&str; 16] = [
 ];
 
 /// Variables a developer's shell may carry that would steer the wrapper, the
-/// fake claude or the fake age (S7's `local-scratch` login: the keystore, the
-/// token's descriptor and the unseal); removed from every harness run before
-/// the test's own `envs`.
-pub const REMOVED_ENV: [&str; 55] = [
+/// fake claude, the fake age or the fake git (S7's `local-scratch` login: the
+/// keystore, the token's descriptor and the unseal; S8's VM pin, its
+/// transcript knob and the knobs of the remote session's fakes); removed
+/// from every harness run before the test's own `envs`. Every
+/// `AI_ENV_BRIDGE_*` knob the code reads is here but the bridge root, and
+/// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
+/// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
+/// (`tests/infra/image.rs` checks both).
+pub const REMOVED_ENV: [&str; 78] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
     "AI_ENV_BRIDGE_MODE",
+    "AI_ENV_BRIDGE_VM",
     "AI_ENV_BRIDGE_MIRROR_ROOT",
     "AI_ENV_BRIDGE_LAB_IGNORE_EOF",
     "AI_ENV_BRIDGE_LAB_STDOUT_NOISE",
@@ -67,8 +96,10 @@ pub const REMOVED_ENV: [&str; 55] = [
     "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
     "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
     "AI_ENV_BRIDGE_LAB_AGENT_ADDR",
+    "AI_ENV_BRIDGE_LAB_FAKE_SHELL",
     "AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS",
     "AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS",
+    "AI_ENV_BRIDGE_LAB_TRANSCRIPT",
     "AI_ENV_BRIDGE_TRACE",
     "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
@@ -103,9 +134,30 @@ pub const REMOVED_ENV: [&str; 55] = [
     "FAKE_INIT_AT_TURN",
     "FAKE_MISS_DELAY_MS",
     "FAKE_MISS_EXIT_DELAY_MS",
+    // S8: the remote session's knobs of the fake claude, and the fake git's.
+    "FAKE_RESUME_NEEDS_FILE",
+    "FAKE_WRITE_TRANSCRIPT",
+    "FAKE_CWD",
+    "FAKE_CONFIG_DIR",
+    "FAKE_EDIT",
+    "FAKE_COMMIT",
+    "FAKE_WIP_EDIT",
+    "FAKE_WRITE_SETTINGS",
+    "FAKE_EXIT_DELAY_MS",
+    "FAKE_FINAL_MIRROR_MS",
+    "FAKE_RATE_LIMIT_EVENT",
+    "FAKE_ONBOARDING",
+    "FAKE_ENV_NAMES_LOG",
+    "FAKE_VERSION",
+    "FAKE_ENV_DUMP",
+    "GIT_ARGV_LOG",
+    "GIT_REAL",
+    "FAKE_GIT_FAIL",
+    "FAKE_GIT_KEEP_PACK",
     "FAKE_AGE_FAIL",
     "FAKE_AGE_DELAY_MS",
     "FAKE_AGE_HANG",
+    "FAKE_AGE_IGNORE_TERM",
     "FAKE_AGE_WAIT_FILE",
     "FAKE_AGE_PIDFILE",
     "FAKE_AGE_LOG",
@@ -117,7 +169,9 @@ pub fn uuid(n: u64) -> String {
     format!("{n:08x}-0000-4000-8000-{n:012x}")
 }
 
-/// The fake's session id when neither `FAKE_SESSION_ID` nor `--resume` is given.
+/// The fake's session id when neither `FAKE_SESSION_ID` nor `--resume` is
+/// given: its first process's on a spawn counter (each later one names a
+/// session of its own, `uuid(3054 + 65536 * <generation>)`).
 #[must_use]
 pub fn fake_fixed_sid() -> String {
     uuid(3054)
@@ -194,11 +248,78 @@ pub fn is_echo_of(v: &Value, uuid: &str) -> bool {
     v["type"] == "user" && v["isReplay"] == true && v["uuid"] == uuid
 }
 
+// ---- the link (S8) -----------------------------------------------------------------------
+
+/// Which link a pump test's child runs over (S8): today's local child, or
+/// the remote link (the wrapper in remote mode; its child spawned by the
+/// in-process shim of `remote::RemoteRig`, the shim feature only). Both
+/// exist in every world, so a body written for both compiles where only
+/// the local half runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    Local,
+    Remote,
+}
+
+impl Link {
+    #[must_use]
+    pub fn is_remote(self) -> bool {
+        self == Link::Remote
+    }
+}
+
+/// One test body, two tests (S8, plans/s8-design-tests.md §2.2): `<name>::local`
+/// runs it on [`Link::Local`] and, with the shim feature (the only world with
+/// an in-process shim), `<name>::remote` on [`Link::Remote`]. Attributes before
+/// the body's `|link|` (an `#[ignore = "…"]` while the remote half cannot run
+/// yet) go to the remote half only; doc comments before the name document
+/// the pair. The body sees the test file's items (`use super::*`).
+///
+/// ```ignore
+/// on_links!(
+///     /// One turn, then EOF: exit 0.
+///     a_turn_round_trips,
+///     #[ignore = "S8 wave 2: W5 (the remote half's fake knobs)"]
+///     |link| {
+///         let mut h = Harness::prepare().spawn_on(link, "local-child", &[], &[]);
+///         // …
+///     }
+/// );
+/// ```
+#[macro_export]
+macro_rules! on_links {
+    ($(#[$doc:meta])* $name:ident, $(#[$remote:meta])* |$link:ident| $body:block) => {
+        $(#[$doc])*
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+
+            fn body($link: $crate::common::Link) $body
+
+            #[test]
+            fn local() {
+                body($crate::common::Link::Local);
+            }
+
+            #[cfg(feature = "shim")]
+            #[test]
+            $(#[$remote])*
+            fn remote() {
+                body($crate::common::Link::Remote);
+            }
+        }
+    };
+}
+
 // ---- before the spawn --------------------------------------------------------------------
 
 /// The tempdir set up before the wrapper runs (fake copied, `work/` created),
 /// so a test can plant transcripts and files first.
 pub struct Prepared {
+    /// S8: the remote link's rig, made on first use ([`Prepared::rig`]);
+    /// declared first, so it stops before the tempdir it lives in goes.
+    #[cfg(feature = "shim")]
+    rig: Option<remote::RemoteRig>,
     pub tmp: tempfile::TempDir,
     /// The canonical tempdir path: the wrapper's `HOME`.
     pub root: PathBuf,
@@ -210,21 +331,24 @@ impl Default for Prepared {
     }
 }
 
-/// One 0755 copy of `src` per content under `CARGO_TARGET_TMPDIR/<cache>`,
-/// which every harness hard-links as `<tmp>/claude`. macOS assesses the FIRST
-/// exec of every new file (≈200 ms each, serialised system-wide: 30 fresh
-/// copies exec'd at once took 6 s), which made a parallel test run's children
-/// start seconds late; a hard link shares the inode, so only the master pays.
-fn cached_executable(src: &str, cache: &str) -> PathBuf {
+/// One 0755 copy of `src` per content under `CARGO_TARGET_TMPDIR/<cache>`
+/// (named `<stem>-<digest>`), which every harness hard-links (as `<tmp>/claude`,
+/// and S8's fake git where it is installed).
+/// macOS assesses the FIRST exec of every new file (≈200 ms each, serialised
+/// system-wide: 30 fresh copies exec'd at once took 6 s), which made a
+/// parallel test run's children start seconds late; a hard link shares the
+/// inode, so only the master pays (and so no link is ever written over in
+/// place).
+fn cached_executable(src: &str, cache: &str, stem: &str) -> PathBuf {
     use sha2::Digest;
     use std::os::unix::fs::PermissionsExt;
     let bytes = std::fs::read(src).unwrap_or_else(|e| panic!("read {src}: {e}"));
     let digest = hex::encode(sha2::Sha256::digest(&bytes));
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(cache);
     std::fs::create_dir_all(&dir).expect("mkdir the fake's cache dir");
-    let path = dir.join(format!("claude-{}", &digest[..16]));
+    let path = dir.join(format!("{stem}-{}", &digest[..16]));
     if !path.exists() {
-        let tmp = dir.join(format!(".claude-{}.{}.tmp", &digest[..16], std::process::id()));
+        let tmp = dir.join(format!(".{stem}-{}.{}.tmp", &digest[..16], std::process::id()));
         std::fs::write(&tmp, &bytes).expect("write the fake");
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).expect("chmod the fake");
         std::fs::rename(&tmp, &path).expect("install the fake");
@@ -235,13 +359,19 @@ fn cached_executable(src: &str, cache: &str) -> PathBuf {
 /// The cached master of fake v2 ([`FAKE_V2`]).
 fn fake_master() -> &'static Path {
     static MASTER: OnceLock<PathBuf> = OnceLock::new();
-    MASTER.get_or_init(|| cached_executable(FAKE_V2, "fake-claude-v2"))
+    MASTER.get_or_init(|| cached_executable(FAKE_V2, "fake-claude-v2", "claude"))
 }
 
 /// The cached master of the S1 fake ([`FAKE_V1`]).
 fn fake_v1_master() -> &'static Path {
     static MASTER: OnceLock<PathBuf> = OnceLock::new();
-    MASTER.get_or_init(|| cached_executable(FAKE_V1, "fake-claude-v1"))
+    MASTER.get_or_init(|| cached_executable(FAKE_V1, "fake-claude-v1", "claude"))
+}
+
+/// The cached master of the fake git ([`FAKE_GIT`]).
+fn fake_git_master() -> &'static Path {
+    static MASTER: OnceLock<PathBuf> = OnceLock::new();
+    MASTER.get_or_init(|| cached_executable(FAKE_GIT, "fake-git", "git"))
 }
 
 /// Hard-link `master` at `dest`; on another filesystem, copy `src` there (0755;
@@ -259,6 +389,133 @@ pub fn install_fake_v1(dest: &Path) {
     link_fake(fake_v1_master(), FAKE_V1, dest);
 }
 
+/// Write `vars` to `path` as the knob file a fake sources first (`<the path
+/// it runs as>.knobs`: tests/fakes/claude-v2.sh, tests/fakes/git.sh), for a
+/// fake whose caller clears or strips its environment: one `export
+/// NAME='value'` line each, in order (a later line wins), the value
+/// single-quoted (a `'` in it written `'\''`). A name that is not a shell
+/// identifier panics.
+pub fn write_knobs(path: &Path, vars: &[(&str, &str)]) {
+    let mut text = String::new();
+    for (name, value) in vars {
+        let ident = name.bytes().next().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
+        assert!(ident, "not a shell variable name: {name:?}");
+        text.push_str(&format!("export {name}='{}'\n", value.replace('\'', r"'\''")));
+    }
+    std::fs::write(path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+}
+
+/// The real git the fake git runs (`GIT_REAL`): the first executable `git`
+/// in an absolute entry of this process's `PATH`, else `/usr/bin/git`;
+/// resolved once.
+pub fn git_real() -> &'static Path {
+    static REAL: OnceLock<PathBuf> = OnceLock::new();
+    REAL.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("git"))
+            .chain(std::iter::once(PathBuf::from("/usr/bin/git")))
+            .find(|git| executable(git))
+            .expect("the fake git needs a real git in an absolute PATH entry")
+    })
+}
+
+/// Install the fake git at `dest` (S8): a hard link of its cached master (a
+/// copy on another filesystem; an existing `dest` is kept, never written
+/// over) and beside it `<dest>.knobs`: `GIT_REAL` ([`git_real`]),
+/// `GIT_ARGV_LOG` at `log`, then `knobs` (`FAKE_GIT_FAIL`,
+/// `FAKE_GIT_KEEP_PACK`), which reach it whatever environment `GitRun`
+/// gives it (every `GIT_*` stripped on the Mac, none in the VM). Put `dest`
+/// first on a `PATH` as `git`, or hand it to `GitRun::with_program` or the
+/// shim's `--git`; read the calls back with [`git_calls`].
+pub fn install_fake_git(dest: &Path, log: &Path, knobs: &[(&str, &str)]) {
+    if std::fs::symlink_metadata(dest).is_err() {
+        link_fake(fake_git_master(), FAKE_GIT, dest);
+    }
+    let (real, log) = (git_real().display().to_string(), log.display().to_string());
+    let mut vars = vec![("GIT_REAL", real.as_str()), ("GIT_ARGV_LOG", log.as_str())];
+    vars.extend_from_slice(knobs);
+    let mut path = dest.as_os_str().to_owned();
+    path.push(".knobs");
+    write_knobs(Path::new(&path), &vars);
+}
+
+/// One call the fake git logged ([`git_calls`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCall {
+    /// The `GIT_*` names set when it started (names only, never a value), sorted.
+    pub env: Vec<String>,
+    /// The descriptors from 3 to 254 open when it started.
+    pub fds: Vec<u32>,
+    /// Its arguments, as given.
+    pub args: Vec<String>,
+}
+
+impl GitCall {
+    /// The subcommand: the first argument past git's global options (as the fake finds it).
+    #[must_use]
+    pub fn sub(&self) -> Option<&str> {
+        let mut skip = false;
+        for a in &self.args {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            match a.as_str() {
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--config-env" => skip = true,
+                s if s.starts_with('-') => {}
+                s => return Some(s),
+            }
+        }
+        None
+    }
+
+    /// Does it carry `arg` as one of its arguments?
+    #[must_use]
+    pub fn has(&self, arg: &str) -> bool {
+        self.args.iter().any(|a| a == arg)
+    }
+}
+
+/// Every call the fake git logged to `log`, in order (none when it is absent).
+#[must_use]
+pub fn git_calls(log: &Path) -> Vec<GitCall> {
+    fn list<T>(field: &str, key: &str, parse: impl Fn(&str) -> T) -> Vec<T> {
+        let value = field.strip_prefix(key).unwrap_or_else(|| panic!("fake git log: {key} expected, got {field:?}"));
+        if value == "-" { Vec::new() } else { value.split(',').map(parse).collect() }
+    }
+    /// The fake's `%25`, `%09` and `%0A` back to `%`, tab and newline.
+    fn unescape(arg: &str) -> String {
+        let mut out = String::with_capacity(arg.len());
+        let mut rest = arg;
+        while let Some(at) = rest.find('%') {
+            out.push_str(&rest[..at]);
+            let (c, len) = match rest.get(at..at + 3) {
+                Some("%25") => ('%', 3),
+                Some("%09") => ('\t', 3),
+                Some("%0A") => ('\n', 3),
+                _ => ('%', 1),
+            };
+            out.push(c);
+            rest = &rest[at + len..];
+        }
+        out.push_str(rest);
+        out
+    }
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let env = list(fields.next().unwrap_or_default(), "env=", str::to_string);
+            let fds = list(fields.next().unwrap_or_default(), "fds=", |n| n.parse().unwrap_or_else(|_| panic!("fake git log: fd {n:?}")));
+            GitCall { env, fds, args: fields.map(unescape).collect() }
+        })
+        .collect()
+}
+
 impl Prepared {
     #[must_use]
     pub fn new() -> Prepared {
@@ -266,7 +523,22 @@ impl Prepared {
         let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
         link_fake(fake_master(), FAKE_V2, &root.join("claude"));
         std::fs::create_dir(root.join("work")).expect("mkdir work");
-        Prepared { tmp, root }
+        Prepared {
+            #[cfg(feature = "shim")]
+            rig: None,
+            tmp,
+            root,
+        }
+    }
+
+    /// S8: the remote link's rig in this tempdir, made on first use (the
+    /// in-process shim, the routed endpoint, the green world, the fixture
+    /// repository in `work/`: `remote::RemoteRig`). Call it before planting
+    /// what the VM or the workspace holds when the wrapper starts.
+    #[cfg(feature = "shim")]
+    pub fn rig(&mut self) -> &remote::RemoteRig {
+        let root = self.root.clone();
+        self.rig.get_or_insert_with(|| remote::RemoteRig::new(&root))
     }
 
     /// The wrapper's cwd.
@@ -331,6 +603,37 @@ impl Prepared {
         for (k, v) in envs {
             cmd.env(k, v);
         }
+        self.launch(cmd)
+    }
+
+    /// S8: spawn the wrapper on `link`. `Local` is [`Prepared::spawn`].
+    /// `Remote` (the shim feature) runs it in remote mode against this
+    /// tempdir's rig, made here unless [`Prepared::rig`] made it:
+    /// `AI_ENV_BRIDGE_MODE=remote` whatever `mode` says, the fake API, the
+    /// agent-address knob at the routed endpoint and
+    /// `AI_ENV_BRIDGE_LAB_BACKOFF_MS=100`, with `envs` split by name
+    /// (`remote::on_vm`): the fake claude's knobs to the VM side (its
+    /// `vm-claude.knobs`), everything else to the wrapper.
+    pub fn spawn_on(self, link: Link, mode: &str, extra_args: &[&str], envs: &[(&str, &str)]) -> Harness {
+        match link {
+            Link::Local => self.spawn(mode, extra_args, envs),
+            Link::Remote => self.spawn_remote(extra_args, envs),
+        }
+    }
+
+    #[cfg(feature = "shim")]
+    fn spawn_remote(mut self, extra_args: &[&str], envs: &[(&str, &str)]) -> Harness {
+        let cmd = self.rig().wrapper(extra_args, envs);
+        self.launch(cmd)
+    }
+
+    #[cfg(not(feature = "shim"))]
+    fn spawn_remote(self, _extra_args: &[&str], _envs: &[(&str, &str)]) -> Harness {
+        panic!("the remote link needs the shim feature: on_links! builds its remote half only with it");
+    }
+
+    /// Start `cmd` (the wrapper) with piped stdio and its two readers: the harness.
+    fn launch(self, mut cmd: Command) -> Harness {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let started = Instant::now();
         let mut child = cmd.spawn().expect("spawn ai-env-claude");
@@ -506,6 +809,13 @@ impl Harness {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.prepared.root
+    }
+
+    /// S8: the rig of a run on the remote link ([`Prepared::rig`]); panics on a local run.
+    #[cfg(feature = "shim")]
+    #[must_use]
+    pub fn rig(&self) -> &remote::RemoteRig {
+        self.prepared.rig.as_ref().expect("a run on the remote link (Prepared::spawn_on with Link::Remote) has a rig")
     }
 
     #[must_use]
@@ -939,6 +1249,68 @@ impl Harness {
     pub fn fake_pid(&self, gen: u32) -> Option<u32> {
         let prefix = format!("gen {gen} ");
         self.env_log().iter().find(|l| l.starts_with(&prefix)).and_then(|l| env_log_field(l, "pid")).and_then(|p| p.parse().ok())
+    }
+}
+
+// ---- S8 wave 2 (W5): the pump suites on either link -----------------------------------------
+
+/// How long the rig's shim may take to end what a session on the remote link
+/// left on the VM: its ladder after a final detach (TERM at +0.8 s, KILL at
+/// +1.2 s), then the group's own, with room for a loaded Mac.
+pub const VM_END: Duration = Duration::from_secs(20);
+
+impl Harness {
+    /// `Harness::prepare().spawn_on(link, mode, extra_args, envs)`.
+    pub fn spawn_on(link: Link, mode: &str, extra_args: &[&str], envs: &[(&str, &str)]) -> Harness {
+        Prepared::new().spawn_on(link, mode, extra_args, envs)
+    }
+
+    /// What only the remote link shows once a run on it ended, nothing on
+    /// the local link: the census says `mode:remote`, and the VM is left
+    /// with nothing: within [`VM_END`] the rig's shim holds no spawn (its
+    /// own ladder ends a CLI the wrapper detached from, plan L2, and a spawn
+    /// whose exit is nobody's leaves the table) and every generation's CLI
+    /// is reaped (the shim keeps a dead leader a moment, its group's id
+    /// pinned for the group's ladder).
+    pub fn assert_remote_end(&self, link: Link) {
+        if !link.is_remote() {
+            return;
+        }
+        let note = self.end_note();
+        assert!(note_has(&note, "mode:remote"), "the census names the remote mode: {note}");
+        self.assert_vm_empty();
+    }
+
+    /// Within [`VM_END`], no spawn left in the rig's shim and no CLI the
+    /// fake logged still a process (a run on the remote link).
+    #[cfg(feature = "shim")]
+    fn assert_vm_empty(&self) {
+        let deadline = Instant::now() + VM_END;
+        let clis: Vec<u32> = (1..=self.spawn_count()).filter_map(|gen| self.fake_pid(gen)).collect();
+        while !self.rig().vm_spawns().is_empty() || clis.iter().any(|pid| pid_alive(*pid)) {
+            assert!(Instant::now() < deadline, "the VM still holds a spawn or a CLI {VM_END:?} after the session: {:?}, CLIs {clis:?}\n{}", self.rig().vm_spawns(), self.transcript());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(feature = "shim"))]
+    fn assert_vm_empty(&self) {
+        panic!("the remote link needs the shim feature: on_links! builds its remote half only with it");
+    }
+
+    /// The VM's projects dir (the rig's `vm_projects`): where a remote
+    /// session's CLI keeps its transcripts, and the resume's upload puts
+    /// the Mac's.
+    #[cfg(feature = "shim")]
+    #[must_use]
+    pub fn vm_projects(&self) -> PathBuf {
+        self.rig().vm_projects()
+    }
+
+    #[cfg(not(feature = "shim"))]
+    #[must_use]
+    pub fn vm_projects(&self) -> PathBuf {
+        panic!("the remote link needs the shim feature: on_links! builds its remote half only with it");
     }
 }
 

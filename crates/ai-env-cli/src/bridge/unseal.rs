@@ -223,6 +223,9 @@ impl UnsealJob {
 }
 
 /// Kills one job's decrypt group when dropped while armed ([`UnsealJob::wait_or`]).
+/// The kill returns once the group ended on its TERM and the decrypt's waiter
+/// reaped it (`AgeKill::kill_group`), so a drop on a runtime's thread (S8: the
+/// pump drops a pending remote start on its only one) holds it tens of ms.
 struct CloseOnDrop(Option<Arc<AgeKill>>);
 
 impl CloseOnDrop {
@@ -518,6 +521,57 @@ mod tests {
         let t = Instant::now();
         drop(rt);
         assert!(t.elapsed() < Duration::from_secs(3), "the runtime's shutdown waited {:?} for the blocking wait", t.elapsed());
+    }
+
+    /// S8 phase 4 (TIMING-1): the pump drops a pending remote start, and with
+    /// it this wait, on its only runtime thread. The drop returns once the
+    /// group ended on its TERM and its leader was reaped, never after the
+    /// whole TERM-to-KILL wait (500 ms), which would freeze the pump's host
+    /// lines, signals and deadlines meanwhile.
+    #[test]
+    fn dropping_an_async_wait_returns_once_its_group_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("age.pid");
+        let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1"), ("FAKE_AGE_PIDFILE", &pidfile.display().to_string())]);
+        let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
+        let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(30), "the setup token");
+        let pgid = decrypt_group(&pidfile);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let held = rt.block_on(async {
+            let mut wait = Box::pin(job.wait_or(std::future::pending::<()>()));
+            assert!(tokio::time::timeout(Duration::from_millis(300), &mut wait).await.is_err(), "the dialog waits for its answer");
+            let t = Instant::now();
+            drop(wait);
+            t.elapsed()
+        });
+        assert!(group_ends(pgid), "the dropped wait left decrypt group {pgid} running");
+        assert!(held < Duration::from_millis(250), "the drop held the runtime's thread {held:?}");
+    }
+
+    /// S8 phase 4 (TIMING-1): `kill_group` returns as soon as a group ended
+    /// on its TERM, but its bound still holds for one that ignores the TERM:
+    /// the SIGKILL comes once the 500 ms after the TERM are up, and ends it
+    /// (no age or plugin outlives the wrapper with its dialog up, and the
+    /// caller's thread is held 500 ms at most).
+    #[test]
+    fn a_group_that_ignores_its_term_gets_the_kill_at_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("age.pid");
+        let age = fake_age(dir.path(), &[("FAKE_AGE_HANG", "1"), ("FAKE_AGE_IGNORE_TERM", "1"), ("FAKE_AGE_PIDFILE", &pidfile.display().to_string())]);
+        let (identity, ct) = sealed(&age, dir.path(), b"NEVER\n");
+        let job = UnsealJob::start(Arc::clone(&age), identity, ct, Duration::from_secs(30), "the setup token");
+        let pgid = decrypt_group(&pidfile);
+        let kill = job.kill_handle();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            kill.kill_group();
+            let _ = tx.send(t.elapsed());
+        });
+        let took = rx.recv_timeout(Duration::from_secs(3));
+        let ended = group_ends(pgid);
+        assert!(matches!(took, Ok(t) if (Duration::from_millis(450)..Duration::from_secs(2)).contains(&t)), "kill_group returned within 3 s, once the TERM's 500 ms were up: {took:?}");
+        assert!(ended, "the group that ignored its TERM ended by the KILL");
     }
 
     /// `stop` ends the wait early: the group is killed first, and `Err` carries

@@ -12,7 +12,10 @@
 //! extension's own rule: `..`/absolute/outside → rejected, 3 segments →
 //! rejected, `<project>/<session>.jsonl` or `<project>/<session>/<sub…>`),
 //! and the destination is `dest_root/<the validated relative path itself>` —
-//! a `…/subagents/agent-a1.meta.json` companion keeps its name. Directories
+//! a `…/subagents/agent-a1.meta.json` companion keeps its name. A remote
+//! child's writer (S8: the frames are the VM's output, which the Mac does not
+//! trust) is confined to the session's own project ([`MirrorCfg::project`]):
+//! a frame naming another is refused before anything is created. Directories
 //! below the root are created 0700 one level at a time and a symlink at any
 //! level is refused; files are opened `O_APPEND|O_CREAT|O_NOFOLLOW`, 0600,
 //! regular files only. Existing directories and files are never chmod'ed:
@@ -50,8 +53,26 @@ pub struct MirrorCfg {
     /// `AI_ENV_BRIDGE_MIRROR_ROOT`, else `<Mac config dir>/projects`.
     pub dest_root: PathBuf,
     pub enabled: bool,
+    /// A remote child's (S8) own project, the session's slug: a frame whose
+    /// `<project>` is another is refused ([`MirrorCfg::confined_to`]). `None`:
+    /// any project (a child on this Mac).
+    pub project: Option<String>,
     /// One human line for the log: `mirror writer enabled: …` / `mirror writer disabled: …`.
     pub reason: String,
+}
+
+impl MirrorCfg {
+    /// This configuration confined to `project`, the session's own (a remote
+    /// child's frames name what the VM chose: never the Mac's other
+    /// projects). Without a project the writer is disabled: nothing is
+    /// mirrored rather than anywhere.
+    #[must_use]
+    pub fn confined_to(self, project: Option<&str>) -> MirrorCfg {
+        match project {
+            Some(p) => MirrorCfg { project: Some(p.to_string()), reason: format!("{} (project {p} only)", self.reason), ..self },
+            None => MirrorCfg { enabled: false, project: None, reason: "mirror writer disabled: the remote child's own project is unknown (no slug of the cwd)".to_string(), ..self },
+        }
+    }
 }
 
 /// The Mac's Claude config dir as the wrapper's own environment has it:
@@ -92,7 +113,7 @@ pub fn decide(route_remote: bool, child_local: bool, child_config_dir: &Path, ma
     } else {
         (true, format!("mirror writer enabled: {} -> {}", child_projects_root.display(), dest_root.display()))
     };
-    MirrorCfg { child_projects_root, dest_root, enabled, reason }
+    MirrorCfg { child_projects_root, dest_root, enabled, project: None, reason }
 }
 
 /// Why a frame was not appended.
@@ -102,6 +123,8 @@ pub enum Reject {
     Disabled,
     /// No `filePath`, or one `mirror_key` refuses.
     BadKey,
+    /// A confined writer's frame names another project ([`MirrorCfg::project`]).
+    OtherProject,
     /// A symlink or a non-directory/non-regular file on the way.
     Unconfined(String),
     /// A directory or the file could not be created or opened.
@@ -235,6 +258,15 @@ impl Writer {
                 return Err(e);
             }
         };
+        // A confined writer: another project's frame touches nothing (no directory, no `.meta.json`).
+        if let Some(own) = &self.cfg.project {
+            let project = rel.components().next().map(|c| c.as_os_str().to_string_lossy());
+            if project.as_deref() != Some(own.as_str()) {
+                self.rejected += 1;
+                tracing::warn!(project = ?project.as_deref().unwrap_or("-"), "mirror frame for another project refused: a remote session mirrors its own only");
+                return Err(Reject::OtherProject);
+            }
+        }
         // Subagent metadata: only on a subagent transcript (`<project>/<session>/<sub…>.jsonl`),
         // where the CLI mirrors its `.meta.json` writes.
         let subagent = rel.components().count() >= 4 && rel.extension().is_some_and(|e| e == "jsonl");
@@ -463,7 +495,7 @@ mod tests {
     }
 
     fn writer(f: &Fx) -> Writer {
-        Writer::new(MirrorCfg { child_projects_root: f.child.clone(), dest_root: f.dest.clone(), enabled: true, reason: String::new() })
+        Writer::new(MirrorCfg { child_projects_root: f.child.clone(), dest_root: f.dest.clone(), enabled: true, project: None, reason: String::new() })
     }
 
     fn raw(s: &str) -> Box<RawValue> {
@@ -631,6 +663,28 @@ mod tests {
         let mut w = Writer::new(MirrorCfg { enabled: false, ..writer(&f).cfg.clone() });
         assert_eq!(w.append(Some(&fp(&f, &format!("{SLUG}/{SID}.jsonl"))), &[&raw("{}")]), Err(Reject::Disabled));
         assert_eq!((w.skipped, w.rejected), (1, 0));
+    }
+
+    /// S8: a writer confined to the session's project (a remote child's)
+    /// refuses a frame naming another, a subagent's `.meta.json` included,
+    /// before anything is created, and counts it; its own frames append.
+    /// Without a project of its own it mirrors nothing.
+    #[test]
+    fn a_confined_writer_refuses_another_projects_frames() {
+        let f = fx();
+        let mut w = Writer::new(writer(&f).cfg.clone().confined_to(Some(SLUG)));
+        let other = "-Users-someone-else-project";
+        let line = raw(r#"{"type":"user"}"#);
+        let meta = raw(r#"{"type":"agent_metadata","agentType":"x"}"#);
+        assert_eq!(w.append(Some(&fp(&f, &format!("{other}/{SID}.jsonl"))), &[&line]), Err(Reject::OtherProject));
+        assert_eq!(w.append(Some(&fp(&f, &format!("{other}/{SID}/subagents/agent-a1.jsonl"))), &[&meta, &line]), Err(Reject::OtherProject));
+        assert!(!f.dest.exists(), "nothing was created for another project");
+        w.append(Some(&fp(&f, &format!("{SLUG}/{SID}.jsonl"))), &[&line]).unwrap();
+        assert_eq!(std::fs::read_to_string(f.dest.join(SLUG).join(format!("{SID}.jsonl"))).unwrap(), "{\"type\":\"user\"}\n");
+        assert_eq!((w.appended_frames, w.rejected, w.meta_files), (1, 2, 0));
+        assert!(!f.dest.join(other).exists());
+        let c = writer(&f).cfg.clone().confined_to(None);
+        assert!(!c.enabled && c.reason.contains("own project is unknown"), "{}", c.reason);
     }
 
     #[test]

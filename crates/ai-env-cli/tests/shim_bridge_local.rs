@@ -17,6 +17,8 @@
 //! writes. Every wait is bounded.
 #[path = "common/fake_endpoint.rs"]
 mod fake_endpoint;
+#[path = "common/green_world.rs"]
+mod green_world;
 
 use ai_env_cli::bridge::agent::{run_spawn, spawn_channels, AgentEnv, AgentTarget, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnSpec, Start};
 use ai_env_cli::bridge::api::{FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, VmInfo, FAKE_IMAGE_ARN};
@@ -155,7 +157,7 @@ impl Rig {
             }
             (out, err, pid, exit)
         });
-        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None };
+        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None };
         let env = self.env();
         let outcome = tokio::time::timeout(LIMIT, run_spawn(&env, Start::New(spec), io)).await.expect("the spawn ends in time").unwrap_or_else(|e| panic!("run_spawn: {e}"));
         drop(env);
@@ -1473,22 +1475,8 @@ fn smoke_exec_without_a_recorded_claude_takes_any_version_line() {
 
 // ---- S7: `vm exec --with-credential` through the binary -----------------------------------
 
-/// The documentation account's made-up egress connector (the fixture's ARN).
-const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
-/// The public test recipients of tests/cli.rs: an SE tag one and an X25519 recovery one.
-const SE_REC: &str = "age1tag1qwww38sn08g0m3x3ue8wh33wa4vs2wcx0427jya9fjrhxa94fxjk7yz4e4r";
-const X_REC: &str = "age15csf02ez9ze9xnk3djhm497jwjysdg96tcqwpsn4m5clex767vrs5da5j0";
-/// The fake image version's build (`FakeState::new`).
-const BUILD: i64 = 1_789_804_800;
-
-fn connector_doc() -> serde_json::Value {
-    serde_json::from_str(include_str!("fixtures/egress/lambda-core.get-network-connector.json")).unwrap()
-}
-
-/// A stand-in setup-token of the real shape, built at run time with `tail`.
-fn setup_token(tail: &str) -> String {
-    format!("sk-ant-oat01-{}{tail}", "Kq4_".repeat(20))
-}
+// The connector, its answer and the stand-in setup-token are the shared green world's (S8 phase 0).
+use green_world::{connector_doc, setup_token, CONNECTOR};
 
 impl World {
     fn bin(&self) -> PathBuf {
@@ -1560,56 +1548,17 @@ impl World {
         w
     }
 
-    /// Everything but a VM a credential needs: the fake age and keystore key,
-    /// the configured connector and its answer, the fake shim's `/health`
-    /// offering the credential cache, a passing `egress check` recorded an
-    /// hour ago for `image_version` with the connector's facts and the fake's
-    /// build, a `no-dns` dns-path verdict, and the runtime key and `token`
-    /// sealed by the real `creds` commands (no combined.env).
+    /// Everything but a VM a credential needs: the shared green world
+    /// (`green_world::Green::seed`) under the world's root, its workspace
+    /// root `ws/`: the fake age and keystore key, the configured connector
+    /// and its answer, the fake shim's `/health` offering the credential
+    /// cache, a passing `egress check` recorded an hour ago for
+    /// `image_version` with the connector's facts and the fake's build, a
+    /// `no-dns` dns-path verdict, and the runtime key and `token` sealed by
+    /// the real `creds` commands (no combined.env).
     fn seed_credentials(&self, token: &str, image_version: &str) {
-        use ai_env_cli::bridge::egress::{ConnectorFacts, EgressVerified, VerifiedRecord, DNS_NONE, DNS_RULE};
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(self.bin()).unwrap();
-        for name in ["age", "age-keygen", "age-plugin-se"] {
-            let dst = self.bin().join(name);
-            std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/age.sh"), &dst).unwrap();
-            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let key = self.root.join("keys").join("keys").join("ai-env-bridge");
-        std::fs::create_dir_all(&key).unwrap();
-        std::fs::write(key.join("identity.txt"), format!("# public key: {SE_REC}\nAGE-PLUGIN-SE-1FAKEFAKE\n")).unwrap();
-        std::fs::write(key.join("recipients.txt"), format!("{SE_REC}\n{X_REC}\n")).unwrap();
-        std::fs::write(key.join("meta.toml"), "created = \"2026-09-29\"\naccess_control = \"none\"\n").unwrap();
-        let toml = format!("[aws]\nimage_arn = \"{FAKE_IMAGE_ARN}\"\negress_connector_arn = \"{CONNECTOR}\"\n\n[workspaces]\nroots = [{:?}]\n", self.root.join("ws").display().to_string());
-        std::fs::write(self.root.join("bridge").join("bridge.toml"), toml).unwrap();
-        self.update_fake(|s| {
-            s.connectors.insert(CONNECTOR.to_string(), connector_doc());
-            s.health_caps = vec![ai_env_cli::wire::frame::CAP_CREDENTIAL_CACHE.to_string()];
-        });
-        let now = ai_env_cli::wire::time::unix_now();
-        let record = VerifiedRecord {
-            image_arn: FAKE_IMAGE_ARN.into(),
-            image_version: image_version.into(),
-            connector: CONNECTOR.into(),
-            vm_id: "microvm-checked".into(),
-            at: ai_env_cli::wire::time::rfc3339_utc(now - 3600),
-            dns: DNS_NONE.into(),
-            dns_rule: DNS_RULE,
-            connector_facts: ConnectorFacts::from_get(&connector_doc()).unwrap(),
-            image_created_at: Some(BUILD),
-            ..VerifiedRecord::default()
-        };
-        std::fs::create_dir_all(self.root.join("bridge").join("state")).unwrap();
-        std::fs::write(self.root.join("bridge").join("state").join("egress-verified.toml"), toml::to_string(&EgressVerified { records: vec![record], ..EgressVerified::default() }).unwrap()).unwrap();
-        std::fs::create_dir_all(self.root.join("bridge").join("lab")).unwrap();
-        let dns_row = serde_json::json!({ "probe": "dns-path", "verdict": DNS_NONE, "ts": ai_env_cli::wire::time::rfc3339_utc(now - 7200) });
-        std::fs::write(self.root.join("bridge").join("lab").join("probes.jsonl"), format!("{dns_row}\n")).unwrap();
-        let secret = format!("{}cred", "Tq8+".repeat(9));
-        let aws = format!("{{\"AccessKey\": {{\"UserName\": \"ai-env-runtime\", \"AccessKeyId\": \"AKIA{}\", \"Status\": \"Active\", \"SecretAccessKey\": \"{secret}\"}}}}", "CRED".repeat(4));
-        let o = run(self.sealed_cmd(&["creds", "aws-set"]), Some(aws.into_bytes()));
-        assert!(o.status.success(), "creds aws-set: {}", text(&o.stderr));
-        let o = run(self.sealed_cmd(&["creds", "setup-token", "--stdin", "--no-combined"]), Some(format!("{token}\n").into_bytes()));
-        assert!(o.status.success(), "creds setup-token: {}", text(&o.stderr));
+        let (fake, roots) = (self.fake_path(), [self.root.join("ws")]);
+        green_world::Green { root: &self.root, fake: &fake, roots: &roots }.seed(token, image_version, false, &|args| self.sealed_cmd(args));
     }
 }
 

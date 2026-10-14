@@ -31,6 +31,16 @@
 //! (`crate::bridge::signals`), so a stop that comes between two phases is
 //! never lost, and one that came before an unseal spares its dialog.
 //!
+//! S8: one dialog at a time on this Mac (`state/unseal.lock`, taken around
+//! each dialog by every wrapper, `vm warm` and credentialed `vm exec`; the
+//! wait counts against the unseal's budget, and no turn in time is the
+//! deadline's exit 5); the remote session's unseals
+//! ([`backend_for_session`], [`prepare_session`]) are
+//! [`Stopping::ByDrop`]: no listener of their own, cancelled only by
+//! dropping their future (the pump owns the signals), the budget never past
+//! Cursor's initialize window, the countdown as `ai-env-claude`, and no
+//! `ai-env:` line (every note goes through `bridge::voice`).
+//!
 //! Audit rows: `credential_gate` (passed, or the refused condition and which
 //! half), `credential_unseal` (what, ms, outcome: `ok`, `exit N`, or
 //! `stopped` when the command's own stop dropped the unseal), and the
@@ -46,6 +56,7 @@ use crate::bridge::setup_token::{combined_state, parse_combined, parse_token_env
 use crate::bridge::unseal::UnsealJob;
 use crate::bridge::vm::cmd::{audit_event, backend, Backend, Ctx};
 use crate::bridge::vm::registry::VmRow;
+use crate::bridge::voice;
 use crate::errors::{CliError, Result};
 use crate::store::{validate_key_name, Keystore};
 use crate::wire::frame::{Deliver, CAP_CREDENTIAL_CACHE};
@@ -262,8 +273,8 @@ pub(crate) fn record_rejection(paths: &Paths, vm_id: &str, tag: &str, how: &str)
         }
     });
     if let Err(e) = written {
-        // Never a panic: `vm exec` gets here after its pump, when a stop may have closed the terminal.
-        crate::bridge::signals::say(&format!("ai-env: warning: the rejection of seal {tag} is not recorded ({e})"));
+        // Never a panic (the voice): `vm exec` gets here after its pump, when a stop may have closed the terminal.
+        voice::warn(&format!("the rejection of seal {tag} is not recorded ({e})"));
     }
     audit_event(paths, "credential_rejected", &[("id", vm_id.to_string()), ("tag", tag.to_string()), ("how", how.to_string())]);
 }
@@ -359,16 +370,85 @@ fn budget(ctx: &Ctx) -> Duration {
     ctx.knobs.unseal_timeout.unwrap_or_else(|| ctx.cfg.creds.unseal_budget())
 }
 
+/// Who answers a stop signal while an unseal waits for Touch ID (S8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopping {
+    /// The command (S7): its own listeners (`crate::bridge::signals`) end the
+    /// unseal, its dialog closed, with an `ai-env:` line and 130 or 143.
+    Own,
+    /// Whoever drops the unseal's future: the remote session's pipeline,
+    /// which the pump drops on a host EOF or a signal (it owns them). No
+    /// listener of its own and no stop line; the dialog closes with the
+    /// future. Its budget is the wrapper's: the configured one, but ending
+    /// [`SESSION_DIALOG_MARGIN`] before the pipeline's deadline, T0 + 50 s
+    /// of Cursor's initialize window, which opened at `window_from`
+    /// ([`session_room`]), the wait for another dialog
+    /// (`state/unseal.lock`) included.
+    ByDrop { window_from: Instant },
+}
+
+/// What the lock's waiting notice calls another dialog.
+const UNSEAL_LOCK_WHAT: &str = "another Touch ID dialog (state/unseal.lock)";
+
+/// `state/unseal.lock`, held around one Touch ID dialog (S8): dialogs of
+/// wrappers, `vm warm` and credentialed `vm exec` come one at a time; the
+/// wait for it is bounded by `budget` (`Busy` past it), which [`turn`]
+/// counts against the dialog's.
+pub(crate) async fn unseal_lock(paths: &Paths, budget: Duration) -> std::result::Result<crate::bridge::vm::lock::FlockGuard, BridgeError> {
+    crate::bridge::vm::lock::lock_exclusive(&paths.unseal_lock(), budget, UNSEAL_LOCK_WHAT).await
+}
+
+/// The deadline's failure, as `UnsealJob` words it, for an unseal whose
+/// budget ran out before its dialog could open (the wait for another dialog
+/// took it): exit 5, `unseal::is_deadline`.
+fn no_time_left(what: &str, budget: Duration, advice: &str) -> CliError {
+    CliError::AuthUnavailable(format!("no Touch ID within {} s, so {what} stayed sealed ({advice})", budget.as_secs()))
+}
+
+/// A dialog's turn (S8): `state/unseal.lock` waited for within `allowed`,
+/// the unseal's whole budget as the wait starts, then what is left of it for
+/// the dialog (`left` of the time waited: the command's [`left_after`], or
+/// the wrapper's room in Cursor's window). No turn in time, or nothing left
+/// after it, is the deadline's error naming `allowed` (exit 5), never `Busy`.
+async fn turn(paths: &Paths, allowed: Duration, left: impl FnOnce(Duration) -> Duration, what: &str, advice: &str) -> Result<(crate::bridge::vm::lock::FlockGuard, Duration)> {
+    let asked = Instant::now();
+    let lock = match unseal_lock(paths, allowed).await {
+        Ok(lock) => lock,
+        Err(BridgeError::Busy(why)) => {
+            tracing::info!("no turn for the Touch ID dialog: {why}");
+            return Err(no_time_left(what, allowed, advice));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let left = left(asked.elapsed());
+    if left.is_zero() {
+        return Err(no_time_left(what, allowed, advice));
+    }
+    Ok((lock, left))
+}
+
+/// What a command's dialog has of its one budget `allowed` once its turn
+/// came after `waited`: the wait in whole seconds, as the wrapper's window
+/// counts it (`pump::scratch_unseal_budget`), so a turn that came at once
+/// leaves the whole budget (and the countdown says it).
+fn left_after(allowed: Duration, waited: Duration) -> Duration {
+    allowed.saturating_sub(Duration::from_secs(waited.as_secs()))
+}
+
 /// One timed, killable unseal of a sealed credentials file with
-/// `[creds].key`: the countdown goes to stderr; the deadline is exit 5 with
-/// `deadline`'s advice; SIGINT (130), SIGTERM or SIGHUP (143) close the dialog
-/// first, since `age` runs in its own process group and a terminal's signal
-/// no longer reaches it. The listeners exist before the dialog does, and stay
-/// with the command afterwards (`crate::bridge::signals`): a stop that came
-/// before its first prompt, while no phase listened, ends it with no dialog
-/// at all; the token's unseal runs inside a phase that listens
-/// (`signals::stoppable`), which answers a stop first and drops the unseal
-/// before its dialog.
+/// `[creds].key`: the countdown goes to stderr (`ai-env:`, or
+/// `ai-env-claude:` in the wrapper: `voice::prefix`); the deadline is exit 5
+/// with `deadline`'s advice; the dialog waits for any other one on this Mac
+/// first (`state/unseal.lock`, S8). With [`Stopping::Own`], SIGINT (130),
+/// SIGTERM or SIGHUP (143) close the dialog first, since `age` runs in its
+/// own process group and a terminal's signal no longer reaches it. The
+/// listeners exist before the dialog does, and stay with the command
+/// afterwards (`crate::bridge::signals`): a stop that came before its first
+/// prompt, while no phase listened, ends it with no dialog at all; the
+/// token's unseal runs inside a phase that listens (`signals::stoppable`),
+/// which answers a stop first and drops the unseal before its dialog. With
+/// [`Stopping::ByDrop`] (the wrapper) nothing listens here and nothing is
+/// said: dropping the future is the only stop.
 /// Dropping this future (an outer select or timeout) closes the dialog too.
 /// Returns the plaintext and the sealed text it was decrypted from (a
 /// container: no secret), read once before the dialog: what is said of the
@@ -381,7 +461,8 @@ fn budget(ctx: &Ctx) -> Duration {
 /// group, so a terminal's Ctrl-C ends it too: the listeners are taken first,
 /// and a stop that came while it ran is the answer (130 or 143), never the
 /// failed probe it caused (F19).
-pub async fn unseal_killable(store: &Keystore, ctx: &Ctx, path: &Path, what: &str, hint: &str, deadline: &str, checked: Option<&str>) -> Result<(Zeroizing<Vec<u8>>, String)> {
+#[allow(clippy::too_many_arguments)]
+pub async fn unseal_killable(store: &Keystore, ctx: &Ctx, path: &Path, what: &str, hint: &str, deadline: &str, checked: Option<&str>, stopping: Stopping) -> Result<(Zeroizing<Vec<u8>>, String)> {
     let key = ctx.cfg.creds.key.as_str();
     validate_key_name(key).map_err(|e| CliError::Msg(format!("[creds].key: {e}")))?;
     let text = sealed_text(path, hint)?;
@@ -393,16 +474,86 @@ pub async fn unseal_killable(store: &Keystore, ctx: &Ctx, path: &Path, what: &st
     }
     let cont = crate::container::read(&text)?;
     let name = crate::select::resolve_for_decrypt(store, Some(key), &cont)?;
-    let mut stops = crate::bridge::signals::Stops::take()?;
+    let Stopping::ByDrop { window_from } = stopping else {
+        return unseal_own(store, ctx, &name, cont.data, what, deadline).await.map(|plain| (plain, text));
+    };
+    let age = Arc::new(AgeTool::probe()?);
+    let dialog = Dialog { age, identity: store.identity_path(&name), data: cont.data, what, advice: deadline };
+    Ok((unseal_by_drop(&ctx.paths, dialog, budget(ctx), window_from).await?, text))
+}
+
+/// One Touch ID dialog to open: the decrypt of `data` with `identity`, what
+/// it unseals (`what`, for the countdown and the deadline) and the
+/// deadline's advice.
+struct Dialog<'a> {
+    age: Arc<AgeTool>,
+    identity: PathBuf,
+    data: Vec<u8>,
+    what: &'a str,
+    advice: &'a str,
+}
+
+/// What the wrapper's dialog ([`Stopping::ByDrop`]) keeps clear of the
+/// pipeline's deadline, T0 + 50 s (`remote::INIT_DEADLINE`): its own
+/// deadline, the kill of its group (at most `age_cmd`'s 0.5 s from TERM to
+/// KILL) and the failure's way back all come before it, so an unanswered
+/// dialog ends as the unseal's deadline (exit 5, `no Touch ID within N s`),
+/// never as the pipeline's (S8 phase 4).
+const SESSION_DIALOG_MARGIN: Duration = Duration::from_secs(1);
+
+/// The wrapper's room for a dialog once `used` of Cursor's window is gone:
+/// `configured` (the unseal's budget), but in whole seconds (the countdown
+/// says them) never past [`SESSION_DIALOG_MARGIN`] before T0 + 50 s, so the
+/// dialog's deadline is T0 + 49 s at the latest.
+fn session_room(configured: Duration, used: Duration) -> Duration {
+    let room = crate::bridge::remote::INIT_DEADLINE.saturating_sub(used).saturating_sub(SESSION_DIALOG_MARGIN);
+    configured.min(Duration::from_secs(room.as_secs()))
+}
+
+/// [`Stopping::ByDrop`]'s dialog: its turn on `state/unseal.lock`, then the
+/// decrypt, both within `configured` (the unseal's budget) and within the
+/// wrapper's room in Cursor's window opened at `window_from`
+/// ([`session_room`]); no listener, no stop line, the countdown in this
+/// process's voice. Dropping the future closes the dialog
+/// (`UnsealJob::wait_or`), or gives up the wait for the lock.
+async fn unseal_by_drop(paths: &Paths, dialog: Dialog<'_>, configured: Duration, window_from: Instant) -> Result<Zeroizing<Vec<u8>>> {
+    let Dialog { age, identity, data, what, advice } = dialog;
+    let room = || session_room(configured, window_from.elapsed());
+    let (lock, left) = turn(paths, room(), |_| room(), what, advice).await?;
+    let job = UnsealJob::start(age, identity, data, left, what).with_prefix(voice::prefix()).with_deadline(advice);
+    let answer = job.wait_or(std::future::pending::<std::convert::Infallible>()).await.unwrap_or_else(|never| match never {});
+    drop(lock);
+    answer
+}
+
+/// [`unseal_killable`] under [`Stopping::Own`]: the command's listeners (see
+/// there), its stop line, then its [`turn`] and the dialog, both within the
+/// one budget (the wait for another dialog counts against it).
+async fn unseal_own(store: &Keystore, ctx: &Ctx, name: &str, data: Vec<u8>, what: &str, deadline: &str) -> Result<Zeroizing<Vec<u8>>> {
+    use crate::bridge::signals::{stoppable, Stops};
+    let mut stops = Stops::take()?;
     let probed = AgeTool::probe();
+    let allowed = budget(ctx);
     let outcome = match stops.pending().await {
         Some(stop) => Err((stop, "before Touch ID was asked for", "")),
         None => match probed {
-            Ok(age) => UnsealJob::start(Arc::new(age), store.identity_path(&name), cont.data, budget(ctx), what)
-                .with_deadline(deadline)
-                .wait_or(stops.next())
-                .await
-                .map_err(|stop| (stop, "while waiting for Touch ID", "the dialog was closed and ")),
+            Ok(age) => match stoppable(&mut stops, turn(&ctx.paths, allowed, |waited| left_after(allowed, waited), what, deadline)).await {
+                Ok(Ok((lock, left))) => {
+                    let answer = UnsealJob::start(Arc::new(age), store.identity_path(name), data, left, what)
+                        .with_prefix(voice::prefix())
+                        .with_deadline(deadline)
+                        .wait_or(stops.next())
+                        .await
+                        .map_err(|stop| (stop, "while waiting for Touch ID", "the dialog was closed and "));
+                    drop(lock);
+                    answer
+                }
+                Ok(Err(e)) => {
+                    stops.keep();
+                    return Err(e);
+                }
+                Err(stop) => Err((stop, "while waiting for another Touch ID dialog", "")),
+            },
             Err(e) => {
                 stops.keep();
                 return Err(e);
@@ -410,11 +561,10 @@ pub async fn unseal_killable(store: &Keystore, ctx: &Ctx, path: &Path, what: &st
         },
     };
     stops.keep();
-    let plain = outcome.unwrap_or_else(|(stop, when, closed)| {
-        crate::bridge::signals::say(&format!("ai-env: stopped {when} ({}): {closed}{what} stayed sealed", stop.name()));
+    outcome.unwrap_or_else(|(stop, when, closed)| {
+        voice::note(&format!("stopped {when} ({}): {closed}{what} stayed sealed", stop.name()));
         Err(CliError::Exit(stop.status()))
-    })?;
-    Ok((plain, text))
+    })
 }
 
 /// Exit 5 for a token's container sealed anew after [`check`] read it (M38):
@@ -488,14 +638,15 @@ impl Drop for UnsealRow<'_> {
 /// it): exit 7 with no Touch ID, and no row. `--credential-file`'s one-shot
 /// delivery needs no cache, and comes only with `vm exec`, before anything
 /// started.
-async fn unseal_token(store: &Keystore, ctx: &Ctx, path: &Path, what: &'static str, source: &str, vm_id: &str, checked: &str) -> Result<(SetupToken, String)> {
+#[allow(clippy::too_many_arguments)]
+async fn unseal_token(store: &Keystore, ctx: &Ctx, path: &Path, what: &'static str, source: &str, vm_id: &str, checked: &str, stopping: Stopping) -> Result<(SetupToken, String)> {
     let one_shot = source == "file";
     if let Some(e) = crate::bridge::vm::registry::read_row(&ctx.paths, vm_id).ok().flatten().as_ref().and_then(cannot_hold).filter(|_| !one_shot) {
         return Err(e);
     }
     let deadline = if one_shot { "nothing was started; answer the dialog sooner or raise [creds].unseal_timeout_s" } else { "nothing was delivered; answer the dialog sooner or raise [creds].unseal_timeout_s" };
     let row = UnsealRow::start(&ctx.paths, Some(vm_id), source);
-    let r = unseal_killable(store, ctx, path, what, "seal it with `ai-env creds setup-token`", deadline, Some(checked)).await.and_then(|(plain, sealed)| Ok((parse_token_env(&plain)?, tag_of(&sealed))));
+    let r = unseal_killable(store, ctx, path, what, "seal it with `ai-env creds setup-token`", deadline, Some(checked), stopping).await.and_then(|(plain, sealed)| Ok((parse_token_env(&plain)?, tag_of(&sealed))));
     row.end(&r);
     r
 }
@@ -511,6 +662,19 @@ async fn unseal_token(store: &Keystore, ctx: &Ctx, path: &Path, what: &'static s
 /// was decrypted from records for it ([`from_combined`]); a text that
 /// records none hands over no token (it is unsealed on its own if needed).
 pub async fn backend_for_credential(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan) -> Result<(Backend, Option<(SetupToken, String)>)> {
+    backend_with(store, ctx, plan, Stopping::Own).await
+}
+
+/// [`backend_for_credential`] for the remote session (S8 P1, D1: one Touch
+/// ID per wrapper process): the same unseal (with a current `combined.env`
+/// the token comes with the runtime key) under [`Stopping::ByDrop`], its
+/// budget ending before Cursor's initialize window, opened at `window_from`
+/// (the census start), would; nothing on stderr but the countdown.
+pub async fn backend_for_session(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, window_from: Instant) -> Result<(Backend, Option<(SetupToken, String)>)> {
+    backend_with(store, ctx, plan, Stopping::ByDrop { window_from }).await
+}
+
+async fn backend_with(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, stopping: Stopping) -> Result<(Backend, Option<(SetupToken, String)>)> {
     let container = matches!(CredentialsSource::parse(&ctx.cfg.aws.credentials)?, CredentialsSource::Container);
     let real_unseal = ctx.knobs.fake_api.is_none() || ctx.knobs.fake_api_unseal;
     if !container || !real_unseal {
@@ -521,19 +685,19 @@ pub async fn backend_for_credential(store: &Keystore, ctx: &Ctx, plan: &Credenti
         && match combined_state(&ctx.paths) {
             CombinedState::Current => true,
             state => {
-                eprintln!("ai-env: combined.env is {}: the setup token is a second Touch ID if the VM does not hold it (`ai-env creds setup-token` rebuilds combined.env)", state.word());
+                voice::note(&format!("combined.env is {}: the setup token is a second Touch ID if the VM does not hold it (`ai-env creds setup-token` rebuilds combined.env)", state.word()));
                 false
             }
         };
     if !combined {
         let hint = "seal the runtime key with `make runtime-key` (or set [aws] credentials = \"profile:<name>\")";
-        let (plain, _) = unseal_killable(store, ctx, &ctx.paths.aws_env(), "the runtime key", hint, FIRST_PROMPT_DEADLINE, None).await?;
+        let (plain, _) = unseal_killable(store, ctx, &ctx.paths.aws_env(), "the runtime key", hint, FIRST_PROMPT_DEADLINE, None, stopping).await?;
         let (id, secret) = crate::bridge::vm::client::parse_runtime_env(&plain)?;
         drop(plain);
         return Ok((connected(ctx, &id, &secret).await?, None));
     }
     let row = UnsealRow::start(&ctx.paths, None, "combined");
-    let unsealed = unseal_killable(store, ctx, &ctx.paths.combined_env(), "the runtime key and the setup token", "rebuild it with `ai-env creds setup-token`", FIRST_PROMPT_DEADLINE, None).await;
+    let unsealed = unseal_killable(store, ctx, &ctx.paths.combined_env(), "the runtime key and the setup token", "rebuild it with `ai-env creds setup-token`", FIRST_PROMPT_DEADLINE, None, stopping).await;
     row.end(&unsealed);
     let (plain, sealed) = unsealed?;
     let ((id, secret), token) = from_combined(&plain, &sealed)?;
@@ -545,7 +709,7 @@ pub async fn backend_for_credential(store: &Keystore, ctx: &Ctx, plan: &Credenti
 /// runtime key, and the token with the seal id `sealed`, the text it was
 /// decrypted from, records for it ([`combined_token_tag`]), never the one
 /// [`check`] read: [`prepare`] compares the two (M38). A text that records
-/// none hands over no token, said on stderr (it is unsealed on its own if
+/// none hands over no token, said in a note (it is unsealed on its own if
 /// the VM does not hold it).
 fn from_combined(plain: &[u8], sealed: &str) -> Result<(RuntimeKey, Option<(SetupToken, String)>)> {
     let (key, token) = parse_combined(plain)?;
@@ -553,7 +717,7 @@ fn from_combined(plain: &[u8], sealed: &str) -> Result<(RuntimeKey, Option<(Setu
         Some(tag) => Ok((key, Some((token, tag)))),
         None => {
             // Rebuilt meanwhile by something that records no seal: its token cannot be bound to the one checked.
-            eprintln!("ai-env: the combined.env just unsealed records no seal for its setup token: it is not used (the token is unsealed on its own if the VM does not hold it)");
+            voice::note("the combined.env just unsealed records no seal for its setup token: it is not used (the token is unsealed on its own if the VM does not hold it)");
             Ok((key, None))
         }
     }
@@ -565,12 +729,12 @@ async fn connected(ctx: &Ctx, id: &str, secret: &str) -> Result<Backend> {
     let creds = crate::bridge::vm::client::static_creds(id, secret);
     Ok(match &ctx.knobs.fake_api {
         Some(path) => {
-            eprintln!("ai-env: {} (unsealed; the fake API does not use it)", creds.describe());
+            voice::note(&format!("{} (unsealed; the fake API does not use it)", creds.describe()));
             Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(path)?)
         }
         None => {
-            eprintln!("ai-env: {}", creds.describe());
-            Backend::Sdk(crate::bridge::vm::client::connect(&creds).await, crate::bridge::vm::health::HttpsEndpoint::new()?)
+            voice::note(&creds.describe());
+            Backend::Sdk(Arc::new(crate::bridge::vm::client::connect(&creds).await), Arc::new(crate::bridge::vm::health::HttpsEndpoint::new()?))
         }
     })
 }
@@ -582,6 +746,13 @@ pub struct Prepared {
     pub delivery: Delivery,
     pub source: &'static str,
 }
+
+/// The word for the VM's cached copy of the token (S7): [`Prepared`]'s
+/// source when the VM held it and nothing was unsealed, and (S8) a remote
+/// session's census `credential:` whenever its spawn found the VM holding
+/// it and sent none (`agent::DeliveryReport::held_by_vm`), even with a token
+/// in hand (`combined.env`'s, unused).
+pub const CACHED: &str = "cached";
 
 impl Prepared {
     /// When the gate pass the delivery is bound to was given (unix seconds):
@@ -596,20 +767,37 @@ impl Prepared {
 /// The gate, the token (in hand, cached on the VM, or unsealed now) and the
 /// delivery bound to the pass (see the module doc).
 pub async fn prepare<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>) -> Result<Prepared> {
+    prepare_with(ctx, api, ep, row, vm, plan, supply, Stopping::Own).await
+}
+
+/// [`prepare`] for the remote session (S8 P3, beside the workspace step):
+/// the gate first, then the token (in hand from the runtime key's unseal,
+/// cached on the VM, or unsealed now under [`Stopping::ByDrop`]: a second
+/// Touch ID only when `combined.env` is not current and the VM lacks it),
+/// the delivery bound to the pass. Once the workspace step joined, the
+/// session gates again without a prompt if the pass passed half its life
+/// ([`regate_if_stale`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_session<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>, window_from: Instant) -> Result<Prepared> {
+    prepare_with(ctx, api, ep, row, vm, plan, supply, Stopping::ByDrop { window_from }).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>, stopping: Stopping) -> Result<Prepared> {
     let CredentialSupply { store, token } = supply;
     let mut pass = gate(&ctx.cfg, &ctx.paths, api, row, vm).await?;
     // The token and the seal id of the bytes it was decrypted from; none when the VM holds this seal.
     let (token, source) = if let Some(file) = &plan.file {
         drop(token);
-        (Some(unseal_token(store, ctx, file, "the token in --credential-file", "file", &row.id, &plan.tag).await?), "file")
+        (Some(unseal_token(store, ctx, file, "the token in --credential-file", "file", &row.id, &plan.tag, stopping).await?), "file")
     } else if let Some(t) = token {
         (Some(t), "combined")
     } else if cached_on_vm(&ctx.paths, api, ep, row, vm, &plan.tag).await {
         // The VM holds this seal: its row names it, even if no delivery recorded it.
         record_holder(&ctx.paths, &row.id, &plan.tag, Held::Seen);
-        (None, "cached")
+        (None, CACHED)
     } else {
-        (Some(unseal_token(store, ctx, &ctx.paths.setup_token_env(), "the setup token", "setup-token", &row.id, &plan.tag).await?), "setup-token")
+        (Some(unseal_token(store, ctx, &ctx.paths.setup_token_env(), "the setup token", "setup-token", &row.id, &plan.tag, stopping).await?), "setup-token")
     };
     // One rule (M38): the value goes out only under the seal id of the bytes
     // it was decrypted from, which must be the one `check` read. A file sealed
@@ -641,6 +829,19 @@ pub async fn prepare<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &
     Ok(Prepared { delivery, source })
 }
 
+/// S8 P3b: once the workspace step joined (a slow seed), a delivery whose
+/// pass passed half its life is bound to a new one, gated again with no
+/// prompt (`Delivery::rebind`), so the session's dial never starts on a
+/// pass about to age out. `true` when it gated again.
+pub async fn regate_if_stale<A: MicrovmApi>(ctx: &Ctx, api: &A, row: &VmRow, vm: &VmInfo, prepared: &mut Prepared) -> Result<bool> {
+    if fresh_enough(&prepared.delivery.pass, &row.id, unix_now()) {
+        return Ok(false);
+    }
+    let pass = gate(&ctx.cfg, &ctx.paths, api, row, vm).await?;
+    prepared.delivery.rebind(&pass, unix_now())?;
+    Ok(true)
+}
+
 /// Does `pass` still stand for `vm_id` with at least half its life left?
 /// [`prepare`] hands the session only such a pass: an 89 s old one, after a
 /// Touch ID approved late, would age out on the way to the VM's `hello_ok`.
@@ -668,8 +869,8 @@ static UNRECORDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::ne
 /// `credential_at` and `credential_tag`, which `creds status` and `creds
 /// forget` list until it is terminated (an over-approximation by design:
 /// recorded before the value leaves, whatever comes back). A row that cannot
-/// be written, or none at all, is a warning on stderr (once per VM): the
-/// holder list would miss the VM.
+/// be written, or none at all, is a warning (once per VM, through the
+/// voice): the holder list would miss the VM.
 pub(crate) fn record_holder(paths: &Paths, vm_id: &str, tag: &str, how: Held) {
     use crate::bridge::vm::registry::{read_row, update_row};
     if how == Held::Seen && matches!(read_row(paths, vm_id), Ok(Some(r)) if r.credential_at.is_some()) {
@@ -690,7 +891,7 @@ pub(crate) fn record_holder(paths: &Paths, vm_id: &str, tag: &str, how: Held) {
     let mut warned = UNRECORDED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !warned.iter().any(|v| v == vm_id) {
         warned.push(vm_id.to_string());
-        eprintln!("ai-env: warning: {vm_id} may hold the setup-token (seal {tag}), but {why}: `ai-env creds status` and `creds forget` will not list it; only `ai-env vm terminate {vm_id}` clears its copies");
+        voice::warn(&format!("{vm_id} may hold the setup-token (seal {tag}), but {why}: `ai-env creds status` and `creds forget` will not list it; only `ai-env vm terminate {vm_id}` clears its copies"));
     }
 }
 
@@ -817,7 +1018,7 @@ async fn warm_socket<A: MicrovmApi, E: EndpointClient>(env: &super::AgentEnv<'_,
                 let wait = retry_after_s.map_or(b, |s| p.backoff_min.saturating_mul(u32::try_from(s).unwrap_or(u32::MAX)).max(b));
                 let retry_after = retry_after_s.map_or_else(|| "none".to_string(), |s| s.to_string());
                 audit_event(env.paths, "endpoint_429", &[("id", vm.to_string()), ("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
-                eprintln!("ai-env: the endpoint throttled /agent (HTTP 429); retrying in {:.1} s", wait.as_secs_f64());
+                voice::note(&format!("the endpoint throttled /agent (HTTP 429); retrying in {:.1} s", wait.as_secs_f64()));
                 (wait, e.to_string(), Some(retry_after_s))
             }
             Err(e @ DialError::Busy) => (backoff(), e.to_string(), None),
@@ -1000,6 +1201,225 @@ mod tests {
         assert!(is_claude(&v(&["claude", "-p", "x"])) && is_claude(&v(&["/usr/local/bin/claude"])));
         assert!(!is_claude(&v(&["claude-code"])) && !is_claude(&v(&["/bin/sh", "claude"])) && !is_claude(&[]));
     }
+
+    /// The repo's fake age behind a wrapper carrying `knobs` (as
+    /// `bridge::unseal`'s tests build it): never this process's environment.
+    fn fake_age(dir: &Path, knobs: &[(&str, String)]) -> Arc<AgeTool> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/age.sh");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut script = String::from("#!/bin/sh\n");
+        for (k, v) in knobs {
+            script.push_str(&format!("{k}='{v}'\nexport {k}\n"));
+        }
+        script.push_str(&format!("exec /bin/sh {} \"$@\"\n", src.display()));
+        let (age, keygen) = (bin.join("age"), bin.join("age-keygen"));
+        for p in [&age, &keygen] {
+            std::fs::write(p, &script).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Arc::new(AgeTool::for_tests(age, keygen, (1, 3, 2)))
+    }
+
+    /// A dialog of the fake age on `plaintext` (its identity and ciphertext under `dir`).
+    fn dialog<'a>(age: &Arc<AgeTool>, dir: &Path, plaintext: &[u8], what: &'a str) -> Dialog<'a> {
+        let recipients = dir.join("recipients.txt");
+        std::fs::write(&recipients, "age1fake\n").unwrap();
+        let data = age.encrypt(&recipients, plaintext).unwrap();
+        let identity = dir.join("identity.txt");
+        std::fs::write(&identity, "AGE-PLUGIN-SE-FAKE\n").unwrap();
+        Dialog { age: Arc::clone(age), identity, data, what, advice: "the test's advice" }
+    }
+
+    /// S8: two dialogs on one Mac come one at a time (`state/unseal.lock`):
+    /// while the first is up (its decrypt held until a file appears), the
+    /// second asks and opens nothing; once the first answered, the second
+    /// opens and answers.
+    #[test]
+    fn the_unseal_lock_serialises_two_dialogs() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let (log, release) = (d.path().join("age.log"), d.path().join("release"));
+        let age = fake_age(d.path(), &[("FAKE_AGE_WAIT_FILE", release.display().to_string()), ("FAKE_AGE_LOG", log.display().to_string())]);
+        // The fake logs each call as its script's name and argv (`age.sh -d -i …`).
+        let decrypts = || std::fs::read_to_string(&log).unwrap_or_default().lines().filter(|l| l.contains(" -d ")).count();
+        let (first, second) = (dialog(&age, d.path(), b"ONE\n", "the first"), dialog(&age, d.path(), b"TWO\n", "the second"));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (a, b) = rt.block_on(async {
+            let one = unseal_by_drop(&paths, first, Duration::from_secs(30), Instant::now());
+            let two = async {
+                // The second asks once the first's dialog is up, and gets no dialog of its own while it is.
+                for _ in 0..250 {
+                    if decrypts() == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(decrypts(), 1, "the first dialog is up");
+                let asked = unseal_by_drop(&paths, second, Duration::from_secs(30), Instant::now());
+                let watch = async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    assert_eq!(decrypts(), 1, "the second opened nothing while the first was up");
+                    std::fs::write(&release, b"go").unwrap();
+                };
+                let (answer, ()) = tokio::join!(asked, watch);
+                answer
+            };
+            tokio::join!(one, two)
+        });
+        assert_eq!((&a.unwrap()[..], &b.unwrap()[..]), (&b"ONE\n"[..], &b"TWO\n"[..]));
+        assert_eq!(decrypts(), 2, "each its own dialog, one after the other");
+    }
+
+    /// S8: a dialog whose turn does not come before Cursor's window closes
+    /// (another dialog holds `unseal.lock`) is the deadline (exit 5), with no
+    /// decrypt started.
+    #[test]
+    fn a_dialog_without_a_turn_in_the_window_is_the_deadline() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let log = d.path().join("age.log");
+        let age = fake_age(d.path(), &[("FAKE_AGE_LOG", log.display().to_string())]);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let e = rt.block_on(async {
+            let _other = unseal_lock(&paths, Duration::from_secs(5)).await.unwrap();
+            // Built first: its encryption is the fake age's first exec, which macOS may take seconds to assess.
+            let never = dialog(&age, d.path(), b"NEVER\n", "the runtime key");
+            // Cursor's window opened 47 s ago: one second is left of the 49 a dialog may have (`session_room`).
+            let window = Instant::now().checked_sub(Duration::from_secs(47)).unwrap();
+            unseal_by_drop(&paths, never, Duration::from_secs(60), window).await.unwrap_err()
+        });
+        assert!(crate::bridge::unseal::is_deadline(&e) && e.exit_code() == 5, "{e}");
+        assert_eq!(e.to_string(), "no Touch ID within 1 s, so the runtime key stayed sealed (the test's advice)", "the budget it had, not what is left after the wait");
+        assert!(std::fs::read_to_string(&log).unwrap_or_default().lines().all(|l| !l.contains(" -d ")), "no dialog was opened");
+    }
+
+    /// S8 phase 4 (TIMING-2): the wrapper's dialog ends by its own deadline
+    /// before the pipeline's T0 + 50 s, the kill of its group included, so an
+    /// unanswered Touch ID is the unseal's deadline (exit 5, `no Touch ID
+    /// within N s`, the line Cursor is promised), never the pipeline's.
+    /// Cursor's window opened 47.3 s ago: of the 2.7 s left, less the
+    /// margin, the dialog gets 1 s in whole seconds, and its failure comes
+    /// before T0 + 50 s. The room is whole seconds, T0 + 49 s at the latest.
+    #[test]
+    fn an_unanswered_wrapper_dialog_ends_before_the_pipelines_deadline() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let age = fake_age(d.path(), &[("FAKE_AGE_HANG", "1".into())]);
+        // Built first: its encryption is the fake age's first exec, which macOS may take seconds to assess.
+        let hanging = dialog(&age, d.path(), b"NEVER\n", "the runtime key");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let ended = rt.block_on(async {
+            let window = Instant::now().checked_sub(Duration::from_millis(47_300)).unwrap();
+            let pipeline = tokio::time::Instant::from_std(window + crate::bridge::remote::INIT_DEADLINE);
+            tokio::time::timeout_at(pipeline, unseal_by_drop(&paths, hanging, Duration::from_secs(60), window)).await
+        });
+        let e = ended.expect("the dialog's own deadline comes before the pipeline's").unwrap_err();
+        assert!(crate::bridge::unseal::is_deadline(&e) && e.exit_code() == 5, "{e}");
+        assert_eq!(e.to_string(), "no Touch ID within 1 s, so the runtime key stayed sealed (the test's advice)");
+        let s = Duration::from_secs;
+        assert_eq!(session_room(s(60), Duration::ZERO), s(49));
+        assert_eq!(session_room(s(60), Duration::from_millis(300)), s(48), "a fraction used is a second less, never past T0 + 49 s");
+        assert_eq!(session_room(s(30), Duration::from_millis(300)), s(30), "the configured budget when it ends sooner");
+        assert_eq!(session_room(s(60), Duration::from_millis(48_100)), Duration::ZERO);
+    }
+
+    /// S8, a command's dialog ([`Stopping::Own`]'s [`turn`]): the wait for
+    /// another dialog counts against its one budget, in whole seconds. No
+    /// turn within it is the deadline (exit 5, naming the budget), never
+    /// `Busy` (exit 1); a turn that comes at once leaves the whole budget
+    /// (the countdown and the deadline name it), one after a wait the budget
+    /// less the seconds waited.
+    #[test]
+    fn a_commands_wait_for_another_dialog_counts_against_its_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let e = rt.block_on(async {
+            let _other = unseal_lock(&paths, Duration::from_secs(5)).await.unwrap();
+            let allowed = Duration::from_secs(1);
+            turn(&paths, allowed, |waited| left_after(allowed, waited), "the runtime key", "the advice").await.map(drop).unwrap_err()
+        });
+        assert!(crate::bridge::unseal::is_deadline(&e) && e.exit_code() == 5, "{e}");
+        assert_eq!(e.to_string(), "no Touch ID within 1 s, so the runtime key stayed sealed (the advice)");
+        let allowed = Duration::from_secs(3);
+        let (lock, at_once) = rt.block_on(turn(&paths, allowed, |waited| left_after(allowed, waited), "the runtime key", "the advice")).unwrap();
+        assert_eq!(at_once, allowed, "no wait: the whole budget");
+        drop(lock);
+        let (lock, left) = rt.block_on(async {
+            let other = unseal_lock(&paths, Duration::from_secs(5)).await.unwrap();
+            let release = async {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                drop(other);
+            };
+            let (got, ()) = tokio::join!(turn(&paths, allowed, |waited| left_after(allowed, waited), "the runtime key", "the advice"), release);
+            got.unwrap()
+        });
+        assert!(left <= allowed - Duration::from_secs(1) && !left.is_zero(), "the budget less the seconds waited: {left:?}");
+        assert_eq!(lock.path(), paths.unseal_lock().as_path());
+    }
+
+    /// Set only in the environment of the by-drop test's child half: its directory.
+    const BY_DROP_DIR: &str = "AI_ENV_TEST_UNSEAL_BY_DROP";
+
+    /// S8 [`Stopping::ByDrop`]: the wrapper's dialog has no listener and no
+    /// stop line; dropping its future (the pump's EOF or signal drops the
+    /// pipeline) closes the dialog. The test runs itself again as its child
+    /// half, which speaks as the wrapper, opens a dialog of a fake age that
+    /// never answers and drops it after 300 ms; this half reads the child's
+    /// stderr: the countdown alone (`ai-env-claude:`), no `stopped` line, no
+    /// `ai-env:` line; the child saw the decrypt's group gone.
+    #[test]
+    fn a_dropped_by_drop_unseal_closes_its_dialog_and_says_no_stop_line() {
+        if let Some(dir) = std::env::var_os(BY_DROP_DIR) {
+            by_drop_in_this_process(Path::new(&dir));
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let name = format!("{}::a_dropped_by_drop_unseal_closes_its_dialog_and_says_no_stop_line", module_path!().split_once("::").map_or("", |(_, m)| m));
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name.as_str(), "--test-threads=1", "--nocapture"]).env(BY_DROP_DIR, d.path()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let child = {
+            // Held across the spawn, as every fork of these tests holds it (`test_locks`).
+            let _fork = crate::test_locks::forking();
+            cmd.spawn().unwrap()
+        };
+        let out = child.wait_with_output().unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && stdout.contains("test result: ok. 1 passed"), "{stdout}\n{stderr}");
+        let said: Vec<&str> = stderr.lines().filter(|l| l.starts_with("ai-env")).collect();
+        assert!(!said.is_empty() && said.iter().all(|l| l.starts_with("ai-env-claude: waiting for Touch ID to unseal the runtime key")), "the countdown alone: {said:?}");
+        assert!(!stderr.contains("stopped"), "{stderr}");
+    }
+
+    /// The child half: the wrapper's voice, a hanging dialog dropped after 300 ms, its group gone.
+    fn by_drop_in_this_process(dir: &Path) {
+        crate::bridge::voice::set(crate::bridge::voice::Voice::Wrapper);
+        let paths = Paths::from_root_and_env(dir.join("bridge"), None);
+        let pidfile = dir.join("age.pid");
+        let age = fake_age(dir, &[("FAKE_AGE_HANG", "1".into()), ("FAKE_AGE_PIDFILE", pidfile.display().to_string())]);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hanging = dialog(&age, dir, b"NEVER\n", "the runtime key");
+        let dropped = rt.block_on(async { tokio::time::timeout(Duration::from_millis(300), unseal_by_drop(&paths, hanging, Duration::from_secs(30), Instant::now())).await });
+        assert!(dropped.is_err(), "the timeout dropped the unseal");
+        let pgid: i32 = (0..250)
+            .find_map(|_| {
+                let pgid = std::fs::read_to_string(&pidfile).ok().and_then(|t| t.trim().parse().ok());
+                if pgid.is_none() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                pgid
+            })
+            .expect("the fake decrypt started");
+        // SAFETY: a plain existence check of the test's own fake decrypt group; signal 0 sends nothing.
+        let gone = (0..150).any(|_| unsafe { libc::killpg(pgid, 0) } != 0 || {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        });
+        assert!(gone, "the dropped unseal left decrypt group {pgid} running");
+        drop(rt);
+    }
 }
 
 
@@ -1068,7 +1488,7 @@ mod e2e {
             }
             out
         });
-        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None };
+        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None };
         let outcome = tokio::time::timeout(LIMIT, run_spawn_with(env, Start::New(spec), io, Some(delivery))).await.expect("the spawn ends in time");
         drop(c.control);
         let out = tokio::time::timeout(LIMIT, consumer).await.expect("the events end").unwrap();

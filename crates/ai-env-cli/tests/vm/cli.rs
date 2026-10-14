@@ -73,7 +73,8 @@ impl World {
             .stdin(Stdio::null());
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy().to_string();
-            if k.starts_with("AWS_") || k.starts_with("PULUMI_") || k.starts_with("AI_ENV_BRIDGE_LAB_") || k.starts_with("CLAUDE_CODE_") {
+            // FAKE_*: a developer's exported fake knob (FAKE_AWS_FAIL_OP, FAKE_AGE_HANG, …) never reaches the fakes.
+            if k.starts_with("AWS_") || k.starts_with("PULUMI_") || k.starts_with("AI_ENV_BRIDGE_LAB_") || k.starts_with("CLAUDE_CODE_") || k.starts_with("FAKE_") {
                 c.env_remove(&k);
             }
         }

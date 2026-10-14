@@ -174,13 +174,13 @@ pub enum Cmd {
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
     },
-    /// Cursor wrapper: install the claudeProcessWrapper setting, inspect the invocation census
+    /// Cursor wrapper: install the claudeProcessWrapper setting, inspect the invocation census, promote a session's approved settings
     #[cfg(feature = "bridge")]
     Wrapper {
         #[command(subcommand)]
         cmd: WrapperCmd,
     },
-    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget
+    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget, drop-transport
     #[cfg(feature = "bridge")]
     Session {
         #[command(subcommand)]
@@ -204,6 +204,12 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: VmCmd,
     },
+    /// The workspace a VM works in (S8): seed it into the VM, fetch the VM's commits into refs/remotes/box/*
+    #[cfg(feature = "bridge")]
+    Box {
+        #[command(subcommand)]
+        cmd: BoxCmd,
+    },
     /// Platform probes (lab/probes.jsonl): list, show, run
     #[cfg(feature = "bridge")]
     Lab {
@@ -225,6 +231,10 @@ pub enum Cmd {
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
     Shim(crate::shim::ShimArgs),
+    /// The agent's workspace helper the shim starts (S8): one seed, code-out, transcript or settings operation
+    #[cfg(feature = "shim")]
+    #[command(hide = true)]
+    ShimIo(crate::shim::wshelper::ShimIoArgs),
 }
 
 /// `--egress` of `ai-env vm run`.
@@ -267,6 +277,28 @@ impl DeliverArg {
         match self {
             DeliverArg::Fd => crate::wire::frame::Deliver::Fd,
             DeliverArg::Env => crate::wire::frame::Deliver::Env,
+        }
+    }
+}
+
+/// `--mode` of `ai-env wrapper install` (S8, L1): the `[wrapper].mode` to write.
+#[cfg(feature = "bridge")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum WrapperModeArg {
+    /// Cursor's chats run on this Mac
+    Passthrough,
+    /// Cursor's chats under [workspaces].roots run in the workspace's MicroVM
+    Remote,
+}
+
+#[cfg(feature = "bridge")]
+impl WrapperModeArg {
+    /// The config's mode.
+    #[must_use]
+    pub fn mode(self) -> crate::bridge::config::WrapperMode {
+        match self {
+            WrapperModeArg::Passthrough => crate::bridge::config::WrapperMode::Passthrough,
+            WrapperModeArg::Remote => crate::bridge::config::WrapperMode::Remote,
         }
     }
 }
@@ -393,13 +425,19 @@ pub enum VmCmd {
         #[arg(last = true, required = true, value_name = "ARGV")]
         argv: Vec<String>,
     },
-    /// Deliver the sealed setup-token to the workspace's VM ahead of time (starting one with vpc egress if it has none): later credentialed commands there need no Touch ID for it until the VM is suspended
+    /// Start or reuse the workspace's VM (vpc egress), seed it (HEAD and the uncommitted changes, scanned before the Touch ID: a finding is exit 9; none for a workspace that is no git repository or an unsupported one) and deliver the sealed setup-token ahead of time: later credentialed commands there need no Touch ID for it until the VM is suspended
     Warm {
         /// Workspace directory (under [workspaces].roots)
         workspace: PathBuf,
         /// One JSON document
         #[arg(long)]
         json: bool,
+        /// Say what it would do (the VM it would use, what the seed carries and its scans: a finding is exit 9) and do nothing: no AWS call, no Touch ID
+        #[arg(long, conflicts_with = "prewarm")]
+        dry_run: bool,
+        /// Started by the wrapper on `auth status` (S8 prewarm): quiet, audited as purpose prewarm
+        #[arg(long, hide = true)]
+        prewarm: bool,
     },
     /// Reattach to a running command (the newest attachment wins; the previous client exits 8). A terminal's input feeds the command's stdin (Ctrl-D closes it for good); any other stdin is not read, and the command's stdin is left as it is
     Attach {
@@ -501,6 +539,55 @@ pub enum VmCmd {
         #[arg(long, requires = "exec")]
         with_credential: bool,
         /// One JSON record on stdout (the step lines go to stderr)
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `ai-env box …` (feature `bridge`, S8): the workspace a VM works in. A seed
+/// carries HEAD's commit and tree and a scanned snapshot of the uncommitted
+/// changes (never the history); a fetch brings the VM's commits and
+/// snapshots back into `refs/remotes/box/*`, never into your branches.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum BoxCmd {
+    /// Seed the workspace's VM at the identical path: HEAD's commit and tree plus the scanned uncommitted changes (a shallow clone, no origin); a VM seeded before is fast-forwarded when its checkout is clean, on the same branch and its tip an ancestor of the commit seeded (HEAD, or --branch's), else kept (ai-env box fetch shows what changed)
+    Seed {
+        /// Workspace directory (under [workspaces].roots; default: the current directory)
+        workspace: Option<PathBuf>,
+        /// Seed this branch instead of the one checked out (its committed state only)
+        #[arg(long, value_name = "B")]
+        branch: Option<String>,
+        /// Committed refs only: the uncommitted changes stay on this Mac (default: [[workspace]].seed_wip)
+        #[arg(long)]
+        no_wip: bool,
+        /// Replace the VM's checkout (only while it is unchanged since its seed)
+        #[arg(long)]
+        replace: bool,
+        /// Resolve, snapshot, pack and scan, then print the plan: no AWS call, no Touch ID
+        #[arg(long)]
+        dry_run: bool,
+        /// The largest pack in MiB (default: [seed].max_mib)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        max_mib: Option<u32>,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch the VM's commits into refs/remotes/box/* (a ref with a scan finding into refs/remotes/box-quarantine/*); your branches and working tree are never touched
+    Fetch {
+        /// A session id or a workspace directory (default: the current directory)
+        target: Option<String>,
+        /// Also snapshot the VM's uncommitted changes into a refs/wip/* ref and fetch it (refs/remotes/box/wip/*)
+        #[arg(long)]
+        wip: bool,
+        /// Read the VM's refs and print what would move: nothing is transferred
+        #[arg(long)]
+        dry_run: bool,
+        /// The largest code-out in MiB (default: [seed].max_fetch_mib)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        max_mib: Option<u32>,
+        /// One JSON document
         #[arg(long)]
         json: bool,
     },
@@ -745,7 +832,8 @@ pub enum CredsCmd {
     },
 }
 
-/// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands.
+/// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands, and
+/// S8's settings sync.
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum WrapperCmd {
@@ -758,8 +846,28 @@ pub enum WrapperCmd {
         /// (default: [wrapper].initial_permission_mode from bridge.toml, else default)
         #[arg(long, value_name = "M")]
         permission_mode: Option<String>,
+        /// Also set [wrapper].mode in bridge.toml (backup first): remote runs Cursor's chats under the roots in a MicroVM, passthrough on this Mac
+        #[arg(long, value_enum, value_name = "MODE")]
+        mode: Option<WrapperModeArg>,
     },
-    /// Print the invocation census (logs/census.jsonl); --record-probes writes the entrypoint/stock-ext-oauth verdicts to lab/probes.jsonl
+    /// Promote the permission rules a session approved in its VMs into the image's settings (dry run unless --write; never a broad allow, a repo-scan finding or defaultMode)
+    SettingsSync {
+        /// Session id (a uuid)
+        session: String,
+        /// Promote this rule (repeatable): an entry the session added to permissions.allow, deny or ask
+        #[arg(long = "rule", value_name = "R")]
+        rule: Vec<String>,
+        /// Promote every rule the session added that is safe
+        #[arg(long)]
+        all_safe: bool,
+        /// Write image/claude/settings.json and the settings policy (backups first), then re-scan (default: a dry run)
+        #[arg(long)]
+        write: bool,
+        /// The image directory (default: image/ under the git toplevel of the current directory; it must hold MANIFEST)
+        #[arg(long, value_name = "DIR")]
+        image_dir: Option<PathBuf>,
+    },
+    /// Print the invocation census (logs/census.jsonl); --record-probes writes the entrypoint and stock-ext-oauth verdicts and, once remote end rows exist, init-wrapper to lab/probes.jsonl
     Census {
         /// Only the last N rows
         #[arg(long, value_name = "N")]
@@ -767,8 +875,10 @@ pub enum WrapperCmd {
         /// Raw JSON lines instead of the text table
         #[arg(long)]
         json: bool,
-        /// Derive the S1 probe verdicts from the newest session row and append them to lab/probes.jsonl
-        /// (exit 1 when a verdict differs from its expectation; the rows are written first)
+        /// Derive the S1 verdicts (entrypoint, stock-ext-oauth) from the newest session row and, once the census
+        /// holds remote end rows, S8's init-wrapper from the newest cold and warm ones (gap:cold or gap:warm while
+        /// either is missing), and append them to lab/probes.jsonl (exit 1 when a verdict differs from its
+        /// expectation, a gap included; the rows are written first)
         #[arg(long)]
         record_probes: bool,
     },
@@ -791,9 +901,17 @@ pub enum SessionCmd {
         /// Pretty JSON instead of TOML
         #[arg(long)]
         json: bool,
+        /// The settings the session's claude changed in its VMs: the rules added in any VM's last capture, then each VM's other changes against the start, per scope (env values masked); written to quarantine/UUID/settings/diff.json
+        #[arg(long)]
+        settings_diff: bool,
     },
-    /// Delete a session's row and its scratch config dir (refused while the session is active)
+    /// Delete a session's row, its scratch config dir and its quarantine (the settings captures, diff.json and settings-sync's backups); refused while the session is active
     Forget {
+        /// Session id (a uuid)
+        uuid: String,
+    },
+    /// Close a remote session's socket from the wrapper's side; the session reattaches (T8.6)
+    DropTransport {
         /// Session id (a uuid)
         uuid: String,
     },
@@ -861,6 +979,11 @@ pub fn run(cli: Cli) -> Result<()> {
     #[cfg(feature = "shim")]
     if let Cmd::Shim(args) = cli.cmd {
         return crate::shim::run(args);
+    }
+    // The agent's helper in the VM (S8) runs with the environment the shim gives it: no keystore either.
+    #[cfg(feature = "shim")]
+    if let Cmd::ShimIo(args) = cli.cmd {
+        return crate::shim::wshelper::run(args);
     }
     let store = Keystore::resolve(cli.key_dir)?;
     match cli.cmd {
@@ -942,14 +1065,18 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Gates { json, out, only } => crate::bridge::gates::main(json, out, only),
         #[cfg(feature = "bridge")]
         Cmd::Wrapper { cmd } => match cmd {
-            WrapperCmd::Install { write, permission_mode } => crate::bridge::wrapper::install(write, permission_mode),
+            WrapperCmd::Install { write, permission_mode, mode: None } => crate::bridge::wrapper::install(write, permission_mode),
+            WrapperCmd::Install { write, permission_mode, mode: Some(mode) } => crate::bridge::wrapper::install_mode(write, permission_mode, mode.mode()),
             WrapperCmd::Census { last, json, record_probes } => crate::bridge::wrapper::census(last, json, record_probes),
+            WrapperCmd::SettingsSync { session, rule, all_safe, write, image_dir } => crate::bridge::wrapper::settings_sync(&session, &rule, all_safe, write, image_dir.as_deref()),
         },
         #[cfg(feature = "bridge")]
         Cmd::Session { cmd } => match cmd {
             SessionCmd::List { json } => crate::bridge::registry::cmd_list(json),
-            SessionCmd::Show { uuid, json } => crate::bridge::registry::cmd_show(&uuid, json),
+            SessionCmd::Show { uuid, json, settings_diff: false } => crate::bridge::registry::cmd_show(&uuid, json),
+            SessionCmd::Show { uuid, json, settings_diff: true } => crate::bridge::settings_capture::cmd_settings_diff(&uuid, json),
             SessionCmd::Forget { uuid } => crate::bridge::registry::cmd_forget(&uuid),
+            SessionCmd::DropTransport { uuid } => crate::bridge::registry::cmd_drop_transport(&uuid),
         },
         #[cfg(feature = "bridge")]
         Cmd::Infra { cmd } => match cmd {
@@ -973,6 +1100,8 @@ pub fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "bridge")]
         Cmd::Vm { cmd } => crate::bridge::vm::cmd::main(&store, cmd),
         #[cfg(feature = "bridge")]
+        Cmd::Box { cmd } => crate::bridge::boxcmd::main(&store, cmd),
+        #[cfg(feature = "bridge")]
         Cmd::Lab { cmd } => crate::bridge::vm::cmd::lab_main(&store, cmd),
         #[cfg(feature = "bridge")]
         Cmd::Egress { cmd } => crate::bridge::egress::cli::main(&store, cmd),
@@ -980,6 +1109,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Proxy { cmd } => crate::bridge::egress::cli::proxy_main(cmd),
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
+        #[cfg(feature = "shim")]
+        Cmd::ShimIo(_) => unreachable!("shim-io is dispatched before the keystore is resolved"),
     }
 }
 
@@ -1006,8 +1137,72 @@ fn doctor(store: &Keystore, file: &std::path::Path, json: bool) -> Result<()> {
 
 #[cfg(all(test, feature = "bridge"))]
 mod tests {
-    use super::Cli;
-    use clap::CommandFactory as _;
+    use super::{BoxCmd, Cli, Cmd, SessionCmd, VmCmd, WrapperCmd, WrapperModeArg};
+    use clap::{CommandFactory as _, Parser as _};
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("ai-env").chain(args.iter().copied()))
+    }
+
+    fn cmd(args: &[&str]) -> Cmd {
+        parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}")).cmd
+    }
+
+    /// S8's commands and flags (C8) parse with their values; what clap
+    /// bounds is refused (a cap of 0 MiB, a mode the config cannot hold,
+    /// `vm warm --dry-run` with the prewarm's flag).
+    #[test]
+    fn the_s8_commands_parse_with_their_flags() {
+        let Cmd::Box { cmd: BoxCmd::Seed { workspace, branch, no_wip: true, replace: true, dry_run: true, max_mib: Some(64), json: true } } = cmd(&["box", "seed", "/w", "--branch", "dev", "--no-wip", "--replace", "--dry-run", "--max-mib", "64", "--json"]) else {
+            panic!("box seed")
+        };
+        assert_eq!((workspace, branch.as_deref()), (Some(std::path::PathBuf::from("/w")), Some("dev")));
+        let Cmd::Box { cmd: BoxCmd::Seed { workspace: None, branch: None, no_wip: false, replace: false, dry_run: false, max_mib: None, json: false } } = cmd(&["box", "seed"]) else {
+            panic!("box seed, every default")
+        };
+        let Cmd::Box { cmd: BoxCmd::Fetch { target, wip: true, dry_run: true, max_mib: Some(256), json: true } } = cmd(&["box", "fetch", "ws", "--wip", "--dry-run", "--max-mib", "256", "--json"]) else {
+            panic!("box fetch")
+        };
+        assert_eq!(target.as_deref(), Some("ws"));
+        let Cmd::Vm { cmd: VmCmd::Warm { dry_run: true, prewarm: false, .. } } = cmd(&["vm", "warm", "/w", "--dry-run"]) else { panic!("vm warm --dry-run") };
+        let Cmd::Vm { cmd: VmCmd::Warm { dry_run: false, prewarm: true, .. } } = cmd(&["vm", "warm", "/w", "--prewarm"]) else { panic!("vm warm --prewarm") };
+        let Cmd::Session { cmd: SessionCmd::Show { settings_diff: true, json: true, .. } } = cmd(&["session", "show", "u", "--settings-diff", "--json"]) else { panic!("session show --settings-diff") };
+        let Cmd::Session { cmd: SessionCmd::DropTransport { uuid } } = cmd(&["session", "drop-transport", "u"]) else { panic!("session drop-transport") };
+        assert_eq!(uuid, "u");
+        let Cmd::Wrapper { cmd: WrapperCmd::SettingsSync { session, rule, all_safe: true, write: true, image_dir } } =
+            cmd(&["wrapper", "settings-sync", "u", "--rule", "Bash(git status)", "--rule", "Read", "--all-safe", "--write", "--image-dir", "/i"])
+        else {
+            panic!("wrapper settings-sync")
+        };
+        assert_eq!((session.as_str(), rule, image_dir), ("u", vec!["Bash(git status)".to_string(), "Read".to_string()], Some(std::path::PathBuf::from("/i"))));
+        let Cmd::Wrapper { cmd: WrapperCmd::Install { mode: Some(WrapperModeArg::Remote), write: true, .. } } = cmd(&["wrapper", "install", "--write", "--mode", "remote"]) else { panic!("wrapper install --mode") };
+        let Cmd::Wrapper { cmd: WrapperCmd::Install { mode: None, .. } } = cmd(&["wrapper", "install"]) else { panic!("wrapper install") };
+        assert_eq!(WrapperModeArg::Passthrough.mode().name(), "passthrough");
+        assert_eq!(WrapperModeArg::Remote.mode().name(), "remote");
+        for bad in [
+            &["box", "seed", "--max-mib", "0"][..],
+            &["box", "fetch", "--max-mib", "1025"],
+            &["wrapper", "install", "--mode", "local-child"],
+            &["vm", "warm", "/w", "--dry-run", "--prewarm"],
+            &["vm", "warm", "--dry-run"],
+            &["session", "drop-transport"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        // The prewarm's flag stays out of the help; box is listed.
+        let mut cli = Cli::command();
+        let warm = cli.find_subcommand_mut("vm").and_then(|vm| vm.find_subcommand_mut("warm")).expect("vm warm").render_help().to_string();
+        assert!(warm.contains("--dry-run") && !warm.contains("--prewarm"), "{warm}");
+        assert!(Cli::command().render_help().to_string().contains("box"));
+    }
+
+    /// Without the shim feature there is no `shim-io` (the bridge-only build).
+    #[cfg(not(feature = "shim"))]
+    #[test]
+    fn shim_io_needs_the_shim_feature() {
+        assert!(Cli::command().find_subcommand("shim-io").is_none());
+        assert!(parse(&["shim-io", "seed-state", "--path", "/w"]).is_err());
+    }
 
     /// `vm exec --deliver`'s help names the real default (S7):
     /// `[creds] deliver = "env"` makes env the default delivery, not only an
@@ -1018,5 +1213,88 @@ mod tests {
         let exec = cli.find_subcommand_mut("vm").and_then(|vm| vm.find_subcommand_mut("exec")).expect("vm exec");
         let help = exec.get_arguments().find(|a| a.get_id() == "deliver").and_then(clap::Arg::get_help).map(ToString::to_string).expect("--deliver has a help line");
         assert!(help.contains("the default is [creds] deliver") && !help.contains("fd (default)"), "{help}");
+    }
+
+    /// `ai-env <cmd> <sub> --help`.
+    fn long_help(cmd: &str, sub: &str) -> String {
+        let mut cli = Cli::command();
+        cli.find_subcommand_mut(cmd).and_then(|c| c.find_subcommand_mut(sub)).unwrap_or_else(|| panic!("{cmd} {sub}")).render_long_help().to_string()
+    }
+
+    /// `wrapper census --help` names every probe `--record-probes` records
+    /// (the catalog's: S8's init-wrapper too), and the gaps that fail it
+    /// until both a cold and a warm remote row exist.
+    #[test]
+    fn wrapper_census_help_names_every_probe_record_probes_writes() {
+        let census = long_help("wrapper", "census");
+        let recorded: Vec<&str> = crate::bridge::probes::CATALOG.iter().filter(|p| p.recorded_by == "ai-env wrapper census --record-probes").map(|p| p.name).collect();
+        assert_eq!(recorded, ["entrypoint", "stock-ext-oauth", "init-wrapper"]);
+        let missing: Vec<&&str> = recorded.iter().chain(&["gap:cold", "gap:warm"]).filter(|w| !census.contains(**w)).collect();
+        assert!(missing.is_empty(), "census --help does not name {missing:?}:\n{census}");
+    }
+
+    /// `session forget --help` names the quarantine it also removes (the
+    /// settings captures and settings-sync's backups); `box seed --help`
+    /// D3's whole rule, not only a clean checkout.
+    #[test]
+    fn session_forget_and_box_seed_helps_say_what_they_do() {
+        let (forget, seed) = (long_help("session", "forget"), long_help("box", "seed"));
+        let wants = [
+            (&forget, "its quarantine (the settings captures, diff.json and settings-sync's backups)"),
+            (&seed, "fast-forwarded when its checkout is clean, on the same branch and its tip an ancestor of the commit seeded"),
+        ];
+        let missing: Vec<&str> = wants.iter().filter(|(help, want)| !help.contains(want)).map(|(_, want)| *want).collect();
+        assert!(missing.is_empty(), "missing {missing:?}:\n{forget}\n{seed}");
+    }
+}
+
+#[cfg(all(test, feature = "shim"))]
+mod shim_io_tests {
+    use super::{Cli, Cmd};
+    use clap::{CommandFactory as _, Parser as _};
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["ai-env", "shim-io"].into_iter().chain(args.iter().copied()))
+    }
+
+    /// `shim-io` (S8 C8): hidden from the help, its subcommands are exactly
+    /// `wshelper::OPS` with their flags (W3 added the shim's `--record` to
+    /// `seed-state` and `seed-apply`). The ops themselves run in
+    /// `shim::wshelper`'s tests and `tests/shim_local.rs`.
+    #[test]
+    fn shim_io_is_hidden_and_parses_its_ops() {
+        let cli = Cli::command();
+        let io = cli.find_subcommand("shim-io").expect("shim-io");
+        assert!(io.is_hide_set());
+        let names: Vec<&str> = io.get_subcommands().map(clap::Command::get_name).collect();
+        assert_eq!(names, crate::shim::wshelper::OPS);
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("shim-io"), "{help}");
+        for args in [
+            &["seed-state", "--path", "/Users/mike/w"][..],
+            &["seed-state", "--path", "/Users/mike/w", "--record", "{}"],
+            &["seed-apply", "--path", "/Users/mike/w", "--mode", "clone", "--branch", "main", "--len", "3"],
+            &["seed-apply", "--path", "/h/w", "--mode", "replace", "--branch", "main", "--expect", "abc", "--len", "3", "--record", "{}"],
+            &["--home", "/h", "seed-apply", "--path", "/h/w", "--mode", "update", "--detached", "--expect", "abc", "--len", "3"],
+            &["codeout", "--path", "/Users/mike/w", "--wip", "--max-bytes", "1024"],
+            &["snapshot", "--path", "/Users/mike/w"],
+            &["transcript-stat", "--projects", "/p", "--rel", "s/u.jsonl"],
+            &["transcript-put", "--projects", "/p", "--rel", "s/u.jsonl", "--len", "9"],
+            &["settings", "--path", "/Users/mike/w", "--git", "/usr/bin/git", "--fs-root", "/tmp/vm"],
+        ] {
+            let parsed = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let Cmd::ShimIo(io) = &parsed.cmd else { panic!("{args:?}") };
+            let op = io.op.name();
+            assert_eq!(args.iter().find(|a| crate::shim::wshelper::OPS.contains(*a)), Some(&op), "{args:?}");
+        }
+        // Refused by clap: a mode it does not know, both or neither of --branch and --detached, a missing length.
+        for args in [
+            &["seed-apply", "--path", "/w", "--mode", "merge", "--branch", "main", "--len", "1"][..],
+            &["seed-apply", "--path", "/w", "--mode", "clone", "--branch", "main", "--detached", "--len", "1"],
+            &["seed-apply", "--path", "/w", "--mode", "clone", "--len", "1"],
+            &["transcript-put", "--projects", "/p", "--rel", "s/u.jsonl"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
     }
 }

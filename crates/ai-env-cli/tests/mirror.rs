@@ -8,10 +8,18 @@
 //! `AI_ENV_CLAUDE_TESTS=1`) replays frames Mike captured from the real CLI
 //! and demands byte equality with every real `.jsonl`; it reads files only
 //! and never runs a binary.
+//!
+//! S8 (plans/s8-design-tests.md §2.2): four of the five run on both links
+//! (`on_links!`), the remote half the wrapper in remote mode against the
+//! rig's in-process shim (`tests/common/remote.rs`), whose CLI's frames name
+//! the Mac's `~/.claude` (Design A). On the remote link T2.2 also runs a
+//! session: the Mac's mirror is the VM's own transcript, byte for byte
+//! (T8.4), and the writer, confined to the session's project, refuses the
+//! frames of any other.
 mod common;
 
 use ai_env_cli::bridge::mirror::{MirrorCfg, Writer};
-use common::{is_init, note_has, uuid, Harness};
+use common::{fake_fixed_sid, is_init, is_result_for, note_has, uuid, Harness, Link};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,13 +59,27 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-#[test]
-fn t2_2_writer_byte_equality_and_confinement() {
+on_links!(
+    /// T2.2: the writer lays the frames' entries down byte for byte, in
+    /// order, confined to its root (3 rejected shapes, nothing written for
+    /// them). On the remote link the same, then through a session
+    /// ([`remote_mirror_is_the_vms_transcript`]).
+    t2_2_writer_byte_equality_and_confinement,
+    |link| {
+        writer_byte_equality_and_confinement();
+        if link.is_remote() {
+            remote_mirror_is_the_vms_transcript(link);
+        }
+    }
+);
+
+/// T2.2 through the library: byte equality, the companion, the rejected shapes, the modes.
+fn writer_byte_equality_and_confinement() {
     let tmp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let child = root.join("child").join("projects");
     let dest = root.join("dest");
-    let mut w = Writer::new(MirrorCfg { child_projects_root: child.clone(), dest_root: dest.clone(), enabled: true, reason: "test".into() });
+    let mut w = Writer::new(MirrorCfg { child_projects_root: child.clone(), dest_root: dest.clone(), enabled: true, project: None, reason: "test".into() });
     let slug = "-Users-mike-Documents-DeFi-ai-env";
     let sid = uuid(0x7702);
     let c = child.display().to_string();
@@ -112,6 +134,54 @@ fn t2_2_writer_byte_equality_and_confinement() {
     }
 }
 
+/// T2.2 through a remote session (T8.4): the VM's CLI writes its own
+/// transcript and mirrors it frame by frame (`FAKE_WRITE_TRANSCRIPT`, two
+/// turns, a last frame after the EOF), into the Mac's projects dir with no
+/// mirror root: the Mac's copy is the VM's file, byte for byte, 0600 in
+/// 0700 dirs. Frames whose path is another project's, `..` out of the root
+/// or of a shape no transcript has are refused, and nothing is written for
+/// them: the writer is confined to the session's own project.
+fn remote_mirror_is_the_vms_transcript(link: Link) {
+    let p = Harness::prepare();
+    let sid = fake_fixed_sid();
+    let (slug, projects) = (p.slug(), p.mac_projects());
+    let elsewhere = ["-another-project", &format!("../escape/{slug}"), &format!("{slug}/{sid}")];
+    let refused: String = elsewhere
+        .iter()
+        .map(|rel| format!("{{\"type\":\"transcript_mirror\",\"filePath\":{},\"entries\":[{{\"type\":\"user\",\"n\":1}}]}}\n", serde_json::to_string(&format!("{}/{rel}/{sid}.jsonl", projects.display())).unwrap()))
+        .collect();
+    let file = p.write_file("refused-frames.ndjson", &refused);
+    let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_STDOUT_FILE", file.to_str().unwrap()), ("FAKE_FINAL_MIRROR_MS", "200"), ("FAKE_EXIT_DELAY_MS", "500")];
+    let mut h = p.spawn_on(link, "local-child", &[], &knobs);
+    h.send_initialize();
+    h.expect_out(is_init, T);
+    for text in ["one", "two"] {
+        let u = h.send_user(text);
+        h.expect_out(|v| is_result_for(v, &u), T);
+    }
+    h.close_stdin();
+    let (status, _) = h.wait(EXIT);
+    let transcript = h.transcript();
+    assert_eq!(status.code(), Some(0), "{transcript}");
+    assert!(!h.out_lines().iter().any(|l| l.contains("transcript_mirror")), "a mirror frame reached the host\n{transcript}");
+    let mac = projects.join(&slug).join(format!("{sid}.jsonl"));
+    let vm = h.vm_projects().join(&slug).join(format!("{sid}.jsonl"));
+    let (mac_text, vm_text) = (std::fs::read(&mac).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", mac.display())), std::fs::read(&vm).unwrap_or_else(|e| panic!("{}: {e}", vm.display())));
+    assert_eq!(mac_text, vm_text, "the Mac's mirror is the VM's transcript, byte for byte");
+    assert_eq!(String::from_utf8_lossy(&mac_text).lines().count(), 5, "two turns of two entries, then the last frame's summary");
+    assert_eq!(files_under(&projects), vec![mac.clone()], "nothing written for a refused frame");
+    assert!(!escaped(&projects), "nothing landed beside the projects root");
+    assert_eq!(mode(&mac), 0o600, "{}", mac.display());
+    assert_eq!(mode(&projects.join(&slug)), 0o700);
+    assert!(note_has(&h.end_note(), "mirror:3/3"), "three frames mirrored, three refused: {}", h.end_note());
+    h.assert_remote_end(link);
+}
+
+/// Did a frame `..` out of `projects` land beside it (`<projects>/../escape`)?
+fn escaped(projects: &Path) -> bool {
+    projects.parent().is_some_and(|claude| claude.join("escape").exists())
+}
+
 /// Two mirror frames (entries under the Mac's own projects root: the child's
 /// root in local-child) and one noise line, as the fake's stdout file.
 fn frames_file(p: &common::Prepared, sid: &str) -> (PathBuf, Vec<&'static str>, &'static str) {
@@ -126,33 +196,41 @@ fn frames_file(p: &common::Prepared, sid: &str) -> (PathBuf, Vec<&'static str>, 
     (p.write_file("mirror-frames.ndjson", &text), entries, noise)
 }
 
-#[test]
-fn frames_are_never_forwarded() {
-    let p = Harness::prepare();
-    let sid = uuid(0x7703);
-    let (file, entries, noise) = frames_file(&p, &sid);
-    let mirror = p.root.join("mirror");
-    let slug = p.slug();
-    let mut h = p.spawn("local-child", &[], &[("FAKE_STDOUT_FILE", file.to_str().unwrap()), ("AI_ENV_BRIDGE_MIRROR_ROOT", mirror.to_str().unwrap())]);
-    h.send_initialize();
-    h.expect_out(|v| v["type"] == "stream_event", T);
-    h.close_stdin();
-    let (status, _) = h.wait(EXIT);
-    let transcript = h.transcript();
-    assert_eq!(status.code(), Some(0), "{transcript}");
-    let out = h.out_lines();
-    assert!(!out.iter().any(|l| l.contains("transcript_mirror")), "a mirror frame reached the host\n{transcript}");
-    assert_eq!(out.iter().filter(|l| *l == noise).count(), 1, "the noise line is forwarded verbatim\n{transcript}");
-    let at = out.iter().position(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| is_init(&v))).expect("init");
-    assert_eq!(out.get(at + 1).map(String::as_str), Some(noise), "nothing but the noise follows the init\n{transcript}");
-    let mirrored = mirror.join(&slug).join(format!("{sid}.jsonl"));
-    assert_eq!(std::fs::read_to_string(&mirrored).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", mirrored.display())), joined(&entries));
-    assert!(!h.prepared.mac_projects().exists(), "the wrapper wrote nothing under the Mac's projects root");
-    let note = h.end_note();
-    assert!(note_has(&note, "mirror:2/0"), "{note}");
-    assert!(h.wrapper_log().contains("mirror writer enabled:"), "{}", h.wrapper_log());
-}
+on_links!(
+    /// Mirror frames are written where `AI_ENV_BRIDGE_MIRROR_ROOT` says and
+    /// never reach the host; the noise line between them is forwarded verbatim.
+    frames_are_never_forwarded,
+    |link| {
+        let p = Harness::prepare();
+        let sid = uuid(0x7703);
+        let (file, entries, noise) = frames_file(&p, &sid);
+        let mirror = p.root.join("mirror");
+        let slug = p.slug();
+        let mut h = p.spawn_on(link, "local-child", &[], &[("FAKE_STDOUT_FILE", file.to_str().unwrap()), ("AI_ENV_BRIDGE_MIRROR_ROOT", mirror.to_str().unwrap())]);
+        h.send_initialize();
+        h.expect_out(|v| v["type"] == "stream_event", T);
+        h.close_stdin();
+        let (status, _) = h.wait(EXIT);
+        let transcript = h.transcript();
+        assert_eq!(status.code(), Some(0), "{transcript}");
+        let out = h.out_lines();
+        assert!(!out.iter().any(|l| l.contains("transcript_mirror")), "a mirror frame reached the host\n{transcript}");
+        assert_eq!(out.iter().filter(|l| *l == noise).count(), 1, "the noise line is forwarded verbatim\n{transcript}");
+        let at = out.iter().position(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| is_init(&v))).expect("init");
+        assert_eq!(out.get(at + 1).map(String::as_str), Some(noise), "nothing but the noise follows the init\n{transcript}");
+        let mirrored = mirror.join(&slug).join(format!("{sid}.jsonl"));
+        assert_eq!(std::fs::read_to_string(&mirrored).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", mirrored.display())), joined(&entries));
+        assert!(!h.prepared.mac_projects().exists(), "the wrapper wrote nothing under the Mac's projects root");
+        let note = h.end_note();
+        assert!(note_has(&note, "mirror:2/0"), "{note}");
+        assert!(h.wrapper_log().contains("mirror writer enabled:"), "{}", h.wrapper_log());
+        h.assert_remote_end(link);
+    }
+);
 
+/// Local only: a local child writes its own transcript, so without a mirror
+/// root there is nothing to mirror. A remote child's writer is always on,
+/// confined to the session's project (`t2_2_writer_byte_equality_and_confinement::remote`).
 #[test]
 fn writer_disabled_without_mirror_root_in_local_child() {
     let p = Harness::prepare();
@@ -173,72 +251,77 @@ fn writer_disabled_without_mirror_root_in_local_child() {
     assert!(log.contains("mirror writer disabled:"), "{log}");
 }
 
-/// Run one local-child session whose fake prints `frames` (NDJSON text) after
+/// Run one session on `link` whose fake prints `frames` (NDJSON text) after
 /// its init, with the writer pointed at `<tmp>/mirror`; the mirror root and
 /// the finished harness.
-fn run_frames(p: common::Prepared, frames: &str) -> (PathBuf, Harness) {
+fn run_frames(link: Link, p: common::Prepared, frames: &str) -> (PathBuf, Harness) {
     let file = p.write_file("mirror-frames.ndjson", frames);
     let mirror = p.root.join("mirror");
-    let mut h = p.spawn("local-child", &[], &[("FAKE_STDOUT_FILE", file.to_str().unwrap()), ("AI_ENV_BRIDGE_MIRROR_ROOT", mirror.to_str().unwrap())]);
+    let mut h = p.spawn_on(link, "local-child", &[], &[("FAKE_STDOUT_FILE", file.to_str().unwrap()), ("AI_ENV_BRIDGE_MIRROR_ROOT", mirror.to_str().unwrap())]);
     h.send_initialize();
     h.expect_out(|v| v["type"] == "stream_event", T);
     h.close_stdin();
     let (status, _) = h.wait(EXIT);
     assert_eq!(status.code(), Some(0), "{}", h.transcript());
     assert!(!h.out_lines().iter().any(|l| l.contains("transcript_mirror")), "a mirror frame reached the host\n{}", h.transcript());
+    h.assert_remote_end(link);
     (mirror, h)
 }
 
-/// A subagent frame carrying one transcript entry and one `agent_metadata`
-/// entry: the `.jsonl` gets only the transcript line, the `.meta.json`
-/// companion the metadata without its `type` (0600).
-#[test]
-fn agent_metadata_frame_writes_the_meta_json() {
-    let p = Harness::prepare();
-    let sid = uuid(0x7705);
-    let slug = p.slug();
-    let entry = r#"{"type":"user","isSidechain":true,"agentId":"a1","message":{"role":"user","content":"sub"}}"#;
-    let meta = r#"{"type":"agent_metadata","agentType":"general-purpose","description":"find the thing"}"#;
-    let fp = serde_json::to_string(&format!("{}/{slug}/{sid}/subagents/agent-a1.jsonl", p.mac_projects().display())).unwrap();
-    let frames = format!("{{\"type\":\"transcript_mirror\",\"filePath\":{fp},\"entries\":[{entry},{meta}]}}\n{{\"type\":\"stream_event\",\"event\":{{\"type\":\"ping\"}}}}\n");
-    let (mirror, h) = run_frames(p, &frames);
-    let dir = mirror.join(&slug).join(&sid).join("subagents");
-    let jsonl = dir.join("agent-a1.jsonl");
-    let meta_json = dir.join("agent-a1.meta.json");
-    let transcript = h.transcript();
-    assert_eq!(std::fs::read_to_string(&jsonl).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", jsonl.display())), format!("{entry}\n"), "only the transcript line");
-    let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_json).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", meta_json.display()))).expect("meta.json is JSON");
-    let mut want: serde_json::Value = serde_json::from_str(meta).unwrap();
-    want.as_object_mut().unwrap().remove("type");
-    assert_eq!(got, want, "the metadata without its type");
-    assert!(got.get("type").is_none());
-    assert_eq!(mode(&meta_json), 0o600);
-    assert_eq!(mode(&jsonl), 0o600);
-    assert_eq!(files_under(&mirror), vec![jsonl.clone(), meta_json.clone()], "nothing else written");
-    assert!(note_has(&h.end_note(), "mirror:1/0"), "{}", h.end_note());
-}
+on_links!(
+    /// A subagent frame carrying one transcript entry and one `agent_metadata`
+    /// entry: the `.jsonl` gets only the transcript line, the `.meta.json`
+    /// companion the metadata without its `type` (0600).
+    agent_metadata_frame_writes_the_meta_json,
+    |link| {
+        let p = Harness::prepare();
+        let sid = uuid(0x7705);
+        let slug = p.slug();
+        let entry = r#"{"type":"user","isSidechain":true,"agentId":"a1","message":{"role":"user","content":"sub"}}"#;
+        let meta = r#"{"type":"agent_metadata","agentType":"general-purpose","description":"find the thing"}"#;
+        let fp = serde_json::to_string(&format!("{}/{slug}/{sid}/subagents/agent-a1.jsonl", p.mac_projects().display())).unwrap();
+        let frames = format!("{{\"type\":\"transcript_mirror\",\"filePath\":{fp},\"entries\":[{entry},{meta}]}}\n{{\"type\":\"stream_event\",\"event\":{{\"type\":\"ping\"}}}}\n");
+        let (mirror, h) = run_frames(link, p, &frames);
+        let dir = mirror.join(&slug).join(&sid).join("subagents");
+        let jsonl = dir.join("agent-a1.jsonl");
+        let meta_json = dir.join("agent-a1.meta.json");
+        let transcript = h.transcript();
+        assert_eq!(std::fs::read_to_string(&jsonl).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", jsonl.display())), format!("{entry}\n"), "only the transcript line");
+        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_json).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", meta_json.display()))).expect("meta.json is JSON");
+        let mut want: serde_json::Value = serde_json::from_str(meta).unwrap();
+        want.as_object_mut().unwrap().remove("type");
+        assert_eq!(got, want, "the metadata without its type");
+        assert!(got.get("type").is_none());
+        assert_eq!(mode(&meta_json), 0o600);
+        assert_eq!(mode(&jsonl), 0o600);
+        assert_eq!(files_under(&mirror), vec![jsonl.clone(), meta_json.clone()], "nothing else written");
+        assert!(note_has(&h.end_note(), "mirror:1/0"), "{}", h.end_note());
+    }
+);
 
-/// The stdout serializer escapes U+2028/U+2029 (` `, ` `); the CLI's
-/// file line holds the raw characters, and so must the mirror.
-#[test]
-fn line_separator_escapes_are_unescaped() {
-    let p = Harness::prepare();
-    let sid = uuid(0x7706);
-    let slug = p.slug();
-    let entry = r#"{"type":"user","message":{"role":"user","content":"a b c \\u2028 stays"}}"#;
-    let fp = serde_json::to_string(&format!("{}/{slug}/{sid}.jsonl", p.mac_projects().display())).unwrap();
-    let frames = format!("{{\"type\":\"transcript_mirror\",\"filePath\":{fp},\"entries\":[{entry}]}}\n{{\"type\":\"stream_event\",\"event\":{{\"type\":\"ping\"}}}}\n");
-    let (mirror, h) = run_frames(p, &frames);
-    let file = mirror.join(&slug).join(format!("{sid}.jsonl"));
-    let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}\n{}", file.display(), h.transcript()));
-    let want = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a\u{2028}b\u{2029}c \\\\u2028 stays\"}}\n";
-    assert_eq!(text, want, "the raw separators, an escaped backslash left alone");
-    assert!(text.contains('\u{2028}') && text.contains('\u{2029}'));
-    let parsed: serde_json::Value = serde_json::from_str(text.trim_end_matches('\n')).unwrap();
-    let original: serde_json::Value = serde_json::from_str(entry).unwrap();
-    assert_eq!(parsed, original, "the same JSON value");
-    assert!(note_has(&h.end_note(), "mirror:1/0"), "{}", h.end_note());
-}
+on_links!(
+    /// The stdout serializer escapes U+2028/U+2029 (` `, ` `); the CLI's
+    /// file line holds the raw characters, and so must the mirror.
+    line_separator_escapes_are_unescaped,
+    |link| {
+        let p = Harness::prepare();
+        let sid = uuid(0x7706);
+        let slug = p.slug();
+        let entry = r#"{"type":"user","message":{"role":"user","content":"a b c \\u2028 stays"}}"#;
+        let fp = serde_json::to_string(&format!("{}/{slug}/{sid}.jsonl", p.mac_projects().display())).unwrap();
+        let frames = format!("{{\"type\":\"transcript_mirror\",\"filePath\":{fp},\"entries\":[{entry}]}}\n{{\"type\":\"stream_event\",\"event\":{{\"type\":\"ping\"}}}}\n");
+        let (mirror, h) = run_frames(link, p, &frames);
+        let file = mirror.join(&slug).join(format!("{sid}.jsonl"));
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}\n{}", file.display(), h.transcript()));
+        let want = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a\u{2028}b\u{2029}c \\\\u2028 stays\"}}\n";
+        assert_eq!(text, want, "the raw separators, an escaped backslash left alone");
+        assert!(text.contains('\u{2028}') && text.contains('\u{2029}'));
+        let parsed: serde_json::Value = serde_json::from_str(text.trim_end_matches('\n')).unwrap();
+        let original: serde_json::Value = serde_json::from_str(entry).unwrap();
+        assert_eq!(parsed, original, "the same JSON value");
+        assert!(note_has(&h.end_note(), "mirror:1/0"), "{}", h.end_note());
+    }
+);
 
 // ---- T2.1 (Mike; real CLI capture) ---------------------------------------------------------
 
@@ -262,7 +345,7 @@ fn t2_1_captured_frames_match_real_file() {
     let projects = PathBuf::from(std::env::var("AI_ENV_T21_PROJECTS").expect("AI_ENV_T21_PROJECTS: that run's CLAUDE_CONFIG_DIR/projects"));
     let text = std::fs::read_to_string(&frames).unwrap_or_else(|e| panic!("{frames}: {e}"));
     let dest = tempfile::tempdir().unwrap();
-    let mut w = Writer::new(MirrorCfg { child_projects_root: projects.clone(), dest_root: dest.path().to_path_buf(), enabled: true, reason: "t2.1".into() });
+    let mut w = Writer::new(MirrorCfg { child_projects_root: projects.clone(), dest_root: dest.path().to_path_buf(), enabled: true, project: None, reason: "t2.1".into() });
     let mut ext: Option<String> = None;
     let mut mirror_frames = 0_u32;
     for line in text.lines() {

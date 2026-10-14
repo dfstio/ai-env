@@ -1,17 +1,27 @@
 //! `GET /health` — the public summary the Mac polls after `run_microvm` — and
 //! the state every listener shares: options, the claude probe, the `/run`
-//! record, the booting/draining flags, and (S6) the spawn manager, the agent
-//! registry and what the peer guard saw. `GET /health/detail` (bearer only)
-//! adds the guard, the sockets, the spawns and the listeners. The app router
-//! puts the peer guard first, then the bearer (every path but `/health` and
-//! `/agent`), and answers any other path 404 behind them.
+//! record, the booting/draining flags, (S6) the spawn manager, the agent
+//! registry and what the peer guard saw, and (S8) the VM's one workspace.
+//! `GET /health/detail` (bearer only) adds the guard, the sockets, the
+//! spawns, the listeners and the workspace. The app router puts the peer
+//! guard first, then the bearer (every path but `/health` and `/agent`),
+//! and answers any other path 404 behind them.
+//!
+//! S8's app-port routes (`wire::workspace`), each run by the agent's helper
+//! (`asagent`) and served only by a shim that has one (it then names
+//! `CAP_WORKSPACE_V1`; without one they answer 404, as an older shim's do):
+//! `GET /transcript?rel=` (a `TranscriptStat`), `PUT /transcript?rel=` (the
+//! file, `Content-Length` required, at most `TRANSCRIPT_MAX`; one at a time)
+//! and `GET /settings?path=` (a `SettingsCapture`).
 use crate::shim::agent::AgentRegistry;
+use crate::shim::asagent::{self, AgentCmd, WorkspaceSlot};
 use crate::shim::hooks::HookSource;
 use crate::shim::peer::AgentGuard;
 use crate::shim::spawn::{SpawnManager, SpawnOpts};
 use crate::shim::state::RunState;
 use crate::shim::sys::{ClockMode, RealSys, SysOps};
-use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, STDOUT_WINDOW_BYTES, WIRE_VERSION};
+use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
+use crate::wire::workspace::{budget, refusal, transcript_rel_check, vm_path_check, PathQuery, RelQuery, SettingsCapture, TranscriptReply, TranscriptStat, WsRefusal, SETTINGS_ROUTE, TRANSCRIPT_MAX, TRANSCRIPT_ROUTE};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
@@ -66,7 +76,17 @@ pub struct ShimOpts {
     pub gid: u32,
     /// stdout window per spawn (hidden `--agent-window-bytes`).
     pub window_bytes: u64,
+    /// The program the agent's workspace helper runs as `<helper> shim-io
+    /// <op>` (S8 §6; W3 starts it): the shim's own binary, resolved at
+    /// startup, or the hidden `--helper`. `None` (an in-process test that
+    /// names none): the workspace routes cannot start a helper.
+    pub helper: Option<PathBuf>,
+    /// The git the helper runs (hidden `--git`, default [`GIT_DEFAULT`]).
+    pub git: PathBuf,
 }
+
+/// The image's git, the helper's unless `--git` names another.
+pub const GIT_DEFAULT: &str = "/usr/bin/git";
 
 impl Default for ShimOpts {
     fn default() -> Self {
@@ -80,6 +100,8 @@ impl Default for ShimOpts {
             uid: 1000,
             gid: 1000,
             window_bytes: STDOUT_WINDOW_BYTES,
+            helper: None,
+            git: PathBuf::from(GIT_DEFAULT),
         }
     }
 }
@@ -121,6 +143,9 @@ pub struct ShimState {
     pub last_clock: Mutex<Option<serde_json::Value>>,
     /// Set once by [`Self::set_ports`].
     pub ports: OnceLock<BoundPorts>,
+    /// The VM's one workspace (S8): the last seed's record, the lock of seed,
+    /// code-out and snapshot.
+    pub workspace: WorkspaceSlot,
 }
 
 impl ShimState {
@@ -144,6 +169,7 @@ impl ShimState {
             agent_uid: opts.uid,
             window_bytes: opts.window_bytes,
             sweep: cfg!(target_os = "linux") && probe.uid.is_some(),
+            fs_root: opts.fs_root.clone(),
         });
         ShimState {
             started: Instant::now(),
@@ -164,6 +190,7 @@ impl ShimState {
             refused: Mutex::new(BTreeMap::new()),
             last_clock: Mutex::new(None),
             ports: OnceLock::new(),
+            workspace: WorkspaceSlot::default(),
         }
     }
 
@@ -197,6 +224,25 @@ impl ShimState {
             Some(root) => root.join(path.strip_prefix("/").unwrap_or(path)),
             None => path.to_path_buf(),
         }
+    }
+
+    /// Whether this shim serves the workspace routes (S8): it has a helper
+    /// program to run them as the agent (the shim's own binary, or the
+    /// hidden `--helper`). Without one it neither names
+    /// [`CAP_WORKSPACE_V1`] nor serves them (404, as an older shim).
+    #[must_use]
+    pub fn serves_workspace(&self) -> bool {
+        self.opts.helper.is_some()
+    }
+
+    /// What this shim can do beyond wire v1's core: `hello_ok.caps` and `/health`'s.
+    #[must_use]
+    pub fn caps(&self) -> Vec<String> {
+        let mut caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
+        if self.serves_workspace() {
+            caps.push(CAP_WORKSPACE_V1.to_string());
+        }
+        caps
     }
 
     /// `/ready`: the three listeners are bound and one probe succeeded.
@@ -233,8 +279,11 @@ impl ShimState {
     /// throwaway `HOME`, a fixed `PATH`), as `uid:gid` when root, stdin
     /// closed, killed after [`CLAUDE_PROBE_TIMEOUT`]. Returns the first
     /// stdout line. An EPERM from the chown or the dropped spawn names the
-    /// capabilities the effective set lacks.
+    /// capabilities the effective set lacks. Counted as a workspace helper
+    /// while it runs (`SpawnManager::hold_helper`): the idle sweep a spawn's
+    /// end starts never kills the probe, which runs as the agent too.
     pub async fn probe_fresh(&self) -> Result<String, String> {
+        let _hold = self.spawns.hold_helper(true).await;
         let home = tempfile::Builder::new().prefix("ai-env-probe-").tempdir().map_err(|e| format!("probe HOME: {e}"))?;
         let dropping = self.probe.uid.is_some() || self.probe.gid.is_some();
         let hint = |e: &std::io::Error| if dropping { crate::shim::sys::eperm_hint(e, self.sys.cap_eff()) } else { String::new() };
@@ -294,7 +343,7 @@ impl ShimState {
             run_hook_seen: run.seen,
             uptime_s: since.elapsed().as_secs(),
             wire: Some(WIRE_VERSION),
-            caps: vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.to_string()],
+            caps: self.caps(),
         }
     }
 
@@ -320,6 +369,7 @@ impl ShimState {
             clock: self.last_clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
             listeners,
             listeners_omitted,
+            workspace: self.serves_workspace().then(|| self.workspace.view(self.spawns.helpers())),
         }
     }
 }
@@ -334,7 +384,7 @@ async fn detail(State(state): State<Arc<ShimState>>) -> Json<HealthDetail> {
 
 /// 405 for a method a route does not serve (axum adds `Allow`), after
 /// draining the request body like every other refusal.
-async fn method_not_allowed(req: Request) -> StatusCode {
+pub(crate) async fn method_not_allowed(req: Request) -> StatusCode {
     crate::shim::peer::drain(req).await;
     StatusCode::METHOD_NOT_ALLOWED
 }
@@ -344,15 +394,101 @@ async fn method_not_allowed(req: Request) -> StatusCode {
 /// `/health/detail`, and 404 for the rest. Serve it with
 /// `into_make_service_with_connect_info::<peer::Peer>()`.
 pub fn router(state: Arc<ShimState>) -> Router {
-    // The last layer runs first: the guard, then the bearer.
-    Router::new()
+    let mut routes = Router::new()
         .route("/health", get(health).fallback(method_not_allowed))
         .route("/health/detail", get(detail).fallback(method_not_allowed))
-        .route("/agent", any(crate::shim::agent::upgrade))
+        .route("/agent", any(crate::shim::agent::upgrade));
+    if state.serves_workspace() {
+        routes = routes
+            .route(TRANSCRIPT_ROUTE, get(get_transcript).put(put_transcript).fallback(method_not_allowed))
+            .route(SETTINGS_ROUTE, get(get_settings).fallback(method_not_allowed));
+    }
+    // The last layer runs first: the guard, then the bearer.
+    routes
         .fallback(crate::shim::auth::not_implemented)
         .layer(from_fn_with_state(state.clone(), crate::shim::auth::app_bearer))
         .layer(from_fn_with_state(state.clone(), crate::shim::peer::guard))
         .with_state(state)
+}
+
+// ---- S8: the transcript and settings routes -------------------------------------------------
+
+/// The agent's projects directory, where its claude keeps its transcripts
+/// (`CLAUDE_CONFIG_DIR` is `<home>/.claude`: `spawn`).
+fn projects(state: &ShimState) -> std::path::PathBuf {
+    state.opts.home.join(".claude").join("projects")
+}
+
+/// `GET /transcript?rel=`: the VM's copy, as the agent's projects directory holds it.
+async fn get_transcript(State(state): State<Arc<ShimState>>, req: Request) -> axum::response::Response {
+    let (op, started) = ("transcript-stat", Instant::now());
+    let q: RelQuery = match crate::shim::code::query(&req) {
+        Ok(q) => q,
+        Err(r) => return asagent::refuse(op, started, &r),
+    };
+    if let Err(e) = transcript_rel_check(&q.rel) {
+        return asagent::refuse(op, started, &WsRefusal::new(refusal::BAD_REQUEST, &format!("the transcript's rel {e}")));
+    }
+    if state.is_draining() {
+        return asagent::refuse(op, started, &asagent::AgentProcError::Draining.refusal(op));
+    }
+    let cmd = AgentCmd { op, args: vec![asagent::flag("projects", projects(&state)), asagent::flag("rel", &q.rel)], budget: budget::TRANSCRIPT, stdin: false, during_stop: false };
+    let out = asagent::run_op::<TranscriptStat>(&state, cmd, None).await;
+    asagent::respond(op, started, out, |_| 200)
+}
+
+/// `PUT /transcript?rel=`: the file (`Content-Length` required, at most
+/// `TRANSCRIPT_MAX`), streamed to the helper, which writes it as the agent;
+/// under the transcripts' own lock, as a task of its own
+/// (`asagent::detached`: a client gone meanwhile never kills the helper
+/// before it removed its temp file).
+async fn put_transcript(State(state): State<Arc<ShimState>>, req: Request) -> axum::response::Response {
+    let (op, started) = ("transcript-put", Instant::now());
+    let q: RelQuery = match crate::shim::code::query(&req) {
+        Ok(q) => q,
+        Err(r) => return crate::shim::code::refuse_draining(op, started, req, &r).await,
+    };
+    if let Err(e) = transcript_rel_check(&q.rel) {
+        return crate::shim::code::refuse_draining(op, started, req, &WsRefusal::new(refusal::BAD_REQUEST, &format!("the transcript's rel {e}"))).await;
+    }
+    let len = match crate::shim::code::content_length(&req, TRANSCRIPT_MAX) {
+        Ok(len) => len,
+        Err(stop) => {
+            crate::shim::peer::drain(req).await;
+            return stop.respond(op, started);
+        }
+    };
+    if state.is_draining() {
+        return crate::shim::code::refuse_draining(op, started, req, &asagent::AgentProcError::Draining.refusal(op)).await;
+    }
+    asagent::detached(op, started, async move {
+        let Ok(_one) = tokio::time::timeout(state.workspace.busy_wait(), state.workspace.transcripts.lock()).await else {
+            return crate::shim::code::refuse_after_body(op, started, req, len, &asagent::busy(op, "another transcript upload is being written", state.workspace.busy_wait())).await;
+        };
+        let args = vec![asagent::flag("projects", projects(&state)), asagent::flag("rel", &q.rel), asagent::flag("len", len.to_string())];
+        let cmd = AgentCmd { op, args, budget: budget::TRANSCRIPT + asagent::transfer(len), stdin: true, during_stop: false };
+        let out = asagent::run_with_body::<TranscriptReply>(&state, cmd, req.into_body()).await;
+        asagent::respond(op, started, out, |r| r.outcome.status())
+    })
+    .await
+}
+
+/// `GET /settings?path=`: the VM claude's settings for the workspace (T8.7).
+async fn get_settings(State(state): State<Arc<ShimState>>, req: Request) -> axum::response::Response {
+    let (op, started) = ("settings", Instant::now());
+    let q: PathQuery = match crate::shim::code::query(&req) {
+        Ok(q) => q,
+        Err(r) => return asagent::refuse(op, started, &r),
+    };
+    if let Err(e) = vm_path_check(&q.path) {
+        return asagent::refuse(op, started, &WsRefusal::new(refusal::BAD_REQUEST, &format!("the workspace path {e}")));
+    }
+    if state.is_draining() {
+        return asagent::refuse(op, started, &asagent::AgentProcError::Draining.refusal(op));
+    }
+    let cmd = AgentCmd { op, args: vec![asagent::flag("path", &q.path)], budget: budget::SETTINGS, stdin: false, during_stop: false };
+    let out = asagent::run_op::<SettingsCapture>(&state, cmd, None).await;
+    asagent::respond(op, started, out, |_| 200)
 }
 
 #[cfg(test)]
@@ -392,6 +528,29 @@ mod tests {
         assert_eq!(state.claude_version().as_deref(), Some("2.1.283"));
         assert_eq!(state.ready(), Ok(()));
         assert!(state.probe_fresh().await.is_err(), "a fresh probe is never served from the cache");
+    }
+
+    /// The probe runs as the agent, as a workspace helper does: while it
+    /// runs it is counted as one, so a spawn's end never sweeps it away.
+    #[tokio::test]
+    async fn the_probe_holds_off_the_idle_sweep_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, started) = (dir.path().join("claude"), dir.path().join("started"));
+        std::fs::write(&script, format!("#!/bin/sh\n: > '{}'\nsleep 1\necho '2.1.283 (Claude Code)'\n", started.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = Arc::new(ShimState::new(script));
+        assert_eq!(state.spawns.helpers(), 0);
+        let probe = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.probe_fresh().await }
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !started.exists() && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.spawns.helpers(), 1, "the running probe is counted");
+        assert_eq!(probe.await.unwrap().unwrap(), "2.1.283 (Claude Code)");
+        assert_eq!(state.spawns.helpers(), 0, "and let go once it ended");
     }
 
     #[tokio::test]

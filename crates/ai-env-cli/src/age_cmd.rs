@@ -490,7 +490,8 @@ pub struct AgeKill {
 /// How long [`AgeKill::kill_group`] gives the group to end on SIGTERM before
 /// SIGKILL.
 const KILL_AFTER_TERM: std::time::Duration = std::time::Duration::from_millis(500);
-/// How often the waiter asks whether the child has exited.
+/// How often the waiter asks whether the child has exited (and
+/// [`AgeKill::kill_group`] whether the waiter has reaped it).
 const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl AgeKill {
@@ -546,8 +547,11 @@ impl AgeKill {
 
     /// End the decrypt now: SIGTERM to the child's process group, then SIGKILL
     /// after [`KILL_AFTER_TERM`] if anything is still there. Doing nothing when
-    /// the child has already been reaped. Safe to call more than once, and from
-    /// any thread.
+    /// the child has already been reaped, and returning as soon as the waiter
+    /// reaped it after the TERM (asked every [`REAP_POLL`]): a group that ends
+    /// on its TERM costs the caller tens of ms, never the whole wait (S8: the
+    /// remote session drops a pending unseal on the pump's only runtime
+    /// thread). Safe to call more than once, and from any thread.
     pub fn kill_group(&self) {
         // First, so a child adopted after this point is killed by `adopt` itself.
         self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -556,7 +560,11 @@ impl AgeKill {
             if !self.signal_group(libc::SIGTERM) {
                 return;
             }
-            std::thread::sleep(KILL_AFTER_TERM);
+            // Reaped: the SIGKILL below finds no child, as it always did once the waiter had reaped it.
+            let until = std::time::Instant::now() + KILL_AFTER_TERM;
+            while self.running() && std::time::Instant::now() < until {
+                std::thread::sleep(REAP_POLL);
+            }
             self.signal_group(libc::SIGKILL);
         }
     }

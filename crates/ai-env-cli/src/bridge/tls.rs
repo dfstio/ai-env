@@ -95,6 +95,27 @@ fn reqwest_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().use_preconfigured_tls((*client_config()).clone()).no_proxy().redirect(reqwest::redirect::Policy::none())
 }
 
+/// The data plane's client under the lab's agent address (S8 C4; debug
+/// builds only, with the fake API, as `AI_ENV_BRIDGE_LAB_AGENT_ADDR` itself):
+/// plain `http://` to `addr`, a loopback address only (a test's per-port
+/// fake endpoint), the endpoint's `host` resolved to it so a request names
+/// the endpoint's Host as through the real one; no proxy, no redirect, no
+/// pooled connection (the fake endpoint takes one request per connection).
+/// It carries the one TLS configuration although it never uses it: without
+/// one, reqwest would look for a process-wide crypto provider and panic
+/// where none was installed. Any other address is refused (exit 1).
+#[cfg(debug_assertions)]
+pub fn lab_http_client(addr: std::net::SocketAddr, host: &str) -> Result<reqwest::Client, crate::bridge::errors::BridgeError> {
+    if !addr.ip().is_loopback() {
+        return Err(crate::bridge::errors::BridgeError::Config(format!("the lab HTTP client dials a loopback address only, not {addr}")));
+    }
+    reqwest_builder()
+        .resolve(host, addr)
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| crate::bridge::errors::BridgeError::Config(format!("cannot build the lab HTTP client: {e}")))
+}
+
 /// The AWS SDK's HTTP client under the same policy, for `api::sdk_config()`:
 /// rustls on aws-lc-rs, a trust store that starts EMPTY (never the platform
 /// store) and holds only the four embedded Amazon roots, and the proxy
@@ -210,6 +231,31 @@ mod tests {
     #[test]
     fn reqwest_client_builds() {
         assert!(reqwest_client().is_ok());
+    }
+
+    /// The lab client: never anything but a loopback address; there, plain
+    /// http with the endpoint's Host, never following a redirect.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn the_lab_client_takes_loopback_only_and_names_the_endpoints_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = "abc.lambda-microvm.eu-central-1.on.aws";
+        let e = lab_http_client("192.0.2.1:8080".parse().unwrap(), host).unwrap_err();
+        assert!(matches!(e, crate::bridge::errors::BridgeError::Config(_)) && e.to_string().contains("loopback address only"), "{e}");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(b"HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:1/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let client = lab_http_client(addr, host).unwrap();
+        let r = client.get(format!("http://{host}/seed?path=%2Fw")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 302, "the redirect is the answer, never followed");
+        let head = server.await.unwrap();
+        assert!(head.starts_with("GET /seed?path=%2Fw HTTP/1.1\r\n") && head.to_ascii_lowercase().contains(&format!("host: {host}\r\n")), "{head}");
     }
 
     #[test]

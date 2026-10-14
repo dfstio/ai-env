@@ -140,6 +140,86 @@ impl Paths {
         self.workspaces().join(format!("{slug}.lock"))
     }
 
+    /// `state/workspaces/<slug>.toml` (S8): the workspace's row, a map keyed
+    /// by canonical cwd (the slug is lossy): root, VM path, branch, the last
+    /// fetch and, per VM, what was seeded. Written under [`Paths::workspaces_rows_lock`].
+    #[must_use]
+    pub fn workspace_row(&self, slug: &str) -> PathBuf {
+        self.workspaces().join(format!("{slug}.toml"))
+    }
+
+    /// `state/workspaces/<slug>.seed.lock` (S8): held while a seed of the
+    /// workspace runs; never together with [`Paths::workspace_lock`].
+    #[must_use]
+    pub fn workspace_seed_lock(&self, slug: &str) -> PathBuf {
+        self.workspaces().join(format!("{slug}.seed.lock"))
+    }
+
+    /// `state/workspaces/<slug>.fetch.lock` (S8): held while a code-out
+    /// fetch of the workspace writes `refs/remotes/box/*`.
+    #[must_use]
+    pub fn workspace_fetch_lock(&self, slug: &str) -> PathBuf {
+        self.workspaces().join(format!("{slug}.fetch.lock"))
+    }
+
+    /// `state/workspaces/<slug>.active` (S8): a shared lock every remote
+    /// wrapper and `vm warm` of the workspace holds for its life; a close
+    /// suspends the VM only when it can take it alone.
+    #[must_use]
+    pub fn workspace_active(&self, slug: &str) -> PathBuf {
+        self.workspaces().join(format!("{slug}.active"))
+    }
+
+    /// `state/workspaces/<slug>.warm.lock` (S8): taken without waiting by the
+    /// `auth status` prewarm, held by its detached `vm warm --prewarm`.
+    #[must_use]
+    pub fn workspace_warm_lock(&self, slug: &str) -> PathBuf {
+        self.workspaces().join(format!("{slug}.warm.lock"))
+    }
+
+    /// `state/workspaces/.rows.lock` (S8): held around every read-modify-write
+    /// of a workspace row (never S4's placement lock).
+    #[must_use]
+    pub fn workspaces_rows_lock(&self) -> PathBuf {
+        self.workspaces().join(".rows.lock")
+    }
+
+    /// `state/unseal.lock` (S8): serialises the Touch ID dialogs of every
+    /// wrapper, `vm warm` and credentialed `vm exec`.
+    #[must_use]
+    pub fn unseal_lock(&self) -> PathBuf {
+        self.root.join("state").join("unseal.lock")
+    }
+
+    /// `state/tmp` (S8): scratch repositories and packs of a seed or a
+    /// code-out (0700, removed on every path).
+    #[must_use]
+    pub fn tmp(&self) -> PathBuf {
+        self.root.join("state").join("tmp")
+    }
+
+    /// `state/scan-cache` (S8): object ids a complete scan found clean, per
+    /// digest of the scan rules.
+    #[must_use]
+    pub fn scan_cache(&self) -> PathBuf {
+        self.root.join("state").join("scan-cache")
+    }
+
+    /// `quarantine/` (S8): what a session's VM left that is reviewed before
+    /// it goes anywhere (its settings captures).
+    #[must_use]
+    pub fn quarantine(&self) -> PathBuf {
+        self.root.join("quarantine")
+    }
+
+    /// `quarantine/<uuid>` (S8): one session's captures (`settings/start.json`,
+    /// `latest.json`, `latest-<VM id>.json`, `diff.json`). `uuid` must already
+    /// be a session id.
+    #[must_use]
+    pub fn quarantine_session(&self, uuid: &str) -> PathBuf {
+        self.quarantine().join(uuid)
+    }
+
     /// `logs/ai-env.log`: the operator CLI's own log (`ai-env vm|lab`).
     #[must_use]
     pub fn cli_log(&self) -> PathBuf {
@@ -284,7 +364,49 @@ impl VmCfg {
         if self.memory_mib == 0 {
             return bad("memory_mib", "must be positive");
         }
-        Ok(())
+        self.prewarm_mode().map(|_| ())
+    }
+
+    /// `prewarm_on_auth_status` as a mode, or exit 1 naming the key.
+    pub fn prewarm_mode(&self) -> Result<PrewarmMode, BridgeError> {
+        PrewarmMode::parse(&self.prewarm_on_auth_status)
+            .ok_or_else(|| BridgeError::Config(format!("[vm].prewarm_on_auth_status = {:?}: must be \"auto\", \"always\" or \"never\"", self.prewarm_on_auth_status)))
+    }
+}
+
+/// `[vm].prewarm_on_auth_status` (S8): whether the wrapper, run for exactly
+/// `auth status --json` under the roots in remote mode, starts a detached
+/// `ai-env vm warm --prewarm` for the workspace (one Touch ID of its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrewarmMode {
+    /// Only when no reusable VM row exists for the workspace (a cold start; the default).
+    Auto,
+    /// Whenever the other conditions hold.
+    Always,
+    /// Never.
+    Never,
+}
+
+impl PrewarmMode {
+    /// `auto`, `always` or `never`; anything else is `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<PrewarmMode> {
+        match value {
+            "auto" => Some(PrewarmMode::Auto),
+            "always" => Some(PrewarmMode::Always),
+            "never" => Some(PrewarmMode::Never),
+            _ => None,
+        }
+    }
+
+    /// The spelling in bridge.toml.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            PrewarmMode::Auto => "auto",
+            PrewarmMode::Always => "always",
+            PrewarmMode::Never => "never",
+        }
     }
 }
 
@@ -359,6 +481,9 @@ pub struct WrapperCfg {
     pub env_forward: Vec<String>,
     pub env_extra: Vec<String>,
     pub initial_permission_mode: String,
+    /// S8 (L1): `passthrough` (the default) or `remote`, see [`WrapperMode`];
+    /// `AI_ENV_BRIDGE_MODE` overrides it. Read through [`WrapperCfg::wrapper_mode`].
+    pub mode: String,
 }
 
 impl Default for WrapperCfg {
@@ -381,6 +506,56 @@ impl Default for WrapperCfg {
             .collect(),
             env_extra: Vec::new(),
             initial_permission_mode: "default".into(),
+            mode: WrapperMode::Passthrough.name().into(),
+        }
+    }
+}
+
+impl WrapperCfg {
+    /// `mode` as a [`WrapperMode`], or exit 1 naming the key. Checked where
+    /// it is acted on (the wrapper, `wrapper install --mode`, doctor), never
+    /// by [`BridgeConfig::parse`]: the wrapper routes on the file, and a bad
+    /// value must not make the whole file unreadable.
+    pub fn wrapper_mode(&self) -> Result<WrapperMode, BridgeError> {
+        WrapperMode::parse(&self.mode).ok_or_else(|| BridgeError::Config(format!("[wrapper].mode = {:?}: must be \"passthrough\" or \"remote\"", self.mode)))
+    }
+
+    /// The `[wrapper]` values S8 acts on (`mode`); a violation is exit 1 naming the key.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        self.wrapper_mode().map(|_| ())
+    }
+}
+
+/// `[wrapper].mode` (S8, L1): what the wrapper does with a stream-json
+/// session under the roots. Everything else (subcommands, sessions outside
+/// the roots) execs locally either way; the two local pump modes stay
+/// `AI_ENV_BRIDGE_MODE`-only lab tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapperMode {
+    /// Exec the real binary on this Mac (S1; the default).
+    Passthrough,
+    /// Run the session in the workspace's MicroVM; under the roots it fails
+    /// closed (an exit and one line), never a silent local run.
+    Remote,
+}
+
+impl WrapperMode {
+    /// `passthrough` or `remote`; anything else is `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<WrapperMode> {
+        match value {
+            "passthrough" => Some(WrapperMode::Passthrough),
+            "remote" => Some(WrapperMode::Remote),
+            _ => None,
+        }
+    }
+
+    /// The spelling in bridge.toml and of `wrapper install --mode`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            WrapperMode::Passthrough => "passthrough",
+            WrapperMode::Remote => "remote",
         }
     }
 }
@@ -398,8 +573,16 @@ pub struct WorkspaceCfg {
     pub branch: Option<String>,
     pub memory_mib: Option<u32>,
     pub egress_allow: Vec<String>,
-    pub seed_allow_dirty: bool,
+    /// Deprecated by S8 D2 (the seed carries the uncommitted changes): parsed
+    /// so a file that sets it still loads, never acted on; a set value earns
+    /// [`WorkspaceCfg::deprecation`]'s note. [`WorkspaceCfg::seed_wip`] replaces it.
+    pub seed_allow_dirty: Option<bool>,
     pub trust_repo_settings: bool,
+    /// S8 D2: the seed carries the uncommitted changes (tracked, and
+    /// untracked files that are not ignored) as one scanned WIP commit the
+    /// VM checks out uncommitted (default true); `box seed --no-wip`
+    /// overrides it for one seed.
+    pub seed_wip: bool,
 }
 
 impl Default for WorkspaceCfg {
@@ -409,9 +592,93 @@ impl Default for WorkspaceCfg {
             branch: None,
             memory_mib: None,
             egress_allow: Vec::new(),
-            seed_allow_dirty: false,
+            seed_allow_dirty: None,
             trust_repo_settings: false,
+            seed_wip: true,
         }
+    }
+}
+
+impl WorkspaceCfg {
+    /// The one note a workspace that still sets `seed_allow_dirty` earns
+    /// (either value: S8 D2 changed what a dirty tree means), `None` otherwise.
+    #[must_use]
+    pub fn deprecation(&self) -> Option<String> {
+        self.seed_allow_dirty.map(|_| {
+            format!(
+                "[[workspace]] {}: seed_allow_dirty is deprecated and ignored (S8 D2: the seed carries the uncommitted changes; seed_wip = false or box seed --no-wip leaves them on the Mac)",
+                self.path.display()
+            )
+        })
+    }
+}
+
+/// `[seed]` (S8): the caps of what a seed and a code-out carry (plan §5,
+/// §7). Checked by the commands that act on them ([`SeedCfg::validate`]),
+/// never by [`BridgeConfig::parse`]: the wrapper routes on the file.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SeedCfg {
+    /// The most the wrapper's own seed sends, in MiB: it runs inside Cursor's
+    /// 60 s initialize window (64 MiB is about 16 s at 4 MB/s); a larger seed
+    /// is left to `box seed` and the prewarm.
+    pub wrapper_inline_mib: u32,
+    /// The most `box seed`, `vm warm` and the prewarm send, in MiB.
+    pub max_mib: u32,
+    /// The largest object a seed carries, in MiB: a larger blob is a finding.
+    pub max_blob_mib: u32,
+    /// The most new bytes the uncommitted changes add, in MiB: more is refused
+    /// (exit 9) naming the five largest files.
+    pub max_wip_mib: u32,
+    /// The most untracked files the uncommitted changes carry.
+    pub max_untracked_files: u32,
+    /// The most one code-out fetch receives, in MiB.
+    pub max_fetch_mib: u32,
+    /// How many `refs/wip/*` snapshots the VM, and how many
+    /// `refs/remotes/box/wip/*` refs the Mac, keep (the newest); at most
+    /// [`SeedCfg::KEEP_WIP_REFS_MAX`].
+    pub keep_wip_refs: u32,
+}
+
+impl Default for SeedCfg {
+    fn default() -> Self {
+        SeedCfg { wrapper_inline_mib: 64, max_mib: 512, max_blob_mib: 64, max_wip_mib: 64, max_untracked_files: 5000, max_fetch_mib: 256, keep_wip_refs: 64 }
+    }
+}
+
+impl SeedCfg {
+    /// The largest value a MiB cap may take: the shim takes a seed body of at most 1 GiB.
+    pub const MIB_MAX: u32 = 1024;
+    /// The most `keep_wip_refs`: a code-out names at most
+    /// `wire::workspace::HAVES_MAX` object ids as the Mac's, the box tips
+    /// among them, with room left for the Mac's HEAD, the seeded head and a
+    /// few branches.
+    pub const KEEP_WIP_REFS_MAX: u32 = crate::wire::workspace::HAVES_MAX as u32 - 8;
+
+    /// Every cap within its range, and the wrapper's and the WIP's within
+    /// `max_mib`; a violation is exit 1 naming the key.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        let bad = |key: &str, why: String| Err(BridgeError::Config(format!("[seed].{key}: {why}")));
+        let ranges: [(&str, u32, std::ops::RangeInclusive<u32>); 7] = [
+            ("wrapper_inline_mib", self.wrapper_inline_mib, 1..=Self::MIB_MAX),
+            ("max_mib", self.max_mib, 1..=Self::MIB_MAX),
+            ("max_blob_mib", self.max_blob_mib, 1..=Self::MIB_MAX),
+            ("max_wip_mib", self.max_wip_mib, 1..=Self::MIB_MAX),
+            ("max_untracked_files", self.max_untracked_files, 1..=100_000),
+            ("max_fetch_mib", self.max_fetch_mib, 1..=Self::MIB_MAX),
+            ("keep_wip_refs", self.keep_wip_refs, 1..=Self::KEEP_WIP_REFS_MAX),
+        ];
+        for (key, value, range) in ranges {
+            if !range.contains(&value) {
+                return bad(key, format!("{value} is outside {}..={}", range.start(), range.end()));
+            }
+        }
+        for (key, value) in [("wrapper_inline_mib", self.wrapper_inline_mib), ("max_wip_mib", self.max_wip_mib)] {
+            if value > self.max_mib {
+                return bad(key, format!("{value} is more than [seed].max_mib ({})", self.max_mib));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -684,6 +951,7 @@ pub struct BridgeConfig {
     pub review: ReviewCfg,
     pub panel: PanelCfg,
     pub transport: TransportCfg,
+    pub seed: SeedCfg,
 }
 
 impl BridgeConfig {
@@ -972,6 +1240,112 @@ mod tests {
     fn review_pre_push_hook_is_unknown() {
         let e = BridgeConfig::parse("[review]\npre_push_hook = true\n").unwrap_err();
         assert!(e.to_string().contains("pre_push_hook"), "{e}");
+    }
+
+    /// S8's state (plan §12): the workspace rows and their locks, the scratch
+    /// and scan-cache directories, the quarantine, the unseal lock.
+    #[test]
+    fn the_s8_state_paths() {
+        let p = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        let slug = "-Users-mike-Documents-DeFi-ai-env";
+        assert_eq!(p.workspace_row(slug), PathBuf::from(format!("/r/state/workspaces/{slug}.toml")));
+        assert_eq!(p.workspace_seed_lock(slug), PathBuf::from(format!("/r/state/workspaces/{slug}.seed.lock")));
+        assert_eq!(p.workspace_fetch_lock(slug), PathBuf::from(format!("/r/state/workspaces/{slug}.fetch.lock")));
+        assert_eq!(p.workspace_active(slug), PathBuf::from(format!("/r/state/workspaces/{slug}.active")));
+        assert_eq!(p.workspace_warm_lock(slug), PathBuf::from(format!("/r/state/workspaces/{slug}.warm.lock")));
+        assert_eq!(p.workspaces_rows_lock(), PathBuf::from("/r/state/workspaces/.rows.lock"));
+        assert_eq!(p.unseal_lock(), PathBuf::from("/r/state/unseal.lock"));
+        assert_eq!(p.tmp(), PathBuf::from("/r/state/tmp"));
+        assert_eq!(p.scan_cache(), PathBuf::from("/r/state/scan-cache"));
+        assert_eq!(p.quarantine(), PathBuf::from("/r/quarantine"));
+        let uuid = "01926f2e-0000-7000-8000-0000000000aa";
+        assert_eq!(p.quarantine_session(uuid), PathBuf::from(format!("/r/quarantine/{uuid}")));
+        assert_eq!(p.workspace_lock(slug).parent(), p.workspace_row(slug).parent(), "beside S4's lock");
+    }
+
+    /// `[wrapper].mode` (S8 L1): passthrough by default; any value parses (the
+    /// wrapper routes on the file), only the two names validate.
+    #[test]
+    fn wrapper_mode_defaults_to_passthrough_and_is_checked_where_used() {
+        let c = BridgeConfig::parse("").unwrap();
+        assert_eq!(c.wrapper.mode, "passthrough");
+        assert_eq!(c.wrapper.wrapper_mode().unwrap(), WrapperMode::Passthrough);
+        c.wrapper.validate().unwrap();
+        let of = |v: &str| BridgeConfig::parse(&format!("[wrapper]\nmode = {v:?}\n")).unwrap().wrapper;
+        assert_eq!(of("remote").wrapper_mode().unwrap(), WrapperMode::Remote);
+        assert_eq!(of("passthrough").wrapper_mode().unwrap(), WrapperMode::Passthrough);
+        for bad in ["Remote", "local-child", "local-scratch", "", " remote"] {
+            let w = of(bad);
+            let e = w.validate().unwrap_err().to_string();
+            assert!(e.contains("[wrapper].mode") && e.contains("\"passthrough\" or \"remote\""), "{bad:?}: {e}");
+            assert!(w.wrapper_mode().is_err(), "{bad:?}");
+        }
+        for m in [WrapperMode::Passthrough, WrapperMode::Remote] {
+            assert_eq!(WrapperMode::parse(m.name()), Some(m));
+        }
+    }
+
+    /// `[vm].prewarm_on_auth_status` (S8): auto, always or never, checked with the other `[vm]` ranges.
+    #[test]
+    fn prewarm_on_auth_status_is_auto_always_or_never() {
+        let c = BridgeConfig::parse("").unwrap();
+        assert_eq!(c.vm.prewarm_mode().unwrap(), PrewarmMode::Auto);
+        for m in [PrewarmMode::Auto, PrewarmMode::Always, PrewarmMode::Never] {
+            let vm = BridgeConfig::parse(&format!("[vm]\nprewarm_on_auth_status = {:?}\n", m.name())).unwrap().vm;
+            vm.validate().unwrap();
+            assert_eq!(vm.prewarm_mode().unwrap(), m);
+        }
+        let vm = BridgeConfig::parse("[vm]\nprewarm_on_auth_status = \"sometimes\"\n").unwrap().vm;
+        let e = vm.validate().unwrap_err().to_string();
+        assert!(e.contains("[vm].prewarm_on_auth_status") && e.contains("\"auto\", \"always\" or \"never\""), "{e}");
+        assert!(vm.prewarm_mode().is_err());
+    }
+
+    /// `[seed]` (S8 plan §12): its defaults, every cap's range, the wrapper's
+    /// and the WIP's caps within `max_mib`, no unknown key.
+    #[test]
+    fn the_seed_table_has_its_defaults_and_ranges() {
+        let d = BridgeConfig::parse("").unwrap().seed;
+        assert_eq!(d, SeedCfg { wrapper_inline_mib: 64, max_mib: 512, max_blob_mib: 64, max_wip_mib: 64, max_untracked_files: 5000, max_fetch_mib: 256, keep_wip_refs: 64 });
+        d.validate().unwrap();
+        let of = |body: &str| BridgeConfig::parse(&format!("[seed]\n{body}")).unwrap().seed;
+        assert_eq!(of("max_mib = 1024\nkeep_wip_refs = 8\n").max_mib, 1024);
+        of("max_mib = 1024\nkeep_wip_refs = 8\n").validate().unwrap();
+        // The newest box/wip/* tips go out as a code-out's haves, at most HAVES_MAX of them with the heads.
+        assert_eq!(SeedCfg::KEEP_WIP_REFS_MAX, 248);
+        of("keep_wip_refs = 248\n").validate().unwrap();
+        for (body, why) in [
+            ("max_mib = 0\n", "[seed].max_mib: 0 is outside 1..=1024"),
+            ("max_mib = 1025\n", "[seed].max_mib: 1025 is outside 1..=1024"),
+            ("max_blob_mib = 0\n", "[seed].max_blob_mib: 0 is outside"),
+            ("max_untracked_files = 100001\n", "[seed].max_untracked_files: 100001 is outside 1..=100000"),
+            ("max_fetch_mib = 2048\n", "[seed].max_fetch_mib"),
+            ("keep_wip_refs = 0\n", "[seed].keep_wip_refs"),
+            ("keep_wip_refs = 249\n", "[seed].keep_wip_refs: 249 is outside 1..=248"),
+            ("max_mib = 32\n", "[seed].wrapper_inline_mib: 64 is more than [seed].max_mib (32)"),
+            ("max_wip_mib = 600\n", "[seed].max_wip_mib: 600 is more than [seed].max_mib (512)"),
+        ] {
+            let e = of(body).validate().unwrap_err().to_string();
+            assert!(e.contains(why), "{body:?}: {e}");
+        }
+        assert!(BridgeConfig::parse("[seed]\nmax_bundle_mib = 64\n").is_err(), "an unknown key is refused");
+    }
+
+    /// `[[workspace]]` (S8 D2): `seed_wip` is on by default; the deprecated
+    /// `seed_allow_dirty` still parses, does nothing, and earns one note.
+    #[test]
+    fn seed_wip_defaults_on_and_seed_allow_dirty_is_deprecated() {
+        let c = BridgeConfig::parse("[[workspace]]\npath = \"/a\"\n").unwrap();
+        let w = &c.workspace_overrides[0];
+        assert!(w.seed_wip && w.seed_allow_dirty.is_none() && w.deprecation().is_none(), "{w:?}");
+        assert!(WorkspaceCfg::default().seed_wip);
+        let c = BridgeConfig::parse("[[workspace]]\npath = \"/a\"\nseed_wip = false\n").unwrap();
+        assert!(!c.workspace_overrides[0].seed_wip);
+        for v in ["true", "false"] {
+            let c = BridgeConfig::parse(&format!("[[workspace]]\npath = \"/a\"\nseed_allow_dirty = {v}\n")).unwrap();
+            let note = c.workspace_overrides[0].deprecation().unwrap_or_default();
+            assert!(note.starts_with("[[workspace]] /a: seed_allow_dirty is deprecated and ignored"), "{v}: {note}");
+        }
     }
 
     #[test]

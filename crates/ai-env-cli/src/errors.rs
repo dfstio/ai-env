@@ -97,6 +97,15 @@ pub fn exit_on_error(prefix: &str, result: Result<()>) {
     }
 }
 
+/// S8's phase-0 stubs: what a command or an operation a later S8 wave builds
+/// answers until then (`<what>: not built yet (<wave>)`, exit 1, `wave` as
+/// `S8 wave 1: W4`). A stub returns it and never panics; the wave that builds
+/// the code removes the stub.
+#[must_use]
+pub fn not_built(what: &str, wave: &str) -> CliError {
+    CliError::Msg(format!("{what}: not built yet ({wave})"))
+}
+
 /// Convenience for `format!`-style one-offs.
 #[macro_export]
 macro_rules! bail {

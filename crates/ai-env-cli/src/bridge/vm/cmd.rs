@@ -44,24 +44,39 @@ impl Ctx {
     pub fn load() -> Result<Ctx> {
         let paths = Paths::resolve()?;
         let cfg = BridgeConfig::load(&paths)?.ok_or_else(|| CliError::Msg(format!("{} not found: run `make infra-status WRITE=1` (it writes [aws])", paths.config.display())))?;
+        let knobs = Ctx::checked(&paths, &cfg)?;
+        let _ = crate::bridge::logging::init(&crate::bridge::logging::LogOpts { path: paths.cli_log(), rust_log: std::env::var("RUST_LOG").ok() });
+        Ok(Ctx { paths, cfg, knobs })
+    }
+
+    /// The remote wrapper's context (S8 P0): `bridge.toml` as the wrapper
+    /// loaded it, through [`Ctx::load`]'s checks, its notes and warnings
+    /// through the voice (the wrapper's log), the lab knobs read; no CLI log
+    /// is opened (the wrapper logs to its own).
+    pub fn for_wrapper(paths: &Paths, cfg: &BridgeConfig) -> Result<Ctx> {
+        let knobs = Ctx::checked(paths, cfg)?;
+        Ok(Ctx { paths: paths.clone(), cfg: cfg.clone(), knobs })
+    }
+
+    /// The `vm` checks of `cfg` ([`Ctx::load`]'s) and the lab knobs, announced when active.
+    fn checked(paths: &Paths, cfg: &BridgeConfig) -> Result<VmKnobs> {
         cfg.vm.validate()?;
         cfg.aws.validate_egress()?;
         cfg.egress.validate()?;
         if cfg.egress.names_no_resolver() {
             // Reported, never refused: S5's first form still parses, and only the credential gate depends on it.
-            let newest = crate::bridge::egress::newest_dns_path(&paths);
+            let newest = crate::bridge::egress::newest_dns_path(paths);
             let fix = crate::bridge::egress::pin_suggestion(newest.as_ref().ok().and_then(Option::as_deref));
             // Without the rows the suggestion can only be the placeholder: say why.
             let unread = newest.err().map(|e| format!(" (the dns-path rows cannot be read: {e})")).unwrap_or_default();
-            eprintln!("ai-env: warning: {TRUE_ACCEPTS_NOTHING}; only no-dns passes the credential gate: in {}: {fix}{unread}", paths.config.display());
+            crate::bridge::voice::warn(&format!("{TRUE_ACCEPTS_NOTHING}; only no-dns passes the credential gate: in {}: {fix}{unread}", paths.config.display()));
         }
         CredentialsSource::parse(&cfg.aws.credentials)?;
         cfg.transport.validate()?;
         let knobs = vm_knobs();
         knobs.agent_addr().map_err(CliError::Usage)?;
         announce(&knobs);
-        let _ = crate::bridge::logging::init(&crate::bridge::logging::LogOpts { path: paths.cli_log(), rust_log: std::env::var("RUST_LOG").ok() });
-        Ok(Ctx { paths, cfg, knobs })
+        Ok(knobs)
     }
 
     /// `[aws].image_arn`, or exit 1 naming the command that writes it.
@@ -83,11 +98,13 @@ impl Ctx {
         }
     }
 
-    fn poll(&self, p: run::Poll) -> run::Poll {
+    /// `p` scaled by the lab's backoff knob.
+    pub(crate) fn poll(&self, p: run::Poll) -> run::Poll {
         p.scaled(self.knobs.backoff_ms)
     }
 
-    fn backoff(&self) -> health::Backoff {
+    /// The `/health` backoff, scaled by the lab's backoff knob.
+    pub(crate) fn backoff(&self) -> health::Backoff {
         health::Backoff::HEALTH.scaled(self.knobs.backoff_ms)
     }
 }
@@ -95,13 +112,15 @@ impl Ctx {
 fn announce(knobs: &VmKnobs) {
     let active = knobs.active();
     if !active.is_empty() {
-        eprintln!("ai-env: LAB KNOBS ACTIVE ({}): not the real service (debug build)", active.join(", "));
+        crate::bridge::voice::note(&format!("LAB KNOBS ACTIVE ({}): not the real service (debug build)", active.join(", ")));
     }
 }
 
-/// The control plane and the endpoint a command talks to.
+/// The control plane and the endpoint a command talks to. The SDK's halves
+/// are shared (S8: the remote session's task and its code-out trigger hold
+/// them past the pipeline that made them).
 pub enum Backend {
-    Sdk(client::SdkMicrovmApi, health::HttpsEndpoint),
+    Sdk(std::sync::Arc<client::SdkMicrovmApi>, std::sync::Arc<health::HttpsEndpoint>),
     Fake(FileFakeMicrovmApi),
 }
 
@@ -110,15 +129,15 @@ pub async fn backend(store: &Keystore, ctx: &Ctx) -> Result<Backend> {
     if let Some(path) = &ctx.knobs.fake_api {
         if ctx.knobs.fake_api_unseal {
             let creds = client::runtime_credentials(store, &ctx.paths, &ctx.cfg)?;
-            eprintln!("ai-env: {} (unsealed; the fake API does not use it)", creds.describe());
+            crate::bridge::voice::note(&format!("{} (unsealed; the fake API does not use it)", creds.describe()));
         }
         return Ok(Backend::Fake(FileFakeMicrovmApi::open(path)?));
     }
     let creds = client::runtime_credentials(store, &ctx.paths, &ctx.cfg)?;
-    eprintln!("ai-env: {}", creds.describe());
+    crate::bridge::voice::note(&creds.describe());
     let api = client::connect(&creds).await;
     let ep = health::HttpsEndpoint::new()?;
-    Ok(Backend::Sdk(api, ep))
+    Ok(Backend::Sdk(std::sync::Arc::new(api), std::sync::Arc::new(ep)))
 }
 
 /// Run `$body` with `$api`/`$ep` bound to the backend's control plane and
@@ -127,7 +146,7 @@ macro_rules! with_backend {
     ($b:expr, |$api:ident, $ep:ident| $body:expr) => {
         match $b {
             $crate::bridge::vm::cmd::Backend::Sdk(a, e) => {
-                let ($api, $ep) = (a, e);
+                let ($api, $ep) = (&**a, &**e);
                 $body
             }
             $crate::bridge::vm::cmd::Backend::Fake(f) => {
@@ -144,15 +163,36 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| CliError::Msg(format!("cannot start the async runtime: {e}")))
 }
 
-/// One audit row (`actor=cli` first); a failure to write is a warning, never
-/// fatal, and never a panic (`signals::say`): a command may audit after a
-/// stop that closed its terminal.
+/// One audit row (`actor=cli` first, and the process's purpose, S8: see
+/// [`set_audit_purpose`], when `pairs` name none); a failure to write is a
+/// warning through the voice, never fatal, and never a panic: a command may
+/// audit after a stop that closed its terminal.
 pub fn audit_event(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
     let mut d = audit::detail(pairs);
     d.insert("actor".into(), "cli".into());
-    if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(event, None, d)) {
-        crate::bridge::signals::say(&format!("ai-env: warning: audit row {event} not written: {e}"));
+    if let Some(purpose) = audit_purpose() {
+        d.entry("purpose".into()).or_insert_with(|| purpose.into());
     }
+    if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(event, None, d)) {
+        crate::bridge::voice::warn(&format!("audit row {event} not written: {e}"));
+    }
+}
+
+/// The purpose this process's S4–S7 audit rows carry (S8 plan §12).
+static AUDIT_PURPOSE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Mark every audit row this process writes from now on (`vm_run`,
+/// `vm_reuse`, `credential_*`, `agent_*`, `endpoint_429`, …) with `purpose`,
+/// one of `remote::PURPOSES` (`session` for the remote wrapper, `prewarm`
+/// for `vm warm --prewarm`), unless a row names its own; picked once,
+/// `false` when one was picked already.
+pub fn set_audit_purpose(purpose: &'static str) -> bool {
+    AUDIT_PURPOSE.set(purpose).is_ok()
+}
+
+/// The purpose [`set_audit_purpose`] picked, if any.
+pub(crate) fn audit_purpose() -> Option<&'static str> {
+    AUDIT_PURPOSE.get().copied()
 }
 
 fn json_out(v: &serde_json::Value) -> Result<()> {
@@ -209,9 +249,10 @@ fn refresh_row(paths: &Paths, vm: &VmInfo) {
     }
 }
 
+/// The plan's warnings: on stderr for the CLI, to the log for a prewarm (`bridge::voice`).
 fn warn_plan(plan: &run::RunPlan) {
     for w in &plan.warnings {
-        eprintln!("ai-env: warning: {w}");
+        crate::bridge::voice::warn(w);
     }
 }
 
@@ -225,11 +266,25 @@ fn gc_hint(items: std::result::Result<Vec<gc::GcItem>, BridgeError>) {
 
 /// `ai-env vm …`.
 pub fn main(store: &Keystore, cmd: VmCmd) -> Result<()> {
+    // S8: the prewarm the wrapper started is quiet (its notes go to the log) and audited as such; it records
+    // itself in the warm lock it inherits on fd 3 until it ends.
+    let _record = match &cmd {
+        VmCmd::Warm { workspace, prewarm: true, .. } => {
+            crate::bridge::voice::set(crate::bridge::voice::Voice::Wrapper);
+            set_audit_purpose("prewarm");
+            Paths::resolve().ok().and_then(|paths| WarmRecord::adopt(&paths, workspace))
+        }
+        _ => None,
+    };
     // Before anything could listen: a signal ignored when ai-env started stays ignored (`signals`).
     crate::bridge::signals::note_dispositions();
     let ctx = Ctx::load()?;
     // Everything that can be refused without AWS is refused before the Touch ID.
     let pre = Pre::check(&ctx, &cmd)?;
+    // `vm warm --dry-run` (S8): the plan, said; no AWS call, no Touch ID.
+    if let (VmCmd::Warm { dry_run: true, json, .. }, Pre::Warm(warm)) = (&cmd, &pre) {
+        return warm_dry_run(&ctx, warm, *json);
+    }
     // Only `vm exec` knows that the setup-token's own prompt is one `vm warm` could have taken ahead of time.
     let token_prompt = matches!(&pre, Pre::Exec(plan) if plan.credential.as_ref().is_some_and(|c| c.file.is_none()));
     let rt = runtime()?;
@@ -244,13 +299,21 @@ pub fn main(store: &Keystore, cmd: VmCmd) -> Result<()> {
                 let (b, token) = crate::bridge::agent::credential::backend_for_credential(store, &ctx, cred).await?;
                 (b, Some(crate::bridge::agent::credential::CredentialSupply { store, token }))
             }
-            Pre::Warm(_, cred) | Pre::Smoke(_, Some(cred)) => {
+            Pre::Warm(_) | Pre::Smoke(_, Some(_)) => {
+                let cred = pre.sealed_token().ok_or_else(|| CliError::Msg("internal: no credential plan".into()))?;
                 crate::bridge::signals::Stops::take()?.keep();
                 let (b, token) = crate::bridge::agent::credential::backend_for_credential(store, &ctx, cred).await?;
                 (b, Some(crate::bridge::agent::credential::CredentialSupply { store, token }))
             }
             _ => (backend(store, &ctx).await?, None),
         };
+        // `vm warm` holds the control plane shared (S8: the seed's endpoint tokens are minted with it).
+        if let (VmCmd::Warm { json, prewarm, .. }, Pre::Warm(w)) = (&cmd, &pre) {
+            return match &b {
+                Backend::Sdk(api, ep) => warm(&ctx, std::sync::Arc::clone(api), &**ep, w, *json, *prewarm, supply).await,
+                Backend::Fake(f) => warm(&ctx, std::sync::Arc::new(f.clone()), f, w, *json, *prewarm, supply).await,
+            };
+        }
         with_backend!(&b, |api, ep| dispatch(&ctx, api, ep, cmd, pre, supply).await).map_err(|e| {
             if token_prompt && crate::bridge::unseal::is_deadline(&e) {
                 crate::bridge::creds::with_note(e, "nothing was started; `ai-env vm warm <workspace>` delivers the token to that workspace's VM ahead of time, so a command there needs no Touch ID for it")
@@ -274,13 +337,22 @@ enum Pre {
     Attach(Box<crate::bridge::agent::exec::AttachPlan>),
     /// `vm health --detail`: the row whose session token is the bearer.
     Detail(Box<VmRow>),
-    /// `vm warm` (S7): the workspace's run plan and the setup-token's seal.
-    Warm(Box<run::RunPlan>, crate::bridge::agent::credential::CredentialPlan),
+    /// `vm warm` (S7, S8): the workspace's run plan, the setup-token's seal, the workspace to seed.
+    Warm(Box<Warm>),
     /// `vm smoke`: its run plan, and the setup-token's seal with `--with-credential` (S7).
     Smoke(Box<run::RunPlan>, Option<crate::bridge::agent::credential::CredentialPlan>),
 }
 
 impl Pre {
+    /// The sealed setup-token's plan of `vm warm` and `vm smoke --with-credential`.
+    fn sealed_token(&self) -> Option<&crate::bridge::agent::credential::CredentialPlan> {
+        match self {
+            Pre::Warm(w) => Some(&w.cred),
+            Pre::Smoke(_, cred) => cred.as_ref(),
+            _ => None,
+        }
+    }
+
     fn check(ctx: &Ctx, cmd: &VmCmd) -> Result<Pre> {
         Ok(match cmd {
             VmCmd::Run { image, version, max_duration, idle, suspended, no_auto_resume, egress, workspace, new, label, shell, no_execution_role, no_wait, .. } => {
@@ -357,14 +429,13 @@ impl Pre {
                 Pre::Exec(Box::new(crate::bridge::agent::exec::check_exec(ctx, id, cwd.clone(), env, *detach_grace, argv.clone(), &cred)?))
             }
             VmCmd::Attach { id, spawn, from_seq } => Pre::Attach(Box::new(crate::bridge::agent::exec::check_attach(ctx, id, spawn, *from_seq)?)),
-            VmCmd::Warm { workspace, .. } => {
-                let flags = run::RunFlags { workspace: Some(workspace.clone()), egress: Some(run::Egress::Vpc), purpose: "operator", wait: true, ..run::RunFlags::default() };
-                let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags)?;
-                // Its own client token, as the smoke's: a stop while `select` runs still finds the VM it started.
-                plan.client_token = Some(uuid::Uuid::now_v7().to_string());
-                let cred = sealed_token_plan(ctx)?;
-                provisional_gate(ctx, &plan)?;
-                Pre::Warm(Box::new(plan), cred)
+            VmCmd::Warm { workspace, prewarm, .. } => {
+                let warm = warm_check(ctx, workspace, *prewarm);
+                if let (true, Err(e)) = (*prewarm, &warm) {
+                    // The prewarm's stderr is /dev/null (S8 §11): why nothing was warmed goes to its log.
+                    crate::bridge::voice::note(&format!("no prewarm: {e}"));
+                }
+                Pre::Warm(Box::new(warm?))
             }
             VmCmd::Health { id, detail: true, .. } => Pre::Detail(Box::new(crate::bridge::agent::exec::check_detail(ctx, id)?)),
             _ => Pre::None,
@@ -377,7 +448,7 @@ impl Pre {
 /// the Touch ID about the token: `[creds]`, a sealed token, its seal not
 /// refused. The gate's local half follows ([`provisional_gate`]); the chosen
 /// VM's own row is checked once it is chosen (`credential::check`).
-fn sealed_token_plan(ctx: &Ctx) -> Result<crate::bridge::agent::credential::CredentialPlan> {
+pub(crate) fn sealed_token_plan(ctx: &Ctx) -> Result<crate::bridge::agent::credential::CredentialPlan> {
     use crate::bridge::creds::{aws_env_state, AwsEnvState};
     ctx.cfg.creds.validate()?;
     let token = ctx.paths.setup_token_env();
@@ -411,7 +482,7 @@ fn sealed_token_plan(ctx: &Ctx) -> Result<crate::bridge::agent::credential::Cred
 /// never hides what stops `N.0` (the version the doctor's row judges), and
 /// the fallback names the most recently recorded version, never the oldest.
 /// `credential::check` judges the chosen VM's own row afterwards.
-fn provisional_gate(ctx: &Ctx, plan: &run::RunPlan) -> Result<()> {
+pub(crate) fn provisional_gate(ctx: &Ctx, plan: &run::RunPlan) -> Result<()> {
     use crate::bridge::egress::{credential_precheck, newest_dns_path, normalize_connector, EgressVerified};
     let verified = EgressVerified::load(&ctx.paths)?;
     let dns = newest_dns_path(&ctx.paths);
@@ -507,7 +578,6 @@ async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
         (VmCmd::Health { id, detail: false, json }, _) => health_cmd(ctx, api, ep, &id, json).await,
         (VmCmd::Exec { .. }, Pre::Exec(plan)) => crate::bridge::agent::exec::run_exec(ctx, api, ep, *plan, supply).await,
         (VmCmd::Attach { .. }, Pre::Attach(plan)) => crate::bridge::agent::exec::run_attach(ctx, api, ep, *plan).await,
-        (VmCmd::Warm { json, .. }, Pre::Warm(plan, _)) => warm(ctx, api, ep, &plan, json, supply).await,
         (VmCmd::Token { id, port, minutes, reveal }, _) => token_cmd(ctx, api, &id, port, minutes, reveal).await,
         (VmCmd::Suspend { id, no_wait }, _) => suspend_resume(ctx, api, &id, true, no_wait).await,
         (VmCmd::Resume { id, no_wait }, _) => suspend_resume(ctx, api, &id, false, no_wait).await,
@@ -613,12 +683,14 @@ fn connector_state_line(paths: &Paths, configured: Option<&str>) -> Option<(bool
     }
 }
 
-/// `vm run`: a VM the S5 egress gate rejected but could not terminate gets
-/// one more TerminateMicrovm (by `policy`; TERMINATED waited for, best
-/// effort) before the command exits 9. Accepted, the failure says
-/// terminated and names no VM to terminate; refused again, it is left as it
-/// is (the row says `mismatch`: `ai-env vm gc --yes` terminates it).
-async fn retry_gate_terminate<A: MicrovmApi>(ctx: &Ctx, api: &A, mut f: run::SelectFailure) -> run::SelectFailure {
+/// `vm run` (and S8's remote session): a VM the S5 egress gate rejected but
+/// could not terminate gets one more TerminateMicrovm (by `policy`;
+/// TERMINATED waited for, best effort) before the command exits 9. Accepted,
+/// the failure says terminated and names no VM to terminate; refused again,
+/// it is left as it is (the row says `mismatch`: `ai-env vm gc --yes`
+/// terminates it). Its lines go through the voice.
+pub(crate) async fn retry_gate_terminate<A: MicrovmApi>(ctx: &Ctx, api: &A, mut f: run::SelectFailure) -> run::SelectFailure {
+    use crate::bridge::voice::{note, warn};
     let alive = match &f.error {
         BridgeError::EgressMismatch(m) if !m.terminated => (**m).clone(),
         _ => return f,
@@ -626,16 +698,16 @@ async fn retry_gate_terminate<A: MicrovmApi>(ctx: &Ctx, api: &A, mut f: run::Sel
     match run::request_terminate(api, &ctx.paths, &alive.id, "policy").await {
         Ok(recorded) => {
             if let Err(e) = recorded {
-                eprintln!("ai-env: warning: vm row {}: terminated, but the row was not updated: {e}", alive.id);
+                warn(&format!("vm row {}: terminated, but the row was not updated: {e}", alive.id));
             }
             if let Err(e) = run::wait_for_state(api, &alive.id, &VmState::Terminated, ctx.poll(run::Poll::SETTLE)).await {
-                eprintln!("ai-env: warning: {} not seen TERMINATED: {e}", alive.id);
+                warn(&format!("{} not seen TERMINATED: {e}", alive.id));
             }
-            eprintln!("ai-env: terminated {} on the second try", alive.id);
+            note(&format!("terminated {} on the second try", alive.id));
             f.error = BridgeError::egress_mismatch(&alive.id, alive.expected, alive.echoed, true);
             f.started = None;
         }
-        Err(e) => eprintln!("ai-env: warning: terminating {} failed again: {e} (its row says egress mismatch: `ai-env vm gc --yes` terminates it)", alive.id),
+        Err(e) => warn(&format!("terminating {} failed again: {e} (its row says egress mismatch: `ai-env vm gc --yes` terminates it)", alive.id)),
     }
     f
 }
@@ -662,10 +734,222 @@ async fn select<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan) -> Resul
     })
 }
 
-/// `vm warm <workspace>` (S7): the workspace's VM (started with vpc egress
-/// when it has none), its `/health` (which records the shim's caps), the
-/// credential's local and live gate, and the setup-token delivered with no
-/// spawn (`credential::deliver_only`), unless the VM holds it already.
+/// `vm warm`'s plan, checked before any Touch ID (S7, S8): the workspace's
+/// run plan, the setup-token's seal, and the workspace to seed (S8), or why
+/// there is none, with the seed's snapshot and scans (`prepared`, taken once
+/// by the warm or its dry run).
+struct Warm {
+    plan: run::RunPlan,
+    cred: crate::bridge::agent::credential::CredentialPlan,
+    seed: std::result::Result<crate::bridge::workspace::WorkspaceRef, String>,
+    prepared: std::cell::Cell<Option<crate::bridge::workspace::PreparedSeed>>,
+}
+
+/// `vm warm`'s prechecks (S7, S8), all before the Touch ID: the run plan;
+/// then, as the session's P0 orders them, the workspace ([`warm_seed`]: the
+/// prewarm refuses one no remote session takes), the setup-token's seal and
+/// the gate's local half; then the seed's snapshot and every scan
+/// (`workspace::prepare` with the CLI's caps, as `box seed` takes them): a
+/// finding or uncommitted changes over a `[seed]` cap are exit 9 here,
+/// nothing unsealed or started.
+fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool) -> Result<Warm> {
+    let purpose = if prewarm { "prewarm" } else { "operator" };
+    let flags = run::RunFlags { workspace: Some(workspace.to_path_buf()), egress: Some(run::Egress::Vpc), purpose, wait: true, ..run::RunFlags::default() };
+    let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags)?;
+    // Its own client token, as the smoke's: a stop while `select` runs still finds the VM it started.
+    plan.client_token = Some(uuid::Uuid::now_v7().to_string());
+    let seed = warm_seed(ctx, workspace, prewarm)?;
+    let cred = sealed_token_plan(ctx)?;
+    provisional_gate(ctx, &plan)?;
+    let prepared = match &seed {
+        Ok(ws) => Some(crate::bridge::workspace::prepare(&ctx.paths, &ctx.cfg, ws, &crate::bridge::workspace::SeedLimits::cli(&ctx.cfg, None))?),
+        Err(_) => None,
+    };
+    // A seed goes only to a VM that serves the workspace routes (L5).
+    plan.workspace_cap = seed.is_ok();
+    Ok(Warm { plan, cred, seed, prepared: std::cell::Cell::new(prepared) })
+}
+
+/// The workspace `vm warm` seeds (S8 §11): `workspace::resolve`'s. One the
+/// seed cannot carry (no git repository, an unsupported repository) is
+/// warmed without a seed by hand, which is said: `vm exec` there still wants
+/// the token. The prewarm (`prewarm`) refuses it instead, as a remote
+/// session's P0 does (D6: exit 9, nothing leaves the Mac; an unsupported
+/// repository: exit 1): no chat there could use the VM. Its refusal is
+/// audited as the data plane audits the seed's other refusals
+/// (`workspace::audit`: `seed_refused`, step `resolve`, the actor the
+/// process's voice, `wrapper` for a prewarm), with purpose `prewarm`. Any
+/// other refusal (outside the roots) is the warm's.
+fn warm_seed(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool) -> Result<std::result::Result<crate::bridge::workspace::WorkspaceRef, String>> {
+    use crate::bridge::workspace::code;
+    match crate::bridge::workspace::resolve(&ctx.cfg, workspace, None) {
+        Ok(ws) => Ok(Ok(ws)),
+        Err(e @ (BridgeError::WorkspaceRefused { code: code::NOT_A_GIT_REPO, .. } | BridgeError::WorkspaceFailed { code: code::UNSUPPORTED_REPO, .. })) if !prewarm => Ok(Err(e.to_string())),
+        Err(e @ (BridgeError::WorkspaceRefused { code: code::NOT_A_GIT_REPO, .. } | BridgeError::WorkspaceFailed { code: code::UNSUPPORTED_REPO, .. })) => {
+            let why = if matches!(e, BridgeError::WorkspaceRefused { .. }) { code::NOT_A_GIT_REPO } else { code::UNSUPPORTED_REPO };
+            crate::bridge::workspace::audit(&ctx.paths, crate::bridge::remote::audit_event::SEED_REFUSED, &[("workspace", workspace.display().to_string()), ("code", why.to_string()), ("step", "resolve".to_string()), ("purpose", "prewarm".to_string())]);
+            Err(e.into())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `vm warm --dry-run` (S8): what a warm would do, said and nothing done
+/// (no AWS call, no Touch ID; nothing written but the scans' clean-object
+/// cache): the workspace and its seed, what the seed carries and its scans
+/// (the prechecks took them: a finding was exit 9 there), the VM the
+/// registry would offer for reuse (SELECT_VM's own filter,
+/// `run::reuse_candidate`, when the plan reuses at all; the image version is
+/// resolved live, so offline only an `N.M` one filters, and the line says
+/// when the reuse hangs on it; GetMicrovm decides at the warm itself) or a
+/// new one, the token's seal.
+fn warm_dry_run(ctx: &Ctx, w: &Warm, json: bool) -> Result<()> {
+    let now = unix_now();
+    let key = w.plan.workspace.as_ref().map(|(p, _)| run::workspace_key(p));
+    let version = w.plan.want_version.contains('.').then_some(w.plan.want_version.as_str());
+    let wanted = ExpectedEcho::for_plan(w.plan.egress, &w.plan.egress_connectors);
+    let rows = registry::list_rows(&ctx.paths)?;
+    let reusable = match (&key, &wanted) {
+        (Some(key), Some(wanted)) if w.plan.reuse => rows.iter().find(|r| run::reuse_candidate(r, &w.plan, wanted, key, version, None, now)),
+        _ => None,
+    };
+    let carries = w.prepared.take().map(|p| p.summary());
+    let seed = match &w.seed {
+        Ok(ws) => serde_json::json!({ "cwd": ws.cwd, "root": ws.root, "vm_path": ws.vm_cwd, "branch": ws.head.branch(), "head": ws.head.sha(), "prepared": carries }),
+        Err(why) => serde_json::json!({ "none": why }),
+    };
+    if json {
+        return json_out(&serde_json::json!({
+            "backend": ctx.backend_name(), "dry_run": true, "workspace": key, "seed": seed,
+            "reuse": reusable.map(|r| r.id.clone()), "image_version": w.plan.want_version, "tag": w.cred.tag,
+        }));
+    }
+    match &w.seed {
+        Ok(ws) => outln!("the seed: {} at {} ({}), checked out at {} in the VM", ws.root.display(), ws.head.sha(), ws.head.branch().unwrap_or("a detached HEAD"), ws.vm_cwd),
+        Err(why) => outln!("no seed: {why}"),
+    }
+    if let Some(s) = &carries {
+        use crate::bridge::workspace::snapshot::human_bytes;
+        match &s.wip {
+            Some(wip) => outln!("  uncommitted: {} path(s) changed, {} untracked file(s), {} new", wip.changed, wip.untracked, human_bytes(wip.new_bytes)),
+            None => outln!("  uncommitted: none carried"),
+        }
+        let trust = if s.trust_repo_settings { " (trust_repo_settings: the repo mode is off)" } else { "" };
+        outln!("  scan: {} object(s), {} from the clean cache, {} settings file(s): clean{trust}", s.objects, s.cached, s.settings_files);
+        for note in &s.notes {
+            crate::bridge::voice::note(note);
+        }
+    }
+    match reusable {
+        Some(r) if version.is_some() => outln!("the VM: {} (its row says {}; GetMicrovm decides at the warm)", r.id, r.status.as_str()),
+        Some(r) => outln!("the VM: {} (its row says {} at image version {}: reused if `{}` is still that version; GetMicrovm decides at the warm)", r.id, r.status.as_str(), r.image_version, w.plan.want_version),
+        None if !w.plan.reuse => outln!("the VM: a new one with vpc egress (image version {}; [vm].reuse_per_workspace is off)", w.plan.want_version),
+        None => outln!("the VM: a new one with vpc egress (image version {})", w.plan.want_version),
+    }
+    outln!("the setup-token: seal {}, delivered unless the VM holds it; nothing was started: no AWS call, no Touch ID", w.cred.tag);
+    Ok(())
+}
+
+/// What `vm warm` did for the workspace's checkout (S8).
+enum Seeded {
+    /// `workspace::ensure_workspace`'s outcome.
+    Done(crate::bridge::workspace::EnsureOutcome),
+    /// No seed, and why.
+    None(String),
+}
+
+/// The seed of `vm warm` (S8 §11): `workspace::ensure_workspace` with the
+/// CLI's caps, through the data plane on `api`
+/// (`remote::pipeline::data_plane`), of `prepared`, the WIP snapshot and the
+/// scans the prechecks took before the Touch ID (`ensure_workspace` takes
+/// them itself when there is none). A VM whose shim does not serve the
+/// workspace routes (`caps`, as its `/health` just showed them) is warmed
+/// without a seed, which is said (`make deploy`).
+async fn seed_on<A: MicrovmApi + 'static>(ctx: &Ctx, api: &std::sync::Arc<A>, row: &VmRow, vm: &VmInfo, caps: &[String], seed: &std::result::Result<crate::bridge::workspace::WorkspaceRef, String>, prepared: Option<crate::bridge::workspace::PreparedSeed>) -> Result<Seeded> {
+    use crate::bridge::workspace::{self as ws_mod, EnsureCtx, SeedLimits, SeedWant};
+    let ws = match seed {
+        Ok(ws) => ws,
+        Err(why) => return Ok(Seeded::None(why.clone())),
+    };
+    if !caps.iter().any(|c| c == crate::wire::frame::CAP_WORKSPACE_V1) {
+        return Ok(Seeded::None(format!("{} runs an image older than S8 (no {}): make deploy", vm.id, crate::wire::frame::CAP_WORKSPACE_V1)));
+    }
+    let lim = SeedLimits::cli(&ctx.cfg, None);
+    let mut target_row = row.clone();
+    if !vm.endpoint.is_empty() {
+        target_row.endpoint = Some(vm.endpoint.clone());
+    }
+    let target = crate::bridge::agent::AgentTarget::from_row(&target_row)?;
+    let (dp, tokens) = crate::bridge::remote::pipeline::data_plane(ctx, api, &vm.id, true)?;
+    // Each step to the log (a send reports many times); the outcome is the warm's line.
+    let progress = |p: ws_mod::SeedProgress| tracing::info!("seed: {p:?}");
+    let ectx = EnsureCtx { api: &**api, dp: &*dp, tokens: &*tokens, paths: &ctx.paths, cfg: &ctx.cfg, target: &target, caps, ws, lim, deadline: None, progress: &progress };
+    Ok(Seeded::Done(ws_mod::ensure_workspace(&ectx, prepared, SeedWant::Auto).await?))
+}
+
+/// `vm warm --prewarm`'s record in the warm lock it inherits on fd 3 (S8
+/// §11): `pid=` and `started_at=` when it starts, `finished_at=` when it
+/// ends; the wrapper's next prewarm reads `finished_at` for its cool-down.
+/// Only a fd 3 that is this workspace's warm lock file is adopted (a `vm
+/// warm --prewarm` typed by hand has none). Holding it keeps the lock: it
+/// goes when this process does, never with a child (fd 3 is made
+/// close-on-exec first: no git or age of the prewarm inherits it).
+struct WarmRecord(std::fs::File);
+
+impl WarmRecord {
+    /// fd 3, when it is the warm lock of `workspace` (the same file as
+    /// `state/workspaces/<slug>.warm.lock`), stamped with this process: the
+    /// record written anew from its first byte (the wrapper read the last
+    /// one through this open file, so its offset may be past the end; a
+    /// write there would leave a hole of NULs before it, which the next
+    /// read's 4 KiB would come to hold alone).
+    fn adopt(paths: &Paths, workspace: &std::path::Path) -> Option<WarmRecord> {
+        use std::io::{Seek as _, Write as _};
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: an all-zero `struct stat` is a valid value of it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat(2) on fd 3 into `st`; it only reads the descriptor, which nothing owns yet.
+        if unsafe { libc::fstat(3, &raw mut st) } != 0 {
+            return None;
+        }
+        // Whatever fd 3 is, no child of the prewarm gets it (the wrapper's dup2 cleared the flag for this exec only).
+        // SAFETY: fcntl(2) F_SETFD on the open descriptor 3; the flag is the descriptor's, the lock the open file's.
+        unsafe {
+            libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let slug = crate::wire::slug::project_dir_name(workspace).ok()?;
+        let lock = std::fs::symlink_metadata(paths.workspace_warm_lock(&slug)).ok().filter(std::fs::Metadata::is_file)?;
+        if u64::try_from(st.st_dev).ok()? != lock.dev() || st.st_ino != lock.ino() {
+            return None;
+        }
+        // SAFETY: fd 3 is open (fstat above) and is the warm lock's file; this process owns it from here on.
+        let mut file = unsafe { std::fs::File::from_raw_fd(3) };
+        let _ = file.set_len(0);
+        let _ = file.seek(std::io::SeekFrom::Start(0));
+        let _ = write!(file, "pid={}\nstarted_at={}\n", std::process::id(), unix_now());
+        Some(WarmRecord(file))
+    }
+}
+
+impl Drop for WarmRecord {
+    fn drop(&mut self) {
+        use std::io::{Seek as _, Write as _};
+        let _ = self.0.seek(std::io::SeekFrom::End(0));
+        let _ = writeln!(self.0, "finished_at={}", unix_now());
+    }
+}
+
+/// `vm warm <workspace>` (S7, S8): the workspace's VM (started with vpc
+/// egress when it has none), its `/health` (which records the shim's caps),
+/// then, in parallel, the seed (S8: `workspace::ensure_workspace` with the
+/// CLI's caps, of the snapshot the prechecks scanned before the Touch ID;
+/// none for a workspace the seed cannot carry, said) and the
+/// credential's local and live gate with its token; then the setup-token
+/// delivered with no spawn (`credential::deliver_only`), unless the VM holds
+/// it already. It holds the workspace's `.active` lock, shared, while it
+/// runs (a closing session never suspends the VM under it). `--prewarm`
+/// (the wrapper's, S8 §11) prints nothing on stdout.
 ///
 /// A stop signal (`signals`) ends it at once, the delivery included: 130
 /// after SIGINT, 143 after SIGTERM or SIGHUP, an unseal's dialog closed, and
@@ -678,11 +962,20 @@ async fn select<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan) -> Resul
 /// frame leaves, so the row then says whether the VM may hold the token, as
 /// `creds status` does: any delivery the row records, of this seal or an
 /// earlier one, is named with `ai-env vm terminate`.
-async fn warm<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan: &run::RunPlan, json: bool, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn warm<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: std::sync::Arc<A>, ep: &E, w: &Warm, json: bool, prewarm: bool, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
     use crate::bridge::agent::credential::{self, CredentialFlags, Warmed};
     use crate::bridge::signals::{say, stoppable, Stops};
     let supply = supply.ok_or_else(|| CliError::Msg("internal: vm warm without its keystore".into()))?;
+    let plan = &w.plan;
     warn_plan(plan);
+    let _active = plan.workspace.as_ref().and_then(|(_, slug)| match crate::bridge::vm::lock::lock_shared_blocking(&ctx.paths.workspace_active(slug), crate::bridge::remote::pipeline::ACTIVE_WAIT) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            crate::bridge::voice::warn(&format!("the workspace's .active lock: {e}; warming without it"));
+            None
+        }
+    });
     // How far back the adoption sweep after a stop looks for the VM this warm's RunMicrovm made.
     let t0_unix = unix_now();
     let mut stops = Stops::take()?;
@@ -694,26 +987,27 @@ async fn warm<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan
         None => e,
     };
     let ready = async {
-        let (row, vm, reused) = match select(ctx, api, plan).await? {
+        let (row, vm, reused) = match select(ctx, &*api, plan).await? {
             run::Selected::Started { row, vm, .. } => {
                 *started.borrow_mut() = Some(vm.id.clone());
                 (row, vm, false)
             }
             run::Selected::Reused { row, vm, .. } => (row, vm, true),
         };
-        health::read_health(api, ep, &ctx.paths, &vm.id, ctx.backoff()).await?;
+        let (health, _) = health::read_health(&*api, ep, &ctx.paths, &vm.id, ctx.backoff()).await?;
         let row = registry::read_row(&ctx.paths, &vm.id)?.unwrap_or(row);
         let flags = CredentialFlags { with_credential: true, ..CredentialFlags::default() };
         let cred = credential::check(&ctx.cfg, &ctx.paths, &row, &[], &flags)?.ok_or_else(|| CliError::Msg("internal: no credential plan".into()))?;
-        let delivery = credential::prepare(ctx, api, ep, &row, &vm, &cred, supply).await?.delivery;
-        let env = crate::bridge::agent::exec::agent_env(ctx, api, ep, &row, Some(&vm))?;
-        Ok::<_, CliError>((vm, reused, cred, env, delivery))
+        // The seed beside the gate and the token (S8): neither waits for the other.
+        let (seeded, prepared) = tokio::try_join!(seed_on(ctx, &api, &row, &vm, &health.caps, &w.seed, w.prepared.take()), credential::prepare(ctx, &*api, ep, &row, &vm, &cred, supply))?;
+        let env = crate::bridge::agent::exec::agent_env(ctx, &*api, ep, &row, Some(&vm))?;
+        Ok::<_, CliError>((vm, reused, cred, env, prepared.delivery, seeded))
     };
-    let (vm, reused, cred, env, delivery) = match stoppable(&mut stops, ready).await {
+    let (vm, reused, cred, env, delivery, seeded) = match stoppable(&mut stops, ready).await {
         Ok(r) => r.map_err(started_note)?,
         Err(stop) => {
             let known = started.borrow().clone();
-            return Err(warm_stopped(ctx, api, ep, plan, known, t0_unix, stop, stops.next()).await);
+            return Err(warm_stopped(ctx, &*api, ep, plan, known, t0_unix, stop, stops.next()).await);
         }
     };
     // The dial, the hello and the frame's answer can each take tens of seconds: a stop drops the delivery where
@@ -747,11 +1041,28 @@ async fn warm<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, plan
         Warmed::Delivered => "delivered",
         Warmed::AlreadyHeld => "already_held",
     };
+    let (seed_word, seed_note) = match &seeded {
+        Seeded::Done(outcome) => (Some(outcome.word()), match outcome {
+            crate::bridge::workspace::EnsureOutcome::Kept { note, .. } => Some(note.clone()),
+            _ => None,
+        }),
+        Seeded::None(why) => (None, Some(why.clone())),
+    };
+    if let Some(note) = &seed_note {
+        crate::bridge::voice::note(&format!("seed: {note}"));
+    }
+    if prewarm {
+        tracing::info!(vm = %vm.id, warmed = word, seed = seed_word.unwrap_or("none"), "prewarmed");
+        return Ok(());
+    }
     if json {
-        return json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag }));
+        return json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "seed": seed_word, "seed_note": seed_note }));
     }
     let how = if warmed == Warmed::Delivered { "now holds" } else { "already held" };
     outln!("{} {how} the setup-token (seal {}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
+    if let Some(word) = seed_word {
+        outln!("{}: the workspace's checkout {word}", vm.id);
+    }
     Ok(())
 }
 
@@ -1520,9 +1831,10 @@ fn with_note(derived: String, user: Option<&String>) -> Option<String> {
 
 fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::path::Path>, manual: Option<&str>, note: Option<String>) -> Result<()> {
     let spec = probes::spec(name).ok_or_else(|| CliError::Usage(format!("unknown probe {name:?} (ai-env lab list)")))?;
-    // Only the probes `lab run` records: the S1 census, the S3 deploy and S7's setup-token-prefix (recorded
-    // by `creds setup-token`) are refused, naming their recorder.
-    if !spec.recorded_by.starts_with("ai-env lab run") {
+    // Only the probes `lab run` records: the S1 census, the S3 deploy, S7's setup-token-prefix (recorded
+    // by `creds setup-token`) and S8's init-wrapper (the census) are refused, naming their recorder; so is a
+    // probe of what Cursor showed (S8's dup probes) without the verdict observed there.
+    if !spec.recorded_by.starts_with("ai-env lab run") || (spec.source == probes::Source::Cursor && manual.is_none()) {
         return Err(CliError::Usage(format!("{name} is a {} probe, recorded by: {}", spec.stage, spec.recorded_by)));
     }
     let paths = Paths::resolve()?;
@@ -1557,6 +1869,12 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     if let Some(v) = manual {
         if v.trim().is_empty() || v.len() > 200 || v.chars().any(char::is_control) {
             return Err(CliError::Usage("--manual: 1–200 printable characters".into()));
+        }
+        if spec.source == probes::Source::Cursor {
+            // S8's dup probes: what Cursor showed, recorded only with the census evidence of the remote resume it
+            // showed it after (T8.5), which the row's note carries.
+            let evidence = probes::cursor_evidence(&paths, name, v.trim())?;
+            return probes::record(&paths, &probes::stamped(&paths, spec, v.trim(), with_note(evidence, note.as_ref())));
         }
         return probes::record(&paths, &probes::stamped(&paths, spec, v.trim(), Some(note.unwrap_or_else(|| "recorded by hand".into()))));
     }
@@ -1594,11 +1912,14 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
         };
         return probes::record(&paths, &probes::stamped(&paths, spec, &verdict, with_note(derived, note.as_ref())));
     }
-    // The live probes: their own VMs, the runtime key; S7's credential probes also the setup-token (one Touch ID
-    // for both with a current combined.env).
+    // The live probes: their own VMs, the runtime key; the credential probes (S7's, S8's fresh-claude-json) also
+    // the setup-token (one Touch ID for both with a current combined.env).
     let ctx = Ctx::load()?;
+    // S8's fresh-claude-json seeds the current directory's workspace into its VM and starts claude there as Cursor
+    // starts a chat: both made before any Touch ID (a refusal is exit 9, as a session's P0).
+    let fresh = if name == "fresh-claude-json" { Some((fresh_workspace(&ctx)?, lab::CursorChat::new(&ctx.cfg)?)) } else { None };
     let rt = runtime()?;
-    let credentialed = matches!(name, "fd-delivery" | "init-budget");
+    let credentialed = matches!(name, "fd-delivery" | "init-budget" | "fresh-claude-json");
     let outcome = rt.block_on(async {
         if credentialed {
             let cred = sealed_token_plan(&ctx)?;
@@ -1608,6 +1929,14 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
             crate::bridge::signals::Stops::take()?.keep();
             let (b, token) = crate::bridge::agent::credential::backend_for_credential(store, &ctx, &cred).await?;
             let supply = crate::bridge::agent::credential::CredentialSupply { store, token };
+            if let Some((ws, chat)) = &fresh {
+                // The seed's data plane holds the API past a borrow (as `vm warm`'s does).
+                return match &b {
+                    Backend::Sdk(api, ep) => lab::run_fresh_claude_json(&ctx, std::sync::Arc::clone(api), &**ep, supply, ws, chat).await,
+                    Backend::Fake(f) => lab::run_fresh_claude_json(&ctx, std::sync::Arc::new(f.clone()), f, supply, ws, chat).await,
+                }
+                .map_err(CliError::from);
+            }
             return with_backend!(&b, |api, ep| lab::run_probe_with(&ctx, api, ep, name, id, Some(supply)).await.map_err(CliError::from));
         }
         let b = backend(store, &ctx).await?;
@@ -1626,6 +1955,23 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
         outln!("dns-path: {}", crate::bridge::egress::acceptance_line(&row.verdict, &ctx.cfg.egress));
     }
     probes::record(&ctx.paths, &row)
+}
+
+/// The workspace `lab run fresh-claude-json` seeds into its VM (S8, L7): the
+/// current directory's, as `workspace::resolve` takes a session's, before any
+/// Touch ID or AWS call; a refusal names the probe (exit 9 for a directory
+/// outside the roots or no git repository, as a session's).
+fn fresh_workspace(ctx: &Ctx) -> Result<crate::bridge::workspace::WorkspaceRef> {
+    use crate::bridge::workspace::code;
+    const WHAT: &str = "lab run fresh-claude-json seeds the current directory's workspace into its fresh VM, as a session's is";
+    let cwd = std::env::current_dir().map_err(|e| CliError::Msg(format!("{WHAT}: the current directory: {e}")))?;
+    crate::bridge::workspace::resolve(&ctx.cfg, &cwd, None).map_err(|e| {
+        CliError::from(match e {
+            BridgeError::WorkspaceRefused { code: code::NOT_A_GIT_REPO, .. } => BridgeError::WorkspaceRefused { code: code::NOT_A_GIT_REPO, message: format!("{WHAT}: {} is no git repository; run it from a git workspace under the roots", cwd.display()) },
+            BridgeError::WorkspaceRefused { code, message } => BridgeError::WorkspaceRefused { code, message: format!("{WHAT}: {message}") },
+            other => other,
+        })
+    })
 }
 
 fn snapshot_log_pass(paths: &Paths, spec: &probes::ProbeSpec, text: &str, src: &str, note: Option<&String>) -> Result<()> {

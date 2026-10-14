@@ -21,6 +21,15 @@
 //! ([`AuthWatch::rejected_at_exit`]): a 401 the command recovered from is no
 //! rejection. `vm exec` audits either as `text`.
 //!
+//! **A remote session** (S8, [`AuthWatch::for_session`]): the CLI in the VM
+//! runs as long as its stdin stays open, and [`AUTH_TIMERS`] measured that it
+//! never exits after a failed turn while it does (`exits_while_stdin_open`
+//! false), so the exit 1 that confirms a result or a text 401 never comes.
+//! When the VM's claude is the version those timers were measured on, a
+//! result 401 or a text 401 is a [`Verdict::Rejected`] at once; for any other
+//! version only the retry rule stops the session (and the exit rule still
+//! reads its exit, should it come).
+//!
 //! **Progress clears all three**: an `assistant` line that is not an API error
 //! (no `error`, not the CLI's `<synthetic>` message) is a model reply, and a
 //! `result` that is not `is_error` is an answered turn; either shows the token
@@ -129,6 +138,14 @@ pub const RETRY_LIMIT: u32 = 3;
 /// those bytes, past the probe's bound) stay unmeasured: ai-env's CLI is
 /// never a remote child.
 pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.296", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
+/// How long a turn whose model requests all fail without a refusal (an
+/// egress that blocks api.anthropic.com, an outage) may take before the CLI
+/// gives up by itself, keyed to [`AUTH_TIMERS`]'s claude like the timers: S7
+/// B10 (11 Oct 2026, claude 2.1.296) measured 179 s of the CLI's own retries
+/// against the proxy's 403s, then a result with `is_error` and exit 1 (never
+/// 5: nothing was refused). S8's tests and part B judge a blocked turn
+/// against it (plan L8); the wrapper does not enforce it.
+pub const AUTH_FAIL_BUDGET_MS: u64 = 200_000;
 /// Longest line inspected; a longer one is passed over, its head aside.
 pub const LINE_MAX: usize = 64 * 1024;
 /// What is kept of a line passed over: its first bytes, which tell a model
@@ -178,8 +195,10 @@ pub enum Stream {
 pub enum Verdict {
     /// Nothing to act on (yet).
     Watching,
-    /// The [`RETRY_LIMIT`]th retry 401 with no progress between them: stop
-    /// the command now. Said once, by the chunk that completes that line.
+    /// The [`RETRY_LIMIT`]th retry 401 with no progress between them (or,
+    /// for [`AuthWatch::for_session`] on the measured claude, a result or a
+    /// text 401): stop the command now. Said once, by the chunk that
+    /// completes that line.
     Rejected,
 }
 
@@ -202,13 +221,35 @@ pub struct AuthWatch {
     /// A text 401 or a result 401 since the last progress (one flag: both
     /// count only with exit 1, and are audited alike).
     text_401: bool,
+    /// A remote session's watch on the measured claude ([`AuthWatch::for_session`]):
+    /// a text 401 or a result 401 is a verdict at once.
+    at_once: bool,
     said: bool,
+    /// How the verdict was reached, once said: `retries` or `text`.
+    said_how: Option<&'static str>,
 }
 
 impl AuthWatch {
     #[must_use]
     pub fn new() -> AuthWatch {
         AuthWatch::default()
+    }
+
+    /// The watch over a remote session's CLI (S8, the module doc):
+    /// `timers_match` when the VM's claude is [`AUTH_TIMERS`]' version, so a
+    /// result 401 or a text 401 is said at once ([`Verdict::Rejected`]);
+    /// otherwise the retry rule alone says it.
+    #[must_use]
+    pub fn for_session(timers_match: bool) -> AuthWatch {
+        AuthWatch { at_once: timers_match, ..AuthWatch::default() }
+    }
+
+    /// How the [`Verdict::Rejected`] [`AuthWatch::feed`] said was reached:
+    /// `retries` ([`RETRY_LIMIT`] retry 401s) or `text` (a result or a text
+    /// 401, [`AuthWatch::for_session`]'s at-once rule); `None` before it.
+    #[must_use]
+    pub fn verdict_how(&self) -> Option<&'static str> {
+        self.said_how
     }
 
     /// Read `bytes` from `stream` (any chunking: a line split across chunks
@@ -238,8 +279,16 @@ impl AuthWatch {
         let mut rejected = false;
         for (long, line) in lines {
             self.judge(long, &line);
-            if self.retries >= RETRY_LIMIT && !self.said {
+            let how = if self.retries >= RETRY_LIMIT {
+                Some("retries")
+            } else if self.at_once && self.text_401 {
+                Some("text")
+            } else {
+                None
+            };
+            if let Some(how) = how.filter(|_| !self.said) {
                 self.said = true;
+                self.said_how = Some(how);
                 rejected = true;
             }
         }
@@ -963,11 +1012,94 @@ mod tests {
         }
     }
 
+    /// S8: a session on the measured claude is stopped by B7's result 401 at
+    /// once (its exit 1 never comes while the session's stdin stays open),
+    /// said once, as `text`; a text 401 on either stream likewise. The two
+    /// retries before the result are counted, below the limit.
+    #[test]
+    fn a_session_on_the_measured_claude_is_stopped_by_its_first_result_or_text_401() {
+        let mut w = AuthWatch::for_session(true);
+        for i in 0..4 {
+            assert_eq!(w.feed(Stream::Stdout, b7_line(i).as_bytes()), Verdict::Watching, "line {i}");
+        }
+        assert_eq!(w.verdict_how(), None);
+        assert_eq!(w.feed(Stream::Stdout, b7_line(4).as_bytes()), Verdict::Rejected, "the result 401");
+        assert_eq!((w.verdict_how(), w.retries()), (Some("text"), 2));
+        assert_eq!(w.feed(Stream::Stdout, b7_line(4).as_bytes()), Verdict::Watching, "said once");
+        for (stream, line) in [(Stream::Stderr, format!("{}\n", b7_text())), (Stream::Stdout, "API Error: 401 nope\n".to_string()), (Stream::Stderr, "  Invalid API key · Please run /login\n".to_string())] {
+            let mut w = AuthWatch::for_session(true);
+            assert_eq!(w.feed(stream, line.as_bytes()), Verdict::Rejected, "{line}");
+            assert_eq!(w.verdict_how(), Some("text"));
+        }
+        // The retry rule still stops it first when the third retry comes before any result.
+        let r401 = retry(401, "authentication_failed");
+        let mut w = AuthWatch::for_session(true);
+        assert_eq!(w.feed(Stream::Stdout, format!("{r401}{r401}{r401}").as_bytes()), Verdict::Rejected);
+        assert_eq!(w.verdict_how(), Some("retries"));
+        // A turn answered before the 401 does not shield the 401 after it.
+        let mut w = AuthWatch::for_session(true);
+        assert_eq!(w.feed(Stream::Stdout, format!("{ANSWERED}{REFUSED}").as_bytes()), Verdict::Rejected);
+    }
+
+    /// S8: on any other claude (the timers unmeasured), a session is stopped
+    /// by the retry rule alone: B7's result 401 says nothing while it runs
+    /// (the exit rule still reads an exit 1, should one come), three retries
+    /// say it as `retries`.
+    #[test]
+    fn a_session_on_another_claude_is_stopped_by_the_retry_rule_alone() {
+        let mut w = AuthWatch::for_session(false);
+        assert!(B7_STREAM.as_bytes().chunks(7).all(|c| w.feed(Stream::Stdout, c) == Verdict::Watching));
+        assert_eq!((w.verdict_how(), w.retries()), (None, 2));
+        assert!(w.rejected_at_exit(Some(1)), "an exit 1 after it is still the S7 rule's");
+        let r401 = retry(401, "authentication_failed");
+        let mut w = AuthWatch::for_session(false);
+        assert_eq!(w.feed(Stream::Stdout, format!("{r401}{REFUSED}{r401}").as_bytes()), Verdict::Watching);
+        assert_eq!(w.feed(Stream::Stdout, r401.as_bytes()), Verdict::Rejected);
+        assert_eq!(w.verdict_how(), Some("retries"));
+        assert_eq!(AuthWatch::new().verdict_how(), None, "vm exec's watch");
+    }
+
+    /// S8: what is never evidence stays nothing for a session on the
+    /// measured claude too: each line of `what_never_counts`, B16's valid run
+    /// (its `rate_limit_event` line included), a long refused result (passed
+    /// over), an error result that only mentions a signature.
+    #[test]
+    fn a_session_watch_never_stops_on_what_is_no_evidence() {
+        let mut lines = vec![
+            retry(429, "rate_limit"),
+            retry(500, "server_error"),
+            "API Error: 403 Forbidden (the proxy)\n".to_string(),
+            "Connection error.\n".to_string(),
+            "{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}\n".to_string(),
+            "{\"type\":\"result\",\"is_error\":false,\"result\":\"API Error: 401 in a quoted answer\"}\n".to_string(),
+            "the model said: API Error: 401 is a status code\n".to_string(),
+            "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"the fetch said: API Error: 401\"}\n".to_string(),
+            padded(&b7_line(4), "\"terminal_reason\":\""),
+            B16_STREAM.to_string(),
+        ];
+        lines.push(B16_JSON.to_string());
+        for line in lines {
+            let mut w = AuthWatch::for_session(true);
+            assert_eq!(w.feed(Stream::Stdout, line.as_bytes()), Verdict::Watching, "{}", &line[..line.len().min(120)]);
+            assert_eq!(w.verdict_how(), None);
+        }
+    }
+
     /// AUTH_TIMERS is what `oauth-t1` measured (S7 B11, claude 2.1.296): a
     /// changed value comes from a new measurement, for the version it names.
     #[test]
     fn auth_timers_are_what_oauth_t1_measured() {
         assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.296", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
+    }
+
+    /// AUTH_FAIL_BUDGET_MS covers what S7 B10 measured on the same claude
+    /// (179 s of retries before the blocked turn ended), with a margin (S8 L8).
+    #[test]
+    fn the_auth_fail_budget_covers_b10s_179_seconds() {
+        const B10_MS: u64 = 179_000;
+        assert_eq!(AUTH_FAIL_BUDGET_MS, 200_000);
+        const { assert!(AUTH_FAIL_BUDGET_MS > B10_MS && AUTH_FAIL_BUDGET_MS - B10_MS <= 30_000, "a margin over B10, not a different measurement") };
+        assert_eq!(AUTH_TIMERS.claude, "2.1.296", "keyed to the version B10 ran");
     }
 
     proptest::proptest! {
@@ -1041,6 +1173,31 @@ mod tests {
             proptest::prop_assert_eq!(said[0].1, bytes.len(), "by the chunk that ends the last line: {:?}", said);
             proptest::prop_assert_eq!(pieces.retries(), 3);
             proptest::prop_assert_eq!(whole.rejected_at_exit(Some(1)), pieces.rejected_at_exit(Some(1)));
+        }
+
+        /// S8: any chunking of B7's stream-json run, on either stream, stops
+        /// a session on the measured claude exactly once, by the chunk that
+        /// ends its result line, as `text`.
+        #[test]
+        fn chunking_never_changes_a_sessions_verdict(cuts in proptest::collection::vec(0usize..4096, 0..12), on_stderr in proptest::bool::ANY) {
+            let bytes = B7_STREAM.as_bytes();
+            let result_at = B7_STREAM.len() - b7_line(4).len();
+            let stream = if on_stderr { Stream::Stderr } else { Stream::Stdout };
+            let mut points: Vec<usize> = cuts.into_iter().map(|c| c % (bytes.len() + 1)).collect();
+            points.sort_unstable();
+            let mut w = AuthWatch::for_session(true);
+            let mut said = Vec::new();
+            let mut at = 0;
+            for p in points.into_iter().chain([bytes.len()]) {
+                let end = p.max(at);
+                if w.feed(stream, &bytes[at..end]) == Verdict::Rejected {
+                    said.push((at, end));
+                }
+                at = end;
+            }
+            proptest::prop_assert_eq!(said.len(), 1, "said once: {:?}", said);
+            proptest::prop_assert!(said[0].1 > result_at && said[0].1 == bytes.len(), "by the chunk that ends the result: {:?}", said);
+            proptest::prop_assert_eq!(w.verdict_how(), Some("text"));
         }
     }
 }

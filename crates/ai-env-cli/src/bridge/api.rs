@@ -501,6 +501,16 @@ pub struct FakeState {
     /// credentialed `vm exec` drops a GetMicrovm in flight at once).
     #[serde(default)]
     pub park_get_ms: u64,
+    /// `/health/detail` answered by the shim itself (S8 phase 4): the
+    /// file-backed fake records the call and applies a scripted failure as
+    /// ever ([`FakeState::health_detail_call`]), then sends the request to
+    /// the routed fake endpoint at this loopback address, in front of a
+    /// process test's in-process shim (`tests/common/remote.rs`). The proxy's
+    /// check is this state's there; the answer is the shim's: the VM's live
+    /// spawns and its credential cache, which this state has no model of.
+    /// `None`: this state answers.
+    #[serde(default)]
+    pub health_detail_at: Option<std::net::SocketAddr>,
 }
 
 fn default_retry_after_429() -> Option<u64> {
@@ -830,11 +840,18 @@ impl FakeState {
         Ok(HealthReply { status: 200, proxy_error: None, retry_after_s: None, health: Some(health), body: String::new() })
     }
 
+    /// What every `/health/detail` request does first, whether this state
+    /// answers it or the shim does ([`FakeState::health_detail_at`]): the
+    /// call recorded, then a scripted failure of it, if one is queued.
+    pub fn health_detail_call(&mut self, endpoint: &str, token: &AuthToken) -> Result<(), BridgeError> {
+        self.calls.push(Call::HealthDetail { endpoint: endpoint.to_string(), port: token.port });
+        self.fail("health_detail", "health_detail")
+    }
+
     /// The fake endpoint's `/health/detail`: the proxy's checks, then the
     /// bearer (the VM's session token, whose commitment is in its payload).
     pub fn get_health_detail(&mut self, endpoint: &str, token: &AuthToken, bearer: &Secret<String>) -> Result<HealthDetailReply, BridgeError> {
-        self.calls.push(Call::HealthDetail { endpoint: endpoint.to_string(), port: token.port });
-        self.fail("health_detail", "health_detail")?;
+        self.health_detail_call(endpoint, token)?;
         let as_detail = |r: HealthReply| HealthDetailReply { status: r.status, proxy_error: r.proxy_error, retry_after_s: r.retry_after_s, detail: None, body: r.body };
         let id = match self.endpoint_check(endpoint, token, token.port) {
             Ok(id) => id,
@@ -865,6 +882,7 @@ impl FakeState {
             clock: None,
             listeners: Vec::new(),
             listeners_omitted: 0,
+            workspace: None,
         };
         Ok(HealthDetailReply { status: 200, proxy_error: None, retry_after_s: None, detail: Some(detail), body: String::new() })
     }

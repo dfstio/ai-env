@@ -5,7 +5,7 @@
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
 use crate::bridge::awscli::aws_run;
-use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, CredsCfg, EgressCfg, Paths, VmCfg, REGION, TRUE_ACCEPTS_NOTHING};
+use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, CredsCfg, EgressCfg, Paths, VmCfg, WrapperMode, REGION, TRUE_ACCEPTS_NOTHING};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
 use crate::bridge::egress::{credential_precheck, EgressVerified};
 use crate::bridge::errors::BridgeError;
@@ -763,6 +763,106 @@ pub fn rows_bridge_settings(
     vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector, DNS acceptance, [creds] and the credential gate not checked ({why})"))]
 }
 
+/// The S8 rows bridge.toml alone decides (plan §12): the wrapper's mode
+/// (`[wrapper] mode`: `remote` without a root is `[!! ]`, every chat running
+/// here; a value the wrapper does not know is `[NO ]`, every chat under the
+/// roots failing closed), one `[!! ]` per `[[workspace]]` still setting the
+/// deprecated `seed_allow_dirty` (D2), and the `[seed]` caps (`[NO ]` when
+/// the wrapper, `box` and `vm warm` refuse them). The image's
+/// `workspace_v1` is [`row_workspace_cap`]'s.
+#[must_use]
+pub fn rows_s8(cfg: &BridgeConfig) -> Vec<DoctorLine> {
+    let mut rows = vec![match cfg.wrapper.wrapper_mode() {
+        Ok(WrapperMode::Remote) if cfg.roots().is_empty() => DoctorLine::row(Tag::Warn, "wrapper mode remote, but no [workspaces].roots: every Cursor chat runs on this Mac  <- add the roots to bridge.toml"),
+        Ok(WrapperMode::Remote) => DoctorLine::row(Tag::Ok, format!("wrapper mode remote: Cursor's chats under the {} root(s) run in their workspace's MicroVM (AI_ENV_BRIDGE_LOCAL=1 runs them here)", cfg.roots().len())),
+        Ok(WrapperMode::Passthrough) => DoctorLine::row(Tag::Ok, "wrapper mode passthrough: Cursor's chats run on this Mac (ai-env wrapper install --write --mode remote runs them in MicroVMs)"),
+        Err(e) => DoctorLine::row(Tag::No, format!("{e}: every Cursor chat under the roots fails closed  <- ai-env wrapper install --write --mode remote (or passthrough)")),
+    }];
+    rows.extend(cfg.workspace_overrides.iter().filter_map(crate::bridge::config::WorkspaceCfg::deprecation).map(|note| DoctorLine::row(Tag::Warn, format!("{note}  <- remove it from bridge.toml"))));
+    let seed = &cfg.seed;
+    rows.push(match seed.validate() {
+        Ok(()) => DoctorLine::row(
+            Tag::Ok,
+            format!(
+                "[seed] a wrapper's seed {} MiB, box seed and vm warm {} MiB, a blob {} MiB, uncommitted changes {} MiB and {} untracked files, a code-out {} MiB, {} box/wip refs kept",
+                seed.wrapper_inline_mib, seed.max_mib, seed.max_blob_mib, seed.max_wip_mib, seed.max_untracked_files, seed.max_fetch_mib, seed.keep_wip_refs
+            ),
+        ),
+        Err(e) => DoctorLine::row(Tag::No, format!("{e}  <- fix [seed] in bridge.toml (the wrapper, box and vm warm refuse it)")),
+    });
+    rows
+}
+
+/// [`rows_s8`] for what bridge.toml loaded as (the defaults when there is
+/// none); for a file that does not load, the one row the wrapper still acts
+/// on: its mode as `route::Broken` reads the file (`[NO ]` when that is
+/// remote, a mode it cannot read included, as the wrapper takes it). There
+/// are no `[seed]` caps to show.
+#[must_use]
+pub fn rows_s8_loaded(paths: &Paths, loaded: &Result<Option<BridgeConfig>, BridgeError>) -> Vec<DoctorLine> {
+    use crate::bridge::route::{effective_mode_loaded, Broken, Loaded, Mode};
+    match loaded {
+        Ok(Some(cfg)) => return rows_s8(cfg),
+        Ok(None) => return rows_s8(&BridgeConfig::default()),
+        Err(_) => {}
+    }
+    let broken = Broken::read(std::fs::read_to_string(&paths.config).ok().as_deref());
+    vec![match effective_mode_loaded(None, &Loaded { broken: Some(broken), ..Loaded::default() }).0 {
+        Mode::Remote => DoctorLine::row(Tag::No, "wrapper mode remote, but bridge.toml does not load: every Cursor chat under its roots (every chat, when the roots cannot be read) exits 1 naming the error  <- fix bridge.toml (the bridge.toml row above)"),
+        _ => DoctorLine::row(Tag::Skip, "wrapper mode passthrough as far as bridge.toml still reads: Cursor's chats run on this Mac"),
+    }]
+}
+
+/// The image version a new VM runs (`[aws].image_version` as `vm run`
+/// resolves it: `active` the recorded latest active version, `N` is `N.0`),
+/// or `None` when `active` and nothing is recorded.
+fn new_vm_version(cfg: &BridgeConfig, state: Option<&InfraState>) -> Option<String> {
+    let want = cfg.aws.image_version.trim();
+    if want == "active" {
+        state?.latest_active_image_version.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+    } else if want.contains('.') {
+        Some(want.to_string())
+    } else {
+        Some(format!("{want}.0"))
+    }
+}
+
+/// Does the image serve the workspace routes (S8 L5, `workspace_v1`)? A
+/// remote session never selects a VM without it and a pinned one exits 7
+/// naming `make deploy`, so an S7 image (7.0) needs `make deploy`. The
+/// evidence is the VM rows' caps (`/health`, recorded): `[!! ]` naming each
+/// live VM (not terminated) whose caps lack it, with `make deploy` first
+/// unless the version a new VM runs has it already (then only `ai-env vm
+/// terminate`); else, for the version a new VM runs ([`new_vm_version`]),
+/// the newest row of it whose caps were read (any status: caps belong to
+/// the image) decides: `[ok ]` with the cap, `[!! ]` without; `[-  ]` when
+/// no VM of it answered `/health` yet.
+#[must_use]
+pub fn row_workspace_cap(vms: &[VmRow], state: &Result<Option<InfraState>, BridgeError>, cfg: &BridgeConfig) -> DoctorLine {
+    use crate::bridge::workspace::{vm_capability, Capability};
+    const CAP: &str = crate::wire::frame::CAP_WORKSPACE_V1;
+    let version = new_vm_version(cfg, state.as_ref().ok().and_then(Option::as_ref));
+    let newest = version.as_deref().and_then(|v| vms.iter().filter(|r| r.image_version == v && vm_capability(r) != Capability::Unknown).max_by(|a, b| a.created.cmp(&b.created)));
+    let lacking: Vec<&VmRow> = vms.iter().filter(|r| r.status != RowStatus::Terminated && !r.id.is_empty() && vm_capability(r) == Capability::No).collect();
+    if !lacking.is_empty() {
+        let named = lacking.iter().map(|r| format!("{} ({})", r.id, r.image_version)).collect::<Vec<_>>().join(", ");
+        if newest.is_some_and(|r| vm_capability(r) == Capability::Yes) {
+            // The image is deployed already: only the leftovers go.
+            let ids = lacking.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ai-env vm terminate ");
+            return DoctorLine::row(Tag::Warn, format!("{CAP}: {named} lack it: remote sessions never use them  <- ai-env vm terminate {ids}"));
+        }
+        return DoctorLine::row(Tag::Warn, format!("{CAP}: {named} lack it (an S7 image): remote sessions never use them  <- make deploy, then ai-env vm terminate them"));
+    }
+    let Some(version) = version else {
+        return DoctorLine::row(Tag::Skip, format!("{CAP}: no active image version recorded  <- make infra-status WRITE=1"));
+    };
+    match newest {
+        Some(r) if vm_capability(r) == Capability::Yes => DoctorLine::row(Tag::Ok, format!("{CAP}: image version {version} serves the workspace routes (from {}'s /health)", r.id)),
+        Some(r) => DoctorLine::row(Tag::Warn, format!("{CAP}: image version {version} lacks it (from {}'s /health): every remote session exits 7  <- make deploy", r.id)),
+        None => DoctorLine::row(Tag::Skip, format!("{CAP}: image version {version} not known yet (no VM of it answered /health): a remote session reads it, and exits 7 naming make deploy without it")),
+    }
+}
+
 /// `state/vms`: the rows by status, and whether a pending row (a
 /// `pending-<client_token>.toml` written before `RunMicrovm` and never
 /// promoted to an id row) is older than [`PENDING_STALE_S`]: the trace of a
@@ -1242,12 +1342,15 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             // adds one operator call, for a recorded proxy and an identity.
             let described = proxy_call(arn.is_some(), recorded).map(|id| aws_run("ec2", &proxy_describe_args(id), None, Duration::from_secs(15)));
             lines.push(row_proxy(cfg.aws.proxy_private_ip.as_deref(), &state, described.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
-            lines.push(match list_rows(paths) {
-                Ok(vms) => row_vm_registry(&vms, unix_now()),
+            let vms = list_rows(paths);
+            lines.push(match &vms {
+                Ok(vms) => row_vm_registry(vms, unix_now()),
                 Err(e) => DoctorLine::row(Tag::Warn, format!("vm registry unreadable: {e}")),
             });
             let (tw, sp) = (cfg.review.tripwires_path(paths), cfg.review.settings_policy_path(paths));
             lines.push(row_review_files(&tw, tw.is_file(), &sp, sp.is_file()));
+            lines.extend(rows_s8_loaded(paths, loaded));
+            lines.push(row_workspace_cap(vms.as_deref().unwrap_or_default(), &state, &cfg));
             state.ok().flatten()
         }
         Err(_) => None,
@@ -2037,6 +2140,107 @@ mod tests {
             DoctorLine::Row { tag, text } => (*tag, text.clone()),
             DoctorLine::Plain(t) => (Tag::Skip, t.clone()),
         }
+    }
+
+    /// The S8 rows bridge.toml decides: the wrapper's mode (remote without a
+    /// root warns, a mode nobody knows is `[NO ]`), one warning per
+    /// workspace still setting `seed_allow_dirty`, the `[seed]` caps (`[NO ]`
+    /// naming the key the commands refuse).
+    #[test]
+    fn the_s8_rows_name_the_mode_the_deprecation_and_the_seed_caps() {
+        let rows = |toml: &str| -> Vec<(Tag, String)> { rows_s8(&BridgeConfig::parse(toml).unwrap()).iter().map(text).collect() };
+        let plain = rows("");
+        assert_eq!(plain.len(), 2, "{plain:?}");
+        assert_eq!(plain[0], (Tag::Ok, "wrapper mode passthrough: Cursor's chats run on this Mac (ai-env wrapper install --write --mode remote runs them in MicroVMs)".to_string()));
+        assert_eq!(plain[1].0, Tag::Ok);
+        assert!(plain[1].1.starts_with("[seed] a wrapper's seed 64 MiB, box seed and vm warm 512 MiB,") && plain[1].1.ends_with("64 box/wip refs kept"), "{}", plain[1].1);
+        let remote = rows("[wrapper]\nmode = \"remote\"\n[workspaces]\nroots = [\"/Users/mike/w\"]\n");
+        assert_eq!(remote[0].0, Tag::Ok);
+        assert!(remote[0].1.starts_with("wrapper mode remote: Cursor's chats under the 1 root(s) run in their workspace's MicroVM"), "{}", remote[0].1);
+        let rootless = rows("[wrapper]\nmode = \"remote\"\n");
+        assert_eq!(rootless[0].0, Tag::Warn, "{rootless:?}");
+        let unknown = rows("[wrapper]\nmode = \"local\"\n");
+        assert_eq!(unknown[0].0, Tag::No);
+        assert!(unknown[0].1.contains("[wrapper].mode = \"local\"") && unknown[0].1.contains("fails closed"), "{}", unknown[0].1);
+        let dirty = rows("[[workspace]]\npath = \"/a\"\nseed_allow_dirty = true\n[[workspace]]\npath = \"/b\"\n[seed]\nmax_mib = 32\n");
+        assert_eq!(dirty.len(), 3, "{dirty:?}");
+        assert_eq!(dirty[1].0, Tag::Warn);
+        assert!(dirty[1].1.starts_with("[[workspace]] /a: seed_allow_dirty is deprecated and ignored") && dirty[1].1.ends_with("<- remove it from bridge.toml"), "{}", dirty[1].1);
+        assert_eq!(dirty[2].0, Tag::No, "the wrapper's 64 MiB past max_mib 32: {}", dirty[2].1);
+        assert!(dirty[2].1.contains("[seed].wrapper_inline_mib: 64 is more than [seed].max_mib (32)  <- fix [seed]"), "{}", dirty[2].1);
+    }
+
+    /// For a bridge.toml that does not load, the S8 rows are the one mode
+    /// row the wrapper acts on, the file read as `route::Broken` reads it:
+    /// remote (a mode that cannot be read included) is `[NO ]`, passthrough
+    /// or no mode `[-  ]`, never the default's `[ok ] passthrough`; a file
+    /// that loads, or none, keeps [`rows_s8`]'s rows.
+    #[test]
+    fn the_s8_rows_of_a_bridge_toml_that_does_not_load_follow_the_wrapper() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().to_path_buf(), None);
+        let rows = |toml: Option<&str>| -> Vec<(Tag, String)> {
+            match toml {
+                Some(toml) => std::fs::write(&paths.config, toml).unwrap(),
+                None => std::fs::create_dir(&paths.config).unwrap(),
+            }
+            let got = rows_s8_loaded(&paths, &BridgeConfig::load(&paths)).iter().map(text).collect();
+            match toml {
+                Some(_) => std::fs::remove_file(&paths.config).unwrap(),
+                None => std::fs::remove_dir(&paths.config).unwrap(),
+            }
+            got
+        };
+        let remote = "[wrapper]\nmode = \"remote\"\n[workspaces]\nroots = [\"/x\"]\n";
+        // (what, the file or None for one that cannot be read, the tag)
+        let broken: [(&str, Option<String>, Tag); 5] = [
+            ("remote with an unknown key", Some(format!("{remote}[vm]\nmax_idle = 300\n")), Tag::No),
+            ("no TOML at all", Some(format!("{remote}[wrapper]\nmode = \"remote\"\n")), Tag::No),
+            ("a file that cannot be read", None, Tag::No),
+            ("passthrough with an unknown key", Some("[wrapper]\nmode = \"passthrough\"\n[vm]\nmax_idle = 300\n".to_string()), Tag::Skip),
+            ("no mode with an unknown key", Some("[vm]\nmax_idle = 300\n".to_string()), Tag::Skip),
+        ];
+        for (what, toml, tag) in broken {
+            let got = rows(toml.as_deref());
+            assert_eq!(got.len(), 1, "{what}: the mode row alone: {got:?}");
+            assert_eq!(got[0].0, tag, "{what}: {}", got[0].1);
+            let want = if tag == Tag::No { "wrapper mode remote, but bridge.toml does not load: every Cursor chat under its roots" } else { "wrapper mode passthrough as far as bridge.toml still reads" };
+            assert!(got[0].1.starts_with(want), "{what}: {}", got[0].1);
+        }
+        let rows_of = |toml: &str| -> Vec<(Tag, String)> { rows_s8(&BridgeConfig::parse(toml).unwrap()).iter().map(text).collect() };
+        assert_eq!(rows(Some(remote)), rows_of(remote), "a file that loads");
+        let absent = rows_s8_loaded(&paths, &BridgeConfig::load(&paths)).iter().map(text).collect::<Vec<_>>();
+        assert_eq!(absent, rows_of(""), "no bridge.toml: the defaults");
+    }
+
+    /// The image's `workspace_v1` (L5): a live VM without it is named (make
+    /// deploy, or only `vm terminate` once the version a new VM runs has
+    /// it); else the newest row of the version a new VM runs whose caps
+    /// were read decides, terminated rows included; unknown is `[-  ]`.
+    #[test]
+    fn the_workspace_cap_row_reads_the_vms_caps_for_the_version_new_vms_run() {
+        use crate::wire::frame::CAP_WORKSPACE_V1;
+        let row = |id: &str, version: &str, status: RowStatus, created: &str, caps: Option<&[&str]>| VmRow { image_version: version.into(), caps: caps.map(|c| c.iter().map(|s| (*s).to_string()).collect()), ..vm(id, status, created) };
+        let state = |active: &str| -> Result<Option<InfraState>, BridgeError> { Ok(Some(InfraState { latest_active_image_version: Some(active.into()), ..InfraState::default() })) };
+        let cfg = BridgeConfig::default();
+        let s7 = row("microvm-old", "7.0", RowStatus::Running, "2026-10-11T08:00:00.000Z", Some(&["credential_cache"]));
+        let (tag, t) = text(&row_workspace_cap(std::slice::from_ref(&s7), &state("8.0"), &cfg));
+        assert!(tag == Tag::Warn && t.contains("microvm-old (7.0) lack it") && t.contains("make deploy"), "{t}");
+        let gone = VmRow { status: RowStatus::Terminated, ..s7.clone() };
+        let (tag, t) = text(&row_workspace_cap(std::slice::from_ref(&gone), &state("7.0"), &cfg));
+        assert!(tag == Tag::Warn && t.contains("image version 7.0 lacks it (from microvm-old's /health)") && t.ends_with("<- make deploy"), "a terminated row still tells the image's caps: {t}");
+        let s8 = [gone.clone(), row("microvm-new", "8.0", RowStatus::Suspended, "2026-10-12T08:00:00.000Z", Some(&["credential_cache", CAP_WORKSPACE_V1])), row("microvm-unread", "8.0", RowStatus::Running, "2026-10-12T09:00:00.000Z", None)];
+        assert_eq!(text(&row_workspace_cap(&s8, &state("8.0"), &cfg)), (Tag::Ok, format!("{CAP_WORKSPACE_V1}: image version 8.0 serves the workspace routes (from microvm-new's /health)")));
+        let (tag, t) = text(&row_workspace_cap(&s8[2..], &state("8.0"), &cfg));
+        assert!(tag == Tag::Skip && t.contains("not known yet") && t.contains("make deploy"), "{t}");
+        let pinned = BridgeConfig::parse("[aws]\nimage_version = \"7\"\n").unwrap();
+        assert_eq!(text(&row_workspace_cap(&s8, &state("8.0"), &pinned)).0, Tag::Warn, "[aws].image_version 7 is 7.0, which lacks it");
+        assert_eq!(text(&row_workspace_cap(&[], &Ok(None), &cfg)).0, Tag::Skip, "no active version recorded");
+        // Deployed already, an S7 VM still running: only it goes, no second deploy.
+        let leftover = [s7.clone(), s8[1].clone()];
+        assert_eq!(text(&row_workspace_cap(&leftover, &state("8.0"), &cfg)), (Tag::Warn, format!("{CAP_WORKSPACE_V1}: microvm-old (7.0) lack it: remote sessions never use them  <- ai-env vm terminate microvm-old")));
+        let (tag, t) = text(&row_workspace_cap(&leftover, &state("8.0"), &pinned));
+        assert!(tag == Tag::Warn && t.contains("make deploy"), "new VMs run 7.0, which lacks it: {t}");
     }
 
     fn sh(script: &str) -> Command {

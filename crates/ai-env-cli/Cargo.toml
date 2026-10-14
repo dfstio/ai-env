@@ -141,6 +141,41 @@ name = "vm"
 path = "tests/vm.rs"
 required-features = ["bridge"]
 
+# S8 (wave 1, W2): the real `ai-env-claude` in remote mode through the tests' fake endpoint, routed per port, to
+# the in-process shim with fs_root (tests/common/remote.rs); declared in phase 0 with ignored placeholders.
+[[test]]
+name = "remote_pump"
+path = "tests/remote_pump.rs"
+required-features = ["bridge", "shim"]
+
+# S8 (wave 1, W4): the Mac's workspace data plane (resolve, the WIP, the shallow pack, the scans, box seed and
+# box fetch) against the native shim; the areas will live in tests/workspace/*.rs.
+[[test]]
+name = "workspace"
+path = "tests/workspace.rs"
+required-features = ["bridge", "shim"]
+
+# S8 (wave 1, W2): the `auth status` prewarm (the sibling `vm warm --prewarm` detached, and when it is not started).
+[[test]]
+name = "prewarm"
+path = "tests/prewarm.rs"
+required-features = ["bridge"]
+
+# S8 (wave 2, W9): the README's and SKILL.md's `sh doc-test` blocks run in their dry forms (`make doc-test`; part
+# of `make test`).
+[[test]]
+name = "readme"
+path = "tests/readme.rs"
+required-features = ["bridge"]
+
+# Opt-in (AI_ENV_CURSOR_TESTS=1, every test #[ignore]d; `make test-cursor STEP=…`, S8 wave 2, W7): the evidence
+# checks after Mike's Cursor steps in S8 part B (census, registry, audit, lab rows and git refs, through the real
+# commands).
+[[test]]
+name = "cursor_live"
+path = "tests/cursor_live.rs"
+required-features = ["bridge"]
+
 # Negative fixture for `make lint-negative`: clippy must REJECT it (every clippy.toml
 # disallowed method is called once). Built only with the lint-negative feature.
 [[example]]

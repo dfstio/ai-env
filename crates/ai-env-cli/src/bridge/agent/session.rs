@@ -40,6 +40,8 @@
 //!   `VmNotFound`/`Terminated`; SUSPENDED without auto-resume → one
 //!   ResumeMicrovm (a Conflict is a resume already under way) and up to 60 s
 //!   for RUNNING; PENDING → up to 60 s; otherwise keep backing off.
+//!   `SpawnInput::DropSocket` (S8 `session drop-transport`) ends a socket
+//!   that carries the spawn as a lost one, reconnected by these rules.
 //! - **Tokens.** Wall-clock expiry (Darwin's `Instant` stops during sleep):
 //!   a fresh token before any dial with less than `remint_below` left, and on
 //!   any tick (the keep-alive presents it; a failed mint there never ends a
@@ -127,7 +129,7 @@ pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, sta
     }
     crate::wire::redact::register_secret(env.target.session_token.expose());
     let token = mint_token(env).await?;
-    let mut session = Session { env, io, trace: Trace::from_env(env.paths), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery, cred_retried: false, cred_suspended: false };
+    let mut session = Session { env, io, trace: Trace::from_env(env.paths), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery, cred_retried: false, cred_suspended: false, claude: None };
     session.run().await
 }
 
@@ -323,7 +325,8 @@ impl State {
             detach_sent: false,
         };
         match start {
-            Start::New(spec) => base(SpawnId::new_v7(), Some(spec), Phase::ToSpawn),
+            // The caller's id when it named one (S8: the wrapper's remote spawn), else a fresh v7.
+            Start::New(spec) => base(spec.id.clone().unwrap_or_else(SpawnId::new_v7), Some(spec), Phase::ToSpawn),
             Start::Attach { spawn_id, from_seq, err_from_seq } => State {
                 out: from_seq.map_or(0, |s| s.saturating_sub(1)),
                 out_known: from_seq.is_some(),
@@ -366,6 +369,8 @@ impl State {
             }
             SpawnInput::Signal(sig) => self.signals.push_back(sig),
             SpawnInput::Detach { is_final } => self.detach = Some(is_final),
+            // Only `serve` drops a socket that carries the spawn: with none, nothing to drop.
+            SpawnInput::DropSocket => {}
         }
     }
 
@@ -550,6 +555,10 @@ struct Session<'e, 'a, A: MicrovmApi, E: EndpointClient> {
     cred_retried: bool,
     /// `credential_err suspended` was waited out once: a second ends the session.
     cred_suspended: bool,
+    /// The VM's claude, as the last `hello_ok` that named it said: `Started`
+    /// carries it when `spawned` (or a reattach) names none (S8: the remote
+    /// link compares it with `authwatch::AUTH_TIMERS`).
+    claude: Option<String>,
 }
 
 impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
@@ -812,6 +821,9 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
 
     /// A `hello_ok`: the spawn goes out (again), or what became of it.
     async fn adopt(&mut self, ok: &HelloOk, link: &mut Link) -> Result<(), BridgeError> {
+        if ok.claude_version.is_some() {
+            self.claude.clone_from(&ok.claude_version);
+        }
         if self.st.phase == Phase::ToSpawn {
             self.no_pending_detach()?;
             self.offer_credential(ok, link).await?;
@@ -836,7 +848,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 self.attached = true;
                 if !self.st.started {
                     let (pid, pgid) = found.map_or((0, 0), |s| (s.pid, s.pgid));
-                    self.started(pid, pgid, None);
+                    self.started(pid, pgid, self.claude.clone());
                     // `spawned` died with its socket (and maybe the `credential_ok`
                     // before it): the spawn runs, so the VM holds the credential.
                     if let Some(d) = &self.delivery {
@@ -886,6 +898,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             tracing::info!("vm {}: the VM holds credential {} (tag {}): not sent", self.vm(), d.name(), d.tag());
             // Its row names it, even if the delivery that put it there was never recorded.
             record_holder(self.env.paths, self.vm(), d.tag(), Held::Seen);
+            // S8: the VM's copy served the spawn (the remote session's census says `cached`).
+            d.report.note_held();
             return Ok(());
         }
         self.send_credential(link).await
@@ -901,6 +915,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         let frame = Frame::Credential { name: d.name().to_string(), secret, tag: Some(d.tag().to_string()) };
         // Recorded before it leaves: an answer lost with the socket must not leave the VM unlisted.
         record_holder(self.env.paths, &vm, d.tag(), Held::Sent);
+        d.report.note_sent();
         link.send(&frame).await;
         Ok(())
     }
@@ -1010,6 +1025,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     }
                 },
                 m = self.io.control.recv(), if self.control_open => match m {
+                    // S8 `session drop-transport`: this socket goes as a lost one would, the spawn stays.
+                    Some(SpawnInput::DropSocket) if self.attached => return Ok(End::Lost("dropped by session drop-transport".into())),
                     Some(input) => self.on_input(input, link).await,
                     None => self.control_open = false,
                 },
@@ -1079,7 +1096,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 self.st.phase = Phase::Running;
                 self.attached = true;
                 if !self.st.started {
-                    self.started(pid, pgid, claude_version);
+                    let claude = claude_version.or_else(|| self.claude.clone());
+                    self.started(pid, pgid, claude);
                 }
                 self.spawn_has_its_copy();
                 self.flush(link).await;
@@ -1788,7 +1806,7 @@ mod tests {
     }
 
     fn cat_spec() -> SpawnSpec {
-        SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: None }
+        SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None }
     }
 
     fn lines(n: usize) -> Vec<Vec<u8>> {
@@ -1915,7 +1933,7 @@ mod tests {
     /// A session as `run` builds it (a fresh token), before its first socket.
     async fn session<'e, 'a>(env: &'e AgentEnv<'a, FakeMicrovmApi, FakeMicrovmApi>, io: SpawnIo, start: Start) -> Session<'e, 'a, FakeMicrovmApi, FakeMicrovmApi> {
         let token = mint_token(env).await.unwrap();
-        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false }
+        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None }
     }
 
     /// A socket to the rig's endpoint with the session's token, and the endpoint's end of it.
@@ -3583,6 +3601,42 @@ mod tests {
         assert_eq!(st.eof, Some(2));
     }
 
+    /// S8: a spec that names its spawn id is started under it (the frame's
+    /// `spawn_id` is the state's); one that does not gets a fresh v7 each time.
+    #[test]
+    fn a_spec_that_names_its_id_spawns_under_it() {
+        let id = SpawnId::new_v7();
+        let named = State::new(Start::New(SpawnSpec { id: Some(id.clone()), ..cat_spec() }));
+        assert_eq!(named.id, id);
+        assert_eq!(named.spec.as_ref().and_then(|s| s.id.clone()), Some(id), "the spec keeps it");
+        let (a, b) = (State::new(Start::New(cat_spec())), State::new(Start::New(cat_spec())));
+        assert!(a.id.is_v7() && b.id.is_v7() && a.id != b.id, "unnamed: a fresh v7 per spawn");
+    }
+
+    /// The same through a socket: the `spawn` frame the shim gets names the
+    /// spec's id, and the session runs to its exit under it.
+    #[tokio::test]
+    async fn the_spawn_frame_carries_the_named_id() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let named = SpawnId::new_v7();
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                let id = start_spawn(&mut ws).await;
+                put(&mut ws, &exit0(&id, 1)).await;
+                assert_eq!(frame(&mut ws).await, Frame::Ack { spawn_id: id.clone(), seq: 1, err_seq: 0 });
+                id
+            };
+            let spec = SpawnSpec { id: Some(named.clone()), ..cat_spec() };
+            let (result, _, id) = tokio::join!(run_spawn(&env, Start::New(spec), sio), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(result.unwrap().exit.status(), 0);
+            assert_eq!(id, named);
+        })
+        .await;
+    }
+
     #[test]
     fn resume_points_follow_what_was_delivered() {
         let mut st = State::new(Start::New(cat_spec()));
@@ -3733,6 +3787,7 @@ mod tests {
 
     /// A hit: the VM's cache holds this name and tag, so only the spawn goes
     /// out — with no value even in hand, and nothing recorded as delivered.
+    /// The delivery's report says the VM held it (S8: the census's `cached`).
     #[tokio::test]
     async fn a_cache_hit_sends_only_the_spawn() {
         bounded(async {
@@ -3748,9 +3803,12 @@ mod tests {
                 run_and_exit(&mut ws, &spawn_id).await;
                 ws
             };
-            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(delivery(&rig, None, false))), consume(cio, None, Duration::ZERO), shim);
+            let d = delivery(&rig, None, false);
+            let report = d.report();
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(d)), consume(cio, None, Duration::ZERO), shim);
             assert_eq!(result.unwrap().exit.code, Some(0));
             assert!(rig.audit("credential_deliver").is_empty());
+            assert!(report.held_by_vm(), "the VM's copy served the spawn");
         })
         .await;
     }
@@ -3835,6 +3893,38 @@ mod tests {
             let e = result.unwrap_err();
             assert!(e.to_string().contains("dropped the credential twice"), "{e}");
             assert_eq!(CliError::from(e).exit_code(), 8);
+        })
+        .await;
+    }
+
+    /// S8's census word: a hit, then `no_credential` (the cache emptied
+    /// before the spawn started): the value goes out in its own `credential`
+    /// frame before the same spawn again, so the delivery's report never says
+    /// the VM held it (`credential:cached` only when nothing was sent).
+    #[tokio::test]
+    async fn no_credential_after_a_hit_sends_the_value_and_reports_it_sent() {
+        bounded(async {
+            let rig = rig(true).await;
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_s7(Some((CRED_NAME, CRED_TAG)))).await;
+                let Frame::Spawn { spawn_id, credential, .. } = frame(&mut ws).await else { panic!("the spawn alone: a hit") };
+                assert_eq!(credential.as_deref(), Some(CRED_NAME));
+                put(&mut ws, &Frame::SpawnErr { spawn_id: spawn_id.clone(), code: SpawnErrCode::NoCredential, message: "no credential".into() }).await;
+                assert!(matches!(frame(&mut ws).await, Frame::Credential { .. }), "the credential, delivered once more");
+                let Frame::Spawn { spawn_id: again, .. } = frame(&mut ws).await else { panic!("then the spawn again") };
+                assert_eq!(again, spawn_id, "the same spawn, which never started");
+                run_and_exit(&mut ws, &spawn_id).await;
+                ws
+            };
+            let d = delivery(&rig, Some(cred_value()), false);
+            let report = d.report();
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(d)), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(result.unwrap().exit.code, Some(0));
+            assert!(!report.held_by_vm(), "the value went out: the census keeps its source");
         })
         .await;
     }

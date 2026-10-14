@@ -29,7 +29,7 @@ pub const MAX_ROW_BYTES: usize = 64 * 1024;
 /// `CLAUDECODE`, `NODE_OPTIONS`) is read from `env_names` — so is S7's
 /// `AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS`, kept out by that rule: what it
 /// found is the end row's `synthetic_oauth:` part.
-pub const CENSUS_VALUE_ALLOWLIST: [&str; 20] = [
+pub const CENSUS_VALUE_ALLOWLIST: [&str; 21] = [
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_AGENT_SDK_VERSION",
     "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
@@ -52,6 +52,8 @@ pub const CENSUS_VALUE_ALLOWLIST: [&str; 20] = [
     "AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS",
     // S7: the local-scratch unseal's budget (the row then explains a timeout note).
     "AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS",
+    // S8: the remote session's transcript knob (`skip`, the forced resume miss: the row then explains a retry).
+    "AI_ENV_BRIDGE_LAB_TRANSCRIPT",
 ];
 
 /// One census line. `end`/`exit` are absent on the start row of every

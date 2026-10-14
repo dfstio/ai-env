@@ -4,10 +4,13 @@
 //! `/health` and `/agent` (`/agent` authenticates in `hello`; both answer
 //! 405 to other methods themselves); code port: every path. No commitment
 //! (before `/run`, or after a fail-closed `/run`) → 401; a bad or missing
-//! bearer → 401; with a valid bearer an unknown path answers 404 "not
-//! implemented (S8/S9)". The peer guard runs first, so a local agent-uid
-//! client gets 403 before any bearer check. Each of these answers reads the
-//! request body first ([`drain`]): the client gets it, not a reset.
+//! bearer → 401; with a valid bearer a path no stage serves (S9's; S8's
+//! workspace routes on a shim without a helper) answers 404 "not
+//! implemented (S8/S9)", as an image-7.0 shim answered S8's routes (the
+//! Mac reads it as a VM without `workspace_v1`). The peer guard runs first,
+//! so a local agent-uid client gets 403 before any bearer check. Each of
+//! these answers reads the request body first ([`drain`]): the client gets
+//! it, not a reset.
 use crate::shim::health::ShimState;
 use crate::shim::peer::drain;
 use axum::extract::{Request, State};
@@ -67,8 +70,9 @@ pub async fn code_bearer(State(state): State<Arc<ShimState>>, req: Request, next
 }
 
 /// What both ports answer behind the bearer for a path no stage serves yet
-/// (`PUT /seed`, a git push), after draining the request body (bounded), so
-/// the client reads the 404 instead of a reset.
+/// (S9's: a git push; the workspace routes of a shim without a helper),
+/// after draining the request body (bounded), so the client reads the 404
+/// instead of a reset.
 pub async fn not_implemented(req: Request) -> Response {
     drain(req).await;
     (StatusCode::NOT_FOUND, "ai-env: not implemented (S8/S9)\n").into_response()

@@ -1,6 +1,7 @@
 //! ai-env library: the classic Touch ID `.env` tool (eleven modules moved
 //! verbatim from the old `src/main.rs`), the network-free wire protocol
-//! (`wire`), and the feature-gated halves — `bridge` (Mac operator CLI +
+//! (`wire`), the git runner both sides of the S8 workspace data plane share
+//! (`gitrun`), and the feature-gated halves — `bridge` (Mac operator CLI +
 //! the `ai-env-claude` wrapper) and `shim` (VM PID 1).
 //!
 //! Feature matrix: `default = ["bridge", "shim"]`; the VM image is built with
@@ -19,6 +20,7 @@ pub mod select;
 pub mod store;
 
 pub mod cli;
+pub mod gitrun;
 pub mod wire;
 #[cfg(feature = "bridge")]
 pub mod bridge;

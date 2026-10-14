@@ -1,6 +1,6 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
+.PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
         claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
 
 SHELL        := /bin/bash
@@ -93,6 +93,9 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	@target/matrix/none/debug/ai-env lab --help >/dev/null 2>&1;   test $$? -eq 2 || { echo "expected exit 2 for 'lab' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env egress --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'egress' without bridge"; exit 1; }
 	@target/matrix/none/debug/ai-env proxy --help >/dev/null 2>&1;  test $$? -eq 2 || { echo "expected exit 2 for 'proxy' without bridge"; exit 1; }
+	@target/matrix/none/debug/ai-env box --help >/dev/null 2>&1;    test $$? -eq 2 || { echo "expected exit 2 for 'box' without bridge"; exit 1; }
+	@target/matrix/none/debug/ai-env shim-io --help >/dev/null 2>&1; test $$? -eq 2 || { echo "expected exit 2 for 'shim-io' without shim"; exit 1; }
+	@target/matrix/shim/debug/ai-env box --help >/dev/null 2>&1;    test $$? -eq 2 || { echo "expected exit 2 for 'box' in the shim-only build"; exit 1; }
 	@out=$$($(CARGO) build -p $(PKG) --bin ai-env-claude --no-default-features --features shim 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-claude built without bridge"; exit 1; }; \
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
@@ -107,18 +110,43 @@ test: ## Unit + integration tests in all four feature sets
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
 # AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend; S7: the
 # wrapper's synthetic oauth_token_refresh, and the unseal budget of its local-scratch and of every credentialed
-# vm and lab command).
-LAB_UNSET    := env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS
+# vm and lab command; S8: the remote session's transcript knob, a resume that uploads no transcript, and S2's pump
+# knobs, which S8's live wrapper runs meet: s8-smoke, test-aws CRED=1, acceptance). tests/infra/image.rs holds the
+# list to every AI_ENV_BRIDGE_LAB_* name the code and infra/scripts read.
+LAB_KNOBS    := AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_SHELL AI_ENV_BRIDGE_LAB_ASSUME_TTY \
+                AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS AI_ENV_BRIDGE_LAB_TRANSCRIPT AI_ENV_BRIDGE_LAB_EXIT \
+                AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS
+LAB_UNSET    := env $(addprefix -u ,$(LAB_KNOBS))
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
 # cargo hides for passing tests; one thread keeps each test's lines together.
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file)
-	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command: 10 beside the test process's one, 11 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension, one more; live_wrapper_smoke is skipped: make s8-smoke runs it)
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture$(if $(filter 1,$(call cmdline,CRED)), --skip live_wrapper_smoke)
 	@$(if $(filter 1,$(call cmdline,PROBES)),rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
 
 test-claude: ## T7.2 (live, this Mac): the sealed setup-token drives the real claude: a stream-json session with a tool call, --resume, the Remote Control refusal, --bare not logged in (AI_ENV_CLAUDE_TESTS=1; one Touch ID; real model requests)
 	$(LAB_UNSET) AI_ENV_CLAUDE_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test claude_live -- --ignored --test-threads=1 --nocapture
+
+# S8. s8-smoke is T8.2's gate, tests/aws.rs live_wrapper_smoke: it prints "s8-smoke: pass N ok" per pass and
+# "s8-smoke: 3/3 ok (PATH)" itself, and appends each pass's record (exit, close_ms, initialize_ms, turn_ms and the
+# census end row's vm, vm_how, init_ms, legs, seed, fetch and credential) to target/s8/smoke.jsonl once the pass's
+# turn answered and its close passed (exit 0 within 1.5 s, end:eof, pid_rewrite:ok), then judges its fetch and seed:
+# a pass that fails before that leaves no record.
+# test-cursor checks one Cursor step's evidence (tests/cursor_live.rs): STEP, SINCE and WORKSPACE count only on the
+# make command line (SINCE is egress-logs' window too, 1h by default), and a missing or unknown STEP stops before
+# cargo. doc-test runs tests/readme.rs, the README's and SKILL.md's doc-test, which make test runs too.
+s8-smoke: ## T8.2 gate: tests/aws.rs live_wrapper_smoke, three passes, each a chat of the real ai-env-claude in remote mode on the fixture target/s8/live-wrapper-smoke (made anew; [workspaces].roots must hold target/s8): the seed, one turn, its code-out fetched before the close, exit 0 within 1.5 s; one Touch ID each, plus the test process's own (its runtime key): 4 in all; the test's VM terminated at its end; each pass's record appended to target/s8/smoke.jsonl once its close passed
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --exact live_wrapper_smoke --nocapture --test-threads=1
+
+test-cursor: ## S8 part B: one Cursor step's evidence (tests/cursor_live.rs; no VM, no Touch ID, no AWS: the census, the registry, the audit, the lab rows, the git refs): STEP=t8_3|t8_4|t8_5|t8_6|t8_7, optional SINCE=TIME (RFC 3339 UTC: only rows from then on, such as the step's start taken with date -u +%Y-%m-%dT%H:%M:%SZ) and WORKSPACE=PATH (the chats' workspace; default this checkout)
+	@step='$(call cmdline,STEP)'; case "$$step" in t8_3|t8_4|t8_5|t8_6|t8_7) ;; \
+	  '') echo "test-cursor: STEP is missing: make test-cursor STEP=t8_3 (or t8_4, t8_5, t8_6, t8_7) after that step in Cursor"; exit 2 ;; \
+	  *) echo "test-cursor: STEP=$$step names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7"; exit 2 ;; esac
+	$(LAB_UNSET) AI_ENV_CURSOR_TESTS=1 AI_ENV_CURSOR_STEP=$(call cmdline,STEP) $(if $(call cmdline,SINCE),AI_ENV_CURSOR_SINCE='$(call cmdline,SINCE)' )$(if $(call cmdline,WORKSPACE),AI_ENV_CURSOR_WORKSPACE='$(call cmdline,WORKSPACE)' )$(CARGO) test -p $(PKG) --features bridge --test cursor_live -- --ignored --nocapture --test-threads=1
+
+doc-test: ## The README's and SKILL.md's sh doc-test blocks in their dry forms (tests/readme.rs; also part of make test)
+	$(CARGO) test -p $(PKG) --features bridge --test readme
 
 test-aws-readonly: ## Part A live checks, read-only (this identity, eu-central-1): TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm of an unknown id
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored readonly_ --test-threads=1 --nocapture
@@ -182,8 +210,11 @@ test-egress: ## S5 T5.2-T5.4: the live egress tests (#[ignore]d; AI_ENV_AWS_TEST
 test-proxy: ## S5: the proxy host in Docker (squid of AL2023 pinned by digest, the reload script, user-data; AI_ENV_PROXY_TESTS=1); SYSTEMD=0 skips the privileged systemd boot
 	AI_ENV_PROXY_TESTS=1 $(if $(filter 0,$(call cmdline,SYSTEMD)),,AI_ENV_PROXY_SYSTEMD=1 )$(CARGO) test -p $(PKG) --features bridge --test proxy_docker -- --include-ignored --test-threads=1
 
-perf-wrapper: ## T1.2 overhead: ai-env-claude (release) vs a bare exec of the fake, 100 interleaved runs, median delta <= 10 ms
+# PREWARM=1 on the command line adds T8.6's offline half (S8): auth status in remote mode with the prewarm spawning a
+# stand-in sibling, against the same world with the prewarm off and against a bare exec of the fake (10 ms each).
+perf-wrapper: ## T1.2 overhead: ai-env-claude (release) vs a bare exec of the fake, 100 interleaved runs, median delta <= 10 ms; PREWARM=1 also the prewarm's on auth status (T8.6)
 	AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test wrapper -- --ignored overhead --nocapture --test-threads=1
+	$(if $(filter 1,$(call cmdline,PREWARM)),AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test prewarm -- --ignored overhead --nocapture --test-threads=1)
 
 install: ## cargo install both bins (ai-env + ai-env-claude) into $(INSTALL_ROOT)/bin with the committed Cargo.lock; asserts one version
 	$(CARGO) install --path crates/$(PKG) --locked --root "$(INSTALL_ROOT)"
@@ -265,8 +296,9 @@ clippy: ## clippy -D warnings in every cfg world (bridge+shim, shim-only, shim-o
 	$(CARGO) clippy -p $(PKG) --all-targets --no-default-features -- -D warnings
 	$(CARGO) clippy -p ai-env-age --all-targets -- -D warnings
 
-lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); every tests/*.rs declared)
+lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; no raw `ai-env:` line on the remote path, which speaks through bridge::voice; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); every tests/*.rs declared)
 	@bad=$$(grep -rn 'Connector::Plain' crates/$(PKG)/src || true); test -z "$$bad" || { echo "$$bad"; echo "lint: Connector::Plain is forbidden"; exit 1; }
+	@bad=$$(grep -nE '(eprintln!|eprint!|say|writeln!|write!)\(.*"ai-env: ' crates/$(PKG)/src/bridge/vm/run.rs crates/$(PKG)/src/bridge/vm/lock.rs crates/$(PKG)/src/bridge/agent/credential.rs crates/$(PKG)/src/bridge/creds.rs crates/$(PKG)/src/bridge/remote/*.rs || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the remote path speaks through bridge::voice (no raw ai-env: line in vm/run.rs, vm/lock.rs, agent/credential.rs, creds.rs, remote/)"; exit 1; }
 	@bad=$$(grep -rlE 'connect_async|client_async|Connector::Rustls|use_preconfigured_tls|ClientConfig::builder|aws_smithy_http_client' crates/$(PKG)/src | grep -vE '$(TLS_ALLOW)' || true); \
 	  test -z "$$bad" || { echo "$$bad"; echo "lint: TLS/WS/SDK-HTTP dialing must live in $(TLS_ALLOW)"; exit 1; }
 	@for f in crates/$(PKG)/tests/*.rs; do n=$$(basename "$$f" .rs); \
@@ -451,8 +483,117 @@ vm-build-pick:
 gates: ## Run the G1–G8 pre-code gates via `ai-env gates` (writes plans/gates.md); GATES_ARGS='--only G1,G3' re-measures a subset without writing
 	$(CARGO) run -q -p $(PKG) --bin ai-env -- gates $(GATES_ARGS)
 
-acceptance: ## Stage acceptance run (defined from stage S8 on)
-	@echo "acceptance: not defined yet — see plans/v6-microvm-bridge.md §6"; exit 1
+# S8 acceptance (plans/v6-microvm-bridge.md §6, the S8 subset), live on this Mac: the pair `make install` put in
+# ACCEPT_BIN (a relative one is taken from this directory), as Cursor runs it, against this Mac's bridge root. Each
+# step is one recipe line, so each negative is its own one-liner: its shell drops the lab knobs and the wrapper's own
+# switches (the kill switch, the mode, the VM pin, the mirror root), works in a directory of its own under ACCEPT_DIR,
+# removes it on every exit (ACCEPT_DIR too once empty, target/s8 too when the run made it) and stops the target with
+# one "acceptance: STEP: ..." line. The fixture repositories are built at run time with no user
+# or system git config (no hook, no signing), the tripwire's value with printf. The two Touch IDs come last (vm
+# smoke, vm list). Under make -i a failed step would be ignored, the next ones would run (the Touch IDs among them)
+# and the last line would say ok: the first line is a $(error) that make expands before any step runs, -i or not (the
+# options are MAKEFLAGS' first word and its -x words, as GNU make 3.81 writes them; under -k a failed line still ends
+# the recipe). The VM's own negatives (a 9418 token used against 8080, curl without the proxy from a VM shell, ai-env
+# vm list inside the VM) are part B's.
+ACCEPT_BIN   ?= $(INSTALL_ROOT)/bin
+ACCEPT_DIR   := target/s8/acceptance
+# A Cursor session's stream-json argv (the stand-in claude only records it).
+ACCEPT_ARGV  := --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --permission-mode default
+# One step's shell, $(1) its name: `a` its directory, `ai` and `wrap` the pair (absolute: the steps change directory),
+# `bridge` the bridge root; on exit it also removes ACCEPT_DIR once empty, and target/s8 once empty when make found it
+# absent (make expands every line of the recipe before the first runs); `fail` says why and exits 1; `repo DIR`
+# commits what DIR holds; `standin DIR` writes DIR/claude, which records its pid and argv in DIR/ran and exits 0
+# (\043 is the shebang's first character).
+ACCEPT_SH     = set -uo pipefail; unset $(LAB_KNOBS) AI_ENV_BRIDGE_LOCAL AI_ENV_BRIDGE_MODE AI_ENV_BRIDGE_VM AI_ENV_BRIDGE_MIRROR_ROOT; \
+                a="$(CURDIR)/$(ACCEPT_DIR)/$(1)"; ai="$(if $(filter /%,$(ACCEPT_BIN)),,$(CURDIR)/)$(ACCEPT_BIN)/ai-env"; wrap="$(if $(filter /%,$(ACCEPT_BIN)),,$(CURDIR)/)$(ACCEPT_BIN)/ai-env-claude"; bridge="$(BRIDGE_DIR_SH)"; \
+                rm -rf "$$a"; mkdir -p "$$a" || exit 1; \
+                trap 'rm -rf "$$a"; rmdir "$(CURDIR)/$(ACCEPT_DIR)" $(if $(wildcard $(dir $(ACCEPT_DIR))),,"$(CURDIR)/$(dir $(ACCEPT_DIR))") 2>/dev/null; true' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
+                fail() { echo "acceptance: $(1): $$*"; exit 1; }; \
+                git_() { env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c user.name=ai-env-acceptance -c user.email=acceptance@ai-env.invalid "$$@"; }; \
+                repo() { git_ init -q -b main "$$1" && git_ -C "$$1" add -A && git_ -C "$$1" commit -q -m fixture; }; \
+                standin() { printf '\043!/bin/sh\necho "$$$$ $$*" > "%s/ran"\nexit 0\n' "$$1" > "$$1/claude" && chmod 755 "$$1/claude"; };
+
+acceptance: ## S8 acceptance, live (v6 §6, the S8 subset; part B, after make install: the installed pair, or ACCEPT_BIN=DIR): [workspaces].roots must hold target/s8, checked first; doctor exits 0 in eu-central-1, ai-env and ai-env-claude are one version, creds status; then the negatives, each its own line: (a) a remote-mode session outside the roots execs the stand-in claude (census route local, reason outside_roots), (b) an AKIA-shaped value in a tracked file and (c) a committed bypassPermissions each make box seed --dry-run exit 9 naming it, (d) no egress connector: the remote wrapper refuses at the precheck, exit 9 (no Touch ID, no unseal row; it asks for vpc egress whatever [egress].require says), (e) AI_ENV_BRIDGE_LOCAL=1 execs the stand-in with no census row, (f) AWS_REGION=eu-west-3 leaves eu-central-1, (g) ai-env alone: doctor [NO ] exit 1, wrapper install exit 5; last vm smoke --max-duration 900, then vm list holds none of its VM: the two Touch IDs, nothing before needs one; a VM's own negatives (a 9418 token on 8080, curl without the proxy, ai-env vm list in the VM) are part B's; target/s8/acceptance removed on every exit (target/s8 too when the run made it); refused under make -i
+	@$(if $(findstring i,$(foreach w,$(firstword $(MAKEFLAGS)),$(if $(or $(findstring =,$(w)),$(filter --%,$(w))),,$(w))) $(filter-out --%,$(filter -%,$(MAKEFLAGS)))),$(error acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it))
+	@$(call ACCEPT_SH,roots) test -x "$$ai" && test -x "$$wrap" || fail "no ai-env and ai-env-claude in $(ACCEPT_BIN): make install first (or ACCEPT_BIN=DIR)"; \
+	  printf 'acceptance fixture\n' > "$$a/README.md"; repo "$$a" > /dev/null || fail "git could not make the fixture repository $$a"; \
+	  out=$$("$$ai" box seed "$$a" --dry-run 2>&1); rc=$$?; \
+	  if [ $$rc -ne 0 ]; then cfg="$${AI_ENV_BRIDGE_CONFIG:-$$bridge/bridge.toml}"; printf '%s\n' "$$out"; \
+	    fail "box seed --dry-run of a clean fixture exited $$rc: [workspaces].roots of $$cfg must hold target/s8 (part B, P0); its roots: $$(awk '/^[[:space:]]*roots[[:space:]]*=/ { p = 1 } p { printf "%s ", $$0 } p && /]/ { exit }' "$$cfg" 2>/dev/null)"; fi; \
+	  echo "acceptance: roots: ok (box seed --dry-run plans a fixture under $(ACCEPT_DIR): no AWS call, no Touch ID)"
+	@$(call ACCEPT_SH,doctor) out=$$("$$ai" doctor 2>&1); rc=$$?; printf '%s\n' "$$out"; \
+	  test $$rc -eq 0 || fail "ai-env doctor exited $$rc (its rows above)"; \
+	  grep -qF 'region eu-central-1 (pinned in code)' <<<"$$out" || fail "doctor shows no effective region eu-central-1"; \
+	  echo "acceptance: doctor: ok (exit 0, region eu-central-1)"
+	@$(call ACCEPT_SH,version) v1=$$("$$ai" --version) && v2=$$("$$wrap" --version) || fail "--version failed"; \
+	  test "$${v1##* }" = "$${v2##* }" || fail "version skew: $$v1, $$v2 (make install)"; \
+	  echo "acceptance: version: ok ($$v1, $$v2)"
+	@$(call ACCEPT_SH,creds) out=$$("$$ai" creds status 2>&1); rc=$$?; printf '%s\n' "$$out"; \
+	  test $$rc -eq 0 || fail "ai-env creds status exited $$rc"; \
+	  grep -qF 'setup-token.env: sealed' <<<"$$out" || fail "no sealed setup-token (ai-env creds setup-token)"; \
+	  ! grep -qF '[NO ]' <<<"$$out" || fail "a [NO ] row above"; \
+	  echo "acceptance: creds: ok (the setup-token sealed; no Touch ID)"
+	@$(call ACCEPT_SH,outside-roots) standin "$$a" || fail "cannot write the stand-in claude"; \
+	  (cd / && exec env AI_ENV_BRIDGE_MODE=remote "$$wrap" "$$a/claude" $(ACCEPT_ARGV)) < /dev/null > "$$a/out" 2>&1 & pid=$$!; wait $$pid; rc=$$?; \
+	  test $$rc -eq 0 || fail "ai-env-claude exited $$rc: $$(cat "$$a/out")"; \
+	  test "$$(cat "$$a/ran" 2>/dev/null)" = "$$pid $(ACCEPT_ARGV)" || fail "the stand-in claude did not run in place of ai-env-claude (pid $$pid) with the session's argv"; \
+	  rows=$$("$$ai" wrapper census --json) || fail "ai-env wrapper census failed"; row=$$(grep -F "\"pid\":$$pid," <<<"$$rows" | tail -1); \
+	  grep -qF '"route":"local"' <<<"$$row" && grep -qF '"reason":"outside_roots"' <<<"$$row" || fail "the census row of pid $$pid is not route local, reason outside_roots: $${row:-none}"; \
+	  echo "acceptance: outside-roots: ok (a remote-mode session from / exec'd the stand-in claude; census route local, reason outside_roots)"
+	@$(call ACCEPT_SH,planted-key) key=$$(printf '%s%s' AKIA "$$(printf 'Q7ZT%.0s' 1 2 3 4)"); printf 'aws_access_key_id = %s\n' "$$key" > "$$a/deploy.conf"; \
+	  repo "$$a" > /dev/null || fail "git could not make the fixture repository $$a"; \
+	  out=$$("$$ai" box seed "$$a" --dry-run 2>&1); rc=$$?; \
+	  ! grep -qF "$${key#AKIA}" <<<"$$out" || fail "box seed --dry-run shows the planted value"; \
+	  test $$rc -eq 9 || fail "box seed --dry-run exited $$rc, not 9: $$out"; \
+	  grep -qF 'HEAD:deploy.conf' <<<"$$out" && grep -qF 'rule aws-access-key-id' <<<"$$out" || fail "the refusal names neither HEAD:deploy.conf nor its rule: $$out"; \
+	  echo "acceptance: planted-key: ok (exit 9 naming HEAD:deploy.conf and its rule, never the value)"
+	@$(call ACCEPT_SH,bypass-settings) mkdir -p "$$a/.claude"; printf '{"permissions": {"defaultMode": "bypassPermissions"}}\n' > "$$a/.claude/settings.json"; \
+	  repo "$$a" > /dev/null || fail "git could not make the fixture repository $$a"; \
+	  out=$$("$$ai" box seed "$$a" --dry-run 2>&1); rc=$$?; \
+	  test $$rc -eq 9 || fail "box seed --dry-run exited $$rc, not 9: $$out"; \
+	  grep -qF 'HEAD:.claude/settings.json' <<<"$$out" && grep -qF 'key permissions.defaultMode' <<<"$$out" || fail "the refusal names neither HEAD:.claude/settings.json nor its key permissions.defaultMode: $$out"; \
+	  echo "acceptance: bypass-settings: ok (exit 9 naming the key permissions.defaultMode)"
+	@$(call ACCEPT_SH,egress-required) cfg="$${AI_ENV_BRIDGE_CONFIG:-$$bridge/bridge.toml}"; test -f "$$cfg" || fail "no bridge.toml at $$cfg"; \
+	  sed -E '/^[[:space:]]*["'\'']?(egress_connector_arn|require)["'\'']?[[:space:]]*=/d' "$$cfg" > "$$a/bridge.toml" || fail "cannot copy $$cfg"; \
+	  body=$$(sed 's/#.*//' "$$a/bridge.toml"); ! grep -qE 'egress_connector_arn|(^|[^A-Za-z0-9_])require[[:space:]]*=' <<<"$$body" || fail "the copy of $$cfg still names egress_connector_arn or require (a form this copy does not edit): nothing was run"; \
+	  mkdir -p "$$a/repo"; printf 'acceptance fixture\n' > "$$a/repo/README.md"; repo "$$a/repo" > /dev/null || fail "git could not make the fixture repository $$a/repo"; \
+	  standin "$$a" || fail "cannot write the stand-in claude"; seen=$$(wc -l 2>/dev/null < "$$bridge/audit.jsonl" || echo 0); \
+	  (cd "$$a/repo" && exec env AI_ENV_BRIDGE_CONFIG="$$a/bridge.toml" AI_ENV_BRIDGE_MODE=remote "$$wrap" "$$a/claude" $(ACCEPT_ARGV)) < /dev/null > "$$a/out" 2>&1 & pid=$$!; wait $$pid; rc=$$?; \
+	  test $$rc -eq 9 && grep -qF 'egress connector required' "$$a/out" || fail "ai-env-claude exited $$rc, not 9 naming the egress connector: $$(cat "$$a/out")"; \
+	  test ! -e "$$a/ran" || fail "the stand-in claude ran: a session under the roots in remote mode runs no Mac binary"; \
+	  unseals=$$(tail -n +$$((seen + 1)) "$$bridge/audit.jsonl" 2>/dev/null | grep -F '"event":"credential_unseal"' | grep -cF "\"pid\":$$pid," || true); \
+	  test "$${unseals:-0}" = 0 || fail "$$unseals credential_unseal audit row(s) of pid $$pid: a credential was unsealed"; \
+	  rows=$$("$$ai" wrapper census --json) || fail "ai-env wrapper census failed"; row=$$(grep -F "\"pid\":$$pid," <<<"$$rows" | grep -F '"end":' | tail -1); \
+	  grep -qF 'step:precheck' <<<"$$row" && ! grep -qF 'touchid=' <<<"$$row" || fail "the census end row of pid $$pid shows no refusal at the precheck before any Touch ID: $${row:-none}"; \
+	  echo "acceptance: egress-required: ok (no egress connector: the remote wrapper refused at the precheck: exit 9, no Touch ID, no credential_unseal row)"
+	@$(call ACCEPT_SH,kill-switch) mkdir -p "$$a/repo"; printf 'acceptance fixture\n' > "$$a/repo/README.md"; repo "$$a/repo" > /dev/null || fail "git could not make the fixture repository $$a/repo"; \
+	  standin "$$a" || fail "cannot write the stand-in claude"; \
+	  (cd "$$a/repo" && exec env AI_ENV_BRIDGE_LOCAL=1 AI_ENV_BRIDGE_MODE=remote "$$wrap" "$$a/claude" $(ACCEPT_ARGV)) < /dev/null > "$$a/out" 2>&1 & pid=$$!; wait $$pid; rc=$$?; \
+	  test $$rc -eq 0 && test ! -s "$$a/out" || fail "ai-env-claude exited $$rc saying: $$(cat "$$a/out")"; \
+	  test "$$(cat "$$a/ran" 2>/dev/null)" = "$$pid $(ACCEPT_ARGV)" || fail "the stand-in claude did not run in place of ai-env-claude (pid $$pid) with the session's argv"; \
+	  rows=$$("$$ai" wrapper census --json) || fail "ai-env wrapper census failed"; hit=$$(grep -F "\"pid\":$$pid," <<<"$$rows" | grep -F "\"cwd\":\"$$a/repo\""); \
+	  test -z "$$hit" || fail "a census row of pid $$pid: the kill switch records nothing: $$hit"; \
+	  echo "acceptance: kill-switch: ok (AI_ENV_BRIDGE_LOCAL=1 under the roots in remote mode: the plain exec, no census row, no config read, no AWS call)"
+	@$(call ACCEPT_SH,region) out=$$(AWS_REGION=eu-west-3 "$$ai" doctor 2>&1); rc=$$?; \
+	  test $$rc -eq 0 || { printf '%s\n' "$$out"; fail "doctor with AWS_REGION=eu-west-3 exited $$rc"; }; \
+	  grep -qF 'region eu-central-1 (pinned in code)  <- env AWS_REGION=eu-west-3 ignored (region pinned to eu-central-1)' <<<"$$out" || { printf '%s\n' "$$out"; fail "doctor with AWS_REGION=eu-west-3 does not say the variable is ignored for eu-central-1"; }; \
+	  echo "acceptance: region: ok (AWS_REGION=eu-west-3 ignored, eu-central-1 pinned)"
+	@$(call ACCEPT_SH,lone-ai-env) cp "$$ai" "$$a/ai-env" || fail "cannot copy $$ai"; \
+	  p=; IFS=:; for d in $$PATH; do if [ -n "$$d" ] && [ ! -e "$$d/ai-env-claude" ]; then p="$${p:+$$p:}$$d"; fi; done; unset IFS; \
+	  out=$$(PATH="$$p" "$$a/ai-env" doctor 2>&1); rc=$$?; \
+	  test $$rc -eq 1 && grep -qF '[NO ] ai-env-claude missing' <<<"$$out" || { printf '%s\n' "$$out"; fail "doctor of ai-env alone exited $$rc (1 with [NO ] ai-env-claude missing wanted)"; }; \
+	  out=$$(PATH="$$p" "$$a/ai-env" wrapper install 2>&1); rc=$$?; \
+	  test $$rc -eq 5 || fail "wrapper install of ai-env alone exited $$rc, not 5: $$out"; \
+	  echo "acceptance: lone-ai-env: ok (ai-env without ai-env-claude: doctor [NO ] exit 1, wrapper install exit 5)"
+	@$(call ACCEPT_SH,smoke) echo "acceptance: smoke: ai-env vm smoke --max-duration 900, then vm list: answer their two Touch IDs"; \
+	  rec=$$("$$ai" vm smoke --max-duration 900 --json); rc=$$?; printf '%s\n' "$$rec"; \
+	  test $$rc -eq 0 || fail "ai-env vm smoke exited $$rc"; \
+	  grep -qF '"backend":"sdk"' <<<"$$rec" || fail "the smoke did not use the SDK backend"; \
+	  id=$$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$$rec" | head -1); test -n "$$id" || fail "the smoke's record names no VM"; \
+	  list=$$("$$ai" vm list --json); rc=$$?; test $$rc -eq 0 || fail "ai-env vm list exited $$rc"; \
+	  ! grep -qF "\"$$id\"" <<<"$$list" || fail "vm list still holds $$id"; \
+	  echo "acceptance: smoke: ok ($$id: PENDING, RUNNING, /health 200, TERMINATED; vm list holds none of it)"
+	@echo "acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; $(ACCEPT_DIR) removed"
 
 clean: ## Remove build artifacts (keeps image/ sources)
 	cargo clean

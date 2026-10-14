@@ -1,9 +1,10 @@
-//! The live platform probes `ai-env lab run` drives (plan S4 §8; S5; S6): each
-//! starts its own VMs (label `probe:<name>`; max duration 900 s and audited
-//! internet egress unless the probe sets its own: S5's dns-path and
+//! The live platform probes `ai-env lab run` drives (plan S4 §8; S5; S6; S7;
+//! S8): each starts its own VMs (label `probe:<name>`; max duration 900 s and
+//! audited internet egress unless the probe sets its own: S5's dns-path and
 //! connector-pending on vpc; S6's e1 1200 s with max idle 1200 s, e5 and
 //! clock-after-resume 2400 s with 1500 s suspended (e5 max idle 60 s,
-//! clock-after-resume on vpc), in-vm-firewall a default and a `--shell` VM),
+//! clock-after-resume on vpc), in-vm-firewall a default and a `--shell` VM;
+//! the credential probes, S7's and S8's fresh-claude-json, on vpc),
 //! measures, and terminates every VM it started on every path — success,
 //! failure, error or a stop signal — before the verdict is recorded (a stop
 //! records nothing: Ctrl-C exits 3, SIGTERM or SIGHUP 143, as `vm smoke`
@@ -18,6 +19,7 @@ use crate::bridge::transport::{self, AgentDial, ShellAuth, UpgradeAuth, UpgradeP
 use crate::bridge::vm::cmd::Ctx;
 use crate::bridge::vm::registry::{self, RowStatus, VmRow};
 use crate::bridge::vm::{health, run, shell, token};
+use crate::bridge::workspace::WorkspaceRef;
 use crate::bridge::{egress, probes};
 use crate::wire::frame::{Deliver, Frame, HealthDetail, ResumePoint, ResumeStatus, RunHookPayload, Scope, Sig, SpawnId, CHUNK_MAX, CLOSE_NORMAL};
 use crate::wire::redact::{register_secret, Secret};
@@ -73,36 +75,53 @@ pub async fn run_probe<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep:
 /// [`run_probe`] with the credential the S7 probes deliver (`fd-delivery`,
 /// `init-budget`); the same terminate guard.
 pub async fn run_probe_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str, arg: Option<&str>, supply: Option<CredentialSupply<'_>>) -> Result<ProbeOutcome, BridgeError> {
-    let since = unix_now();
-    let mut started = Started::default();
-    let mut supply = supply;
-    let probe = async {
+    guarded(ctx, api, ep, async move |started: &mut Started| {
+        let mut supply = supply;
         let mut need = || supply.take().ok_or_else(|| BridgeError::Config(format!("{name} delivers the setup-token: it needs the keystore (internal)")));
         match name {
             // S7: the credential's own probes.
-            "fd-delivery" => fd_delivery(ctx, api, ep, &mut started, need()?).await,
-            "init-budget" => init_budget(ctx, api, ep, &mut started, need()?).await,
-            "payload-size" => payload_size(ctx, api, ep, &mut started).await,
-            "no-traffic-before-run" => no_traffic_before_run(ctx, api, ep, &mut started).await,
-            "snapshot-uniqueness" => snapshot_uniqueness(ctx, api, ep, &mut started).await,
-            "idle-policy-limits" => idle_policy_limits(ctx, api, ep, &mut started).await,
-            "connector-pending" => connector_pending(ctx, api, ep, arg, &mut started).await,
-            "dns-path" => dns_path(ctx, api, ep, &mut started).await,
+            "fd-delivery" => fd_delivery(ctx, api, ep, started, need()?).await,
+            "init-budget" => init_budget(ctx, api, ep, started, need()?).await,
+            "payload-size" => payload_size(ctx, api, ep, started).await,
+            "no-traffic-before-run" => no_traffic_before_run(ctx, api, ep, started).await,
+            "snapshot-uniqueness" => snapshot_uniqueness(ctx, api, ep, started).await,
+            "idle-policy-limits" => idle_policy_limits(ctx, api, ep, started).await,
+            "connector-pending" => connector_pending(ctx, api, ep, arg, started).await,
+            "dns-path" => dns_path(ctx, api, ep, started).await,
             // S6: each owns its VMs on the lab path with its own budget and terminate guard.
-            "e0" => e0(ctx, api, ep, &mut started).await,
-            "e1" => e1(ctx, api, ep, &mut started).await,
-            "e5" => e5(ctx, api, ep, &mut started).await,
-            "frames" => frames(ctx, api, ep, &mut started).await,
-            "reattach" => reattach(ctx, api, ep, &mut started).await,
-            "clock-after-resume" => clock_after_resume(ctx, api, ep, &mut started).await,
-            "in-vm-firewall" => in_vm_firewall(ctx, api, ep, &mut started).await,
+            "e0" => e0(ctx, api, ep, started).await,
+            "e1" => e1(ctx, api, ep, started).await,
+            "e5" => e5(ctx, api, ep, started).await,
+            "frames" => frames(ctx, api, ep, started).await,
+            "reattach" => reattach(ctx, api, ep, started).await,
+            "clock-after-resume" => clock_after_resume(ctx, api, ep, started).await,
+            "in-vm-firewall" => in_vm_firewall(ctx, api, ep, started).await,
             other => Err(BridgeError::Config(format!("{other} is not a live probe"))),
         }
-    };
+    })
+    .await
+}
+
+/// S8's fresh-claude-json (L7) under the same terminate guard: its VM, the
+/// seed of `ws` into it (the data plane holds `api` past a borrow, hence the
+/// `Arc`, as `vm warm`'s seed does), the setup-token of `supply` and claude
+/// started as `chat` says.
+pub async fn run_fresh_claude_json<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: std::sync::Arc<A>, ep: &E, supply: CredentialSupply<'_>, ws: &WorkspaceRef, chat: &CursorChat) -> Result<ProbeOutcome, BridgeError> {
+    let shared = &api;
+    guarded(ctx, &*api, ep, async move |started: &mut Started| fresh_claude_json(ctx, shared, ep, started, supply, ws, chat).await).await
+}
+
+/// Run `probe` with the terminate guard every live probe has: a stop signal
+/// ends the probe, never the guard; the VMs it started (and one its cut
+/// caught starting, [`sweep_own`]) are ended, nothing is recorded, and the
+/// command exits as `vm smoke` does.
+async fn guarded<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, probe: impl AsyncFnOnce(&mut Started) -> Result<ProbeOutcome, BridgeError>) -> Result<ProbeOutcome, BridgeError> {
+    let since = unix_now();
+    let mut started = Started::default();
     // The listeners exist before the probe's first call, so a stop is never the default death; they are the ones
     // `lab run` kept since its Touch ID (`signals`), and a signal ignored when ai-env started gets none.
     let mut stops = crate::bridge::signals::Stops::take().map_err(|e| BridgeError::Config(e.to_string()))?;
-    let result = match crate::bridge::signals::stoppable(&mut stops, probe).await {
+    let result = match crate::bridge::signals::stoppable(&mut stops, probe(&mut started)).await {
         Ok(r) => r,
         Err(crate::bridge::signals::Stop::Int) => Err(BridgeError::Cancelled),
         Err(stop) => {
@@ -1142,7 +1161,7 @@ async fn frames<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, st
     let policy = RunPolicy::from_cfg(&ctx.cfg.transport, &row, ctx.knobs.backoff_ms);
     let env = AgentEnv { api, ep, paths: &ctx.paths, target, policy, dial: agent_dial(ctx) };
     let input = frames_input();
-    let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60) };
+    let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None };
     let t = Instant::now();
     let (stdout, stderr, _pid, exit) = exec_agent(&env, spec, input.clone()).await?;
     let secs = t.elapsed().as_secs_f64().max(0.001);
@@ -1172,7 +1191,7 @@ async fn reattach<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
     let env = AgentEnv { api, ep, paths: &ctx.paths, target: target.clone(), policy, dial };
 
     // Session 1: a producer with a null stdin, cut client-side after the first chunk.
-    let producer = SpawnSpec { argv: vec!["sh".into(), "-c".into(), REATTACH_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300) };
+    let producer = SpawnSpec { argv: vec!["sh".into(), "-c".into(), REATTACH_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None };
     let (io1, c1) = spawn_channels(16);
     drop(c1.input); // null stdin → EOF
     let mut ev1 = c1.events;
@@ -1379,7 +1398,7 @@ async fn clock_after_resume<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
     let proxy_env: BTreeMap<String, String> = egress::proxy_env(&egress::check::proxy_ip(&ctx.cfg, &ctx.paths), egress::PROXY_PORT).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     let env = AgentEnv { api, ep, paths: &ctx.paths, target: target.clone(), policy, dial };
     let curl = "s=$SECONDS; code=000; while [ $((SECONDS-s)) -lt 120 ]; do code=$(command curl -sS -o /dev/null -w '%{http_code}' -m 5 https://api.anthropic.com/v1/models 2>/dev/null); case $code in 401|200) break;; esac; command sleep 2; done; echo \"proxy code=$code after=$((SECONDS-s))s\"";
-    let proxy_note = match exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), curl.into()], cwd: None, env: proxy_env, detach_grace_s: Some(60) }, Vec::new()).await {
+    let proxy_note = match exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), curl.into()], cwd: None, env: proxy_env, detach_grace_s: Some(60), id: None }, Vec::new()).await {
         Ok((o, _, _, _)) => String::from_utf8_lossy(&o).trim().to_string(),
         Err(e) => format!("first proxied success not measured: {e}"),
     };
@@ -1836,7 +1855,7 @@ async fn in_vm_firewall<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
     let guard = guard_mode(&before);
     let refused_before = refused_8080(&before);
     let foreign = foreign_listeners(before, &mut notes, &mut gaps);
-    let (rst, _, _, rst_ended) = exec_agent_partial(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_rst_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60) }, Vec::new()).await;
+    let (rst, _, _, rst_ended) = exec_agent_partial(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_rst_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, Vec::new()).await;
     if let Err(e) = rst_ended {
         notes.push(format!("the RST abort's spawn: {e}"));
     }
@@ -1847,7 +1866,7 @@ async fn in_vm_firewall<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
         argv.push(addr.clone());
         argv.push(port.to_string());
     }
-    let (stdout, _stderr, _pid, ended) = exec_agent_partial(&env, SpawnSpec { argv, cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60) }, Vec::new()).await;
+    let (stdout, _stderr, _pid, ended) = exec_agent_partial(&env, SpawnSpec { argv, cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, Vec::new()).await;
     match ended {
         Ok(_) => {}
         // A drain ends every spawn (`hook_terminate`): recorded with what the script printed before it, never an abort.
@@ -1908,7 +1927,7 @@ async fn in_vm_firewall_shell<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: 
     let policy = RunPolicy::from_cfg(&ctx.cfg.transport, srow, ctx.knobs.backoff_ms);
     let target = AgentTarget { shell: false, ..starget.clone() };
     let env = AgentEnv { api, ep, paths: &ctx.paths, target, policy, dial: *dial };
-    let (out, _, _, _) = exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_shell_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60) }, Vec::new()).await?;
+    let (out, _, _, _) = exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_shell_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, Vec::new()).await?;
     Ok(format!("--shell VM: {}; {}", platform_shell_note(&platform, &nonce), shell8022_note(&String::from_utf8_lossy(&out))))
 }
 
@@ -2126,7 +2145,7 @@ async fn held<A: MicrovmApi>(ctx: &Ctx, api: &A, row: &VmRow, vm: &VmInfo, plan:
 
 /// A spawn of `argv` with the proxy variables of a vpc row.
 fn cred_spec(ctx: &Ctx, row: &VmRow, argv: &[&str]) -> SpawnSpec {
-    SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: crate::bridge::agent::exec::spawn_env(ctx, row, &[]), detach_grace_s: Some(60) }
+    SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: crate::bridge::agent::exec::spawn_env(ctx, row, &[]), detach_grace_s: Some(60), id: None }
 }
 
 /// Whether the first complete stream-json `result` line in `buf` is an
@@ -2379,6 +2398,361 @@ async fn init_budget<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &
         ms(warm.ended, warm.answered),
         probes::INIT_COLD_BUDGET_MS,
         probes::INIT_WARM_BUDGET_MS
+    );
+    Ok(out)
+}
+
+// ---- S8: fresh-claude-json (L7) --------------------------------------------------------------
+//
+// One fresh vpc VM of its own (`probe:fresh-claude-json`, so its agent's
+// `.claude.json` is the image's), the current directory's workspace seeded
+// into it as a session's is (`workspace::ensure_workspace` with the CLI's
+// caps, beside the gate and the setup-token), then the image's claude started
+// as Cursor starts a chat's: the extension's argv as the wrapper sanitises it,
+// the extension's entrypoint in the session's environment, the token on fd 3,
+// in the workspace's VM path; `initialize`, then one turn. The project's keys
+// of that `.claude.json` are read before and after (`GET /settings`, best
+// effort). Under the file-backed fake only the emulated platform goes on, as
+// for the S7 credential probes.
+
+/// The argv Cursor's extension starts a chat's claude with (2.1.282's, as
+/// `tests/common/mod.rs`'s `SESSION_ARGV`), before the wrapper's
+/// `argv::sanitise` (the debug flags stripped as `[wrapper]` says,
+/// `--session-mirror` last).
+const CURSOR_SESSION: [&str; 16] = [
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--input-format",
+    "stream-json",
+    "--permission-prompt-tool",
+    "stdio",
+    "--setting-sources=user,project,local",
+    "--permission-mode",
+    "default",
+    "--include-partial-messages",
+    "--debug",
+    "--debug-to-stderr",
+    "--enable-auth-status",
+    "--no-chrome",
+    "--replay-user-messages",
+];
+
+/// The extension's entrypoint (the S1 `entrypoint` probe's), which a
+/// session's environment carries through `[wrapper].env_forward`.
+const CURSOR_ENTRYPOINT: (&str, &str) = ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode");
+
+/// How long claude has to answer `initialize`: Cursor's own window.
+const FRESH_INIT_WINDOW: Duration = crate::bridge::pump::INITIALIZE_WINDOW;
+/// How long the one turn ([`ASK_OK`]) has to bring its result.
+const FRESH_TURN_WINDOW: Duration = Duration::from_secs(120);
+/// Once the answers are in or a window passed: claude's stdin is closed, then
+/// after this it gets SIGTERM, and after this again the spawn is detached.
+const FRESH_STOP_GRACE: Duration = Duration::from_secs(5);
+/// The request id of the probe's `initialize`.
+const FRESH_INIT_ID: &str = "fresh-claude-json-1";
+/// At most this much of a stdout line is kept waiting for its newline.
+const FRESH_LINE_MAX: usize = 16 << 20;
+
+/// `d` scaled by the lab backoff knob (one second of the probe's policy is
+/// that many ms), at least a second.
+fn lab_wait(ctx: &Ctx, d: Duration) -> Duration {
+    ctx.knobs.backoff_ms.map_or(d, |ms| Duration::from_millis((d.as_millis() as u64).saturating_mul(ms) / 1000).max(Duration::from_secs(1)))
+}
+
+/// The VM's argv of a Cursor chat: `claude`, then [`CURSOR_SESSION`] as the
+/// wrapper's `argv::sanitise` makes it under `[wrapper]`.
+fn cursor_argv(cfg: &crate::bridge::config::BridgeConfig) -> Result<Vec<String>, BridgeError> {
+    let opts = crate::wire::argv::SanitiseOpts { strip_add_dir: cfg.wrapper.strip_add_dir, strip_debug: cfg.wrapper.strip_debug };
+    let args = crate::wire::argv::sanitise(&CURSOR_SESSION.map(str::to_string), opts).map_err(|e| BridgeError::Config(format!("the session's arguments: {e}")))?;
+    Ok(std::iter::once("claude".to_string()).chain(args).collect())
+}
+
+/// A Cursor chat's environment before the proxy variables: the session's
+/// (`remote::env::session_env`, its refusals exit 9) with the extension's
+/// entrypoint as Cursor's environment holds it.
+fn cursor_env(cfg: &crate::bridge::config::BridgeConfig) -> Result<Vec<(String, String)>, BridgeError> {
+    let cursor = |name: &str| (name == CURSOR_ENTRYPOINT.0).then(|| std::ffi::OsString::from(CURSOR_ENTRYPOINT.1));
+    let env = crate::bridge::remote::env::session_env(cfg, &cursor).map_err(BridgeError::Policy)?;
+    Ok(env.into_iter().collect())
+}
+
+/// What fresh-claude-json starts the VM's claude with: a Cursor chat's argv
+/// ([`cursor_argv`]) and environment ([`cursor_env`]). `lab run` makes it
+/// before any Touch ID, as a session's P0 makes its own: a configured name
+/// the session refuses is exit 9 with no dialog shown.
+pub struct CursorChat {
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+impl CursorChat {
+    /// The chat under `cfg`'s `[wrapper]`.
+    pub fn new(cfg: &crate::bridge::config::BridgeConfig) -> Result<CursorChat, BridgeError> {
+        Ok(CursorChat { argv: cursor_argv(cfg)?, env: cursor_env(cfg)? })
+    }
+}
+
+/// What fresh-claude-json's claude did, from its spawn on.
+#[derive(Debug, Default)]
+struct FirstStart {
+    /// From the spawn to the answer to `initialize` (its subtype when it was no success).
+    initialized: Option<(u128, Option<String>)>,
+    /// The turn's result: from the turn to it, whether it was an answer, its subtype.
+    turn: Option<(u128, bool, String)>,
+    /// The subtypes of the requests claude sent its host, in order: each
+    /// answered (`can_use_tool` denied, the rest an error), so none waits.
+    asked: Vec<String>,
+    /// claude's first stderr line, scrubbed and cut.
+    stderr: Option<String>,
+    /// claude's exit status, when it came while watched.
+    exit: Option<i32>,
+    /// The window that passed without its answer.
+    lapsed: Option<&'static str>,
+    /// The probe detached the spawn after its stop ladder (the session's end is then its error).
+    detached: bool,
+}
+
+impl FirstStart {
+    /// What the verdict judges: whether `initialize` was answered within its
+    /// window, and the turn's result within its own (whether it was an
+    /// answer); an answer after its window had passed (claude's stdin
+    /// already closed) is none.
+    fn judged(&self) -> (bool, Option<bool>) {
+        let initialized = self.initialized.is_some() && self.lapsed != Some("initialize");
+        (initialized, self.turn.as_ref().filter(|_| initialized && self.lapsed != Some("turn")).map(|(_, ok, _)| *ok))
+    }
+
+    /// The note's words for `initialize` and the turn: a window that passed
+    /// (and claude's exit after it, once its stdin closed), or claude's exit
+    /// before an answer.
+    fn words(&self, init_window: Duration, turn_window: Duration) -> String {
+        let late = |what: &str, window: Duration| if self.lapsed == Some(what) { format!(", after the {} s window had passed", window.as_secs_f32()) } else { String::new() };
+        let silent = |what: &str, window: Duration| format!("no {what} within {} s{}", window.as_secs_f32(), self.exit.map_or_else(String::new, |c| format!(" (then claude exited {c})")));
+        let exited = |when: &str| self.exit.map_or_else(|| format!("claude's session ended {when}"), |c| format!("claude exited {c} {when}"));
+        let init = match &self.initialized {
+            Some((ms, sub)) => format!("answered initialize in {ms} ms{}{}", sub.as_ref().map_or_else(String::new, |s| format!(" ({s})")), late("initialize", init_window)),
+            None if self.lapsed == Some("initialize") => silent("answer to initialize", init_window),
+            None => exited("before answering initialize"),
+        };
+        let turn = match (self.judged().0, &self.turn) {
+            (false, _) => "no turn sent".to_string(),
+            (true, Some((ms, ok, sub))) => format!("the turn's result in {ms} ms{} ({sub}){}", if *ok { "" } else { ": an error" }, late("turn", turn_window)),
+            (true, None) if self.lapsed == Some("turn") => silent("result for the turn", turn_window),
+            (true, None) => exited("before the turn's result"),
+        };
+        format!("{init}; {turn}")
+    }
+}
+
+/// What the watch does after one of claude's stdout lines.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Nothing.
+    Wait,
+    /// Send this line (a `control_response` to claude's request, with its newline).
+    Answer(String),
+    /// `initialize` was answered: the turn goes out, under the turn's window.
+    Ask,
+    /// The turn's result came: claude's stdin closes.
+    Close,
+}
+
+/// One line claude wrote on stdout (without its newline), as the probe takes
+/// it into `seen`: the answer to its `initialize`, a request to its host
+/// (answered at once: `can_use_tool` denied, the rest an error), the turn's
+/// result once the turn went out (`turn_sent`).
+fn first_start_line(seen: &mut FirstStart, line: &[u8], since_spawn: Duration, turn_sent: Option<Instant>) -> Step {
+    use crate::wire::claude::{classify_child, ChildFrame};
+    match classify_child(line) {
+        ChildFrame::ControlResponse { request_id: Some(id), subtype } if id == FRESH_INIT_ID && seen.initialized.is_none() => {
+            seen.initialized = Some((since_spawn.as_millis(), subtype.filter(|s| s != "success").map(|s| s.to_string())));
+            Step::Ask
+        }
+        ChildFrame::ControlRequest { request_id, subtype } => {
+            let subtype = subtype.map_or_else(|| "?".to_string(), |s| s.to_string());
+            seen.asked.push(subtype.clone());
+            let Some(id) = request_id else { return Step::Wait };
+            let response = if subtype == "can_use_tool" {
+                serde_json::json!({"subtype": "success", "request_id": id, "response": {"behavior": "deny", "message": "fresh-claude-json allows no tool"}})
+            } else {
+                serde_json::json!({"subtype": "error", "request_id": id, "error": "fresh-claude-json answers no request"})
+            };
+            Step::Answer(format!("{}\n", serde_json::json!({"type": "control_response", "response": response})))
+        }
+        ChildFrame::Result { subtype, is_error, .. } if seen.turn.is_none() => match turn_sent {
+            Some(at) => {
+                seen.turn = Some((at.elapsed().as_millis(), !is_error, subtype.map_or_else(|| "?".to_string(), |s| s.to_string())));
+                Step::Close
+            }
+            None => Step::Wait,
+        },
+        _ => Step::Wait,
+    }
+}
+
+/// claude started from `spec` with `delivery`, asked `initialize`, then (once
+/// answered) [`ASK_OK`], judged on its answers: a window that passes
+/// (`init_window`, then `turn_window`), or the turn's result, ends the watch
+/// with claude's stdin closed, then SIGTERM and a final detach `grace` apart
+/// until its session ended. An error of the session before anything was
+/// decided (no answer, no exit, no window passed) is the probe's error.
+async fn first_start<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spec: SpawnSpec, delivery: Delivery, init_window: Duration, turn_window: Duration, grace: Duration) -> Result<FirstStart, BridgeError> {
+    let (io, c) = spawn_channels(4);
+    let input = c.input.clone();
+    let control = c.control.clone();
+    let mut events = c.events;
+    let consumed = c.consumed.clone();
+    let initialize = format!("{{\"type\":\"control_request\",\"request_id\":\"{FRESH_INIT_ID}\",\"request\":{{\"subtype\":\"initialize\"}}}}\n");
+    let _ = input.send(SpawnInput::Stdin(initialize.into_bytes())).await;
+    let sent = Instant::now();
+    // Past every rung of the watch: the session is given up (the guard terminates its VM).
+    let bound = init_window + turn_window + grace * 4;
+    let session = tokio::time::timeout(bound, run_spawn_with(env, Start::New(spec), io, Some(delivery)));
+    let watch = async {
+        let mut seen = FirstStart::default();
+        let (mut pending, mut err) = (Vec::new(), Vec::new());
+        let mut turn_sent = None;
+        let mut deadline = tokio::time::Instant::now() + init_window;
+        // The stop ladder's rungs taken: stdin closed, SIGTERM, detach.
+        let mut rungs = 0u8;
+        loop {
+            let ev = tokio::select! {
+                ev = events.recv() => ev,
+                () = tokio::time::sleep_until(deadline) => {
+                    if rungs == 0 {
+                        seen.lapsed = Some(if seen.initialized.is_some() { "turn" } else { "initialize" });
+                        let _ = input.send(SpawnInput::StdinEof).await;
+                    } else if rungs == 1 {
+                        let _ = control.send(SpawnInput::Signal(Sig::Term));
+                    } else if rungs == 2 {
+                        let _ = control.send(SpawnInput::Detach { is_final: true });
+                        seen.detached = true;
+                    } else {
+                        break;
+                    }
+                    rungs += 1;
+                    deadline = tokio::time::Instant::now() + grace;
+                    continue;
+                }
+            };
+            let Some(ev) = ev else { break };
+            match ev {
+                SpawnEvent::Stdout { seq, bytes } => {
+                    consumed.stdout_done(seq);
+                    pending.extend_from_slice(&bytes);
+                    while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=nl).collect();
+                        match first_start_line(&mut seen, &line[..nl], sent.elapsed(), turn_sent) {
+                            Step::Wait => {}
+                            Step::Answer(reply) => {
+                                let _ = input.send(SpawnInput::Stdin(reply.into_bytes())).await;
+                            }
+                            Step::Ask if rungs == 0 => {
+                                let _ = input.send(SpawnInput::Stdin(format!("{ASK_OK}\n").into_bytes())).await;
+                                turn_sent = Some(Instant::now());
+                                deadline = tokio::time::Instant::now() + turn_window;
+                            }
+                            Step::Close if rungs == 0 => {
+                                let _ = input.send(SpawnInput::StdinEof).await;
+                                rungs = 1;
+                                deadline = tokio::time::Instant::now() + grace;
+                            }
+                            Step::Ask | Step::Close => {}
+                        }
+                    }
+                    if pending.len() > FRESH_LINE_MAX {
+                        pending.clear();
+                    }
+                }
+                SpawnEvent::Stderr { seq, bytes, .. } => {
+                    consumed.stderr_done(seq);
+                    if seen.stderr.is_none() {
+                        err.extend_from_slice(&bytes);
+                        if let Some(nl) = err.iter().position(|b| *b == b'\n').or_else(|| (err.len() >= 4096).then_some(4096)) {
+                            let first = String::from_utf8_lossy(&err[..nl]).into_owned();
+                            seen.stderr = Some(crate::wire::redact::scrub(first.trim()).chars().take(200).collect());
+                        }
+                    }
+                }
+                SpawnEvent::Exit(exit) => seen.exit = Some(exit.status()),
+                _ => {}
+            }
+        }
+        if seen.stderr.is_none() && !err.is_empty() {
+            seen.stderr = Some(crate::wire::redact::scrub(String::from_utf8_lossy(&err).trim()).chars().take(200).collect());
+        }
+        seen
+    };
+    let (outcome, seen) = tokio::join!(session, watch);
+    drop(c.control);
+    let decided = seen.turn.is_some() || seen.lapsed.is_some() || seen.exit.is_some();
+    match outcome {
+        Ok(Ok(_)) => Ok(seen),
+        Ok(Err(_)) if seen.detached => Ok(seen),
+        Ok(Err(e)) if !decided => Err(e),
+        Ok(Err(e)) => {
+            tracing::info!("fresh-claude-json: the session ended in an error once the verdict was in: {e}");
+            Ok(seen)
+        }
+        Err(_) => Err(BridgeError::Protocol(format!("fresh-claude-json: claude's session did not end within {} s", bound.as_secs()))),
+    }
+}
+
+/// The project's keys (`wire::workspace::PROJECT_KEYS`) of `projects[path]`
+/// in the VM agent's `.claude.json`, through `GET /settings`.
+async fn project_keys<A: MicrovmApi, D: crate::bridge::dataplane::DataPlane, T: crate::bridge::dataplane::TokenSource>(api: &A, dp: &D, tokens: &T, target: &AgentTarget, path: &str) -> Result<BTreeMap<String, serde_json::Value>, BridgeError> {
+    use crate::bridge::dataplane::{exchange, Exchange};
+    let x = Exchange { api, tokens, vm_id: &target.vm_id, port: APP_PORT, route: crate::wire::workspace::SETTINGS_ROUTE, deadline: None, idempotent: true };
+    let (reply, _) = exchange(&x, |t| async move { dp.get_settings(target, &t, path).await }).await?;
+    Ok(reply.body.map(|c| c.project).unwrap_or_default())
+}
+
+/// [`project_keys`] in the note's words, each value scrubbed before it is
+/// cut (an `allowedTools` rule can hold a credential: the note goes to
+/// stdout and `lab/probes.jsonl` as it is).
+fn project_words(keys: &Result<BTreeMap<String, serde_json::Value>, BridgeError>) -> String {
+    match keys {
+        Ok(k) if k.is_empty() => "none (fresh)".to_string(),
+        Ok(k) => k.iter().map(|(name, v)| format!("{name}={}", crate::wire::redact::scrub(&v.to_string()).chars().take(80).collect::<String>())).collect::<Vec<_>>().join(", "),
+        Err(e) => format!("unread ({})", e.to_string().chars().take(160).collect::<String>()),
+    }
+}
+
+/// fresh-claude-json (L7, T8.7): see the catalog's text and this section's
+/// head; claude is started as `chat` says (made before any Touch ID).
+async fn fresh_claude_json<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: &std::sync::Arc<A>, ep: &E, started: &mut Started, supply: CredentialSupply<'_>, ws: &WorkspaceRef, chat: &CursorChat) -> Result<ProbeOutcome, BridgeError> {
+    use crate::bridge::workspace::{ensure_workspace, EnsureCtx, SeedLimits, SeedProgress, SeedWant};
+    let (vm, row, target, mut out, plan) = cred_start(ctx, &**api, ep, "fresh-claude-json", started).await?;
+    let caps = row.caps.clone().unwrap_or_default();
+    let (dp, tokens) = crate::bridge::remote::pipeline::data_plane(ctx, api, &vm.id, true)?;
+    let progress = |p: SeedProgress| tracing::info!("fresh-claude-json seed: {p:?}");
+    let seeding = EnsureCtx { api: &**api, dp: &*dp, tokens: &*tokens, paths: &ctx.paths, cfg: &ctx.cfg, target: &target, caps: &caps, ws, lim: SeedLimits::cli(&ctx.cfg, None), deadline: None, progress: &progress };
+    let token = async { credential::prepare(ctx, &**api, ep, &row, &vm, &plan, supply).await.map_err(bridge_err) };
+    let (seeded, prepared) = tokio::try_join!(ensure_workspace(&seeding, None, SeedWant::Auto), token)?;
+    let before = project_keys(&**api, &*dp, &*tokens, &target, &ws.vm_cwd).await;
+    let policy = RunPolicy::from_cfg(&ctx.cfg.transport, &row, ctx.knobs.backoff_ms);
+    let env = AgentEnv { api: &**api, ep, paths: &ctx.paths, target: target.clone(), policy, dial: agent_dial(ctx) };
+    let args = chat.argv.len() - 1;
+    let spec = SpawnSpec { argv: chat.argv.clone(), cwd: Some(ws.vm_cwd.clone()), env: crate::bridge::agent::exec::spawn_env(ctx, &row, &chat.env), detach_grace_s: Some(60), id: None };
+    // The note names the entrypoint the spawn was given (none when `[wrapper].env_forward` leaves it out).
+    let entrypoint = spec.env.get(CURSOR_ENTRYPOINT.0).map_or_else(|| "unset".to_string(), Clone::clone);
+    let (init_window, turn_window) = (lab_wait(ctx, FRESH_INIT_WINDOW), lab_wait(ctx, FRESH_TURN_WINDOW));
+    let run = first_start(&env, spec, prepared.delivery, init_window, turn_window, lab_wait(ctx, FRESH_STOP_GRACE)).await?;
+    let after = project_keys(&**api, &*dp, &*tokens, &target, &ws.vm_cwd).await;
+    let (initialized, turn) = run.judged();
+    out.verdict = probes::verdict_fresh_claude_json(initialized, turn).to_string();
+    out.note = format!(
+        "{}: the seed of {}: {}; projects[the path] in the agent's .claude.json before: {}; claude as Cursor starts a chat ({args} arguments, {}={entrypoint}): {}; it asked its host: {}; its first stderr line: {}; projects[the path] after: {}",
+        vm.id,
+        ws.vm_cwd,
+        seeded.word(),
+        project_words(&before),
+        CURSOR_ENTRYPOINT.0,
+        run.words(init_window, turn_window),
+        if run.asked.is_empty() { "nothing".to_string() } else { run.asked.join(", ") },
+        run.stderr.as_deref().unwrap_or("none"),
+        project_words(&after)
     );
     Ok(out)
 }
@@ -3452,5 +3826,124 @@ mod tests {
         assert_eq!(super::own_unseal_ms(&paths, "setup-token", Some("microvm-b")), None);
         append(&paths.audit(), &row(&[("source", "combined"), ("ms", "1300"), ("outcome", "ok")])).unwrap();
         assert_eq!(super::own_unseal_ms(&paths, "combined", None), Some(1300), "the newest");
+    }
+
+    /// fresh-claude-json starts claude as a Cursor chat's: `claude`, the
+    /// extension's argv sanitised as the wrapper sanitises it (the debug flags
+    /// only as `[wrapper].strip_debug` says, `--session-mirror` last), and the
+    /// session's environment with the extension's entrypoint; a configured
+    /// name the session refuses refuses the probe too (exit 9) when `lab run`
+    /// makes its `CursorChat`, before any Touch ID.
+    #[test]
+    fn the_fresh_probe_starts_claude_as_cursor_starts_a_chat() {
+        let argv = super::cursor_argv(&BridgeConfig::default()).unwrap();
+        assert_eq!(argv.first().map(String::as_str), Some("claude"));
+        assert_eq!(argv.last().map(String::as_str), Some("--session-mirror"));
+        assert!(argv.windows(2).any(|w| w == ["--permission-prompt-tool", "stdio"]) && argv.contains(&"--replay-user-messages".to_string()), "{argv:?}");
+        assert!(!argv.iter().any(|a| a.starts_with("--debug")), "{argv:?}");
+        assert_eq!(argv.len(), super::CURSOR_SESSION.len(), "the two debug flags out, claude and --session-mirror in");
+        let keep = BridgeConfig::parse("[wrapper]\nstrip_debug = false\n").unwrap();
+        assert!(super::cursor_argv(&keep).unwrap().contains(&"--debug-to-stderr".to_string()));
+        let env: BTreeMap<String, String> = super::cursor_env(&BridgeConfig::default()).unwrap().into_iter().collect();
+        assert_eq!(env.get("CLAUDE_CODE_ENTRYPOINT").map(String::as_str), Some("claude-vscode"));
+        assert_eq!((env.get("DISABLE_TELEMETRY").map(String::as_str), env.get("DISABLE_AUTOUPDATER").map(String::as_str)), (Some("1"), Some("1")), "{env:?}");
+        assert!(!env.keys().any(|k| k.starts_with("AWS_") || k == "HOME" || k == "PATH"), "{env:?}");
+        let refused = BridgeConfig::parse("[wrapper]\nenv_extra = [\"AWS_SECRET_ACCESS_KEY\"]\n").unwrap();
+        let e = super::cursor_env(&refused).unwrap_err();
+        assert_eq!(crate::errors::CliError::from(e).exit_code(), 9);
+        assert!(super::CursorChat::new(&refused).is_err_and(|e| crate::errors::CliError::from(e).exit_code() == 9));
+        let chat = super::CursorChat::new(&BridgeConfig::default()).unwrap();
+        assert_eq!((chat.argv, chat.env.into_iter().collect::<BTreeMap<_, _>>()), (argv, env), "the chat is made of the two");
+    }
+
+    /// The project's keys in the note: none (fresh), or each key with its
+    /// value scrubbed before the cut (an `allowedTools` rule can hold a
+    /// credential, and the note is printed and recorded as it is).
+    #[test]
+    fn the_fresh_probe_notes_the_project_keys_scrubbed() {
+        let token = format!("sk-ant-oat01-{}", "Zx9_".repeat(20));
+        let rule = format!("Bash(curl -H 'Authorization: Bearer {token}' https://api.example.invalid/v1)");
+        let keys = BTreeMap::from([("allowedTools".to_string(), serde_json::json!([rule])), ("hasTrustDialogAccepted".to_string(), serde_json::json!(false))]);
+        let words = super::project_words(&Ok(keys));
+        assert!(words.starts_with("allowedTools=[\"Bash(curl -H 'Authorization: Bearer [redacted:len=") && words.ends_with(", hasTrustDialogAccepted=false"), "{words}");
+        assert!(!words.contains(&token[13..29]), "a piece of the credential in the note: {words}");
+        assert_eq!(super::project_words(&Ok(BTreeMap::new())), "none (fresh)");
+    }
+
+    /// How the probe takes claude's stdout lines: a request to its host is
+    /// answered at once (`can_use_tool` denied, anything else an error), the
+    /// answer to its `initialize` sends the turn (an error answer is noted), a
+    /// result counts only once the turn went out, then closes claude's stdin;
+    /// a second answer to `initialize` and a second result change nothing.
+    #[test]
+    fn the_fresh_probe_takes_claudes_lines_in_order() {
+        use super::{first_start_line, FirstStart, Step, FRESH_INIT_ID};
+        let mut seen = FirstStart::default();
+        let at = Duration::from_millis(1234);
+        let answer = |line: &str| -> serde_json::Value {
+            match first_start_line(&mut FirstStart::default(), line.as_bytes(), at, None) {
+                Step::Answer(text) => {
+                    assert!(text.ends_with('\n'), "{text:?}");
+                    serde_json::from_str(text.trim_end()).unwrap()
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        let deny = answer(r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash"}}"#);
+        assert_eq!(deny, serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r1", "response": {"behavior": "deny", "message": "fresh-claude-json allows no tool"}}}));
+        let other = answer(r#"{"type":"control_request","request_id":"r2","request":{"subtype":"hook_callback"}}"#);
+        assert_eq!((other["response"]["subtype"].as_str(), other["response"]["request_id"].as_str()), (Some("error"), Some("r2")));
+        assert_eq!(first_start_line(&mut seen, br#"{"type":"control_request","request_id":"r3","request":{"subtype":"mcp_message"}}"#, at, None), Step::Answer(format!("{}\n", serde_json::json!({"type": "control_response", "response": {"subtype": "error", "request_id": "r3", "error": "fresh-claude-json answers no request"}}))));
+        assert_eq!(first_start_line(&mut seen, br#"{"type":"result","subtype":"success","is_error":false}"#, at, None), Step::Wait, "no turn went out yet");
+        let init = format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{FRESH_INIT_ID}","response":{{"pid":7}}}}}}"#);
+        assert_eq!(first_start_line(&mut seen, init.as_bytes(), at, None), Step::Ask);
+        assert_eq!(seen.initialized, Some((1234, None)));
+        assert_eq!(first_start_line(&mut seen, init.as_bytes(), Duration::from_secs(9), None), Step::Wait, "a second answer changes nothing");
+        assert_eq!(first_start_line(&mut seen, br#"{"type":"assistant","message":{"content":[]}}"#, at, Some(Instant::now())), Step::Wait);
+        assert_eq!(first_start_line(&mut seen, br#"{"type":"result","subtype":"error_during_execution","is_error":true}"#, at, Some(Instant::now())), Step::Close);
+        assert_eq!(first_start_line(&mut seen, br#"{"type":"result","subtype":"success","is_error":false}"#, at, Some(Instant::now())), Step::Wait, "the first result is the turn's");
+        assert_eq!(seen.turn.as_ref().map(|(_, ok, sub)| (*ok, sub.as_str())), Some((false, "error_during_execution")));
+        assert_eq!(seen.asked, ["mcp_message"]);
+        assert_eq!(seen.judged(), (true, Some(false)));
+        let mut refused = FirstStart::default();
+        let error = format!(r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{FRESH_INIT_ID}","error":"no"}}}}"#);
+        assert_eq!(first_start_line(&mut refused, error.as_bytes(), at, None), Step::Ask);
+        assert_eq!(refused.initialized, Some((1234, Some("error".to_string()))));
+    }
+
+    /// An answer that came only after its window passed (claude's stdin was
+    /// closed by then) is no answer: the verdict stalls at that step, and the
+    /// note says when it came; an exit before an answer is named.
+    #[test]
+    fn a_late_answer_or_an_exit_is_a_stall_and_the_note_says_which() {
+        use super::FirstStart;
+        let (init, turn) = (Duration::from_secs(6), Duration::from_secs(12));
+        let late_init = FirstStart { initialized: Some((7_000, None)), lapsed: Some("initialize"), ..FirstStart::default() };
+        assert_eq!(late_init.judged(), (false, None));
+        assert_eq!(late_init.words(init, turn), "answered initialize in 7000 ms, after the 6 s window had passed; no turn sent");
+        let late_turn = FirstStart { initialized: Some((900, None)), turn: Some((13_000, true, "success".into())), lapsed: Some("turn"), ..FirstStart::default() };
+        assert_eq!(late_turn.judged(), (true, None));
+        assert_eq!(late_turn.words(init, turn), "answered initialize in 900 ms; the turn's result in 13000 ms (success), after the 12 s window had passed");
+        let silent = FirstStart { lapsed: Some("initialize"), ..FirstStart::default() };
+        assert_eq!(silent.words(init, turn), "no answer to initialize within 6 s; no turn sent");
+        let closed = FirstStart { lapsed: Some("initialize"), exit: Some(1), ..FirstStart::default() };
+        assert_eq!(closed.words(init, turn), "no answer to initialize within 6 s (then claude exited 1); no turn sent", "its exit once its stdin closed");
+        let first = FirstStart { exit: Some(2), ..FirstStart::default() };
+        assert_eq!((first.judged(), first.words(init, turn).as_str()), ((false, None), "claude exited 2 before answering initialize; no turn sent"));
+        let exited = FirstStart { initialized: Some((900, None)), exit: Some(1), ..FirstStart::default() };
+        assert_eq!((exited.judged(), exited.words(init, turn).as_str()), ((true, None), "answered initialize in 900 ms; claude exited 1 before the turn's result"));
+        let quiet = FirstStart { initialized: Some((900, None)), lapsed: Some("turn"), ..FirstStart::default() };
+        assert_eq!(quiet.words(init, turn), "answered initialize in 900 ms; no result for the turn within 12 s");
+        let answered = FirstStart { initialized: Some((900, None)), turn: Some((2_500, true, "success".into())), ..FirstStart::default() };
+        assert_eq!((answered.judged(), answered.words(init, turn).as_str()), ((true, Some(true)), "answered initialize in 900 ms; the turn's result in 2500 ms (success)"));
+        let backoff = |ms: Option<u64>| {
+            let d = tempfile::tempdir().unwrap();
+            let mut ctx = ctx(d.path(), 1);
+            ctx.knobs.backoff_ms = ms;
+            (super::lab_wait(&ctx, super::FRESH_INIT_WINDOW), super::lab_wait(&ctx, super::FRESH_TURN_WINDOW))
+        };
+        assert_eq!(backoff(None), (Duration::from_secs(60), Duration::from_secs(120)), "Cursor's window and the turn's, unscaled in a release");
+        assert_eq!(backoff(Some(100)), (Duration::from_secs(6), Duration::from_secs(12)));
+        assert_eq!(backoff(Some(1)), (Duration::from_secs(1), Duration::from_secs(1)), "at least a second");
     }
 }

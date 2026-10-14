@@ -4,12 +4,16 @@
 //! Two roles (see `init`): as PID 1, or with the hidden `--supervise`, the
 //! process is a signal-forwarding, orphan-reaping init that spawns the same
 //! binary as the worker; otherwise it is the worker. The worker binds three
-//! listeners — hooks (`hooks`, 9000), app (`/health`, `/agent` and the
-//! bearer-only `/health/detail`, 8080) and code (9418, bearer-only; its
-//! routes arrive in S8/S9) — probes `claude --version` in the background
+//! listeners — hooks (`hooks`, 9000), app (`/health`, `/agent`, and behind
+//! the bearer `/health/detail` and S8's `/transcript` and `/settings`, 8080)
+//! and code (9418, bearer-only: S8's `/seed` and `/codeout`; git smart-HTTP
+//! arrives in S9) — probes `claude --version` in the background
 //! (`/ready` waits for it), and shuts down gracefully on SIGTERM/SIGINT/SIGQUIT
 //! or when its init dies: the `/agent` sockets are closed and every spawn's
-//! process group is stopped before the servers end.
+//! process group is stopped before the servers end. S8 adds the agent's
+//! workspace helper (`wshelper`: the hidden `ai-env shim-io`), the runner
+//! that starts it as the agent (`asagent`, on `childproc`'s child setup, the
+//! spawns' too) and the workspace routes that use it (`code`, `health`).
 //!
 //! Every log line goes through `errln!`: stderr is whatever PID 1 was
 //! given, and a reader that went away must not panic a hook (`eprintln!`
@@ -31,7 +35,9 @@ macro_rules! errln {
 }
 
 pub mod agent;
+pub mod asagent;
 pub mod auth;
+pub mod childproc;
 pub mod code;
 pub mod credential;
 pub mod health;
@@ -43,6 +49,7 @@ pub mod spawn;
 pub mod state;
 pub mod sys;
 pub mod validate;
+pub mod wshelper;
 
 use crate::errors::{CliError, Result};
 use std::future::IntoFuture;
@@ -59,7 +66,7 @@ pub struct ShimArgs {
     /// Platform lifecycle hooks port
     #[arg(long, default_value_t = 9000)]
     pub hooks_port: u16,
-    /// Code channel port: /seed, /bundle, git smart-HTTP
+    /// Code channel port: /seed, /codeout (S8), git smart-HTTP (S9)
     #[arg(long, default_value_t = 9418)]
     pub code_port: u16,
     /// Path of the claude binary the shim spawns
@@ -92,6 +99,12 @@ pub struct ShimArgs {
     /// Prefix for every path /validate checks (native tests)
     #[arg(long, value_name = "DIR", hide = true)]
     pub fs_root: Option<PathBuf>,
+    /// The program the agent's workspace helper runs (`<PATH> shim-io …`; S8): this binary unless set (native tests)
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub helper: Option<PathBuf>,
+    /// The git the agent's workspace helper runs (S8; native tests point it at the Mac's)
+    #[arg(long, value_name = "PATH", hide = true, default_value = health::GIT_DEFAULT)]
+    pub git: PathBuf,
     /// Worker role: the init that spawned us (exit when it dies)
     #[arg(long, value_name = "PID", hide = true)]
     pub init_pid: Option<u32>,
@@ -218,6 +231,9 @@ async fn serve(args: ShimArgs) -> Result<()> {
         uid: args.uid,
         gid: args.gid,
         window_bytes: args.agent_window_bytes.unwrap_or(crate::wire::frame::STDOUT_WINDOW_BYTES),
+        // This very binary, resolved once at startup (the image's ENTRYPOINT passes neither flag).
+        helper: args.helper.clone().or_else(|| std::env::current_exe().ok()),
+        git: args.git.clone(),
     };
     let probe = health::ProbeSpec::for_agent(args.uid, args.gid);
     let state = Arc::new(health::ShimState::with(args.claude.clone(), opts, probe, Arc::new(sys::RealSys)));

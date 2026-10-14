@@ -1,6 +1,8 @@
-//! Recognisers for the Claude stream-json frames the wrapper must act on, and
-//! builders for the few frames it writes itself. Pure and serde-only: the S2
-//! pump (`bridge::pump`, `bridge::hoststate`) and later the VM path use them.
+//! Recognisers for the Claude stream-json frames the wrapper must act on,
+//! builders for the few frames it writes itself, and the byte-exact edits it
+//! makes to forwarded ones (a response's id, the `initialize` answer's pid).
+//! Pure and serde-only: the S2 pump (`bridge::pump`, `bridge::hoststate`) and
+//! the S8 remote session use them.
 //!
 //! Only a line whose first byte is `{`, that parses as a JSON object and has a
 //! string `type` is classified; everything else is [`ChildFrame::Other`] /
@@ -321,6 +323,45 @@ pub fn control_error_line(request_id: &str, message: &str) -> Bytes {
     ))
 }
 
+/// The CLI's answer to `initialize` with the pid it reports
+/// (`response.response.pid`) made `to`, every other byte unchanged, and the
+/// pid it reported (S8 §4): the extension takes that pid for the process it
+/// spawned, which is the wrapper's, never the CLI's in a VM or a respawned
+/// generation's. `None` unless the line is a success `control_response`
+/// whose inner `pid` serde reads as an integer P, and `"pid":P` not followed
+/// by a digit occurs exactly once in the line, and the rewritten line reads
+/// back with the inner pid `to`; the caller then forwards the line unchanged.
+#[must_use]
+pub fn rewrite_initialize_pid(line: &[u8], to: u32) -> Option<(Bytes, u64)> {
+    #[derive(Deserialize)]
+    struct Line<'a> {
+        #[serde(borrow, default)]
+        response: Option<&'a RawValue>,
+    }
+    #[derive(Deserialize)]
+    struct Pid {
+        pid: u64,
+    }
+    fn inner_pid(line: &[u8]) -> Option<u64> {
+        let outer = serde_json::from_slice::<Line<'_>>(line).ok()?.response?;
+        let answer = serde_json::from_str::<Line<'_>>(outer.get()).ok()?.response?;
+        serde_json::from_str::<Pid>(answer.get()).ok().map(|p| p.pid)
+    }
+    if !matches!(classify_child(line), ChildFrame::ControlResponse { subtype: Some(s), .. } if s == "success") {
+        return None;
+    }
+    let pid = inner_pid(line)?;
+    let needle = format!("\"pid\":{pid}");
+    let hits: Vec<usize> = line.windows(needle.len()).enumerate().filter(|(at, w)| *w == needle.as_bytes() && !line.get(at + needle.len()).is_some_and(u8::is_ascii_digit)).map(|(at, _)| at).collect();
+    let &[at] = hits.as_slice() else { return None };
+    let mut out = Vec::with_capacity(line.len() + 10);
+    out.extend_from_slice(&line[..at]);
+    out.extend_from_slice(format!("\"pid\":{to}").as_bytes());
+    out.extend_from_slice(&line[at + needle.len()..]);
+    // The one occurrence must have been the inner pid (not a nested one while the inner is spelled otherwise).
+    (inner_pid(&out) == Some(u64::from(to))).then(|| (Bytes::from(out), pid))
+}
+
 /// A child `control_response` line with `response.request_id` changed from
 /// `from` to `to`, everything else byte-for-byte: the one quoted occurrence
 /// of `from` is replaced (the pump's replay ids are fresh uuid v7s, unique in
@@ -499,5 +540,54 @@ mod tests {
         assert_eq!(rewrite_response_id(twice, "id", "x"), None, "an ambiguous id is never rewritten");
         let not_response = br#"{"type":"user","uuid":"0199aa"}"#;
         assert_eq!(rewrite_response_id(not_response, "0199aa", "x"), None);
+    }
+
+    /// The `initialize` answer the CLI prints (claude 2.1.296's shape: the
+    /// inner response's keys, the pid last), its pid made the wrapper's,
+    /// every other byte as it was; the pid it reported comes back.
+    #[test]
+    fn the_initialize_pid_is_rewritten_byte_exact() {
+        let line = br#"{"type":"control_response","response":{"subtype":"success","request_id":"k2l","response":{"commands":[{"name":"compact","description":"Clear history but keep a summary","argumentHint":"<optional>"}],"output_style":"default","available_output_styles":["default","Explanatory","Learning"],"models":[{"value":"default","displayName":"Default (recommended)"}],"account":{"subscriptionType":"max"},"pid":48213}}}"#;
+        let (out, from) = rewrite_initialize_pid(line, 777).unwrap();
+        assert_eq!(from, 48213);
+        let want = String::from_utf8_lossy(line).replace("\"pid\":48213", "\"pid\":777");
+        assert_eq!(&out[..], want.as_bytes(), "only the digits changed");
+        assert_eq!(classify_child(&out), ChildFrame::ControlResponse { request_id: Some("k2l".into()), subtype: Some("success".into()) });
+        // The fake claude's answer, the pid alone; the same pid is a no-op that still answers.
+        let fake = br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid":4242}}}"#;
+        assert_eq!(rewrite_initialize_pid(fake, 9).map(|(b, p)| (b.to_vec(), p)), Some((br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid":9}}}"#.to_vec(), 4242)));
+        assert_eq!(rewrite_initialize_pid(fake, 4242).map(|(b, p)| (b.to_vec(), p)), Some((fake.to_vec(), 4242)));
+        // A longer pid in a nested object is not the inner one: `"pid":42` followed by a digit is no occurrence.
+        let nested = br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"mcp":{"pid":4210},"pid":42}}}"#;
+        let (out, from) = rewrite_initialize_pid(nested, 5).unwrap();
+        assert_eq!((String::from_utf8_lossy(&out).into_owned(), from), (r#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"mcp":{"pid":4210},"pid":5}}}"#.to_string(), 42));
+    }
+
+    /// Whenever the inner pid cannot be found once, byte-exact, nothing is
+    /// rewritten (the caller forwards the line as it came): no pid, a pid
+    /// that is no integer, a pid spelled with a space, the same `"pid":P`
+    /// twice (a nested copy, a string that ends in it never counts), an
+    /// error answer, another frame, a pid only in a nested object.
+    #[test]
+    fn an_initialize_answer_whose_pid_is_not_found_once_passes_unchanged() {
+        for line in [
+            &br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"commands":[]}}}"#[..],
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid":"4242"}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid":-1}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid":42.5}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid": 4242}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"child":{"pid":4242},"pid":4242}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid":4242,"child":{"pid":4242}}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"pid": 4242,"child":{"pid":4242}}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"error","request_id":"i1","error":"no","response":{"pid":4242}}}"#,
+            br#"{"type":"system","subtype":"init","response":{"response":{"pid":4242}}}"#,
+            br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"child":{"pid":4242}}}}"#,
+            b"not json \"pid\":4242",
+        ] {
+            assert_eq!(rewrite_initialize_pid(line, 9), None, "{}", String::from_utf8_lossy(line));
+        }
+        // A string ending in the needle is escaped in JSON, so it never matches.
+        let quoted = br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"note":"\"pid\":4242","pid":4242}}}"#;
+        assert!(rewrite_initialize_pid(quoted, 9).is_some_and(|(b, _)| b.ends_with(br#""pid":9}}}"#)));
     }
 }

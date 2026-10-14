@@ -29,21 +29,37 @@
 //! the other direction, the signals or the deadlines.
 //!
 //! The child is reached through a [`ChildLink`] (an input sender, a signal
-//! sender, an event receiver): S2 builds it over a local process
-//! ([`spawn_local`]); S8 builds the same link over the MicroVM WebSocket
-//! (`RemoteLink`, moved there from S6 by its D5: `spawn_next` then needs an
-//! async link seam, and a refused remote spawn a [`ChildEvent`] of its own,
-//! never `Exit(None)`, so the [`EndReason`]s keep their meaning).
+//! sender, an event receiver) that a `remote::link::LinkFactory` hands the
+//! pump for each generation: `LocalLinks` over a local process
+//! ([`spawn_local`], S2), `RemoteLinks` over the MicroVM's agent transport
+//! (S8 `remote`). The supervisor runs on a `LocalSet` in every mode, where a
+//! remote generation's pipeline and adapter run as local tasks. A remote
+//! start returns its link at once and is pending until its first event,
+//! `Started` or `SpawnFailed` (never `Exit(None)`, so the [`EndReason`]s keep
+//! their meaning): a pending start is a live child, so the ladders run, the
+//! host is still read (up to `PENDING_IN_LINES` lines or `PENDING_IN_BYTES`
+//! queued), and a host EOF or a signal cancels it at once. A remote session
+//! fails closed: whatever ends it before or after the pump started is an
+//! exit with one `ai-env-claude:` line, printed last through `bridge::voice`,
+//! never a local run.
 //!
 //! Timing (plan D22): host stdin EOF → child stdin closed → SIGTERM at
 //! +800 ms → SIGKILL at +1200 ms → hard stop at +1400 ms → exit ≤ 1500 ms;
 //! SIGTERM to the wrapper → SIGTERM the child now → SIGKILL at +600 ms →
-//! hard stop at +900 ms → exit ≤ 1000 ms. The queued lines' flush to the
-//! host never outlives the hard stop. When the child ends on its own while
-//! the host still reads, its remaining output is drained eagerly and the
-//! host gets up to 5 s to take it. At the end the mirror is fsync'ed, the
+//! hard stop at +900 ms → exit ≤ 1000 ms. The rungs are the link's
+//! (`CloseTimings`): a remote CLI is never sent TERM after EOF, its own exit
+//! is awaited until `detach{final}` at +1200 ms (L2). The queued lines' flush
+//! to the host never outlives the hard stop. When the child ends on its own
+//! while the host still reads, its remaining output is drained eagerly and
+//! the host gets up to 5 s to take it. At the end the mirror is fsync'ed, the
 //! registry row closed and a second census row (the start row + `end`,
-//! `exit`, a note) appended before `process::exit`.
+//! `exit`, a note) appended; a remote link then gets what is left of the hard
+//! stop to close (`LinkFactory::close`) before `process::exit`.
+//!
+//! The forwarded answer to the host's `initialize` carries the wrapper's pid
+//! in every piped mode (`wire::claude::rewrite_initialize_pid`): the
+//! extension's pid is the process it spawned, never a CLI in a VM or a
+//! respawned generation.
 //!
 //! Lines are split at the CLI's own limit (256 MiB, `CLI_LINE_BYTES`): a user
 //! message with pasted images or a transcript entry holding them passes as
@@ -81,8 +97,12 @@ use crate::bridge::lab::{self, PumpKnobs};
 use crate::bridge::logging::{self, LogOpts};
 use crate::bridge::mirror::{self, MirrorCfg, Writer};
 use crate::bridge::registry::{self, SessionRow};
+use crate::bridge::remote::link::{CloseTimings, LinkFactory, LinkKind, LinkLoss, LocalLinks, RemoteLinks, RemoteStarted, SpawnFailure, StartReq, StartStep, StartWhy, PENDING_IN_BYTES, PENDING_IN_LINES, STEP_PART};
+use crate::bridge::remote::{audit_event, census_part, pipeline, Failure};
 use crate::bridge::route::Mode;
+use crate::bridge::voice;
 use crate::bridge::seed;
+use crate::bridge::workspace::TranscriptOutcome;
 use crate::bridge::setup_token::{parse_token_env, sealed_text, SetupToken, TOKEN_VAR};
 use crate::bridge::unseal::UnsealJob;
 use crate::errors::CliError;
@@ -103,6 +123,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -185,6 +206,12 @@ pub const INIT_FAIL_FAST: Duration = Duration::from_secs(10);
 const RESUME_MISS_GRACE: Duration = Duration::from_secs(2);
 /// The most of an error text the end row keeps from the extension's answer.
 const SYNTHETIC_ERROR_CHARS: usize = 160;
+/// The wrapper's exit once Anthropic refused a remote session's token (S7
+/// D6's, as `vm exec`'s).
+const REJECTED_STATUS: i32 = 5;
+/// After that refusal, how long the session's stop (`Signal(Term)` plus
+/// `detach{final}`) may take before the wrapper finishes anyway.
+const REJECT_HARD_STOP: Duration = Duration::from_secs(2);
 
 const READ_CHUNK: usize = 64 * 1024;
 
@@ -220,7 +247,9 @@ pub struct Session {
     /// Unused by the local modes; S8 reads the VM settings from it.
     pub cfg: Option<BridgeConfig>,
     pub mode: Mode,
-    /// The census row already written for this invocation (the end row clones it).
+    /// This invocation's census row (the end row clones it): written by
+    /// `main`, or for a remote session by [`run`] once it listens for a stop
+    /// (S8 phase 4).
     pub start_row: CensusRow,
 }
 
@@ -262,7 +291,15 @@ pub fn route_label(route: &Route) -> String {
 
 /// The child plan, from the session and an environment lookup (the wrapper's
 /// own environment in production). Pure apart from `canonicalize` inside the
-/// slug and mirror decisions; the scratch dir is only named here.
+/// slug and mirror decisions; the scratch dir is only named here. A remote
+/// session's (S8) child is the CLI in the VM, run by the agent whose HOME is
+/// the Mac's (Design A): its config dir is the Mac HOME's `.claude`, which
+/// the mirror frames name and the writer mirrors into the Mac's projects dir
+/// (`mirror::decide` with a child that is not local), confined to the
+/// session's own project, the slug (`MirrorCfg::confined_to`); no scratch dir, no
+/// environment of the wrapper's (the pipeline builds the VM's), and the slug
+/// is the cwd's (no `CLAUDE_CODE_PROJECT_DIR_NAME`: the shim sets the VM's
+/// `CLAUDE_CONFIG_DIR`, the wrapper forwards no override).
 pub fn child_plan(sess: &Session, env: &dyn Fn(&str) -> Option<OsString>, fresh_id: &mut dyn FnMut() -> String) -> Result<ChildPlan, String> {
     let argv = argv::sanitise(&sess.args, SanitiseOpts { strip_add_dir: false, strip_debug: false }).map_err(|e| e.to_string())?;
     let nonempty = |k: &str| env(k).filter(|v| !v.is_empty());
@@ -282,10 +319,15 @@ pub fn child_plan(sess: &Session, env: &dyn Fn(&str) -> Option<OsString>, fresh_
             (dir.clone(), Some(dir.clone()), vec![("CLAUDE_CONFIG_DIR".to_string(), dir.into_os_string())], vec![SECURE_STORAGE_ENV.to_string(), TOKEN_FD_VAR.to_string()], true)
         }
         Mode::LocalChild => (mac_config_dir.clone(), None, Vec::new(), Vec::new(), nonempty("CLAUDE_CONFIG_DIR").is_some()),
-        Mode::Passthrough | Mode::Remote => return Err(format!("mode {} does not pipe", sess.mode.name())),
+        Mode::Remote => (PathBuf::from(nonempty("HOME").ok_or("HOME is not set")?).join(".claude"), None, Vec::new(), Vec::new(), false),
+        Mode::Passthrough => return Err(format!("mode {} does not pipe", sess.mode.name())),
     };
     let slug = child_slug(sess.cwd.as_deref(), config_dir_set, override_name.as_deref());
-    let mirror = mirror::decide(matches!(sess.route, Route::Remote(_)), true, &child_config_dir, &mac_config_dir, mirror_root.as_deref());
+    let mut mirror = mirror::decide(matches!(sess.route, Route::Remote(_)), sess.mode != Mode::Remote, &child_config_dir, &mac_config_dir, mirror_root.as_deref());
+    if sess.mode == Mode::Remote {
+        // The VM's frames name what the VM chose: the Mac's other projects are never theirs.
+        mirror = mirror.confined_to(slug.as_deref());
+    }
     Ok(ChildPlan { program: sess.real_binary.clone(), argv, env_set, env_remove, child_config_dir, scratch, resume, slug, mirror })
 }
 
@@ -304,8 +346,15 @@ pub enum EndReason {
     HostGone,
     /// `AI_ENV_BRIDGE_LAB_EXIT=…:after-init`.
     LabExit,
-    /// The child could not be spawned.
+    /// The child could not be spawned (S8: a remote start that ended before
+    /// `spawned`, `ChildEvent::SpawnFailed`).
     SpawnFailed,
+    /// S8: the remote link stayed lost past its budget after the spawn
+    /// started (`ChildEvent::Lost`).
+    LinkLost,
+    /// S8: Anthropic refused the token delivered to the remote session (the
+    /// AuthWatch verdict, `ChildEvent::Rejected`).
+    CredentialRejected,
 }
 
 impl EndReason {
@@ -319,6 +368,8 @@ impl EndReason {
             EndReason::HostGone => "host_gone",
             EndReason::LabExit => "lab_exit",
             EndReason::SpawnFailed => "spawn_failed",
+            EndReason::LinkLost => "link_lost",
+            EndReason::CredentialRejected => "credential_rejected",
         }
     }
 }
@@ -338,21 +389,43 @@ pub struct Outcome {
     pub init_latency_ms: Option<u64>,
     pub eof_to_sigterm_ms: Option<u64>,
     pub session_id: Option<String>,
-    /// `local-scratch` only: how the child was logged in ([`ScratchLogin::word`]);
+    /// `local-scratch`: how the child was logged in ([`ScratchLogin::word`]);
     /// `none` once the seed retry respawned it after the token copy was
-    /// dropped, since that generation runs logged out.
+    /// dropped, since that generation runs logged out. A remote session:
+    /// where its token came from (`RemoteSnapshot::credential`), however
+    /// the session ended.
     pub credential: Option<&'static str>,
     /// With [`SYNTHETIC_OAUTH_KNOB`]: the class of the extension's answer
     /// ([`synthetic_answer_class`]), `none` (no answer within the wait) or
     /// `unsent` (the session was never initialized).
     pub synthetic_oauth: Option<String>,
+    /// A failed remote start (`end:spawn_failed`): the step it stopped at
+    /// (`remote::link::StartStep::name`).
+    pub step: Option<&'static str>,
+    /// A remote session: the parts its link owns (`RemoteSnapshot::census_parts`).
+    pub remote: Vec<String>,
+    /// From the host's EOF or the signal that closed the session to the end row.
+    pub close_ms: Option<u64>,
+    /// The `initialize` answer's pid: `ok` (the wrapper's), `failed` (forwarded as the CLI gave it).
+    pub pid_rewrite: Option<&'static str>,
+    /// A remote session: the `system/init` session ids not adopted, each
+    /// naming another session's row ([`INIT_ID_REFUSED_PART`]).
+    pub init_id_refused: u64,
 }
+
+/// The end row's part counting a remote session's `system/init` ids that
+/// named another session's row, and so were not adopted
+/// (`init_id_refused:<n>`, written only when `n` > 0; S8 W1's fix).
+pub const INIT_ID_REFUSED_PART: &str = "init_id_refused";
 
 /// The census end row: a clone of `start` with `end`, `exit` and the note
 /// extended by `end:<reason>; child_pid:<n>; respawns:<n>; mirror:<frames>/<rejected>;
 /// dropped:<n>; oauth_refresh_answered:<n>` (+ `init_ms`, `eof_to_sigterm_ms` when known;
-/// `credential:<fd|env|inherited|none>` for `local-scratch`; `synthetic_oauth:<class>`
-/// with the lab knob).
+/// `credential:<fd|env|inherited|none>` for `local-scratch`, a remote session's
+/// `credential:<combined|setup-token|cached>`; `synthetic_oauth:<class>` with the lab
+/// knob; `init_id_refused:<n>` when n > 0; `step:<step>` for a failed remote start; a remote link's parts
+/// with `close_ms` before its `link_drops`, `remote::census_part::ALL`'s order; else
+/// `close_ms` after the rest; `pid_rewrite:<ok|failed>` once an `initialize` answer went).
 #[must_use]
 pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
     let mut row = start.clone();
@@ -378,6 +451,30 @@ pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
     if let Some(class) = &out.synthetic_oauth {
         parts.push(format!("synthetic_oauth:{class}"));
     }
+    if out.init_id_refused > 0 {
+        parts.push(format!("{INIT_ID_REFUSED_PART}:{}", out.init_id_refused));
+    }
+    if let Some(step) = out.step {
+        parts.push(format!("{STEP_PART}:{step}"));
+    }
+    let close = out.close_ms.map(|ms| format!("{}:{ms}", census_part::CLOSE_MS));
+    let drops = format!("{}:", census_part::LINK_DROPS);
+    let mut close_put = false;
+    for part in &out.remote {
+        if part.starts_with(&drops) {
+            if let Some(c) = close.as_ref().filter(|_| !close_put) {
+                parts.push(c.clone());
+                close_put = true;
+            }
+        }
+        parts.push(part.clone());
+    }
+    if let Some(c) = close.filter(|_| !close_put) {
+        parts.push(c);
+    }
+    if let Some(word) = out.pid_rewrite {
+        parts.push(format!("{}:{word}", census_part::PID_REWRITE));
+    }
     let tail = parts.join("; ");
     row.note = Some(match row.note.take() {
         Some(n) if !n.is_empty() => format!("{n}; {tail}"),
@@ -402,7 +499,9 @@ pub enum Sig {
     Kill,
 }
 
-/// What the child side reports.
+/// What the child side reports. A local child sends the first five; the
+/// rest are a remote link's (S8 §2; `remote::link` holds their payloads and
+/// builds them). A local pump that met one would log it and change nothing.
 #[derive(Debug)]
 pub enum ChildEvent {
     /// One stdout line (without `\n`).
@@ -411,11 +510,55 @@ pub enum ChildEvent {
     TooLong(usize),
     StdoutEof,
     StderrEof,
-    /// The child was reaped (`None`: waiting failed).
+    /// The child was reaped (`None`: waiting failed). A remote exit arrives
+    /// as a status made from the shim's code or signal.
     Exit(Option<ExitStatus>),
+    /// The remote spawn started (the shim's `spawned`): a pending start's
+    /// first event when it succeeds.
+    Started(RemoteStarted),
+    /// The remote start ended before `spawned`, with its exit code and line:
+    /// never `Exit(None)`.
+    SpawnFailed(SpawnFailure),
+    /// The remote spawn started, then its link was lost past the budget.
+    Lost(LinkLoss),
+    /// The remote spawn started, and the wrapper's own `detach{final}` ended
+    /// the link before an exit came (0 after a host EOF, 143 after a signal).
+    Detached,
+    /// AuthWatch: Anthropic refused the delivered token (`how`: `retries` or
+    /// `text`, as `credential_rejected` records it).
+    Rejected { how: &'static str },
+    /// The remote link went down (`false`) or came back (`true`): the
+    /// registry row's `detached`, never an exit.
+    Link(bool),
+    /// A remote transport note for the wrapper's log, never its stderr.
+    Note(String),
 }
 
-/// The pump's handle on one child: the seam S8's `RemoteLink` reuses with a WebSocket behind it.
+impl ChildEvent {
+    /// The event's kind, for logs (a `Line`'s bytes are never logged).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ChildEvent::Line(_) => "line",
+            ChildEvent::TooLong(_) => "too_long",
+            ChildEvent::StdoutEof => "stdout_eof",
+            ChildEvent::StderrEof => "stderr_eof",
+            ChildEvent::Exit(_) => "exit",
+            ChildEvent::Started(_) => "started",
+            ChildEvent::SpawnFailed(_) => "spawn_failed",
+            ChildEvent::Lost(_) => "lost",
+            ChildEvent::Detached => "detached",
+            ChildEvent::Rejected { .. } => "rejected",
+            ChildEvent::Link(_) => "link",
+            ChildEvent::Note(_) => "note",
+        }
+    }
+}
+
+/// The pump's handle on one child: the seam S8's remote link
+/// (`remote::link::LinkFactory`) reuses with a WebSocket behind it.
+/// `pid` is a local child's; a remote link's is `None` (the VM's pid comes
+/// with `ChildEvent::Started`).
 #[derive(Debug)]
 pub struct ChildLink {
     pub pid: Option<u32>,
@@ -560,7 +703,8 @@ async fn child_stdout_reader(mut out: tokio::process::ChildStdout, tx: mpsc::Sen
     let _ = tx.send(ChildEvent::StdoutEof).await;
 }
 
-fn line_event(r: Result<Bytes, LineError>) -> ChildEvent {
+/// One splitter result as the child's event: a line, or a line over the cap dropped.
+pub(crate) fn line_event(r: Result<Bytes, LineError>) -> ChildEvent {
     match r {
         Ok(line) => ChildEvent::Line(line),
         Err(LineError::TooLong { dropped_bytes }) => ChildEvent::TooLong(dropped_bytes),
@@ -672,18 +816,140 @@ async fn reserve_opt<T>(tx: &Option<mpsc::Sender<T>>) -> Option<mpsc::Permit<'_,
     }
 }
 
+/// A signal to the wrapper, as the supervisor acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostSignal {
+    /// SIGTERM or SIGINT (and, for a remote session, SIGHUP): close.
+    Term,
+    /// `registry::DROP_TRANSPORT_SIGNAL` (`session drop-transport`, T8.6).
+    DropTransport,
+}
+
+/// The wrapper's signal handlers, installed by the supervisor before the
+/// first child (and so before the session's row is first written); a remote
+/// session's by `run`, as soon as its runtime exists (before P0).
+enum Signals {
+    Os {
+        term: tokio::signal::unix::Signal,
+        int: tokio::signal::unix::Signal,
+        /// A remote session only: a hang-up during a pending start must not
+        /// leave a Touch ID dialog orphaned (S8 §3).
+        hup: Option<tokio::signal::unix::Signal>,
+        drop_transport: tokio::signal::unix::Signal,
+    },
+    /// The tests' signals.
+    #[cfg(test)]
+    Scripted(mpsc::UnboundedReceiver<HostSignal>),
+}
+
+impl Signals {
+    /// The handlers of a pump whose child is `kind`. A remote session's
+    /// SIGHUP listener is `signals::handle`'s: one ignored when the wrapper
+    /// started stays ignored, as `vm exec` leaves it.
+    fn install(kind: LinkKind) -> std::io::Result<Signals> {
+        use tokio::signal::unix::{signal, SignalKind};
+        crate::bridge::signals::note_dispositions();
+        let hup = match kind {
+            LinkKind::Remote => crate::bridge::signals::handle(libc::SIGHUP, SignalKind::hangup()).map_err(|e| std::io::Error::other(e.to_string()))?,
+            LinkKind::Local => None,
+        };
+        Ok(Signals::Os { term: signal(SignalKind::terminate())?, int: signal(SignalKind::interrupt())?, hup, drop_transport: signal(SignalKind::from_raw(registry::DROP_TRANSPORT_SIGNAL))? })
+    }
+
+    /// The next signal (cancel-safe).
+    async fn recv(&mut self) -> HostSignal {
+        match self {
+            Signals::Os { term, int, hup, drop_transport } => tokio::select! {
+                biased;
+                _ = term.recv() => HostSignal::Term,
+                _ = int.recv() => HostSignal::Term,
+                _ = async { match hup { Some(h) => h.recv().await, None => std::future::pending().await } } => HostSignal::Term,
+                _ = drop_transport.recv() => HostSignal::DropTransport,
+            },
+            #[cfg(test)]
+            Signals::Scripted(rx) => match rx.recv().await {
+                Some(s) => s,
+                None => std::future::pending().await,
+            },
+        }
+    }
+}
+
+/// The supervisor's host side: the host's lines, its stdout (and the
+/// writer task that drains it), the signals.
+struct HostIo {
+    lines: mpsc::Receiver<HostIn>,
+    out: mpsc::Sender<Bytes>,
+    writer: tokio::task::JoinHandle<()>,
+    signals: Signals,
+}
+
 /// What woke the supervisor. The `select!` arms only touch disjoint fields
 /// (its futures stay alive while an arm runs); everything else happens on
 /// this value afterwards.
 #[derive(Debug)]
 enum Wake {
-    Signal,
+    Signal(HostSignal),
     Deadline,
     Sent,
     HostOutClosed,
     ChildInClosed,
     Child(Option<ChildEvent>),
     Host(Option<HostIn>),
+}
+
+/// The lines queued for the child, and their bytes (a pending remote start
+/// reads the host until either is past its cap).
+#[derive(Debug, Default)]
+struct InQueue {
+    items: VecDeque<ChildInput>,
+    bytes: usize,
+}
+
+impl InQueue {
+    fn size(item: &ChildInput) -> usize {
+        match item {
+            ChildInput::Line(b) => b.len(),
+            ChildInput::Eof => 0,
+        }
+    }
+
+    fn push_back(&mut self, item: ChildInput) {
+        self.bytes += InQueue::size(&item);
+        self.items.push_back(item);
+    }
+
+    fn pop_front(&mut self) -> Option<ChildInput> {
+        let item = self.items.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(InQueue::size(&item));
+        Some(item)
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.bytes = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// One child generation's registry entry (`SessionRow.vms`): the VM and the
+/// spawn a remote generation ran on, from its `Started` to its end.
+#[derive(Debug, Clone, serde::Serialize)]
+struct VmGen {
+    gen: u32,
+    vm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spawn: Option<String>,
+    from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
 }
 
 // ---- the supervisor ----------------------------------------------------------------------
@@ -705,11 +971,33 @@ struct Ladder {
 struct Pump {
     sess: Session,
     plan: ChildPlan,
+    /// Where each child generation comes from (S8's seam), its kind and its close ladder.
+    links: Box<dyn LinkFactory>,
+    kind: LinkKind,
+    timings: CloseTimings,
     knobs: PumpKnobs,
     after_init: Option<(i32, String)>,
     state: HostState,
     mirror: Writer,
     gen: u32,
+    /// A remote start is pending: its link's first event has not come.
+    starting: bool,
+    /// How a remote link ended without an exit, what `on_child_gone` maps
+    /// first: a start that ended before `Started` (its code and line), a
+    /// started link lost past its budget, the wrapper's own detach.
+    start_failure: Option<SpawnFailure>,
+    link_loss: Option<LinkLoss>,
+    detached: bool,
+    /// A remote session's link is down (`ChildEvent::Link(false)`): its row says `detached`.
+    link_down: bool,
+    /// A respawn's replay deadline waits for the remote generation's `Started`.
+    replay_at_start: bool,
+    /// The remote generations' VMs and spawns (the row's `vms`).
+    vms: Vec<VmGen>,
+    /// The one `ai-env-claude:` line the wrapper ends with, printed last (a remote session's).
+    final_line: Option<String>,
+    /// The host's EOF (or its stdout gone) or the signal that closed the session: the census's `close_ms` counts from it.
+    close_at: Option<Instant>,
     // The current child, split so the select! can borrow the parts independently.
     child_events: Option<mpsc::Receiver<ChildEvent>>,
     child_input: Option<mpsc::Sender<ChildInput>>,
@@ -728,7 +1016,9 @@ struct Pump {
     first_session_id: Option<String>,
     /// A registry row was written at least once.
     registered: bool,
-    in_q: VecDeque<ChildInput>,
+    /// The session ids whose row this wrapper wrote (a remote init may name them again).
+    own_ids: Vec<String>,
+    in_q: InQueue,
     out_q: VecDeque<Bytes>,
     host_open: bool,
     host_eof_at: Option<Instant>,
@@ -798,7 +1088,7 @@ impl Synthetic {
 }
 
 impl Pump {
-    fn new(sess: Session, plan: ChildPlan, login: Option<ScratchLogin>) -> Pump {
+    fn new(sess: Session, plan: ChildPlan, login: Option<ScratchLogin>, links: Box<dyn LinkFactory>) -> Pump {
         let audit_path = sess.paths.audit();
         let mirror = Writer::new(plan.mirror.clone());
         let word = login.as_ref().map(ScratchLogin::word);
@@ -807,12 +1097,25 @@ impl Pump {
             _ => None,
         };
         let synthetic = Synthetic::from_knob();
+        let (kind, timings) = (links.kind(), links.timings());
         Pump {
+            links,
+            kind,
+            timings,
             knobs: lab::pump_knobs(),
             after_init: lab::exit_after_init(),
             state: HostState::new(),
             mirror,
             gen: 0,
+            starting: false,
+            start_failure: None,
+            link_loss: None,
+            detached: false,
+            link_down: false,
+            replay_at_start: false,
+            vms: Vec::new(),
+            final_line: None,
+            close_at: None,
             child_events: None,
             child_input: None,
             child_signal: None,
@@ -827,7 +1130,8 @@ impl Pump {
             close_requested: false,
             first_session_id: None,
             registered: false,
-            in_q: VecDeque::new(),
+            own_ids: Vec::new(),
+            in_q: InQueue::default(),
             out_q: VecDeque::new(),
             host_open: true,
             host_eof_at: None,
@@ -920,9 +1224,11 @@ impl Pump {
         self.audit("synthetic_oauth", &[("class", class), ("ms", ms.to_string())]);
     }
 
-    /// Spawn the next child generation; `false` when the spawn failed (the
-    /// finish is then already decided).
-    fn spawn_next(&mut self) -> bool {
+    /// Start the next child generation (`why`: the first, or the resume
+    /// miss's retry) from the link factory; `false` when the start failed
+    /// (the finish is then already decided). A remote start is pending until
+    /// its link's first event; its init-delay knob waits for `Started`.
+    fn spawn_next(&mut self, why: StartWhy) -> bool {
         self.gen += 1;
         self.state.begin_gen(self.gen);
         self.child_exit = None;
@@ -936,16 +1242,18 @@ impl Pump {
             // The end row says how the generation that serves the session was logged in.
             self.out.credential = Some("none");
         }
-        match spawn_local(&self.plan, self.credential.as_ref().map(|c| (&c.token, c.deliver))) {
+        let req = StartReq { why, credential: self.credential.as_ref().map(|c| (&c.token, c.deliver)) };
+        match self.links.start(self.gen, req) {
             Ok(link) => {
-                tracing::info!(gen = self.gen, pid = link.pid, "child spawned");
+                tracing::info!(gen = self.gen, pid = link.pid, kind = self.kind.name(), "child spawned");
                 self.child_pid = link.pid;
                 self.out.child_pid = link.pid;
                 self.child_events = Some(link.events);
                 self.child_input = Some(link.input);
                 self.child_signal = Some(link.signal);
                 self.spawned_at = Instant::now();
-                if self.gen == 1 {
+                self.starting = self.kind == LinkKind::Remote;
+                if self.gen == 1 && !self.starting {
                     self.delay_until = self.knobs.delay_init.map(|d| self.spawned_at + d);
                 }
                 if let Some(c) = &self.credential {
@@ -964,11 +1272,15 @@ impl Pump {
                 true
             }
             Err(e) => {
-                eprintln!("ai-env-claude: cannot spawn {}: {e}", self.plan.program.display());
+                match self.kind {
+                    LinkKind::Local => eprintln!("ai-env-claude: cannot spawn {}: {e}", self.plan.program.display()),
+                    LinkKind::Remote => self.final_line = Some(Failure::Other { code: 1, step: StartStep::Spawn.name(), first_line: format!("the remote session could not start: {e}") }.line()),
+                }
                 tracing::warn!("spawn failed: {e}");
                 self.child_events = None;
                 self.child_input = None;
                 self.child_signal = None;
+                self.out.step = (self.kind == LinkKind::Remote).then_some(StartStep::Spawn.name());
                 self.decide_finish(1, EndReason::SpawnFailed);
                 false
             }
@@ -1083,6 +1395,7 @@ impl Pump {
             return;
         }
         self.close_requested = true;
+        self.close_at.get_or_insert(now);
         if self.child_events.is_none() {
             self.decide_finish(0, EndReason::EofTerm);
             return;
@@ -1092,10 +1405,26 @@ impl Pump {
             return;
         }
         self.in_q.push_back(ChildInput::Eof);
-        self.start_ladder(Some(now + EOF_TERM_AFTER), now + EOF_KILL_AFTER, now + EOF_HARD_STOP, true);
+        self.eof_ladder(now);
     }
 
-    fn start_ladder(&mut self, term_at: Option<Instant>, kill_at: Instant, hard_stop: Instant, host_initiated: bool) {
+    /// The host closed (EOF, or its stdout gone) with a child alive: the EOF
+    /// ladder of the link's timings. A pending remote start is cancelled at
+    /// once instead (no spawn goes out, an unseal's dialog closes), under the
+    /// same hard stop.
+    fn eof_ladder(&mut self, now: Instant) {
+        let t = self.timings;
+        if self.starting {
+            self.signal_child(Sig::Term);
+            self.start_ladder(None, now + t.eof_kill_after, now + t.eof_hard_stop, true, true);
+        } else {
+            self.start_ladder(t.eof_term_after.map(|d| now + d), now + t.eof_kill_after, now + t.eof_hard_stop, true, false);
+        }
+    }
+
+    /// Start (or tighten) the ladder; `signalled`: a signal went to the child
+    /// as it started (SIGTERM's at once; an EOF ladder sends none yet).
+    fn start_ladder(&mut self, term_at: Option<Instant>, kill_at: Instant, hard_stop: Instant, host_initiated: bool, signalled: bool) {
         // A closing session is never held back by the init-delay knob.
         self.delay_until = None;
         match &mut self.ladder {
@@ -1106,8 +1435,9 @@ impl Pump {
                     l.term_at = None;
                 }
                 l.host_initiated &= host_initiated;
+                l.signalled |= signalled;
             }
-            None => self.ladder = Some(Ladder { term_at, kill_at, hard_stop, host_initiated, signalled: term_at.is_none(), killed: false }),
+            None => self.ladder = Some(Ladder { term_at, kill_at, hard_stop, host_initiated, signalled, killed: false }),
         }
     }
 
@@ -1130,6 +1460,7 @@ impl Pump {
         }
         self.host_open = false;
         self.close_requested = true;
+        self.close_at.get_or_insert(now);
         if self.finish.is_some() {
             self.shorten_finish();
             return;
@@ -1142,8 +1473,16 @@ impl Pump {
             // The child already exited and is draining: its own exit decides (no respawn).
             return;
         }
+        // A remote child: `Signal(Term)` plus `detach{final}`, or the pending start cancelled.
         self.signal_child(Sig::Term);
-        self.start_ladder(None, now + SIGTERM_KILL_AFTER, now + SIGTERM_HARD_STOP, false);
+        self.start_ladder(None, now + self.timings.sigterm_kill_after, now + self.timings.sigterm_hard_stop, false, true);
+    }
+
+    /// `session drop-transport` (T8.6): the link closes its socket and
+    /// reattaches (a local child is left alone).
+    fn on_drop_transport(&mut self) {
+        tracing::info!(gen = self.gen, kind = self.kind.name(), "drop-transport signal");
+        self.links.drop_transport();
     }
 
     // -- child → host --------------------------------------------------------------------
@@ -1162,16 +1501,118 @@ impl Pump {
                 self.child_exit = Some(status);
                 self.exit_seen_at = Some(Instant::now());
             }
+            // A remote link's events: no local child sends one.
+            Some(ev) if self.kind == LinkKind::Local => tracing::debug!(gen = self.gen, event = ev.kind(), "a remote link's event on a local child: ignored"),
+            Some(ChildEvent::Started(s)) => self.on_started(s),
+            Some(ChildEvent::SpawnFailed(f)) => {
+                tracing::info!(gen = self.gen, step = f.step.name(), code = f.code, cancelled = f.cancelled, "the remote start ended before the spawn ran");
+                self.start_failure = Some(f);
+                self.link_ended();
+            }
+            Some(ChildEvent::Lost(l)) => {
+                tracing::warn!(gen = self.gen, code = l.code, "the remote link was lost");
+                self.link_loss = Some(l);
+                self.link_ended();
+            }
+            Some(ChildEvent::Detached) => {
+                tracing::info!(gen = self.gen, "the remote spawn was detached for good");
+                self.detached = true;
+                self.link_ended();
+            }
+            Some(ChildEvent::Rejected { how }) => self.on_rejected(how),
+            Some(ChildEvent::Link(up)) => self.on_link(up),
+            Some(ChildEvent::Note(text)) => tracing::info!(gen = self.gen, "remote link: {text}"),
             None => {
                 // Every task of this child ended.
                 self.stdout_eof = true;
                 self.stderr_eof = true;
                 if self.child_exit.is_none() {
+                    if self.kind == LinkKind::Remote {
+                        // Fail closed: a remote link that ends without saying how is lost, never a local run.
+                        tracing::warn!(gen = self.gen, starting = self.starting, "the remote link ended without its last event");
+                        let vm = self.links.snapshot().and_then(|s| s.vm).unwrap_or_else(|| "the VM".to_string());
+                        if self.starting {
+                            self.start_failure = Some(SpawnFailure::from_failure(StartStep::Spawn, &Failure::LinkLost { vm }, None));
+                        } else {
+                            self.link_loss = Some(LinkLoss::from_failure(&Failure::LinkLost { vm }));
+                        }
+                        self.starting = false;
+                    }
                     self.child_exit = Some(None);
                     self.exit_seen_at = Some(Instant::now());
                 }
             }
         }
+    }
+
+    /// The remote link's last event (a failed start, a lost link, our own
+    /// detach): nothing more comes from it, and `on_child_gone` maps it.
+    fn link_ended(&mut self) {
+        self.starting = false;
+        self.stdout_eof = true;
+        self.stderr_eof = true;
+        if self.child_exit.is_none() {
+            self.child_exit = Some(None);
+            self.exit_seen_at = Some(Instant::now());
+        }
+    }
+
+    /// The remote spawn runs (`spawned`): the start is no longer pending; the
+    /// generation's VM and spawn go into the row's `vms`; the init-delay knob
+    /// (generation 1) and a respawn's replay deadline start now.
+    fn on_started(&mut self, s: RemoteStarted) {
+        let now = Instant::now();
+        tracing::info!(gen = self.gen, spawn = %s.spawn_id, vm_pid = s.vm_pid, ms = now.duration_since(self.spawned_at).as_millis() as u64, "the remote spawn started");
+        self.starting = false;
+        self.link_down = false;
+        let vm = self.links.snapshot().and_then(|snap| snap.vm).unwrap_or_default();
+        self.vms.push(VmGen { gen: self.gen, vm, spawn: Some(s.spawn_id.to_string()), from: registry::now_rfc3339(), to: None });
+        if self.ladder.is_none() {
+            if self.gen == 1 {
+                self.delay_until = self.knobs.delay_init.map(|d| now + d);
+            }
+            if std::mem::take(&mut self.replay_at_start) && self.state.replaying() {
+                self.replay_deadline = Some(now + self.replay_deadline_len());
+            }
+        }
+        self.touch_registry();
+    }
+
+    /// The remote link went down (`false`) or came back (`true`): the row's
+    /// `detached` or `active`, written when it changes; never an exit.
+    fn on_link(&mut self, up: bool) {
+        tracing::info!(gen = self.gen, up, "remote link");
+        self.link_down = !up;
+        let want = if up { "active" } else { "detached" };
+        if let Some(row) = self.row.as_mut().filter(|r| r.status != want && r.status != "closed") {
+            row.status = want.to_string();
+            self.write_row();
+        }
+    }
+
+    /// AuthWatch's verdict on the VM's claude (S7 D6): Anthropic refused the
+    /// delivered setup-token. The session stops (`Signal(Term)` plus
+    /// `detach{final}`) and is never started again; the wrapper exits 5 with
+    /// D6's line, and the seal is recorded as refused, so no later session
+    /// unseals it. The seal is the one the VM's row names (the delivered
+    /// copy), else the sealed file's.
+    fn on_rejected(&mut self, how: &'static str) {
+        if self.finish.is_some() || self.finish_after_child.is_some() {
+            return;
+        }
+        tracing::warn!(gen = self.gen, how, "Anthropic refused the delivered setup-token: stopping the session");
+        self.final_line = Some(Failure::TokenRefused.line());
+        let vm = self.links.snapshot().and_then(|s| s.vm);
+        let tag = vm.as_deref().and_then(|vm| crate::bridge::vm::registry::read_row(&self.sess.paths, vm).ok().flatten()).and_then(|r| r.credential_tag).or_else(|| crate::bridge::agent::credential::seal_tag(&self.sess.paths.setup_token_env()));
+        match (&vm, &tag) {
+            (Some(vm), Some(tag)) => crate::bridge::agent::credential::record_rejection(&self.sess.paths, vm, tag, how),
+            _ => tracing::warn!("the refusal is not recorded: no VM or no seal known"),
+        }
+        self.finish_after_child = Some((REJECTED_STATUS, EndReason::CredentialRejected));
+        self.close_requested = true;
+        self.signal_child(Sig::Term);
+        let now = Instant::now();
+        self.start_ladder(None, now + self.timings.sigterm_kill_after, now + REJECT_HARD_STOP, false, true);
     }
 
     fn on_child_line(&mut self, line: Bytes) {
@@ -1207,7 +1648,11 @@ impl Pump {
         // Generation 1's answer to the host's `initialize`: its latency, and the start of the token's grace.
         if let ChildFrame::ControlResponse { request_id: Some(id), .. } = &frame {
             if self.gen == 1 && self.out.init_latency_ms.is_none() && self.state.initialize_id() == Some(id.as_ref()) {
-                self.out.init_latency_ms = Some(self.spawned_at.elapsed().as_millis() as u64);
+                // A remote session's runs from the census start (T0): Cursor's 60 s window covers the pipeline too.
+                self.out.init_latency_ms = Some(match self.kind {
+                    LinkKind::Local => self.spawned_at.elapsed().as_millis() as u64,
+                    LinkKind::Remote => unix_now_ms().saturating_sub(self.sess.start_row.start),
+                });
                 if self.credential.is_some() {
                     // Still held: a seed retry is possible. A resume miss comes at startup, so not for long.
                     self.credential_hold_until = Some(Instant::now() + RESUME_MISS_GRACE);
@@ -1226,18 +1671,25 @@ impl Pump {
             ChildVerdict::Swallow(_) => false,
         };
         match verdict {
+            ChildVerdict::Forward if initialized => self.forward_initialize(&line),
+            ChildVerdict::Rewritten(b) if initialized => self.forward_initialize(&b),
             ChildVerdict::Forward => self.forward(&line),
             ChildVerdict::Rewritten(b) => self.forward(&b),
             ChildVerdict::Swallow(why) => tracing::debug!(?why, "child frame swallowed"),
         }
         if initialized {
+            if self.kind == LinkKind::Remote && self.out.init_latency_ms.is_none() {
+                // The first answer the host got, whichever generation gave it (a resume miss's retry
+                // answers the replayed request under a fresh id): from T0, as generation 1's above.
+                self.out.init_latency_ms = Some(unix_now_ms().saturating_sub(self.sess.start_row.start));
+            }
             // Queued behind the response, so the host's handshake is complete when it arrives.
             self.send_synthetic_oauth();
         }
         match &frame {
             ChildFrame::Init { session_id, cwd } => {
-                if let Some(id) = session_id {
-                    if self.out.session_id.as_deref() != Some(id.as_ref()) {
+                if let Some(id) = session_id.as_ref().filter(|id| self.out.session_id.as_deref() != Some(id.as_ref())) {
+                    if self.may_adopt(id) {
                         if self.out.session_id.is_some() {
                             // `/clear` starts a new session in the same process: close the old row.
                             tracing::info!(session = %id, "new session id in the same process");
@@ -1248,6 +1700,12 @@ impl Pump {
                         }
                         self.out.session_id = Some(id.to_string());
                         self.first_session_id.get_or_insert_with(|| id.to_string());
+                        // A remote link's settings captures go to this session's quarantine (T8.7).
+                        self.links.session_adopted(id);
+                    } else {
+                        // A remote CLI's output is the VM's: it never chooses which of the Mac's rows this wrapper writes.
+                        self.out.init_id_refused += 1;
+                        tracing::warn!(session = ?id, "the remote init named a session whose row is another's: not adopted, this session's row stays");
                     }
                 }
                 if init_before == 0 && self.state.inits_forwarded() == 1 {
@@ -1261,9 +1719,30 @@ impl Pump {
                 if let Err(e) = self.mirror.sync_all() {
                     tracing::warn!("mirror fsync: {e}");
                 }
+                // A remote link's per-result code-out: asked for, never awaited.
+                self.links.on_result();
                 self.touch_registry();
             }
             _ => {}
+        }
+    }
+
+    /// Forward the answer to the host's `initialize` with the wrapper's pid
+    /// in it (every piped mode, S8 §4): the extension's pid is the process it
+    /// spawned. A line whose pid is not found once, byte-exact, goes as it
+    /// came (`pid_rewrite:failed` in the census).
+    fn forward_initialize(&mut self, line: &[u8]) {
+        match claude::rewrite_initialize_pid(line, std::process::id()) {
+            Some((rewritten, from)) => {
+                tracing::info!(from, to = std::process::id(), "the initialize answer carries the wrapper's pid");
+                self.out.pid_rewrite = Some(self.out.pid_rewrite.unwrap_or("ok"));
+                self.forward(&rewritten);
+            }
+            None => {
+                tracing::warn!("the initialize answer's pid was not found once: forwarded as the CLI gave it");
+                self.out.pid_rewrite = Some("failed");
+                self.forward(line);
+            }
         }
     }
 
@@ -1279,7 +1758,7 @@ impl Pump {
             self.host_open = false;
             self.signal_child(Sig::Term);
             let now = Instant::now();
-            self.start_ladder(None, now + SIGTERM_KILL_AFTER, now + SIGTERM_HARD_STOP, false);
+            self.start_ladder(None, now + self.timings.sigterm_kill_after, now + self.timings.sigterm_hard_stop, false, true);
             self.finish_after_child = Some((code, EndReason::LabExit));
         }
     }
@@ -1289,8 +1768,25 @@ impl Pump {
         matches!(frame, ChildFrame::ControlResponse { request_id: Some(id), subtype: Some(s) } if s == "success" && self.state.initialize_id() == Some(id.as_ref()))
     }
 
+    /// The resume miss's one retry is possible: a `--resume` of
+    /// `local-scratch` (the scratch dir re-seeded) or of a remote session
+    /// (the transcript uploaded to the VM), generation 1, no init forwarded.
     fn retry_possible(&self) -> bool {
-        self.sess.mode == Mode::LocalScratch && self.gen == 1 && self.retries == 0 && self.plan.resume.is_some() && self.state.inits_forwarded() == 0
+        matches!(self.sess.mode, Mode::LocalScratch | Mode::Remote) && self.gen == 1 && self.retries == 0 && self.plan.resume.is_some() && self.state.inits_forwarded() == 0
+    }
+
+    /// May a `system/init` naming `id` make it this session's (its registry
+    /// row)? A local child's, always. A remote one's (the VM's output, which
+    /// the Mac does not trust) only when no row of `id` exists, or `id` is
+    /// the session's own `--resume`, or its row is one this wrapper wrote:
+    /// never another session's row, whose VM, cwd and pid would become this
+    /// wrapper's (and a `--resume` of it would prefer this VM). A row that
+    /// cannot be read, or an id that is no uuid, is refused too.
+    fn may_adopt(&self, id: &str) -> bool {
+        if self.kind == LinkKind::Local || self.plan.resume.as_deref() == Some(id) || self.own_ids.iter().any(|own| own == id) {
+            return true;
+        }
+        matches!(registry::read(&self.sess.paths, id), Ok(None))
     }
 
     // -- registry ------------------------------------------------------------------------
@@ -1326,6 +1822,15 @@ impl Pump {
         };
         self.row = Some(row);
         self.registered = true;
+        if !self.own_ids.contains(&session_id) {
+            self.own_ids.push(session_id);
+        }
+        if self.link_down {
+            if let Some(row) = &mut self.row {
+                row.status = "detached".to_string();
+            }
+        }
+        self.fill_remote();
         self.write_row();
     }
 
@@ -1336,6 +1841,7 @@ impl Pump {
             row.child_pid = self.child_pid;
             row.respawns = self.out.respawns;
         }
+        self.fill_remote();
         self.write_row();
     }
 
@@ -1348,7 +1854,23 @@ impl Pump {
             row.host_state = self.state.snapshot();
             row.respawns = self.out.respawns;
         }
+        self.fill_remote();
         self.write_row();
+    }
+
+    /// A remote session's fields of the row (plan §2.4's reserved ones),
+    /// from its link: the VM, the spawn, the last stdout seq handed to the
+    /// pump, the seeded head, the newest WIP ref fetched, one `vms` entry per
+    /// generation.
+    fn fill_remote(&mut self) {
+        let Some(row) = self.row.as_mut() else { return };
+        let Some(s) = self.links.snapshot() else { return };
+        row.microvm_id = s.vm;
+        row.spawn_id = s.spawn.as_ref().map(ToString::to_string);
+        row.last_acked_seq = s.spawn.is_some().then_some(s.last_acked_seq);
+        row.seeded_head = s.seeded_head;
+        row.last_wip_fetch = s.last_wip_fetch;
+        row.vms = self.vms.iter().filter_map(|v| toml::Value::try_from(v).ok()).collect();
     }
 
     fn write_row(&self) {
@@ -1370,6 +1892,10 @@ impl Pump {
         self.child_input = None;
         self.child_signal = None;
         self.in_q.clear();
+        // This generation's end, before a retry moves `gen` on (its row write closes it with it).
+        if let Some(v) = self.vms.last_mut().filter(|v| v.gen == self.gen && v.to.is_none()) {
+            v.to = Some(registry::now_rfc3339());
+        }
         if let Some(held) = self.held_miss.take() {
             if code == Some(1) && self.retry_possible() && !self.close_requested && self.finish.is_none() && self.ladder.is_none() && self.respawn_after_miss() {
                 return;
@@ -1380,6 +1906,36 @@ impl Pump {
         }
         if let Some(fin) = self.finish_after_child.take() {
             self.decide_finish(fin.0, fin.1);
+            return;
+        }
+        // A remote link's last events, ahead of the exit table (S8 §2): a start
+        // that failed (its code, its line), or one the host's EOF or a signal
+        // cancelled; a link lost past its budget; the wrapper's own detach.
+        let host_closed = self.ladder.map_or(self.host_eof_at.is_some() || self.host_gone, |l| l.host_initiated);
+        if let Some(f) = self.start_failure.take() {
+            let (exit_code, end) = match (f.cancelled, host_closed) {
+                (true, true) => (0, EndReason::EofTerm),
+                (true, false) => (143, EndReason::SigTerm),
+                (false, _) => (f.code, EndReason::SpawnFailed),
+            };
+            if !f.cancelled {
+                self.out.step = Some(f.step.name());
+            }
+            // A host that closed hears nothing; a signal or a failure ends with the line.
+            if !(f.cancelled && host_closed) {
+                self.final_line = f.line;
+            }
+            self.decide_finish(exit_code, end);
+            return;
+        }
+        if let Some(l) = self.link_loss.take() {
+            self.final_line = Some(l.line);
+            self.decide_finish(l.code, EndReason::LinkLost);
+            return;
+        }
+        if std::mem::take(&mut self.detached) {
+            let (exit_code, end) = if host_closed { (0, EndReason::EofKill) } else { (143, EndReason::SigTerm) };
+            self.decide_finish(exit_code, end);
             return;
         }
         let (exit_code, end) = match (code, signal, self.ladder) {
@@ -1398,10 +1954,24 @@ impl Pump {
 
     /// The seed retry: re-seed the scratch dir from the Mac's transcript and
     /// spawn generation 2 with the host state replayed. `false` when there
-    /// was nothing to seed from (the miss then propagates).
+    /// was nothing to seed from (the miss then propagates). A remote session
+    /// seeds nothing here: generation 2's pipeline uploads the Mac's
+    /// transcript to the VM first (`StartWhy::ResumeRetry`, §8) and respawns
+    /// on the same VM; its replay deadline starts at its `Started`. When
+    /// generation 1's upload found no Mac copy, there is nothing to upload
+    /// either: the miss propagates, as a local one with no source does.
     fn respawn_after_miss(&mut self) -> bool {
         self.retries += 1;
         let Some(resume) = self.plan.resume.clone() else { return false };
+        if self.kind == LinkKind::Remote {
+            if self.links.snapshot().and_then(|s| s.transcript) == Some(TranscriptOutcome::NoMacCopy.word()) {
+                tracing::warn!("resume miss for {resume}: no local transcript to upload");
+                self.audit("resume_seed_miss", &[("session_id", resume.clone()), ("reason", "no local transcript".to_string())]);
+                return false;
+            }
+            self.audit("resume_seed_retry", &[("session_id", resume.clone()), ("source", "put_transcript".to_string())]);
+            return self.respawn_and_replay(resume);
+        }
         let detail: Vec<(&str, String)> = match seed_from_mac(&self.sess, &self.plan, &resume, true) {
             SeedOutcome::Seeded(report) => vec![
                 ("session_id", resume.clone()),
@@ -1424,7 +1994,17 @@ impl Pump {
             }
         };
         self.audit("resume_seed_retry", &detail);
-        if !self.spawn_next() {
+        self.respawn_and_replay(resume)
+    }
+
+    /// Generation 2 for the resume miss of `resume`, the host state replayed
+    /// to it (`true` also when its start failed: the finish is decided). It
+    /// is told whether generation 1 answered the host's `initialize` (its
+    /// latency is recorded only then): while the host waits, a remote
+    /// retry's start keeps Cursor's window from T0.
+    fn respawn_and_replay(&mut self, resume: String) -> bool {
+        let init_answered = self.out.init_latency_ms.is_some();
+        if !self.spawn_next(StartWhy::ResumeRetry { session_id: resume, init_answered }) {
             return true;
         }
         self.out.respawns += 1;
@@ -1436,7 +2016,11 @@ impl Pump {
             self.forward(&line);
         }
         if self.state.replaying() {
-            self.replay_deadline = Some(Instant::now() + self.replay_deadline_len());
+            if self.starting {
+                self.replay_at_start = true;
+            } else {
+                self.replay_deadline = Some(Instant::now() + self.replay_deadline_len());
+            }
         }
         self.touch_registry();
         true
@@ -1484,10 +2068,16 @@ impl Pump {
                     tracing::info!("ladder: SIGKILL child");
                     self.signal_child(Sig::Kill);
                 } else if l.killed && now >= l.hard_stop && self.finish.is_none() {
-                    // Killed, yet its exit is still queued behind lines the host does not read.
-                    tracing::warn!("child killed but its exit was not observed; finishing");
+                    // Killed, yet its exit is still queued behind lines the host does not read
+                    // (or a remote start that never said how it ended: a cancelled start).
+                    tracing::warn!(starting = self.starting, "child killed but its exit was not observed; finishing");
                     let (code, end) = match self.finish_after_child.take() {
                         Some(f) => f,
+                        None if self.starting && l.host_initiated => (0, EndReason::EofTerm),
+                        None if self.starting => {
+                            self.final_line = Some(Failure::Stopped.line());
+                            (143, EndReason::SigTerm)
+                        }
                         None if l.host_initiated => (0, EndReason::EofKill),
                         None => (143, EndReason::SigTerm),
                     };
@@ -1539,35 +2129,65 @@ impl Pump {
         out.mirror_frames = self.mirror.appended_frames;
         out.mirror_rejected = self.mirror.rejected;
         out.synthetic_oauth = self.synthetic.as_ref().map(Synthetic::census);
+        if let Some(snap) = self.links.snapshot() {
+            // A remote session's S7 `credential:` part: where its token came from.
+            out.credential = snap.credential;
+            out.remote = snap.census_parts();
+        }
         out
     }
 
     fn write_end_row(&self, out: &Outcome) {
         let row = end_row(&self.sess.start_row, out, unix_now_ms());
         if let Err(e) = census::record(&self.sess.paths.census(), &row) {
-            eprintln!("ai-env-claude: census: {e}");
+            match self.kind {
+                LinkKind::Local => eprintln!("ai-env-claude: census: {e}"),
+                // A remote session's stderr ends with its one line: the log has this.
+                LinkKind::Remote => voice::warn(&format!("census: {e}")),
+            }
         }
+    }
+
+    /// The loop over this process's stdio and signals (`supervise_with`):
+    /// the host's stdin reader and stdout writer tasks, then the handlers of
+    /// SIGTERM, SIGINT, the drop-transport signal and, for a remote session,
+    /// SIGHUP, all before the first child (and so before the session's row
+    /// is first written). `early`: the handlers `run` installed already (a
+    /// remote session's, before P0). With them the loop first waits one turn
+    /// of the runtime's driver, which reads the signals: the current-thread
+    /// runtime would otherwise poll the loop and generation 1's task before
+    /// that turn. So a signal that came during P0 is the loop's first wake,
+    /// and generation 1's pending start never runs (no countdown, no `age`,
+    /// no WIP snapshot).
+    async fn supervise(&mut self, early: Option<std::io::Result<Signals>>) -> i32 {
+        let yield_first = early.is_some();
+        let (host_tx, host_rx) = mpsc::channel::<HostIn>(CHANNEL_CAP);
+        let (out_tx, out_rx) = mpsc::channel::<Bytes>(CHANNEL_CAP);
+        tokio::spawn(host_stdin_reader(host_tx));
+        let writer = tokio::spawn(host_stdout_writer(out_rx));
+        let signals = match early.unwrap_or_else(|| Signals::install(self.kind)) {
+            Ok(s) => s,
+            Err(e) => {
+                match self.kind {
+                    LinkKind::Local => eprintln!("ai-env-claude: cannot install signal handlers: {e}"),
+                    LinkKind::Remote => self.final_line = Some(Failure::Other { code: 1, step: StartStep::Precheck.name(), first_line: format!("cannot install signal handlers: {e}") }.line()),
+                }
+                return 1;
+            }
+        };
+        if yield_first {
+            // `yield_now` wakes this only after the driver's next turn: a signal from P0 is in `signals` by then.
+            tokio::task::yield_now().await;
+        }
+        self.supervise_with(HostIo { lines: host_rx, out: out_tx, writer, signals }).await
     }
 
     /// The loop. Returns the exit code once the finish is decided and the
     /// queued lines reached the host (or the flush deadline passed).
-    async fn supervise(&mut self) -> i32 {
-        let (host_tx, mut host_rx) = mpsc::channel::<HostIn>(CHANNEL_CAP);
-        let (out_tx, out_rx) = mpsc::channel::<Bytes>(CHANNEL_CAP);
-        tokio::spawn(host_stdin_reader(host_tx));
-        let writer = tokio::spawn(host_stdout_writer(out_rx));
-        let (mut sigterm, mut sigint) = match (
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
-        ) {
-            (Ok(t), Ok(i)) => (t, i),
-            (Err(e), _) | (_, Err(e)) => {
-                eprintln!("ai-env-claude: cannot install signal handlers: {e}");
-                return 1;
-            }
-        };
+    async fn supervise_with(&mut self, io: HostIo) -> i32 {
+        let HostIo { lines: mut host_rx, out: out_tx, writer, mut signals } = io;
         let out_tx = Some(out_tx);
-        self.spawn_next();
+        self.spawn_next(StartWhy::First);
         loop {
             let now = Instant::now();
             if self.child_done(now) {
@@ -1591,14 +2211,15 @@ impl Pump {
             let read_child = self.child_events.is_some() && (self.out_q.len() < 2 || self.child_exit.is_some() || self.ladder.is_some()) && self.delay_until.is_none();
             // Host lines during a replay queue behind the replayed ones (the CLI takes user
             // lines before it has answered initialize); an EOF is acted on at once. While
-            // finishing, host lines are read only to notice an EOF.
-            let read_host = self.host_open && (self.finish.is_some() || (self.child_input.is_some() && self.in_q.len() < 2));
+            // finishing, host lines are read only to notice an EOF. A pending remote start
+            // takes no input yet: the host is still read up to its caps, so its EOF is seen.
+            let starting_room = self.starting && self.in_q.len() < PENDING_IN_LINES && self.in_q.bytes < PENDING_IN_BYTES;
+            let read_host = self.host_open && (self.finish.is_some() || (self.child_input.is_some() && (self.in_q.len() < 2 || starting_room)));
             let write_out = !self.out_q.is_empty() && !self.host_gone;
             let write_in = !self.in_q.is_empty() && self.child_input.is_some();
             let wake = tokio::select! {
                 biased;
-                _ = sigterm.recv() => Wake::Signal,
-                _ = sigint.recv() => Wake::Signal,
+                s = signals.recv() => Wake::Signal(s),
                 () = tokio::time::sleep_until(deadline) => Wake::Deadline,
                 permit = reserve_opt(&out_tx), if write_out => match permit {
                     Some(p) => {
@@ -1622,7 +2243,8 @@ impl Pump {
                 item = host_rx.recv(), if read_host => Wake::Host(item),
             };
             match wake {
-                Wake::Signal => self.on_sigterm(),
+                Wake::Signal(HostSignal::Term) => self.on_sigterm(),
+                Wake::Signal(HostSignal::DropTransport) => self.on_drop_transport(),
                 Wake::Deadline => self.on_deadline(Instant::now()),
                 Wake::Sent => {}
                 Wake::HostOutClosed => {
@@ -1644,16 +2266,89 @@ impl Pump {
 
     fn on_host_gone(&mut self) {
         self.host_open = false;
+        let now = Instant::now();
+        self.close_at.get_or_insert(now);
         if self.child_alive() {
-            let now = Instant::now();
             self.close_requested = true;
             self.in_q.push_back(ChildInput::Eof);
-            self.start_ladder(Some(now + EOF_TERM_AFTER), now + EOF_KILL_AFTER, now + EOF_HARD_STOP, true);
+            self.eof_ladder(now);
         } else {
             self.close_requested = true;
             self.decide_finish(0, EndReason::HostGone);
             self.shorten_finish();
         }
+    }
+
+    /// After the supervisor: the token dropped, the mirror fsync'ed, the
+    /// scratch dir settled, every generation's `vms` entry ended, the
+    /// registry row closed and the census end row written (with `code`); the
+    /// outcome recorded.
+    fn conclude(&mut self, code: i32) -> Outcome {
+        // `process::exit` runs no destructor: the token, if one is still held, is zeroized here.
+        self.settle_credential(true, "the session ended");
+        if let Err(e) = self.mirror.sync_all() {
+            tracing::warn!("mirror fsync: {e}");
+        }
+        let mut out = self.snapshot_outcome();
+        out.code = Some(code);
+        out.end = self.finish.map(|f| f.1);
+        out.close_ms = self.close_at.map(|t| t.elapsed().as_millis() as u64);
+        let scratch = finish_scratch(&self.plan, self.registered, self.first_session_id.as_deref());
+        if let (Some(row), Some(dir)) = (&mut self.row, &scratch) {
+            row.scratch_dir = Some(dir.display().to_string());
+        }
+        // A generation whose exit never came (the hard stop with its link down) ends with the wrapper.
+        let now = registry::now_rfc3339();
+        for v in self.vms.iter_mut().filter(|v| v.to.is_none()) {
+            v.to = Some(now.clone());
+        }
+        self.close_row(Some(code));
+        if !self.ignored_sigterm_row {
+            self.write_end_row(&out);
+        }
+        self.audit_remote_end(&out);
+        tracing::info!(code, end = out.end.map_or("unknown", EndReason::name), "pump done");
+        out
+    }
+
+    /// `session_remote_end` (C6), after the end row, once a remote spawn ran
+    /// (a start that never did is `session_remote_failed`'s): the VM, the
+    /// spawn and its last stdout seq handed over (the row's), the
+    /// generation, the exit, how it closed. Ids and numbers only.
+    fn audit_remote_end(&self, out: &Outcome) {
+        if self.vms.is_empty() {
+            return;
+        }
+        let Some(snap) = self.links.snapshot() else { return };
+        let or_dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+        let detail = [
+            ("vm", or_dash(snap.vm)),
+            ("spawn", or_dash(snap.spawn.map(|s| s.to_string()))),
+            ("gen", self.gen.to_string()),
+            ("exit", or_dash(out.code.map(|c| c.to_string()))),
+            ("end", out.end.map_or("unknown", EndReason::name).to_string()),
+            ("close_ms", or_dash(out.close_ms.map(|ms| ms.to_string()))),
+            ("last_acked_seq", snap.last_acked_seq.to_string()),
+        ];
+        self.audit(audit_event::SESSION_REMOTE_END, &detail);
+    }
+
+    /// What is left of the hard stop, from now: the ladder's, else the one
+    /// of the close request (the host's EOF or its stdout gone, or a signal)
+    /// that came after the CLI had ended, else a remote EOF ladder's from
+    /// now. The remote link's close budget.
+    fn close_budget(&self) -> Duration {
+        let hard_stop = if self.host_eof_at.is_some() || self.host_gone { self.timings.eof_hard_stop } else { self.timings.sigterm_hard_stop };
+        let until = self.ladder.map(|l| l.hard_stop).or_else(|| self.close_at.map(|t| t + hard_stop)).unwrap_or_else(|| Instant::now() + self.timings.eof_hard_stop);
+        until.saturating_duration_since(Instant::now())
+    }
+
+    /// A remote session lets its link go before the close: its adapter then
+    /// stops waiting on the pump (its stdin ends, a running spawn is detached).
+    fn release_link(&mut self) {
+        self.child_events = None;
+        self.child_input = None;
+        self.child_signal = None;
     }
 }
 
@@ -2190,20 +2885,96 @@ fn exec_unpiped(sess: &Session) -> ! {
     std::process::exit(1)
 }
 
+/// A remote session that cannot reach its pump (S8 P0, fail closed): the
+/// census end row (`end:spawn_failed; step:precheck`, with the failure's
+/// code) and the audit row `session_remote_failed` are written, then the
+/// failure's one line is printed last (through the voice), and the wrapper
+/// exits with the failure's code. Nothing ran: no AWS call, no Touch ID.
+fn fail_before_pump(sess: &Session, failure: &Failure) -> ! {
+    let code = record_failure_before_pump(sess, failure);
+    voice::line(&failure.line());
+    std::process::exit(code)
+}
+
+/// What [`fail_before_pump`] records before its line (the census end row
+/// and the audit row); the exit code.
+fn record_failure_before_pump(sess: &Session, failure: &Failure) -> i32 {
+    let code = failure.exit_code();
+    let step = match failure {
+        Failure::Other { step, .. } => step,
+        _ => StartStep::Precheck.name(),
+    };
+    tracing::warn!(why = failure.word(), code, step, "the remote session failed before the pump started");
+    let out = Outcome { code: Some(code), end: Some(EndReason::SpawnFailed), step: Some(step), ..Outcome::default() };
+    if let Err(e) = census::record(&sess.paths.census(), &end_row(&sess.start_row, &out, unix_now_ms())) {
+        voice::warn(&format!("census: {e}"));
+    }
+    let detail = [("step", step.to_string()), ("code", code.to_string()), ("why", failure.word().to_string())];
+    if let Err(e) = audit::append(&sess.paths.audit(), &AuditRow::new(audit_event::SESSION_REMOTE_FAILED, None, audit::detail(&detail))) {
+        voice::warn(&format!("audit {}: {e}", audit_event::SESSION_REMOTE_FAILED));
+    }
+    code
+}
+
+/// What a remote session's pump could not get before it started: the
+/// `Failure` it fails closed with (exit 1, at the precheck).
+fn not_started(what: &str, e: &dyn std::fmt::Display) -> Failure {
+    Failure::Other { code: 1, step: StartStep::Precheck.name(), first_line: format!("{what}: {e}") }
+}
+
+/// A remote session's census start row, which `main` leaves to the pump (S8
+/// phase 4): written once the stop handlers listen, so a stop that comes
+/// after it always ends as a cancelled start with its end row, never by the
+/// default action. A failure is a warning in the log, as the end row's is.
+fn record_start_row(sess: &Session) {
+    if let Err(e) = census::record(&sess.paths.census(), &sess.start_row) {
+        voice::warn(&format!("census: {e}"));
+    }
+}
+
 /// Pipe `sess` through the pump and exit with the child's code. Never returns.
 ///
-/// Order: logging (the first production caller of `logging::init`; a
-/// failure is one stderr line, never fatal) → register
-/// `CLAUDE_CODE_OAUTH_TOKEN` as a secret → the child plan (on failure: one
-/// stderr line and S1's exec) → the runtime (before any Touch ID, so a
-/// runtime that cannot start never wastes one) → `local-scratch`: the
-/// scratch dir, the child's login ([`scratch_login`]: the sealed token, or
-/// one note line), the pre-spawn seed → the supervisor → mirror fsync →
-/// registry row closed → census end row → the lab message → exit.
+/// Order: the wrapper's voice → the runtime (before any Touch ID, so a
+/// runtime that cannot start never wastes one) → remote: the stop handlers
+/// (S8 phase 4: as early as the runtime allows) → logging (the first
+/// production caller of `logging::init`; a failure is one stderr line,
+/// never fatal) → remote: the census start row ([`record_start_row`]) →
+/// register `CLAUDE_CODE_OAUTH_TOKEN` as a secret → the child plan (on
+/// failure: one stderr line and S1's exec; a remote session fails closed
+/// instead) → the link factory (remote: P0, `remote::pipeline::precheck`,
+/// whose failure ends it before the pump) → `local-scratch`: the scratch
+/// dir, the child's login ([`scratch_login`]: the sealed token, or one note
+/// line), the pre-spawn seed → the supervisor on a `LocalSet` → mirror
+/// fsync → registry row closed → census end row → the link's close
+/// (remote: within what is left of the hard stop) → the lab message or the
+/// one final line → exit.
 pub fn run(sess: Session) -> ! {
+    // Only the wrapper pipes: its notes go to the log, its one final line to stderr.
+    voice::set(voice::Voice::Wrapper);
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) if sess.mode == Mode::Remote => {
+            record_start_row(&sess);
+            fail_before_pump(&sess, &not_started("cannot start the pump runtime", &e))
+        }
+        Err(e) => {
+            eprintln!("ai-env-claude: cannot start the pump runtime ({e}); running unpiped");
+            exec_unpiped(&sess)
+        }
+    };
+    // A remote session listens for a stop before anything else, its census start row included (S8 phase 4): a
+    // SIGTERM, SIGINT or SIGHUP during the setup below or P0 is the supervisor's first wake ([`Pump::supervise`]),
+    // a cancelled start (143, its line, the end row), never the default action.
+    let early = (sess.mode == Mode::Remote).then(|| {
+        let _rt = rt.enter();
+        Signals::install(LinkKind::Remote)
+    });
     let log_path = sess.paths.wrapper_log();
     if let Err(e) = logging::init(&LogOpts { path: log_path, rust_log: std::env::var("RUST_LOG").ok() }) {
         eprintln!("ai-env-claude: log: {e}");
+    }
+    if sess.mode == Mode::Remote {
+        record_start_row(&sess);
     }
     if let Some(token) = std::env::var_os(TOKEN_VAR) {
         redact::register_secret(&token.to_string_lossy());
@@ -2212,6 +2983,7 @@ pub fn run(sess: Session) -> ! {
     let mut fresh = || uuid::Uuid::now_v7().to_string();
     let plan = match child_plan(&sess, &env, &mut fresh) {
         Ok(p) => p,
+        Err(e) if sess.mode == Mode::Remote => fail_before_pump(&sess, &not_started("the session's pump cannot start", &e)),
         Err(e) => {
             eprintln!("ai-env-claude: pump unavailable ({e}); running unpiped");
             tracing::warn!("pump unavailable: {e}");
@@ -2219,12 +2991,12 @@ pub fn run(sess: Session) -> ! {
         }
     };
     tracing::info!(mode = sess.mode.name(), argc = plan.argv.len(), resume = plan.resume.is_some(), scratch = plan.scratch.is_some(), "piping the session");
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("ai-env-claude: cannot start the pump runtime ({e}); running unpiped");
-            exec_unpiped(&sess)
-        }
+    let links: Box<dyn LinkFactory> = match sess.mode {
+        Mode::Remote => match pipeline::precheck(&sess) {
+            Ok(session_plan) => Box::new(RemoteLinks::new(Rc::new(session_plan))),
+            Err(failure) => fail_before_pump(&sess, &failure),
+        },
+        _ => Box::new(LocalLinks::new(plan.clone())),
     };
     let mut login = None;
     if let Some(dir) = &plan.scratch {
@@ -2255,27 +3027,24 @@ pub fn run(sess: Session) -> ! {
         tracing::warn!("the child's projects subdirectory differs from the picker's slug of the cwd (CLAUDE_CODE_PROJECT_DIR_NAME?)");
     }
     tracing::info!("{}", plan.mirror.reason);
-    let mut pump = Pump::new(sess, plan, login);
-    let code = rt.block_on(pump.supervise());
-    // `process::exit` runs no destructor: the token, if one is still held, is zeroized here.
-    pump.settle_credential(true, "the session ended");
-    if let Err(e) = pump.mirror.sync_all() {
-        tracing::warn!("mirror fsync: {e}");
+    let mut pump = Pump::new(sess, plan, login, links);
+    // A remote generation's pipeline, session and adapter run as local tasks beside the supervisor.
+    let local = tokio::task::LocalSet::new();
+    let code = local.block_on(&rt, pump.supervise(early));
+    pump.conclude(code);
+    if pump.kind == LinkKind::Remote {
+        let budget = pump.close_budget();
+        pump.release_link();
+        let close = pump.links.close(budget);
+        local.block_on(&rt, async move {
+            let _ = tokio::time::timeout(budget, close).await;
+        });
     }
-    let mut out = pump.snapshot_outcome();
-    out.code = Some(code);
-    out.end = pump.finish.map(|f| f.1);
-    let scratch = finish_scratch(&pump.plan, pump.registered, pump.first_session_id.as_deref());
-    if let (Some(row), Some(dir)) = (&mut pump.row, &scratch) {
-        row.scratch_dir = Some(dir.display().to_string());
-    }
-    pump.close_row(Some(code));
-    if !pump.ignored_sigterm_row {
-        pump.write_end_row(&out);
-    }
-    tracing::info!(code, end = out.end.map_or("unknown", EndReason::name), "pump done");
     if let Some(msg) = pump.lab_message.take() {
         eprintln!("{msg}");
+    }
+    if let Some(line) = pump.final_line.take() {
+        voice::line(&line);
     }
     // Never drop the runtime: its blocking stdin reader would hold the exit.
     std::process::exit(code)
@@ -2332,6 +3101,12 @@ mod tests {
         move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())
     }
 
+    /// A pump over a local child plan, as `run` builds one.
+    fn local_pump(sess: Session, plan: ChildPlan, login: Option<ScratchLogin>) -> Pump {
+        let links = Box::new(LocalLinks::new(plan.clone()));
+        Pump::new(sess, plan, login, links)
+    }
+
     #[test]
     fn end_row_clones_the_start_row_and_extends_the_note() {
         let out = Outcome {
@@ -2348,6 +3123,11 @@ mod tests {
             session_id: None,
             credential: None,
             synthetic_oauth: None,
+            step: None,
+            remote: Vec::new(),
+            close_ms: None,
+            pid_rewrite: None,
+            init_id_refused: 0,
         };
         let row = end_row(&start_row(), &out, 9_000);
         assert_eq!((row.end, row.exit, row.pid, row.start), (Some(9_000), Some(3), 42, 1_000), "paired with the start row on (pid, start)");
@@ -2355,6 +3135,8 @@ mod tests {
             row.note.as_deref(),
             Some("mode:local-child; end:lab_exit; child_pid:77; respawns:1; mirror:2/1; dropped:0; oauth_refresh_answered:1; init_ms:120")
         );
+        let refused = end_row(&start_row(), &Outcome { init_id_refused: 2, step: Some("spawn"), ..out.clone() }, 9_000);
+        assert!(refused.note.unwrap().ends_with("; init_ms:120; init_id_refused:2; step:spawn"), "only when n > 0, before the remote parts");
         let mut bare = start_row();
         bare.note = None;
         let row = end_row(&bare, &Outcome { code: None, ..Outcome::default() }, 5);
@@ -2463,10 +3245,42 @@ mod tests {
             (EndReason::HostGone, "host_gone"),
             (EndReason::LabExit, "lab_exit"),
             (EndReason::SpawnFailed, "spawn_failed"),
+            (EndReason::LinkLost, "link_lost"),
+            (EndReason::CredentialRejected, "credential_rejected"),
         ];
         for (r, n) in all {
             assert_eq!(r.name(), n);
         }
+    }
+
+    /// The remote link's events reach a local pump as nothing but a log
+    /// line: its exit, its streams and its finish stay as they were.
+    #[test]
+    fn a_remote_links_events_change_nothing_on_a_local_child() {
+        use crate::bridge::remote::link::StartStep;
+        use crate::bridge::remote::Failure;
+        use crate::wire::frame::SpawnId;
+        let d = tempfile::tempdir().unwrap();
+        let sess = session(Mode::LocalChild, &["--output-format", "stream-json"], d.path());
+        let env = env_of(vec![("HOME", d.path().as_os_str().to_owned())]);
+        let plan = child_plan(&sess, &env, &mut || "x".to_string()).unwrap();
+        let mut pump = local_pump(sess, plan, None);
+        let events = [
+            ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 42, claude_version: None }),
+            ChildEvent::SpawnFailed(SpawnFailure::from_failure(StartStep::Spawn, &Failure::OldImage { vm: "microvm-1".into() }, None)),
+            ChildEvent::Lost(LinkLoss::from_failure(&Failure::LinkLost { vm: "microvm-1".into() })),
+            ChildEvent::Detached,
+            ChildEvent::Rejected { how: "text" },
+            ChildEvent::Link(false),
+            ChildEvent::Note("reattached".into()),
+        ];
+        let kinds: Vec<&str> = events.iter().map(ChildEvent::kind).collect();
+        assert_eq!(kinds, ["started", "spawn_failed", "lost", "detached", "rejected", "link", "note"]);
+        for ev in events {
+            pump.on_child_event(Some(ev));
+        }
+        assert!(pump.child_exit.is_none() && !pump.stdout_eof && !pump.stderr_eof && pump.finish.is_none() && pump.out_q.is_empty() && pump.in_q.is_empty());
+        assert_eq!(pump.out.end, None);
     }
 
     /// The end row carries how a scratch child logged in and the synthetic
@@ -2541,7 +3355,7 @@ mod tests {
         let odd = format!("odd-shape-scratch-{}", "Q8".repeat(12));
         let masked = |v: &str| !redact::scrub(&format!("x {v} y")).contains(v);
         let token = crate::bridge::setup_token::parse_token(&odd).unwrap_or_else(|f| panic!("{}", f.message));
-        let mut pump = Pump::new(sess, plan, Some(ScratchLogin::Sealed(ChildCredential { token, deliver: Deliver::Fd, tag: "seal".into() })));
+        let mut pump = local_pump(sess, plan, Some(ScratchLogin::Sealed(ChildCredential { token, deliver: Deliver::Fd, tag: "seal".into() })));
         assert!(masked(&odd), "masked while the wrapper holds it");
         pump.drop_credential("the test");
         assert!(pump.credential.is_none(), "the copy is gone");
@@ -2563,7 +3377,7 @@ mod tests {
             let plan = child_plan(&sess, &env, &mut || "fresh".to_string()).unwrap();
             assert!(plan.resume.is_some(), "a --resume, so a seed retry is possible");
             let token = crate::bridge::setup_token::parse_token(&format!("{}oat01-{}", "sk-ant-", "Gr9_".repeat(12))).unwrap_or_else(|f| panic!("{}", f.message));
-            let mut pump = Pump::new(sess, plan, Some(ScratchLogin::Sealed(ChildCredential { token, deliver: Deliver::Fd, tag: "seal".into() })));
+            let mut pump = local_pump(sess, plan, Some(ScratchLogin::Sealed(ChildCredential { token, deliver: Deliver::Fd, tag: "seal".into() })));
             pump.gen = 1;
             let now = Instant::now();
             pump.credential_hold_until = Some(now);
@@ -2835,5 +3649,1171 @@ mod tests {
         assert!(out == want.as_bytes(), "env delivery: {} bytes, expected {}", out.len(), want.len());
         let out = child_stdout(spawn_local(&plan, None).unwrap()).await;
         assert_eq!(out, b"fd=7\nenv=\n");
+    }
+
+    /// The wrapper's handlers by link kind: every piped mode answers
+    /// `registry::DROP_TRANSPORT_SIGNAL` (whose default would end the
+    /// wrapper), a remote session alone listens to SIGHUP, as a SIGTERM, and
+    /// a local one leaves SIGHUP as it found it. In a child run of this test
+    /// binary, its SIGHUP and SIGUSR2 at their defaults: tokio's handlers are
+    /// never removed, and in the library's test process they would swallow
+    /// the signals meant for `cargo test`.
+    #[test]
+    fn the_handlers_answer_drop_transport_everywhere_and_sighup_when_remote() {
+        use std::os::unix::process::CommandExt as _;
+        const TEST: &str = "bridge::pump::tests::the_handlers_answer_drop_transport_everywhere_and_sighup_when_remote";
+        // The child's mark: its parent's pid, which no exported value matches.
+        const PARENT: &str = "AI_ENV_TEST_PUMP_SIGNALS_PARENT";
+        if std::env::var(PARENT).ok() == Some(std::os::unix::process::parent_id().to_string()) {
+            return handlers_in_this_process();
+        }
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([TEST, "--exact", "--test-threads=1"]).env(PARENT, std::process::id().to_string()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // As from a terminal: a `nohup` above this run would hand SIGHUP down ignored.
+        // SAFETY: runs in the forked child before exec; signal(2) is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGHUP, libc::SIG_DFL);
+                libc::signal(registry::DROP_TRANSPORT_SIGNAL, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let child = {
+            // Held across the fork, as every fork of these tests holds it (`test_locks`).
+            let _fork = crate::test_locks::forking();
+            cmd.spawn().unwrap()
+        };
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A filter that matches nothing passes too: the count says it ran.
+        assert!(out.status.success() && stdout.contains("test result: ok. 1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The child's half: each signal raised is answered (a missing handler
+    /// would end this process, failing the parent's run).
+    fn handlers_in_this_process() {
+        // SAFETY: sigaction(2) with a null new action only reads into a zeroed (valid) struct.
+        let disposition = |sig: libc::c_int| unsafe {
+            let mut now: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(sig, std::ptr::null(), &raw mut now), 0);
+            now.sa_sigaction
+        };
+        let raise = |sig: libc::c_int| {
+            // SAFETY: raise(3) on this process, whose handler for `sig` tokio installed.
+            assert_eq!(unsafe { libc::raise(sig) }, 0);
+        };
+        let hup_before = disposition(libc::SIGHUP);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let local = Signals::install(LinkKind::Local).unwrap();
+            assert!(matches!(local, Signals::Os { hup: None, .. }), "a local session has no SIGHUP listener");
+            assert_eq!(disposition(libc::SIGHUP), hup_before, "a local session leaves SIGHUP as it found it");
+            assert_ne!(disposition(registry::DROP_TRANSPORT_SIGNAL), libc::SIG_DFL, "every piped mode answers the drop-transport signal");
+            drop(local);
+            let mut remote = Signals::install(LinkKind::Remote).unwrap();
+            raise(registry::DROP_TRANSPORT_SIGNAL);
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), remote.recv()).await.unwrap(), HostSignal::DropTransport);
+            if crate::bridge::signals::ignored(libc::SIGHUP) {
+                eprintln!("SIGHUP was ignored when this run started: it stays ignored");
+                return;
+            }
+            raise(libc::SIGHUP);
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), remote.recv()).await.unwrap(), HostSignal::Term, "a remote session's SIGHUP is a SIGTERM");
+        });
+    }
+
+    /// S8 W1, the link contract (plans/s8-design-tests.md §2.3): the pump
+    /// over a remote link played by hand, as `remote::link` builds one (the
+    /// first event `Started` or `SpawnFailed`; a `Sig::Term` cancelling a
+    /// pending start; `Detached` after the wrapper's own detach; `Lost`;
+    /// `Rejected`; `Link`), the host's stdio and signals in memory, on a
+    /// `LocalSet` as `run` drives it.
+    mod link_contract {
+        use super::*;
+        use crate::bridge::remote::link::RemoteSnapshot;
+        use crate::bridge::remote::CLOSE_BUDGET_MS;
+        use crate::wire::frame::SpawnId;
+        use serde_json::Value;
+        use std::cell::RefCell;
+
+        /// Every wait's bound (timing is asserted where it is the point).
+        const T: Duration = Duration::from_secs(5);
+        const INIT: &str = r#"{"type":"control_request","request_id":"i1","request":{"subtype":"initialize"}}"#;
+        const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+        fn on_local<F: std::future::Future>(f: F) -> F::Output {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            tokio::task::LocalSet::new().block_on(&rt, f)
+        }
+
+        /// The CLI's answer to request `id` (`body` its inner response).
+        fn answer(id: &str, body: &str) -> String {
+            format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{body}}}}}"#)
+        }
+
+        fn init_frame(sid: &str) -> String {
+            format!(r#"{{"type":"system","subtype":"init","session_id":"{sid}","cwd":"/w"}}"#)
+        }
+
+        fn user(n: u32) -> String {
+            format!(r#"{{"type":"user","uuid":"{n:08x}-0000-4000-8000-{n:012x}","message":{{"role":"user","content":"line {n}"}}}}"#)
+        }
+
+        fn result_for(n: u32) -> String {
+            format!(r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"{SID}","user_message_uuid":"{n:08x}-0000-4000-8000-{n:012x}"}}"#)
+        }
+
+        /// One generation's far end, as the hand factory started it.
+        struct Far {
+            gen: u32,
+            input: mpsc::Receiver<ChildInput>,
+            signal: mpsc::UnboundedReceiver<Sig>,
+            events: mpsc::Sender<ChildEvent>,
+        }
+
+        impl Far {
+            async fn send(&self, ev: ChildEvent) {
+                tokio::time::timeout(T, self.events.send(ev)).await.expect("the pump reads its link").expect("the link is open");
+            }
+
+            async fn line(&self, text: &str) {
+                self.send(ChildEvent::Line(Bytes::from(text.to_string()))).await;
+            }
+
+            async fn started(&self) {
+                self.send(ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 4000 + self.gen, claude_version: Some("2.1.296".into()) })).await;
+            }
+
+            async fn exit(&self, code: i32) {
+                for ev in [ChildEvent::StdoutEof, ChildEvent::StderrEof, ChildEvent::Exit(Some(ExitStatus::from_raw(code << 8)))] {
+                    self.send(ev).await;
+                }
+            }
+
+            /// The next input line (without its newline), `None` at its EOF.
+            async fn next_input(&mut self) -> Option<String> {
+                match tokio::time::timeout(T, self.input.recv()).await.expect("input within the bound") {
+                    Some(ChildInput::Line(b)) => Some(String::from_utf8_lossy(&b).trim_end().to_string()),
+                    Some(ChildInput::Eof) | None => None,
+                }
+            }
+
+            async fn next_signal(&mut self) -> Option<Sig> {
+                tokio::time::timeout(T, self.signal.recv()).await.expect("a signal within the bound")
+            }
+        }
+
+        /// What the hand factory saw, and the far ends it started.
+        #[derive(Default)]
+        struct Hand {
+            fars: VecDeque<Far>,
+            whys: Vec<StartWhy>,
+            results: u32,
+            drops: u32,
+            snap: RemoteSnapshot,
+        }
+
+        struct HandLinks(Rc<RefCell<Hand>>);
+
+        impl LinkFactory for HandLinks {
+            fn start(&mut self, gen: u32, req: StartReq<'_>) -> std::io::Result<ChildLink> {
+                assert!(req.credential.is_none(), "a remote start carries no token");
+                let (input, input_rx) = mpsc::channel(CHANNEL_CAP);
+                let (signal, signal_rx) = mpsc::unbounded_channel();
+                let (events_tx, events) = mpsc::channel(CHANNEL_CAP);
+                let mut hand = self.0.borrow_mut();
+                hand.whys.push(req.why);
+                hand.fars.push_back(Far { gen, input: input_rx, signal: signal_rx, events: events_tx });
+                Ok(ChildLink { pid: None, input, signal, events })
+            }
+
+            fn kind(&self) -> LinkKind {
+                LinkKind::Remote
+            }
+
+            fn timings(&self) -> CloseTimings {
+                CloseTimings::REMOTE
+            }
+
+            fn on_result(&mut self) {
+                self.0.borrow_mut().results += 1;
+            }
+
+            fn snapshot(&self) -> Option<RemoteSnapshot> {
+                Some(self.0.borrow().snap.clone())
+            }
+
+            fn drop_transport(&mut self) {
+                self.0.borrow_mut().drops += 1;
+            }
+        }
+
+        /// The host's side: its lines and signals into the pump, its stdout out.
+        struct Host {
+            lines: mpsc::Sender<HostIn>,
+            signals: mpsc::UnboundedSender<HostSignal>,
+            out: Rc<RefCell<Vec<Bytes>>>,
+        }
+
+        impl Host {
+            async fn send(&self, line: &str) {
+                tokio::time::timeout(T, self.lines.send(HostIn::Line(Bytes::from(line.to_string())))).await.expect("the pump reads the host").expect("the host channel is open");
+            }
+
+            async fn eof(&self) {
+                let _ = self.lines.send(HostIn::Eof).await;
+            }
+
+            fn signal(&self, s: HostSignal) {
+                let _ = self.signals.send(s);
+            }
+
+            /// Every line the host got, as written (with its newline).
+            fn raw(&self) -> Vec<Vec<u8>> {
+                self.out.borrow().iter().map(|b| b.to_vec()).collect()
+            }
+
+            fn json(&self) -> Vec<Value> {
+                self.out.borrow().iter().filter_map(|b| serde_json::from_slice(b).ok()).collect()
+            }
+
+            /// Wait until the host got a line `pred` accepts; that line.
+            async fn wait_for(&self, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+                let until = Instant::now() + T;
+                loop {
+                    if let Some(v) = self.json().into_iter().find(|v| pred(v)) {
+                        return v;
+                    }
+                    assert!(Instant::now() < until, "the host never got {what}: {:?}", self.json());
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        }
+
+        /// A remote session in `dir` (`extra` after the stream-json argv).
+        fn remote_session(dir: &Path, extra: &[&str]) -> Session {
+            let mut args: Vec<String> = ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json"].iter().map(|s| (*s).to_string()).collect();
+            args.extend(extra.iter().map(|s| (*s).to_string()));
+            let route = argv::classify(&args);
+            let Route::Remote(session) = route.clone() else { panic!("not a session: {route:?}") };
+            let mut row = start_row();
+            (row.route, row.reason, row.note, row.start) = ("remote".into(), "session".into(), Some("mode:remote".into()), unix_now_ms());
+            Session { real_binary: PathBuf::from("/bin/claude"), args, route, session, cwd: Some(dir.to_path_buf()), paths: Paths::from_root_and_env(dir.join("bridge"), None), cfg: None, mode: Mode::Remote, start_row: row }
+        }
+
+        /// A remote session in `dir` (`extra` after the stream-json argv),
+        /// its pump on the hand factory, its host, and the pump's host side.
+        fn remote_pump(dir: &Path, extra: &[&str]) -> (Pump, Rc<RefCell<Hand>>, Host, HostIo) {
+            let sess = remote_session(dir, extra);
+            let plan = child_plan(&sess, &env_of(vec![("HOME", dir.as_os_str().to_owned())]), &mut || "x".to_string()).unwrap();
+            let hand = Rc::new(RefCell::new(Hand::default()));
+            let pump = Pump::new(sess, plan, None, Box::new(HandLinks(Rc::clone(&hand))));
+            let (lines_tx, lines) = mpsc::channel(CHANNEL_CAP);
+            let (signals_tx, signals) = mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(CHANNEL_CAP);
+            let out = Rc::new(RefCell::new(Vec::new()));
+            let sink = Rc::clone(&out);
+            let writer = tokio::task::spawn_local(async move {
+                while let Some(b) = out_rx.recv().await {
+                    sink.borrow_mut().push(b);
+                }
+            });
+            (pump, hand, Host { lines: lines_tx, signals: signals_tx, out }, HostIo { lines, out: out_tx, writer, signals: Signals::Scripted(signals) })
+        }
+
+        fn supervise(mut pump: Pump, io: HostIo) -> tokio::task::JoinHandle<(i32, Pump)> {
+            tokio::task::spawn_local(async move {
+                let code = pump.supervise_with(io).await;
+                (code, pump)
+            })
+        }
+
+        async fn ended(task: tokio::task::JoinHandle<(i32, Pump)>) -> (i32, Pump) {
+            tokio::time::timeout(T, task).await.expect("the pump finished within the bound").expect("the pump task")
+        }
+
+        /// The generation the pump started next.
+        async fn far(hand: &Rc<RefCell<Hand>>) -> Far {
+            let until = Instant::now() + T;
+            loop {
+                if let Some(f) = hand.borrow_mut().fars.pop_front() {
+                    return f;
+                }
+                assert!(Instant::now() < until, "the pump started no generation");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// The census end row's note `conclude` wrote.
+        fn end_note(pump: &Pump) -> String {
+            let rows = census::read_rows(&pump.sess.paths.census(), None).unwrap();
+            rows.last().and_then(|r| r["note"].as_str()).unwrap_or_default().to_string()
+        }
+
+        fn registry_row(pump: &Pump, sid: &str) -> SessionRow {
+            registry::read(&pump.sess.paths, sid).unwrap().expect("the session's row")
+        }
+
+        /// The far end answers `initialize` (pid 4242) and starts the session `sid`.
+        async fn handshake(host: &Host, far: &mut Far, sid: &str) {
+            host.send(INIT).await;
+            assert_eq!(far.next_input().await.as_deref(), Some(INIT));
+            far.line(&answer("i1", r#"{"pid":4242}"#)).await;
+            far.line(&init_frame(sid)).await;
+            host.wait_for("the init", |v| v["type"] == "system").await;
+        }
+
+        /// M01, M02: a remote start that ends before `spawned` is
+        /// `SpawnFailed`, never `Exit(None)`: the wrapper exits with each
+        /// failure's own code, its line is the one it ends with, the census
+        /// ends `spawn_failed` naming the step, and the host gets nothing.
+        #[test]
+        fn a_refused_spawn_is_spawn_failed_not_exit_none() {
+            let cases = [
+                (StartStep::TouchId, Failure::TouchIdCancelled, 3),
+                (StartStep::TouchId, Failure::TouchIdTimeout { secs: 47 }, 5),
+                (StartStep::SelectVm, Failure::MaxConcurrent { running: 3 }, 9),
+                (StartStep::SelectVm, Failure::Select { code: 8, first_line: "microvm not found".into() }, 8),
+                (StartStep::Workspace, Failure::Finding { finding: "untracked .env: rule env-file-plaintext".into() }, 9),
+                (StartStep::Spawn, Failure::OldImage { vm: "microvm-1".into() }, 7),
+                (StartStep::Deadline, Failure::Deadline { code: 5, step: "touchid" }, 5),
+                (StartStep::Spawn, Failure::Other { code: 1, step: "spawn", first_line: "broken pipe".into() }, 1),
+            ];
+            for (step, failure, code) in cases {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    host.send(INIT).await;
+                    let far = far(&hand).await;
+                    far.send(ChildEvent::SpawnFailed(SpawnFailure::from_failure(step, &failure, Some("microvm-1".into())))).await;
+                    let (got, mut pump) = ended(task).await;
+                    assert_eq!((got, pump.finish.map(|f| f.1)), (code, Some(EndReason::SpawnFailed)), "{failure:?}");
+                    assert_eq!(pump.final_line.as_deref(), Some(failure.line().as_str()), "the failure's line");
+                    let out = pump.conclude(got);
+                    assert_eq!((out.code, out.step), (Some(code), Some(step.name())));
+                    let note = end_note(&pump);
+                    assert!(note.contains("end:spawn_failed") && note.contains(&format!("; step:{}", step.name())), "{note}");
+                    assert!(host.raw().is_empty(), "nothing reached the host");
+                });
+            }
+        }
+
+        /// M05: while the start is pending (a Touch ID, a cold boot) the host
+        /// is still read, past what the link's and the host's channels hold
+        /// (the local rule stops at two queued lines): the lines reach the
+        /// spawn in order, `initialize` first, once it started.
+        #[test]
+        fn a_slow_start_buffers_host_lines_in_order() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                let users: Vec<String> = (0..300).map(user).collect();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    host.send(INIT).await;
+                    for u in &users {
+                        host.send(u).await;
+                    }
+                })
+                .await
+                .expect("the host is read while the start is pending");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!task.is_finished());
+                far.started().await;
+                assert_eq!(far.next_input().await.as_deref(), Some(INIT), "initialize first");
+                for u in &users {
+                    assert_eq!(far.next_input().await.as_deref(), Some(u.as_str()));
+                }
+                host.eof().await;
+                assert_eq!(far.next_input().await, None, "the host's EOF after its lines");
+                far.exit(0).await;
+                let (code, pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofTerm)));
+            });
+        }
+
+        /// M06: a host EOF while the start is pending cancels it at once
+        /// (`Sig::Term` now, never at the EOF ladder's +0.8 s: the spawn
+        /// never goes out, a Touch ID dialog closes); the cancelled start
+        /// exits 0 with no line, within the close budget. A start that never
+        /// answers is ended by the remote hard stop (1.4 s), the same way.
+        #[test]
+        fn eof_before_the_start_resolves_sends_no_spawn_and_exits_within_budget() {
+            for answers in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    host.send(INIT).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let eof_at = Instant::now();
+                    host.eof().await;
+                    assert_eq!(far.next_signal().await, Some(Sig::Term), "answers {answers}");
+                    assert!(eof_at.elapsed() < Duration::from_millis(800), "the cancel waited {:?} (the EOF ladder's TERM rung)", eof_at.elapsed());
+                    if answers {
+                        far.send(ChildEvent::SpawnFailed(SpawnFailure::stopped(StartStep::TouchId, None))).await;
+                    }
+                    let (code, pump) = ended(task).await;
+                    let took = eof_at.elapsed();
+                    assert!(took < Duration::from_millis(CLOSE_BUDGET_MS), "EOF to the end took {took:?}");
+                    assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofTerm)), "answers {answers}");
+                    assert_eq!(pump.final_line, None, "a host that closed hears nothing");
+                    assert!(!host.raw().iter().any(|l| l.starts_with(b"{\"type\":\"control_response\"")), "no spawn answered anything");
+                });
+            }
+        }
+
+        /// M07: a SIGTERM while the start is pending cancels it at once (it
+        /// never waits for `spawned`): 143 within 1000 ms, the line saying
+        /// nothing was started; one that never answers is ended by the
+        /// SIGTERM hard stop (0.9 s), the same way.
+        #[test]
+        fn sigterm_before_the_start_resolves_cancels_it() {
+            for answers in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    let term_at = Instant::now();
+                    host.signal(HostSignal::Term);
+                    assert_eq!(far.next_signal().await, Some(Sig::Term));
+                    if answers {
+                        far.send(ChildEvent::SpawnFailed(SpawnFailure::stopped(StartStep::TouchId, None))).await;
+                    }
+                    let (code, pump) = ended(task).await;
+                    let took = term_at.elapsed();
+                    assert!(took < Duration::from_millis(1000), "SIGTERM to the end took {took:?}");
+                    assert_eq!((code, pump.finish.map(|f| f.1)), (143, Some(EndReason::SigTerm)), "answers {answers}");
+                    assert_eq!(pump.final_line.as_deref(), Some(Failure::Stopped.line().as_str()));
+                });
+            }
+        }
+
+        /// M08: a link that goes down is not an exit (the row says
+        /// `detached`, then `active` again); one lost past its budget ends
+        /// the wrapper with the loss's code and line (`end:link_lost`).
+        #[test]
+        fn a_lost_link_is_not_an_exit() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.send(&user(1)).await;
+                assert!(far.next_input().await.is_some());
+                far.send(ChildEvent::Link(false)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(!task.is_finished(), "a link down is no exit");
+                let status = |dir: &Path| registry::read(&Paths::from_root_and_env(dir.join("bridge"), None), SID).unwrap().map(|r| r.status);
+                assert_eq!(status(d.path()).as_deref(), Some("detached"));
+                far.send(ChildEvent::Link(true)).await;
+                far.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                assert_eq!(status(d.path()).as_deref(), Some("active"));
+                let loss = LinkLoss::from_failure(&Failure::LinkLost { vm: "microvm-1".into() });
+                far.send(ChildEvent::Lost(loss.clone())).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::LinkLost)));
+                assert_eq!(pump.final_line.as_deref(), Some(loss.line.as_str()));
+                pump.conclude(code);
+                assert!(end_note(&pump).contains("end:link_lost"));
+                assert_eq!(registry_row(&pump, SID).status, "closed");
+            });
+        }
+
+        /// With the link down at the host's EOF nothing comes back: the
+        /// remote ladder still sends `detach{final}` (`Sig::Kill`) at +1.2 s
+        /// and the hard stop ends the wrapper at +1.4 s, exit 0.
+        #[test]
+        fn with_the_link_down_at_eof_the_hard_stop_still_holds() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                far.send(ChildEvent::Link(false)).await;
+                let eof_at = Instant::now();
+                host.eof().await;
+                assert_eq!(far.next_input().await, None, "stdin_eof at once");
+                assert_eq!(far.next_signal().await, Some(Sig::Kill), "no TERM from the Mac after EOF");
+                let kill = eof_at.elapsed();
+                assert!(kill >= Duration::from_millis(1150) && kill < Duration::from_millis(CLOSE_BUDGET_MS), "detach at {kill:?}");
+                let (code, pump) = ended(task).await;
+                let took = eof_at.elapsed();
+                assert!(took < Duration::from_millis(CLOSE_BUDGET_MS), "EOF to the end took {took:?}");
+                assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofKill)));
+            });
+        }
+
+        /// The wrapper's own detach ends a started link: 0 after the host's
+        /// EOF (at the ladder's +1.2 s), 143 after a signal (at once, after
+        /// `Sig::Term`, which is `Signal(Term)` plus the detach); either close
+        /// is timed in the end row (`close_ms`, from the EOF or the signal).
+        #[test]
+        fn a_detached_link_ends_0_after_eof_and_143_after_a_signal() {
+            for eof in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    if eof {
+                        host.eof().await;
+                        assert_eq!(far.next_input().await, None);
+                        assert_eq!(far.next_signal().await, Some(Sig::Kill));
+                    } else {
+                        host.signal(HostSignal::Term);
+                        assert_eq!(far.next_signal().await, Some(Sig::Term));
+                    }
+                    far.send(ChildEvent::Detached).await;
+                    let (code, mut pump) = ended(task).await;
+                    let want = if eof { (0, EndReason::EofKill) } else { (143, EndReason::SigTerm) };
+                    assert_eq!((code, pump.finish.map(|f| f.1).unwrap()), want, "eof {eof}");
+                    assert_eq!(pump.final_line, None);
+                    let ms = pump.conclude(code).close_ms.expect("the close is timed");
+                    assert!(end_note(&pump).split("; ").any(|p| p == format!("close_ms:{ms}")), "eof {eof}: {}", end_note(&pump));
+                });
+            }
+        }
+
+        /// The CLI's own exit after the host's EOF (no TERM from the Mac,
+        /// L2) keeps its code: the remote EOF ladder signals nothing first.
+        #[test]
+        fn the_clis_own_exit_after_eof_keeps_its_code() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(far.signal.try_recv().is_err(), "no signal before +1.2 s");
+                far.exit(3).await;
+                let (code, pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (3, Some(EndReason::EofTerm)));
+            });
+        }
+
+        /// M28, the resume miss on the remote link: generation 1 reports the
+        /// CLI's miss and exits 1; generation 2 starts as the retry of that
+        /// session (its pipeline uploads the transcript first), the host's
+        /// state is replayed to it, its answer to the replayed `initialize`
+        /// reaches the host under the host's id with the wrapper's pid (and
+        /// times the session's `init_ms`), and the miss itself never reaches
+        /// the host.
+        #[test]
+        fn the_resume_miss_path_keeps_its_meaning_on_the_remote_link() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                let miss = format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No conversation found with session ID: {SID}"]}}"#);
+                gen1.line(&miss).await;
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::ResumeRetry { session_id: SID.to_string(), init_answered: false }], "the host still waits: the retry keeps Cursor's window");
+                gen2.started().await;
+                let replayed = gen2.next_input().await.expect("the replayed initialize");
+                let v: Value = serde_json::from_str(&replayed).unwrap();
+                assert_eq!(v["request"]["subtype"], "initialize");
+                let fresh = v["request_id"].as_str().unwrap().to_string();
+                assert_ne!(fresh, "i1", "replayed under a fresh id");
+                gen2.line(&answer(&fresh, r#"{"pid":4242}"#)).await;
+                gen2.line(&init_frame(SID)).await;
+                host.wait_for("the init", |v| v["type"] == "system").await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                let answers: Vec<Value> = host.json().into_iter().filter(|v| v["type"] == "control_response").collect();
+                assert_eq!(answers.len(), 1, "{answers:?}");
+                assert_eq!((answers[0]["response"]["request_id"].as_str(), answers[0]["response"]["response"]["pid"].as_u64()), (Some("i1"), Some(u64::from(std::process::id()))));
+                assert!(!host.json().iter().any(|v| v["type"] == "result"), "the miss never reached the host");
+                let out = pump.conclude(code);
+                assert_eq!(out.respawns, 1);
+                assert!(out.init_latency_ms.is_some(), "the retry's answer, the first the host got, is the session's init_ms");
+                assert!(end_note(&pump).split("; ").any(|p| p.starts_with("init_ms:")), "{}", end_note(&pump));
+                let audit = std::fs::read_to_string(pump.sess.paths.audit()).unwrap();
+                assert!(audit.contains("\"event\":\"resume_seed_retry\"") && audit.contains("\"source\":\"put_transcript\""), "{audit}");
+            });
+        }
+
+        /// S8 phase 4 (TIMING-3): a miss after generation 1 answered the
+        /// host's `initialize` (the CLI read a user line first) starts the
+        /// retry `init_answered`: Cursor's 60 s window is over, so its start
+        /// has a window of its own (`pipeline::deadline_of`); M28's miss
+        /// before the answer starts it unanswered.
+        #[test]
+        fn a_miss_after_the_answer_starts_the_retry_answered() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                gen1.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                host.wait_for("the initialize answer", |v| v["response"]["request_id"] == "i1").await;
+                gen1.line(&format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No conversation found with session ID: {SID}"]}}"#)).await;
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::ResumeRetry { session_id: SID.to_string(), init_answered: true }]);
+                gen2.started().await;
+                host.eof().await;
+                while gen2.next_input().await.is_some() {}
+                gen2.exit(0).await;
+                let (code, _) = ended(task).await;
+                assert_eq!(code, 0);
+            });
+        }
+
+        /// S8 phase 4 (RESUME-2): each generation's `vms` entry ends with its
+        /// child: generation 1's before the resume miss's retry moves the
+        /// session on (the retry's row write carries it closed), the
+        /// retry's at its own end, so the closed row's history ends both.
+        /// The host's user line before the miss lets the retry's init write
+        /// the row.
+        #[test]
+        fn each_generations_vms_entry_ends_with_it_across_a_retry() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                let paths = pump.sess.paths.clone();
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                host.send(&user(1)).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                assert!(gen1.next_input().await.is_some(), "the user line");
+                gen1.line(&format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No conversation found with session ID: {SID}"]}}"#)).await;
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                gen2.started().await;
+                let replayed: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert!(gen2.next_input().await.is_some_and(|l| l.contains("\"type\":\"user\"")), "the replayed user line");
+                gen2.line(&answer(replayed["request_id"].as_str().unwrap(), r#"{"pid":4242}"#)).await;
+                gen2.line(&init_frame(SID)).await;
+                host.wait_for("the init", |v| v["type"] == "system").await;
+                let ended_of = |vms: &[toml::Value]| vms.iter().map(|v| (v["gen"].as_integer(), v.get("to").is_some())).collect::<Vec<_>>();
+                let row = registry::read(&paths, SID).unwrap().expect("the session's row");
+                assert_eq!(ended_of(&row.vms), [(Some(1), true), (Some(2), false)], "generation 1 ended before the retry ran: {:?}", row.vms);
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                let row = registry_row(&pump, SID);
+                assert_eq!((row.status.as_str(), ended_of(&row.vms)), ("closed", vec![(Some(1), true), (Some(2), true)]), "{:?}", row.vms);
+            });
+        }
+
+        /// S8 phase 4 (RESUME-2, the hard stop): with the link down at the
+        /// host's EOF the generation's exit never comes; the wrapper's end
+        /// ends its `vms` entry, so the closed row records no generation as
+        /// still running.
+        #[test]
+        fn the_hard_stop_ends_the_generations_vms_entry() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.send(&user(1)).await;
+                assert!(far.next_input().await.is_some());
+                far.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                far.send(ChildEvent::Link(false)).await;
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                assert_eq!(far.next_signal().await, Some(Sig::Kill));
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofKill)));
+                pump.conclude(code);
+                let row = registry_row(&pump, SID);
+                assert_eq!((row.status.as_str(), row.vms.len()), ("closed", 1));
+                assert!(row.vms[0].get("to").is_some(), "{:?}", row.vms);
+            });
+        }
+
+        /// A spawn failure on the seed retry ends the wrapper `spawn_failed`
+        /// with that failure's code, line and step.
+        #[test]
+        fn a_spawn_failure_on_the_seed_retry_ends_spawn_failed() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                let task = supervise(pump, io);
+                let gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                gen1.line(&format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: {SID}"]}}"#)).await;
+                gen1.exit(1).await;
+                let gen2 = far(&hand).await;
+                let failure = Failure::Workspace { code: 9, first_line: "workspace refused (symlink_component): PUT /transcript".into() };
+                gen2.send(ChildEvent::SpawnFailed(SpawnFailure::from_failure(StartStep::Workspace, &failure, Some("microvm-1".into())))).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (9, Some(EndReason::SpawnFailed)));
+                assert_eq!(pump.final_line.as_deref(), Some(failure.line().as_str()));
+                pump.conclude(code);
+                let note = end_note(&pump);
+                assert!(note.contains("end:spawn_failed") && note.contains("; step:workspace") && note.contains("; respawns:1"), "{note}");
+            });
+        }
+
+        /// M03, M04: the forwarded answer to the host's `initialize` carries
+        /// the wrapper's pid; another answer that names a pid passes byte
+        /// for byte (`pid_rewrite:ok`), one naming it once too (the rewrite
+        /// would take that one: phase 4's mutation check); an `initialize`
+        /// answer whose pid is not found once passes as it came
+        /// (`pid_rewrite:failed`).
+        #[test]
+        fn only_the_initialize_answer_gets_the_wrappers_pid() {
+            for once in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    let status = r#"{"type":"control_request","request_id":"m1","request":{"subtype":"mcp_status"}}"#;
+                    let status2 = r#"{"type":"control_request","request_id":"m2","request":{"subtype":"mcp_status"}}"#;
+                    host.send(INIT).await;
+                    host.send(status).await;
+                    host.send(status2).await;
+                    assert_eq!(far.next_input().await.as_deref(), Some(INIT));
+                    assert_eq!(far.next_input().await.as_deref(), Some(status));
+                    assert_eq!(far.next_input().await.as_deref(), Some(status2));
+                    let other = answer("m1", r#"{"mcpServers":[{"name":"x","pid":4242}],"pid":4242}"#);
+                    far.line(&other).await;
+                    let lone = answer("m2", r#"{"pid":4242}"#);
+                    far.line(&lone).await;
+                    let init_body = if once { r#"{"commands":[],"pid":4242}"# } else { r#"{"commands":[{"pid":4242}],"pid":4242}"# };
+                    far.line(&answer("i1", init_body)).await;
+                    host.wait_for("the initialize answer", |v| v["response"]["request_id"] == "i1").await;
+                    host.eof().await;
+                    far.exit(0).await;
+                    let (code, mut pump) = ended(task).await;
+                    let raw = host.raw();
+                    assert_eq!(raw[0], format!("{other}\n").into_bytes(), "another answer passes byte for byte");
+                    assert_eq!(raw[1], format!("{lone}\n").into_bytes(), "one naming its pid once too: only initialize's is rewritten");
+                    let want = if once { answer("i1", &format!(r#"{{"commands":[],"pid":{}}}"#, std::process::id())) } else { answer("i1", init_body) };
+                    assert_eq!(String::from_utf8_lossy(&raw[2]), format!("{want}\n"));
+                    assert_eq!(pump.conclude(code).pid_rewrite, Some(if once { "ok" } else { "failed" }));
+                    assert!(end_note(&pump).ends_with(&format!("; pid_rewrite:{}", if once { "ok" } else { "failed" })));
+                });
+            }
+        }
+
+        /// The 2.1.296 fixture's `rate_limit_event` line reaches the host byte
+        /// for byte (the S7 B16 hand-off).
+        #[test]
+        fn a_rate_limit_event_line_passes_byte_identical() {
+            let line = include_str!("../../tests/fixtures/claude/valid-stream-json-2.1.296.jsonl").lines().find(|l| l.contains("rate_limit_event")).unwrap().to_string();
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                far.line(&line).await;
+                host.wait_for("the rate limit line", |v| v["type"] == "rate_limit_event").await;
+                host.eof().await;
+                far.exit(0).await;
+                ended(task).await;
+                assert!(host.raw().contains(&format!("{line}\n").into_bytes()));
+            });
+        }
+
+        /// S7 D6 on the remote link: AuthWatch's verdict stops the session
+        /// (`Sig::Term`: `Signal(Term)` plus the detach) and the wrapper
+        /// exits 5 with D6's line, `end:credential_rejected`, whatever the
+        /// link's end after it; the seal the VM's row names is recorded as
+        /// refused (the sealed file's when the row names none).
+        #[test]
+        fn a_rejected_token_stops_the_session_with_5_and_records_its_seal() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                let token_env = paths.setup_token_env();
+                std::fs::create_dir_all(token_env.parent().unwrap()).unwrap();
+                std::fs::write(&token_env, "a sealed text\n").unwrap();
+                let tag = crate::bridge::agent::credential::seal_tag(&token_env).unwrap();
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                far.send(ChildEvent::Rejected { how: "text" }).await;
+                assert_eq!(far.next_signal().await, Some(Sig::Term));
+                far.send(ChildEvent::Detached).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (5, Some(EndReason::CredentialRejected)));
+                assert_eq!(pump.final_line.as_deref(), Some(Failure::TokenRefused.line().as_str()));
+                let refused = crate::bridge::agent::credential::read_rejection(&paths, &tag).unwrap().expect("the seal is recorded as refused");
+                assert_eq!(refused.vm, "microvm-1");
+                pump.conclude(code);
+                assert!(end_note(&pump).contains("end:credential_rejected"));
+                assert_eq!(REJECTED_STATUS, Failure::TokenRefused.exit_code());
+            });
+        }
+
+        /// A remote session's registry row and census end row come from its
+        /// link: the VM, the spawn, the last stdout seq handed over, the
+        /// seeded head, one `vms` entry per generation; the census's remote
+        /// parts, `close_ms` before `link_drops`, `pid_rewrite`, and S7's
+        /// `credential` (the pipeline's delivery). A forwarded result asks
+        /// the link for a code-out; the drop-transport signal reaches the
+        /// link. The audit row `session_remote_end` follows the end row.
+        #[test]
+        fn the_row_and_the_census_of_a_remote_session_come_from_its_link() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let spawn = SpawnId::new_v7();
+                hand.borrow_mut().snap = RemoteSnapshot {
+                    vm: Some("microvm-1".into()),
+                    vm_how: Some("reused"),
+                    spawn: Some(spawn.clone()),
+                    last_acked_seq: 7,
+                    seeded_head: Some("a".repeat(40)),
+                    credential: Some("combined"),
+                    fetch_ok: 1,
+                    fetch_runs: 1,
+                    link_drops: 1,
+                    ..RemoteSnapshot::default()
+                };
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.send(&user(1)).await;
+                assert!(far.next_input().await.is_some());
+                far.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                assert_eq!(hand.borrow().results, 1, "a forwarded result asks for a code-out");
+                host.signal(HostSignal::DropTransport);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(hand.borrow().drops, 1);
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                let row = registry_row(&pump, SID);
+                assert_eq!((row.mode.as_str(), row.status.as_str(), row.child_pid), ("remote", "closed", None));
+                assert_eq!((row.microvm_id.as_deref(), row.spawn_id.clone(), row.last_acked_seq), (Some("microvm-1"), Some(spawn.to_string()), Some(7)));
+                assert_eq!(row.seeded_head, Some("a".repeat(40)));
+                assert_eq!(row.vms.len(), 1);
+                assert_eq!((row.vms[0]["gen"].as_integer(), row.vms[0]["vm"].as_str()), (Some(1), Some("microvm-1")));
+                assert!(row.vms[0].get("to").is_some(), "{:?}", row.vms);
+                assert_eq!(row.child_config_dir, Some(d.path().join(".claude").display().to_string()), "the VM's config dir: the Mac HOME's .claude");
+                let note = end_note(&pump);
+                for part in ["end:eof", "vm:microvm-1", "vm_how:reused", "fetch:1/1", "pid_rewrite:ok", "credential:combined"] {
+                    assert!(note.split("; ").any(|p| p == part), "{part} in {note}");
+                }
+                let close = note.find("; close_ms:").expect("close_ms");
+                assert!(close < note.find("; link_drops:1").expect("link_drops"), "close_ms before link_drops: {note}");
+                assert!(note.split("; ").any(|p| p.starts_with("init_ms:")), "{note}");
+                assert!(!note.contains(INIT_ID_REFUSED_PART), "no refusal, no part: {note}");
+                let audit = std::fs::read_to_string(pump.sess.paths.audit()).unwrap();
+                let ends: Vec<Value> = audit.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["event"] == "session_remote_end").collect();
+                assert_eq!(ends.len(), 1, "{audit}");
+                let (row, detail) = (&ends[0], &ends[0]["detail"]);
+                assert_eq!(row["session_id"], SID);
+                let spawn = spawn.to_string();
+                for (key, want) in [("vm", "microvm-1"), ("spawn", spawn.as_str()), ("gen", "1"), ("exit", "0"), ("end", "eof"), ("last_acked_seq", "7")] {
+                    assert_eq!(detail[key], want, "{key}: {detail}");
+                }
+                assert!(detail["close_ms"].as_str().is_some_and(|ms| ms.parse::<u64>().is_ok()), "{detail}");
+            });
+        }
+
+        /// A remote session mirrors the VM's frames into its own project only
+        /// (its cwd's slug): a frame naming another project of the Mac's (a
+        /// forgery the VM can print) is refused before anything is created
+        /// there, a subagent's `.meta.json` included, and counted
+        /// (`mirror:<appended>/<refused>`); its own frames append.
+        #[test]
+        fn a_remote_sessions_mirror_writes_its_own_project_only() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let slug = pump.plan.slug.clone().expect("the cwd's slug");
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                let projects = d.path().join(".claude").join("projects");
+                let frame = |project: &str, rel: &str, entry: &str| format!(r#"{{"type":"transcript_mirror","filePath":"{}","entries":[{entry}]}}"#, projects.join(project).join(rel).display());
+                let other = "-Users-someone-else-project";
+                far.line(&frame(other, &format!("{SID}.jsonl"), r#"{"type":"user","message":"injected by the VM"}"#)).await;
+                far.line(&frame(other, &format!("{SID}/subagents/agent-a1.jsonl"), r#"{"type":"agent_metadata","agentType":"x"}"#)).await;
+                far.line(&frame(&slug, &format!("{SID}.jsonl"), r#"{"type":"user","message":"the session's own"}"#)).await;
+                far.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                assert!(!projects.join(other).exists(), "nothing was created in another project");
+                assert_eq!(std::fs::read_to_string(projects.join(&slug).join(format!("{SID}.jsonl"))).unwrap(), "{\"type\":\"user\",\"message\":\"the session's own\"}\n");
+                assert!(end_note(&pump).split("; ").any(|p| p == "mirror:1/2"), "{}", end_note(&pump));
+                assert!(!host.json().iter().any(|v| v["type"] == "transcript_mirror"), "no mirror frame reached the host");
+            });
+        }
+
+        /// A remote CLI's `system/init` never chooses which of the Mac's
+        /// rows the wrapper writes: an id whose row is another session's is
+        /// not adopted (that row stays as it was; `init_id_refused:1`); the
+        /// session's own `--resume` id is, its row then this wrapper's.
+        #[test]
+        fn a_remote_init_never_takes_over_another_sessions_row() {
+            const OTHER: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+            for resumed in [false, true] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let resume = format!("--resume={OTHER}");
+                    let extra: Vec<&str> = if resumed { vec![resume.as_str()] } else { Vec::new() };
+                    let (pump, hand, host, io) = remote_pump(d.path(), &extra);
+                    let theirs = SessionRow { v: registry::REGISTRY_SCHEMA_V, session_id: OTHER.into(), cwd: Some("/Users/someone/other-workspace".into()), status: "closed".into(), mode: "remote".into(), pid: 1, microvm_id: Some("microvm-other".into()), ..SessionRow::default() };
+                    registry::write(&pump.sess.paths, &theirs).unwrap();
+                    hand.borrow_mut().snap.vm = Some("microvm-this".into());
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, OTHER).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    host.eof().await;
+                    assert_eq!(far.next_input().await, None);
+                    far.exit(0).await;
+                    let (code, mut pump) = ended(task).await;
+                    let out = pump.conclude(code);
+                    let row = registry_row(&pump, OTHER);
+                    let fields = (row.pid, row.cwd.clone(), row.microvm_id.clone(), row.status.clone());
+                    if resumed {
+                        assert_eq!(fields, (std::process::id(), Some(d.path().display().to_string()), Some("microvm-this".into()), "closed".into()), "the session's own --resume");
+                        assert_eq!(out.init_id_refused, 0);
+                    } else {
+                        assert_eq!(fields, (1, theirs.cwd.clone(), theirs.microvm_id.clone(), theirs.status.clone()), "another session's row is left as it was");
+                        assert_eq!((out.init_id_refused, out.session_id), (1, None));
+                        assert!(end_note(&pump).split("; ").any(|p| p == format!("{INIT_ID_REFUSED_PART}:1")), "{}", end_note(&pump));
+                    }
+                });
+            }
+        }
+
+        /// M05's caps: while the start is pending the host is read until
+        /// `PENDING_IN_LINES` lines wait in the pump (beside the link's and
+        /// the host's channels), then no more: the host's next send waits
+        /// until the start resolves, and every line reaches the spawn in order.
+        #[test]
+        fn a_pending_start_reads_the_host_up_to_its_caps() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                let total = PENDING_IN_LINES + 2 * CHANNEL_CAP + 8;
+                let lines: Vec<String> = (0..u32::try_from(total).unwrap()).map(user).collect();
+                let mut sent = 0;
+                while sent < total {
+                    // A send that waits a second is one the pump will not take while the start is pending.
+                    match tokio::time::timeout(Duration::from_secs(1), host.lines.send(HostIn::Line(Bytes::from(lines[sent].clone())))).await {
+                        Ok(r) => {
+                            r.expect("the host channel is open");
+                            sent += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                assert!((PENDING_IN_LINES..total).contains(&sent), "the pending start read {sent} of {total} lines: past two, up to its cap");
+                far.started().await;
+                let reader = tokio::task::spawn_local(async move {
+                    let mut got = Vec::new();
+                    while got.len() < total {
+                        got.push(far.next_input().await.expect("a line"));
+                    }
+                    (got, far)
+                });
+                for line in &lines[sent..] {
+                    host.send(line).await;
+                }
+                let (got, mut far) = tokio::time::timeout(T, reader).await.expect("every line within the bound").unwrap();
+                assert!(got == lines, "every line, in order");
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                far.exit(0).await;
+                let (code, pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofTerm)));
+            });
+        }
+
+        /// M15: a remote link that ends without its last event (the far end
+        /// gone, no exit, no loss said) fails closed: once started it is a
+        /// lost link (8, `end:link_lost`, the loss's line), while pending a
+        /// failed start (8, `end:spawn_failed`): never a CLI's exit 1.
+        #[test]
+        fn a_link_that_ends_without_its_last_event_is_lost_not_an_exit() {
+            for started in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    if started {
+                        far.started().await;
+                        handshake(&host, &mut far, SID).await;
+                    }
+                    drop(far);
+                    let (code, pump) = ended(task).await;
+                    let want = if started { EndReason::LinkLost } else { EndReason::SpawnFailed };
+                    assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(want)), "started {started}");
+                    assert_eq!(pump.final_line, Some(Failure::LinkLost { vm: "microvm-1".into() }.line()), "started {started}");
+                });
+            }
+        }
+
+        /// M23: the retry's replay deadline runs from its `Started`, never
+        /// while its start is pending (the transcript's upload, a cold boot):
+        /// with a 200 ms deadline (the lab knob) and the start pending 400
+        /// ms, the host's `initialize` fails only once generation 2 has run
+        /// 200 ms without answering the replay.
+        #[test]
+        fn the_retrys_replay_deadline_runs_from_its_started() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (mut pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                pump.knobs.replay_deadline = Some(Duration::from_millis(200));
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                gen1.line(&format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: {SID}"]}}"#)).await;
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                assert!(host.json().is_empty(), "nothing failed while the retry's start was pending: {:?}", host.json());
+                let started = Instant::now();
+                gen2.started().await;
+                assert!(gen2.next_input().await.is_some(), "the replayed initialize");
+                let failed = host.wait_for("the replay's timeout", |v| v["response"]["request_id"] == "i1").await;
+                assert_eq!(failed["response"]["subtype"], "error", "{failed}");
+                assert!(started.elapsed() >= Duration::from_millis(190), "the deadline ran from Started: {:?}", started.elapsed());
+                host.eof().await;
+                gen2.exit(0).await;
+                let (_, pump) = ended(task).await;
+                let audit = std::fs::read_to_string(pump.sess.paths.audit()).unwrap();
+                assert!(audit.contains("\"event\":\"replay_timeout\""), "{audit}");
+            });
+        }
+
+        /// L2's bound on the remote close (M03): what is left of the hard
+        /// stop, the ladder's, else that of the close request that came after
+        /// the CLI had ended (a host's EOF 1.4 s, a signal 0.9 s), else a
+        /// remote EOF ladder's from now.
+        #[test]
+        fn the_close_budget_is_what_is_left_of_the_hard_stop() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (mut pump, _hand, _host, _io) = remote_pump(d.path(), &[]);
+                let ms = |p: &Pump| p.close_budget().as_millis();
+                let ago = |d: u64| Some(Instant::now() - Duration::from_millis(d));
+                let budget = ms(&pump);
+                assert!((1300..=1400).contains(&budget), "nothing closed it yet: {budget}");
+                pump.close_at = ago(300);
+                let budget = ms(&pump);
+                assert!((500..=600).contains(&budget), "a signal 300 ms ago: {budget}");
+                pump.close_at = ago(1000);
+                pump.host_eof_at = pump.close_at;
+                let budget = ms(&pump);
+                assert!((300..=400).contains(&budget), "the host's EOF 1 s ago: {budget}");
+                pump.close_at = ago(2000);
+                assert_eq!(ms(&pump), 0, "past the hard stop");
+                let now = Instant::now();
+                pump.ladder = Some(Ladder { term_at: None, kill_at: now, hard_stop: now + Duration::from_millis(500), host_initiated: true, signalled: false, killed: false });
+                let budget = ms(&pump);
+                assert!((400..=500).contains(&budget), "the ladder's: {budget}");
+            });
+        }
+
+        /// A remote session's child plan: the VM's CLI runs with the Mac
+        /// HOME's `.claude` (Design A: the VM path its mirror frames name),
+        /// whose frames the writer mirrors into the Mac's projects dir (the
+        /// child is not local), its own project only; no scratch dir, no environment of the
+        /// wrapper's, the cwd's slug whatever `CLAUDE_CODE_PROJECT_DIR_NAME`
+        /// says, a `--resume` uuid kept; without HOME no plan (fail closed).
+        #[test]
+        fn a_remote_child_plan_mirrors_the_vms_frames_and_spawns_nothing_here() {
+            let d = tempfile::tempdir().unwrap();
+            let resume = format!("--resume={SID}");
+            let sess = remote_session(d.path(), &[&resume]);
+            let env = env_of(vec![("HOME", d.path().as_os_str().to_owned()), ("CLAUDE_CODE_PROJECT_DIR_NAME", OsString::from("custom-dir"))]);
+            let plan = child_plan(&sess, &env, &mut || "fresh".to_string()).unwrap();
+            assert_eq!(plan.child_config_dir, d.path().join(".claude"));
+            assert_eq!((plan.scratch.as_deref(), plan.resume.as_deref()), (None, Some(SID)));
+            assert!(plan.env_set.is_empty() && plan.env_remove.is_empty());
+            assert_eq!(plan.slug, slug::project_dir_name(d.path()).ok(), "the cwd's slug, no override");
+            assert!(plan.mirror.enabled, "{}", plan.mirror.reason);
+            assert_eq!(plan.mirror.project, plan.slug, "the writer is confined to the session's project");
+            let projects = d.path().join(".claude").join("projects");
+            assert_eq!((&plan.mirror.child_projects_root, &plan.mirror.dest_root), (&projects, &projects));
+            assert!(child_plan(&sess, &env_of(vec![]), &mut || "x".into()).is_err());
+        }
+
+        /// P0's failure, before the pump: the census end row
+        /// (`end:spawn_failed`, the failure's exit, its step) and the audit
+        /// row `session_remote_failed` with the failure's word; the wrapper's
+        /// exit is the failure's code.
+        #[test]
+        fn a_failure_before_the_pump_is_recorded_with_its_code_and_step() {
+            for (failure, code) in [
+                (Failure::NotGitRepo, 9),
+                (Failure::NoToken { why: "no setup-token is sealed".into() }, 5),
+                (Failure::Other { code: 1, step: "precheck", first_line: "the session's pump cannot start: HOME is not set".into() }, 1),
+            ] {
+                let d = tempfile::tempdir().unwrap();
+                let sess = remote_session(d.path(), &[]);
+                assert_eq!(record_failure_before_pump(&sess, &failure), code);
+                let rows = census::read_rows(&sess.paths.census(), None).unwrap();
+                assert_eq!((rows.len(), rows[0]["exit"].as_i64()), (1, Some(i64::from(code))));
+                let note = rows[0]["note"].as_str().unwrap_or_default();
+                assert!(note.starts_with("mode:remote; end:spawn_failed; child_pid:-") && note.ends_with("; step:precheck"), "{note}");
+                let audit = std::fs::read_to_string(sess.paths.audit()).unwrap();
+                assert!(audit.contains("\"event\":\"session_remote_failed\"") && audit.contains(&format!("\"why\":\"{}\"", failure.word())) && audit.contains(&format!("\"code\":\"{code}\"")), "{audit}");
+            }
+        }
     }
 }

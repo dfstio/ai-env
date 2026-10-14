@@ -1,8 +1,9 @@
 //! `<bridge root>/audit.jsonl`: one JSON line per audited event (plan §2.4:
-//! fsync per line). S2 writes `resume_seed_retry`, `resume_seed_miss`,
-//! `replay_timeout` and `oauth_refresh_answered`; S8/S10 and the operator
-//! CLI add theirs through the same writer, so every surface emits identical
-//! rows. Every string in a row passes `wire::redact::scrub`.
+//! fsync per line; the prewarm's row alone is not synced: [`append_unsynced`]).
+//! S2 writes `resume_seed_retry`, `resume_seed_miss`, `replay_timeout` and
+//! `oauth_refresh_answered`; S8/S10 and the operator CLI add theirs through
+//! the same writer, so every surface emits identical rows. Every string in
+//! a row passes `wire::redact::scrub`.
 use crate::bridge::census;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::logging::open_log_file;
@@ -58,6 +59,22 @@ pub fn detail(pairs: &[(&str, String)]) -> BTreeMap<String, String> {
 /// completed by a second write that could interleave with another writer);
 /// a row over [`MAX_AUDIT_ROW_BYTES`] is refused before the file is touched.
 pub fn append(path: &Path, row: &AuditRow) -> Result<(), BridgeError> {
+    write_row(path, row)?.sync_data()?;
+    Ok(())
+}
+
+/// [`append`] without its `sync_data` (`F_FULLFSYNC` on macOS: milliseconds,
+/// more on a busy disk), as the census writes its rows: only for the
+/// `prewarm` row, which `auth status` waits for (T1.2's 10 ms over a bare
+/// exec). A crash may lose it, as it may that run's census row, which
+/// names the same spawn.
+pub fn append_unsynced(path: &Path, row: &AuditRow) -> Result<(), BridgeError> {
+    write_row(path, row)?;
+    Ok(())
+}
+
+/// The one `write` of [`append`] and [`append_unsynced`]: the file, for the caller to sync or not.
+fn write_row(path: &Path, row: &AuditRow) -> Result<std::fs::File, BridgeError> {
     let mut line = serde_json::to_vec(row).map_err(|e| BridgeError::Config(format!("audit row: {e}")))?;
     line.push(b'\n');
     if line.len() > MAX_AUDIT_ROW_BYTES {
@@ -71,8 +88,7 @@ pub fn append(path: &Path, row: &AuditRow) -> Result<(), BridgeError> {
             format!("short audit write: {written} of {} bytes", line.len()),
         )));
     }
-    file.sync_data()?;
-    Ok(())
+    Ok(file)
 }
 
 /// Every parseable row (oldest first), or the last `last` of them; a missing
@@ -107,6 +123,25 @@ mod tests {
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(mode_of(path.parent().unwrap()), 0o700);
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
+
+    /// The prewarm's unsynced row is the synced one's line, in the same file
+    /// under the same rules.
+    #[test]
+    fn an_unsynced_row_is_the_same_line() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("root").join("audit.jsonl");
+        let row = AuditRow::new("prewarm", None, detail(&[("pid", "4242".into())]));
+        append_unsynced(&path, &row).unwrap();
+        append(&path, &row).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], lines[1]);
+        assert_eq!(serde_json::from_str::<AuditRow>(lines[0]).unwrap(), row);
+        assert_eq!((mode_of(&path), mode_of(path.parent().unwrap())), (0o600, 0o700));
+        assert!(append_unsynced(&path, &AuditRow::new("big", None, detail(&[("x", "y".repeat(MAX_AUDIT_ROW_BYTES))]))).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "an oversized row is refused before the file is touched");
     }
 
     #[test]

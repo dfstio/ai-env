@@ -10,6 +10,7 @@
 //! direction (`ack` / `stdin_ack`); nothing is ever dropped but stderr beyond
 //! its 2 MiB buffer (counted in `dropped`). Plan: S6 (D2, D3).
 use crate::wire::redact::Secret;
+use crate::wire::workspace::WorkspaceView;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -79,6 +80,17 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rule for later changes: anything the receiver must act on is gated by a cap;
 /// a field it may ignore is not.
 pub const CAP_CREDENTIAL_CACHE: &str = "credential_cache";
+
+/// The capability a shim names in `hello_ok.caps` and `/health` (S8, L5)
+/// when it serves the workspace routes (`wire::workspace`): `GET`/`PUT
+/// /seed` and `POST /codeout` on the code port, `GET`/`PUT /transcript` and
+/// `GET /settings` on the app port. The Mac sends a workspace request only
+/// to a shim that names it (an image-7.0 shim answers each with 404), and
+/// SELECT_VM never reuses a VM whose recorded caps lack it. Wire stays v1:
+/// caps are additive. A shim names it when it has a workspace helper to run
+/// (`ShimState::caps`: the image's binary); one without answers the routes
+/// with 404, as an older shim does.
+pub const CAP_WORKSPACE_V1: &str = "workspace_v1";
 
 /// Longest `credential.tag` (an opaque, non-secret seal id the Mac chooses:
 /// `[A-Za-z0-9-]`).
@@ -974,6 +986,11 @@ pub struct HealthDetail {
     /// The listeners past [`LISTENERS_MAX`], left out.
     #[serde(default)]
     pub listeners_omitted: u64,
+    /// The S8 workspace (one per VM): its seed record, the operation holding
+    /// it, the newest snapshot. Left out while the shim holds none (and by
+    /// any older shim), so a detail without it reads, and is written, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceView>,
 }
 
 #[cfg(test)]
@@ -1146,6 +1163,44 @@ mod tests {
         let json = serde_json::to_string(&alive).unwrap();
         assert!(json.ends_with(",\"frozen\":false,\"group_alive\":true}"), "{json}");
         assert_eq!(serde_json::from_str::<SpawnDetail>(&json).unwrap(), alive);
+    }
+
+    /// S8 (C1): the workspace capability is new beside S7's, and
+    /// `/health/detail`'s workspace is additive: a detail without it (an
+    /// older shim's, or one with no workspace yet) reads as `None` and is
+    /// written without it; one with it round-trips, the view last.
+    #[test]
+    fn the_workspace_cap_and_view_are_additive() {
+        assert_eq!(CAP_WORKSPACE_V1, "workspace_v1");
+        assert_ne!(CAP_WORKSPACE_V1, CAP_CREDENTIAL_CACHE);
+        let d: HealthDetail = serde_json::from_value(serde_json::json!({
+            "status": "ok", "shim_version": "0.1.0", "run_hook_seen": true, "uptime_s": 1, "caps": [CAP_CREDENTIAL_CACHE], "hook_source": "peer", "agent_guard": "on",
+            "refused_peers": {}, "hook_peers": {}, "sockets_open": 0, "sockets_authenticated": 0, "spawns": [], "has_credentials": false, "listeners": [],
+        }))
+        .unwrap();
+        assert_eq!(d.workspace, None, "an S7 detail");
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("workspace") && json.ends_with(",\"listeners_omitted\":0}"), "left out while none: {json}");
+        assert_eq!(serde_json::from_str::<HealthDetail>(&json).unwrap(), d);
+        let with = HealthDetail { workspace: Some(WorkspaceView { busy: Some("codeout".into()), helpers: 1, ..WorkspaceView::default() }), ..d };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.ends_with(",\"listeners_omitted\":0,\"workspace\":{\"busy\":\"codeout\",\"helpers\":1}}"), "{json}");
+        assert_eq!(serde_json::from_str::<HealthDetail>(&json).unwrap(), with);
+    }
+
+    /// S8 changes neither earlier golden conversation: both files are pinned
+    /// by their sha256 (public known-answers of the committed files, not
+    /// credentials), so a change to the S6 or S7 wire would show here.
+    #[test]
+    fn the_s6_and_s7_goldens_stay_byte_identical() {
+        use sha2::{Digest, Sha256};
+        let pinned: [(&str, &[u8], &str); 2] = [
+            ("exec-golden.jsonl", include_bytes!("../../tests/fixtures/wire/exec-golden.jsonl"), "bc13c39eca1b9979eff83aba3347a8a9bd9b658425084d3b933d3cc16468dfab"),
+            ("cred-golden.jsonl", include_bytes!("../../tests/fixtures/wire/cred-golden.jsonl"), "53dc8e29c4b27a354cc3927e0680159262ffd05670ef571caee856a1ab8e0ff6"),
+        ];
+        for (name, bytes, sha) in pinned {
+            assert_eq!(hex::encode(Sha256::digest(bytes)), sha, "{name} changed");
+        }
     }
 
     #[test]

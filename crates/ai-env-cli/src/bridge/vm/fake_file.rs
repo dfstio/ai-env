@@ -121,9 +121,56 @@ impl EndpointClient for FileFakeMicrovmApi {
         self.with(|s| s.get_health(endpoint, token, port_header))
     }
 
+    /// The state's answer, or, when it names the shim
+    /// (`FakeState::health_detail_at`), the call recorded under the lock and
+    /// the request sent to the shim outside it: the routed endpoint checks
+    /// the token against this same file.
     async fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &crate::wire::redact::Secret<String>) -> Result<crate::bridge::api::HealthDetailReply, BridgeError> {
-        self.with(|s| s.get_health_detail(endpoint, token, bearer))
+        let answered = self.with(|s| match s.health_detail_at {
+            Some(at) => s.health_detail_call(endpoint, token).map(|()| Err(at)),
+            None => s.get_health_detail(endpoint, token, bearer).map(Ok),
+        })?;
+        match answered {
+            Ok(reply) => Ok(reply),
+            Err(at) => detail_from_shim(at, endpoint, token, bearer).await,
+        }
     }
+}
+
+/// `GET /health/detail` through the routed fake endpoint at `at` (debug
+/// builds: `tls::lab_http_client`, plain http to a loopback address only),
+/// as `vm::health::HttpsEndpoint` sends it to the real one: the token's
+/// headers, the session bearer, `health::REQUEST_TIMEOUT`, the body capped
+/// at `health::MAX_DETAIL_BODY` and read by the same rules.
+#[cfg(debug_assertions)]
+async fn detail_from_shim(at: std::net::SocketAddr, endpoint: &str, token: &AuthToken, bearer: &crate::wire::redact::Secret<String>) -> Result<crate::bridge::api::HealthDetailReply, BridgeError> {
+    use crate::bridge::vm::health;
+    let host = crate::bridge::api::normalize_endpoint(endpoint)?;
+    let url = format!("http://{host}/health/detail");
+    let mut auth = reqwest::header::HeaderValue::from_str(token.value()?.expose()).map_err(|_| BridgeError::Sdk { op: "health_detail", message: "the endpoint token is not a valid header value".into() })?;
+    auth.set_sensitive(true);
+    let req = crate::bridge::tls::lab_http_client(at, &host)?
+        .get(&url)
+        .header("x-aws-proxy-auth", auth)
+        .header("x-aws-proxy-port", token.port.to_string())
+        .header(reqwest::header::AUTHORIZATION, health::bearer_header(bearer)?)
+        .timeout(health::REQUEST_TIMEOUT);
+    let mut resp = req.send().await.map_err(|e| health::transport_error_for("GET", "health_detail", &url, &e))?;
+    let (status, headers) = (resp.status().as_u16(), resp.headers().clone());
+    let (mut body, mut truncated) = (Vec::new(), false);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| health::transport_error_for("GET", "health_detail", &url, &e))? {
+        if health::keep_capped(&mut body, &chunk, health::MAX_DETAIL_BODY) {
+            truncated = true;
+            break;
+        }
+    }
+    health::detail_from_parts(status, &headers, &body, truncated)
+}
+
+/// Release builds have no lab client (and no fake API: its knob is debug only).
+#[cfg(not(debug_assertions))]
+async fn detail_from_shim(_at: std::net::SocketAddr, _endpoint: &str, _token: &AuthToken, _bearer: &crate::wire::redact::Secret<String>) -> Result<crate::bridge::api::HealthDetailReply, BridgeError> {
+    Err(BridgeError::Config("the fake API's health_detail_at needs a debug build".into()))
 }
 
 #[cfg(test)]

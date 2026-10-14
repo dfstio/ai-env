@@ -14,8 +14,9 @@
 //!   `--claude`, else the child PATH), start as `--uid`/`--gid` (when root)
 //!   with a cleared environment (`HOME`, `PATH=/usr/local/bin:/usr/bin:/bin`,
 //!   `CLAUDE_CONFIG_DIR=<home>/.claude`, `DISABLE_AUTOUPDATER=1`, then the
-//!   frame's env), piped stdio, and in `pre_exec` (async-signal-safe, nothing
-//!   allocated after the fork): `setsid`, `PR_SET_NO_NEW_PRIVS` (Linux), the
+//!   frame's env), piped stdio, and in `pre_exec` (`childproc`, shared with
+//!   the workspace helper; async-signal-safe, nothing allocated after the
+//!   fork): `setsid`, `PR_SET_NO_NEW_PRIVS` (Linux), the
 //!   working directory — created (missing components, mode 0700) and entered
 //!   AS THE AGENT, after std's setuid, from paths prepared before the fork;
 //!   `current_dir` is never set, and no root filesystem operation ever touches
@@ -65,7 +66,14 @@
 //!   every remaining agent-uid process (a setsid escaper) is killed through a
 //!   pidfd after re-checking its uid; `/proc` is scanned again until a scan
 //!   finds none (at most five scans), so what an escaper forked during a
-//!   pass dies in the next.
+//!   pass dies in the next. A workspace helper (S8, `asagent`) is counted
+//!   under the same lock before it is forked ([`SpawnManager::hold_helper`]):
+//!   no sweep runs while one lives, the last one to go runs a sweep it held
+//!   off, and both stops signal its group too. Helpers are not spawns: they
+//!   never count toward [`MAX_SPAWNS`].
+//! - **working directory** (S8): a spawn's `cwd` is a VM path; with the
+//!   shim's `--fs-root` (native tests) it is entered under that prefix, as
+//!   every VM path is.
 //!
 //! Group signals: a group is signalled only while its leader is UNREAPED.
 //! The leader's death is observed with `waitid(WNOWAIT)`, the group ladder
@@ -76,6 +84,7 @@
 //! record with its spawn id AND its pid.
 //!
 //! Native macOS runs skip the uid drop and NO_NEW_PRIVS and keep setsid and killpg.
+use crate::shim::childproc::{child_setup, cwd_parts, fd_walk_end, CWD_ERRNO_BASE};
 use crate::shim::replay::{Cursor, ErrBuffer, ExitRecord, OutWindow, StdinQueue};
 use crate::shim::sys::SysOps;
 use crate::wire::chunk::Chunker;
@@ -86,7 +95,6 @@ use crate::wire::frame::{
     ARGV_MAX_BYTES, CHUNK_MAX, DETACH_GRACE_EXEC_S, ENV_MAX_ENTRIES, GROUP_KILL_AFTER, LADDER_KILL_AFTER, LADDER_TERM_AFTER, MAX_SPAWNS, STDERR_BUFFER_BYTES, STDIN_WINDOW_BYTES, STDOUT_WINDOW_CHUNKS,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -122,6 +130,10 @@ pub struct SpawnOpts {
     pub window_bytes: u64,
     /// Kill leftover agent-uid processes when the last spawn ends (Linux, root).
     pub sweep: bool,
+    /// The shim's `--fs-root` (native tests, S8): a spawn's working directory
+    /// is a VM path, entered under this prefix as every other VM path is
+    /// (`ShimState::at`); the default (`home`) is the shim's own path already.
+    pub fs_root: Option<PathBuf>,
 }
 
 /// A `spawn` frame's fields. `Debug` is written by hand: the id, argv[0] and
@@ -177,8 +189,6 @@ impl std::fmt::Debug for SpawnRequest {
 const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// Names the shim sets itself.
 const RESERVED_ENV: [&str; 3] = ["HOME", "PATH", "CLAUDE_CONFIG_DIR"];
-/// Longest working directory (PATH_MAX).
-const CWD_MAX_BYTES: usize = 4096;
 /// Largest secret delivered on fd 3: it is written into the pipe before the
 /// child exists, so it must fit the pipe buffer (≥ 16 KiB everywhere).
 pub(crate) const SECRET_FD_MAX_BYTES: usize = 4096;
@@ -205,11 +215,6 @@ const USED_IDS_MAX: usize = 16_384;
 /// monotonic clock leapt at resume) extends every running grace by the excess.
 const TICK: Duration = Duration::from_secs(1);
 const JUMP: Duration = Duration::from_secs(10);
-/// `pre_exec` reports a working-directory failure as `CWD_ERRNO_BASE + errno`
-/// (std passes only an errno from the child), so it is told from an exec failure.
-const CWD_ERRNO_BASE: i32 = 1 << 20;
-/// The child's fallback close-on-exec walk (no `close_range`) stops here.
-const FD_WALK_MAX: u64 = 4096;
 /// The idle sweep scans `/proc` until a scan finds nothing, at most this
 /// often (a process forked between a scan and its parent's kill is in the
 /// next scan) ...
@@ -419,11 +424,23 @@ struct State {
     stopping: bool,
     /// Between `/suspend` and `/resume`: new graces start frozen.
     frozen: bool,
+    /// The workspace helpers running now (S8), by hold, with the process
+    /// group of each once it was forked and until it is about to be reaped
+    /// ([`HelperHold`]): a group is signalled only while its leader is unreaped.
+    helpers: BTreeMap<u64, Option<u32>>,
+    next_helper: u64,
+    /// An idle sweep was held off by a helper: the last hold to go runs it.
+    sweep_due: bool,
 }
 
 impl State {
     fn live(&self) -> usize {
         self.spawns.values().filter(|s| s.leader.is_none()).count()
+    }
+
+    /// The groups of the helpers running now.
+    fn helper_groups(&self) -> Vec<u32> {
+        self.helpers.values().filter_map(|g| *g).collect()
     }
 
     /// After any change to `id`: assign its exit once the leader died and both
@@ -641,12 +658,23 @@ impl Inner {
     }
 
     /// After the last leader died: kill every leftover agent-uid process, under
-    /// the spawn lock, if still nothing runs.
+    /// the spawn lock, if still nothing runs: no spawn and no workspace
+    /// helper (S8; a helper is the agent's too, and its git with it). A sweep
+    /// a helper held off is due once the last helper is gone.
     async fn sweep_if_idle(&self) {
         let _held = self.spawn_lock.lock().await;
         let uid = self.opts.agent_uid;
-        if self.lock().live() != 0 || uid == 0 {
-            return;
+        {
+            let mut st = self.lock();
+            if st.live() != 0 || uid == 0 {
+                return;
+            }
+            if !st.helpers.is_empty() {
+                st.sweep_due = true;
+                log(&format!("ai-env: idle sweep held off: {} workspace helper(s) running", st.helpers.len()));
+                return;
+            }
+            st.sweep_due = false;
         }
         // /proc reads and the pauses between scans block: off the runtime's workers.
         let (killed, scans) = tokio::task::spawn_blocking(move || sweep(uid)).await.unwrap_or_default();
@@ -795,7 +823,7 @@ impl SpawnManager {
         }
         let cwd_text = short(&req.cwd.clone().unwrap_or_else(|| opts.home.to_string_lossy().into_owned()));
         let cwd = match &req.cwd {
-            Some(c) => cwd_parts(c.as_bytes()),
+            Some(c) => vm_cwd_parts(opts.fs_root.as_deref(), c),
             None => cwd_parts(opts.home.as_os_str().as_bytes()),
         }
         .map_err(|m| (SpawnErrCode::Cwd, format!("working directory \"{cwd_text}\": {m}")))?;
@@ -1172,6 +1200,29 @@ impl SpawnManager {
         self.inner.lock().live()
     }
 
+    /// Count one workspace helper (S8 §6, `asagent`) before it is forked,
+    /// under the lock the idle sweep holds, so a sweep never runs while a
+    /// helper lives and a helper is never forked into a sweep. `None` once
+    /// the shim is stopping, unless `during_stop`. Helpers do not count
+    /// toward [`MAX_SPAWNS`].
+    pub async fn hold_helper(&self, during_stop: bool) -> Option<HelperHold> {
+        let _held = self.inner.spawn_lock.lock().await;
+        let mut st = self.inner.lock();
+        if st.stopping && !during_stop {
+            return None;
+        }
+        st.next_helper += 1;
+        let id = st.next_helper;
+        st.helpers.insert(id, None);
+        Some(HelperHold { inner: self.inner.clone(), id })
+    }
+
+    /// Workspace helpers running now (`/health/detail`'s workspace view).
+    #[must_use]
+    pub fn helpers(&self) -> usize {
+        self.inner.lock().helpers.len()
+    }
+
     /// The stop ladder (the shim exits next): TERM every group, at most 3 s
     /// for the leaders, then KILL every group still pinned — an exited
     /// leader's too, whose watcher would not see its 1 s out — at most 1 s.
@@ -1192,7 +1243,7 @@ impl SpawnManager {
     /// `kill_pinned` every group an exited leader still pins; at most
     /// [`SHUTDOWN_KILL_WAIT`]. Outboxes never wake again.
     async fn end_all(&self, why: &str, term_wait: Duration, kill_pinned: bool) {
-        let terms = {
+        let (terms, helpers) = {
             let _held = self.inner.spawn_lock.lock().await;
             let mut st = self.inner.lock();
             st.stopping = true;
@@ -1200,15 +1251,23 @@ impl SpawnManager {
             for s in &live {
                 s.signal_group(libc::SIGTERM);
             }
-            live.len()
+            // The workspace helpers too (S8): each one's owner reaps it.
+            let helpers = st.helper_groups();
+            for g in &helpers {
+                killpg(*g, libc::SIGTERM);
+            }
+            (live.len(), helpers.len())
         };
-        log(&format!("ai-env: spawns stopping ({why}): TERM to {terms} group(s)"));
+        log(&format!("ai-env: spawns stopping ({why}): TERM to {terms} group(s) and {helpers} workspace helper(s)"));
         self.wait_idle(term_wait).await;
         let kills = {
             let st = self.inner.lock();
             let due: Vec<&Spawn> = st.spawns.values().filter(|s| !s.reaped && (kill_pinned || s.leader.is_none())).collect();
             for s in &due {
                 s.signal_group(libc::SIGKILL);
+            }
+            for g in st.helper_groups() {
+                killpg(g, libc::SIGKILL);
             }
             due.len()
         };
@@ -1219,11 +1278,58 @@ impl SpawnManager {
         self.inner.bump();
     }
 
-    /// Until no leader runs, or `limit`.
+    /// Until no leader runs and no workspace helper's group is left to
+    /// signal (each one's owner reaps it), or `limit`.
     async fn wait_idle(&self, limit: Duration) {
         let until = Instant::now() + limit;
-        while self.live() > 0 && Instant::now() < until {
+        let busy = || {
+            let st = self.inner.lock();
+            st.live() > 0 || st.helpers.values().any(Option::is_some)
+        };
+        while busy() && Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// One workspace helper counted by [`SpawnManager::hold_helper`]: the idle
+/// sweep waits while it exists, and a stop signals its process group once
+/// [`HelperHold::set_group`] named it. Its owner clears the group
+/// ([`HelperHold::clear_group`]) before it reaps the leader, so no stop ever
+/// signals a reused group id. Dropping it runs a sweep a helper held off.
+pub struct HelperHold {
+    inner: Arc<Inner>,
+    id: u64,
+}
+
+impl HelperHold {
+    /// The helper was forked: its group (its pid) may be signalled by a stop.
+    pub fn set_group(&self, pgid: u32) {
+        if let Some(g) = self.inner.lock().helpers.get_mut(&self.id) {
+            *g = Some(pgid);
+        }
+    }
+
+    /// The helper's leader is about to be reaped: no stop signals it from here.
+    pub fn clear_group(&self) {
+        if let Some(g) = self.inner.lock().helpers.get_mut(&self.id) {
+            *g = None;
+        }
+    }
+}
+
+impl Drop for HelperHold {
+    fn drop(&mut self) {
+        let sweep = {
+            let mut st = self.inner.lock();
+            st.helpers.remove(&self.id);
+            st.sweep_due && st.helpers.is_empty() && st.live() == 0 && !st.stopping
+        };
+        if sweep && self.inner.opts.sweep {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let inner = self.inner.clone();
+                rt.spawn(async move { inner.sweep_if_idle().await });
+            }
         }
     }
 }
@@ -1455,8 +1561,8 @@ fn short(text: &str) -> String {
     quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"')).unwrap_or(&quoted).to_string()
 }
 
-/// killpg for a group id this module got from a spawn (never 0 or 1).
-fn killpg(pgid: u32, sig: i32) {
+/// killpg for a group id this module got from a spawn or a helper (never 0 or 1).
+pub(crate) fn killpg(pgid: u32, sig: i32) {
     if let Ok(pgid) = libc::pid_t::try_from(pgid) {
         if pgid > 1 {
             // SAFETY: plain integers; the caller holds the leader unreaped, so the id is still its group.
@@ -1484,7 +1590,7 @@ fn group_alive(pgid: u32) -> bool {
 
 /// Block until the leader `pid` has exited, WITHOUT reaping it: `None` when
 /// it cannot be waited for (reaped by someone else: the group is not pinned).
-fn wait_exited(pid: libc::pid_t) -> Option<ExitInfo> {
+pub(crate) fn wait_exited(pid: libc::pid_t) -> Option<ExitInfo> {
     let id = libc::id_t::try_from(pid).ok()?;
     loop {
         // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill.
@@ -1510,121 +1616,6 @@ fn exit_info(info: &libc::siginfo_t) -> ExitInfo {
         libc::CLD_KILLED | libc::CLD_DUMPED => ExitInfo { code: None, signal: Some(status) },
         _ => ExitInfo { code: None, signal: None },
     }
-}
-
-/// The child between fork and exec, after std applied the stdio and the
-/// uid/gid: only async-signal-safe calls on data prepared before the fork
-/// (nothing is allocated). setsid; NO_NEW_PRIVS (Linux); the working
-/// directory, each missing component made 0700 and entered AS THE AGENT;
-/// every fd from 3 marked close-on-exec (what the shim opens already is:
-/// this catches anything it inherited); the secret's pipe on fd 3.
-fn child_setup(cwd: &[CString], secret_fd: Option<libc::c_int>, fd_walk: libc::c_int) -> io::Result<()> {
-    // SAFETY: plain syscalls on integers and on NUL-terminated strings the closure owns.
-    unsafe {
-        if libc::setsid() == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let (one, zero): (libc::c_ulong, libc::c_ulong) = (1, 0);
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        default_dispositions();
-        enter_cwd(cwd)?;
-        cloexec_from_3(fd_walk);
-        if let Some(fd) = secret_fd {
-            // dup2 gives fd 3 without close-on-exec; a pipe already on 3 just loses the flag.
-            let rc = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
-            if rc == -1 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The highest signal number to reset (Linux: the realtime range included).
-const LAST_SIGNAL: libc::c_int = if cfg!(target_os = "linux") { 64 } else { 31 };
-
-/// Every signal the shim had ignored back to its default action: an ignored
-/// disposition survives exec (std resets only SIGPIPE and the mask), and an
-/// agent process must not start with SIGINT or SIGTERM ignored because of how
-/// the shim itself was started.
-///
-/// # Safety
-/// Async-signal-safe; call only in the forked child.
-unsafe fn default_dispositions() {
-    for sig in 1..=LAST_SIGNAL {
-        if sig == libc::SIGKILL || sig == libc::SIGSTOP {
-            continue;
-        }
-        let mut old: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            dfl.sa_sigaction = libc::SIG_DFL;
-            libc::sigaction(sig, &dfl, std::ptr::null_mut());
-        }
-    }
-}
-
-/// `chdir("/")`, then into each component, made (0700) when missing: as the
-/// agent, so nothing here can touch what the agent may not.
-///
-/// # Safety
-/// Async-signal-safe; call only in the forked child.
-unsafe fn enter_cwd(parts: &[CString]) -> io::Result<()> {
-    let errno = || io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    let fail = |e: i32| Err(io::Error::from_raw_os_error(CWD_ERRNO_BASE + e));
-    if libc::chdir(c"/".as_ptr()) != 0 {
-        return fail(errno());
-    }
-    for p in parts {
-        if libc::chdir(p.as_ptr()) == 0 {
-            continue;
-        }
-        let e = errno();
-        if e != libc::ENOENT {
-            return fail(e);
-        }
-        if libc::mkdir(p.as_ptr(), 0o700) != 0 && errno() != libc::EEXIST {
-            return fail(errno());
-        }
-        if libc::chdir(p.as_ptr()) != 0 {
-            return fail(errno());
-        }
-    }
-    Ok(())
-}
-
-/// Mark every fd from 3 close-on-exec: `close_range` on Linux (one call), a
-/// bounded `fcntl` walk elsewhere or when it fails.
-///
-/// # Safety
-/// Async-signal-safe; call only in the forked child.
-unsafe fn cloexec_from_3(walk_end: libc::c_int) {
-    #[cfg(target_os = "linux")]
-    {
-        let (first, last): (libc::c_uint, libc::c_uint) = (3, libc::c_uint::MAX);
-        if libc::syscall(libc::SYS_close_range, first, last, libc::CLOSE_RANGE_CLOEXEC) == 0 {
-            return;
-        }
-    }
-    for fd in 3..walk_end {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
-    }
-}
-
-/// Where the child's fallback fd walk ends: the soft RLIMIT_NOFILE, at most [`FD_WALK_MAX`].
-fn fd_walk_end() -> libc::c_int {
-    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: getrlimit fills the struct on the stack.
-    let cur = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 { rl.rlim_cur } else { FD_WALK_MAX };
-    libc::c_int::try_from(cur.min(FD_WALK_MAX)).unwrap_or(1024)
 }
 
 /// A close-on-exec pipe already holding `value`, its write end closed: the
@@ -1670,20 +1661,16 @@ fn resolve(argv0: &str, claude: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("{}: not found on PATH={CHILD_PATH}", short(argv0)))
 }
 
-/// The CStrings of an absolute working directory's components, prepared
-/// before the fork; `.`, `..`, a relative path or more than 4096 bytes are refused.
-fn cwd_parts(path: &[u8]) -> Result<Vec<CString>, String> {
-    if path.len() > CWD_MAX_BYTES {
-        return Err(format!("{} bytes (at most {CWD_MAX_BYTES})", path.len()));
-    }
-    if path.first() != Some(&b'/') {
-        return Err("must be absolute".into());
-    }
-    let parts: Vec<&[u8]> = path.split(|c| *c == b'/').filter(|p| !p.is_empty()).collect();
-    if parts.iter().any(|p| *p == b"." || *p == b"..") {
-        return Err("must not contain . or .. components".into());
-    }
-    parts.into_iter().map(|p| CString::new(p).map_err(|_| "holds a NUL byte".to_string())).collect()
+/// The components of a spawn's working directory, a VM path ([`cwd_parts`]'s
+/// rules), entered under `fs_root` when the shim has one (native tests: the
+/// VM's disk is a directory of the Mac's).
+fn vm_cwd_parts(fs_root: Option<&Path>, path: &str) -> Result<Vec<std::ffi::CString>, String> {
+    let mut parts = match fs_root {
+        Some(root) => cwd_parts(root.as_os_str().as_bytes()).map_err(|m| format!("the fs root {m}"))?,
+        None => Vec::new(),
+    };
+    parts.extend(cwd_parts(path.as_bytes())?);
+    Ok(parts)
 }
 
 /// The `bad_request` rules of a spawn frame; the message names a field or a
@@ -1817,6 +1804,7 @@ fn sweep_passes(mut scan: impl FnMut() -> Vec<u32>, mut kill: impl FnMut(u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shim::childproc::CWD_MAX_BYTES;
     use crate::wire::chunk::decode;
     use crate::wire::frame::STDOUT_WINDOW_BYTES;
     use crate::wire::redact::Secret;
@@ -1824,10 +1812,13 @@ mod tests {
     /// Every line this module logged (tests assert what never appears).
     pub(super) static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+    /// Held by the tests that count idle-sweep lines (they share [`LOG`]).
+    static SWEEPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     const WAIT: Duration = Duration::from_secs(10);
 
     fn opts(home: &Path, window_bytes: u64) -> SpawnOpts {
-        SpawnOpts { claude: PathBuf::from("/nonexistent/claude"), home: home.to_path_buf(), uid: None, gid: None, agent_uid: 1000, window_bytes, sweep: false }
+        SpawnOpts { claude: PathBuf::from("/nonexistent/claude"), home: home.to_path_buf(), uid: None, gid: None, agent_uid: 1000, window_bytes, sweep: false, fs_root: None }
     }
 
     fn manager(home: &Path) -> SpawnManager {
@@ -2359,6 +2350,7 @@ mod tests {
             eprintln!("needs root on Linux (the image): skipped");
             return;
         }
+        let _sweeps = SWEEPS.lock().await;
         let home = tempfile::tempdir().unwrap();
         std::os::unix::fs::chown(home.path(), Some(1000), Some(1000)).unwrap();
         let m = SpawnManager::new(SpawnOpts { uid: Some(1000), gid: Some(1000), sweep: true, ..opts(home.path(), STDOUT_WINDOW_BYTES) });
@@ -3011,21 +3003,108 @@ mod tests {
     }
 
     #[test]
-    fn cwd_rules() {
-        assert_eq!(cwd_parts(b"/a//b/").unwrap(), [CString::new("a").unwrap(), CString::new("b").unwrap()]);
-        assert!(cwd_parts(b"/").unwrap().is_empty());
-        for bad in [&b"a/b"[..], b"", b"/a/./b", b"/a/../b", b"/..", b"/a\0b"] {
-            assert!(cwd_parts(bad).is_err(), "{bad:?}");
-        }
-        assert!(cwd_parts(format!("/{}", "x".repeat(CWD_MAX_BYTES - 1)).as_bytes()).is_ok());
-        assert!(cwd_parts(format!("/{}", "x".repeat(CWD_MAX_BYTES)).as_bytes()).is_err());
-    }
-
-    #[test]
     fn programs_resolve_like_a_shell_but_claude() {
         assert_eq!(resolve("claude", Path::new("/opt/c")).unwrap(), PathBuf::from("/opt/c"));
         assert_eq!(resolve("./x", Path::new("/opt/c")).unwrap(), PathBuf::from("./x"));
         assert!(resolve("sh", Path::new("/opt/c")).unwrap().starts_with("/"), "found on the child PATH");
         assert!(resolve("no-such-program-for-ai-env-tests", Path::new("/opt/c")).unwrap_err().contains("not found on PATH=/usr/local/bin:/usr/bin:/bin"));
+    }
+
+    /// S8: a workspace helper holds off the idle sweep. With a hold alive, a
+    /// spawn's end logs the sweep held off and sweeps nothing; dropping the
+    /// last hold runs the sweep that was due. The uid is one nothing runs
+    /// as, so a sweep here kills nothing (and off Linux it scans nothing).
+    #[tokio::test]
+    async fn a_helper_holds_off_the_idle_sweep_until_it_ends() {
+        let _sweeps = SWEEPS.lock().await;
+        let swept = || LOG.lock().unwrap().iter().filter(|l| l.starts_with("ai-env: idle sweep: ")).count();
+        let held_off = || LOG.lock().unwrap().iter().filter(|l| l.starts_with("ai-env: idle sweep held off: ")).count();
+        let home = tempfile::tempdir().unwrap();
+        let m = SpawnManager::new(SpawnOpts { sweep: true, agent_uid: 3_999_999_999, ..opts(home.path(), STDOUT_WINDOW_BYTES) });
+        let hold = m.hold_helper(false).await.expect("a hold while running");
+        assert_eq!((m.helpers(), m.live()), (1, 0), "a helper is no spawn");
+        let (before, off) = (swept(), held_off());
+        let mut c = Client::new(&m, 1);
+        start(&m, 1, req(&["true"])).await;
+        assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        assert!(wait_until(Duration::from_secs(4), || held_off() > off).await, "the spawn's end found a helper");
+        assert_eq!(swept(), before, "no sweep while the helper lives");
+        drop(hold);
+        assert!(wait_until(Duration::from_secs(4), || swept() > before).await, "the last hold ran the sweep that was due");
+        assert_eq!(m.helpers(), 0);
+        let again = m.hold_helper(false).await.expect("a hold");
+        let before = swept();
+        drop(again);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(swept(), before, "no sweep was due: none runs");
+    }
+
+    /// A stop TERMs every helper group it was told of (the owner reaps it:
+    /// exit observed, group cleared, then reaped), and afterwards only a
+    /// helper started during the stop is held.
+    #[tokio::test]
+    async fn a_stop_ends_the_helper_groups_and_refuses_new_helpers() {
+        use std::os::unix::process::CommandExt;
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let hold = m.hold_helper(false).await.expect("a hold");
+        let mut child = {
+            let _fork = crate::test_locks::forking();
+            std::process::Command::new("sleep").arg("100").process_group(0).spawn().unwrap()
+        };
+        let pid = child.id();
+        hold.set_group(pid);
+        let owner = tokio::spawn(async move {
+            let p = libc::pid_t::try_from(pid).unwrap();
+            tokio::task::spawn_blocking(move || wait_exited(p)).await.unwrap();
+            hold.clear_group();
+            child.wait().unwrap()
+        });
+        let t = Instant::now();
+        m.shutdown("test").await;
+        let status = tokio::time::timeout(WAIT, owner).await.unwrap().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "the stop's TERM reached the helper's group");
+        assert!(t.elapsed() < Duration::from_secs(3), "no KILL step was needed: {:?}", t.elapsed());
+        assert!(m.hold_helper(false).await.is_none(), "stopping: no new helper");
+        let during = m.hold_helper(true).await.expect("a helper the stop itself starts");
+        assert_eq!(m.helpers(), 1);
+        drop(during);
+        let log = LOG.lock().unwrap().join("\n");
+        assert!(log.contains("ai-env: spawns stopping (test): TERM to 0 group(s) and 1 workspace helper(s)"), "{log}");
+    }
+
+    /// Helpers are no spawns: with helpers held, MAX_SPAWNS spawns still
+    /// start, and with that many running a helper is still held.
+    #[tokio::test]
+    async fn helpers_never_count_toward_the_spawn_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let first = m.hold_helper(false).await.expect("a hold");
+        for _ in 0..MAX_SPAWNS {
+            start(&m, 1, req(&["sleep", "100"])).await;
+        }
+        assert_eq!(refused(&m, req(&["true"])).await.0, SpawnErrCode::Limit, "the limit is the spawns'");
+        let second = m.hold_helper(false).await.expect("a helper beside MAX_SPAWNS spawns");
+        assert_eq!((m.live(), m.helpers()), (MAX_SPAWNS, 2));
+        drop((first, second));
+        m.shutdown("test").await;
+    }
+
+    /// The spawn's working directory is a VM path: with an fs root it is
+    /// entered (and made) under it, as every VM path is.
+    #[tokio::test]
+    async fn a_spawn_cwd_is_entered_under_the_fs_root() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let m = SpawnManager::new(SpawnOpts { fs_root: Some(root.clone()), ..opts(&root, STDOUT_WINDOW_BYTES) });
+        let mut r = req(&["pwd"]);
+        r.cwd = Some("/Users/agent/ws".into());
+        let mut c = Client::new(&m, 1);
+        start(&m, 1, r).await;
+        assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        assert_eq!(String::from_utf8_lossy(&c.out).trim_end(), root.join("Users/agent/ws").to_str().unwrap());
+        let mut bad = req(&["pwd"]);
+        bad.cwd = Some("/Users/../x".into());
+        assert_eq!(refused(&m, bad).await.0, SpawnErrCode::Cwd, "the VM path's own rules first");
     }
 }

@@ -8,6 +8,16 @@
 //! The holder writes its pid into the file for the "waiting for pid N"
 //! message; lock files are never deleted (deleting one while another process
 //! waits on its descriptor would let a third process lock a new inode).
+//!
+//! S8 adds shared locks ([`lock_shared_blocking`], [`try_lock_shared`]):
+//! every remote wrapper and `vm warm` of a workspace holds
+//! `state/workspaces/<slug>.active` shared for its life, and a closing
+//! session suspends the VM only when it can take that file exclusively
+//! without waiting ([`try_lock_exclusive`]), so with no other holder, then
+//! holds it shared again ([`FlockGuard::share`]). A shared holder writes
+//! nothing into the file (several hold it at once). The waiting notice
+//! speaks through `bridge::voice`: on stderr for the CLI, to the log for the
+//! wrapper.
 use crate::bridge::errors::BridgeError;
 use crate::bridge::registry::ensure_private_dir;
 use std::fs::File;
@@ -23,7 +33,8 @@ pub const POLL: Duration = Duration::from_millis(50);
 /// After this long, a waiter says once on stderr whom it is waiting for.
 pub const NOTICE_AFTER: Duration = Duration::from_secs(2);
 
-/// An exclusive lock; released when dropped (the descriptor closes).
+/// A lock (exclusive, or S8's shared `.active`); released when dropped (the
+/// descriptor closes).
 #[derive(Debug)]
 pub struct FlockGuard {
     file: File,
@@ -34,6 +45,15 @@ impl FlockGuard {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// This exclusive hold made shared, on the same descriptor and without
+    /// waiting (S8: a closing session keeps its `.active` as every other
+    /// holder does once its suspend is decided). `Ok(false)` when it did not
+    /// take: Linux converts a lock by dropping the old one first, so another
+    /// process may take it between, and the guard then holds nothing.
+    pub fn share(&self) -> Result<bool, BridgeError> {
+        try_flock_as(&self.file, libc::LOCK_SH)
     }
 }
 
@@ -70,8 +90,13 @@ fn open_lock_file(path: &Path) -> Result<File, BridgeError> {
 
 /// One non-blocking attempt: `Ok(true)` when locked.
 fn try_flock(file: &File) -> Result<bool, BridgeError> {
+    try_flock_as(file, libc::LOCK_EX)
+}
+
+/// One non-blocking attempt at `how` (`LOCK_EX` or `LOCK_SH`): `Ok(true)` when locked.
+fn try_flock_as(file: &File, how: libc::c_int) -> Result<bool, BridgeError> {
     // SAFETY: flock(2) on a descriptor we own.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), how | libc::LOCK_NB) };
     if rc == 0 {
         return Ok(true);
     }
@@ -99,9 +124,10 @@ fn stamp(file: &mut File) {
 
 /// Take `path` exclusively, polling every [`POLL`] with `tokio::time::sleep`
 /// (the runtime is never blocked) for at most `budget`; `what` names the
-/// lock in messages. After [`NOTICE_AFTER`] a waiter prints one line
-/// `ai-env: waiting for <what> (held by pid N)`; past the budget the result
-/// is `Busy` (exit 1) naming the holder.
+/// lock in messages. After [`NOTICE_AFTER`] a waiter says once (a voice
+/// note: `ai-env: waiting for <what> (held by pid N)` from the CLI, the log
+/// from the wrapper); past the budget the result is `Busy` (exit 1) naming
+/// the holder.
 pub async fn lock_exclusive(path: &Path, budget: Duration, what: &str) -> Result<FlockGuard, BridgeError> {
     let mut file = open_lock_file(path)?;
     let start = Instant::now();
@@ -118,9 +144,44 @@ pub async fn lock_exclusive(path: &Path, budget: Duration, what: &str) -> Result
         }
         if !noticed && waited >= NOTICE_AFTER {
             noticed = true;
-            eprintln!("ai-env: waiting for {what} (held by {})", holder());
+            crate::bridge::voice::note(&format!("waiting for {what} (held by {})", holder()));
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// `path` exclusively if no one holds it, shared or not, right now (one
+/// attempt, no wait): `Ok(None)` while anyone does. The holder's pid is not
+/// written (S8's `.active` file is no "waiting for pid N" lock).
+pub fn try_lock_exclusive(path: &Path) -> Result<Option<FlockGuard>, BridgeError> {
+    let file = open_lock_file(path)?;
+    Ok(try_flock_as(&file, libc::LOCK_EX)?.then(|| FlockGuard { file, path: path.to_path_buf() }))
+}
+
+/// `path` shared now, one attempt and no wait (S8: the closing session's
+/// hold taken again): `Ok(None)` while someone holds it exclusively.
+pub fn try_lock_shared(path: &Path) -> Result<Option<FlockGuard>, BridgeError> {
+    let file = open_lock_file(path)?;
+    Ok(try_flock_as(&file, libc::LOCK_SH)?.then(|| FlockGuard { file, path: path.to_path_buf() }))
+}
+
+/// `path` shared (S8: a workspace's `.active` file), polling every [`POLL`]
+/// with a blocking sleep (for code with no runtime: the wrapper's prechecks)
+/// for at most `budget`, while someone holds it exclusively (a closing
+/// session around its suspend verdict and its SuspendMicrovm, within
+/// `remote::CLOSE_BUDGET_MS`). Past the budget `Busy` (exit 1). Several
+/// processes hold it at once; none writes into the file.
+pub fn lock_shared_blocking(path: &Path, budget: Duration) -> Result<FlockGuard, BridgeError> {
+    let file = open_lock_file(path)?;
+    let start = Instant::now();
+    loop {
+        if try_flock_as(&file, libc::LOCK_SH)? {
+            return Ok(FlockGuard { file, path: path.to_path_buf() });
+        }
+        if start.elapsed() >= budget {
+            return Err(BridgeError::Busy(format!("{} still held exclusively after {} ms", path.display(), budget.as_millis())));
+        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -175,6 +236,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(held);
         waiter.await.unwrap().unwrap();
+    }
+
+    /// S8's `.active` file: any number of shared holders at once (none
+    /// writes the file), an exclusive try only while nobody holds it, and a
+    /// shared wait bounded by its budget while it is held exclusively.
+    #[test]
+    fn shared_holders_keep_out_an_exclusive_try_and_one_exclusive_holder_bounds_the_shared_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join("workspaces").join("-w.active");
+        let a = lock_shared_blocking(&path, Duration::from_millis(100)).unwrap();
+        let b = lock_shared_blocking(&path, Duration::from_millis(100)).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty(), "a shared holder writes nothing");
+        assert!(try_lock_exclusive(&path).unwrap().is_none(), "two shared holders");
+        drop(a);
+        assert!(try_lock_exclusive(&path).unwrap().is_none(), "one is left");
+        drop(b);
+        let alone = try_lock_exclusive(&path).unwrap().expect("nobody holds it");
+        let t = Instant::now();
+        let e = lock_shared_blocking(&path, Duration::from_millis(200)).unwrap_err();
+        assert!(t.elapsed() >= Duration::from_millis(200) && matches!(e, BridgeError::Busy(_)), "{e}");
+        drop(alone);
+        assert!(lock_shared_blocking(&path, Duration::from_millis(100)).is_ok(), "free again");
+    }
+
+    /// A closing session's hold: taken alone, then shared on its own
+    /// descriptor (others join, nobody takes it alone); a one-attempt shared
+    /// lock gets nothing while it is held alone.
+    #[test]
+    fn an_exclusive_hold_is_shared_in_place_and_a_shared_try_never_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join("workspaces").join("-w.active");
+        let alone = try_lock_exclusive(&path).unwrap().expect("nobody holds it");
+        assert!(try_lock_shared(&path).unwrap().is_none(), "held alone: no wait, no lock");
+        assert!(alone.share().unwrap(), "made shared");
+        let other = try_lock_shared(&path).unwrap().expect("shared with another");
+        assert!(try_lock_exclusive(&path).unwrap().is_none(), "two shared holders");
+        drop(other);
+        assert!(try_lock_exclusive(&path).unwrap().is_none(), "the shared hold stays");
+        drop(alone);
+        assert!(try_lock_exclusive(&path).unwrap().is_some(), "free once dropped");
     }
 
     #[test]

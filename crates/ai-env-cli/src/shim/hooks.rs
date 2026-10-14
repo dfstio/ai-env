@@ -22,8 +22,12 @@
 //! [`sys::run_report`].
 //!
 //! The agent transport (S6): `/suspend` freezes the spawns' detach graces,
-//! sends `event hook_suspend` to every `/agent` socket and closes them
-//! (1001, at most 1 s); `/resume` reports the clock, then thaws the graces;
+//! snapshots the workspace's uncommitted work (S8, L6: a `refs/wip/*` ref
+//! made by the agent's helper within `budget::SUSPEND_SNAPSHOT`, only for a
+//! seeded VM, skipped while a seed or a code-out holds the workspace; none
+//! in `/terminate`, whose disk has no reader), then sends `event
+//! hook_suspend` to every `/agent` socket and closes them (1001, at most
+//! 1 s); `/resume` reports the clock, then thaws the graces;
 //! `/terminate` drains, sends `event hook_terminate` and closes every
 //! socket, stops the spawns (TERM every process group, at most 5 s for the
 //! leaders, then KILL the groups whose leader still runs, at most 1 s: the
@@ -434,12 +438,14 @@ async fn resume(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
 }
 
 /// Drop the cached credential and close the cache until `/resume` (S7), then
-/// freeze the detach graces, then tell every `/agent` socket and close it (no
-/// socket survives a suspend), then answer.
+/// freeze the detach graces, then snapshot the workspace (S8), then tell
+/// every `/agent` socket and close it (no socket survives a suspend), then
+/// answer.
 async fn suspend(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     // First: the cached credential goes before the snapshot can take it, and none is accepted until /resume (S7).
     state.spawns.credential().close(CredentialErrCode::Suspended, "suspend");
     state.spawns.freeze();
+    crate::shim::asagent::suspend_snapshot(&state).await;
     state.agents.close_all_with(CLOSE_GOING_AWAY, "suspend", Some(event(EventKind::HookSuspend))).await;
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }

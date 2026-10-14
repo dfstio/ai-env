@@ -146,6 +146,40 @@ fn seed_local_capped(src_dir: &Path, session_id: &str, dst_projects: &Path, dst_
     Ok(report)
 }
 
+/// The files one seed of `session_id` from the Mac project directory
+/// `src_dir` would copy, by the seeder's own plan (S8 §8: the resume's
+/// upload to a VM takes the same files): `<uuid>.jsonl` when it is a regular
+/// file, then the regular files of the `<uuid>/` subtree, parents before
+/// children, at most [`MAX_SUBTREE_DEPTH`] levels deep, symlinks never
+/// followed, each as its path below `src_dir` (`<uuid>.jsonl`,
+/// `<uuid>/subagents/agent-a1.jsonl`, `/`-separated) and its size. Refused as
+/// [`seed_local`] refuses: a non-uuid id, a symlinked or non-regular
+/// `<uuid>.jsonl`, more than [`MAX_SEED_BYTES`] in all (`transcript too large
+/// to seed`). A name that is not UTF-8 is left out (no transcript rel can
+/// name it), logged; nothing missing is an empty list.
+pub fn transcript_files(src_dir: &Path, session_id: &str) -> Result<Vec<(String, u64)>, BridgeError> {
+    if !is_uuid(session_id) {
+        return Err(BridgeError::Config(format!("not a session id: {session_id:?}")));
+    }
+    let plan = plan(src_dir, session_id)?;
+    let total = plan.total_bytes();
+    if total > MAX_SEED_BYTES {
+        return Err(BridgeError::Config(format!("transcript too large to seed: {total} bytes")));
+    }
+    let mut out = Vec::new();
+    if let Some(len) = plan.jsonl {
+        out.push((jsonl_name(session_id), len));
+    }
+    for entry in plan.subtree.iter().flatten() {
+        let Entry::File(rel, len) = entry else { continue };
+        match rel.to_str() {
+            Some(rel) => out.push((format!("{session_id}/{rel}"), *len)),
+            None => tracing::warn!("seed: {} is not UTF-8; not a transcript file", rel.display()),
+        }
+    }
+    Ok(out)
+}
+
 // ---- planning --------------------------------------------------------------------------
 
 /// Everything one seed will copy, gathered before the first byte moves.
@@ -745,6 +779,35 @@ mod tests {
         }
         assert!(last_ok.join("f.jsonl").is_file());
         assert!(!last_ok.join(format!("d{}", MAX_SUBTREE_DEPTH + 1)).exists());
+    }
+
+    /// S8: the files a resume uploads are exactly the ones a seed copies,
+    /// by the seeder's own rules: symlinks skipped, the depth limit, the cap.
+    #[test]
+    fn transcript_files_are_what_the_seeder_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = fake_source(tmp.path(), "p");
+        symlink(tmp.path().join("elsewhere"), src.join(ID).join("subagents/link.jsonl")).unwrap();
+        let files = transcript_files(&src, ID).unwrap();
+        let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+        let want = [".jsonl", "/subagents/agent-a1.jsonl", "/subagents/agent-a1.meta.json", "/subagents/workflows/x.jsonl"].map(|tail| format!("{ID}{tail}"));
+        assert_eq!(rels, want.iter().map(String::as_str).collect::<Vec<_>>());
+        for (rel, len) in &files {
+            assert_eq!(*len, std::fs::metadata(src.join(rel)).unwrap().len(), "{rel}");
+        }
+        let report = seed_local(&src, ID, &tmp.path().join("dst"), "p").unwrap();
+        assert_eq!((report.subtree_files as usize + usize::from(report.copied_jsonl), report.bytes), (files.len(), files.iter().map(|(_, l)| l).sum()));
+        // Nothing there is nothing to send; the seeder's refusals are its own.
+        assert!(transcript_files(&tmp.path().join("empty"), ID).unwrap().is_empty());
+        assert!(config_msg(transcript_files(&src, "../x").map(|_| SeedReport::default())).starts_with("not a session id"));
+        let big = tmp.path().join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::File::create(big.join(format!("{ID}.jsonl"))).unwrap().set_len(MAX_SEED_BYTES + 1).unwrap();
+        assert_eq!(config_msg(transcript_files(&big, ID).map(|_| SeedReport::default())), format!("transcript too large to seed: {} bytes", MAX_SEED_BYTES + 1));
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        symlink(src.join(format!("{ID}.jsonl")), linked.join(format!("{ID}.jsonl"))).unwrap();
+        assert!(config_msg(transcript_files(&linked, ID).map(|_| SeedReport::default())).contains("symlink"));
     }
 
     #[test]

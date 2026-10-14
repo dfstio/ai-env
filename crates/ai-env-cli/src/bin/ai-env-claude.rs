@@ -1,32 +1,44 @@
 //! `ai-env-claude` — Cursor's `claudeCode.claudeProcessWrapper` target,
-//! exec'd as `<wrapper> <realBinary> <claude args…>`. `--version` is its only
-//! other mode. Every Local route (subcommands, `--version`, …) and, with
-//! `AI_ENV_BRIDGE_MODE` unset, every route execs the real binary locally with
-//! argv verbatim, before any tokio runtime, SDK or TLS object exists. A
+//! exec'd as `<wrapper> <realBinary> <claude args…>`. `--version` and `--help`
+//! (alone) are its only other modes: neither reads anything or runs a binary
+//! (a `--help` taken as the real binary's path would reach the local fallback,
+//! which runs the Mac's claude). Every Local route (subcommands, `--version`, …) and, in
+//! passthrough mode, every route execs the real binary locally with argv
+//! verbatim, before any tokio runtime, SDK or TLS object exists. A
 //! stream-json session under `AI_ENV_BRIDGE_MODE=local-child|local-scratch`
-//! (S2; `Route::Remote` from S8) is piped instead: `bridge::pump::run` builds
-//! the only runtime this binary ever has, after the census row is written.
+//! (S2), or under the roots in remote mode (S8: the variable, else
+//! `[wrapper].mode`), is piped instead: `bridge::pump::run` builds the only
+//! runtime this binary ever has, after the census row is written, except
+//! that a remote session's row is the pump's own, written once that runtime
+//! listens for a stop (S8 phase 4).
 //!
-//! The ORDER below is the invariant (plan S1 §4 step 9, S2 step 12):
-//! `--version` → kill switch (raw exec, no census, no config read) →
+//! The ORDER below is the invariant (plan S1 §4 step 9, S2 step 12, S8 §1):
+//! `--version` and `--help` → kill switch (raw exec, no census, no config read) →
 //! `argv::split` (exit 2 only for a missing argv[1] or an argument that is
 //! not valid UTF-8 — Cursor's argv comes from JS strings, so the latter never
 //! happens from the extension; the kill switch execs raw bytes regardless) →
-//! `route::load_for_wrapper` + `current_dir` → `route::decide` → notes
-//! (`mcp add|remove`, missing cwd, lab knob, the pump mode, local fallback) →
-//! the binary check, so the row can carry the fallback note →
-//! `census::record` (one stderr line on failure, never blocking) → the lab
+//! `route::load_for_wrapper` + `current_dir` → the mode
+//! (`route::effective_mode_loaded`) → `route::decide_loaded` (after the
+//! mode: in remote mode a bridge.toml that does not load still routes a
+//! session on its roots, which P0 fails closed) → notes (`mcp add|remove`,
+//! missing cwd, lab knob, the mode, local fallback) → the binary check, so
+//! the row can carry the fallback note (not on the remote route: the Mac's
+//! binary is not used there) → the prewarm (`remote::prewarm`, for exactly
+//! `auth status --json` in remote mode) → `census::record` (one stderr line
+//! on failure, never blocking; a remote session's is the pump's) → the lab
 //! exit knob (debug builds) → the piped branch (`route::piped`) → exec.
 //! stderr lines are prefixed `ai-env-claude:` (the extension shows the last
-//! 2 KiB of stderr only on a non-zero exit); stdout belongs to Claude's
-//! stream-json.
+//! 2 KiB of stderr only on a non-zero exit; shared code speaks through
+//! `bridge::voice`, set to the wrapper's voice here: notes to the log, one
+//! final line); stdout belongs to Claude's stream-json.
+use ai_env_cli::bridge::remote::prewarm;
 use ai_env_cli::bridge::sibling::exists_exec;
-use ai_env_cli::bridge::{census, lab, pump, route};
-use ai_env_cli::wire::argv::{self, ArgvError};
+use ai_env_cli::bridge::{census, lab, pump, route, voice};
+use ai_env_cli::wire::argv::{self, ArgvError, Route};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "(usage: ai-env-claude <realBinary> <claude args…> | --version)";
+const USAGE: &str = "(usage: ai-env-claude <realBinary> <claude args…> | --version | --help)";
 
 fn fail(code: i32, msg: &str) -> ! {
     eprintln!("ai-env-claude: {msg}");
@@ -67,6 +79,11 @@ fn main() {
         println!("ai-env-claude {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if argv.len() == 2 && matches!(argv[1].to_str(), Some("--help" | "-h")) {
+        println!("ai-env-claude {}: Cursor's claudeCode.claudeProcessWrapper for ai-env {USAGE}", env!("CARGO_PKG_VERSION"));
+        println!("Cursor runs it with its bundled claude as the first argument; ai-env wrapper install --write sets it up (ai-env wrapper --help).");
+        return;
+    }
     // Kill switch: plain Cursor, no AWS, no runtime, no census, no config
     // read. Checked BEFORE the UTF-8 split so argv reaches the real binary
     // byte-for-byte, non-UTF-8 included.
@@ -76,13 +93,21 @@ fn main() {
             None => fail(2, &format!("{}  {USAGE}", ArgvError::MissingRealBinary)),
         }
     }
+    // Shared code (the VM selection, the locks, the credential steps) speaks as the wrapper from here on.
+    voice::set(voice::Voice::Wrapper);
     let inv = match argv::split(&argv) {
         Ok(i) => i,
         Err(e) => fail(2, &format!("{e}  {USAGE}")),
     };
     let loaded = route::load_for_wrapper();
     let cwd = std::env::current_dir().ok();
-    let route = route::decide(&inv.args, cwd.as_deref(), loaded.cfg.as_ref());
+    // The mode: AI_ENV_BRIDGE_MODE when it names one, else [wrapper].mode (as far as a bridge.toml
+    // that does not load still reads; a mode it cannot read counts as remote), else passthrough (S8 L1).
+    let mode_env = std::env::var_os(route::MODE_ENV).map(|v| v.to_string_lossy().into_owned());
+    let (mode, mode_note) = route::effective_mode_loaded(mode_env.as_deref(), &loaded);
+    // Remote mode never runs a session under the roots on the Mac, not even when bridge.toml does not load.
+    let route = route::decide_loaded(&inv.args, cwd.as_deref(), &loaded, mode);
+    let remote = mode == route::Mode::Remote && matches!(route, Route::Remote(_));
 
     // Notes for the census row, joined by "; ".
     let mut notes: Vec<String> = Vec::new();
@@ -100,8 +125,6 @@ fn main() {
     if let Some((code, _)) = &knob {
         notes.push(format!("lab_exit:{code}"));
     }
-    // The pump mode: one environment variable, read on the exec path too.
-    let (mode, mode_note) = route::mode_from_env();
     if let Some(n) = mode_note {
         notes.push(n);
     }
@@ -110,10 +133,11 @@ fn main() {
     // fallback note; a failure is remembered and reported after the row.
     // A bare name (`claude`, no path separator) would be checked against the
     // cwd but exec'd through PATH: treat it as "not found" so the fallback
-    // lookup decides, and the file checked is the file exec'd.
+    // lookup decides, and the file checked is the file exec'd. The remote
+    // route runs no Mac binary: nothing to check (S8).
     let bare_name = inv.real_binary.components().count() == 1 && !inv.real_binary.is_absolute();
     let (exists, exec) = exists_exec(&inv.real_binary);
-    let bin: Result<PathBuf, String> = if exists && exec && !bare_name {
+    let bin: Result<PathBuf, String> = if remote || (exists && exec && !bare_name) {
         Ok(inv.real_binary.clone())
     } else {
         // "claude on PATH" means the PATH the extension handed us (its login
@@ -131,11 +155,20 @@ fn main() {
         }
     };
 
+    // The prewarm (S8 §11): for exactly `auth status --json` in remote mode, a
+    // detached `ai-env vm warm <cwd> --prewarm`, before the census and the exec.
+    if let Some(p) = prewarm::maybe_prewarm(&loaded, mode, &inv.args, cwd.as_deref()) {
+        notes.push(p.census_part());
+    }
+
     // The census: one redacted row, never blocking the exec. A piped session
-    // appends a second row (the same row + end, exit) when it ends.
+    // appends a second row (the same row + end, exit) when it ends. A remote
+    // session's row is the pump's to write, once it listens for a stop (S8
+    // phase 4): the piped branch below runs for it unless the lab knob exits.
     let note = if notes.is_empty() { None } else { Some(notes.join("; ")) };
     let start_row = census::build_row(&argv, &route, cwd.as_deref(), note);
     match &loaded.paths {
+        Some(_) if remote && knob.is_none() => {}
         Some(paths) => {
             if let Err(e) = census::record(&paths.census(), &start_row) {
                 eprintln!("ai-env-claude: census: {e}");
@@ -151,10 +184,15 @@ fn main() {
         std::process::exit(code);
     }
 
-    // The piped branch (S2): a stream-json session in a local pump mode.
-    // Without a state root (HOME unset) there is nowhere to log or register:
-    // exec as S1 does.
+    // The piped branch: a stream-json session in a local pump mode (S2), or
+    // under the roots in remote mode (S8, failing closed: never the exec
+    // below). Without a state root (HOME unset) there is nowhere to log or
+    // register: exec as S1 does.
     if let (Ok(bin), Some(paths), Some(session)) = (&bin, &loaded.paths, route::piped(mode, &route, &inv.args)) {
+        if remote {
+            // The S4–S7 audit rows this process writes are the session's.
+            ai_env_cli::bridge::vm::cmd::set_audit_purpose("session");
+        }
         pump::run(pump::Session {
             real_binary: bin.clone(),
             args: inv.args.clone(),

@@ -7,10 +7,14 @@
 //! keyring or the real keystore. `image-stage-scan` runs on a planted copy of
 //! image/ with this test run's binary as AI_ENV. The S5 section drives the
 //! egress ops of ops.sh and the new targets with a stateful aws, a pulumi and
-//! the `ai-env` stand-in, `make deploy` whole in a planted repo. Every child
-//! runs under a deadline ([`Bounded`]).
+//! the `ai-env` stand-in, `make deploy` whole in a planted repo. The S8
+//! section drives s8-smoke, test-cursor, doc-test and `make acceptance`
+//! (stand-ins for what is live, the real `ai-env` and `ai-env-claude` for
+//! what runs offline), and holds the scrub lists to every knob the code and
+//! the fakes read. Every child runs under a deadline ([`Bounded`]).
 use super::common::*;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -134,7 +138,15 @@ fn lines_of(p: &Path) -> Vec<String> {
 
 /// A copy of image/ under `tmp/img`, with a stand-in for the cross-built
 /// shim (the real one is not needed to test the wiring).
-fn planted_image(tmp: &Path) -> PathBuf {
+/// The S3 baseline of `image/claude/settings.json`. The planted images use it
+/// whatever the repository's holds, so a rule a T8.7 promotion committed there
+/// (`wrapper settings-sync --write`, its allow line in the operator's policy)
+/// never changes what these tests see.
+const BASE_SETTINGS: &str = "{\"permissions\":{\"defaultMode\":\"default\",\"allow\":[]}}\n";
+
+/// The repository's image files under `<tmp>/img`, its settings as the
+/// repository holds them, with a stand-in for the cross-built shim.
+fn copied_image(tmp: &Path) -> PathBuf {
     let src = Path::new(REPO).join("image");
     let dst = tmp.join("img");
     for rel in ["Dockerfile", "MANIFEST", "claude.lock", "managed-settings.json", "claude/settings.json", "claude/CLAUDE.md", "claude/claude.json"] {
@@ -143,6 +155,14 @@ fn planted_image(tmp: &Path) -> PathBuf {
         std::fs::copy(src.join(rel), &to).unwrap_or_else(|e| panic!("{rel}: {e}"));
     }
     std::fs::write(dst.join("ai-env"), "stand-in for the cross-built shim\n").unwrap();
+    dst
+}
+
+/// [`copied_image`] with the baseline settings ([`BASE_SETTINGS`]): what the
+/// tests that plant their own changes start from.
+fn planted_image(tmp: &Path) -> PathBuf {
+    let dst = copied_image(tmp);
+    std::fs::write(dst.join("claude/settings.json"), BASE_SETTINGS).unwrap();
     dst
 }
 
@@ -165,7 +185,15 @@ fn assert_no_stage(tmp: &Path, what: &str) {
 #[test]
 fn image_stage_scan_passes_on_the_repo_image_files() {
     let t = tempfile::tempdir().unwrap();
-    let img = planted_image(t.path());
+    let img = copied_image(t.path());
+    // A rule a T8.7 promotion committed to the repository's settings has its
+    // allow line in the operator's policy (settings-sync writes both): here too.
+    let settings: Value = serde_json::from_str(&read(&img.join("claude/settings.json"))).unwrap();
+    let allow: String = settings["permissions"]["allow"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|rule| format!("allow {rule}\n")).collect();
+    if !allow.is_empty() {
+        std::fs::create_dir_all(t.path().join("bridge")).unwrap();
+        std::fs::write(t.path().join("bridge").join("settings-policy.txt"), allow).unwrap();
+    }
     let out = stage_scan(t.path(), &img);
     assert!(out.status.success(), "{}", all(&out));
     assert!(stdout(&out).contains("scan: clean (7 files)"), "{}", stdout(&out));
@@ -258,6 +286,77 @@ fn image_stage_scan_refuses_symlinks_before_staging() {
     assert!(out.status.success() && stdout(&out).contains("scan: clean (7 files)"), "{}", all(&out));
 }
 
+// ---- S8 T8.7: settings-sync, then the image scan ----
+
+const SESSION: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+/// A session's two captures in `<tmp>/bridge/quarantine/<session>/settings`:
+/// no local settings at the start, `allow` approved by the latest.
+fn plant_captures(tmp: &Path, allow: &[&str]) {
+    let file = |scope: &str, path: &str, text: Option<&str>| match text {
+        Some(t) => json!({"scope": scope, "path": path, "present": true, "size": t.len(), "text": t}),
+        None => json!({"scope": scope, "path": path, "present": false, "size": 0}),
+    };
+    let capture = |local: Option<&str>, at: &str| {
+        json!({"path": "/Users/mike/w", "files": [file("user", "/Users/mike/.claude/settings.json", Some("{}")), file("project", "/Users/mike/w/.claude/settings.json", None), file("local", "/Users/mike/w/.claude/settings.local.json", local)], "project": {}, "at": at})
+    };
+    let local = json!({"permissions": {"allow": allow}}).to_string();
+    let dir = tmp.join("bridge").join("quarantine").join(SESSION).join("settings");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("start.json"), capture(None, "2026-10-12T10:00:00Z").to_string()).unwrap();
+    std::fs::write(dir.join("latest.json"), capture(Some(&local), "2026-10-12T10:30:00Z").to_string()).unwrap();
+}
+
+/// `ai-env wrapper settings-sync SESSION --all-safe --write --image-dir IMG`
+/// in the tests' isolation (the bridge under `tmp`, where the scan reads
+/// its settings policy too).
+fn sync_into(tmp: &Path, img: &Path) -> Output {
+    run(&mut ai_env(tmp, &["wrapper", "settings-sync", SESSION, "--all-safe", "--write", "--image-dir", img.to_str().unwrap()]))
+}
+
+/// T8.7 end to end on the image: the rules settings-sync promotes (into
+/// `claude/settings.json`, with their allow lines in the settings policy)
+/// pass `make image-stage-scan`, whose `infra scan --profile image` reads
+/// that policy; the staged settings carry them.
+#[test]
+fn synced_settings_pass_the_image_scan() {
+    let t = tempfile::tempdir().unwrap();
+    let img = planted_image(t.path());
+    plant_captures(t.path(), &["Bash(git status)", "Bash(cargo test:*)"]);
+    let out = sync_into(t.path(), &img);
+    assert!(out.status.success(), "{}", all(&out));
+    assert!(stdout(&out).contains("scan: clean (") && stdout(&out).contains("next: make test-docker deploy (") && stdout(&out).contains("then ai-env egress check --if-needed ("), "{}", stdout(&out));
+    assert_eq!(read(&t.path().join("bridge").join("settings-policy.txt")), "allow Bash(cargo test:*)\nallow Bash(git status)\n");
+    let scan = stage_scan(t.path(), &img);
+    assert!(scan.status.success(), "{}", all(&scan));
+    assert!(stdout(&scan).contains("scan: clean (7 files)"), "{}", stdout(&scan));
+    let staged: Value = serde_json::from_str(&read(&t.path().join("out/stage/claude/settings.json"))).unwrap();
+    assert_eq!(staged["permissions"]["allow"], json!(["Bash(cargo test:*)", "Bash(git status)"]), "{staged}");
+    assert_eq!(staged["permissions"]["defaultMode"], "default");
+}
+
+/// The policy is what lets a synced rule through: the same image with the
+/// rule's allow line gone from the policy fails `make image-stage-scan`
+/// with the scanner's exit 9, naming the file, the line and the rule
+/// (never the rule), and leaves no stage.
+#[test]
+fn a_rule_missing_from_the_policy_fails_the_image_scan_with_9() {
+    let t = tempfile::tempdir().unwrap();
+    let img = planted_image(t.path());
+    plant_captures(t.path(), &["Bash(git status)"]);
+    let out = sync_into(t.path(), &img);
+    assert!(out.status.success(), "{}", all(&out));
+    let policy = t.path().join("bridge").join("settings-policy.txt");
+    assert_eq!(read(&policy), "allow Bash(git status)\n");
+    std::fs::write(&policy, "# emptied by hand\n").unwrap();
+    let scan = stage_scan(t.path(), &img);
+    let text = all(&scan);
+    assert!(!scan.status.success(), "{text}");
+    assert!(text.contains("claude/settings.json:1: allow-not-in-policy") && text.contains("Error 9"), "{text}");
+    assert!(!text.contains("git status"), "the rule itself is never printed: {text}");
+    assert_no_stage(t.path(), "a rule missing from the policy");
+}
+
 #[test]
 fn the_make_child_carries_no_outer_make_or_operator_state() {
     // What an outer `make -i test` and an operator shell would hand down: the
@@ -285,6 +384,11 @@ fn the_make_child_carries_no_outer_make_or_operator_state() {
 // ---- make -n: a dry parse ----
 
 const MUST_NOT_RUN: &[&str] = &["aws", "pulumi", "docker", "curl", "gpg", "cargo", "npm", "node", "zip", "shasum", "rustup", "sleep"];
+
+/// `$(LAB_UNSET)` as the live recipes run it: the fourteen lab knobs
+/// (`the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read` holds the
+/// Makefile's list to every one the code and ops.sh read).
+const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS";
 
 #[test]
 fn make_n_of_the_part_b_targets_executes_nothing() {
@@ -1130,7 +1234,7 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
         stdout(&out)
     };
     let ai_env = "cargo +1.98.1 run -q -p ai-env-cli --bin ai-env --";
-    let lab_unset = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS";
+    let lab_unset = LAB_UNSET;
     let probe_cli = format!("{lab_unset} AI_ENV_CLI='{ai_env}'");
     let cases: Vec<(&str, Vec<String>)> = vec![
         ("connector-status", vec!["/bin/bash infra/scripts/ops.sh connector-status".into()]),
@@ -2148,8 +2252,24 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
 #[test]
 fn the_live_s5_targets_drop_every_lab_knob() {
     // S7 adds the wrapper's two knobs (the synthetic oauth_token_refresh, the unseal budget of local-scratch and of
-    // credentialed vm and lab commands).
-    let knobs = [("AI_ENV_BRIDGE_LAB_FAKE_API", "1"), ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"), ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"), ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"), ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1"), ("AI_ENV_BRIDGE_LAB_AGENT_ADDR", "127.0.0.1:9"), ("AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS", "300"), ("AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS", "1500")];
+    // credentialed vm and lab commands); S8 the transcript knob (a resume that uploads no transcript), S2's pump
+    // knobs (S8's live targets run the wrapper: s8-smoke, test-aws CRED=1) and its own live targets.
+    let knobs = [
+        ("AI_ENV_BRIDGE_LAB_FAKE_API", "1"),
+        ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"),
+        ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"),
+        ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"),
+        ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1"),
+        ("AI_ENV_BRIDGE_LAB_AGENT_ADDR", "127.0.0.1:9"),
+        ("AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS", "300"),
+        ("AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS", "1500"),
+        ("AI_ENV_BRIDGE_LAB_TRANSCRIPT", "skip"),
+        ("AI_ENV_BRIDGE_LAB_EXIT", "3:boom"),
+        ("AI_ENV_BRIDGE_LAB_IGNORE_EOF", "1"),
+        ("AI_ENV_BRIDGE_LAB_STDOUT_NOISE", "1"),
+        ("AI_ENV_BRIDGE_LAB_DELAY_INIT_MS", "300"),
+        ("AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS", "300"),
+    ];
     let t = tempfile::tempdir().unwrap();
     let w = planted_repo(t.path(), true);
     let bin = s5_bin(t.path());
@@ -2161,20 +2281,36 @@ fn the_live_s5_targets_drop_every_lab_knob() {
         let mut cmd = make_in(t.path(), &bin, &w, args);
         s5_env(&mut cmd, t.path()).arg(&stand_in).env("FAKE_AIENV_SMOKE", &record).envs(knobs).bounded()
     };
-    let live: [&[&str]; 11] = [&["s5-smoke"], &["s6-smoke"], &["s7-smoke"], &["test-egress"], &["test-claude"], &["test-aws", "CRED=1"], &["connector-probe", "CONFIRM=create-probe-connector", "CONNECTOR_WAIT_POLL=1"], &["allowlist-reload"], &["proxy-stop"], &["proxy-start"], &["proxy-patch"]];
+    let live: [&[&str]; 13] = [
+        &["s5-smoke"],
+        &["s6-smoke"],
+        &["s7-smoke"],
+        &["test-egress"],
+        &["test-claude"],
+        &["test-aws", "CRED=1"],
+        &["connector-probe", "CONFIRM=create-probe-connector", "CONNECTOR_WAIT_POLL=1"],
+        &["allowlist-reload"],
+        &["proxy-stop"],
+        &["proxy-start"],
+        &["proxy-patch"],
+        &["s8-smoke"],
+        &["test-cursor", "STEP=t8_3"],
+    ];
     for args in live {
         let out = run(args);
         assert!(out.status.success(), "{args:?}: {}", all(&out));
     }
     let c = calls(t.path());
     let children: Vec<&String> = c.iter().filter(|l| l.contains("[AI_ENV=") || l.starts_with("cargo ")).collect();
-    assert_eq!(children.len(), 3 + 3 + 3 + 2 + 1 + 1 + 1 + 4, "three s5, s6 and s7 smokes, test-egress's cargo and removal, test-claude's and test-aws's cargo, the probe's lab run, the four operator calls: {children:#?}");
+    assert_eq!(children.len(), 3 + 3 + 3 + 2 + 1 + 1 + 1 + 4 + 1 + 1, "three s5, s6 and s7 smokes, test-egress's cargo and removal, test-claude's and test-aws's cargo, the probe's lab run, the four operator calls, s8-smoke's and test-cursor's cargo: {children:#?}");
     assert!(children.iter().all(|l| !l.contains("[LAB=")), "a lab knob reached a live command: {children:#?}");
     // The control: a target that keeps the knobs hands them on, and the stand-in sees them.
     let out = run(&["check-base-image"]);
     assert!(out.status.success(), "{}", all(&out));
     let last = calls(t.path()).pop().unwrap();
-    assert!(last.ends_with("[LAB=AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_ASSUME_TTY AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_FAKE_SHELL AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS]"), "{last}");
+    let mut names: Vec<&str> = knobs.iter().map(|(k, _)| *k).collect();
+    names.sort_unstable();
+    assert!(last.ends_with(&format!("[LAB={}]", names.join(" "))), "{last}");
 }
 
 #[test]
@@ -2647,4 +2783,616 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
             assert!(text.contains("nothing changed") || text.contains("not under make -i or -k"), "{what}: a refusal says nothing changed: {text}");
         }
     }
+}
+
+// ---- S8: s8-smoke, test-cursor, doc-test, test-aws's skip, acceptance, the scrub lists ----
+
+/// The steps of `make acceptance`, one recipe line each, in their order.
+const ACCEPT_STEPS: [&str; 12] = ["roots", "doctor", "version", "creds", "outside-roots", "planted-key", "bypass-settings", "egress-required", "kill-switch", "region", "lone-ai-env", "smoke"];
+
+/// `make -n` of S8's targets: s8-smoke runs W7's live_wrapper_smoke alone
+/// (`--exact` names a test's whole path: it is a top-level test, whose own
+/// output carries the 3/3 line and whose records go where the help says),
+/// test-cursor its gate and step and the two filters given on the command
+/// line, after the step's check, test-aws CRED=1 skips the smoke, doc-test
+/// runs tests/readme.rs, and acceptance shows each step and negative on a
+/// line of its own, the Touch IDs last. Nothing runs, nothing is made.
+#[test]
+fn make_n_of_the_s8_targets_names_their_commands_and_runs_nothing() {
+    let t = tempfile::tempdir().unwrap();
+    let w = planted_repo(t.path(), true);
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().chain(&["git"]).map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let pair = t.path().join("pair");
+    for name in ["ai-env", "ai-env-claude"] {
+        script(&pair.join(name), "echo \"$(basename \"$0\") $*\" >> \"$FAKE_LOG\"\nexit 1");
+    }
+    let log = t.path().join("tools.log");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make_in(t.path(), &bin, &w, &["-n"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge";
+
+    let smoke = dry(&["s8-smoke"], &[]);
+    assert_eq!(smoke, format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 {cargo} --test aws -- --ignored --exact live_wrapper_smoke --nocapture --test-threads=1\n"));
+    let aws = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/aws.rs"));
+    assert!(aws.contains("\n#[test]\n#[ignore = ") && aws.contains("\nfn live_wrapper_smoke() {\n"), "live_wrapper_smoke is no longer a top-level test: make s8-smoke's --exact names it by its whole path");
+    for want in ["\"s8-smoke: pass {pass} ok\"", "\"s8-smoke: 3/3 ok ({})\"", "join(\"../../target/s8\")).unwrap().join(\"smoke.jsonl\")"] {
+        assert!(aws.contains(want), "live_wrapper_smoke no longer has {want}: make s8-smoke's help and comment say what it prints and writes");
+    }
+    let body = aws.split("\nfn live_wrapper_smoke() {\n").nth(1).and_then(|b| b.split("\n}\n").next()).unwrap_or_default();
+    assert!(
+        body.find("assert_closed_well(").is_some_and(|close| body.find(".open(&records)").is_some_and(|write| close < write)),
+        "live_wrapper_smoke no longer writes a pass's record once its close passed, as make s8-smoke's help and comment say"
+    );
+
+    let tail = format!("{cargo} --test cursor_live -- --ignored --nocapture --test-threads=1");
+    let gate = format!("{LAB_UNSET} AI_ENV_CURSOR_TESTS=1 AI_ENV_CURSOR_STEP=t8_5 ");
+    let text = dry(&["test-cursor", "STEP=t8_5"], &[("SINCE", "2026-10-14T09:00:00Z"), ("WORKSPACE", "/w")]);
+    assert!(text.contains(&format!("\n{gate}{tail}\n")), "the filters count only on the command line (egress-logs' SINCE default included): {text}");
+    let text = dry(&["test-cursor", "STEP=t8_5", "SINCE=2026-10-14T09:00:00Z", "WORKSPACE=/Users/x/a b"], &[]);
+    let run = format!("{gate}AI_ENV_CURSOR_SINCE='2026-10-14T09:00:00Z' AI_ENV_CURSOR_WORKSPACE='/Users/x/a b' {tail}");
+    assert!(text.starts_with("step='t8_5'; case \"$step\" in t8_3|t8_4|t8_5|t8_6|t8_7) ;; \\") && text.ends_with(&format!("\n{run}\n")), "the step's check first, then the checks: {text}");
+
+    assert!(dry(&["test-aws", "CRED=1"], &[]).contains(&format!("AI_ENV_CREDENTIAL_TESTS=1 {cargo} --test aws -- --ignored --test-threads=1 --nocapture --skip live_wrapper_smoke\n")), "B3 runs the smoke once");
+    assert!(!dry(&["test-aws"], &[]).contains("--skip"));
+    assert!(!dry(&["test-aws"], &[("CRED", "1")]).contains("--skip"), "CRED=1 in the environment is ignored");
+    assert_eq!(dry(&["doc-test"], &[]), format!("{cargo} --test readme\n"));
+
+    let text = dry(&["acceptance", &format!("ACCEPT_BIN={}", pair.display())], &[]).replace("\\\n", " ");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), ACCEPT_STEPS.len() + 1, "one line per step, then the verdict: {text}");
+    let shell = format!("set -uo pipefail; unset {} AI_ENV_BRIDGE_LOCAL AI_ENV_BRIDGE_MODE AI_ENV_BRIDGE_VM AI_ENV_BRIDGE_MIRROR_ROOT; a=\"{}/target/s8/acceptance/", LAB_UNSET.replace("env -u ", "").replace(" -u ", " "), w.canonicalize().unwrap().display());
+    let argv = "\"$a/claude\" --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --permission-mode default)";
+    let wants: [&[&str]; 12] = [
+        &["test -x \"$ai\" && test -x \"$wrap\" ||", "\"$ai\" box seed \"$a\" --dry-run", "must hold target/s8"],
+        &["out=$(\"$ai\" doctor 2>&1)", "region eu-central-1 (pinned in code)"],
+        &["v1=$(\"$ai\" --version) && v2=$(\"$wrap\" --version)", "test \"${v1##* }\" = \"${v2##* }\""],
+        &["out=$(\"$ai\" creds status 2>&1)", "setup-token.env: sealed", "! grep -qF '[NO ]'"],
+        &[&format!("(cd / && exec env AI_ENV_BRIDGE_MODE=remote \"$wrap\" {argv}"), "\"$ai\" wrapper census --json", "'\"reason\":\"outside_roots\"'"],
+        &["key=$(printf '%s%s' AKIA \"$(printf 'Q7ZT%.0s' 1 2 3 4)\")", "\"$ai\" box seed \"$a\" --dry-run", "test $rc -eq 9", "HEAD:deploy.conf", "rule aws-access-key-id"],
+        &["\"defaultMode\": \"bypassPermissions\"", "\"$ai\" box seed \"$a\" --dry-run", "test $rc -eq 9", "key permissions.defaultMode"],
+        &["cfg=\"${AI_ENV_BRIDGE_CONFIG:-$bridge/bridge.toml}\"", &format!("exec env AI_ENV_BRIDGE_CONFIG=\"$a/bridge.toml\" AI_ENV_BRIDGE_MODE=remote \"$wrap\" {argv}"), "test $rc -eq 9", "'\"event\":\"credential_unseal\"'", "step:precheck"],
+        &[&format!("exec env AI_ENV_BRIDGE_LOCAL=1 AI_ENV_BRIDGE_MODE=remote \"$wrap\" {argv}"), "test -z \"$hit\""],
+        &["out=$(AWS_REGION=eu-west-3 \"$ai\" doctor 2>&1)", "<- env AWS_REGION=eu-west-3 ignored (region pinned to eu-central-1)"],
+        &["cp \"$ai\" \"$a/ai-env\"", "PATH=\"$p\" \"$a/ai-env\" doctor", "[NO ] ai-env-claude missing", "PATH=\"$p\" \"$a/ai-env\" wrapper install", "test $rc -eq 5"],
+        &["\"$ai\" vm smoke --max-duration 900 --json", "\"$ai\" vm list --json"],
+    ];
+    for ((line, step), wants) in lines.iter().zip(ACCEPT_STEPS).zip(wants) {
+        assert!(line.starts_with(&format!("{shell}{step}\"; ai=\"{}/ai-env\"; wrap=\"{}/ai-env-claude\";", pair.display(), pair.display())), "{step}: its own shell and directory: {line}");
+        assert!(line.contains(&format!("fail() {{ echo \"acceptance: {step}: $*\"; exit 1; }};")) && line.contains("trap 'rm -rf \"$a\"; rmdir "), "{step}: {line}");
+        for want in wants {
+            assert!(line.contains(want), "{step}: {want} missing from its line: {line}");
+        }
+        assert_eq!(line.contains("vm smoke") || line.contains("vm list"), step == "smoke", "{step}: the Touch IDs only in the last step: {line}");
+    }
+    assert!(lines[ACCEPT_STEPS.len()].starts_with("echo \"acceptance: ok:"), "{text}");
+    // No credential-looking literal: the planted value is put together at run time.
+    let mk = read(&Path::new(REPO).join("Makefile"));
+    assert!(mk.match_indices("AKIA").all(|(i, _)| !mk[i + 4..].chars().take(16).all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())), "an AKIA literal in the Makefile");
+    assert_eq!(read(&log), "", "make -n ran a tool");
+    assert!(!w.join("target").exists(), "make -n made {}", w.join("target").display());
+}
+
+/// test-cursor checks STEP before cargo runs: a missing STEP (also one only
+/// the environment names) and one that names no step are exit 2, naming the
+/// five steps; a step runs the checks with the gate, the step and the
+/// filters the command line gives, and no lab knob.
+#[test]
+fn test_cursor_refuses_a_missing_or_unknown_step_before_cargo() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = bin_with(t.path(), &[]);
+    script(
+        &bin.join("cargo"),
+        r#"printf 'cargo %s [TESTS=%s STEP=%s SINCE=%s WORKSPACE=%s] [LAB=%s]\n' "$*" "${AI_ENV_CURSOR_TESTS-}" "${AI_ENV_CURSOR_STEP-}" "${AI_ENV_CURSOR_SINCE-unset}" "${AI_ENV_CURSOR_WORKSPACE-unset}" "$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | tr '\n' ' ')" >> "$FAKE_LOG""#,
+    );
+    let log = t.path().join("cargo.log");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        std::fs::remove_file(&log).ok();
+        let out = make(t.path(), &bin, args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        (out, lines_of(&log))
+    };
+    let steps = "(or t8_4, t8_5, t8_6, t8_7)";
+    for (what, args, envs, want) in [
+        ("no STEP", &["test-cursor"][..], &[][..], format!("test-cursor: STEP is missing: make test-cursor STEP=t8_3 {steps} after that step in Cursor")),
+        ("STEP in the environment only", &["test-cursor"][..], &[("STEP", "t8_3")][..], "test-cursor: STEP is missing".to_string()),
+        ("an unknown step", &["test-cursor", "STEP=t8_8"][..], &[][..], "test-cursor: STEP=t8_8 names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7".to_string()),
+        ("a test's name", &["test-cursor", "STEP=t8_3_evidence"][..], &[][..], "test-cursor: STEP=t8_3_evidence names no step".to_string()),
+    ] {
+        let (out, calls) = run(args, envs);
+        assert_eq!(out.status.code(), Some(2), "{what}: {}", all(&out));
+        assert!(all(&out).contains(&want), "{what}: {}", all(&out));
+        assert_eq!(calls, Vec::<String>::new(), "{what}: cargo ran");
+    }
+    let checks = "cargo +1.98.1 test -p ai-env-cli --features bridge --test cursor_live -- --ignored --nocapture --test-threads=1";
+    let (out, calls) = run(&["test-cursor", "STEP=t8_6", "SINCE=2026-10-14T09:00:00Z", "WORKSPACE=/tmp/a b"], &[("AI_ENV_BRIDGE_LAB_TRANSCRIPT", "skip"), ("AI_ENV_BRIDGE_LAB_FAKE_API", "/f.json")]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP=t8_6 SINCE=2026-10-14T09:00:00Z WORKSPACE=/tmp/a b] [LAB=]")]);
+    let (out, calls) = run(&["test-cursor", "STEP=t8_3"], &[("SINCE", "2026-10-14T09:00:00Z"), ("WORKSPACE", "/w")]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP=t8_3 SINCE=unset WORKSPACE=unset] [LAB=]")], "the environment's filters never reach the checks");
+}
+
+/// The `ai-env` of the pair `make acceptance` runs (ACCEPT_BIN), a
+/// stand-in: each call logged to FAKE_ACCEPT_LOG (its argv, and any lab knob
+/// that reached it); what is live on Mike's Mac answered as a green Mac
+/// answers it (doctor, creds status, vm smoke, vm list, wrapper install); the
+/// offline rest (box seed --dry-run, wrapper census, --version) handed to the
+/// real binary (FAKE_ACCEPT_REAL). With no ai-env-claude beside it (negative
+/// g's copy, alone), doctor and wrapper install go to FAKE_ACCEPT_LONE, the
+/// real binary alone in a directory. The failures a case asks for:
+/// FAKE_ACCEPT_DOCTOR_RC (doctor without AWS_REGION) and
+/// FAKE_ACCEPT_REGION_RC (with it); FAKE_ACCEPT_VERSION (its own
+/// --version); FAKE_ACCEPT_CREDS (`absent`: no token sealed; `refused`: a
+/// `[NO ]` row) and FAKE_ACCEPT_CREDS_RC; FAKE_ACCEPT_REGION=ignore (no word
+/// of AWS_REGION); FAKE_ACCEPT_SEED_FOR, a box seed of a path holding it
+/// answered with FAKE_ACCEPT_SEED_SAY on stderr and FAKE_ACCEPT_SEED_RC;
+/// FAKE_ACCEPT_INSTALL_RC, the lone copy's wrapper install;
+/// FAKE_ACCEPT_BACKEND, vm smoke's backend; FAKE_ACCEPT_LIST, vm list's
+/// answer. FAKE_ACCEPT_CENSUS_TAIL, a census row appended before each
+/// wrapper census (another process's, as a Cursor chat writes meanwhile).
+const ACCEPT_AI_ENV: &str = r##"lab=$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | sort | tr '\n' ' ')
+printf 'ai-env %s%s\n' "$*" "${lab:+ [LAB=${lab% }]}" >> "$FAKE_ACCEPT_LOG"
+here=$(dirname "$0")
+case "${1:-} ${2:-}" in
+  "--version ")
+    if [ -n "${FAKE_ACCEPT_VERSION:-}" ]; then echo "ai-env $FAKE_ACCEPT_VERSION"; exit 0; fi ;;
+  "doctor "|"wrapper install")
+    if [ ! -e "$here/ai-env-claude" ]; then
+      if [ "$1" = wrapper ] && [ -n "${FAKE_ACCEPT_INSTALL_RC:-}" ]; then exit "$FAKE_ACCEPT_INSTALL_RC"; fi
+      exec "$FAKE_ACCEPT_LONE" "$@"
+    fi
+    if [ "$1" = doctor ]; then
+      region="[ok ] region eu-central-1 (pinned in code)"
+      if [ -n "${AWS_REGION:-}" ] && [ "${FAKE_ACCEPT_REGION:-}" != ignore ]; then
+        region="[!! ] region eu-central-1 (pinned in code)  <- env AWS_REGION=$AWS_REGION ignored (region pinned to eu-central-1)"
+      fi
+      printf '%s\n' "ai-env doctor" "  $region" "  [ok ] ai-env-claude next to ai-env ($here/ai-env-claude)"
+      if [ -n "${AWS_REGION:-}" ]; then exit "${FAKE_ACCEPT_REGION_RC:-0}"; fi
+      exit "${FAKE_ACCEPT_DOCTOR_RC:-0}"
+    fi
+    echo "dry run: settings.json not written"
+    exit 0 ;;
+  "creds status")
+    echo "[ok ] [creds] key ai-env-bridge, mode setup-token, deliver fd, Touch ID budget 60 s"
+    case "${FAKE_ACCEPT_CREDS:-}" in
+      absent) echo "[-  ] setup-token.env: absent" ;;
+      refused) printf '%s\n' "[ok ] setup-token.env: sealed, opens with key ai-env-bridge" "[NO ] the sealed setup-token was refused by Anthropic" ;;
+      *) echo "[ok ] setup-token.env: sealed, opens with key ai-env-bridge" ;;
+    esac
+    exit "${FAKE_ACCEPT_CREDS_RC:-0}" ;;
+  "vm smoke")
+    printf '{"backend":"%s","id":"microvm-0123456789abcdef0","ok":true}\n' "${FAKE_ACCEPT_BACKEND:-sdk}"
+    exit 0 ;;
+  "vm list")
+    none='{"backend":"sdk","vms":[]}'
+    printf '%s\n' "${FAKE_ACCEPT_LIST:-$none}"
+    exit 0 ;;
+  "wrapper census")
+    if [ -n "${FAKE_ACCEPT_CENSUS_TAIL:-}" ]; then printf '%s\n' "$FAKE_ACCEPT_CENSUS_TAIL" >> "$AI_ENV_BRIDGE_DIR/logs/census.jsonl"; fi ;;
+  "box seed")
+    case "${3:-}" in *"${FAKE_ACCEPT_SEED_FOR:-//}"*) printf '%s\n' "${FAKE_ACCEPT_SEED_SAY:-}" >&2; exit "${FAKE_ACCEPT_SEED_RC:-0}" ;; esac ;;
+esac
+exec "$FAKE_ACCEPT_REAL" "$@""##;
+
+/// The `ai-env-claude` of the pair: each call logged as [`ACCEPT_AI_ENV`]
+/// logs, then the real wrapper (FAKE_ACCEPT_WRAPPER) exec'd in its place.
+/// The failure a case asks for, FAKE_ACCEPT_DO, acts on a session whose
+/// argv[1] holds FAKE_ACCEPT_FOR (a step's directory): `child` (the wrapper
+/// runs as a child, so the session is not exec'd in place), `unconfigured`
+/// (no bridge.toml: the census row's reason is another), `unseal` (an
+/// unseal's audit row of its pid first), `other` (one of another process,
+/// as a Cursor chat starting meanwhile writes), `refuse` (negative d's exit and line with no
+/// wrapper run, so no census row), `ran` (the stand-in claude run first),
+/// `remote` (the kill switch dropped), `passthrough` (the kill switch
+/// dropped for passthrough, whose exec writes a census row) and `noisy` (a
+/// line on stderr first).
+const ACCEPT_WRAPPER: &str = r##"lab=$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | sort | tr '\n' ' ')
+printf 'ai-env-claude %s%s\n' "$*" "${lab:+ [LAB=${lab% }]}" >> "$FAKE_ACCEPT_LOG"
+case "${1:-}" in *"${FAKE_ACCEPT_FOR:-//}"*) act=${FAKE_ACCEPT_DO:-} ;; *) act= ;; esac
+case "$act" in
+  child) "$FAKE_ACCEPT_WRAPPER" "$@"; exit $? ;;
+  unconfigured) export AI_ENV_BRIDGE_CONFIG=/nonexistent/bridge.toml ;;
+  unseal) echo "{\"v\":1,\"event\":\"credential_unseal\",\"pid\":$$,\"detail\":{\"outcome\":\"ok\"}}" >> "$AI_ENV_BRIDGE_DIR/audit.jsonl" ;;
+  other) echo '{"v":1,"event":"credential_unseal","pid":1,"detail":{"outcome":"ok"}}' >> "$AI_ENV_BRIDGE_DIR/audit.jsonl" ;;
+  refuse) echo "ai-env-claude: refused before any Touch ID: egress connector required (vpc egress asked for, or [egress].require=true) and none configured: make infra-status WRITE=1 writes [aws].egress_connector_arn" >&2; exit 9 ;;
+  ran) "$@" ;;
+  remote) unset AI_ENV_BRIDGE_LOCAL ;;
+  passthrough) unset AI_ENV_BRIDGE_LOCAL; export AI_ENV_BRIDGE_MODE=passthrough ;;
+  noisy) echo "ai-env-claude: noise" >&2 ;;
+esac
+exec "$FAKE_ACCEPT_WRAPPER" "$@""##;
+
+/// The world `make acceptance` runs in here: a planted repo whose target/s8
+/// the bridge root's `[workspaces].roots` holds (its bridge.toml also names
+/// an image, the egress connector and `[egress].require`), the tools negative
+/// g's doctor probes as logged fakes first on PATH, and ACCEPT_BIN's pair as
+/// [`ACCEPT_AI_ENV`] and [`ACCEPT_WRAPPER`]; `lone` is the real `ai-env`
+/// alone in a directory (negative g's product).
+struct Acceptance {
+    t: tempfile::TempDir,
+    w: PathBuf,
+    bin: PathBuf,
+    pair: PathBuf,
+    lone: PathBuf,
+}
+
+impl Acceptance {
+    fn new(lone: &Path) -> Acceptance {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let w = planted_repo(&root, true);
+        std::fs::create_dir_all(w.join("target/s8")).unwrap();
+        let fakes: Vec<(&str, &str)> = ["aws", "claude", "rustup", "zig", "cargo-lambda", "age", "pulumi", "docker", "curl"].iter().map(|n| ("logged.sh", *n)).collect();
+        let bin = bin_with(&root, &fakes);
+        let pair = root.join("pair");
+        script(&pair.join("ai-env"), ACCEPT_AI_ENV);
+        script(&pair.join("ai-env-claude"), ACCEPT_WRAPPER);
+        let a = Acceptance { t, w, bin, pair, lone: lone.to_path_buf() };
+        a.bridge_toml(&format!("[aws]\nimage_arn = \"arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent\"\negress_connector_arn = \"{CONNECTOR_ARN}\"\n\n[egress]\nrequire = true\n\n"), &a.w.join("target/s8"));
+        a
+    }
+
+    fn root(&self) -> PathBuf {
+        self.t.path().canonicalize().unwrap()
+    }
+
+    /// `head` then `[workspaces].roots = [roots]`, as the bridge root's bridge.toml.
+    fn bridge_toml(&self, head: &str, roots: &Path) {
+        std::fs::create_dir_all(self.root().join("bridge")).unwrap();
+        std::fs::write(self.root().join("bridge/bridge.toml"), format!("{head}[workspaces]\nroots = [\"{}\"]\n", roots.display())).unwrap();
+    }
+
+    /// `make <flags> acceptance ACCEPT_BIN=<accept_bin>` in w (`accept_bin` the pair's directory, as the operator
+    /// spells it; no -C, so `flags` are all of MAKEFLAGS' options), isolated like [`make_in`], with the stand-ins'
+    /// knobs, then `envs`.
+    fn run(&self, flags: &[&str], accept_bin: &str, envs: &[(&str, String)]) -> Output {
+        let root = self.root();
+        let mut cmd = Command::new("make");
+        isolate(&mut cmd, &root).env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()));
+        cmd.current_dir(&self.w)
+            .args(flags)
+            .arg("acceptance")
+            .arg(format!("ACCEPT_BIN={accept_bin}"))
+            .env("FAKE_LOG", root.join("tools.log"))
+            .env("FAKE_ACCEPT_LOG", root.join("accept.log"))
+            .env("FAKE_ACCEPT_REAL", bin())
+            .env("FAKE_ACCEPT_WRAPPER", env!("CARGO_BIN_EXE_ai-env-claude"))
+            .env("FAKE_ACCEPT_LONE", &self.lone)
+            .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
+            .bounded()
+    }
+
+    /// The pair's calls, in order.
+    fn calls(&self) -> Vec<String> {
+        lines_of(&self.root().join("accept.log"))
+    }
+
+    /// The census rows the real wrapper wrote.
+    fn census(&self) -> Vec<Value> {
+        lines_of(&self.root().join("bridge/logs/census.jsonl")).iter().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+}
+
+/// `make acceptance` whole, with the pair as stand-ins and the real binaries
+/// behind them where nothing is live (the roots' and the two tripwires' box
+/// seed --dry-run, the wrapper of negatives a, d and e and its census,
+/// negative g's doctor and wrapper install of a lone real ai-env): every
+/// step passes in order, the Touch IDs last, with the lab knobs, the kill
+/// switch and the mode of the caller's shell dropped, target/s8/acceptance
+/// gone and the planted value never shown. Then each step and negative made
+/// to fail in turn: the target stops at that step, naming it, after the
+/// steps before it and before any after it, and still removes its
+/// directory. Some cases pass: one with an ai-env-claude on PATH (negative g
+/// takes the lone copy's PATH without it), one with a relative ACCEPT_BIN
+/// (the steps change directory), one without target/s8 before (the run
+/// removes the one it made; one there before stays), and one where another
+/// process writes audit and census rows meanwhile, as a Cursor chat would.
+#[test]
+fn acceptance_runs_each_step_and_negative_and_stops_at_the_first_that_fails() {
+    let lone_dir = tempfile::tempdir().unwrap();
+    let lone = lone_dir.path().canonicalize().unwrap().join("ai-env");
+    std::fs::copy(bin(), &lone).unwrap();
+    // What the recipe plants (it puts the value together with printf).
+    let key = format!("{}{}", "AKIA", "Q7ZT".repeat(4));
+    #[derive(Clone, Copy, PartialEq)]
+    enum World {
+        Green,
+        NoPair,
+        RootsElsewhere,
+        InlineEgress,
+        ClaudeOnPath,
+        RelativePair,
+        NoS8,
+    }
+    let s = |v: &str| v.to_string();
+    let caller = vec![("AI_ENV_BRIDGE_LAB_EXIT", s("7:planted")), ("AI_ENV_BRIDGE_LAB_FAKE_API", s("/nonexistent/fake.json")), ("AI_ENV_BRIDGE_LAB_TRANSCRIPT", s("skip")), ("AI_ENV_BRIDGE_LOCAL", s("1")), ("AI_ENV_BRIDGE_MODE", s("passthrough")), ("AI_ENV_BRIDGE_VM", s("microvm-0123456789abcdef1"))];
+    // The wrapper's failure for the session of one step's directory.
+    let session = |step: &str, act: &str| vec![("FAKE_ACCEPT_FOR", format!("/{step}/")), ("FAKE_ACCEPT_DO", s(act))];
+    let seed = |step: &str, rc: &str, say: String| vec![("FAKE_ACCEPT_SEED_FOR", format!("/{step}")), ("FAKE_ACCEPT_SEED_RC", s(rc)), ("FAKE_ACCEPT_SEED_SAY", say)];
+    // Another process's census row, newer than the step's own when the step reads the census.
+    let tail = r#"{"v":1,"ts":"2026-10-13T09:00:00Z","start":1,"pid":1,"ppid":1,"ext":null,"route":"remote","reason":"session","argv":["ai-env-claude"],"cwd":"/","env_names":[],"env_selected":{},"note":"mode:remote"}"#;
+    // (what, its world, its environment, the step it fails at and what that step says; none: every step passes)
+    type Case<'a> = (&'a str, World, Vec<(&'a str, String)>, Option<(&'a str, &'a str)>);
+    let cases: Vec<Case> = vec![
+        ("every step passes", World::Green, caller, None),
+        ("ai-env-claude on PATH too", World::ClaudeOnPath, vec![], None),
+        ("other processes write audit and census rows meanwhile", World::Green, [session("egress-required", "other"), vec![("FAKE_ACCEPT_CENSUS_TAIL", s(tail))]].concat(), None),
+        ("a relative ACCEPT_BIN", World::RelativePair, vec![], None),
+        ("no target/s8 before", World::NoS8, vec![], None),
+        ("no pair installed", World::NoPair, vec![], Some(("roots", "no ai-env and ai-env-claude in"))),
+        ("roots without target/s8", World::RootsElsewhere, vec![], Some(("roots", "box seed --dry-run of a clean fixture exited 9: [workspaces].roots of"))),
+        ("doctor fails", World::Green, vec![("FAKE_ACCEPT_DOCTOR_RC", s("1"))], Some(("doctor", "ai-env doctor exited 1 (its rows above)"))),
+        ("a version skew", World::Green, vec![("FAKE_ACCEPT_VERSION", s("0.0.9"))], Some(("version", "version skew: ai-env 0.0.9, ai-env-claude "))),
+        ("no token sealed", World::Green, vec![("FAKE_ACCEPT_CREDS", s("absent"))], Some(("creds", "no sealed setup-token (ai-env creds setup-token)"))),
+        ("a refused token", World::Green, vec![("FAKE_ACCEPT_CREDS", s("refused"))], Some(("creds", "a [NO ] row above"))),
+        ("creds status fails", World::Green, vec![("FAKE_ACCEPT_CREDS_RC", s("1"))], Some(("creds", "ai-env creds status exited 1"))),
+        ("(a) not exec'd in place", World::Green, session("outside-roots", "child"), Some(("outside-roots", "the stand-in claude did not run in place of ai-env-claude"))),
+        ("(a) another reason", World::Green, session("outside-roots", "unconfigured"), Some(("outside-roots", "is not route local, reason outside_roots: {"))),
+        ("(b) not refused", World::Green, seed("planted-key", "0", s("")), Some(("planted-key", "box seed --dry-run exited 0, not 9"))),
+        ("(b) the value shown", World::Green, seed("planted-key", "9", format!("ai-env: workspace refused (finding): {key}")), Some(("planted-key", "box seed --dry-run shows the planted value"))),
+        ("(c) no key named", World::Green, seed("bypass-settings", "9", s("ai-env: workspace refused (finding): HEAD:.claude/settings.json (blob 0123456789ab) line 1: rule default-mode")), Some(("bypass-settings", "the refusal names neither HEAD:.claude/settings.json nor its key permissions.defaultMode"))),
+        ("(d) a form the copy cannot edit", World::InlineEgress, vec![], Some(("egress-required", "bridge.toml still names egress_connector_arn or require (a form this copy does not edit): nothing was run"))),
+        ("(d) an unseal", World::Green, session("egress-required", "unseal"), Some(("egress-required", "1 credential_unseal audit row(s) of pid "))),
+        ("(d) no precheck row", World::Green, session("egress-required", "refuse"), Some(("egress-required", "shows no refusal at the precheck before any Touch ID: none"))),
+        ("(d) the stand-in ran", World::Green, session("egress-required", "ran"), Some(("egress-required", "the stand-in claude ran: a session under the roots in remote mode runs no Mac binary"))),
+        ("(e) the switch ignored", World::Green, session("kill-switch", "remote"), Some(("kill-switch", "ai-env-claude exited 5 saying: ai-env-claude: "))),
+        ("(e) not exec'd in place", World::Green, session("kill-switch", "child"), Some(("kill-switch", "the stand-in claude did not run in place of ai-env-claude"))),
+        ("(e) a census row", World::Green, session("kill-switch", "passthrough"), Some(("kill-switch", "a census row of pid"))),
+        ("(e) a word said", World::Green, session("kill-switch", "noisy"), Some(("kill-switch", "ai-env-claude exited 0 saying: ai-env-claude: noise"))),
+        ("(f) the variable unnamed", World::Green, vec![("FAKE_ACCEPT_REGION", s("ignore"))], Some(("region", "doctor with AWS_REGION=eu-west-3 does not say the variable is ignored for eu-central-1"))),
+        ("(f) doctor fails with the variable", World::Green, vec![("FAKE_ACCEPT_REGION_RC", s("1"))], Some(("region", "doctor with AWS_REGION=eu-west-3 exited 1"))),
+        ("(g) ai-env-claude still beside it", World::Green, vec![("FAKE_ACCEPT_LONE", s(bin()))], Some(("lone-ai-env", "doctor of ai-env alone exited 1 (1 with [NO ] ai-env-claude missing wanted)"))),
+        ("(g) wrapper install not refused", World::Green, vec![("FAKE_ACCEPT_INSTALL_RC", s("0"))], Some(("lone-ai-env", "wrapper install of ai-env alone exited 0, not 5"))),
+        ("the smoke on another backend", World::Green, vec![("FAKE_ACCEPT_BACKEND", s("fake"))], Some(("smoke", "the smoke did not use the SDK backend"))),
+        ("the smoke's VM listed", World::Green, vec![("FAKE_ACCEPT_LIST", s(r#"{"backend":"sdk","vms":[{"id":"microvm-0123456789abcdef0","state":"RUNNING"}]}"#))], Some(("smoke", "vm list still holds microvm-0123456789abcdef0"))),
+    ];
+    // One make per case, side by side (each its own tree).
+    let runs: Vec<(Acceptance, Output)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|(_, world, envs, _)| {
+                let lone = &lone;
+                scope.spawn(move || {
+                    let a = Acceptance::new(lone);
+                    let mut envs = envs.clone();
+                    let mut accept_bin = a.pair.display().to_string();
+                    match world {
+                        World::Green => {}
+                        World::NoPair => {
+                            for name in ["ai-env", "ai-env-claude"] {
+                                std::fs::remove_file(a.pair.join(name)).unwrap();
+                            }
+                        }
+                        World::RootsElsewhere => {
+                            std::fs::create_dir_all(a.root().join("elsewhere")).unwrap();
+                            a.bridge_toml("[aws]\nimage_arn = \"arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent\"\n\n", &a.root().join("elsewhere"));
+                        }
+                        World::InlineEgress => a.bridge_toml(&format!("egress = {{ require = false }}\n\n[aws]\nimage_arn = \"arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent\"\negress_connector_arn = \"{CONNECTOR_ARN}\"\n\n"), &a.w.join("target/s8")),
+                        World::ClaudeOnPath => {
+                            script(&a.root().join("onpath/ai-env-claude"), "echo \"ai-env-claude 0.1.0\"");
+                            envs.push(("PATH", format!("{}:{}:/usr/bin:/bin", a.bin.display(), a.root().join("onpath").display())));
+                        }
+                        // make runs in w, the pair's sibling.
+                        World::RelativePair => accept_bin = "../pair".to_string(),
+                        World::NoS8 => std::fs::remove_dir(a.w.join("target/s8")).unwrap(),
+                    }
+                    let out = a.run(&["-s", "--no-print-directory"], &accept_bin, &envs);
+                    (a, out)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for ((what, world, _, fails), (a, out)) in cases.iter().zip(&runs) {
+        let text = all(out);
+        assert!(!text.contains(&key), "{what}: the planted value in the output");
+        assert!(!a.w.join("target/s8/acceptance").exists(), "{what}: target/s8/acceptance is left: {text}");
+        assert_eq!(a.w.join("target/s8").exists(), *world != World::NoS8, "{what}: target/s8 stays when it was there before, and goes when the run made it: {text}");
+        let calls = a.calls();
+        assert!(calls.iter().all(|c| !c.contains("[LAB=")), "{what}: a lab knob reached the pair: {calls:#?}");
+        let ok = |step: &str| text.contains(&format!("acceptance: {step}: ok ("));
+        match fails {
+            None => {
+                assert!(out.status.success(), "{what}: {text}");
+                let at: Vec<usize> = ACCEPT_STEPS.iter().map(|step| text.find(&format!("acceptance: {step}: ok (")).unwrap_or_else(|| panic!("{what}: no ok line for {step}: {text}"))).collect();
+                assert!(at.windows(2).all(|p| p[0] < p[1]), "{what}: the steps in order: {text}");
+                assert!(text.ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; target/s8/acceptance removed\n"), "{what}: {text}");
+                assert_eq!(calls[calls.len() - 2..], ["ai-env vm smoke --max-duration 900 --json", "ai-env vm list --json"], "{what}: the two Touch IDs last: {calls:#?}");
+                assert!(lines_of(&a.root().join("tools.log")).contains(&"aws sts get-caller-identity --region eu-central-1 --output json".to_string()), "{what}: negative g's doctor is the real one (its probes ran)");
+            }
+            Some((step, want)) => {
+                assert!(!out.status.success(), "{what}: {text}");
+                let said = text.lines().rfind(|l| l.starts_with(&format!("acceptance: {step}: "))).unwrap_or_default();
+                assert!(said.contains(want), "{what}: want {step}'s last line to say {want}: {text}");
+                let at = ACCEPT_STEPS.iter().position(|s| s == step).unwrap();
+                assert!(ACCEPT_STEPS[..at].iter().all(|s| ok(s)) && !ACCEPT_STEPS[at..].iter().any(|s| ok(s)), "{what}: the steps before {step} passed, none from it on: {text}");
+            }
+        }
+        let census = a.census();
+        let cwd = |r: &Value| r["cwd"].as_str().unwrap_or("").to_string();
+        match (*world, *what) {
+            (World::Green, "every step passes") => {
+                assert!(census.iter().any(|r| r["route"] == "local" && r["reason"] == "outside_roots" && cwd(r) == "/" && r["note"] == "mode:remote"), "(a)'s row: {census:#?}");
+                assert!(census.iter().any(|r| r["exit"] == 9 && cwd(r).ends_with("/egress-required/repo") && r["note"].as_str().is_some_and(|n| n.contains("end:spawn_failed") && n.ends_with("step:precheck"))), "(d)'s end row: {census:#?}");
+                assert!(!census.iter().any(|r| cwd(r).contains("/kill-switch/")), "(e) wrote a row: {census:#?}");
+                assert!(!read(&a.root().join("bridge/audit.jsonl")).contains("credential_unseal"), "nothing was unsealed");
+            }
+            (World::RootsElsewhere, _) => {
+                assert!(text.contains(&format!("its roots: roots = [\"{}\"]", a.root().join("elsewhere").display())) && text.contains("is outside [workspaces].roots"), "{what}: the roots named: {text}");
+                assert_eq!(calls.len(), 1, "{what}: nothing after the roots' box seed: {calls:#?}");
+            }
+            (World::NoPair, _) => assert_eq!(calls, Vec::<String>::new(), "{what}: nothing ran"),
+            (World::InlineEgress, _) => assert!(!census.iter().any(|r| cwd(r).contains("/egress-required/")) && !calls.iter().any(|c| c.contains("/egress-required/")), "{what}: the wrapper never ran: {calls:#?}"),
+            _ => {}
+        }
+    }
+}
+
+/// `make -i acceptance` stops before any step: under -i a failed step would
+/// be ignored, the next ones would run (the two Touch IDs among them) and the
+/// last line would say ok. The recipe's first line is a `$(error)` that make
+/// expands before any line runs, -i or not, wherever GNU make 3.81 writes
+/// the -i: MAKEFLAGS' first word (`make -i`, an outer make's -i), or a word
+/// of its own after a long option or after -j. The pair never runs, nothing
+/// is made. And `make acceptance` as the operator types it, no option at all
+/// (MAKEFLAGS is then the ACCEPT_BIN, which holds an `i`), runs every step;
+/// the test above runs with `--no-print-directory`, which holds one too.
+#[test]
+fn acceptance_refuses_make_i_before_any_step() {
+    let lone_dir = tempfile::tempdir().unwrap();
+    let lone = lone_dir.path().canonicalize().unwrap().join("ai-env");
+    std::fs::copy(bin(), &lone).unwrap();
+    let refusal = "*** acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it.";
+    for (what, flags, envs) in [
+        ("-i", &["-i"][..], vec![]),
+        ("-i after a long option", &["-s", "--no-print-directory", "-i"][..], vec![]),
+        ("-i after -j", &["-j2", "-i"][..], vec![]),
+        ("an outer make's -i", &[][..], vec![("MAKEFLAGS", "i".to_string())]),
+    ] {
+        let a = Acceptance::new(&lone);
+        let out = a.run(flags, &a.pair.display().to_string(), &envs);
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(2), "{what}: {text}");
+        assert!(text.contains(refusal) && !text.contains("acceptance: roots"), "{what}: {text}");
+        assert_eq!(a.calls(), Vec::<String>::new(), "{what}: the pair ran");
+        assert!(!a.w.join("target/s8/acceptance").exists(), "{what}: a step's directory was made");
+    }
+    let a = Acceptance::new(&lone);
+    let out = a.run(&[], &a.pair.display().to_string(), &[]);
+    assert!(a.pair.display().to_string().contains('i'));
+    assert!(out.status.success() && all(&out).ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; target/s8/acceptance removed\n"), "{}", all(&out));
+}
+
+// ---- S8: the scrub lists ----
+
+/// The upper-case names a shell script reads (`$NAME`, `${NAME`).
+fn shell_reads(text: &str) -> BTreeSet<String> {
+    text.match_indices('$')
+        .filter_map(|(i, _)| {
+            let rest = &text[i + 1..];
+            let rest = rest.strip_prefix('{').unwrap_or(rest);
+            let name: String = rest.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+            (name.len() > 1 && name.starts_with(|c: char| c.is_ascii_uppercase())).then_some(name)
+        })
+        .collect()
+}
+
+/// Every `"AI_ENV_BRIDGE_<NAME>"` string literal of the Rust files under
+/// `dir`, recursively: the knobs the code reads (a constant's value or a
+/// name read in place).
+fn bridge_knob_literals(dir: &Path, out: &mut BTreeSet<String>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            bridge_knob_literals(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            let text = read(&p);
+            for (i, _) in text.match_indices("\"AI_ENV_BRIDGE_") {
+                let rest = &text[i + 1..];
+                let name: String = rest.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+                if rest[name.len()..].starts_with('"') && !name.ends_with('_') {
+                    out.insert(name);
+                }
+            }
+        }
+    }
+}
+
+/// The string literals of `const NAME: [&str; N] = [...];` in `file`, its
+/// comments left out; N, the length its type gives, is checked against them.
+fn const_list(file: &Path, name: &str) -> BTreeSet<String> {
+    let text = read(file);
+    let head = format!("const {name}: [&str; ");
+    let start = text.find(&head).unwrap_or_else(|| panic!("no {head} in {}", file.display())) + head.len();
+    let n: usize = text[start..start + text[start..].find(']').unwrap()].parse().unwrap();
+    let body = &text[start..start + text[start..].find("];").unwrap()];
+    let names: Vec<String> = body.lines().map(|l| l.split("//").next().unwrap_or("")).flat_map(|l| l.split('"').skip(1).step_by(2).map(str::to_string).collect::<Vec<_>>()).collect();
+    assert_eq!(names.len(), n, "{name} in {}: {names:?}", file.display());
+    names.into_iter().collect()
+}
+
+/// The scrub lists hold every knob that would steer what they guard.
+/// REMOVED_ENV (`tests/common/mod.rs`, every harness spawn): every
+/// `AI_ENV_BRIDGE_*` knob the code reads but the bridge root, which each
+/// harness sets, and every knob of the harness's fakes (claude-v2.sh,
+/// claude.sh, age.sh, git.sh) but the four logs a spawn sets before its
+/// removal. WRAPPER_ENV (`tests/wrapper.rs`, the exec tests): the same code
+/// knobs, and the exec fake's (claude.sh) but its argv log. LAB_UNSET (the
+/// Makefile's live targets): exactly the lab knobs the code and ops.sh read.
+/// The census records the transcript knob's value. The code's knobs are its
+/// `"AI_ENV_BRIDGE_*"` literals; that scan sees every knob constant.
+#[test]
+fn the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read() {
+    use ai_env_cli::bridge::{agent::conn::Trace, census::CENSUS_VALUE_ALLOWLIST, egress::check::FAKE_SHELL_KNOB, lab::VM_KNOBS, pump, remote, route::MODE_ENV};
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut code = BTreeSet::new();
+    bridge_knob_literals(&dir.join("src"), &mut code);
+    let constants = [remote::TRANSCRIPT_KNOB, remote::PIN_KNOB, pump::SYNTHETIC_OAUTH_KNOB, pump::UNSEAL_TIMEOUT_KNOB, pump::MIRROR_ROOT_ENV, MODE_ENV, FAKE_SHELL_KNOB, Trace::ENV];
+    for k in constants.into_iter().chain(VM_KNOBS) {
+        assert!(code.contains(k), "the scan of src/ missed the knob constant {k}: {code:?}");
+    }
+    let knobs: BTreeSet<String> = code.iter().filter(|k| *k != "AI_ENV_BRIDGE_DIR").cloned().collect();
+    let fakes = dir.join("tests/fakes");
+    let reads = |fake: &str| shell_reads(&read(&fakes.join(fake)));
+    let lacks = |list: &BTreeSet<String>, want: &BTreeSet<String>| want.difference(list).cloned().collect::<Vec<String>>();
+
+    let removed = const_list(&dir.join("tests/common/mod.rs"), "REMOVED_ENV");
+    let spawn_sets = ["ARGV_LOG", "FAKE_STDIN_LOG", "FAKE_ENV_LOG", "FAKE_SPAWN_COUNT"];
+    let mut want = knobs.clone();
+    for fake in ["claude-v2.sh", "claude.sh", "age.sh", "git.sh"] {
+        want.extend(reads(fake).into_iter().filter(|n| (n.starts_with("FAKE_") || n.starts_with("GIT_") || n == "ARGV_LOG") && !spawn_sets.contains(&n.as_str())));
+    }
+    assert_eq!(lacks(&removed, &want), Vec::<String>::new(), "REMOVED_ENV (tests/common/mod.rs) lacks these");
+    assert!(spawn_sets.iter().all(|n| !removed.contains(*n)), "Prepared::spawn sets {spawn_sets:?} before it removes REMOVED_ENV");
+
+    let wrapper = const_list(&dir.join("tests/wrapper.rs"), "WRAPPER_ENV");
+    let mut want = knobs.clone();
+    want.extend(reads("claude.sh").into_iter().filter(|n| n.starts_with("FAKE_")));
+    assert_eq!(lacks(&wrapper, &want), Vec::<String>::new(), "WRAPPER_ENV (tests/wrapper.rs) lacks these");
+    assert!(!wrapper.contains("ARGV_LOG"), "the exec tests set the argv log before they remove WRAPPER_ENV");
+
+    let t = tempfile::tempdir().unwrap();
+    let vars = make_vars(t.path(), &[]);
+    let unset: BTreeSet<String> = vars["LAB_UNSET"].split(" -u ").skip(1).map(str::to_string).collect();
+    let mut want: BTreeSet<String> = knobs.iter().filter(|k| k.starts_with("AI_ENV_BRIDGE_LAB_")).cloned().collect();
+    for script in std::fs::read_dir(Path::new(REPO).join("infra/scripts")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "sh")) {
+        want.extend(shell_reads(&read(&script)).into_iter().filter(|n| n.starts_with("AI_ENV_BRIDGE_LAB_")));
+    }
+    assert_eq!(unset, want, "LAB_UNSET drops exactly the lab knobs the code and infra/scripts read");
+    assert_eq!(vars["LAB_UNSET"], LAB_UNSET, "the dry-run tests' LAB_UNSET is the Makefile's");
+    assert!(CENSUS_VALUE_ALLOWLIST.contains(&remote::TRANSCRIPT_KNOB), "the census records the transcript knob's value (skip forces the resume miss)");
+}
+
+// ---- phase 4 F9: make perf-wrapper PREWARM=1 (T8.6's offline half) ----
+
+/// `make -n perf-wrapper`: T1.2's release run of tests/wrapper.rs's
+/// overhead test. `PREWARM=1` on the command line adds the release run of
+/// tests/prewarm.rs's (the prewarm's cost to `auth status`, T8.6), gated by
+/// `AI_ENV_PERF_TESTS=1` like T1.2's; the same name in the environment adds
+/// nothing. The `overhead` filter names that test, which is ignored outside
+/// this target. Nothing runs.
+#[test]
+fn make_n_perf_wrapper_adds_the_prewarm_run_only_with_prewarm_1_on_the_command_line() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make(t.path(), &bin, &["-n"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let release = "AI_ENV_PERF_TESTS=1 cargo +1.98.1 test --release -p ai-env-cli --features bridge";
+    let t1_2 = format!("{release} --test wrapper -- --ignored overhead --nocapture --test-threads=1\n");
+    let t8_6 = format!("{release} --test prewarm -- --ignored overhead --nocapture --test-threads=1\n");
+    assert_eq!(dry(&["perf-wrapper"], &[]), t1_2);
+    assert_eq!(dry(&["perf-wrapper", "PREWARM=1"], &[]), format!("{t1_2}{t8_6}"), "T1.2's run, then T8.6's");
+    assert_eq!(dry(&["perf-wrapper"], &[("PREWARM", "1")]), t1_2, "PREWARM=1 in the environment is ignored");
+    let prewarm = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/prewarm.rs"));
+    let ignored = "#[ignore = \"perf measurement: make perf-wrapper PREWARM=1 (AI_ENV_PERF_TESTS=1, release)\"]\nfn t8_6_prewarm_auth_status_overhead_median_100_runs() {\n";
+    assert!(prewarm.contains(ignored), "tests/prewarm.rs's perf test, which the overhead filter names, is no longer ignored as make perf-wrapper's");
+    assert_eq!(read(&log), "", "make -n ran a tool");
 }

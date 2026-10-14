@@ -290,6 +290,8 @@ fn unknown_key_note(user: &str) -> String {
 
 /// `e` with `note` appended, keeping its exit class. A broken pipe (exit 0)
 /// becomes exit 1: a failure to store a key must never look like success.
+/// A dismissed dialog (`Cancelled`, which carries no text) has the note said
+/// through the voice instead (S8: the wrapper's log, the CLI's stderr).
 pub(crate) fn with_note(e: CliError, note: &str) -> CliError {
     let add = |m: String| format!("{m}\n{note}");
     match e {
@@ -304,7 +306,7 @@ pub(crate) fn with_note(e: CliError, note: &str) -> CliError {
         CliError::BrokenPipe => CliError::Msg(add("broken pipe".into())),
         CliError::Exit(code) => CliError::Msg(add(format!("exit status {code}"))),
         CliError::Cancelled => {
-            eprintln!("{note}");
+            crate::bridge::voice::note(note);
             CliError::Cancelled
         }
     }

@@ -27,6 +27,10 @@
 #   FAKE_AGE_PIDFILE    a hanging decrypt writes its pid here and logs
 #                  `age TERM <pid>` to FAKE_AGE_LOG on SIGTERM, so a test can
 #                  see the group signal arrive
+#   FAKE_AGE_IGNORE_TERM  a decrypt ignores SIGTERM, and so do the commands it
+#                  runs (set before the pid is written, in place of the
+#                  PIDFILE's trap): with FAKE_AGE_HANG, a group only SIGKILL
+#                  ends
 set -u
 me=$(basename "$0")
 if [ -n "${FAKE_AGE_LOG:-}" ]; then
@@ -94,9 +98,15 @@ if [ "$mode" = d ]; then
     echo 'age: error: age-plugin-se: The operation couldn.t be completed. (kSecError error -128 - User canceled the operation.)' >&2
     exit 1
   fi
+  if [ -n "${FAKE_AGE_IGNORE_TERM:-}" ]; then
+    # Before the pid is written: a test that read it finds TERM ignored already.
+    trap '' TERM
+  fi
   if [ -n "${FAKE_AGE_PIDFILE:-}" ]; then
     printf '%s\n' "$$" > "$FAKE_AGE_PIDFILE"
-    trap 'if [ -n "${FAKE_AGE_LOG:-}" ]; then printf "age TERM %s\n" "$$" >> "$FAKE_AGE_LOG"; fi; exit 143' TERM
+    if [ -z "${FAKE_AGE_IGNORE_TERM:-}" ]; then
+      trap 'if [ -n "${FAKE_AGE_LOG:-}" ]; then printf "age TERM %s\n" "$$" >> "$FAKE_AGE_LOG"; fi; exit 143' TERM
+    fi
   fi
   if [ -n "${FAKE_AGE_DELAY_MS:-}" ]; then
     # `sleep` takes a fraction on every shell the tests run on.

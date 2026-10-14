@@ -2,6 +2,7 @@
 //! 9 policy, 5 credentials unavailable, 3 cancelled, 1 everything else.
 use crate::errors::CliError;
 use crate::wire::frame::RunHookPayload;
+use crate::wire::redact::scrub;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -29,6 +30,10 @@ pub enum BridgeError {
     EndpointThrottled { retry_after_s: Option<u64> },
     /// The VM answers no `/agent` (404): an image older than S6.
     NoAgent(String),
+    /// S8: the VM lacks a capability a step needs (`cap`, e.g. `workspace_v1`:
+    /// the seed, code-out, transcript and settings routes): an image older
+    /// than S8. Never retried; nothing was sent.
+    NoCapability { cap: &'static str, message: String },
     // exit 5
     /// S7: the VM's credential cache no longer holds the seal a delivery
     /// expected it to hold (it went after it was checked), and no unsealed
@@ -66,6 +71,12 @@ pub enum BridgeError {
     MaxConcurrent(u32),
     /// A request the policy refuses (a token port outside the allowlist, a VM of another image, …).
     Policy(String),
+    /// S8: the workspace data plane refused (`code`: the shim's refusal code,
+    /// `wire::workspace::refusal`, such as `symlink_component` or
+    /// `other_workspace`, or the Mac's own, `bridge::workspace::code`, such as
+    /// `not_a_git_repo` or `wip_too_large`); `message` names the path, ref or
+    /// rule, never a value.
+    WorkspaceRefused { code: &'static str, message: String },
     // exit 1 (vm exec maps `not_found` to 127 and `exec` to 126, like a shell, and `limit` to 9)
     /// The VM could not start the command: `code` is the shim's `spawn_err`
     /// code (`not_found`, `exec`, `cwd`, `limit`), `message` its scrubbed text.
@@ -74,6 +85,11 @@ pub enum BridgeError {
     Io(std::io::Error),
     /// A lock stayed held past its budget (`workspace busy (pid N)`).
     Busy(String),
+    /// S8: a workspace step failed (`code`: the wire's `git_failed`,
+    /// `bad_pack`, `timeout`, …, or the Mac's own, `bridge::workspace::code`,
+    /// such as `unsupported_repo`): a git run, a pack the VM did not take, an
+    /// unsupported repository (shallow, bare, …).
+    WorkspaceFailed { code: &'static str, message: String },
     // its own exit code
     /// A failure the CLI side already classified (S7: a credential step inside
     /// a `lab run` probe): its own exit code and text, so a missing key stays 4
@@ -133,6 +149,8 @@ impl fmt::Display for BridgeError {
                 None => f.write_str("endpoint throttled (HTTP 429) past the reconnect budget"),
             },
             BridgeError::NoAgent(m) => write!(f, "the VM's shim has no /agent ({m}): its image is older than S6; start a VM of the current image"),
+            // The S8 texts are scrubbed here too: a message may quote what the VM or git said.
+            BridgeError::NoCapability { cap, message } => write!(f, "the VM's shim lacks {cap} ({}): its image is older than S8; run make deploy, then use a VM of the new image", scrub(message)),
             BridgeError::CredentialsUnavailable(m) => write!(f, "credentials unavailable: {m}"),
             BridgeError::CredentialMissing(m) => write!(f, "credential not on the VM: {m}"),
             BridgeError::Cancelled => f.write_str("cancelled"),
@@ -150,7 +168,8 @@ impl fmt::Display for BridgeError {
             BridgeError::VmNotFound(m) => write!(f, "microvm not found: {m}"),
             BridgeError::Tripwire(m) => write!(f, "tripwire: {m}"),
             BridgeError::SettingsWidening(m) => write!(f, "repo settings widen permissions: {m}"),
-            BridgeError::EgressRequired => f.write_str("egress connector required ([egress].require=true) and none configured"),
+            // At most 160 characters, so the remote wrapper's P0 line (`remote::Failure::Refused`) keeps the fix whole.
+            BridgeError::EgressRequired => f.write_str("egress connector required (vpc egress asked for, or [egress].require=true) and none configured: make infra-status WRITE=1 writes [aws].egress_connector_arn"),
             BridgeError::EgressMismatch(m) => {
                 let EgressMismatch { id, expected, echoed, terminated } = m.as_ref();
                 let list = |l: &[String]| if l.is_empty() { "nothing".to_string() } else { l.join(", ") };
@@ -173,10 +192,12 @@ impl fmt::Display for BridgeError {
             BridgeError::PayloadTooLarge(n) => write!(f, "run-hook payload of {n} bytes exceeds {}", RunHookPayload::MAX_BYTES),
             BridgeError::MaxConcurrent(n) => write!(f, "[vm].max_concurrent={n} reached"),
             BridgeError::Policy(m) => write!(f, "refused: {m}"),
+            BridgeError::WorkspaceRefused { code, message } => write!(f, "workspace refused ({code}): {}", scrub(message)),
             BridgeError::SpawnRefused { code, message } => write!(f, "the VM could not start the command ({code}): {message}"),
             BridgeError::Config(m) => write!(f, "config: {m}"),
             BridgeError::Io(e) => write!(f, "{e}"),
             BridgeError::Busy(m) => write!(f, "busy: {m}"),
+            BridgeError::WorkspaceFailed { code, message } => write!(f, "workspace failed ({code}): {}", scrub(message)),
             BridgeError::Cli(e) => write!(f, "{e}"),
         }
     }
@@ -205,7 +226,8 @@ impl From<BridgeError> for CliError {
             | BridgeError::Endpoint(_)
             | BridgeError::Ambiguous { .. }
             | BridgeError::EndpointThrottled { .. }
-            | BridgeError::NoAgent(_) => CliError::Aws(text),
+            | BridgeError::NoAgent(_)
+            | BridgeError::NoCapability { .. } => CliError::Aws(text),
             BridgeError::CredentialsUnavailable(_) | BridgeError::CredentialMissing(_) => CliError::AuthUnavailable(text),
             BridgeError::Cancelled => CliError::Cancelled,
             BridgeError::Transport(_)
@@ -223,8 +245,9 @@ impl From<BridgeError> for CliError {
             | BridgeError::OutsideRoots(_)
             | BridgeError::PayloadTooLarge(_)
             | BridgeError::MaxConcurrent(_)
-            | BridgeError::Policy(_) => CliError::Policy(text),
-            BridgeError::Config(_) | BridgeError::Busy(_) | BridgeError::SpawnRefused { .. } => CliError::Msg(text),
+            | BridgeError::Policy(_)
+            | BridgeError::WorkspaceRefused { .. } => CliError::Policy(text),
+            BridgeError::Config(_) | BridgeError::Busy(_) | BridgeError::SpawnRefused { .. } | BridgeError::WorkspaceFailed { .. } => CliError::Msg(text),
             BridgeError::Io(io) => CliError::from(io),
             BridgeError::Cli(e) => e,
         }
@@ -379,6 +402,13 @@ mod tests {
             (BridgeError::Io(std::io::Error::other("io")), 1),
             (BridgeError::Cli(CliError::NoKey("k".into())), 4),
             (BridgeError::Cli(CliError::Exit(143)), 143),
+            // S8: an image without the capability, a workspace the data plane refuses, a workspace step that failed.
+            (BridgeError::NoCapability { cap: "workspace_v1", message: "GET /seed answered 404".into() }, 7),
+            (BridgeError::WorkspaceRefused { code: crate::wire::workspace::refusal::SYMLINK_COMPONENT, message: "/Users/mike/w".into() }, 9),
+            (BridgeError::WorkspaceRefused { code: crate::bridge::workspace::code::NOT_A_GIT_REPO, message: "/Users/mike/w".into() }, 9),
+            (BridgeError::WorkspaceRefused { code: crate::bridge::workspace::code::WIP_TOO_LARGE, message: "/Users/mike/w".into() }, 9),
+            (BridgeError::WorkspaceFailed { code: crate::wire::workspace::refusal::GIT_FAILED, message: "git exited 128".into() }, 1),
+            (BridgeError::WorkspaceFailed { code: crate::bridge::workspace::code::UNSUPPORTED_REPO, message: "a shallow repository".into() }, 1),
         ];
         for (e, code) in cases {
             let text = e.to_string();
@@ -498,6 +528,23 @@ mod tests {
         assert!(pass.contains("iam:PassRole on the execution role") && pass.contains("--no-execution-role") && !pass.contains("aws.env"), "{pass}");
         let pnc = BridgeError::AccessDenied("run_microvm: ... not authorized to perform: lambda:PassNetworkConnector on resource: ...".into()).to_string();
         assert!(pnc.contains("must allow lambda:PassNetworkConnector") && !pnc.contains("aws.env") && !pnc.contains("make connector-status"), "{pnc}");
+        // The missing connector names the command that writes it; `make acceptance` greps the start.
+        let required = BridgeError::EgressRequired.to_string();
+        assert!(required.starts_with("egress connector required (") && required.ends_with("and none configured: make infra-status WRITE=1 writes [aws].egress_connector_arn"), "{required}");
+    }
+
+    /// The S8 variants name the capability or the code and the fix, and
+    /// never show a secret a message may quote (a git or shim text).
+    #[test]
+    fn the_s8_errors_name_their_code_and_never_a_secret() {
+        let token = format!("{}-{}-{}-{}", "sk", "ant", "oat01", "b".repeat(40));
+        let key_id = format!("{}{}", "AKIA", "Q".repeat(16));
+        let cap = BridgeError::NoCapability { cap: "workspace_v1", message: format!("404 from a shim that printed {token}") }.to_string();
+        assert!(cap.contains("lacks workspace_v1") && cap.contains("make deploy") && !cap.contains(&token), "{cap}");
+        let refused = BridgeError::WorkspaceRefused { code: crate::bridge::workspace::code::FINDING, message: format!("refs/heads/dev:cfg/prod.yaml line 3 holds {key_id}") }.to_string();
+        assert!(refused.starts_with("workspace refused (finding): refs/heads/dev:cfg/prod.yaml") && !refused.contains(&key_id), "{refused}");
+        let failed = BridgeError::WorkspaceFailed { code: crate::wire::workspace::refusal::GIT_FAILED, message: format!("git exited 128: token={token}") }.to_string();
+        assert!(failed.starts_with("workspace failed (git_failed): git exited 128") && !failed.contains(&token), "{failed}");
     }
 
     #[test]

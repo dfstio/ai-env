@@ -12,7 +12,7 @@ use ai_env_cli::shim::peer::{AgentGuard, Peer, DRAIN_MAX};
 use ai_env_cli::shim::sys::{ClockMode, SysOps};
 use ai_env_cli::wire::frame::{
     ClientInfo, CredentialErrCode, CredentialView, Deliver, ErrorCode, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, HelloErrCode, ResumePoint, ResumeStatus, Resumed, RunHookPayload, SpawnErrCode, SpawnId,
-    CAP_CREDENTIAL_CACHE, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
+    CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -789,33 +789,6 @@ async fn terminate_drains() {
     assert_eq!(state.health().await.status, HealthStatus::Draining);
 }
 
-/// The code port puts the session bearer in front of every path (S6): 401
-/// before `/run`, without the bearer or with a wrong one; 404 "not
-/// implemented" behind it.
-#[tokio::test]
-async fn code_port_answers_401_then_404_with_the_bearer() {
-    let t = tempfile::tempdir().unwrap();
-    let state = state_with(fake_claude(t.path(), ""), opts(None, HookSource::Log, 0)).await;
-    let code = serve_code(state.clone()).await;
-    let hooks_addr = serve_hooks(state).await;
-    let paths = [("GET", "/"), ("PUT", "/seed"), ("GET", "/bundle?since=x")];
-    for (m, p) in paths {
-        let (s, head, b) = http_with(code, m, p, &bearer_header(TOKEN), b"").await;
-        assert_eq!(s, 401, "before /run, no commitment: {m} {p}: {b}");
-        assert!(head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}");
-    }
-    assert_eq!(hook(hooks_addr, "run", &run_body("mvm-code", Some(&payload_json("mike@mbp")))).await.0, 200);
-    for (m, p) in paths {
-        let (s, _, b) = http(code, m, p, b"x", Some("text/plain")).await;
-        assert_eq!(s, 401, "{m} {p}: {b}");
-        assert!(b.contains("unauthorized"), "{b}");
-        assert_eq!(http_with(code, m, p, &bearer_header("not-the-token"), b"").await.0, 401, "{m} {p}: a wrong token");
-        let (s, _, b) = http_with(code, m, p, &bearer_header(TOKEN), b"").await;
-        assert_eq!(s, 404, "{m} {p}: {b}");
-        assert!(b.contains("not implemented (S8/S9)"), "{b}");
-    }
-}
-
 // ---- S6: /agent, the session bearer, the peer guard ---------------------------------
 
 /// One in-process shim on 127.0.0.1 with OS-chosen ports: hooks, app, code.
@@ -1136,33 +1109,6 @@ async fn agent_upgrade_is_busy_after_max_unauthenticated() {
     s.wait_no_sockets().await;
     let mut w = ws_hello_ok(s.app).await;
     ping(&mut w, 10).await;
-}
-
-/// The app port: `/health` and `/agent` are public; `/health/detail` and
-/// every other path need the session bearer (401 without, and before any
-/// commitment exists); an unknown path is 404 behind it.
-#[tokio::test]
-async fn app_port_bearer() {
-    let s = Stack::log().await;
-    assert_eq!(http_with(s.app, "GET", "/health/detail", &bearer_header(TOKEN), b"").await.0, 401, "no commitment before /run");
-    s.run(true).await;
-    assert_eq!(http(s.app, "GET", "/health", b"", None).await.0, 200);
-    for (m, p, body) in [("PUT", "/transcript", &b"{}"[..]), ("GET", "/health/detail", b""), ("POST", "/seed", b"x")] {
-        let (st, head, b) = http(s.app, m, p, body, Some("application/json")).await;
-        assert_eq!(st, 401, "{m} {p}: {b}");
-        assert!(b.contains("\"unauthorized\"") && head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}{b}");
-        assert_eq!(http_with(s.app, m, p, &bearer_header("not-the-token"), body).await.0, 401, "{m} {p}: a wrong token");
-    }
-    let (st, _, b) = http_with(s.app, "PUT", "/transcript", &bearer_header(TOKEN), b"{}").await;
-    assert_eq!(st, 404, "{b}");
-    assert!(b.contains("not implemented (S8/S9)"), "{b}");
-    let (d, body) = s.detail().await;
-    for key in ["\"hook_source\":\"log\"", "\"agent_guard\":\"off\"", "\"listeners\":", "\"refused_peers\":", "\"hook_peers\":", "\"wire\":1"] {
-        assert!(body.contains(key), "{key} in {body}");
-    }
-    assert!(d.health.run_hook_seen && !d.has_credentials && d.spawns.is_empty());
-    assert_eq!(d.listeners.is_empty(), !cfg!(target_os = "linux"), "the LISTEN inventory exists on Linux only: {:?}", d.listeners);
-    assert!(!body.contains(TOKEN) && !body.contains("commit"), "{body}");
 }
 
 /// Every answer of the side ports reads the request body first (at most
@@ -1835,7 +1781,7 @@ fn shim_help_lists_the_entrypoint_surface() {
         let block = flag_block(&text, head);
         assert!(block.contains(&format!("[default: {default}]")), "{head}: [default: {default}] missing from {block:?}");
     }
-    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes"] {
+    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes", "--helper", "--git"] {
         assert!(!text.contains(hidden), "{hidden} is a hidden test/role flag:\n{text}");
     }
 }
@@ -1879,6 +1825,9 @@ fn the_image_entrypoint_runs_the_agent_as_1000_1000() {
     assert!(matches!(a.agent_guard, None | Some(AgentGuard::On | AgentGuard::Log)), "the image never runs --agent-guard off: {:?}", a.agent_guard);
     assert!(!a.supervise && a.init_pid.is_none() && a.fs_root.is_none() && a.delay_run.is_none(), "PID 1 is init by its pid, not by a flag");
     assert_eq!(a.kill_after_s, 70);
+    // S8: the workspace helper is the shim's own binary and the image's git; the ENTRYPOINT names neither.
+    assert!(a.helper.is_none() && !argv.iter().any(|w| w == "--helper" || w == "--git"), "{argv:?}");
+    assert_eq!(a.git, PathBuf::from("/usr/bin/git"));
 }
 
 #[test]
@@ -2412,4 +2361,1184 @@ async fn binary_stops_drop_the_cached_credential_first() {
         let leaks = lines.iter().filter(|l| l.contains(&value)).count();
         assert_eq!(leaks, 0, "{why}: {leaks} stderr line(s) hold the value");
     }
+}
+
+// ---- S8: the workspace data plane through the routes ---------------------------------------
+//
+// An in-process shim whose helper is this build's `ai-env` (`shim-io`, as the
+// image runs it, here as this test's uid), its VM disk `<tmp>/vm` (the
+// hidden `--fs-root`), the agent's home `/Users/agent` there, and the real
+// git (or tests/fakes/git.sh logging to `<tmp>/git.log`); seeds are built
+// from `<tmp>/mac` with the git CLI as the Mac's data plane builds them
+// (D2's WIP commits, D7's shallow pack and its manifest line).
+
+use ai_env_cli::wire::workspace::{
+    head_line, CodeoutManifest, HelperHead, ObjectFormat, SeedManifest, SeedRecord, SeedReply, SeedState, SettingsCapture, TranscriptReply, TranscriptStat, WorkspaceView, WsRefusal, SEED_REF, SEED_WIP_REF,
+    TRANSCRIPT_MAX,
+};
+
+const VM_HOME: &str = "/Users/agent";
+const WS: &str = "/Users/agent/ws";
+const S8_SLUG: &str = "-Users-agent-ws";
+const S8_ID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+/// The real git: the first in an absolute `PATH` entry, else `/usr/bin/git`.
+fn git_real() -> &'static Path {
+    static REAL: OnceLock<PathBuf> = OnceLock::new();
+    REAL.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .filter(|d| d.is_absolute())
+            .map(|d| d.join("git"))
+            .chain(std::iter::once(PathBuf::from("/usr/bin/git")))
+            .find(|g| std::fs::metadata(g).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+            .expect("a real git")
+    })
+}
+
+/// `git <args>` in `dir` (no user or system config, one author at one date,
+/// `env` on top, `input` on stdin): stdout. A failure panics with stderr.
+fn git_with(dir: &Path, args: &[&str], env: &[(&str, &Path)], input: Option<&[u8]>) -> Vec<u8> {
+    let mut cmd = Command::new(git_real());
+    cmd.args(args)
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", dir)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .env("GIT_AUTHOR_DATE", "2026-10-12T08:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-10-12T08:00:00Z")
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("run git");
+    if let Some(bytes) = input {
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    out.stdout
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&git_with(dir, args, &[], None)).trim().to_string()
+}
+
+/// `git status --porcelain=v1`'s lines, as they are.
+fn git_status(dir: &Path) -> Vec<String> {
+    String::from_utf8_lossy(&git_with(dir, &["status", "--porcelain=v1", "--untracked-files=all"], &[], None)).lines().map(str::to_string).collect()
+}
+
+fn write_file(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+/// tests/fakes/git.sh as `dest` (a hard link of one cached 0755 master: macOS
+/// assesses every new executable's first exec) with its knobs file beside it:
+/// the real git, and its log.
+fn fake_git(dest: &Path, log: &Path) {
+    static MASTER: OnceLock<PathBuf> = OnceLock::new();
+    let master = MASTER.get_or_init(|| {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/git.sh")).unwrap();
+        let digest = hex::encode(sha2::Sha256::digest(&bytes));
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fake-git");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("git-{}", &digest[..16]));
+        if !path.exists() {
+            let tmp = dir.join(format!(".git-{}.{}.tmp", &digest[..16], std::process::id()));
+            std::fs::write(&tmp, &bytes).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+        }
+        path
+    });
+    std::fs::hard_link(master, dest).unwrap();
+    let knobs = format!("export GIT_REAL='{}'\nexport GIT_ARGV_LOG='{}'\n", git_real().display(), log.display());
+    std::fs::write(format!("{}.knobs", dest.display()), knobs).unwrap();
+}
+
+/// `<root>/slow-git`: the real git, `secs` late when its arguments name
+/// `sub`; run once first (macOS assesses a new executable at its first exec).
+fn slow_git(root: &Path, sub: &str, secs: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("slow-git");
+    std::fs::write(&path, format!("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = {sub} ]; then sleep {secs}; fi\ndone\nexec '{}' \"$@\"\n", git_real().display())).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Command::new(&path).arg("--version").stdout(Stdio::null()).status().unwrap().success());
+    path
+}
+
+/// The fake git's log: per call, the `GIT_*` names set, the fds open, the arguments.
+fn git_log(log: &Path) -> Vec<(Vec<String>, String, Vec<String>)> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let mut f = l.split('\t');
+            let env = f.next().unwrap().trim_start_matches("env=");
+            let fds = f.next().unwrap().trim_start_matches("fds=").to_string();
+            let names = if env == "-" { Vec::new() } else { env.split(',').map(str::to_string).collect() };
+            (names, fds, f.map(str::to_string).collect())
+        })
+        .collect()
+}
+
+/// The Mac's dirty state as D2's WIP commits (index commit, WIP commit), `None` when clean.
+fn mac_wip(mac: &Path) -> Option<(String, Option<String>)> {
+    let head = git(mac, &["rev-parse", "HEAD"]);
+    let head_tree = git(mac, &["rev-parse", "HEAD^{tree}"]);
+    let index_tree = git(mac, &["write-tree"]);
+    let scratch = mac.join(".git/test-index.w");
+    std::fs::copy(mac.join(".git/index"), &scratch).unwrap();
+    git_with(mac, &["add", "-A"], &[("GIT_INDEX_FILE", &scratch)], None);
+    let work_tree = String::from_utf8_lossy(&git_with(mac, &["write-tree"], &[("GIT_INDEX_FILE", &scratch)], None)).trim().to_string();
+    std::fs::remove_file(&scratch).unwrap();
+    if work_tree == head_tree && index_tree == head_tree {
+        return None;
+    }
+    let index = (index_tree != head_tree).then(|| git(mac, &["commit-tree", &index_tree, "-p", &head, "-m", "index"]));
+    let mut args = vec!["commit-tree", work_tree.as_str(), "-p", head.as_str()];
+    if let Some(i) = &index {
+        args.extend(["-p", i.as_str()]);
+    }
+    args.extend(["-m", "wip"]);
+    Some((git(mac, &args), index))
+}
+
+/// A first seed's `PUT /seed` body of the Mac's head and WIP (D7): the
+/// manifest line, then the pack of exactly the head's commit and tree and
+/// the WIP commits.
+fn clone_body(mac: &Path, branch: Option<&str>) -> (SeedManifest, Vec<u8>) {
+    let head = git(mac, &["rev-parse", "HEAD"]);
+    let wip = mac_wip(mac);
+    let mut m = SeedManifest {
+        v: SeedManifest::V,
+        object_format: ObjectFormat::Sha1,
+        branch: branch.map(str::to_string),
+        detached: branch.is_none(),
+        head: head.clone(),
+        wip: wip.as_ref().map(|w| w.0.clone()),
+        index: wip.as_ref().and_then(|w| w.1.clone()),
+        shallow: vec![head.clone()],
+        refs: BTreeMap::new(),
+    };
+    m.refs = m.expected_refs();
+    let mut args = vec!["rev-list", "--objects", "--no-walk", head.as_str()];
+    args.extend(m.wip.as_deref());
+    args.extend(m.index.as_deref());
+    let objects: String = git(mac, &args).lines().map(|l| format!("{}\n", l.split(' ').next().unwrap())).collect();
+    let mut body = head_line(&m).unwrap();
+    body.extend(git_with(mac, &["pack-objects", "--stdout", "-q"], &[], Some(objects.as_bytes())));
+    (m, body)
+}
+
+/// An update's body (D3): the thin pack of `head` (and the WIP) less what
+/// the VM's `tip` reaches within its shallow boundary `seeded`.
+fn update_body(mac: &Path, base: &SeedManifest, tip: &str, seeded: &str) -> (SeedManifest, Vec<u8>) {
+    let head = git(mac, &["rev-parse", "HEAD"]);
+    let wip = mac_wip(mac);
+    let mut m = SeedManifest { head: head.clone(), wip: wip.as_ref().map(|w| w.0.clone()), index: wip.as_ref().and_then(|w| w.1.clone()), shallow: Vec::new(), refs: BTreeMap::new(), ..base.clone() };
+    m.refs = m.expected_refs();
+    let shallow_file = mac.join(".git/test-vm-shallow");
+    std::fs::write(&shallow_file, format!("{seeded}\n")).unwrap();
+    let mut revs = format!("{head}\n");
+    if let Some(w) = &m.wip {
+        revs.push_str(&format!("{w}\n"));
+    }
+    revs.push_str(&format!("^{tip}\n"));
+    let mut body = head_line(&m).unwrap();
+    body.extend(git_with(mac, &["--shallow-file", shallow_file.to_str().unwrap(), "pack-objects", "--revs", "--thin", "--stdout", "-q"], &[], Some(revs.as_bytes())));
+    (m, body)
+}
+
+/// One request with the session bearer (`Connection: close`; `body` with its
+/// `Content-Length`): status, head, the body's bytes.
+async fn request(addr: SocketAddr, method: &str, path: &str, extra: &str, body: Option<&[u8]>) -> (u16, String, Vec<u8>) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let len = body.map_or(String::new(), |b| format!("Content-Length: {}\r\n", b.len()));
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{}{extra}{len}Connection: close\r\n\r\n", bearer_header(TOKEN));
+    s.write_all(head.as_bytes()).await.unwrap();
+    if let Some(b) = body {
+        // A refusal may come before the whole body was read; what came back is still read.
+        let _ = s.write_all(b).await;
+    }
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), s.read_to_end(&mut buf)).await.expect("an answer within 60 s").unwrap();
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or_else(|| panic!("no head in {:?}", String::from_utf8_lossy(&buf)));
+    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap();
+    (status, head, buf[end + 4..].to_vec())
+}
+
+fn json(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(body).unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(body)))
+}
+
+fn refusal_of(body: &[u8]) -> WsRefusal {
+    serde_json::from_slice(body).unwrap_or_else(|e| panic!("not a refusal ({e}): {}", String::from_utf8_lossy(body)))
+}
+
+/// The S8 world (the section's doc), `/run` done.
+struct Vm {
+    s: Stack,
+    root: PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+impl Vm {
+    async fn new() -> Vm {
+        Vm::with(|_| git_real().to_path_buf()).await
+    }
+
+    /// With the fake git as the helper's, logging to `<tmp>/git.log`.
+    async fn with_fake_git() -> Vm {
+        Vm::with(|root| {
+            fake_git(&root.join("vm-git"), &root.join("git.log"));
+            root.join("vm-git")
+        })
+        .await
+    }
+
+    /// With the git `make` puts in the test's root as the helper's.
+    async fn with(make: impl FnOnce(&Path) -> PathBuf) -> Vm {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        // The agent's home exists, as the image's does.
+        std::fs::create_dir_all(root.join("vm/Users/agent")).unwrap();
+        let git_path = make(&root);
+        let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(PathBuf::from(bin())), git: git_path, ..opts(None, HookSource::Log, 0) };
+        let s = stack(o).await;
+        s.run(true).await;
+        let mac = root.join("mac");
+        std::fs::create_dir_all(&mac).unwrap();
+        git(&mac, &["init", "-q", "-b", "main"]);
+        write_file(&mac.join("a.txt"), "one\n");
+        write_file(&mac.join("d/b.txt"), "two\n");
+        git(&mac, &["add", "-A"]);
+        git(&mac, &["commit", "-q", "-m", "c1"]);
+        write_file(&mac.join("a.txt"), "three\n");
+        git(&mac, &["commit", "-q", "-am", "c2"]);
+        Vm { s, root, _tmp: tmp }
+    }
+
+    fn mac(&self) -> PathBuf {
+        self.root.join("mac")
+    }
+
+    /// Where the VM path `vm` is on this disk.
+    fn disk(&self, vm: &str) -> PathBuf {
+        self.s.state.at(Path::new(vm))
+    }
+
+    fn ws(&self) -> PathBuf {
+        self.disk(WS)
+    }
+
+    fn inbox_is_empty(&self) -> bool {
+        std::fs::read_dir(self.disk(&format!("{VM_HOME}/.cache/ai-env/inbox"))).map_or(true, |mut d| d.next().is_none())
+    }
+
+    async fn code(&self, method: &str, path: &str, body: Option<&[u8]>) -> (u16, String, Vec<u8>) {
+        request(self.s.code, method, path, "", body).await
+    }
+
+    async fn app(&self, method: &str, path: &str, body: Option<&[u8]>) -> (u16, String, Vec<u8>) {
+        request(self.s.app, method, path, "", body).await
+    }
+
+    /// `PUT /seed?<query>` of `body`: the status and the JSON answer.
+    async fn seed(&self, query: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let (st, _, b) = self.code("PUT", &format!("/seed?{query}"), Some(body)).await;
+        (st, b)
+    }
+
+    /// A first seed of the Mac as it is now (201).
+    async fn clone_mac(&self) -> SeedManifest {
+        let (m, body) = clone_body(&self.mac(), Some("main"));
+        let (st, b) = self.seed(&format!("path={WS}&mode=clone&branch=main"), &body).await;
+        assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+        m
+    }
+
+    async fn state(&self) -> SeedState {
+        let (st, _, b) = self.code("GET", &format!("/seed?path={WS}"), None).await;
+        assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+        serde_json::from_slice(&b).unwrap()
+    }
+
+    async fn workspace_view(&self) -> WorkspaceView {
+        self.s.detail().await.0.workspace.expect("a shim with a helper reports its workspace")
+    }
+}
+
+/// The code port: 401 before `/run`, without the bearer or with a wrong
+/// one; behind it the workspace routes (S8) answer, and any other path is
+/// still 404 (S9's). A shim without a helper serves none of them: 404, as
+/// an older shim, and its caps do not name `workspace_v1`.
+#[tokio::test]
+async fn code_port_answers_401_then_the_seed_routes_with_the_bearer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(root.join("vm/Users/agent")).unwrap();
+    let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(PathBuf::from(bin())), git: git_real().to_path_buf(), ..opts(None, HookSource::Log, 0) };
+    let s = stack(o).await;
+    let seed = format!("/seed?path={WS}");
+    let paths = [("GET", seed.as_str()), ("PUT", "/seed"), ("POST", "/codeout"), ("GET", "/bundle?since=x")];
+    for (m, p) in paths {
+        let (st, head, b) = http_with(s.code, m, p, &bearer_header(TOKEN), b"").await;
+        assert_eq!(st, 401, "before /run, no commitment: {m} {p}: {b}");
+        assert!(head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}");
+    }
+    s.run(true).await;
+    for (m, p) in paths {
+        let (st, _, b) = http(s.code, m, p, b"x", Some("text/plain")).await;
+        assert!(st == 401 && b.contains("unauthorized"), "{m} {p}: {st} {b}");
+        assert_eq!(http_with(s.code, m, p, &bearer_header("not-the-token"), b"").await.0, 401, "{m} {p}: a wrong token");
+    }
+    let (st, _, b) = http_with(s.code, "GET", &seed, &bearer_header(TOKEN), b"").await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(serde_json::from_str::<SeedState>(&b).unwrap(), SeedState::default(), "never seeded");
+    let (st, _, b) = http_with(s.code, "GET", "/seed?path=relative", &bearer_header(TOKEN), b"").await;
+    assert!(st == 400 && b.contains("\"bad_request\""), "{st} {b}");
+    for p in ["/", "/bundle?since=x"] {
+        let (st, _, b) = http_with(s.code, "GET", p, &bearer_header(TOKEN), b"").await;
+        assert!(st == 404 && b.contains("not implemented (S8/S9)"), "{p}: {st} {b}");
+    }
+    let (st, _, _) = http_with(s.code, "DELETE", &seed, &bearer_header(TOKEN), b"").await;
+    assert_eq!(st, 405);
+    let health: Health = serde_json::from_str(&http(s.app, "GET", "/health", b"", None).await.2).unwrap();
+    assert_eq!(health.caps, [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1]);
+    let (_, has, caps, _) = hello_view(s.app).await;
+    assert!(!has && caps == [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1], "{caps:?}");
+    // No helper program: none of it.
+    let old = Stack::log().await;
+    old.run(true).await;
+    let (st, _, b) = http_with(old.code, "GET", &seed, &bearer_header(TOKEN), b"").await;
+    assert!(st == 404 && b.contains("not implemented (S8/S9)"), "{st} {b}");
+    assert_eq!(serde_json::from_str::<Health>(&http(old.app, "GET", "/health", b"", None).await.2).unwrap().caps, [CAP_CREDENTIAL_CACHE]);
+    assert!(old.detail().await.0.workspace.is_none());
+}
+
+/// The app port: `/health` and `/agent` are public; `/health/detail` and
+/// every other path need the session bearer (401 without, and before any
+/// commitment exists); behind it the transcript route answers (S8), and an
+/// unknown path is 404.
+#[tokio::test]
+async fn app_port_bearer() {
+    let vm = Vm::new().await;
+    let s = &vm.s;
+    let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
+    let put = format!("/transcript?rel={rel}");
+    for (m, p, body) in [("PUT", put.as_str(), &b"{}"[..]), ("GET", "/health/detail", b""), ("POST", "/seed", b"x"), ("GET", "/settings?path=/Users/agent/ws", b"")] {
+        let (st, head, b) = http(s.app, m, p, body, Some("application/json")).await;
+        assert_eq!(st, 401, "{m} {p}: {b}");
+        assert!(b.contains("\"unauthorized\"") && head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}{b}");
+        assert_eq!(http_with(s.app, m, p, &bearer_header("not-the-token"), body).await.0, 401, "{m} {p}: a wrong token");
+    }
+    let (st, _, b) = http_with(s.app, "PUT", &put, &bearer_header(TOKEN), b"{}\n").await;
+    assert_eq!(st, 201, "{b}");
+    let (st, _, b) = http_with(s.app, "PUT", "/nope", &bearer_header(TOKEN), b"{}").await;
+    assert!(st == 404 && b.contains("not implemented (S8/S9)"), "{b}");
+    let (d, body) = s.detail().await;
+    for key in ["\"hook_source\":\"log\"", "\"agent_guard\":\"off\"", "\"listeners\":", "\"refused_peers\":", "\"hook_peers\":", "\"wire\":1", "\"workspace\":{"] {
+        assert!(body.contains(key), "{key} in {body}");
+    }
+    assert!(d.health.run_hook_seen && !d.has_credentials && d.spawns.is_empty());
+    assert_eq!(d.listeners.is_empty(), !cfg!(target_os = "linux"), "the LISTEN inventory exists on Linux only: {:?}", d.listeners);
+    assert!(!body.contains(TOKEN) && !body.contains("commit"), "{body}");
+}
+
+/// T8.1 on the shim's side: a first seed of a dirty Mac through `PUT
+/// /seed` (201): the VM's HEAD is the Mac's, shallow at it, no origin and
+/// no history, the WIP uncommitted (the staged change staged, the unstaged
+/// unstaged, the untracked file untracked); `GET /seed` then reports it
+/// pristine and not clean, `/health/detail` its record. Every git the
+/// helper ran is the VM's (no global config, no prompt; nothing but those
+/// and its own index or lock names), with no descriptor past stderr, and
+/// none fetched, cloned or named a remote.
+#[tokio::test]
+async fn a_seed_round_trips_through_the_code_port() {
+    let vm = Vm::with_fake_git().await;
+    let mac = vm.mac();
+    write_file(&mac.join("d/b.txt"), "staged\n");
+    git(&mac, &["add", "d/b.txt"]);
+    write_file(&mac.join("a.txt"), "unstaged\n");
+    write_file(&mac.join("new.txt"), "untracked\n");
+    let (m, body) = clone_body(&mac, Some("main"));
+    let (st, b) = vm.seed(&format!("path={WS}&mode=clone&branch=main"), &body).await;
+    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+    let reply: SeedReply = serde_json::from_slice(&b).unwrap();
+    assert_eq!((reply.head.as_str(), reply.branch.as_deref(), reply.wip.as_deref()), (m.head.as_str(), Some("main"), m.wip.as_deref()));
+    let ws = vm.ws();
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), git(&mac, &["rev-parse", "HEAD"]), "HEAD equal");
+    assert_eq!(git(&ws, &["remote"]), "", "no origin");
+    assert_eq!(std::fs::read_to_string(ws.join(".git/shallow")).unwrap(), format!("{}\n", m.head), "shallow at the seeded commit");
+    assert_eq!(git(&ws, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(git_status(&ws), [" M a.txt", "M  d/b.txt", "?? new.txt"], "the WIP, uncommitted");
+    assert_eq!(git(&ws, &["rev-parse", SEED_REF]), m.head);
+    assert_eq!(Some(git(&ws, &["rev-parse", SEED_WIP_REF])), m.wip);
+    assert!(vm.inbox_is_empty());
+    let st = vm.state().await;
+    assert!(st.pristine && !st.clean && st.tip.as_deref() == Some(m.head.as_str()) && st.branch.as_deref() == Some("main"), "{st:?}");
+    let view = vm.workspace_view().await;
+    assert_eq!(view.seed.as_ref().map(|r| r.path.as_str()), Some(WS));
+    assert_eq!((view.busy, view.helpers), (None, 0));
+    let calls = git_log(&vm.root.join("git.log"));
+    assert!(calls.len() > 8, "{calls:?}");
+    let allowed = ["GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_INDEX_FILE"];
+    for (env, fds, args) in &calls {
+        assert!(env.iter().all(|n| allowed.contains(&n.as_str())) && env.iter().any(|n| n == "GIT_CONFIG_GLOBAL"), "{env:?} {args:?}");
+        assert_eq!(fds, "-", "no descriptor past stderr: {args:?}");
+        assert!(!args.iter().any(|a| ["clone", "fetch", "remote", "push"].contains(&a.as_str())), "{args:?}");
+    }
+    assert!(calls.iter().any(|(_, _, a)| a.iter().any(|x| x == "index-pack")) && calls.iter().any(|(_, _, a)| a.iter().any(|x| x == "--template=")), "{calls:?}");
+}
+
+/// A bad seed is refused before anything stays behind: a pack that does not
+/// index (422 `bad_pack`), a manifest naming a commit the pack lacks (422
+/// `bad_refs`), a bad query (400), no `Content-Length` (411), a body over
+/// `SEED_BODY_MAX` (413); then the good seed goes in.
+#[tokio::test]
+async fn a_bad_seed_is_refused_and_leaves_nothing_behind() {
+    let vm = Vm::new().await;
+    let (m, body) = clone_body(&vm.mac(), Some("main"));
+    let line = head_line(&m).unwrap().len();
+    let q = format!("path={WS}&mode=clone&branch=main");
+    let mut garbage = head_line(&m).unwrap();
+    garbage.extend_from_slice(b"PACK nothing like a pack");
+    let (st, b) = vm.seed(&q, &garbage).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (422, "bad_pack"));
+    let mut other = m.clone();
+    other.head = "1".repeat(40);
+    other.shallow = vec![other.head.clone()];
+    other.refs = other.expected_refs();
+    let mut lacking = head_line(&other).unwrap();
+    lacking.extend_from_slice(&body[line..]);
+    let (st, b) = vm.seed(&q, &lacking).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (422, "bad_refs"));
+    for bad in [format!("path={WS}&mode=merge&branch=main"), format!("path={WS}&mode=clone"), format!("path={WS}&mode=update&branch=main"), "path=relative&mode=clone&branch=main".to_string()] {
+        let (st, b) = vm.seed(&bad, &body).await;
+        assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"), "{bad}");
+    }
+    // Chunked: no length.
+    let mut s = tokio::net::TcpStream::connect(vm.s.code).await.unwrap();
+    let head = format!("PUT /seed?{q} HTTP/1.1\r\nHost: x\r\n{}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n", bearer_header(TOKEN));
+    s.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let (st, _, b) = split_response(&buf);
+    assert!(st == 411 && b.contains("\"bad_request\""), "{st} {b}");
+    // A length over the cap: refused on its head (the body read up to the drain's bound, not the cap).
+    let mut s = tokio::net::TcpStream::connect(vm.s.code).await.unwrap();
+    let head = format!("PUT /seed?{q} HTTP/1.1\r\nHost: x\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", bearer_header(TOKEN), (1u64 << 30) + 1);
+    s.write_all(head.as_bytes()).await.unwrap();
+    let _ = s.write_all(&vec![b'z'; DRAIN_MAX + 1]).await;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    let (st, _, b) = split_response(&buf);
+    assert!(st == 413 && b.contains("\"too_large\""), "{st} {b}");
+    assert!(!vm.ws().exists(), "no workspace left behind");
+    assert!(vm.inbox_is_empty());
+    assert!(vm.state().await.record.is_none(), "nothing recorded");
+    let (st, b) = vm.seed(&q, &body).await;
+    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+}
+
+/// T8.6 and one workspace per VM: a symlink the agent planted on the path is
+/// 409 `symlink_component` (both routes), a non-empty directory 409
+/// `path_occupied`, a path outside the agent's home 409 `not_creatable`;
+/// once seeded, another path is 409 `other_workspace` with the record, and
+/// a clone of the seeded path 409 `changed`.
+#[tokio::test]
+async fn seed_paths_are_refused_as_the_agent() {
+    let vm = Vm::new().await;
+    let (_, body) = clone_body(&vm.mac(), Some("main"));
+    let outside = vm.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, vm.disk("/Users/agent/linked")).unwrap();
+    let (st, b) = vm.seed("path=/Users/agent/linked/ws&mode=clone&branch=main", &body).await;
+    let r = refusal_of(&b);
+    assert!(st == 409 && r.code == "symlink_component" && r.message.contains("/Users/agent/linked"), "{st} {r:?}");
+    let (st, _, b) = vm.code("GET", "/seed?path=/Users/agent/linked/ws", None).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "symlink_component"));
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "nothing written through the link");
+    write_file(&vm.disk("/Users/agent/full/x"), "x");
+    let (st, b) = vm.seed("path=/Users/agent/full&mode=clone&branch=main", &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "path_occupied"));
+    let (st, b) = vm.seed("path=/srv/ws&mode=clone&branch=main", &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "not_creatable"));
+    vm.clone_mac().await;
+    for (method, path) in [("PUT", "/seed?path=/Users/agent/ws2&mode=clone&branch=main"), ("GET", "/seed?path=/Users/agent/ws2")] {
+        let (st, _, b) = vm.code(method, path, (method == "PUT").then_some(body.as_slice())).await;
+        let r = refusal_of(&b);
+        assert!(st == 409 && r.code == "other_workspace" && r.state.as_ref().and_then(|s| s.record.as_ref()).is_some_and(|rec| rec.path == WS), "{method}: {st} {r:?}");
+    }
+    let (st, b) = vm.seed(&format!("path={WS}&mode=clone&branch=main"), &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "changed"));
+}
+
+/// D3 through the route: a clean VM behind the Mac is fast-forwarded by a
+/// thin update (201 `updated`, the new WIP uncommitted); a VM with changes
+/// of its own is kept (409 `dirty`), a stale `expect` is 409 `changed`, a VM
+/// commit makes it 409 `diverged`. A replace of a VM that changed is 409
+/// `not_pristine`; of a pristine one, 201 `replaced`.
+#[tokio::test]
+async fn updates_fast_forward_a_clean_vm_and_keep_the_rest() {
+    let vm = Vm::new().await;
+    let mac = vm.mac();
+    let seed = vm.clone_mac().await;
+    let tip = seed.head.clone();
+    write_file(&mac.join("a.txt"), "four\n");
+    git(&mac, &["commit", "-q", "-am", "c3"]);
+    write_file(&mac.join("wip.txt"), "the Mac's uncommitted file\n");
+    let (m, body) = update_body(&mac, &seed, &tip, &tip);
+    let q = format!("path={WS}&mode=update&branch=main&expect={tip}");
+    let ws = vm.ws();
+    write_file(&ws.join("agent.txt"), "the agent's\n");
+    let (st, b) = vm.seed(&q, &body).await;
+    let r = refusal_of(&b);
+    assert!(st == 409 && r.code == "dirty" && r.state.as_ref().is_some_and(|s| !s.clean), "{st} {r:?}");
+    std::fs::remove_file(ws.join("agent.txt")).unwrap();
+    let (st, b) = vm.seed(&format!("path={WS}&mode=update&branch=main&expect={}", m.head), &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "changed"));
+    let (st, b) = vm.seed(&q, &body).await;
+    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(json(&b)["outcome"], "updated");
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), m.head);
+    assert_eq!(git_status(&ws), ["?? wip.txt"]);
+    let st = vm.state().await;
+    assert!(st.pristine && st.record.as_ref().is_some_and(|r| r.head == m.head), "{st:?}");
+    // The agent commits on its own: the next update is diverged, and a replace is refused.
+    std::fs::remove_file(ws.join("wip.txt")).unwrap();
+    write_file(&ws.join("vm.txt"), "the agent's commit\n");
+    git(&ws, &["add", "vm.txt"]);
+    git(&ws, &["commit", "-q", "-m", "vm"]);
+    let vm_tip = git(&ws, &["rev-parse", "HEAD"]);
+    write_file(&mac.join("a.txt"), "five\n");
+    std::fs::remove_file(mac.join("wip.txt")).unwrap();
+    git(&mac, &["commit", "-q", "-am", "c4"]);
+    let (_, body) = update_body(&mac, &seed, &m.head, &tip);
+    let (st, b) = vm.seed(&format!("path={WS}&mode=update&branch=main&expect={vm_tip}"), &body).await;
+    let r = refusal_of(&b);
+    assert!(st == 409 && r.code == "diverged", "{st} {r:?}");
+    let (_, body) = clone_body(&mac, Some("main"));
+    let (st, b) = vm.seed(&format!("path={WS}&mode=replace&branch=main&expect={vm_tip}"), &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "not_pristine"));
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), vm_tip, "the VM keeps its commit");
+}
+
+/// `replace` on a VM unchanged since its seed: the new head checked out anew
+/// (201 `replaced`), the old seed's WIP gone, the new one applied.
+#[tokio::test]
+async fn a_replace_checks_out_a_pristine_vm_anew() {
+    let vm = Vm::new().await;
+    let mac = vm.mac();
+    write_file(&mac.join("old.txt"), "the first seed's untracked file\n");
+    let seed = vm.clone_mac().await;
+    std::fs::remove_file(mac.join("old.txt")).unwrap();
+    write_file(&mac.join("a.txt"), "replaced\n");
+    git(&mac, &["commit", "-q", "-am", "c3"]);
+    let (m, body) = clone_body(&mac, Some("main"));
+    let (st, b) = vm.seed(&format!("path={WS}&mode=replace&branch=main&expect={}", seed.head), &body).await;
+    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(json(&b)["outcome"], "replaced");
+    let ws = vm.ws();
+    assert_eq!(git(&ws, &["rev-parse", "HEAD"]), m.head);
+    assert!(!ws.join("old.txt").exists());
+    assert!(git_status(&ws).is_empty(), "{:?}", git_status(&ws));
+    assert_eq!(vm.state().await.record.map(|r| r.mode), Some(ai_env_cli::wire::workspace::SeedMode::Replace));
+}
+
+/// Code-out (§7): a VM commit and an uncommitted edit come back through
+/// `POST /codeout`: the manifest line names the branch at the VM's commit
+/// and a `refs/wip/*` snapshot holding the edit, then the pack (its length
+/// the answer's), which the Mac's repository indexes; with every tip had,
+/// 204; past `max_bytes` 413 with the size; an unseeded VM 409 `not_seeded`.
+#[tokio::test]
+async fn a_codeout_brings_back_a_vm_commit_and_the_uncommitted_edit() {
+    let vm = Vm::new().await;
+    let (st, _, b) = vm.code("POST", "/codeout", Some(format!("{{\"path\":\"{WS}\",\"max_bytes\":1000}}").as_bytes())).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "not_seeded"));
+    let seed = vm.clone_mac().await;
+    let ws = vm.ws();
+    write_file(&ws.join("vm.txt"), "committed in the VM\n");
+    git(&ws, &["add", "vm.txt"]);
+    git(&ws, &["commit", "-q", "-m", "vm"]);
+    let vm_head = git(&ws, &["rev-parse", "HEAD"]);
+    write_file(&ws.join("a.txt"), "edited in the VM\n");
+    let req = serde_json::json!({"path": WS, "haves": [seed.head], "wip": true, "max_bytes": 1 << 20});
+    let (st, head, b) = vm.code("POST", "/codeout", Some(req.to_string().as_bytes())).await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+    let declared: usize = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse().unwrap())).unwrap();
+    assert_eq!(declared, b.len());
+    let nl = b.iter().position(|c| *c == b'\n').unwrap();
+    let manifest: CodeoutManifest = serde_json::from_slice(&b[..nl]).unwrap();
+    manifest.check().unwrap();
+    assert_eq!((manifest.head.as_str(), manifest.branch.as_deref()), (vm_head.as_str(), Some("main")));
+    assert_eq!(manifest.refs["refs/heads/main"], vm_head);
+    let wip = manifest.wip_ref.clone().expect("a snapshot");
+    let mac = vm.mac();
+    git_with(&mac, &["index-pack", "--stdin", "--fix-thin"], &[], Some(&b[nl + 1..]));
+    assert_eq!(git(&mac, &["show", &format!("{}:vm.txt", vm_head)]), "committed in the VM");
+    assert_eq!(git(&mac, &["show", &format!("{}:a.txt", manifest.refs[&wip])]), "edited in the VM");
+    assert_eq!(git_status(&ws), [" M a.txt"], "the agent's checkout as it was");
+    assert_eq!(vm.workspace_view().await.last_wip.as_deref(), Some(wip.as_str()));
+    let had: Vec<&String> = manifest.refs.values().collect();
+    let req = serde_json::json!({"path": WS, "haves": had, "wip": true, "max_bytes": 1 << 20});
+    let (st, _, b) = vm.code("POST", "/codeout", Some(req.to_string().as_bytes())).await;
+    assert!(st == 204 && b.is_empty(), "{st}: {}", String::from_utf8_lossy(&b));
+    let req = serde_json::json!({"path": WS, "haves": [], "wip": false, "max_bytes": 64});
+    let (st, _, b) = vm.code("POST", "/codeout", Some(req.to_string().as_bytes())).await;
+    let r = refusal_of(&b);
+    assert!(st == 413 && r.code == "too_large" && r.size.is_some_and(|s| s > 64), "{st} {r:?}");
+    let (st, _, b) = vm.code("POST", "/codeout", Some(b"{\"path\":\"relative\",\"max_bytes\":1}")).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"));
+    assert!(vm.inbox_is_empty());
+}
+
+/// The app port's transcript route (§8): absent, written (201, 0600 by the
+/// agent), present with its size and sha256, the same bytes unchanged
+/// (200), a shorter upload 409 `vm_longer` with the VM's size; a traversal
+/// rel 400; no `Content-Length` 411; past `TRANSCRIPT_MAX` 413.
+#[tokio::test]
+async fn transcripts_round_trip_on_the_app_port() {
+    use std::os::unix::fs::PermissionsExt;
+    let vm = Vm::new().await;
+    let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
+    let path = format!("/transcript?rel={rel}");
+    let (st, _, b) = vm.app("GET", &path, None).await;
+    assert_eq!(st, 200);
+    assert!(!serde_json::from_slice::<TranscriptStat>(&b).unwrap().present);
+    let text = b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n";
+    let (st, _, b) = vm.app("PUT", &path, Some(text)).await;
+    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+    let reply: TranscriptReply = serde_json::from_slice(&b).unwrap();
+    assert_eq!(reply.size, text.len() as u64);
+    let file = vm.disk(&format!("{VM_HOME}/.claude/projects/{rel}"));
+    assert_eq!(std::fs::read(&file).unwrap(), text);
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    let stat: TranscriptStat = serde_json::from_slice(&vm.app("GET", &path, None).await.2).unwrap();
+    assert!(stat.present && stat.size == text.len() as u64 && stat.sha256.as_deref() == Some(reply.sha256.as_str()), "{stat:?}");
+    assert_eq!(vm.app("PUT", &path, Some(text)).await.0, 200, "the same bytes: unchanged");
+    let (st, _, b) = vm.app("PUT", &path, Some(b"{}\n")).await;
+    let r = refusal_of(&b);
+    assert!(st == 409 && r.code == "vm_longer" && r.size == Some(text.len() as u64), "{st} {r:?}");
+    for bad in [format!("/transcript?rel=../{S8_ID}.jsonl"), format!("/transcript?rel={S8_SLUG}/../{S8_ID}.jsonl"), "/transcript".to_string()] {
+        let (st, _, b) = vm.app("PUT", &bad, Some(b"{}\n")).await;
+        assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"), "{bad}");
+    }
+    let mut s = tokio::net::TcpStream::connect(vm.s.app).await.unwrap();
+    s.write_all(format!("PUT {path} HTTP/1.1\r\nHost: x\r\n{}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n", bearer_header(TOKEN)).as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    assert_eq!(split_response(&buf).0, 411);
+    let mut s = tokio::net::TcpStream::connect(vm.s.app).await.unwrap();
+    s.write_all(format!("PUT {path} HTTP/1.1\r\nHost: x\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{{}}", bearer_header(TOKEN), TRANSCRIPT_MAX + 1).as_bytes()).await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    assert_eq!(split_response(&buf).0, 413);
+}
+
+/// A transcript put the helper does not end itself (the shim's TERM at the
+/// put's budget, or at a stop: the helper has no handler, no drop runs)
+/// leaves its 0600 temp file beside the transcript; the next put into that
+/// directory removes it (puts run one at a time), so none outlives it. The
+/// real helper, as the shim starts it.
+#[test]
+fn a_put_ended_by_term_leaves_no_temp_file_past_the_next_put() {
+    use std::os::unix::process::ExitStatusExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    let projects = home.join(".claude/projects");
+    let dir = projects.join(S8_SLUG);
+    let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
+    let put = |len: usize| {
+        let args = [format!("--home={}", home.display()), "transcript-put".into(), format!("--projects={}", projects.display()), format!("--rel={rel}"), format!("--len={len}"), "--budget-ms=90000".into()];
+        Command::new(bin()).env_clear().arg("shim-io").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let temps = || -> Vec<(String, u64)> {
+        let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+        entries.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().map_or(0, |m| m.len()))).filter(|(n, _)| n.starts_with(".ai-env-")).collect()
+    };
+    let mut cut = put(1000);
+    cut.stdin.as_mut().unwrap().write_all(&[b'x'; 25]).unwrap();
+    let until = Instant::now() + Duration::from_secs(30);
+    while !temps().iter().any(|(_, n)| *n == 25) {
+        assert!(Instant::now() < until, "no temp file holding the 25 bytes: {:?}", temps());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    signal(cut.id(), nix::sys::signal::Signal::SIGTERM);
+    assert_eq!(cut.wait().unwrap().signal(), Some(libc::SIGTERM));
+    let left = temps();
+    assert!(left.len() == 1 && left[0].1 == 25, "the ended put left its temp file: {left:?}");
+    let text = b"{\"type\":\"user\"}\n";
+    let mut full = put(text.len());
+    full.stdin.take().unwrap().write_all(text).unwrap();
+    let out = full.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let head = json(&out.stdout);
+    assert_eq!(head["reply"]["outcome"], "written", "{head}");
+    assert!(temps().is_empty(), "no temp file outlives the next put: {:?}", temps());
+    assert_eq!(std::fs::read(dir.join(format!("{S8_ID}.jsonl"))).unwrap(), text);
+}
+
+/// T8.7's capture through `GET /settings`: the agent's and the workspace's
+/// settings files with their text, and the workspace's allowlisted keys.
+#[tokio::test]
+async fn settings_are_captured_on_the_app_port() {
+    let vm = Vm::new().await;
+    vm.clone_mac().await;
+    write_file(&vm.disk(&format!("{VM_HOME}/.claude/settings.json")), "{\"permissions\":{\"allow\":[\"Bash(ls)\"]}}");
+    write_file(&vm.ws().join(".claude/settings.local.json"), "{\"permissions\":{\"allow\":[\"Bash(git status)\"]}}");
+    let doc = serde_json::json!({"projects": {WS: {"allowedTools": ["Bash(ls)"], "hasTrustDialogAccepted": true, "lastCost": 1}}});
+    write_file(&vm.disk(&format!("{VM_HOME}/.claude/.claude.json")), &doc.to_string());
+    let (st, _, b) = vm.app("GET", &format!("/settings?path={WS}"), None).await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+    let c: SettingsCapture = serde_json::from_slice(&b).unwrap();
+    c.check().unwrap();
+    assert!(c.files[0].text.as_deref().is_some_and(|t| t.contains("Bash(ls)")) && c.files[0].path == format!("{VM_HOME}/.claude/settings.json"), "{:?}", c.files[0]);
+    assert!(!c.files[1].present, "no project settings");
+    assert!(c.files[2].text.as_deref().is_some_and(|t| t.contains("git status")), "{:?}", c.files[2]);
+    assert_eq!(c.project.keys().collect::<Vec<_>>(), ["allowedTools", "hasTrustDialogAccepted"]);
+    let (st, _, b) = vm.app("GET", "/settings?path=nope", None).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"));
+}
+
+/// A seed whose body is still arriving is a helper: it counts in the
+/// workspace view and holds off the idle sweep (the spawn manager's own
+/// tests prove the gate; natively the sweep never runs), and a spawn that
+/// ends meanwhile does not end it: the seed completes once its body does.
+#[tokio::test]
+async fn a_helper_outlives_a_spawn_that_ends_meanwhile() {
+    let vm = Vm::new().await;
+    let (_, body) = clone_body(&vm.mac(), Some("main"));
+    let mut s = tokio::net::TcpStream::connect(vm.s.code).await.unwrap();
+    let head = format!("PUT /seed?path={WS}&mode=clone&branch=main HTTP/1.1\r\nHost: x\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", bearer_header(TOKEN), body.len());
+    s.write_all(head.as_bytes()).await.unwrap();
+    let half = body.len() / 2;
+    s.write_all(&body[..half]).await.unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while vm.workspace_view().await.helpers == 0 {
+        assert!(Instant::now() < until, "the seed's helper never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(vm.workspace_view().await.busy.as_deref(), Some("seed-apply"));
+    let mut w = ws_hello_ok(vm.s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/echo", "done"], None).await;
+    let (_, code) = run_to_exit(&mut w, &id).await;
+    assert_eq!(code, Some(0));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(vm.workspace_view().await.helpers, 1, "the helper lives on past the spawn's end");
+    s.write_all(&body[half..]).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let (st, _, b) = split_response(&buf);
+    assert_eq!(st, 201, "{b}");
+    assert_eq!(vm.workspace_view().await.helpers, 0);
+}
+
+/// `/suspend` snapshots the uncommitted work (L6) before it closes the
+/// sockets: a `refs/wip/*` ref in the VM, the workspace view's `last_wip`;
+/// while a seed or a code-out holds the workspace it is skipped, and the
+/// hook still answers at once.
+#[tokio::test]
+async fn suspend_snapshots_the_workspace_unless_it_is_busy() {
+    let vm = Vm::new().await;
+    assert_eq!(hook(vm.s.hooks, "suspend", b"{}").await.0, 200, "nothing seeded: no snapshot");
+    assert_eq!(hook(vm.s.hooks, "resume", b"{}").await.0, 200);
+    vm.clone_mac().await;
+    let ws = vm.ws();
+    write_file(&ws.join("a.txt"), "uncommitted at suspend\n");
+    assert_eq!(hook(vm.s.hooks, "suspend", b"{}").await.0, 200);
+    let refs = git(&ws, &["for-each-ref", "--format=%(refname)", "refs/wip/"]);
+    assert_eq!(refs.lines().count(), 1, "{refs}");
+    assert_eq!(git(&ws, &["show", &format!("{}:a.txt", refs.trim())]), "uncommitted at suspend");
+    assert_eq!(hook(vm.s.hooks, "resume", b"{}").await.0, 200);
+    assert_eq!(vm.workspace_view().await.last_wip.as_deref(), Some(refs.trim()));
+    write_file(&ws.join("a.txt"), "changed again\n");
+    let held = vm.s.state.workspace.try_acquire("codeout").expect("the workspace is free");
+    let t = Instant::now();
+    assert_eq!(hook(vm.s.hooks, "suspend", b"{}").await.0, 200);
+    assert!(t.elapsed() < Duration::from_secs(3), "skipped, not waited for: {:?}", t.elapsed());
+    drop(held);
+    assert_eq!(git(&ws, &["for-each-ref", "--format=%(refname)", "refs/wip/"]).lines().count(), 1, "busy: no snapshot");
+}
+
+/// One seed, code-out or snapshot at a time: a request finding the
+/// workspace held past the wait is 409 `busy` with `Retry-After`.
+#[tokio::test]
+async fn a_held_workspace_answers_busy() {
+    let vm = Vm::new().await;
+    vm.s.state.workspace.set_busy_wait(Duration::from_millis(200));
+    let held = vm.s.state.workspace.try_acquire("seed-apply").unwrap();
+    let (st, head, b) = vm.code("GET", &format!("/seed?path={WS}"), None).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "busy"));
+    assert!(head.to_ascii_lowercase().contains("\r\nretry-after: 5"), "{head}");
+    let (_, body) = clone_body(&vm.mac(), Some("main"));
+    let (st, b) = vm.seed(&format!("path={WS}&mode=clone&branch=main"), &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "busy"), "the body read, then refused");
+    drop(held);
+    assert_eq!(vm.seed(&format!("path={WS}&mode=clone&branch=main"), &body).await.0, 201);
+    // The transcripts' own lock is named as what it is.
+    let one = vm.s.state.workspace.transcripts.lock().await;
+    let (st, _, b) = vm.app("PUT", &format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"), Some(b"{}\n")).await;
+    let r = refusal_of(&b);
+    assert!(st == 409 && r.code == "busy" && r.message.starts_with("another transcript upload"), "{st} {r:?}");
+    drop(one);
+}
+
+/// The workspace routes' refusals read the request body first (at most
+/// `DRAIN_MAX` before the length is trusted), so the client gets the
+/// answer, not a reset.
+#[tokio::test]
+async fn workspace_refusals_read_the_body_first() {
+    let vm = Vm::new().await;
+    let body = vec![b'x'; DRAIN_MAX - 1024];
+    let mut lost = Vec::new();
+    for (addr, path, want) in [(vm.s.code, "/seed?path=relative&mode=clone&branch=main", 400), (vm.s.app, "/transcript?rel=nope", 400), (vm.s.code, "/seed?path=/Users/agent/ws&mode=update&branch=main&expect=0123456789abcdef0123456789abcdef01234567", 409)] {
+        for i in 0..5 {
+            match try_http_with(addr, "PUT", path, &bearer_header(TOKEN), &body).await {
+                Ok((st, _, b)) => assert_eq!(st, want, "{path} #{i}: {b}"),
+                Err(e) => lost.push(format!("{path} #{i}: {e}")),
+            }
+        }
+    }
+    assert!(lost.is_empty(), "answers lost to a reset: {lost:#?}");
+}
+
+/// Until the workspace is free again and no helper runs (at most 30 s).
+async fn wait_workspace_idle(vm: &Vm) {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let view = vm.workspace_view().await;
+        if view.helpers == 0 && view.busy.is_none() {
+            return;
+        }
+        assert!(Instant::now() < until, "the workspace is still held: {view:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A client gone while its seed is applied does not end the seed (it runs
+/// as a task of its own): the helper finishes, the shim keeps the record,
+/// `GET /seed` reads the VM seeded and pristine, nothing is left in the
+/// inbox, and a new clone is 409 `changed` (seeded), not `path_occupied`.
+#[tokio::test]
+async fn a_seed_whose_client_goes_away_still_goes_in() {
+    let vm = Vm::with(|root| slow_git(root, "reset", 2)).await;
+    let (m, body) = clone_body(&vm.mac(), Some("main"));
+    let q = format!("path={WS}&mode=clone&branch=main");
+    let mut s = tokio::net::TcpStream::connect(vm.s.code).await.unwrap();
+    let head = format!("PUT /seed?{q} HTTP/1.1\r\nHost: x\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n", bearer_header(TOKEN), body.len());
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(&body).await.unwrap();
+    // The clone is under way (its git dir is there, its checkout waits): the client goes.
+    let until = Instant::now() + Duration::from_secs(20);
+    while !vm.ws().join(".git/HEAD").exists() {
+        assert!(Instant::now() < until, "the clone never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(s);
+    wait_workspace_idle(&vm).await;
+    let st = vm.state().await;
+    assert!(st.record.as_ref().is_some_and(|r| r.head == m.head) && st.pristine, "{st:?}");
+    assert_eq!(git(&vm.ws(), &["rev-parse", "HEAD"]), m.head);
+    assert!(vm.inbox_is_empty());
+    let (st, b) = vm.seed(&q, &body).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "changed"));
+}
+
+/// A code-out client that reads only the head of a large pack, then goes:
+/// the helper is ended mid-payload, and its pack had left the inbox before
+/// the head went out, so nothing stays behind.
+#[tokio::test]
+async fn a_codeout_read_only_to_its_head_leaves_nothing_behind() {
+    let vm = Vm::new().await;
+    vm.clone_mac().await;
+    // 16 MiB that does not compress, untracked in the VM: the snapshot carries it, far past every buffer.
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let noise: Vec<u8> = (0..16 << 20)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    std::fs::write(vm.ws().join("noise.bin"), &noise).unwrap();
+    let req = serde_json::json!({"path": WS, "haves": [], "wip": true, "max_bytes": 64 << 20}).to_string();
+    let mut s = tokio::net::TcpStream::connect(vm.s.code).await.unwrap();
+    s.write_all(format!("POST /codeout HTTP/1.1\r\nHost: x\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{req}", bearer_header(TOKEN), req.len()).as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(60), s.read(&mut buf)).await.expect("a head within 60 s").unwrap();
+        assert!(n > 0, "closed before the head: {}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert!(got.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&got));
+    drop(s);
+    wait_workspace_idle(&vm).await;
+    let inbox = vm.disk(&format!("{VM_HOME}/.cache/ai-env/inbox"));
+    assert!(vm.inbox_is_empty(), "{:?}", std::fs::read_dir(&inbox).map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>()));
+}
+
+/// A refusal the helper gives before it read the pack (a clone into a
+/// directory that is not empty: 409 `path_occupied`) still reaches the
+/// client of a body larger than the socket buffers: the shim reads the
+/// rest of the body past the helper's exit (five rounds, none lost).
+#[tokio::test]
+async fn a_helper_refusal_still_reads_the_rest_of_the_body() {
+    let vm = Vm::new().await;
+    write_file(&vm.ws().join("the-agents.txt"), "the agent's\n");
+    let (m, _) = clone_body(&vm.mac(), Some("main"));
+    let mut body = head_line(&m).unwrap();
+    body.resize(body.len() + (8 << 20), b'P');
+    let path = format!("/seed?path={WS}&mode=clone&branch=main");
+    let mut lost = Vec::new();
+    for i in 0..5 {
+        match try_http_with(vm.s.code, "PUT", &path, &bearer_header(TOKEN), &body).await {
+            Ok((st, _, b)) => assert!(st == 409 && b.contains("\"path_occupied\""), "#{i}: {st} {b}"),
+            Err(e) => lost.push(format!("#{i}: {e}")),
+        }
+    }
+    assert!(lost.is_empty(), "answers lost to a reset: {lost:#?}");
+}
+
+/// A helper that cannot start (no such program) is a 500 `git_failed` the
+/// client of a body larger than the socket buffers still reads: the shim
+/// reads the body first (five rounds on each route, none lost).
+#[tokio::test]
+async fn a_helper_that_cannot_start_still_reads_the_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(root.join("vm/Users/agent")).unwrap();
+    let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(root.join("no-such-helper")), git: git_real().to_path_buf(), ..opts(None, HookSource::Log, 0) };
+    let s = stack(o).await;
+    s.run(true).await;
+    let body = vec![b'x'; 8 << 20];
+    let mut lost = Vec::new();
+    for (addr, path) in [(s.code, format!("/seed?path={WS}&mode=clone&branch=main")), (s.app, format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"))] {
+        for i in 0..5 {
+            match try_http_with(addr, "PUT", &path, &bearer_header(TOKEN), &body).await {
+                Ok((st, _, b)) => assert!(st == 500 && b.contains("\"git_failed\""), "{path} #{i}: {st} {b}"),
+                Err(e) => lost.push(format!("{path} #{i}: {e}")),
+            }
+        }
+    }
+    assert!(lost.is_empty(), "answers lost to a reset: {lost:#?}");
+}
+
+/// The transcript routes check a rel themselves, before the transcripts'
+/// lock and before any helper starts (the helper's own check is a second
+/// guard, `wshelper`'s): a traversal is 400 `bad_request` even from a shim
+/// whose helper cannot start, where a rel the route passes on is 500
+/// `git_failed` (phase 4's mutation check, M53).
+#[tokio::test]
+async fn a_traversal_rel_is_refused_before_any_helper_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(root.join("vm/Users/agent")).unwrap();
+    let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(root.join("no-such-helper")), git: git_real().to_path_buf(), ..opts(None, HookSource::Log, 0) };
+    let s = stack(o).await;
+    s.run(true).await;
+    for rel in [format!("../{S8_ID}.jsonl"), format!("{S8_SLUG}/../{S8_ID}.jsonl"), format!("{S8_SLUG}/{S8_ID}/../../x/{S8_ID}.jsonl")] {
+        for (method, body) in [("GET", None), ("PUT", Some(&b"{}\n"[..]))] {
+            let (st, _, b) = request(s.app, method, &format!("/transcript?rel={rel}"), "", body).await;
+            assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"), "{method} {rel}: the route's own refusal");
+        }
+    }
+    // A rel the route passes on meets the missing helper: the 400s above were the route's.
+    let (st, _, b) = request(s.app, "PUT", &format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"), "", Some(b"{}\n")).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (500, "git_failed"));
+}
+
+/// The helper runs as the agent: a code-out head announcing more than the
+/// request's `max_bytes` is refused, 413 `too_large` with its size, and
+/// never streamed; the helper is ended and the workspace free again.
+#[tokio::test]
+async fn a_codeout_longer_than_asked_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(root.join("vm/Users/agent")).unwrap();
+    let head = "a".repeat(40);
+    let manifest = CodeoutManifest { v: SeedManifest::V, object_format: ObjectFormat::Sha1, refs: BTreeMap::from([("refs/heads/main".to_string(), head.clone())]), head: head.clone(), branch: Some("main".into()), wip_ref: None, wip_skipped: None };
+    let line = String::from_utf8(head_line(&HelperHead::ok(manifest, Some(5000))).unwrap()).unwrap();
+    let helper = root.join("helper");
+    std::fs::write(&helper, format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nprintf '%s' '{line}'\nhead -c 5000 /dev/zero\n")).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Command::new(&helper).arg("warm").status().unwrap().success());
+    let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(helper), git: git_real().to_path_buf(), ..opts(None, HookSource::Log, 0) };
+    let s = stack(o).await;
+    s.run(true).await;
+    let record = SeedRecord { path: WS.into(), mode: ai_env_cli::wire::workspace::SeedMode::Clone, branch: Some("main".into()), head, wip: None, wip_tree: None, index_tree: None, object_format: ObjectFormat::Sha1, at: "2026-10-12T08:00:00Z".into() };
+    s.state.workspace.set_record(record);
+    let req = serde_json::json!({"path": WS, "haves": [], "wip": false, "max_bytes": 1000}).to_string();
+    let (st, _, b) = request(s.code, "POST", "/codeout", "", Some(req.as_bytes())).await;
+    let r = refusal_of(&b);
+    assert!(st == 413 && r.code == "too_large" && r.size == Some(5000), "{st} {r:?}");
+    let view = s.detail().await.0.workspace.expect("a workspace view");
+    assert_eq!((view.helpers, view.busy), (0, None));
+}
+
+/// The record a seed leaves is the one `GET /seed` and the detail report,
+/// and it is shaped as the wire freezes it.
+#[tokio::test]
+async fn the_seed_record_is_kept_in_memory() {
+    let vm = Vm::new().await;
+    let m = vm.clone_mac().await;
+    let record: SeedRecord = vm.s.state.workspace.record().expect("recorded");
+    assert_eq!((record.path.as_str(), record.head.as_str(), record.branch.as_deref(), record.object_format), (WS, m.head.as_str(), Some("main"), ObjectFormat::Sha1));
+    assert_eq!(vm.state().await.record, Some(record.clone()));
+    assert_eq!(vm.workspace_view().await.seed, Some(record));
+}
+
+// ---- phase 4 F9 ----
+//
+// S8 phase 4's review, FIDELITY-2: an update never resets the VM's checkout
+// (the design's T8.1 `reseed_never_resets_hard`). Plan §6: "a CAS ref update
+// and a two-way checkout, rolling back on failure"; git's two-way merge
+// refuses to overwrite a change of the agent's, a reset discards it.
+
+/// `<root>/editing-git`: the real git, and once armed ([`arm_edit`]) the
+/// agent's edit, once: right after the first `update-ref --stdin` that
+/// succeeds (an update's or a replace's compare-and-swap, past the shim's
+/// clean check and before the checkout moves), `<root>/edit.body` is written
+/// over the VM's file `<root>/edit.path` names, as another session's CLI on
+/// the VM may write while an update runs (D5: the probe and the chat share
+/// one VM). Absolute paths only: the helper runs git with no environment.
+/// Run once first (macOS assesses a new executable at its first exec).
+fn editing_git(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("editing-git");
+    let q = |p: PathBuf| format!("'{}'", p.display());
+    let (arm, done, target, body) = (q(root.join("edit.arm")), q(root.join("edit.done")), q(root.join("edit.path")), q(root.join("edit.body")));
+    let script = format!(
+        "#!/bin/sh\n'{}' \"$@\"\nrc=$?\nref=0\nfed=0\nfor a in \"$@\"; do\n  case \"$a\" in\n    update-ref) ref=1 ;;\n    --stdin) fed=1 ;;\n  esac\ndone\nif [ \"$rc\" = 0 ] && [ \"$ref$fed\" = 11 ] && [ -e {arm} ] && [ ! -e {done} ]; then\n  : > {done}\n  /bin/cat {body} > \"$(/bin/cat {target})\"\nfi\nexit \"$rc\"\n",
+        git_real().display()
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Command::new(&path).arg("--version").stdout(Stdio::null()).status().unwrap().success());
+    path
+}
+
+/// Arm [`editing_git`] of `root`: its one edit writes `body` over `file`.
+fn arm_edit(root: &Path, file: &Path, body: &str) {
+    std::fs::write(root.join("edit.path"), file.display().to_string()).unwrap();
+    std::fs::write(root.join("edit.body"), body).unwrap();
+    std::fs::write(root.join("edit.arm"), "").unwrap();
+}
+
+/// Whether a git argv overwrites what the worktree holds: a hard reset,
+/// `read-tree --reset -u`, a forced checkout, `restore`, `clean`.
+fn discards(args: &[String]) -> bool {
+    let has = |a: &str| args.iter().any(|x| x == a);
+    (has("reset") && (has("--hard") || has("--merge")))
+        || (has("read-tree") && has("--reset") && has("-u"))
+        || ((has("checkout") || has("checkout-index")) && (has("-f") || has("--force")))
+        || has("restore")
+        || has("clean")
+}
+
+/// The design's `reseed_never_resets_hard`, from the shim's git argv: an
+/// update (D3's fast-forward, the new WIP applied) and a replace of the
+/// pristine VM it left move the checkout by two-way merges (`read-tree -m
+/// -u`), never by anything that discards a change of the agent's. Only the
+/// clone, into an empty directory, resets.
+#[tokio::test]
+async fn an_update_and_a_replace_never_reset_the_checkout() {
+    let vm = Vm::with_fake_git().await;
+    let mac = vm.mac();
+    let seed = vm.clone_mac().await;
+    let log = vm.root.join("git.log");
+    let cloned = git_log(&log).len();
+    assert!(git_log(&log).iter().any(|(_, _, a)| discards(a)), "the clone resets its new checkout: the check sees a reset");
+    write_file(&mac.join("a.txt"), "four\n");
+    git(&mac, &["commit", "-q", "-am", "c3"]);
+    write_file(&mac.join("wip.txt"), "the Mac's uncommitted file\n");
+    let (m, body) = update_body(&mac, &seed, &seed.head, &seed.head);
+    let (st, b) = vm.seed(&format!("path={WS}&mode=update&branch=main&expect={}", seed.head), &body).await;
+    assert_eq!((st, json(&b)["outcome"].as_str()), (201, Some("updated")), "{}", String::from_utf8_lossy(&b));
+    let updated = git_log(&log).len();
+    std::fs::remove_file(mac.join("wip.txt")).unwrap();
+    write_file(&mac.join("a.txt"), "five\n");
+    git(&mac, &["commit", "-q", "-am", "c4"]);
+    let (_, body) = clone_body(&mac, Some("main"));
+    let (st, b) = vm.seed(&format!("path={WS}&mode=replace&branch=main&expect={}", m.head), &body).await;
+    assert_eq!((st, json(&b)["outcome"].as_str()), (201, Some("replaced")), "{}", String::from_utf8_lossy(&b));
+    let calls: Vec<Vec<String>> = git_log(&log).into_iter().map(|(_, _, a)| a).collect();
+    let resets: Vec<&Vec<String>> = calls[cloned..].iter().filter(|a| discards(a)).collect();
+    assert!(resets.is_empty(), "an update or a replace reset the checkout: {resets:?}");
+    let two_way = |calls: &[Vec<String>]| calls.iter().any(|a| ["read-tree", "-m", "-u"].iter().all(|w| a.iter().any(|x| x == w)));
+    assert!(two_way(&calls[cloned..updated]) && two_way(&calls[updated..]), "each moved the checkout by a two-way merge: {:?}", &calls[cloned..]);
+}
+
+/// D3's update never discards the agent's work: an edit made in the VM's
+/// checkout while an update runs (past the shim's clean check and its
+/// compare-and-swap), to a file the update changes, makes git's two-way
+/// checkout refuse: 409 `dirty`, the edit kept, the refs and the shallow
+/// boundary back where they were. A replace of a pristine VM alike (409
+/// `not_pristine`).
+#[tokio::test]
+async fn an_edit_made_while_an_update_runs_is_never_discarded() {
+    for (mode, code) in [("update", "dirty"), ("replace", "not_pristine")] {
+        let vm = Vm::with(editing_git).await;
+        let mac = vm.mac();
+        let seed = vm.clone_mac().await;
+        let ws = vm.ws();
+        let shallow = std::fs::read_to_string(ws.join(".git/shallow")).unwrap();
+        write_file(&mac.join("a.txt"), "four\n");
+        git(&mac, &["commit", "-q", "-am", "c3"]);
+        let body = if mode == "update" { update_body(&mac, &seed, &seed.head, &seed.head).1 } else { clone_body(&mac, Some("main")).1 };
+        arm_edit(&vm.root, &ws.join("a.txt"), "the agent's edit\n");
+        let (st, b) = vm.seed(&format!("path={WS}&mode={mode}&branch=main&expect={}", seed.head), &body).await;
+        assert!(vm.root.join("edit.done").exists(), "{mode}: the agent's edit landed while it ran");
+        assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "the agent's edit\n", "{mode}: the agent's edit, made while it ran, was discarded ({st}: {})", String::from_utf8_lossy(&b));
+        assert_eq!((st, refusal_of(&b).code.as_str()), (409, code), "{mode}");
+        assert_eq!((git(&ws, &["rev-parse", "HEAD"]), git(&ws, &["rev-parse", SEED_REF])), (seed.head.clone(), seed.head.clone()), "{mode}: the refs back");
+        assert_eq!(std::fs::read_to_string(ws.join(".git/shallow")).unwrap(), shallow, "{mode}: the shallow boundary back");
+        assert_eq!(git_status(&ws), [" M a.txt"], "{mode}");
+        assert!(vm.inbox_is_empty(), "{mode}");
+    }
+}
+
+/// The same on the WIP's step: an update whose own move leaves a file alone
+/// but whose new WIP changes it meets the agent's edit there. The WIP does
+/// not apply (409 `dirty`); the rollback puts back what the update moved
+/// (the refs, the head's checkout), never the agent's file.
+#[tokio::test]
+async fn an_edit_the_new_wip_meets_is_never_discarded_either() {
+    let vm = Vm::with(editing_git).await;
+    let mac = vm.mac();
+    let seed = vm.clone_mac().await;
+    let ws = vm.ws();
+    write_file(&mac.join("a.txt"), "four\n");
+    git(&mac, &["commit", "-q", "-am", "c3"]);
+    write_file(&mac.join("d/b.txt"), "the Mac's uncommitted change\n");
+    let (_, body) = update_body(&mac, &seed, &seed.head, &seed.head);
+    arm_edit(&vm.root, &ws.join("d/b.txt"), "the agent's edit\n");
+    let (st, b) = vm.seed(&format!("path={WS}&mode=update&branch=main&expect={}", seed.head), &body).await;
+    assert!(vm.root.join("edit.done").exists(), "the agent's edit landed while it ran");
+    assert_eq!(std::fs::read_to_string(ws.join("d/b.txt")).unwrap(), "the agent's edit\n", "the agent's edit, made while it ran, was discarded ({st}: {})", String::from_utf8_lossy(&b));
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "dirty"));
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "three\n", "the update's own move put back");
+    assert_eq!((git(&ws, &["rev-parse", "HEAD"]), git(&ws, &["rev-parse", SEED_REF])), (seed.head.clone(), seed.head.clone()), "the refs back");
+    assert_eq!(git_status(&ws), [" M d/b.txt"]);
 }

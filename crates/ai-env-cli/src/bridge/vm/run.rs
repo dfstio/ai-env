@@ -26,7 +26,8 @@ use crate::bridge::vm::gc::EXPIRY_MARGIN_S;
 use crate::bridge::vm::lock::lock_exclusive;
 use crate::bridge::vm::owner;
 use crate::bridge::vm::registry::{self, IdleRow, RowStatus, VmRow, GATE_MISMATCH, GATE_PASSED, GATE_PENDING, PENDING_STALE_S};
-use crate::wire::frame::{commitment_hex, Health, RunHookPayload, WireError};
+use crate::bridge::workspace::{vm_capability, Capability};
+use crate::wire::frame::{commitment_hex, Health, RunHookPayload, WireError, CAP_WORKSPACE_V1};
 use crate::wire::redact::{register_secret, Secret};
 use crate::wire::slug::project_dir_name;
 use crate::wire::time::{parse_rfc3339_utc, rfc3339_utc_ms, unix_now, unix_now_ms};
@@ -145,7 +146,8 @@ pub struct RunFlags {
     pub no_execution_role: bool,
     /// Wait until RUNNING (`--no-wait` clears it).
     pub wait: bool,
-    /// Who asks: `operator` | `smoke` | `probe` | `test` (audited).
+    /// Who asks: `operator` | `smoke` | `probe` | `test`, or S8's `session`
+    /// (the remote wrapper) | `prewarm` (`vm warm --prewarm`) (audited).
     pub purpose: &'static str,
     /// `vm smoke` and `lab run`: internet egress without a flag (audited).
     pub imply_internet: bool,
@@ -216,11 +218,45 @@ pub struct RunPlan {
     /// `vm smoke` sets it so it can sweep exactly its own run. `None` from
     /// [`RunPlan::from_cfg`].
     pub client_token: Option<String>,
+    /// S8: which VM SELECT_VM takes ([`Choice::Workspace`] from [`RunPlan::from_cfg`]).
+    pub choice: Choice,
+    /// S8 (L5): reuse no VM whose recorded caps lack `workspace_v1`, and
+    /// refuse a pinned one (exit 7, naming `make deploy`): the remote session
+    /// and `vm warm`, which seed the workspace through its routes. `false`
+    /// from [`RunPlan::from_cfg`].
+    pub workspace_cap: bool,
     /// Pad the run-hook payload with spaces after its opening `{` to exactly
     /// this many bytes ([`padded_payload`]); shorter than the payload is a
     /// config error, longer than 4096 is sent as is (the API decides).
     /// `None` from [`RunPlan::from_cfg`].
     pub pad_payload_to: Option<usize>,
+}
+
+/// Which VM SELECT_VM takes for a workspace (S8 plan §1, §3 P2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Choice {
+    /// The workspace's own (S4 D28): its newest usable row, else a new VM.
+    #[default]
+    Workspace,
+    /// A resumed session's VM first (its registry row names it: the
+    /// transcript and the VM's uncommitted work live there), its image
+    /// version taken as it is; then as [`Choice::Workspace`].
+    Prefer(String),
+    /// `AI_ENV_BRIDGE_VM`: this VM or nothing, never a new one, whatever its
+    /// image version.
+    Pin(String),
+}
+
+impl Choice {
+    /// Its word (the remote session's `vm_select` audit row).
+    #[must_use]
+    pub fn word(&self) -> &'static str {
+        match self {
+            Choice::Workspace => "workspace",
+            Choice::Prefer(_) => "prefer",
+            Choice::Pin(_) => "pin",
+        }
+    }
 }
 
 /// `arn:aws:lambda:eu-central-1:<12 digits>:microvm-image:<name>` — the form
@@ -281,7 +317,7 @@ impl RunPlan {
         if !(1..=MAX_DURATION_S).contains(&max_duration_s) {
             return Err(refuse(max_src, format!("{max_duration_s}: must be 1..={MAX_DURATION_S} s (the service maximum)")));
         }
-        debug_assert!(matches!(flags.purpose, "operator" | "smoke" | "probe" | "test"), "unknown run purpose {:?}", flags.purpose);
+        debug_assert!(matches!(flags.purpose, "operator" | "smoke" | "probe" | "test" | "session" | "prewarm"), "unknown run purpose {:?}", flags.purpose);
         let idle = idle_spec(cfg, flags, max_duration_s)?;
         let (egress, egress_connectors) = effective_egress(cfg, flags.egress, flags.imply_internet)?;
         let ingress_connectors = if flags.shell { vec![api::managed_connector_arn("HTTP_INGRESS"), api::managed_connector_arn("SHELL_INGRESS")] } else { Vec::new() };
@@ -318,6 +354,8 @@ impl RunPlan {
             memory_mib: cfg.vm.memory_mib,
             client_token: None,
             pad_payload_to: None,
+            choice: Choice::Workspace,
+            workspace_cap: false,
         })
     }
 }
@@ -365,7 +403,7 @@ fn resolve_workspace(cfg: &BridgeConfig, path: &Path) -> Result<(PathBuf, String
 
 /// The row's `workspace` for a canonical path: what reuse (D28) matches on.
 /// The slug is lossy (`a.b` and `a_b` share one) and only names the lock.
-fn workspace_key(canonical: &Path) -> String {
+pub(crate) fn workspace_key(canonical: &Path) -> String {
     canonical.to_string_lossy().into_owned()
 }
 
@@ -686,28 +724,32 @@ fn apply_echo(row: &mut VmRow, vm: &VmInfo, fallback_start: u64, now: u64) {
     refresh(row, vm, now);
 }
 
-/// Append one audit row with `actor=cli`; a failed write is a warning (the
-/// action it records already happened), never a panic (`signals::say`): a
-/// terminate after a stop that closed the terminal audits here.
+/// Append one audit row with `actor=cli` (and the process's purpose, S8:
+/// `cmd::audit_purpose`, when `pairs` name none); a failed write is a
+/// warning through the voice (the action it records already happened), never
+/// a panic: a terminate after a stop that closed the terminal audits here.
 pub(crate) fn audit_event(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
     let mut all: Vec<(&str, String)> = vec![("actor", "cli".to_string())];
     all.extend(pairs.iter().cloned());
+    if let Some(purpose) = crate::bridge::vm::cmd::audit_purpose().filter(|_| !pairs.iter().any(|(k, _)| *k == "purpose")) {
+        all.push(("purpose", purpose.to_string()));
+    }
     let row = AuditRow::new(event, None, audit::detail(&all));
     if let Err(e) = audit::append(&paths.audit(), &row) {
         tracing::warn!("audit {event}: {e}");
-        crate::bridge::signals::say(&format!("ai-env: warning: audit row {event} not written: {e}"));
+        crate::bridge::voice::warn(&format!("audit row {event} not written: {e}"));
     }
 }
 
-/// [`update_or_write`] after the fact; a failure is a warning (what it
-/// records already happened), never a panic (`signals::say`). Returns the row
+/// [`update_or_write`] after the fact; a failure is a warning through the
+/// voice (what it records already happened), never a panic. Returns the row
 /// as written, else `row` with `f` applied.
 fn update_or_warn(paths: &Paths, row: &VmRow, f: impl Fn(&mut VmRow)) -> VmRow {
     match update_or_write(paths, row, &f) {
         Ok(disk) => disk,
         Err(e) => {
             tracing::warn!("vm row {}: {e}", row.stem());
-            crate::bridge::signals::say(&format!("ai-env: warning: vm row {} not updated: {e}", row.stem()));
+            crate::bridge::voice::warn(&format!("vm row {} not updated: {e}", row.stem()));
             let mut mem = row.clone();
             f(&mut mem);
             mem
@@ -809,25 +851,25 @@ fn record_pass(paths: &Paths, row: &VmRow, expected: &ExpectedEcho) -> VmRow {
 /// as `(none planned)`). `terminated` is whether `TerminateMicrovm` was
 /// accepted (a row write that failed after it does not count against it).
 /// Returns the error (exit 9); when not terminated, the caller keeps the id.
-/// Its warnings never panic (`signals::say`): the adoption sweep of a
+/// Its warnings go through the voice, never a panic: the adoption sweep of a
 /// stopped command reaches it after the stop.
 pub(crate) async fn reject_echo<A: MicrovmApi>(api: &A, paths: &Paths, id: &str, expected: Option<&ExpectedEcho>, echoed: &[String], via: &str, purpose: &str) -> BridgeError {
-    use crate::bridge::signals::say;
+    use crate::bridge::voice::warn;
     if let Err(e) = registry::update_row(paths, id, |r| r.egress_gate = Some(GATE_MISMATCH.to_string())) {
         tracing::warn!("vm row {id}: egress_gate mismatch not recorded: {e}");
-        say(&format!("ai-env: warning: vm row {id}: the egress mismatch not recorded: {e}"));
+        warn(&format!("vm row {id}: the egress mismatch not recorded: {e}"));
     }
     let terminated = match request_terminate(api, paths, id, "policy").await {
         Ok(recorded) => {
             if let Err(e) = recorded {
                 tracing::warn!("vm row {id}: the policy termination not recorded: {e}");
-                say(&format!("ai-env: warning: vm row {id}: terminated, but the row was not updated: {e}"));
+                warn(&format!("vm row {id}: terminated, but the row was not updated: {e}"));
             }
             true
         }
         Err(e) => {
             tracing::warn!("egress gate: terminating {id}: {e}");
-            say(&format!("ai-env: warning: egress mismatch: terminating {id} failed: {e}"));
+            warn(&format!("egress mismatch: terminating {id} failed: {e}"));
             false
         }
     };
@@ -1040,18 +1082,24 @@ pub async fn select_vm<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, po
 /// when it carries egress, passes the gate too. Audits `vm_run` once
 /// `RunMicrovm` answered, `vm_reuse` on reuse. Every failure after the
 /// pending row was written carries its client token
-/// ([`SelectFailure::client_token`]).
+/// ([`SelectFailure::client_token`]). S8: the plan's [`Choice`] decides
+/// inside this lock hold: [`Choice::Pin`] takes that VM alone and never
+/// places one ([`select_pinned`]: no version is resolved), [`Choice::Prefer`]
+/// tries the resumed session's VM first ([`try_reuse`]).
 pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, poll: Poll) -> Result<Selected, SelectFailure> {
     let Some(expected) = ExpectedEcho::for_plan(plan.egress, &plan.egress_connectors) else {
         return Err(BridgeError::EgressRequired.into());
     };
+    if let Choice::Pin(id) = &plan.choice {
+        return select_pinned(api, paths, plan, &expected, id, poll).await;
+    }
     let (version, note) = resolve_image_version(api, &plan.image_arn, &plan.want_version).await?;
     if let Some(note) = note {
-        eprintln!("ai-env: {note}");
+        crate::bridge::voice::note(&note);
     }
     if let Some(w) = memory_warning(plan.memory_mib, &version) {
         tracing::warn!("{w}");
-        eprintln!("ai-env: warning: {w}");
+        crate::bridge::voice::warn(&w);
     }
     let _workspace_guard = match &plan.workspace {
         Some((_, slug)) => Some(lock_exclusive(&paths.workspace_lock(slug), WORKSPACE_LOCK_BUDGET, "workspace lock").await?),
@@ -1273,127 +1321,201 @@ async fn run_with_retry<A: MicrovmApi>(api: &A, paths: &Paths, row: &VmRow, spec
 /// pending or unknown id row is a candidate too, e.g. after `--no-wait` or a
 /// crash before the RUNNING write) with more than `migrate_before_wall_s` of
 /// wall left and the same image ARN and version, egress and shell as asked;
-/// `GetMicrovm` decides: RUNNING is reused, PENDING is waited for (RUNNING
-/// with `poll`), SUSPENDING/SUSPENDED is resumed, then RUNNING. A VM the
-/// service reports TERMINATING/TERMINATED (at once or while waiting) is
-/// marked terminated and the next candidate is tried; `ResourceNotFound`
-/// marks a running/suspended row terminated, while a pending/unknown row
-/// (possibly seconds old: read-after-create) is only skipped. A row of
-/// other connectors than the plan's `wanted` (the configuration changed) is
-/// not a candidate. The S5 egress echo gate, on that first `GetMicrovm`,
-/// before any resume: a VM whose egress is not exactly what its row requires
-/// ([`ExpectedEcho::for_row`]; a `vpc` row without connectors, written before
-/// S5, never passes), or whose row already says `mismatch` (a terminate that
-/// failed), is terminated (`policy`), audited `vm_egress_mismatch` (via
-/// `reuse`) and skipped; when the terminate fails the error is returned with
-/// the id in [`SelectFailure::started`]. A pass records `passed` and the echo
-/// (a row written before S5 gets its connectors), and the settled answer
-/// (after a wait or a resume), when it carries egress, must pass again.
-/// Every row write goes through the rows lock.
+/// `GetMicrovm` decides ([`reuse_row`]). A row of other connectors than the
+/// plan's `wanted` (the configuration changed) is not a candidate. S8: with
+/// [`Choice::Prefer`] the session's VM is tried first, and its image version
+/// is taken as it is (that row only: the transcript and the VM's own work
+/// live there); with [`RunPlan::workspace_cap`] a row whose recorded caps
+/// lack `workspace_v1` is no candidate (L5; caps never read are: the data
+/// plane checks again before it sends anything). Every row write goes
+/// through the rows lock.
 async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted: &ExpectedEcho, workspace: &str, version: &str, poll: Poll) -> Result<Option<Selected>, SelectFailure> {
     let now = unix_now();
-    let min_left = i64::from(plan.migrate_before_wall_s);
-    let candidates: Vec<VmRow> = registry::list_rows(paths)?
-        .into_iter()
-        .filter(|r| !r.is_pending_row() && r.workspace.as_deref() == Some(workspace) && r.status != RowStatus::Terminated)
-        .filter(|r| r.wall_left(now).is_some_and(|left| left > min_left))
-        .filter(|r| r.image_arn == plan.image_arn && r.image_version == version && r.egress == plan.egress.as_str() && r.shell == plan.shell)
-        // Another connector's VM is not this run's; a row without connectors (before S5) goes to the gate.
-        .filter(|r| ExpectedEcho::for_row(r).is_none_or(|e| &e == wanted))
-        .collect();
+    let preferred = match &plan.choice {
+        Choice::Prefer(id) => Some(id.as_str()),
+        Choice::Workspace | Choice::Pin(_) => None,
+    };
+    let mut candidates: Vec<VmRow> = registry::list_rows(paths)?.into_iter().filter(|r| reuse_candidate(r, plan, wanted, workspace, Some(version), preferred, now)).collect();
+    // The session's VM first; the rest stay newest first.
+    candidates.sort_by_key(|r| preferred != Some(r.id.as_str()));
+    for row in candidates {
+        if let Ok(selected) = reuse_row(api, paths, plan, row, poll).await? {
+            return Ok(Some(selected));
+        }
+    }
+    Ok(None)
+}
+
+/// A row [`try_reuse`] tries for `plan` (`vm warm --dry-run` names the first
+/// too): not a pending row; the workspace's (`workspace`, its canonical
+/// path's key); not terminated; more than `migrate_before_wall_s` of wall
+/// left; the plan's image ARN, and its image version when known (`version`:
+/// the one SELECT_VM resolved; `None` offline, where any passes; `preferred`'s
+/// row passes with any); the plan's egress and shell; none of other
+/// connectors than `wanted` (a row without connectors, written before S5,
+/// goes to the gate); with `workspace_cap`, none whose caps lack
+/// `workspace_v1`.
+pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, workspace: &str, version: Option<&str>, preferred: Option<&str>, now: u64) -> bool {
+    !r.is_pending_row()
+        && r.workspace.as_deref() == Some(workspace)
+        && r.status != RowStatus::Terminated
+        && r.wall_left(now).is_some_and(|left| left > i64::from(plan.migrate_before_wall_s))
+        && r.image_arn == plan.image_arn
+        && (version.is_none_or(|v| r.image_version == v) || preferred == Some(r.id.as_str()))
+        && r.egress == plan.egress.as_str()
+        && r.shell == plan.shell
+        && ExpectedEcho::for_row(r).is_none_or(|e| &e == wanted)
+        && !(plan.workspace_cap && vm_capability(r) == Capability::No)
+}
+
+/// One reuse candidate, as [`try_reuse`] and a pinned VM ([`select_pinned`])
+/// take it: `Ok(Ok(_))` reused, `Ok(Err(why))` passed over, `Err` the run's
+/// failure. `GetMicrovm` decides: RUNNING is reused, PENDING is waited for
+/// (RUNNING with `poll`), SUSPENDING/SUSPENDED is resumed, then RUNNING. A VM
+/// the service reports TERMINATING/TERMINATED (at once or while waiting) is
+/// marked terminated and passed over; `ResourceNotFound` marks a
+/// running/suspended row terminated, while a pending/unknown row (possibly
+/// seconds old: read-after-create) is only passed over. The S5 egress echo
+/// gate, on that first `GetMicrovm`, before any resume: a VM whose egress is
+/// not exactly what its row requires ([`ExpectedEcho::for_row`]; a `vpc` row
+/// without connectors, written before S5, never passes), or whose row
+/// already says `mismatch` (a terminate that failed), is terminated
+/// (`policy`), audited `vm_egress_mismatch` (via `reuse`) and passed over;
+/// when the terminate fails the error is the run's, with the id in
+/// [`SelectFailure::started`]. A pass records `passed` and the echo (a row
+/// written before S5 gets its connectors), and the settled answer (after a
+/// wait or a resume), when it carries egress, must pass again. Audits
+/// `vm_reuse`.
+async fn reuse_row<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, row: VmRow, poll: Poll) -> Result<Result<Selected, BridgeError>, SelectFailure> {
+    let now = unix_now();
     // A VM that failed the gate: never reused; the run fails only when it could not be terminated.
     let reject = |error: BridgeError, id: &str| match still_alive(&error) {
         Some(alive) => Err(SelectFailure { error, kept_pending: None, started: Some(alive), client_token: None, ran: None }),
         None => {
-            eprintln!("ai-env: warning: not reusing {id}: {error}");
-            Ok(())
+            crate::bridge::voice::warn(&format!("not reusing {id}: {error}"));
+            Ok(Err(error))
         }
     };
-    for row in candidates {
-        let (expected, alias) = row_gate(paths, &row);
-        let vm = match api.get(&row.id).await {
-            Ok(vm) if !vm.state.is_terminal() => {
-                let judged = row.egress_gate.as_deref() != Some(GATE_MISMATCH) && echo_passes(expected.as_ref(), &vm.egress, alias.as_ref());
-                if !judged {
-                    reject(reject_echo(api, paths, &row.id, expected.as_ref(), &vm.egress, "reuse", plan.purpose).await, &row.id)?;
-                    continue;
-                }
-                if let Some(e) = &expected {
-                    record_pass(paths, &row, e);
-                }
-                vm
+    let (expected, alias) = row_gate(paths, &row);
+    let vm = match api.get(&row.id).await {
+        Ok(vm) if !vm.state.is_terminal() => {
+            let judged = row.egress_gate.as_deref() != Some(GATE_MISMATCH) && echo_passes(expected.as_ref(), &vm.egress, alias.as_ref());
+            if !judged {
+                return reject(reject_echo(api, paths, &row.id, expected.as_ref(), &vm.egress, "reuse", plan.purpose).await, &row.id);
             }
-            Ok(vm) => {
-                let at = vm.terminated_at_unix.and_then(|t| u64::try_from(t).ok()).unwrap_or(now);
-                update_or_warn(paths, &row, |r| {
-                    refresh(r, &vm, now);
-                    r.terminated_at.get_or_insert(at);
-                    r.terminated_by.get_or_insert_with(|| "platform".to_string());
-                });
-                continue;
+            if let Some(e) = &expected {
+                record_pass(paths, &row, e);
             }
-            Err(BridgeError::VmNotFound(_)) if matches!(row.status, RowStatus::Running | RowStatus::Suspended) => {
-                update_or_warn(paths, &row, |r| mark_terminated(r, "platform", now));
-                continue;
-            }
-            Err(BridgeError::VmNotFound(_)) => {
-                tracing::info!("vm reuse: {} ({}) not found yet: skipped", row.id, row.status.as_str());
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let id = row.id.clone();
-        let settled = async {
-            match vm.state {
-                VmState::Running => Ok(Some((vm, false))),
-                VmState::Pending => wait_for_state(api, &id, &VmState::Running, poll).await.map(|vm| Some((vm, false))),
-                VmState::Suspended | VmState::Suspending => {
-                    if vm.state == VmState::Suspending {
-                        wait_for_state(api, &id, &VmState::Suspended, poll).await?;
-                    }
-                    // Conflict: it resumed (or ended) since GetMicrovm; the RUNNING poll tells which.
-                    match api.resume(&id).await {
-                        Ok(()) | Err(BridgeError::Conflict(_)) => {}
-                        Err(e) => return Err(e),
-                    }
-                    wait_for_state(api, &id, &VmState::Running, poll).await.map(|vm| Some((vm, true)))
-                }
-                // A state this build does not know: never reused.
-                _ => Ok(None),
-            }
-        };
-        let (vm, resumed) = match settled.await {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            // The service answered TERMINATING/TERMINATED: confirmed, try the next row.
-            Err(BridgeError::Terminated(m)) => {
-                let at = unix_now();
-                update_or_warn(paths, &row, |r| {
-                    mark_terminated(r, "platform", at);
-                    r.state_reason = Some(m.clone());
-                });
-                continue;
-            }
-            // A candidate that did not settle in the budget (stuck PENDING, gone while
-            // waiting) is not reused: a new VM is placed, and the operator is told.
-            Err(e @ (BridgeError::Sdk { op: "wait", .. } | BridgeError::VmNotFound(_))) => {
-                eprintln!("ai-env: warning: not reusing {id}: {e} (ai-env vm terminate {id} if it is stuck)");
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        // The settled answer is a GetMicrovm too: its egress, when it reports one, must still pass.
-        if !vm.egress.is_empty() && !echo_passes(expected.as_ref(), &vm.egress, alias.as_ref()) {
-            reject(reject_echo(api, paths, &id, expected.as_ref(), &vm.egress, "reuse", plan.purpose).await, &id)?;
-            continue;
+            vm
         }
-        let seen = unix_now();
-        let row = update_or_write(paths, &row, |r| refresh(r, &vm, seen))?;
-        audit_event(paths, "vm_reuse", &[("id", row.id.clone()), ("purpose", plan.purpose.to_string()), ("resumed", resumed.to_string())]);
-        tracing::info!("vm reuse {} (resumed {resumed})", row.id);
-        return Ok(Some(Selected::Reused { row, vm, resumed }));
+        Ok(vm) => {
+            let at = vm.terminated_at_unix.and_then(|t| u64::try_from(t).ok()).unwrap_or(now);
+            update_or_warn(paths, &row, |r| {
+                refresh(r, &vm, now);
+                r.terminated_at.get_or_insert(at);
+                r.terminated_by.get_or_insert_with(|| "platform".to_string());
+            });
+            return Ok(Err(BridgeError::Terminated(format!("{} is {}", row.id, vm.state.as_str()))));
+        }
+        Err(e @ BridgeError::VmNotFound(_)) if matches!(row.status, RowStatus::Running | RowStatus::Suspended) => {
+            update_or_warn(paths, &row, |r| mark_terminated(r, "platform", now));
+            return Ok(Err(e));
+        }
+        Err(e @ BridgeError::VmNotFound(_)) => {
+            tracing::info!("vm reuse: {} ({}) not found yet: skipped", row.id, row.status.as_str());
+            return Ok(Err(e));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let id = row.id.clone();
+    let settled = async {
+        match vm.state {
+            VmState::Running => Ok(Some((vm, false))),
+            VmState::Pending => wait_for_state(api, &id, &VmState::Running, poll).await.map(|vm| Some((vm, false))),
+            VmState::Suspended | VmState::Suspending => {
+                if vm.state == VmState::Suspending {
+                    wait_for_state(api, &id, &VmState::Suspended, poll).await?;
+                }
+                // Conflict: it resumed (or ended) since GetMicrovm; the RUNNING poll tells which.
+                match api.resume(&id).await {
+                    Ok(()) | Err(BridgeError::Conflict(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                wait_for_state(api, &id, &VmState::Running, poll).await.map(|vm| Some((vm, true)))
+            }
+            // A state this build does not know: never reused.
+            _ => Ok(None),
+        }
+    };
+    let (vm, resumed) = match settled.await {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(Err(BridgeError::Conflict(format!("{id} is in a state this build does not know: not reused")))),
+        // The service answered TERMINATING/TERMINATED: confirmed, try the next row.
+        Err(BridgeError::Terminated(m)) => {
+            let at = unix_now();
+            update_or_warn(paths, &row, |r| {
+                mark_terminated(r, "platform", at);
+                r.state_reason = Some(m.clone());
+            });
+            return Ok(Err(BridgeError::Terminated(m)));
+        }
+        // A candidate that did not settle in the budget (stuck PENDING, gone while
+        // waiting) is not reused: a new VM is placed, and the operator is told.
+        Err(e @ (BridgeError::Sdk { op: "wait", .. } | BridgeError::VmNotFound(_))) => {
+            crate::bridge::voice::warn(&format!("not reusing {id}: {e} (ai-env vm terminate {id} if it is stuck)"));
+            return Ok(Err(e));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // The settled answer is a GetMicrovm too: its egress, when it reports one, must still pass.
+    if !vm.egress.is_empty() && !echo_passes(expected.as_ref(), &vm.egress, alias.as_ref()) {
+        return reject(reject_echo(api, paths, &id, expected.as_ref(), &vm.egress, "reuse", plan.purpose).await, &id);
     }
-    Ok(None)
+    let seen = unix_now();
+    let row = update_or_write(paths, &row, |r| refresh(r, &vm, seen))?;
+    // S4's row as it was: the remote session's `vm_select` row says which choice took it.
+    audit_event(paths, "vm_reuse", &[("id", row.id.clone()), ("purpose", plan.purpose.to_string()), ("resumed", resumed.to_string())]);
+    tracing::info!("vm reuse {} (resumed {resumed}, {})", row.id, plan.choice.word());
+    Ok(Ok(Selected::Reused { row, vm, resumed }))
+}
+
+/// S8 `AI_ENV_BRIDGE_VM` ([`Choice::Pin`]): that VM's row and nothing else,
+/// under the workspace's lock when the plan names a workspace; never a new
+/// VM, never another row. Its image version is taken as it is (the operator
+/// chose it), as is its wall left. Refused (the run's failure): no row or
+/// one recording the VM terminated (exit 8), another egress, a `--shell` VM
+/// or another connector than the plan's (exit 9), recorded caps lacking
+/// `workspace_v1` when the plan needs them (exit 7, naming `make deploy`),
+/// and whatever [`reuse_row`] passed it over for (gone: 8; its egress
+/// failed the gate: 9; not settled: 7).
+async fn select_pinned<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted: &ExpectedEcho, id: &str, poll: Poll) -> Result<Selected, SelectFailure> {
+    let pinned = |why: String| format!("the pinned VM {id} ({}): {why}", crate::bridge::remote::PIN_KNOB);
+    if !registry::is_vm_id(id) {
+        return Err(BridgeError::Config(pinned("not a MicroVM id".into())).into());
+    }
+    let _workspace_guard = match &plan.workspace {
+        Some((_, slug)) => Some(lock_exclusive(&paths.workspace_lock(slug), WORKSPACE_LOCK_BUDGET, "workspace lock").await?),
+        None => None,
+    };
+    let Some(row) = registry::read_row(paths, id)? else {
+        return Err(BridgeError::VmNotFound(pinned("no row in state/vms".into())).into());
+    };
+    if row.status == RowStatus::Terminated {
+        return Err(BridgeError::Terminated(pinned("its row records it terminated".into())).into());
+    }
+    if row.egress != plan.egress.as_str() || row.shell != plan.shell {
+        return Err(BridgeError::Policy(pinned(format!("it runs with {} egress{}, the session needs {}{}", row.egress, if row.shell { " and --shell" } else { "" }, plan.egress, if plan.shell { " and --shell" } else { " without --shell" }))).into());
+    }
+    if ExpectedEcho::for_row(&row).is_some_and(|e| &e != wanted) {
+        return Err(BridgeError::Policy(pinned("it was started for another egress connector than the configured one".into())).into());
+    }
+    if plan.workspace_cap && vm_capability(&row) == Capability::No {
+        return Err(BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, message: pinned(format!("image version {} predates the workspace routes", row.image_version)) }.into());
+    }
+    match reuse_row(api, paths, plan, row, poll).await? {
+        Ok(selected) => Ok(selected),
+        Err(why) => Err(why.into()),
+    }
 }
 
 // ---- terminate -------------------------------------------------------------------------
@@ -1604,8 +1726,8 @@ async fn promote_adopted<A: MicrovmApi>(api: &A, paths: &Paths, pending: &VmRow,
             r.egress_gate = Some(GATE_MISMATCH.to_string());
         }) {
             tracing::warn!("vm row {}: the egress mismatch not recorded: {e}", vm.id);
-            // Never a panic: the sweep of a stopped command gets here after the stop.
-            crate::bridge::signals::say(&format!("ai-env: warning: vm row {} not written (egress mismatch): {e}", vm.id));
+            // Never a panic (the voice): the sweep of a stopped command gets here after the stop.
+            crate::bridge::voice::warn(&format!("vm row {} not written (egress mismatch): {e}", vm.id));
         }
         return Err(reject_echo(api, paths, &vm.id, expected.as_ref(), &vm.egress, via, purpose).await);
     }
@@ -1675,6 +1797,164 @@ mod tests {
         assert_eq!(status_of(&VmState::Unknown("X".into())), RowStatus::Unknown);
     }
 
+    /// A temp bridge root, a workspace under its root, and the plan of a
+    /// 3600 s internet VM for it (`choice`, `workspace_cap` as given).
+    struct World {
+        _dir: tempfile::TempDir,
+        paths: Paths,
+        cfg: BridgeConfig,
+        ws: PathBuf,
+    }
+
+    impl World {
+        fn new() -> World {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().join("work").join("ws");
+            std::fs::create_dir_all(&ws).unwrap();
+            let paths = Paths::from_root_and_env(dir.path().join("bridge"), None);
+            let cfg = BridgeConfig::parse(&format!("[aws]\nimage_arn = \"{}\"\n[vm]\nmax_concurrent = 10\n[workspaces]\nroots = [{:?}]\n", api::FAKE_IMAGE_ARN, dir.path().join("work"))).unwrap();
+            World { _dir: dir, paths, cfg, ws }
+        }
+
+        fn plan(&self, choice: Choice, workspace_cap: bool, new: bool) -> RunPlan {
+            let flags = RunFlags { max_duration_s: Some(3600), egress: Some(Egress::Internet), workspace: Some(self.ws.clone()), new, purpose: "test", ..RunFlags::default() };
+            RunPlan { choice, workspace_cap, ..RunPlan::from_cfg(&self.cfg, &flags).unwrap() }
+        }
+
+        /// A new VM for the workspace (its row written), then `edit` on its row.
+        async fn started<A: MicrovmApi>(&self, api: &A, edit: impl FnOnce(&mut VmRow)) -> String {
+            let s = select_vm(api, &self.paths, &self.plan(Choice::Workspace, false, true), Poll::RUNNING.scaled(Some(1))).await.unwrap();
+            let Selected::Started { row, .. } = s else { panic!("a new VM: {s:?}") };
+            registry::update_row(&self.paths, &row.id, edit).unwrap();
+            row.id
+        }
+
+        async fn select<A: MicrovmApi>(&self, api: &A, choice: Choice, workspace_cap: bool) -> Result<Selected, SelectFailure> {
+            select_vm_detailed(api, &self.paths, &self.plan(choice, workspace_cap, false), Poll::RUNNING.scaled(Some(1))).await
+        }
+    }
+
+    fn fake() -> api::FakeMicrovmApi {
+        let a = api::FakeMicrovmApi::new();
+        a.set_auto_advance(true);
+        a
+    }
+
+    fn runs(api: &api::FakeMicrovmApi) -> usize {
+        api.state().calls.iter().filter(|c| matches!(c, api::Call::Run { .. })).count()
+    }
+
+    fn reused(s: &Selected) -> &str {
+        match s {
+            Selected::Reused { row, .. } => &row.id,
+            Selected::Started { row, .. } => panic!("reuse expected, started {}", row.id),
+        }
+    }
+
+    /// S8 `Choice::Prefer`: the resumed session's VM is tried first, its
+    /// image version taken as it is (that row only: another row of an older
+    /// version is still passed over); a preferred VM that cannot be reused
+    /// falls back to the workspace's own.
+    #[tokio::test]
+    async fn a_preferred_vm_goes_first_whatever_its_image_version() {
+        let w = World::new();
+        let api = fake();
+        let older = w.started(&api, |r| {
+            r.image_version = "0.9".into();
+            r.created = "2026-01-01T00:00:00.000Z".into();
+        })
+        .await;
+        let newer = w.started(&api, |_| {}).await;
+        let before = runs(&api);
+        assert_eq!(reused(&w.select(&api, Choice::Workspace, false).await.unwrap()), newer, "the workspace's own: the current version");
+        assert_eq!(reused(&w.select(&api, Choice::Prefer(older.clone()), false).await.unwrap()), older, "the session's VM, its version as it is");
+        assert_eq!(reused(&w.select(&api, Choice::Prefer(newer.clone()), false).await.unwrap()), newer);
+        api.set_state(&older, VmState::Terminated);
+        assert_eq!(reused(&w.select(&api, Choice::Prefer(older.clone()), false).await.unwrap()), newer, "gone: the workspace's own");
+        assert_eq!(runs(&api), before, "nothing placed");
+    }
+
+    /// S8 `Choice::Pin`: that VM alone, never another, never a new one,
+    /// whatever `[vm].reuse_per_workspace` and its image version say; a pin
+    /// that cannot be taken is the run's failure, with its exit code.
+    #[tokio::test]
+    async fn a_pinned_vm_alone_is_taken_and_nothing_is_ever_placed() {
+        let w = World::new();
+        let api = fake();
+        let pinned = w.started(&api, |r| r.image_version = "0.9".into()).await;
+        let other = w.started(&api, |_| {}).await;
+        let before = runs(&api);
+        assert_eq!(reused(&w.select(&api, Choice::Pin(pinned.clone()), false).await.unwrap()), pinned);
+        let mut no_reuse = w.plan(Choice::Pin(other.clone()), false, true);
+        no_reuse.reuse = false;
+        assert!(matches!(select_vm(&api, &w.paths, &no_reuse, Poll::RUNNING.scaled(Some(1))).await.unwrap(), Selected::Reused { .. }), "a pin is taken even without reuse");
+        let exit = |r: Result<Selected, SelectFailure>| crate::errors::CliError::from(r.unwrap_err().error).exit_code();
+        assert_eq!(exit(w.select(&api, Choice::Pin("microvm-nowhere01".into()), false).await), 8, "no row");
+        registry::update_row(&w.paths, &pinned, |r| r.egress = "vpc".into()).unwrap();
+        assert_eq!(exit(w.select(&api, Choice::Pin(pinned.clone()), false).await), 9, "another egress");
+        registry::update_row(&w.paths, &pinned, |r| {
+            r.egress = "internet".into();
+            r.caps = Some(vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.into()]);
+        })
+        .unwrap();
+        let e = w.select(&api, Choice::Pin(pinned.clone()), true).await.unwrap_err().error;
+        assert!(matches!(&e, BridgeError::NoCapability { .. }) && e.to_string().contains("make deploy"), "{e}");
+        assert_eq!(reused(&w.select(&api, Choice::Pin(pinned.clone()), false).await.unwrap()), pinned, "the caps matter only to a plan that needs them");
+        api.set_state(&pinned, VmState::Terminated);
+        assert_eq!(exit(w.select(&api, Choice::Pin(pinned.clone()), false).await), 8, "gone");
+        assert_eq!(registry::read_row(&w.paths, &pinned).unwrap().unwrap().status, RowStatus::Terminated, "recorded");
+        assert_eq!(exit(w.select(&api, Choice::Pin(pinned.clone()), false).await), 8, "its row records it terminated");
+        assert_eq!(runs(&api), before, "a pin never places a VM");
+    }
+
+    /// L5: a plan that needs `workspace_v1` reuses no VM whose recorded caps
+    /// lack it (an image 7.0 VM): a new VM is placed; caps never read, or a
+    /// plan that does not need them, reuse it.
+    #[tokio::test]
+    async fn a_vm_without_workspace_v1_is_never_reused_for_a_seed() {
+        let w = World::new();
+        let api = fake();
+        let old = w.started(&api, |r| r.caps = Some(vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.into()])).await;
+        assert_eq!(reused(&w.select(&api, Choice::Workspace, false).await.unwrap()), old, "no seed: reused");
+        let before = runs(&api);
+        let s = w.select(&api, Choice::Workspace, true).await.unwrap();
+        assert!(matches!(&s, Selected::Started { row, .. } if row.id != old), "placed anew: {s:?}");
+        assert_eq!(runs(&api), before + 1);
+        let unread = w.started(&api, |r| {
+            r.caps = None;
+            r.created = "2030-01-01T00:00:00.000Z".into();
+        })
+        .await;
+        assert_eq!(reused(&w.select(&api, Choice::Workspace, true).await.unwrap()), unread, "never read: the data plane checks again");
+        assert_eq!((Choice::Workspace.word(), Choice::Prefer(String::new()).word(), Choice::Pin(String::new()).word()), ("workspace", "prefer", "pin"));
+    }
+
+    /// The three choices on the file-backed fake (`vm::fake_file`: the
+    /// backend of the lab knob the wrapper and `vm warm` run against in the
+    /// tests): a pin and a preference take their VM whatever its image
+    /// version, the workspace's own choice the current one, and a plan that
+    /// needs `workspace_v1` passes over a VM whose caps lack it.
+    #[tokio::test]
+    async fn the_choices_hold_on_the_file_backed_fake() {
+        use crate::bridge::vm::fake_file::FileFakeMicrovmApi;
+        let w = World::new();
+        let path = w.paths.root.join("fake.json");
+        std::fs::create_dir_all(&w.paths.root).unwrap();
+        std::fs::write(&path, serde_json::to_string(&api::FakeState { auto_advance: true, ..api::FakeState::new() }).unwrap()).unwrap();
+        let file = FileFakeMicrovmApi::open(&path).unwrap();
+        let runs = || file.snapshot().unwrap().calls.iter().filter(|c| matches!(c, api::Call::Run { .. })).count();
+        let older = w.started(&file, |r| r.image_version = "0.9".into()).await;
+        let current = w.started(&file, |r| r.caps = Some(vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.into()])).await;
+        let before = runs();
+        assert_eq!(reused(&w.select(&file, Choice::Pin(older.clone()), false).await.unwrap()), older, "the pin");
+        assert_eq!(reused(&w.select(&file, Choice::Prefer(older.clone()), false).await.unwrap()), older, "the session's VM");
+        assert_eq!(reused(&w.select(&file, Choice::Workspace, false).await.unwrap()), current, "the workspace's: the current version");
+        assert_eq!(runs(), before, "nothing placed");
+        let s = w.select(&file, Choice::Workspace, true).await.unwrap();
+        assert!(matches!(&s, Selected::Started { row, .. } if row.id != older && row.id != current), "no workspace_v1, an older version: placed anew: {s:?}");
+        assert_eq!(runs(), before + 1);
+    }
+
     /// Set only in the environment of the child half of
     /// `warnings_of_a_failed_local_write_never_panic`: its directory.
     const BROKEN_STDERR_DIR: &str = "AI_ENV_TEST_BROKEN_STDERR";
@@ -1684,7 +1964,7 @@ mod tests {
     /// terminate of `vm smoke`, `lab run` and `vm warm`; the adoption sweep):
     /// `record_rejection`'s (`state/creds.toml`), both `audit_event`s,
     /// `update_or_warn`'s, `reject_echo`'s three and `promote_adopted`'s go
-    /// through `signals::say`, never `eprintln!`, which panics when stderr
+    /// through `bridge::voice` (S8), never `eprintln!`, which panics when stderr
     /// cannot be written and turns the ending into exit 101. The test runs
     /// itself again as its child half, with no output capture and stderr a
     /// pipe whose reader is gone (every write fails, as on a hung-up

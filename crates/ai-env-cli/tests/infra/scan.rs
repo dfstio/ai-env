@@ -389,6 +389,26 @@ fn scan_repo_profile_is_tripwires_only() {
     assert_eq!(stdout(&o), "src/main.rs:1: aws-access-key-id\nscan: 1 finding(s) (2 files)\n");
 }
 
+/// S8 factored the lists' loading out of `infra scan` (`scan::load_lists`,
+/// which the seed's and the code-out's scans share): the repo profile still
+/// reads an explicit `--settings-policy` (a missing one is exit 1) and never
+/// the default policy file, whose bad line fails only the image profile.
+#[test]
+fn scan_repo_profile_reads_an_explicit_policy_and_never_the_default_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = tmp.path().join("tree");
+    write(&tree, "a.txt", "plain\n");
+    write(tmp.path(), "bridge/settings-policy.txt", "not an allow line\n");
+    let o = scan(tmp.path(), &[path_str(&tree), "--profile", "repo"]);
+    assert_eq!(o.status.code(), Some(0), "the repo profile never reads the default policy: {}", stderr(&o));
+    let o = scan(tmp.path(), &[path_str(&tree)]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("settings-policy.txt:1: expected `allow <entry>`"), "{}", stderr(&o));
+    let o = scan(tmp.path(), &[path_str(&tree), "--profile", "repo", "--settings-policy", path_str(&tmp.path().join("absent.txt"))]);
+    assert_eq!(o.status.code(), Some(1), "an explicit list must exist, whatever the profile: {}", stderr(&o));
+    assert!(stderr(&o).contains("cannot read"), "{}", stderr(&o));
+}
+
 #[test]
 fn scan_hints_when_the_staged_shim_binary_trips_a_rule() {
     let tmp = tempfile::tempdir().unwrap();

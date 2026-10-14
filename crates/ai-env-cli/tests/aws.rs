@@ -1078,7 +1078,7 @@ async fn live_agent_exec_roundtrip() {
     input.extend_from_slice(&[0x00, 0xff, 0xfe, b'\n']);
     input.extend(std::iter::repeat_n(b'x', 200_000));
     let t = std::time::Instant::now();
-    let (out, err, pid, exit) = agent_exec(&env, SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60) }, input.clone()).await;
+    let (out, err, pid, exit) = agent_exec(&env, SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, input.clone()).await;
     eprintln!("live_agent_exec_roundtrip: {} bytes round trip in {} ms; pid {pid:?}; exit {exit:?}", input.len(), t.elapsed().as_millis());
     assert_eq!(out.len(), input.len(), "stdout length");
     assert!(out == input, "stdout differs from stdin");
@@ -1116,7 +1116,7 @@ async fn live_agent_reattach() {
     let mut ev1 = c1.events;
     let consumed1 = c1.consumed.clone();
     let (mut out, mut last_seq, mut sid, mut pid1, mut chunks) = (Vec::new(), 0u64, None, None, 0u32);
-    let mut s1 = Box::pin(run_spawn(&env, Start::New(SpawnSpec { argv: vec!["sh".into(), "-c".into(), LIVE_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300) }), io1));
+    let mut s1 = Box::pin(run_spawn(&env, Start::New(SpawnSpec { argv: vec!["sh".into(), "-c".into(), LIVE_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None }), io1));
     loop {
         tokio::select! {
             ev = ev1.recv() => match ev {
@@ -1225,7 +1225,7 @@ async fn live_agent_rotation() {
         }
         (lines, notes)
     });
-    let outcome = run_spawn(&env, Start::New(SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300) }), io).await;
+    let outcome = run_spawn(&env, Start::New(SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None }), io).await;
     drop(c.input);
     drop(c.control);
     feeder.abort();
@@ -1795,5 +1795,858 @@ async fn live_credential_never_enters_an_internet_vm() {
     assert!(!rows.iter().any(|r| r["event"] == "credential_unseal"), "no unseal was audited");
     assert!(!err.contains("waiting for Touch ID") && !err.contains("ai-env: runtime key") && !err.contains("ai-env: profile "), "refused before any Touch ID: no countdown and no runtime-key line");
     assert!(t.elapsed() < Duration::from_secs(10), "refused at once");
+    sweep_live(&live, &[&out], &[]);
+}
+
+// ---- S8: the remote wrapper, live (AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1: make test-aws CRED=1) ----
+//
+// The real `ai-env-claude` in remote mode as Cursor runs it, the test playing
+// the extension (stream-json on the wrapper's stdio, the extension's chat argv
+// and entrypoint), in a fixture repository under this checkout's `target/s8/`
+// (made anew by each test), which a configured root must hold: else the test
+// fails, listing the roots. Each test runs in its own temporary bridge root
+// (the credential world's copies) with `[vm] max_duration_s = 900`, so every VM
+// its sessions start lives at most 15 minutes and has its row there, and
+// `migrate_before_wall_s = 300`, so a later chat reuses (or resumes) it for its
+// first ten minutes (at the default 1200 s a 900 s VM is never reused):
+// `SessionVms` terminates them all on every path the test unwinds through and,
+// unless the test already failed, asserts each is gone. The sessions make real
+// model requests with the operator's token. Touch IDs: one for the test
+// process's runtime key (`LIVE_CREDS`, when a test reads the service itself),
+// then one per wrapper process (D1) and one per `ai-env vm` or `box` command,
+// with a current combined.env. The Mac's mirror of each fixture's transcripts
+// goes where Cursor's would (`~/.claude/projects/<the fixture's slug>/`).
+// `live_wrapper_smoke` is `make s8-smoke`'s body; the API-host test needs
+// AI_ENV_AWS_SLOW=1 as well (about four minutes).
+
+use ai_env_cli::bridge::probes::{INIT_COLD_BUDGET_MS, INIT_WARM_BUDGET_MS};
+use ai_env_cli::bridge::remote::CLOSE_BUDGET_MS;
+use ai_env_cli::bridge::vm::registry::{self as vm_rows, RowStatus};
+
+/// The extension's chat argv (2.1.282, `tests/common/mod.rs`'s `SESSION_ARGV`).
+const CURSOR_CHAT: [&str; 16] = [
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--input-format",
+    "stream-json",
+    "--permission-prompt-tool",
+    "stdio",
+    "--setting-sources=user,project,local",
+    "--permission-mode",
+    "default",
+    "--include-partial-messages",
+    "--debug",
+    "--debug-to-stderr",
+    "--enable-auth-status",
+    "--no-chrome",
+    "--replay-user-messages",
+];
+
+/// How long the extension waits for `initialize`: Cursor's window (the Touch ID, a cold VM and the seed inside it).
+const LIVE_INIT_LIMIT: Duration = Duration::from_secs(60);
+/// How long one turn of a live chat may take (a model's answer, a tool call through the VM).
+const LIVE_TURN_LIMIT: Duration = Duration::from_secs(240);
+/// How long a wrapper may take to exit once its stdin closed before the test kills it (the budget is judged apart).
+const LIVE_EXIT_LIMIT: Duration = Duration::from_secs(10);
+
+/// [`cred_world`] for a wrapper test: `[vm] max_duration_s = 900` and
+/// `migrate_before_wall_s = 300` (`reuse_candidate` takes a VM only with
+/// more wall left than that: at the default 1200 none of these would ever be
+/// reused), and `vm`'s other `[vm]` keys, written into the temporary root's
+/// bridge.toml.
+fn wrapper_world(vm: &[(&str, toml::Value)]) -> Live {
+    let mut live = cred_world();
+    let mut doc: toml::Table = toml::from_str(&std::fs::read_to_string(&live.paths.config).unwrap()).expect("the copied bridge.toml");
+    let table = doc.entry("vm").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let table = table.as_table_mut().expect("[vm] is a table");
+    table.insert("max_duration_s".into(), toml::Value::Integer(900));
+    table.insert("migrate_before_wall_s".into(), toml::Value::Integer(300));
+    for (k, v) in vm {
+        table.insert((*k).to_string(), v.clone());
+    }
+    std::fs::write(&live.paths.config, toml::to_string(&doc).unwrap()).unwrap();
+    live.cfg = BridgeConfig::load(&live.paths).unwrap().expect("bridge.toml");
+    live
+}
+
+/// `git args` in `dir` with neither the system's nor a global config, the author, committer and dates fixed.
+fn fixture_git(dir: &std::path::Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .env("HOME", dir)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "ai-env live fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@ai-env.invalid")
+        .env("GIT_AUTHOR_DATE", "2026-10-12T08:00:00+00:00")
+        .env("GIT_COMMITTER_NAME", "ai-env live fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@ai-env.invalid")
+        .env("GIT_COMMITTER_DATE", "2026-10-12T08:00:00+00:00")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git runs");
+    assert!(o.status.success(), "git {args:?} in {}: {}", dir.display(), String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// The fixture repository `target/s8/<name>` of this checkout, made anew (one
+/// commit on `main`); a configured root must hold it, else the test fails
+/// listing the roots.
+fn s8_fixture(live: &Live, name: &str) -> std::path::PathBuf {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/s8");
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = std::fs::canonicalize(&base).unwrap().join(name);
+    let roots: Vec<std::path::PathBuf> = live.cfg.roots().iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf())).collect();
+    assert!(
+        roots.iter().any(|r| dir.starts_with(r)),
+        "{} is under no configured root: add target/s8 (or this checkout) to [workspaces].roots in bridge.toml; the roots: {:?}",
+        dir.display(),
+        live.cfg.roots()
+    );
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    fixture_git(&dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("README.md"), format!("{name}: a fixture of the S8 live tests\n")).unwrap();
+    fixture_git(&dir, &["add", "README.md"]);
+    fixture_git(&dir, &["commit", "-q", "-m", "fixture"]);
+    dir
+}
+
+/// A fixture directory removed on drop, on every path the test unwinds
+/// through: what a test planted there never outlives it.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "guard: could not remove {}: {e} — remove it by hand (a test planted a value there)", self.0.display());
+            }
+        }
+    }
+}
+
+/// The VMs a wrapper test's sessions made, all with their rows in its temporary root: on drop every row's VM is
+/// terminated (on its own runtime and thread) and, unless the test already failed, each is asserted gone.
+struct SessionVms {
+    creds: RuntimeCreds,
+    paths: Paths,
+}
+
+impl SessionVms {
+    fn new(live: &Live) -> SessionVms {
+        SessionVms { creds: live.creds.clone(), paths: live.paths.clone() }
+    }
+}
+
+impl Drop for SessionVms {
+    fn drop(&mut self) {
+        let (creds, paths) = (self.creds.clone(), self.paths.clone());
+        let (said, left) = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let api = connect(&creds).await;
+                let (mut said, mut left) = (Vec::new(), Vec::new());
+                for row in vm_rows::list_rows(&paths).unwrap_or_default() {
+                    if row.is_pending_row() {
+                        left.push(format!("a pending row {} (a run whose VM may exist: ai-env vm gc)", row.stem()));
+                        continue;
+                    }
+                    if row.status != RowStatus::Terminated {
+                        said.push(match vmrun::terminate_and_record(&api, &paths, &row.id, "test", Some(Poll::SETTLE)).await {
+                            Ok(_) => format!("guard: terminated {}", row.id),
+                            Err(e) => format!("guard: could not terminate {}: {} — run: ai-env vm terminate {} --yes (the test's row lived in a temp root)", row.id, no_account(&e.to_string()), row.id),
+                        });
+                    }
+                    match api.get(&row.id).await {
+                        Ok(vm) if vm.state.is_terminal() => {}
+                        Err(BridgeError::VmNotFound(_)) => {}
+                        Ok(vm) => left.push(format!("{} is {}", row.id, vm.state.as_str())),
+                        Err(e) => left.push(format!("{}: {}", row.id, no_account(&e.to_string()))),
+                    }
+                }
+                (said, left)
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| (Vec::new(), vec!["the guard's thread panicked".to_string()]));
+        for line in said {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
+        if !left.is_empty() && !std::thread::panicking() {
+            panic!("the test's VMs are not all gone: {}", left.join("; "));
+        }
+    }
+}
+
+/// One turn of a live chat: its `result` line, the tools claude asked
+/// permission for (each allowed), the tools it used, what those returned, and
+/// how long the turn took.
+#[derive(Default)]
+struct LiveTurn {
+    result: serde_json::Value,
+    asked: Vec<String>,
+    used: Vec<String>,
+    tool_output: String,
+    ms: u128,
+}
+
+/// One Cursor chat the test plays on the real `ai-env-claude` in remote mode:
+/// the extension's argv and entrypoint, its stream-json on the wrapper's stdio
+/// (each stdout line read on a thread), the test's temporary bridge root.
+struct Chat {
+    test: &'static str,
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// Every stdout line so far, for the sweep.
+    stdout: Vec<u8>,
+    /// The session id of the newest `system/init`.
+    session: Option<String>,
+}
+
+impl Chat {
+    /// `ai-env-claude <no claude here> CURSOR_CHAT… extra` in `cwd`: remote mode, the temporary root, the extension's
+    /// entrypoint; the lab knobs and every other `CLAUDE_CODE_` name of this shell removed. argv[1] names no file: in
+    /// remote mode no Mac binary runs, and a local run of it fails at once.
+    fn open(test: &'static str, live: &Live, cwd: &std::path::Path, extra: &[&str]) -> Chat {
+        use std::io::BufRead as _;
+        assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{test}: interrupted before a chat opened");
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env-claude"));
+        cmd.arg(live.paths.root.join("no-claude-on-this-mac").join("claude")).args(CURSOR_CHAT).args(extra).current_dir(cwd);
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy().to_string();
+            if k.starts_with("AI_ENV_BRIDGE_") || k.starts_with("CLAUDE_CODE_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.env("AI_ENV_BRIDGE_DIR", &live.paths.root)
+            .env("AI_ENV_BRIDGE_MODE", "remote")
+            .env("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("ai-env-claude runs");
+        let (tx, lines) = std::sync::mpsc::channel();
+        let out = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(out).lines().map_while(std::result::Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut err = child.stderr.take().expect("piped stderr");
+        let stderr = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+            buf
+        });
+        eprintln!("{test}: ai-env-claude (pid {}) in {}: answer its Touch ID", child.id(), cwd.display());
+        Chat { test, stdin: child.stdin.take(), child, lines, stderr: Some(stderr), stdout: Vec::new(), session: None }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn send(&mut self, line: &serde_json::Value) {
+        use std::io::Write as _;
+        let test = self.test;
+        let stdin = self.stdin.as_mut().unwrap_or_else(|| panic!("{test}: a send after the close"));
+        stdin.write_all(format!("{line}\n").as_bytes()).and_then(|()| stdin.flush()).unwrap_or_else(|e| panic!("{test}: the wrapper's stdin: {e}"));
+    }
+
+    /// The next stdout line that is JSON, before `until`; `None` at the wrapper's EOF or past `until`.
+    fn next(&mut self, until: Instant) -> Option<serde_json::Value> {
+        loop {
+            assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{}: interrupted: the guard ends the test's VMs", self.test);
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match self.lines.recv_timeout(left.min(Duration::from_millis(200))) {
+                Ok(line) => {
+                    self.stdout.extend_from_slice(line.as_bytes());
+                    self.stdout.push(b'\n');
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                    if v["type"] == "system" && v["subtype"] == "init" {
+                        self.session = v["session_id"].as_str().map(str::to_string);
+                    }
+                    return Some(v);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
+    /// `initialize`, answered within Cursor's window: how long it took.
+    fn initialize(&mut self) -> Duration {
+        let t = Instant::now();
+        self.send(&serde_json::json!({"type": "control_request", "request_id": "live-init", "request": {"subtype": "initialize"}}));
+        loop {
+            let Some(v) = self.next(t + LIVE_INIT_LIMIT) else {
+                let test = self.test;
+                panic!("{test}: no answer to initialize within {LIVE_INIT_LIMIT:?}; the wrapper's stderr: {}", self.stderr_now());
+            };
+            if v["type"] == "control_response" && v["response"]["request_id"] == "live-init" {
+                assert_eq!(v["response"]["subtype"], "success", "{}: initialize answered {v}", self.test);
+                return t.elapsed();
+            }
+        }
+    }
+
+    /// One user message and its turn, to its `result`: every `can_use_tool` request is allowed as asked, any other
+    /// request of claude's answered with an error.
+    fn turn(&mut self, text: &str) -> LiveTurn {
+        let t = Instant::now();
+        self.send(&serde_json::json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null, "session_id": "", "uuid": uuid::Uuid::now_v7().to_string()}));
+        let mut turn = LiveTurn::default();
+        loop {
+            let Some(v) = self.next(t + LIVE_TURN_LIMIT) else {
+                let test = self.test;
+                panic!("{test}: no result within {LIVE_TURN_LIMIT:?} (tools used: {:?}, asked for: {:?}); the wrapper's stderr: {}", turn.used, turn.asked, self.stderr_now());
+            };
+            match v["type"].as_str() {
+                Some("control_request") => {
+                    let (id, request) = (v["request_id"].clone(), &v["request"]);
+                    let answer = if request["subtype"] == "can_use_tool" {
+                        turn.asked.push(request["tool_name"].as_str().unwrap_or("?").to_string());
+                        serde_json::json!({"subtype": "success", "request_id": id, "response": {"behavior": "allow", "updatedInput": request["input"]}})
+                    } else {
+                        serde_json::json!({"subtype": "error", "request_id": id, "error": "the live test answers no such request"})
+                    };
+                    self.send(&serde_json::json!({"type": "control_response", "response": answer}));
+                }
+                Some("assistant") => {
+                    let blocks = v["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default();
+                    turn.used.extend(blocks.iter().filter(|b| b["type"] == "tool_use").filter_map(|b| b["name"].as_str().map(str::to_string)));
+                }
+                Some("user") => {
+                    for block in v["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter(|b| b["type"] == "tool_result") {
+                        match &block["content"] {
+                            serde_json::Value::String(s) => turn.tool_output.push_str(s),
+                            serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).for_each(|s| turn.tool_output.push_str(s)),
+                            _ => {}
+                        }
+                        turn.tool_output.push('\n');
+                    }
+                }
+                Some("result") => {
+                    turn.result = v;
+                    turn.ms = t.elapsed().as_millis();
+                    return turn;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The wrapper's stderr once it exited (empty while it runs: its reader holds it).
+    fn stderr_now(&mut self) -> String {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Some(h) = self.stderr.take() {
+                return no_account(&scrub(&String::from_utf8_lossy(&h.join().unwrap_or_default())));
+            }
+        }
+        "(still running)".to_string()
+    }
+
+    /// Close the wrapper's stdin (the extension's `stdin.end()`), then its exit: the code, and how long after the close
+    /// it came; killed and failed past [`LIVE_EXIT_LIMIT`].
+    fn close(&mut self) -> (Option<i32>, Duration) {
+        self.stdin = None;
+        let t = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for ai-env-claude") {
+                return (status.code(), t.elapsed());
+            }
+            if t.elapsed() > LIVE_EXIT_LIMIT {
+                let _ = self.child.kill();
+                panic!("{}: the wrapper did not exit within {LIVE_EXIT_LIMIT:?} of its stdin's close", self.test);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait (bounded by Cursor's window) for the wrapper's own exit, its stdin left open: the code and the stderr.
+    fn exit_unasked(&mut self) -> (Option<i32>, String) {
+        let t = Instant::now();
+        while t.elapsed() < LIVE_INIT_LIMIT {
+            assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{}: interrupted", self.test);
+            if let Some(status) = self.child.try_wait().expect("wait for ai-env-claude") {
+                while self.next(Instant::now() + Duration::from_millis(50)).is_some() {}
+                let err = self.stderr_now();
+                return (status.code(), err);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("{}: the wrapper did not end within {LIVE_INIT_LIMIT:?}", self.test);
+    }
+
+    /// What the chat put out, for [`sweep_live`]: its stdout lines and its stderr, once it exited.
+    fn output(&mut self) -> std::process::Output {
+        let status = self.child.wait().expect("ai-env-claude exited");
+        let stderr = self.stderr.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+        std::process::Output { status, stdout: self.stdout.clone(), stderr }
+    }
+}
+
+impl Drop for Chat {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // SIGTERM first: the wrapper detaches its spawn on its own; then SIGKILL.
+            // SAFETY: kill(2) on our own child, which try_wait just saw running (not reaped).
+            unsafe { libc::kill(i32::try_from(self.child.id()).unwrap_or(0), libc::SIGTERM) };
+            let t = Instant::now();
+            while matches!(self.child.try_wait(), Ok(None)) && t.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// The census end row of the wrapper `pid` in the test's temporary root.
+fn live_end_row(live: &Live, pid: u32) -> serde_json::Value {
+    let rows = ai_env_cli::bridge::census::read_rows(&live.paths.census(), None).unwrap();
+    rows.into_iter().rev().find(|r| r["pid"].as_u64() == Some(u64::from(pid)) && r["end"].as_u64().is_some()).unwrap_or_else(|| panic!("no census end row of the wrapper {pid}"))
+}
+
+/// The value of the note part `name` (`name:value`) of a census row.
+fn note_part(row: &serde_json::Value, name: &str) -> Option<String> {
+    row["note"].as_str()?.rsplit("; ").find_map(|p| p.strip_prefix(name).and_then(|rest| rest.strip_prefix(':'))).map(str::to_string)
+}
+
+/// The audit rows of `event` in the test's temporary root.
+fn live_audit(live: &Live, event: &str) -> Vec<serde_json::Value> {
+    ai_env_cli::bridge::audit::read_rows(&live.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == event).collect()
+}
+
+/// A chat's end row, said: the parts part B's latency table records.
+fn show_end(test: &str, row: &serde_json::Value) {
+    let p = |k: &str| note_part(row, k).unwrap_or_else(|| "-".into());
+    eprintln!(
+        "{test}: exit {} {} vm_how:{} init_ms:{} legs:{} seed:{} transcript:{} fetch:{} credential:{} close_ms:{} end:{}",
+        row["exit"],
+        p("vm"),
+        p("vm_how"),
+        p("init_ms"),
+        p("legs"),
+        p("seed"),
+        p("transcript"),
+        p("fetch"),
+        p("credential"),
+        p("close_ms"),
+        p("end")
+    );
+}
+
+/// What every live chat's end must show: exit 0 and an EOF close (the wrapper's own exit within the close budget, by
+/// the test's clock and by the census), the `initialize` answer's pid rewritten.
+fn assert_closed_well(test: &str, live: &Live, chat: &Chat, code: Option<i32>, close: Duration) -> serde_json::Value {
+    let row = live_end_row(live, chat.pid());
+    show_end(test, &row);
+    assert_eq!(code, Some(0), "{test}: the wrapper's exit");
+    assert!(close.as_millis() <= u128::from(CLOSE_BUDGET_MS), "{test}: the wrapper exited {} ms after its stdin's close (budget {CLOSE_BUDGET_MS} ms)", close.as_millis());
+    assert_eq!(note_part(&row, "end").as_deref(), Some("eof"), "{test}");
+    assert!(note_part(&row, "close_ms").and_then(|ms| ms.parse::<u64>().ok()).is_some_and(|ms| ms <= CLOSE_BUDGET_MS), "{test}: the census's close_ms");
+    assert_eq!(note_part(&row, "pid_rewrite").as_deref(), Some("ok"), "{test}");
+    row
+}
+
+/// T8.2 and T8.3 live: a chat on a fresh VM (one Touch ID) seeds the fixture
+/// at its identical path; a Bash tool call (allowed, as the permission prompt's
+/// button would) prints aarch64, uid 1000 and that path; `initialize` came
+/// within the cold budget, and the wrapper exits 0 within 1.5 s of its stdin's
+/// close; no setup-token in the clear anywhere.
+#[test]
+#[ignore = "live, starts a MicroVM and asks the model (one Touch ID): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+fn live_wrapper_session_answers_ok_on_a_fresh_vm() {
+    const TEST: &str = "live_wrapper_session_answers_ok_on_a_fresh_vm";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-fresh");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    let init = chat.initialize();
+    let turn = chat.turn("Run exactly this command with your Bash tool, then reply with its output only: uname -m; id -u; pwd");
+    let (code, close) = chat.close();
+    eprintln!("{TEST}: initialize answered after {} ms; the turn took {} ms, tools used {:?}, permission asked for {:?}", init.as_millis(), turn.ms, turn.used, turn.asked);
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert!(turn.used.iter().any(|t| t == "Bash"), "{TEST}: claude made no Bash call: {:?}", turn.used);
+    let out = &turn.tool_output;
+    assert!(out.lines().any(|l| l.trim() == "aarch64"), "{TEST}: uname -m: {out}");
+    assert!(out.lines().any(|l| l.trim() == "1000"), "{TEST}: id -u: {out}");
+    assert!(out.lines().any(|l| l.trim() == ws.display().to_string()), "{TEST}: pwd, the identical path {}: {out}", ws.display());
+    assert_eq!(note_part(&row, "vm_how").as_deref(), Some("started"), "{TEST}");
+    assert_eq!(note_part(&row, "seed").as_deref(), Some("seeded"), "{TEST}");
+    let init_ms: u128 = note_part(&row, "init_ms").and_then(|ms| ms.parse().ok()).expect("init_ms");
+    assert!(init_ms <= INIT_COLD_BUDGET_MS, "{TEST}: cold initialize {init_ms} ms over its budget {INIT_COLD_BUDGET_MS} ms (tree A: the legs say where)");
+    assert!(note_part(&row, "legs").is_some_and(|l| l.starts_with("touchid=")), "{TEST}: the Touch ID leg");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
+}
+
+/// A second chat in the same workspace reuses the first one's VM (kept
+/// running: `[vm] suspend_on_close = false`) and its token: one delivery for
+/// both, the second spawn naming the VM's copy (the census's `credential:`
+/// of the second is `cached`, though a current combined.env's one Touch ID
+/// brought the token along with the runtime key: it went unused). Two Touch
+/// IDs (one per wrapper process, D1).
+#[test]
+#[ignore = "live, starts a MicroVM and asks the model (two Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+fn live_wrapper_warm_session_reuses_the_vm_and_its_token() {
+    const TEST: &str = "live_wrapper_warm_session_reuses_the_vm_and_its_token";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false)), ("reuse_per_workspace", toml::Value::Boolean(true))]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-warm");
+    let mut rows = Vec::new();
+    let mut outs = Vec::new();
+    for round in 1..=2 {
+        let mut chat = Chat::open(TEST, &live, &ws, &[]);
+        chat.initialize();
+        let turn = chat.turn("Reply with exactly OK");
+        assert_eq!(turn.result["is_error"], false, "{TEST}: round {round}: {}", turn.result);
+        let (code, close) = chat.close();
+        rows.push(assert_closed_well(TEST, &live, &chat, code, close));
+        outs.push(chat.output());
+    }
+    let vm = note_part(&rows[0], "vm").expect("the first chat's VM");
+    assert_eq!(note_part(&rows[0], "vm_how").as_deref(), Some("started"), "{TEST}");
+    assert_eq!((note_part(&rows[1], "vm").as_deref(), note_part(&rows[1], "vm_how").as_deref()), (Some(vm.as_str()), Some("reused")), "{TEST}: the second chat's VM");
+    assert_eq!(note_part(&rows[1], "credential").as_deref(), Some("cached"), "{TEST}: the second chat's CLI got the VM's copy");
+    let warm_ms: u128 = note_part(&rows[1], "init_ms").and_then(|ms| ms.parse().ok()).expect("init_ms");
+    eprintln!("{TEST}: warm initialize {warm_ms} ms (budget {INIT_WARM_BUDGET_MS} ms, the Touch ID inside it; not judged here: the init-wrapper probe reads the operator's census, never this temporary root's)");
+    let delivered = live_audit(&live, "credential_deliver").iter().filter(|r| r["detail"]["id"] == vm.as_str()).count();
+    assert_eq!(delivered, 1, "{TEST}: one delivery for the two chats");
+    sweep_live(&live, &outs.iter().collect::<Vec<_>>(), &[]);
+}
+
+/// Code-out live: after a chat seeded the fixture (its VM kept running), a
+/// commit and then an uncommitted edit made in the VM's checkout as the agent
+/// (`vm exec`, so the result is the test's, not the model's) come to the Mac
+/// with `box fetch --wip`: `refs/remotes/box/main` at the VM's commit, a
+/// `box/wip/*` ref holding the edit, the Mac's HEAD and worktree untouched.
+/// Three Touch IDs: the chat, `vm exec`, `box fetch`.
+#[test]
+#[ignore = "live, starts a MicroVM and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+fn live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip() {
+    const TEST: &str = "live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-codeout");
+    let mac_head = fixture_git(&ws, &["rev-parse", "HEAD"]);
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    chat.turn("Reply with exactly OK");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    let vm = note_part(&row, "vm").expect("the chat's VM");
+    let path = ws.display().to_string();
+    let script = "printf 'made in the VM\\n' > vm-commit.txt && git add vm-commit.txt && git -c user.name=ai-env-live -c user.email=live@ai-env.invalid -c commit.gpgsign=false commit -q -m 'a commit made in the VM' && git rev-parse HEAD && printf 'uncommitted in the VM\\n' > README.md";
+    let exec = ai_env_live(&live, &["vm", "exec", &vm, "--cwd", &path, "--", "sh", "-c", script]);
+    assert_eq!(exec.status.code(), Some(0), "{TEST}: vm exec");
+    let vm_commit = String::from_utf8_lossy(&exec.stdout).trim().to_string();
+    assert_eq!(vm_commit.len(), 40, "{TEST}: the VM's commit id: {vm_commit:?}");
+    let fetch = ai_env_live(&live, &["box", "fetch", &path, "--wip", "--json"]);
+    assert_eq!(fetch.status.code(), Some(0), "{TEST}: box fetch");
+    assert_eq!(fixture_git(&ws, &["rev-parse", "refs/remotes/box/main"]), vm_commit, "{TEST}: box/main is the VM's commit");
+    let wips = fixture_git(&ws, &["for-each-ref", "--sort=-refname", "--format=%(refname)", "refs/remotes/box/wip/"]);
+    let newest = wips.lines().next().unwrap_or_else(|| panic!("{TEST}: no box/wip ref"));
+    assert_eq!(fixture_git(&ws, &["show", &format!("{newest}:README.md")]), "uncommitted in the VM", "{TEST}: the snapshot holds the edit");
+    assert_eq!(fixture_git(&ws, &["rev-parse", "HEAD"]), mac_head, "{TEST}: the Mac's HEAD");
+    assert_eq!(fixture_git(&ws, &["status", "--porcelain"]), "", "{TEST}: the Mac's worktree");
+    let out = chat.output();
+    sweep_live(&live, &[&out, &exec, &fetch], &[]);
+}
+
+/// T8.5 live: a word told in a chat is recalled after its VM was terminated:
+/// the reopened chat (`--resume` of its session) starts a new VM, its
+/// transcript is put there before the spawn (`transcript:uploaded`, audited),
+/// and the conversation goes on. Three Touch IDs: two chats and the terminate.
+#[test]
+#[ignore = "live, starts two MicroVMs and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+fn live_wrapper_resume_into_a_new_vm_continues_the_conversation() {
+    const TEST: &str = "live_wrapper_resume_into_a_new_vm_continues_the_conversation";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-resume");
+    let word = format!("lantern{}", uuid::Uuid::now_v7().simple().to_string().chars().rev().take(4).collect::<String>());
+    let mut first = Chat::open(TEST, &live, &ws, &[]);
+    first.initialize();
+    first.turn(&format!("Remember this word for later: {word}. Reply with exactly OK"));
+    let (code, close) = first.close();
+    let row = assert_closed_well(TEST, &live, &first, code, close);
+    let (vm1, session) = (note_part(&row, "vm").expect("the first VM"), first.session.clone().expect("the chat's session id"));
+    let terminate = ai_env_live(&live, &["vm", "terminate", &vm1, "--yes"]);
+    assert_eq!(terminate.status.code(), Some(0), "{TEST}: vm terminate");
+    let resume = format!("--resume={session}");
+    let mut second = Chat::open(TEST, &live, &ws, &[&resume]);
+    second.initialize();
+    let turn = second.turn("Which word did I ask you to remember? Reply with the word only.");
+    let (code, close) = second.close();
+    let row = assert_closed_well(TEST, &live, &second, code, close);
+    let answer = turn.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer {answer:?} lacks the word");
+    assert_eq!(second.session.as_deref(), Some(session.as_str()), "{TEST}: the same session id");
+    let vm2 = note_part(&row, "vm").expect("the second VM");
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    assert_eq!((note_part(&row, "vm_how").as_deref(), note_part(&row, "transcript").as_deref()), (Some("started"), Some("uploaded")), "{TEST}");
+    assert!(!live_audit(&live, "transcript_put").is_empty(), "{TEST}: the upload is audited");
+    let (a, b) = (first.output(), second.output());
+    sweep_live(&live, &[&a, &b, &terminate], &[]);
+}
+
+/// The VM's copy of a transcript wins: after a chat (its VM kept running), a
+/// shorter upload of that session's transcript (`PUT /transcript`, as a resume
+/// would send a Mac copy behind the VM's) is 409 `vm_longer` naming the VM's
+/// size, and the VM's copy stays as it was. Two Touch IDs: the chat and the
+/// test process's runtime key.
+#[tokio::test]
+#[ignore = "live, starts a MicroVM and asks the model (two Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+async fn live_wrapper_shorter_transcript_upload_is_409() {
+    use ai_env_cli::bridge::dataplane::{DataPlane, HttpsEndpoint as DataEndpoint, MintingTokens, TokenSource};
+    const TEST: &str = "live_wrapper_shorter_transcript_upload_is_409";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-transcript");
+    // The chat's waits block this test's one thread: nothing else runs on its runtime meanwhile.
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    chat.turn("Reply with exactly OK");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    let (vm, session) = (note_part(&row, "vm").expect("the chat's VM"), chat.session.clone().expect("the chat's session id"));
+    let rel = ai_env_cli::bridge::registry::read(&live.paths, &session).unwrap().and_then(|r| r.transcript_rel).expect("the session's transcript_rel");
+    let api = connect(&live.creds).await;
+    let vm_row = vm_rows::read_row(&live.paths, &vm).unwrap().expect("the VM's row");
+    let target = AgentTarget::from_row(&vm_row).unwrap();
+    let dp = DataEndpoint::new(&ai_env_cli::bridge::lab::VmKnobs::default()).unwrap();
+    let tokens = MintingTokens::new(&api, &live.paths, &vm, false);
+    let token = tokens.token(ai_env_cli::wire::workspace::APP_PORT).await.unwrap_or_else(|e| panic!("{TEST}: a Port(8080) token: {}", no_account(&e.to_string())));
+    let before = dp.transcript_stat(&target, &token, &rel).await.unwrap().body.expect("the VM's stat");
+    assert!(before.present && before.size > 1, "{TEST}: the VM holds the session's transcript: {before:?}");
+    let shorter = live.paths.root.join("shorter.jsonl");
+    std::fs::write(&shorter, vec![b'\n'; usize::try_from(before.size - 1).unwrap()]).unwrap();
+    let put = dp.put_transcript(&target, &token, &rel, &shorter, before.size - 1).await.unwrap();
+    let refusal = put.refusal.clone().unwrap_or_else(|| panic!("{TEST}: HTTP {} without a refusal", put.status));
+    assert_eq!((put.status, refusal.code.as_str(), refusal.size), (409, "vm_longer", Some(before.size)), "{TEST}: {refusal:?}");
+    let after = dp.transcript_stat(&target, &token, &rel).await.unwrap().body.expect("the VM's stat");
+    assert_eq!((after.size, after.sha256.clone()), (before.size, before.sha256.clone()), "{TEST}: the VM's copy stays");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
+}
+
+/// A secret in the workspace is caught before anything leaves the Mac: an
+/// untracked file holding an access-key shape (built here; the fixture is
+/// removed on every path, `RemoveOnDrop`) refuses the seed at P1, the wrapper
+/// exits 9 with the finding's line (never the value), and no VM was asked for
+/// (no RunMicrovm: no VM row, no `vm_run`). At most one Touch ID (the dialog
+/// may close with the refusal).
+#[test]
+#[ignore = "live, no VM expected (at most one Touch ID): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+fn live_wrapper_seed_refuses_a_planted_secret_before_any_vm() {
+    const TEST: &str = "live_wrapper_seed_refuses_a_planted_secret_before_any_vm";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-secret");
+    // The planted value never outlives the test: the fixture goes on every path, after the chat (made later) ended.
+    let _planted = RemoveOnDrop(ws.clone());
+    let key = format!("{}{}", "AKIA", "Q7ZT".repeat(4));
+    std::fs::write(ws.join("deploy.conf"), format!("aws_access_key_id = {key}\n")).unwrap();
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.send(&serde_json::json!({"type": "control_request", "request_id": "live-init", "request": {"subtype": "initialize"}}));
+    let (code, err) = chat.exit_unasked();
+    eprintln!("{TEST}: exit {code:?}; the last line: {}", err.lines().last().unwrap_or_default());
+    assert_eq!(code, Some(9), "{TEST}: {err}");
+    assert!(err.lines().last().is_some_and(|l| l.starts_with("ai-env-claude: ")), "{TEST}: one ai-env-claude line last: {err}");
+    assert!(!err.contains(&key[4..]), "{TEST}: the value is never shown");
+    assert!(vm_rows::list_rows(&live.paths).unwrap().is_empty(), "{TEST}: no VM row: nothing was started");
+    assert!(live_audit(&live, "vm_run").is_empty(), "{TEST}: no RunMicrovm");
+    let row = live_end_row(&live, chat.pid());
+    assert_eq!(note_part(&row, "end").as_deref(), Some("spawn_failed"), "{TEST}");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[&key]);
+}
+
+/// `make s8-smoke`'s body (T8.2's gate): three live chats in a fixture
+/// workspace, each seeding (or keeping) the VM, one turn, its code-out fetch
+/// recorded before the close, and the wrapper's exit 0 within 1.5 s; each
+/// pass's record appended to `target/s8/smoke.jsonl`. One Touch ID per pass.
+#[test]
+#[ignore = "live, starts a MicroVM and asks the model three times (four Touch IDs: the test process's runtime key, then one per pass): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make s8-smoke"]
+fn live_wrapper_smoke() {
+    const TEST: &str = "live_wrapper_smoke";
+    if !cred_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-smoke");
+    let records = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/s8")).unwrap().join("smoke.jsonl");
+    let mut outs = Vec::new();
+    for pass in 1..=3 {
+        let fetched = live_audit(&live, "codeout_fetch").len();
+        let mut chat = Chat::open(TEST, &live, &ws, &[]);
+        let init = chat.initialize();
+        let turn = chat.turn("Reply with exactly OK");
+        assert_eq!(turn.result["is_error"], false, "{TEST}: pass {pass}: {}", turn.result);
+        // The end row counts the turn's code-out only once its report is in (plan section 11): wait for its row.
+        let t = Instant::now();
+        while live_audit(&live, "codeout_fetch").len() == fetched {
+            assert!(t.elapsed() < Duration::from_secs(60), "{TEST}: pass {pass}: no codeout_fetch row within 60 s of the result");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let (code, close) = chat.close();
+        let row = assert_closed_well(TEST, &live, &chat, code, close);
+        let fetch = note_part(&row, "fetch").unwrap_or_default();
+        let (ok, runs) = fetch.split_once('/').map(|(a, b)| (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0))).unwrap_or((0, 0));
+        let record = serde_json::json!({
+            "pass": pass, "ts": ai_env_cli::wire::time::rfc3339_utc(ai_env_cli::wire::time::unix_now()), "exit": code, "close_ms": close.as_millis() as u64,
+            "initialize_ms": init.as_millis() as u64, "turn_ms": turn.ms as u64, "vm": note_part(&row, "vm"), "vm_how": note_part(&row, "vm_how"),
+            "init_ms": note_part(&row, "init_ms"), "legs": note_part(&row, "legs"), "seed": note_part(&row, "seed"), "fetch": fetch, "credential": note_part(&row, "credential"),
+        });
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&records).unwrap();
+            writeln!(f, "{record}").unwrap();
+        }
+        assert!(ok >= 1 && ok == runs, "{TEST}: pass {pass}: the code-out fetch {fetch:?}");
+        assert!(note_part(&row, "seed").is_some(), "{TEST}: pass {pass}: the seed's word");
+        eprintln!("s8-smoke: pass {pass} ok");
+        outs.push(chat.output());
+    }
+    eprintln!("s8-smoke: 3/3 ok ({})", records.display());
+    sweep_live(&live, &outs.iter().collect::<Vec<_>>(), &[]);
+}
+
+/// `ai-env egress suspend api.anthropic.com [--restore]` on the operator's real bridge root (the proxy is shared),
+/// killed after 300 s.
+fn egress_suspend_api(restore: bool) -> std::process::Output {
+    let root = Paths::resolve().expect("the real bridge root").root;
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env"));
+    c.args(["egress", "suspend", "api.anthropic.com"]);
+    if restore {
+        c.arg("--restore");
+    }
+    let child = c.env("AI_ENV_BRIDGE_DIR", root).env_remove("AI_ENV_BRIDGE_CONFIG").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("spawn ai-env");
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(300)) {
+        Ok(out) => out.expect("ai-env output"),
+        Err(_) => {
+            let _ = std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+            panic!("ai-env egress suspend did not finish within 300 s");
+        }
+    }
+}
+
+/// The API host's suspension on the proxy: lifted on drop unless `restore` already did it.
+struct ApiHostSuspended {
+    armed: bool,
+}
+
+impl ApiHostSuspended {
+    fn suspend() -> ApiHostSuspended {
+        let o = egress_suspend_api(false);
+        let held = ApiHostSuspended { armed: true };
+        assert!(o.status.success(), "egress suspend: {}", no_account(&String::from_utf8_lossy(&o.stderr)));
+        held
+    }
+
+    fn restore(&mut self) {
+        let o = egress_suspend_api(true);
+        self.armed = !o.status.success();
+        assert!(o.status.success(), "egress suspend --restore: {}", no_account(&String::from_utf8_lossy(&o.stderr)));
+    }
+}
+
+impl Drop for ApiHostSuspended {
+    fn drop(&mut self) {
+        if self.armed {
+            let o = egress_suspend_api(true);
+            let _ = writeln!(std::io::stderr(), "guard: egress suspend api.anthropic.com --restore: exit {:?} — check with ai-env egress status", o.status.code());
+        }
+    }
+}
+
+/// L8's `AUTH_FAIL_BUDGET_MS` live: with the API host denied on the proxy
+/// mid-session (`egress suspend`, lifted on every path), a turn ends by the
+/// CLI's own retries within the budget, as an error result while the session
+/// lives on (nothing was refused: never exit 5 or `credential_rejected`).
+/// With AI_ENV_AWS_SLOW=1 too (about four minutes; one Touch ID).
+#[test]
+#[ignore = "live, about four minutes, denies api.anthropic.com on the proxy meanwhile (one Touch ID): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws CRED=1 SLOW=1"]
+fn live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget() {
+    const TEST: &str = "live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget";
+    if !cred_live() {
+        return;
+    }
+    if std::env::var("AI_ENV_AWS_SLOW").as_deref() != Ok("1") {
+        eprintln!("skipped: set AI_ENV_AWS_SLOW=1 too (make test-aws CRED=1 SLOW=1)");
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-wrapper-api-host");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let first = chat.turn("Reply with exactly OK");
+    assert_eq!(first.result["is_error"], false, "{TEST}: the turn before the suspension: {}", first.result);
+    let mut held = ApiHostSuspended::suspend();
+    let turn = chat.turn("Reply with exactly OK");
+    held.restore();
+    eprintln!("{TEST}: the turn under the suspension ended after {} ms (budget {} ms): {}", turn.ms, ai_env_cli::bridge::authwatch::AUTH_FAIL_BUDGET_MS, scrub(&turn.result.to_string()).chars().take(400).collect::<String>());
+    assert_eq!(turn.result["is_error"], true, "{TEST}: an error result");
+    assert!(turn.ms <= u128::from(ai_env_cli::bridge::authwatch::AUTH_FAIL_BUDGET_MS), "{TEST}: {} ms over the budget", turn.ms);
+    assert!(matches!(chat.child.try_wait(), Ok(None)), "{TEST}: the session lives on after the failed turn");
+    let (code, close) = chat.close();
+    let row = live_end_row(&live, chat.pid());
+    show_end(TEST, &row);
+    assert_ne!(code, Some(5), "{TEST}: nothing was refused");
+    assert_ne!(note_part(&row, "end").as_deref(), Some("credential_rejected"), "{TEST}");
+    assert!(close.as_millis() <= u128::from(CLOSE_BUDGET_MS), "{TEST}: the close took {} ms", close.as_millis());
+    let out = chat.output();
     sweep_live(&live, &[&out], &[]);
 }

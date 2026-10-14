@@ -1,6 +1,6 @@
 ---
 name: ai-env
-description: Work with ai-env encrypted .env files — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, or when an app's env config appears to be ciphertext.
+description: Work with ai-env encrypted .env files and ai-env MicroVM sessions — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, or when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env).
 ---
 
 # ai-env — encrypted .env files
@@ -59,3 +59,43 @@ re-encrypted, no new key).
 To grant a server or teammate decrypt access, use
 `ai-env keys add-recipient NAME age1… [--label TEXT] [--rekey DIR]` with their PUBLIC
 recipient only — never an `AGE-SECRET-KEY` private identity (the CLI refuses it).
+
+## MicroVM sessions (ai-env bridge)
+
+In the bridge's remote mode a Cursor chat whose workspace is under the configured roots runs
+in a disposable AWS MicroVM, not on the Mac. The Mac keeps the editor, the chat's transcript
+and the git history; the VM has a copy of the checkout to work in.
+
+**Signs you are in the VM:** `cat /proc/1/comm` prints `ai-env`, `id -u` prints `1000`, the
+checkout sits at the same path as on the Mac (under `/Users/mike`), and `git remote` prints
+nothing. Its `~/.claude/CLAUDE.md` holds the rules, in short:
+
+- the developer's uncommitted changes were carried over uncommitted: keep them;
+- commit your own work to the current branch in small steps; after every turn the Mac fetches
+  it into `refs/remotes/box/*` (the clone is shallow and has no `origin`: nothing is pushed);
+- the editor shows the Mac's copy of each file until the developer merges: name the files you
+  changed;
+- no IDE tools, no package installs (the network reaches the Anthropic API and crates.io),
+  and never a credential on disk, in a commit or in a command line.
+
+**On the Mac**, these show and bring back what a VM did (each `ai-env` command that reaches
+AWS asks for one Touch ID):
+
+```sh doc-test
+ai-env session list                # the chats the wrapper ran (session show UUID names a chat's VM)
+ai-env box fetch WORKSPACE --wip   # the VM's commits and uncommitted files into refs/remotes/box/*
+ai-env vm list                     # the VMs that run or are suspended
+```
+
+Review with git (`git log --oneline BRANCH..box/BRANCH`) and merge by hand; never push a
+`box/*` ref. `ai-env vm terminate ID` ends a VM (the next chat seeds a fresh one).
+`AI_ENV_BRIDGE_LOCAL=1` in Cursor's `claudeCode.environmentVariables` runs every chat on the
+Mac again.
+
+**Exits Cursor shows** as `Claude Code process exited with code N`, the last stderr line
+(`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed (nothing started;
+reopen the chat) · `5` no Touch ID in time, no sealed setup-token, or Anthropic refused it
+(`ai-env creds status`) · `7` AWS, or a VM image older than remote sessions (`make deploy`) · `8`
+the VM is gone or unreachable (reopen the chat from the picker) · `9` a policy refusal: a
+secret or a widening setting in what the seed would carry (`ai-env box seed` lists the
+findings), a workspace that is not a git repository, or too many VMs (`ai-env vm list`).

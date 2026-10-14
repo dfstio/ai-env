@@ -55,6 +55,24 @@ pub fn endpoint_url(endpoint: &str, path: &str) -> Result<String, BridgeError> {
     Ok(format!("https://{host}{path}"))
 }
 
+/// [`endpoint_url`] with a query (S8: the workspace routes' `?path=`,
+/// `?rel=` and `PUT /seed`'s query, `wire::workspace`'s `pairs()`): the host
+/// pin and the path whitelist as there, then each pair in order,
+/// form-encoded (a space as `+`, `/`, `&`, `=` and `?` escaped, a non-ASCII
+/// path as its UTF-8 bytes percent-encoded), which axum's `Query` decodes
+/// back exactly. No pairs, no `?`. Errors are `Endpoint` (exit 7).
+pub fn endpoint_url_query<K: AsRef<str>, V: AsRef<str>>(endpoint: &str, path: &str, pairs: &[(K, V)]) -> Result<reqwest::Url, BridgeError> {
+    let base = endpoint_url(endpoint, path)?;
+    let mut url = reqwest::Url::parse(&base).map_err(|e| BridgeError::Endpoint(format!("refusing endpoint URL {base:?}: {e}")))?;
+    if !pairs.is_empty() {
+        let mut query = url.query_pairs_mut();
+        for (k, v) in pairs {
+            query.append_pair(k.as_ref(), v.as_ref());
+        }
+    }
+    Ok(url)
+}
+
 // ---- the HTTPS client -----------------------------------------------------------------
 
 /// The MicroVM endpoint over HTTPS, built on `tls::reqwest_client()` (the one
@@ -120,15 +138,16 @@ impl HttpsEndpoint {
     }
 }
 
-/// Append `chunk` to `body` up to `max` bytes in all; whether it did not fit.
-fn keep_capped(body: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
+/// Append `chunk` to `body` up to `max` bytes in all; whether it did not fit
+/// (S8's data plane reads its answers the same way).
+pub(crate) fn keep_capped(body: &mut Vec<u8>, chunk: &[u8], max: usize) -> bool {
     let room = max.saturating_sub(body.len());
     body.extend_from_slice(&chunk[..chunk.len().min(room)]);
     chunk.len() > room
 }
 
 /// `Bearer <session token>`, marked sensitive (never in a `Debug` of the request).
-fn bearer_header(bearer: &Secret<String>) -> Result<reqwest::header::HeaderValue, BridgeError> {
+pub(crate) fn bearer_header(bearer: &Secret<String>) -> Result<reqwest::header::HeaderValue, BridgeError> {
     let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", bearer.expose())).map_err(|_| BridgeError::Sdk { op: "health", message: "the session token is not a valid header value".into() })?;
     v.set_sensitive(true);
     Ok(v)
@@ -171,6 +190,12 @@ const MAX_LOCATION: usize = 200;
 /// scrubbed; never its path or query), `None` for any other status. Nothing
 /// is ever followed: the token goes to the pinned host only.
 fn redirect_refusal(url: &str, status: u16, location: Option<&reqwest::header::HeaderValue>) -> Option<BridgeError> {
+    redirect_refusal_for("GET", "health", url, status, location)
+}
+
+/// [`redirect_refusal`] for any request (`method`) and error op (S8's data
+/// plane: `PUT /seed` as `Sdk { op: "workspace" }`).
+pub(crate) fn redirect_refusal_for(method: &str, op: &'static str, url: &str, status: u16, location: Option<&reqwest::header::HeaderValue>) -> Option<BridgeError> {
     if !(300..400).contains(&status) {
         return None;
     }
@@ -180,7 +205,7 @@ fn redirect_refusal(url: &str, status: u16, location: Option<&reqwest::header::H
         .map(|u| u.origin().ascii_serialization())
         .filter(|o| o != "null")
         .map_or_else(|| "no usable Location".to_string(), |o| scrub(&o.chars().take(MAX_LOCATION).collect::<String>()).into_owned());
-    Some(BridgeError::Sdk { op: "health", message: format!("GET {url} answered HTTP {status} redirecting to {target}: refused (the bridge never follows a redirect with the endpoint token)") })
+    Some(BridgeError::Sdk { op, message: format!("{method} {url} answered HTTP {status} redirecting to {target}: refused (the bridge never follows a redirect with the endpoint token)") })
 }
 
 /// A `/health` response as a [`HealthReply`]: `x-aws-proxy-error` (printable
@@ -207,7 +232,7 @@ fn reply_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[u
 /// A `/health/detail` response as a [`HealthDetailReply`], by the rules of
 /// `reply_from_parts` with its own cap ([`MAX_DETAIL_BODY`]): a 200 must
 /// carry the shim's `HealthDetail` JSON.
-fn detail_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[u8], truncated: bool) -> Result<HealthDetailReply, BridgeError> {
+pub(crate) fn detail_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[u8], truncated: bool) -> Result<HealthDetailReply, BridgeError> {
     let (proxy_error, retry_after_s) = (proxy_error_of(headers), retry_after_of(headers));
     if status == 200 {
         if truncated {
@@ -223,7 +248,7 @@ fn detail_from_parts(status: u16, headers: &reqwest::header::HeaderMap, body: &[
 }
 
 /// `x-aws-proxy-error`: printable ASCII, at most 128 characters, scrubbed.
-fn proxy_error_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn proxy_error_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers.get("x-aws-proxy-error").map(|v| {
         let text: String = String::from_utf8_lossy(v.as_bytes()).chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(MAX_PROXY_ERROR).collect();
         scrub(&text).into_owned()
@@ -231,12 +256,12 @@ fn proxy_error_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 /// `Retry-After` in seconds (the HTTP-date form is ignored).
-fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+pub(crate) fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers.get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 /// At most [`MAX_ERROR_BODY`] bytes of a non-200 body, scrubbed.
-fn error_body(body: &[u8]) -> String {
+pub(crate) fn error_body(body: &[u8]) -> String {
     scrub(&String::from_utf8_lossy(&body[..body.len().min(MAX_ERROR_BODY)])).into_owned()
 }
 
@@ -300,7 +325,13 @@ fn tls_failure(e: &(dyn StdError + 'static)) -> Option<TlsFailure> {
 /// or a redirect loop → final `Sdk { op: "health" }`; everything else
 /// (connect, timeout, reset, a body cut short) → `Endpoint` (transient).
 fn transport_error(url: &str, e: &reqwest::Error) -> BridgeError {
-    let host = url.trim_start_matches("https://").split('/').next().unwrap_or(url);
+    transport_error_for("GET", "health", url, e)
+}
+
+/// [`transport_error`] for any request (`method`) and error op (S8's data
+/// plane), a lab URL's `http://` host named as an `https://` one is.
+pub(crate) fn transport_error_for(method: &str, op: &'static str, url: &str, e: &reqwest::Error) -> BridgeError {
+    let host = url.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or(url);
     match tls_failure(e) {
         Some(TlsFailure::Certificate(m)) => return BridgeError::Sdk { op: "tls", message: format!("{host}: {} (bridge trusts Amazon Root CA 1\u{2013}4 only)", scrub(&m)) },
         Some(TlsFailure::Protocol(m)) => return BridgeError::Sdk { op: "tls", message: format!("{host}: {} (bridge speaks TLS 1.3 only)", scrub(&m)) },
@@ -308,9 +339,9 @@ fn transport_error(url: &str, e: &reqwest::Error) -> BridgeError {
     }
     let text = scrub(&error_chain(e)).into_owned();
     if e.is_builder() || e.is_redirect() {
-        BridgeError::Sdk { op: "health", message: format!("GET {url}: {text}") }
+        BridgeError::Sdk { op, message: format!("{method} {url}: {text}") }
     } else {
-        BridgeError::Endpoint(format!("GET {url}: {text}"))
+        BridgeError::Endpoint(format!("{method} {url}: {text}"))
     }
 }
 
@@ -616,6 +647,31 @@ mod tests {
         assert_eq!(exit(endpoint_url("evil.example.com", "/health").unwrap_err()), 7);
     }
 
+    /// S8: the workspace routes' URLs keep the pin and the path whitelist,
+    /// and their query is form-encoded: an NFC Cyrillic path as its UTF-8
+    /// bytes, every reserved character escaped, a value that looks like a
+    /// second pair kept as one value; no pairs, no `?`.
+    #[test]
+    fn endpoint_url_query_encodes_the_pairs_and_keeps_the_pins() {
+        use crate::wire::workspace::{SeedMode, SeedQuery};
+        let host = format!("bed07657-5d0f-abe5-1e5e-6bc7bcb0b637{ENDPOINT_SUFFIX}");
+        let none: [(&str, &str); 0] = [];
+        assert_eq!(endpoint_url_query(&host, "/seed", &none).unwrap().as_str(), format!("https://{host}/seed"));
+        let url = endpoint_url_query(&host, "/seed", &[("path", "/Users/mike/\u{0419}\u{043e}\u{0433}\u{0430} x&y=z?#"), ("mode", "clone")]).unwrap();
+        assert_eq!(url.as_str(), format!("https://{host}/seed?path=%2FUsers%2Fmike%2F%D0%99%D0%BE%D0%B3%D0%B0+x%26y%3Dz%3F%23&mode=clone"));
+        let back: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        assert_eq!(back, [("path".to_string(), "/Users/mike/\u{0419}\u{043e}\u{0433}\u{0430} x&y=z?#".to_string()), ("mode".to_string(), "clone".to_string())], "decodes to the same pairs");
+        let q = SeedQuery { path: "/Users/mike/w".into(), mode: SeedMode::Update, branch: None, detached: true, expect: Some("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".into()) };
+        let url = endpoint_url_query(&format!("https://{host}/"), "/seed", &q.pairs()).unwrap();
+        assert_eq!(url.query(), Some("path=%2FUsers%2Fmike%2Fw&mode=update&detached=true&expect=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"));
+        assert_eq!(url.host_str(), Some(host.as_str()));
+        for bad in ["/a?b=c", "/../x", "seed", "/s\u{e9}ed"] {
+            assert!(matches!(endpoint_url_query(&host, bad, &[("path", "/x")]), Err(BridgeError::Endpoint(_))), "{bad}");
+        }
+        assert!(endpoint_url_query(&format!("http://{host}"), "/seed", &[("path", "/x")]).unwrap_err().to_string().contains("plaintext"));
+        assert_eq!(exit(endpoint_url_query("evil.example.com", "/seed", &[("path", "/x")]).unwrap_err()), 7);
+    }
+
     #[test]
     fn backoff_scaling() {
         assert_eq!(Backoff::HEALTH, Backoff { step: Duration::from_secs(1), budget: Duration::from_secs(15) });
@@ -673,6 +729,7 @@ mod tests {
             listeners: vec![],
             listeners_omitted: 0,
             credential: Default::default(),
+            workspace: None,
         }
     }
 

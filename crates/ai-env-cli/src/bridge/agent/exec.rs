@@ -140,11 +140,11 @@ const CAPTURE_MAX: usize = 64 * 1024;
 /// Names `--env` never passes (any case): they change how claude or node start.
 const STARTUP_NAMES: [&str; 2] = ["CLAUDECODE", "NODE_OPTIONS"];
 /// What a name holding one of these looks like: a credential.
-const CREDENTIAL_WORDS: [&str; 4] = ["TOKEN", "KEY", "SECRET", "PASSWORD"];
+pub(crate) const CREDENTIAL_WORDS: [&str; 4] = ["TOKEN", "KEY", "SECRET", "PASSWORD"];
 /// The shim sets these for the agent (`spawn` refuses them).
 const RESERVED_NAMES: [&str; 3] = ["HOME", "PATH", "CLAUDE_CONFIG_DIR"];
 /// The variables `egress::proxy_env` adds on vpc VMs.
-const PROXY_VARS: usize = 6;
+pub(crate) const PROXY_VARS: usize = 6;
 
 /// `vm exec` as validated before the Touch ID: the row it runs on and the
 /// command. `Debug` shows argv[0]'s basename and counts, never an argument,
@@ -299,12 +299,14 @@ fn parse_env(env: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn is_env_name(k: &str) -> bool {
+/// `[A-Za-z_][A-Za-z0-9_]*`: what the shim takes as a name (S8: the remote session's names too).
+pub(crate) fn is_env_name(k: &str) -> bool {
     k.bytes().next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
-/// Why `vm exec` never passes `name` (any case), or `None`.
-fn refused_name(name: &str) -> Option<&'static str> {
+/// Why `vm exec` never passes `name` (any case), or `None`. One rule set
+/// for `vm exec --env` and S8's remote session (`remote::env`).
+pub(crate) fn refused_name(name: &str) -> Option<&'static str> {
     let upper = name.to_ascii_uppercase();
     if upper.starts_with("AWS_") {
         Some("vm exec never passes AWS_* variables (credentials reach the VM only through ai-env's own delivery)")
@@ -320,7 +322,7 @@ fn refused_name(name: &str) -> Option<&'static str> {
 }
 
 /// One of the six proxy variables `egress::proxy_env` sets (any case).
-fn is_proxy_name(name: &str) -> bool {
+pub(crate) fn is_proxy_name(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "https_proxy" | "http_proxy" | "no_proxy")
 }
 
@@ -423,7 +425,7 @@ pub async fn run_exec<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: 
         let ready = async {
             let vm = live_vm(api, &plan.id).await?;
             let env = agent_env(ctx, api, ep, &plan.row, Some(&vm))?;
-            let spec = SpawnSpec { argv: plan.argv.clone(), cwd: plan.cwd.clone(), env: spawn_env(ctx, &plan.row, &plan.env), detach_grace_s: plan.detach_grace_s };
+            let spec = SpawnSpec { argv: plan.argv.clone(), cwd: plan.cwd.clone(), env: spawn_env(ctx, &plan.row, &plan.env), detach_grace_s: plan.detach_grace_s, id: None };
             let delivery = match (&plan.credential, supply) {
                 (Some(cp), Some(supply)) => Some(super::credential::prepare(ctx, api, ep, &plan.row, &vm, cp, supply).await?.delivery),
                 (Some(_), None) => return Err(CliError::Msg("internal: a credentialed exec without its keystore".into())),
@@ -1481,7 +1483,7 @@ pub async fn smoke_exec<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
             }
             (Ok(env), None) => env,
         };
-        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None };
+        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None };
         let t = Instant::now();
         match capture(env, spec, None).await {
             Ok(cap) => steps.push(judged(field, &shown, &want, &cap, t.elapsed().as_millis())),
@@ -1554,7 +1556,7 @@ pub async fn smoke_credential<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: 
         let plan = super::credential::check(&ctx.cfg, &ctx.paths, row, &argv, &flags)?.ok_or_else(|| CliError::Msg("internal: no credential plan".into()))?;
         let prepared = super::credential::prepare(ctx, api, ep, row, vm, &plan, supply).await?;
         let env = agent_env(ctx, api, ep, row, Some(vm))?;
-        let spec = SpawnSpec { argv: argv.clone(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None };
+        let spec = SpawnSpec { argv: argv.clone(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None };
         let cap = capture(&env, spec, Some(prepared.delivery)).await?;
         Ok::<_, CliError>((cap, prepared.source, plan.tag))
     }
@@ -1941,6 +1943,7 @@ mod tests {
             ],
             listeners_omitted: 0,
             credential: Default::default(),
+            workspace: None,
         };
         let lines = detail_lines(&d, None);
         let text = lines.join("\n");

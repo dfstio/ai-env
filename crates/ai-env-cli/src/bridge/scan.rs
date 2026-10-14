@@ -51,7 +51,7 @@
 //! Output names file, line and rule — NEVER the matched bytes or a JSON
 //! value: the report lands in make logs and terminals, and a finding exists
 //! precisely because the bytes may be a secret. Any finding is exit 9.
-use crate::bridge::config::{BridgeConfig, Paths};
+use crate::bridge::config::{BridgeConfig, Paths, ReviewCfg};
 use crate::errors::CliError;
 use crate::outln;
 use crate::wire::managed::{hardening_gaps, MANAGED_HARDENING};
@@ -559,7 +559,15 @@ fn count_byte(hay: &[u8], byte: u8) -> usize {
 struct Rule {
     id: String,
     pattern: Pattern,
+    /// The pattern's text, for [`Rules::digest`] only: never printed (a
+    /// tripwire may be a literal secret).
+    src: String,
 }
+
+/// The matcher's version in [`Rules::digest`]: bumped whenever a change to
+/// the pattern language or the matcher could change a verdict, so the S8
+/// clean-object cache of an older matcher is never trusted.
+pub const ENGINE_VERSION: &str = "ai-env-scan-1";
 
 /// The tripwire set: the built-ins, then the extras of one tripwires file.
 /// `Debug` lists the rule ids only.
@@ -590,9 +598,30 @@ impl Rules {
                 continue;
             }
             let pattern = Pattern::parse(line).map_err(|e| format!("{source}:{}: {e}", n + 1))?;
-            rules.rules.push(Rule { id: format!("tripwire:{}", n + 1), pattern });
+            rules.rules.push(Rule { id: format!("tripwire:{}", n + 1), pattern, src: line.to_string() });
         }
         Ok(rules)
+    }
+
+    /// sha256 (64 lowercase hex digits) over [`ENGINE_VERSION`] and every
+    /// rule's id and pattern text, in order, each length-prefixed: the key of
+    /// the S8 clean-object cache (`state/scan-cache/`), so a verdict is reused
+    /// only under exactly the rules that gave it. The patterns are never
+    /// printed; only this one-way digest leaves the set.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            h.update((bytes.len() as u64).to_be_bytes());
+            h.update(bytes);
+        };
+        field(ENGINE_VERSION.as_bytes());
+        for r in &self.rules {
+            field(r.id.as_bytes());
+            field(r.src.as_bytes());
+        }
+        hex::encode(h.finalize())
     }
 
     /// [`Rules::with_extras`] over a file that must exist.
@@ -622,7 +651,7 @@ impl Rules {
 fn compile_built_ins(table: &[(&str, &str)]) -> Vec<Rule> {
     table
         .iter()
-        .map(|(id, src)| Rule { id: (*id).to_string(), pattern: Pattern::parse(src).unwrap_or_else(|e| panic!("built-in tripwire {id}: {e}")) })
+        .map(|(id, src)| Rule { id: (*id).to_string(), pattern: Pattern::parse(src).unwrap_or_else(|e| panic!("built-in tripwire {id}: {e}")), src: (*src).to_string() })
         .collect()
 }
 
@@ -707,13 +736,75 @@ pub const MANAGED_RULES: [&str; MANAGED_HARDENING.len()] = [
     "managed-hardening:env.DISABLE_UPDATES",
 ];
 
+/// Which settings rules apply ([`settings_findings_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsMode {
+    /// The baked image config (S3 D5, D6): every key whitelisted, every
+    /// allow entry in the policy, the managed settings' D6 values, no
+    /// project entry ([`settings_findings`]).
+    Image,
+    /// A workspace's `.claude/settings.json` and `.claude/settings.local.json`
+    /// as the VM would check them out (S8 D8): only what widens the VM's
+    /// permissions or makes its claude run a command is refused, never the
+    /// image's key whitelist. `default-mode` (other than `default` or
+    /// `plan`), `bypass-permissions` (anywhere), `broad-allow` (the `Bash(*)`
+    /// family, bare `Write`, `Edit`, `WebFetch`, any `mcp__` entry),
+    /// `repo-hooks`, `repo-command` (`apiKeyHelper`, a command `statusLine`,
+    /// `awsAuthRefresh`, `awsCredentialExport`, `otelHeadersHelper`),
+    /// `repo-mcp-autoapprove` (`enableAllProjectMcpServers`, a non-empty
+    /// `enabledMcpjsonServers`), `additional-directories`; a document that
+    /// is no JSON object is `not-json-object`. `[[workspace]]
+    /// trust_repo_settings = true` skips this mode (the tripwires still apply).
+    Repo,
+}
+
+/// One settings finding: the 1-based line (0: the file as a whole, or a
+/// place the walk could not pin down), the rule, and the JSON key path it is
+/// about (`permissions.allow[3]`, `hooks`, `env.GITHUB_TOKEN`; empty for the
+/// file as a whole). Never a value: a key a document chose is shown with
+/// control characters as `?`, scrubbed and cut ([`KEY_MAX`] characters).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct SettingsFinding {
+    pub line: usize,
+    pub rule: &'static str,
+    pub key: String,
+}
+
+/// The longest key path a finding shows, in characters.
+pub const KEY_MAX: usize = 120;
+
+/// D8: the tools a repository may never allow outright (an entry of the name
+/// alone, or with a pattern that is only wildcards: every write, edit, fetch).
+const REPO_BROAD_TOOLS: [&str; 3] = ["Write", "Edit", "WebFetch"];
+/// D8: keys whose value makes the VM's claude run a command or fetch a credential.
+const REPO_COMMAND_KEYS: [&str; 4] = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper"];
+
+impl SettingsFinding {
+    fn new(line: usize, rule: &'static str, key: &[&str]) -> SettingsFinding {
+        SettingsFinding { line, rule, key: shown_key(&key.join(".")) }
+    }
+}
+
+/// A key path as a finding shows it: control characters as `?`, scrubbed,
+/// at most [`KEY_MAX`] characters (an ellipsis last when cut).
+fn shown_key(key: &str) -> String {
+    let clean: String = crate::wire::redact::scrub(key).chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+    if clean.chars().count() <= KEY_MAX {
+        return clean;
+    }
+    let mut out: String = clean.chars().take(KEY_MAX - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// The settings rules for a file named `file_name` (empty for any other
-/// name), as `(line, rule)`. Semantics come from serde_json (duplicate keys:
-/// the last wins, as in Claude's own parser); lines come from [`Located`], a
-/// walk over the same bytes, and are the 1-based line of the offending key,
-/// allow entry or `bypassPermissions` string. Line 0 means the file as a
-/// whole: valid JSON whose root is not an object (a syntax error carries the
-/// parser's line), or a place the walk could not pin down.
+/// name), as `(line, rule)`: the image mode of [`settings_findings_mode`].
+/// Semantics come from serde_json (duplicate keys: the last wins, as in
+/// Claude's own parser); lines come from [`Located`], a walk over the same
+/// bytes, and are the 1-based line of the offending key, allow entry or
+/// `bypassPermissions` string. Line 0 means the file as a whole: valid JSON
+/// whose root is not an object (a syntax error carries the parser's line),
+/// or a place the walk could not pin down.
 ///
 /// Settings and managed settings: top-level and `permissions` keys limited
 /// (`unexpected-key`); `permissions`/`env` must be objects
@@ -732,17 +823,44 @@ pub const MANAGED_RULES: [&str; MANAGED_HARDENING.len()] = [
 /// (`bypass-permissions`).
 #[must_use]
 pub fn settings_findings(file_name: &str, bytes: &[u8], policy: &[String]) -> Vec<(usize, &'static str)> {
+    settings_findings_mode(file_name, bytes, policy, SettingsMode::Image).into_iter().map(|f| (f.line, f.rule)).collect()
+}
+
+/// The settings rules of `mode` for a file named `file_name`, each finding
+/// with the key path it is about. [`SettingsMode::Image`] is
+/// [`settings_findings`]' rule set (the policy applies); [`SettingsMode::Repo`]
+/// applies to `settings.json` and `settings.local.json` only (empty for any
+/// other name) and needs no policy.
+#[must_use]
+pub fn settings_findings_mode(file_name: &str, bytes: &[u8], policy: &[String], mode: SettingsMode) -> Vec<SettingsFinding> {
     let Some(kind) = json_kind(file_name) else {
         return Vec::new();
     };
+    if mode == SettingsMode::Repo && kind != JsonKind::Settings {
+        return Vec::new();
+    }
     let root: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
-        Err(e) => return vec![(e.line(), "not-json-object")],
+        Err(e) => return vec![SettingsFinding::new(e.line(), "not-json-object", &[])],
     };
     let Some(obj) = root.as_object() else {
-        return vec![(0, "not-json-object")];
+        return vec![SettingsFinding::new(0, "not-json-object", &[])];
     };
     let at = Located::walk(bytes);
+    let mut out = match mode {
+        SettingsMode::Image => image_findings(kind, &root, obj, &at, policy),
+        SettingsMode::Repo => repo_findings(obj, &at),
+    };
+    let strings = at.string_locs(BYPASS);
+    if count_strings(&root, BYPASS) > strings.len() {
+        out.push(SettingsFinding::new(0, "bypass-permissions", &[]));
+    }
+    out.extend(strings.into_iter().map(|(line, key)| SettingsFinding { line, rule: "bypass-permissions", key: shown_key(&key) }));
+    out
+}
+
+/// The image mode's rules but `bypass-permissions` (see [`settings_findings`]).
+fn image_findings(kind: JsonKind, root: &Value, obj: &serde_json::Map<String, Value>, at: &Located, policy: &[String]) -> Vec<SettingsFinding> {
     let mut out = Vec::new();
     let top: &[&str] = match kind {
         JsonKind::Settings => &SETTINGS_KEYS,
@@ -751,68 +869,63 @@ pub fn settings_findings(file_name: &str, bytes: &[u8], policy: &[String]) -> Ve
     };
     for k in obj.keys() {
         if !top.contains(&k.as_str()) {
-            out.push((at.key_line(&[k]), "unexpected-key"));
+            out.push(SettingsFinding::new(at.key_line(&[k]), "unexpected-key", &[k]));
         }
     }
     if kind == JsonKind::Config {
         match obj.get("projects").map(Value::as_object) {
             None => {}
-            Some(None) => out.push((at.key_line(&["projects"]), "not-json-object")),
+            Some(None) => out.push(SettingsFinding::new(at.key_line(&["projects"]), "not-json-object", &["projects"])),
             Some(Some(entries)) => {
                 for k in entries.keys() {
-                    out.push((at.key_line(&["projects", k]), "project-entry"));
+                    out.push(SettingsFinding::new(at.key_line(&["projects", k]), "project-entry", &["projects", k]));
                 }
             }
         }
-    } else {
-        if kind == JsonKind::Managed {
-            let gaps = hardening_gaps(&root);
-            for ((path, _), rule) in MANAGED_HARDENING.iter().zip(MANAGED_RULES) {
-                if gaps.contains(&path.join(".")) {
-                    out.push((at.key_line(path), rule));
-                }
+        return out;
+    }
+    if kind == JsonKind::Managed {
+        let gaps = hardening_gaps(root);
+        for ((path, _), rule) in MANAGED_HARDENING.iter().zip(MANAGED_RULES) {
+            if gaps.contains(&path.join(".")) {
+                out.push(SettingsFinding::new(at.key_line(path), rule, path));
             }
         }
-        if let Some(perms) = obj.get("permissions") {
-            permissions_findings(perms, &at, policy, &mut out);
-        }
-        match obj.get("env").map(Value::as_object) {
-            None => {}
-            Some(None) => out.push((at.key_line(&["env"]), "not-json-object")),
-            Some(Some(vars)) => {
-                for name in vars.keys() {
-                    let upper = name.to_ascii_uppercase();
-                    if SECRET_ENV_WORDS.iter().any(|w| upper.contains(w)) {
-                        out.push((at.key_line(&["env", name]), "secret-env-name"));
-                    }
+    }
+    if let Some(perms) = obj.get("permissions") {
+        permissions_findings(perms, at, policy, &mut out);
+    }
+    match obj.get("env").map(Value::as_object) {
+        None => {}
+        Some(None) => out.push(SettingsFinding::new(at.key_line(&["env"]), "not-json-object", &["env"])),
+        Some(Some(vars)) => {
+            for name in vars.keys() {
+                let upper = name.to_ascii_uppercase();
+                if SECRET_ENV_WORDS.iter().any(|w| upper.contains(w)) {
+                    out.push(SettingsFinding::new(at.key_line(&["env", name]), "secret-env-name", &["env", name]));
                 }
             }
         }
     }
-    let lines = at.string_lines(BYPASS);
-    if count_strings(&root, BYPASS) > lines.len() {
-        out.push((0, "bypass-permissions"));
-    }
-    out.extend(lines.into_iter().map(|l| (l, "bypass-permissions")));
     out
 }
 
-fn permissions_findings(perms: &Value, at: &Located, policy: &[String], out: &mut Vec<(usize, &'static str)>) {
+fn permissions_findings(perms: &Value, at: &Located, policy: &[String], out: &mut Vec<SettingsFinding>) {
     let Some(p) = perms.as_object() else {
-        out.push((at.key_line(&["permissions"]), "not-json-object"));
+        out.push(SettingsFinding::new(at.key_line(&["permissions"]), "not-json-object", &["permissions"]));
         return;
     };
     for k in p.keys() {
         if !PERMISSIONS_KEYS.contains(&k.as_str()) {
-            out.push((at.key_line(&["permissions", k]), "unexpected-key"));
+            out.push(SettingsFinding::new(at.key_line(&["permissions", k]), "unexpected-key", &["permissions", k]));
         }
     }
     if p.get("defaultMode").is_some_and(|m| !m.as_str().is_some_and(|m| DEFAULT_MODES.contains(&m))) {
-        out.push((at.key_line(&["permissions", "defaultMode"]), "default-mode"));
+        out.push(SettingsFinding::new(at.key_line(&["permissions", "defaultMode"]), "default-mode", &["permissions", "defaultMode"]));
     }
     match p.get("allow").map(Value::as_array) {
         None => {}
-        Some(None) => out.push((at.key_line(&["permissions", "allow"]), "allow-not-in-policy")),
+        Some(None) => out.push(SettingsFinding::new(at.key_line(&["permissions", "allow"]), "allow-not-in-policy", &["permissions", "allow"])),
         Some(Some(entries)) => {
             for (i, e) in entries.iter().enumerate() {
                 let rule = match e.as_str() {
@@ -820,9 +933,90 @@ fn permissions_findings(perms: &Value, at: &Located, policy: &[String], out: &mu
                     Some(s) if policy.iter().any(|p| p == s) => continue,
                     _ => "allow-not-in-policy",
                 };
-                out.push((at.item_line(&["permissions", "allow"], i), rule));
+                out.push(SettingsFinding { line: at.item_line(&["permissions", "allow"], i), rule, key: format!("permissions.allow[{i}]") });
             }
         }
+    }
+}
+
+/// The repo mode's rules but `bypass-permissions` (see [`SettingsMode::Repo`]).
+fn repo_findings(obj: &serde_json::Map<String, Value>, at: &Located) -> Vec<SettingsFinding> {
+    let mut out = Vec::new();
+    match obj.get("permissions") {
+        None => {}
+        Some(Value::Object(p)) => {
+            if p.get("defaultMode").is_some_and(|m| !m.as_str().is_some_and(|m| DEFAULT_MODES.contains(&m))) {
+                out.push(SettingsFinding::new(at.key_line(&["permissions", "defaultMode"]), "default-mode", &["permissions", "defaultMode"]));
+            }
+            if let Some(entries) = p.get("allow").and_then(Value::as_array) {
+                for (i, e) in entries.iter().enumerate() {
+                    if e.as_str().is_some_and(repo_broad_allow) {
+                        out.push(SettingsFinding { line: at.item_line(&["permissions", "allow"], i), rule: "broad-allow", key: format!("permissions.allow[{i}]") });
+                    }
+                }
+            }
+            if p.get("additionalDirectories").is_some_and(non_empty) {
+                out.push(SettingsFinding::new(at.key_line(&["permissions", "additionalDirectories"]), "additional-directories", &["permissions", "additionalDirectories"]));
+            }
+        }
+        Some(_) => out.push(SettingsFinding::new(at.key_line(&["permissions"]), "not-json-object", &["permissions"])),
+    }
+    if obj.get("additionalDirectories").is_some_and(non_empty) {
+        out.push(SettingsFinding::new(at.key_line(&["additionalDirectories"]), "additional-directories", &["additionalDirectories"]));
+    }
+    if obj.get("hooks").is_some_and(non_empty) {
+        out.push(SettingsFinding::new(at.key_line(&["hooks"]), "repo-hooks", &["hooks"]));
+    }
+    for key in REPO_COMMAND_KEYS {
+        if obj.get(key).is_some_and(|v| !v.is_null()) {
+            out.push(SettingsFinding::new(at.key_line(&[key]), "repo-command", &[key]));
+        }
+    }
+    // A status line is a command unless it says otherwise (`{"type": "command", "command": …}` today).
+    if obj.get("statusLine").is_some_and(|v| !v.is_null() && !v.as_object().is_some_and(|s| s.get("type").and_then(Value::as_str).is_some_and(|t| t != "command") && !s.contains_key("command"))) {
+        out.push(SettingsFinding::new(at.key_line(&["statusLine"]), "repo-command", &["statusLine"]));
+    }
+    if obj.get("enableAllProjectMcpServers").is_some_and(|v| v.as_bool() != Some(false) && !v.is_null()) {
+        out.push(SettingsFinding::new(at.key_line(&["enableAllProjectMcpServers"]), "repo-mcp-autoapprove", &["enableAllProjectMcpServers"]));
+    }
+    if obj.get("enabledMcpjsonServers").is_some_and(non_empty) {
+        out.push(SettingsFinding::new(at.key_line(&["enabledMcpjsonServers"]), "repo-mcp-autoapprove", &["enabledMcpjsonServers"]));
+    }
+    out
+}
+
+/// An allow entry D8 refuses from a repository: the `Bash(*)` family
+/// ([`BROAD_ALLOW`], and `Bash(…)` whose pattern is only `*`, `:` and
+/// spaces), [`REPO_BROAD_TOOLS`] alone or with a pattern that is only
+/// wildcards, and any `mcp__` entry (a server's tools allowed without a prompt).
+fn repo_broad_allow(entry: &str) -> bool {
+    let entry = entry.trim();
+    if BROAD_ALLOW.contains(&entry) || entry.starts_with("mcp__") {
+        return true;
+    }
+    let (tool, pattern) = match entry.split_once('(') {
+        Some((tool, rest)) => match rest.strip_suffix(')') {
+            Some(p) => (tool.trim(), Some(p)),
+            None => return false,
+        },
+        None => (entry, None),
+    };
+    let wild = |p: &str| p.chars().all(|c| matches!(c, '*' | ':' | ' ' | '/'));
+    match pattern {
+        None => REPO_BROAD_TOOLS.contains(&tool),
+        Some(p) => (tool == "Bash" || REPO_BROAD_TOOLS.contains(&tool)) && wild(p),
+    }
+}
+
+/// Anything but `null`, `false`, `""`, `[]` and `{}`.
+fn non_empty(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        Value::Number(_) => true,
     }
 }
 
@@ -1006,10 +1200,28 @@ impl Located {
             .map_or_else(|| self.key_line(keys), |l| l.line)
     }
 
-    /// Lines of every string value equal to `value` (duplicates included).
-    fn string_lines(&self, value: &str) -> Vec<usize> {
-        self.0.iter().filter(|l| l.string.as_deref() == Some(value)).map(|l| l.line).collect()
+    /// Line and key path (`permissions.deny[1]`) of every string value equal
+    /// to `value` (duplicates included).
+    fn string_locs(&self, value: &str) -> Vec<(usize, String)> {
+        self.0.iter().filter(|l| l.string.as_deref() == Some(value)).map(|l| (l.line, key_path(&l.path))).collect()
     }
+}
+
+/// A walked path as a finding names it: keys joined by `.`, array indexes as `[i]`.
+fn key_path(path: &[Seg]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        match seg {
+            Seg::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(k);
+            }
+            Seg::Index(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
+    out
 }
 
 // ---- walk -------------------------------------------------------------------
@@ -1266,28 +1478,11 @@ pub fn cmd_scan(dir: &Path, profile: Profile, tripwires: Option<&Path>, settings
     let review = if tripwires.is_none() || (wants_policy && settings_policy.is_none()) {
         let paths = Paths::resolve()?;
         let review = BridgeConfig::load(&paths)?.map(|c| c.review).unwrap_or_default();
-        Some((review.tripwires_path(&paths), review.settings_policy_path(&paths)))
+        Some((paths, review))
     } else {
         None
     };
-    let rules = match (tripwires, &review) {
-        (Some(p), _) => Rules::from_file(p),
-        (None, Some((p, _))) => read_default_list(p).and_then(|t| match t {
-            Some(text) => Rules::with_extras(&text, &p.display().to_string()),
-            None => Ok(Rules::defaults()),
-        }),
-        (None, None) => Ok(Rules::defaults()),
-    }
-    .map_err(CliError::Msg)?;
-    let policy = match (settings_policy, &review) {
-        (Some(p), _) => read_list(p).and_then(|t| parse_policy(&t, &p.display().to_string())),
-        (None, Some((_, p))) if wants_policy => read_default_list(p).and_then(|t| match t {
-            Some(text) => parse_policy(&text, &p.display().to_string()),
-            None => Ok(Vec::new()),
-        }),
-        (None, _) => Ok(Vec::new()),
-    }
-    .map_err(CliError::Msg)?;
+    let (rules, policy) = load_lists(review.as_ref().map(|(p, r)| (p, r)), tripwires, settings_policy, wants_policy).map_err(CliError::Msg)?;
 
     let (findings, files) = scan_dir(dir, profile, &rules, &policy).map_err(CliError::Msg)?;
 
@@ -1314,6 +1509,37 @@ pub fn cmd_scan(dir: &Path, profile: Profile, tripwires: Option<&Path>, settings
     } else {
         Err(CliError::Policy(format!("{} finding(s) in {}", findings.len(), dir.display())))
     }
+}
+
+/// The tripwires and the settings policy a scan runs with (factored out of
+/// [`cmd_scan`]; S8's seed and code-out scans use it too). Tripwires:
+/// `tripwires` when given (the file must exist), else `[review].tripwires`
+/// when that file exists, else the built-ins alone. The policy: `policy`
+/// when given (it must exist), else, only when `want_policy`,
+/// `[review].settings_policy` when that file exists, else empty. `review`
+/// is the bridge root and its `[review]` table (no bridge.toml is the empty
+/// table); `None` when no default is to be consulted, which leaves a list
+/// without its flag at the built-ins and an empty policy. An error names the
+/// file and line, never a pattern's or an entry's text.
+pub fn load_lists(review: Option<(&Paths, &ReviewCfg)>, tripwires: Option<&Path>, policy: Option<&Path>, want_policy: bool) -> Result<(Rules, Vec<String>), String> {
+    let defaults = review.map(|(paths, r)| (r.tripwires_path(paths), r.settings_policy_path(paths)));
+    let rules = match (tripwires, &defaults) {
+        (Some(p), _) => Rules::from_file(p),
+        (None, Some((p, _))) => read_default_list(p).and_then(|t| match t {
+            Some(text) => Rules::with_extras(&text, &p.display().to_string()),
+            None => Ok(Rules::defaults()),
+        }),
+        (None, None) => Ok(Rules::defaults()),
+    }?;
+    let policy = match (policy, &defaults) {
+        (Some(p), _) => read_list(p).and_then(|t| parse_policy(&t, &p.display().to_string())),
+        (None, Some((_, p))) if want_policy => read_default_list(p).and_then(|t| match t {
+            Some(text) => parse_policy(&text, &p.display().to_string()),
+            None => Ok(Vec::new()),
+        }),
+        _ => Ok(Vec::new()),
+    }?;
+    Ok((rules, policy))
 }
 
 /// The stdout report of [`cmd_scan`]: the JSON document, or one line per finding and a summary.
@@ -1916,6 +2142,128 @@ mod tests {
     fn secret_looking_env_names_are_refused() {
         let doc = "{\"env\": {\n\"GITHUB_TOKEN\": \"x\",\n\"api_key\": \"x\",\n\"DB_PASSWORD\": \"x\",\n\"OAUTH_X\": \"x\",\n\"MY_CREDENTIALS\": \"x\",\n\"Secret\": \"x\",\n\"DISABLE_AUTOUPDATER\": \"1\",\n\"LANG\": \"C\"\n}}";
         assert_eq!(rules_of("settings.json", doc, &[]), (2..=7).map(|l| (l, "secret-env-name")).collect::<Vec<_>>());
+    }
+
+    // ---- S8: keys and the repo mode (D8) ----
+
+    fn repo_of(name: &str, json: &str) -> Vec<(usize, &'static str, String)> {
+        let mut v: Vec<(usize, &'static str, String)> = settings_findings_mode(name, json.as_bytes(), &[], SettingsMode::Repo).into_iter().map(|f| (f.line, f.rule, f.key)).collect();
+        v.sort();
+        v
+    }
+
+    /// Each of D8's keys is refused at its line, the finding naming the key
+    /// path, never the value.
+    #[test]
+    fn repo_mode_refuses_each_d8_key_naming_it() {
+        let one = |json: &str| repo_of("settings.json", json);
+        let hit = |line: usize, rule: &'static str, key: &str| vec![(line, rule, key.to_string())];
+        assert_eq!(one("{\"permissions\": {\n\"defaultMode\": \"acceptEdits\"}}"), hit(2, "default-mode", "permissions.defaultMode"));
+        assert_eq!(one("{\"permissions\": {\"defaultMode\": \"dontAsk\"}}"), hit(1, "default-mode", "permissions.defaultMode"));
+        assert_eq!(
+            one("{\"permissions\": {\n\"defaultMode\": \"bypassPermissions\"}}"),
+            vec![(2, "bypass-permissions", "permissions.defaultMode".to_string()), (2, "default-mode", "permissions.defaultMode".to_string())]
+        );
+        assert_eq!(one("{\"env\": {\"MODE\":\n\"bypassPermissions\"}}"), hit(2, "bypass-permissions", "env.MODE"), "a value anywhere");
+        for (entry, at) in [("Bash", 0), ("Bash(*)", 0), ("Bash(*:*)", 0), ("Bash(:*)", 0), ("*", 0), ("Bash( ** )", 0), ("Write", 0), ("Edit", 0), ("WebFetch", 0), ("Edit(*)", 0), ("Write(**/*)", 0), ("mcp__*", 0), ("mcp__github", 0), ("mcp__github__create_issue", 0)] {
+            let doc = format!("{{\"permissions\": {{\"allow\": [\"Read(./a)\",\n{}]}}}}", serde_json::to_string(entry).unwrap());
+            assert_eq!(one(&doc), hit(2 + at, "broad-allow", "permissions.allow[1]"), "{entry}");
+        }
+        assert_eq!(one("{\"hooks\": {\"PreToolUse\": [{\"matcher\": \"Bash\"}]}}"), hit(1, "repo-hooks", "hooks"));
+        for key in ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper"] {
+            assert_eq!(one(&format!("{{\n\"{key}\": \"./x.sh\"}}")), hit(2, "repo-command", key), "{key}");
+        }
+        assert_eq!(one("{\"statusLine\": {\"type\": \"command\", \"command\": \"./s.sh\"}}"), hit(1, "repo-command", "statusLine"));
+        assert_eq!(one("{\"statusLine\": {\"command\": \"./s.sh\"}}"), hit(1, "repo-command", "statusLine"), "a command without a type");
+        assert_eq!(one("{\"enableAllProjectMcpServers\": true}"), hit(1, "repo-mcp-autoapprove", "enableAllProjectMcpServers"));
+        assert_eq!(one("{\"enabledMcpjsonServers\": [\"db\"]}"), hit(1, "repo-mcp-autoapprove", "enabledMcpjsonServers"));
+        assert_eq!(one("{\"permissions\": {\"additionalDirectories\": [\"/etc\"]}}"), hit(1, "additional-directories", "permissions.additionalDirectories"));
+        assert_eq!(one("{\"additionalDirectories\": [\"../x\"]}"), hit(1, "additional-directories", "additionalDirectories"));
+        assert_eq!(one("[1]"), hit(0, "not-json-object", ""));
+        assert_eq!(one("{\"permissions\": []}"), hit(1, "not-json-object", "permissions"));
+        assert_eq!(repo_of("settings.local.json", "{\"hooks\": {\"Stop\": []}}"), hit(1, "repo-hooks", "hooks"), "settings.local.json too");
+    }
+
+    /// What does not widen passes the repo mode, whatever the image's key
+    /// whitelist would say; other file names get nothing.
+    #[test]
+    fn repo_mode_passes_narrow_settings_and_other_names() {
+        let narrow = r#"{"$schema":"x","model":"opus","env":{"GITHUB_TOKEN":"x"},"unknownKey":1,"hooks":{},"statusLine":{"type":"static","text":"s"},"enableAllProjectMcpServers":false,"enabledMcpjsonServers":[],"permissions":{"defaultMode":"plan","allow":["Bash(npm test:*)","Read(./src/**)","Edit(./src/a.rs)","WebFetch(domain:docs.rs)","Bash(git status)"],"deny":["Bash(*)"],"ask":["Write"],"additionalDirectories":[]}}"#;
+        assert_eq!(repo_of("settings.json", narrow), vec![]);
+        assert_eq!(repo_of("settings.json", r#"{"permissions":{"defaultMode":"default"}}"#), vec![]);
+        for name in ["managed-settings.json", "claude.json", ".claude.json", "config.json"] {
+            assert_eq!(repo_of(name, "{\"hooks\": {\"Stop\": [1]}, \"x\": \"bypassPermissions\"}"), vec![], "{name}");
+        }
+        // The image mode of the same narrow document refuses its keys and entries, as before.
+        assert!(!settings_findings("settings.json", narrow.as_bytes(), &[]).is_empty());
+    }
+
+    /// Image findings carry their key paths too; a key a document chose is
+    /// shown without control characters and scrubbed, never a value.
+    #[test]
+    fn image_findings_name_their_keys_and_never_a_value() {
+        let keys = |json: &str| -> Vec<(usize, &'static str, String)> {
+            let mut v: Vec<_> = settings_findings_mode("settings.json", json.as_bytes(), &[], SettingsMode::Image).into_iter().map(|f| (f.line, f.rule, f.key)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            keys("{\"permissions\": {\"allow\": [\"Bash(ls:*)\",\n\"Bash(*)\"]},\n\"env\": {\"API_KEY\": \"v\"}}"),
+            vec![(1, "allow-not-in-policy", "permissions.allow[0]".to_string()), (2, "broad-allow", "permissions.allow[1]".to_string()), (3, "secret-env-name", "env.API_KEY".to_string())]
+        );
+        let token = format!("{}oat01-{}", "sk-ant-", "Q".repeat(24));
+        let weird = format!("{{\"bad\\u0007key\": 1, \"{token}\": 2}}");
+        let found = keys(&weird);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|(_, r, k)| *r == "unexpected-key" && k == "bad?key"), "{found:?}");
+        assert!(found.iter().all(|(_, _, k)| !k.contains(&token)), "a key is scrubbed: {found:?}");
+        let long = format!("{{\"{}\": 1}}", "k".repeat(500));
+        assert_eq!(keys(&long)[0].2.chars().count(), KEY_MAX, "cut");
+        // The old view is the same findings without keys.
+        assert_eq!(settings_findings("settings.json", BYPASS_DOC.as_bytes(), &[]), vec![(3, "default-mode"), (3, "bypass-permissions")]);
+    }
+
+    /// The clean-object cache's key: one per rule set, any change of a rule
+    /// (its text or its place) a new one; never a pattern's text.
+    #[test]
+    fn the_rules_digest_follows_every_rule() {
+        let d = Rules::defaults().digest();
+        assert_eq!(d.len(), 64);
+        assert!(d.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(Rules::defaults().digest(), d, "stable");
+        let a = Rules::with_extras("abc[0-9]{4}\n", "t").unwrap().digest();
+        let b = Rules::with_extras("abc[0-9]{5}\n", "t").unwrap().digest();
+        let moved = Rules::with_extras("\nabc[0-9]{4}\n", "t").unwrap().digest();
+        let comment = Rules::with_extras("# note\nabc[0-9]{4}\n", "t").unwrap().digest();
+        assert!(a != d && a != b && a != moved, "an added rule, its text, its line");
+        assert_eq!(moved, comment, "the rule id is its line, whatever the line holds before it");
+        assert!(!format!("{:?}", Rules::with_extras("abc[0-9]{4}\n", "t").unwrap()).contains("abc"), "Debug shows ids only");
+    }
+
+    #[test]
+    fn load_lists_takes_the_flags_then_the_review_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let review = ReviewCfg::default();
+        let n = |r: &Rules| r.ids().count();
+        // No file anywhere: the built-ins and no policy.
+        let (rules, policy) = load_lists(Some((&paths, &review)), None, None, true).unwrap();
+        assert_eq!((n(&rules), policy.len()), (DEFAULT_RULES.len(), 0));
+        // The defaults under the root apply when they exist; the policy only when wanted.
+        std::fs::write(dir.path().join("tripwires.txt"), "zz[0-9]{3}\n").unwrap();
+        std::fs::write(dir.path().join("settings-policy.txt"), "allow Bash(ls:*)\n").unwrap();
+        let (rules, policy) = load_lists(Some((&paths, &review)), None, None, true).unwrap();
+        assert_eq!((n(&rules), policy), (DEFAULT_RULES.len() + 1, vec!["Bash(ls:*)".to_string()]));
+        assert!(load_lists(Some((&paths, &review)), None, None, false).unwrap().1.is_empty(), "no policy unless wanted");
+        // An explicit file wins, and must exist; without defaults a missing flag is the built-ins.
+        let extra = dir.path().join("x.txt");
+        std::fs::write(&extra, "a1\nb2\n").unwrap();
+        assert_eq!(n(&load_lists(Some((&paths, &review)), Some(&extra), None, false).unwrap().0), DEFAULT_RULES.len() + 2);
+        let e = load_lists(None, Some(&dir.path().join("missing.txt")), None, false).unwrap_err();
+        assert!(e.contains("cannot read") && e.contains("missing.txt"), "{e}");
+        assert_eq!(n(&load_lists(None, None, None, true).unwrap().0), DEFAULT_RULES.len());
+        let e = load_lists(None, None, Some(&dir.path().join("nope")), false).unwrap_err();
+        assert!(e.contains("nope"), "an explicit policy is read whatever the profile: {e}");
     }
 
     // ---- walk ----

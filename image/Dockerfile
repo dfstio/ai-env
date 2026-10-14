@@ -46,7 +46,9 @@ RUN set -eu; \
 
 # Managed settings (root, 0644: read by claude regardless of --setting-sources)
 # and the reviewed config subset. .claude.json goes to both places claude
-# looks (CLAUDE_CONFIG_DIR set and unset); never a legacy .config.json.
+# looks (CLAUDE_CONFIG_DIR set and unset); never a legacy .config.json. The
+# system git config: no automatic maintenance (an agent's commit would start
+# a background gc --auto whose prune-packed can meet a helper's object write).
 COPY managed-settings.json /etc/claude-code/managed-settings.json
 COPY claude/ /Users/mike/.claude/
 RUN set -eu; \
@@ -60,7 +62,8 @@ RUN set -eu; \
     git config --system init.defaultBranch main; \
     git config --system user.name claude-agent; \
     git config --system user.email claude-agent@ai-env.invalid; \
-    git config --system push.default nothing
+    git config --system push.default nothing; \
+    git config --system maintenance.auto false
 
 # The shim last: it changes most often.
 COPY ai-env /usr/local/bin/ai-env

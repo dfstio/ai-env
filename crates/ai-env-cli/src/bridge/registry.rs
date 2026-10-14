@@ -12,9 +12,10 @@
 //! in the pump's memory only).
 //!
 //! Every path is built from a session id only after [`is_uuid`] accepted it,
-//! so no id can traverse out of `state/sessions` or `state/scratch`. The
-//! operator commands `ai-env session list|show|forget` live at the bottom
-//! ([`cmd_list`], [`cmd_show`], [`cmd_forget`]).
+//! so no id can traverse out of `state/sessions`, `state/scratch` or
+//! `quarantine`. The operator commands `ai-env session
+//! list|show|forget|drop-transport` live at the bottom ([`cmd_list`],
+//! [`cmd_show`], [`cmd_forget`], [`cmd_drop_transport`]).
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
 use crate::errors::CliError;
@@ -109,6 +110,9 @@ pub struct ForgetReport {
     pub removed_row: bool,
     /// `state/scratch/<uuid>` was a real directory and was deleted with its contents.
     pub removed_scratch: bool,
+    /// `quarantine/<uuid>` (S8: the settings captures and their diff) was a
+    /// real directory and was deleted with its contents.
+    pub removed_quarantine: bool,
 }
 
 // ---- ids and paths ---------------------------------------------------------------------
@@ -116,11 +120,11 @@ pub struct ForgetReport {
 /// Is `s` a canonical uuid: 36 characters, hex digits (either case) in the
 /// 8-4-4-4-12 groups, `-` at offsets 8, 13, 18 and 23? The same shape as the
 /// session picker's regex. Checked before ANY path is built from an id, so
-/// `..`, `/` and empty strings never reach the filesystem.
+/// `..`, `/` and empty strings never reach the filesystem. The check is
+/// `wire::workspace::is_uuid`, which the VM's transcript routes apply too (S8).
 #[must_use]
 pub fn is_uuid(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 36 && b.iter().enumerate().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { *c == b'-' } else { c.is_ascii_hexdigit() })
+    crate::wire::workspace::is_uuid(s)
 }
 
 /// `<root>/state/sessions/<session_id>.toml`; `Err(Config)` for anything that
@@ -305,13 +309,16 @@ fn sort_rows(rows: &mut [SessionRow]) {
 
 // ---- forget ------------------------------------------------------------------------------
 
-/// Delete a session's row and its scratch config dir.
+/// Delete a session's row, its scratch config dir and its quarantine (S8:
+/// the settings captures, `quarantine/<id>`).
 ///
 /// Refuses a non-uuid, and a row whose `status` is `active` while its wrapper
 /// pid is alive. The scratch dir is DERIVED from the id
 /// (`<root>/state/scratch/<id>`), never taken from the row's `scratch_dir`, and
 /// is removed only when `symlink_metadata` says it is a real directory — a
-/// symlink there is left alone, and so is its target. A row that exists but
+/// symlink there is left alone, and so is its target; the quarantine
+/// directory likewise, and only while `quarantine` itself is a real
+/// directory (a symlinked one is left alone). A row that exists but
 /// does not parse (or is a symlink / not a regular file) is still removed
 /// (with a `warn!`): a corrupt row cannot belong to a live wrapper, whose
 /// writes are atomic. An I/O error reading the row is returned instead — the
@@ -330,9 +337,19 @@ pub fn forget(paths: &Paths, session_id: &str) -> Result<ForgetReport, BridgeErr
     if let Some(owner) = scratch_owner(&scratch).filter(|pid| pid_alive(*pid)) {
         return Err(BridgeError::Config(format!("the scratch config dir of session {session_id} is in use by wrapper pid {owner}; close that session first")));
     }
-    let removed_scratch = remove_scratch_dir(&scratch)?;
+    let removed_scratch = remove_real_dir(&scratch)?;
+    // `quarantine` itself a real directory too: a symlinked one would lead every path below it elsewhere.
+    let removed_quarantine = match std::fs::symlink_metadata(paths.quarantine()) {
+        Ok(meta) if meta.file_type().is_dir() => remove_real_dir(&paths.quarantine_session(session_id))?,
+        Ok(_) => {
+            tracing::warn!("session registry: {} is not a real directory; the session's quarantine left alone", paths.quarantine().display());
+            false
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(e) => return Err(io_at("cannot stat", &paths.quarantine())(e)),
+    };
     let removed_row = remove_if_present(&row_path)?;
-    Ok(ForgetReport { removed_row, removed_scratch })
+    Ok(ForgetReport { removed_row, removed_scratch, removed_quarantine })
 }
 
 /// The file a pump writes into a scratch config dir while its child uses it
@@ -353,7 +370,7 @@ pub fn scratch_owner(dir: &Path) -> Option<u32> {
 
 /// `remove_dir_all(dir)` when `dir` itself is a real directory; `Ok(false)`
 /// when it is missing, a symlink (left alone) or anything else.
-fn remove_scratch_dir(dir: &Path) -> Result<bool, BridgeError> {
+fn remove_real_dir(dir: &Path) -> Result<bool, BridgeError> {
     match std::fs::symlink_metadata(dir) {
         Ok(meta) if meta.file_type().is_dir() => {
             std::fs::remove_dir_all(dir).map_err(io_at("cannot remove", dir))?;
@@ -415,13 +432,9 @@ fn list_line(row: &SessionRow) -> String {
 }
 
 /// The suffix of `forgot <uuid>…`, or `None` when nothing was removed.
-fn forget_suffix(r: ForgetReport) -> Option<&'static str> {
-    match (r.removed_row, r.removed_scratch) {
-        (true, false) => Some(" (row)"),
-        (true, true) => Some(" (row, scratch dir)"),
-        (false, true) => Some(" (scratch dir)"),
-        (false, false) => None,
-    }
+fn forget_suffix(r: ForgetReport) -> Option<String> {
+    let parts: Vec<&str> = [(r.removed_row, "row"), (r.removed_scratch, "scratch dir"), (r.removed_quarantine, "quarantine")].into_iter().filter(|(removed, _)| *removed).map(|(_, what)| what).collect();
+    (!parts.is_empty()).then(|| format!(" ({})", parts.join(", ")))
 }
 
 /// Pretty JSON of any row(s), mapped into the CLI error type.
@@ -466,9 +479,10 @@ pub fn cmd_show(uuid: &str, json: bool) -> crate::errors::Result<()> {
     Ok(())
 }
 
-/// `ai-env session forget UUID`: delete the row and the derived scratch dir
-/// (refused while the session is active). A non-uuid is a usage error (exit
-/// 2); nothing to remove exits 1 with `no session <uuid>`.
+/// `ai-env session forget UUID`: delete the row, the derived scratch dir and
+/// the session's quarantine (refused while the session is active). A
+/// non-uuid is a usage error (exit 2); nothing to remove exits 1 with `no
+/// session <uuid>`.
 pub fn cmd_forget(uuid: &str) -> crate::errors::Result<()> {
     if !is_uuid(uuid) {
         return Err(CliError::Usage(format!("not a session id: {uuid}")));
@@ -478,6 +492,134 @@ pub fn cmd_forget(uuid: &str) -> crate::errors::Result<()> {
         bail!("no session {uuid}");
     };
     outln!("forgot {uuid}{what}");
+    Ok(())
+}
+
+/// The signal `session drop-transport` sends the wrapper that owns a remote
+/// session (S8 T8.6): SIGUSR2. The wrapper's supervisor (S8 W1) installs its
+/// handler in every piped mode before the session's row is first written
+/// (the default disposition ends a process), and answers it with
+/// `LinkFactory::drop_transport`: a remote link closes its socket from the
+/// wrapper's side and reattaches; a local child is left alone.
+pub const DROP_TRANSPORT_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+/// The check `session drop-transport` makes before it signals (S8 T8.6):
+/// the row is `active` (a `detached` one is already reattaching, a `closed`
+/// one has no wrapper), its mode `remote` (a local child has no transport),
+/// and its wrapper's pid alive; then that pid. `Config` naming why
+/// otherwise (exit 1). W8's command also confirms the pid is still an
+/// `ai-env-claude` before [`DROP_TRANSPORT_SIGNAL`] goes, so a reused pid is
+/// never signalled.
+pub fn drop_transport_target(row: &SessionRow) -> Result<u32, BridgeError> {
+    let id = &row.session_id;
+    if row.status != "active" {
+        return Err(BridgeError::Config(format!("session {id} is {}, not active: only a running session has a transport to drop", if row.status.is_empty() { "of no status" } else { row.status.as_str() })));
+    }
+    if row.mode != "remote" {
+        return Err(BridgeError::Config(format!("session {id} runs {}, not remote: only a remote session has a transport to drop", if row.mode.is_empty() { "in no recorded mode" } else { row.mode.as_str() })));
+    }
+    if !pid_alive(row.pid) {
+        return Err(BridgeError::Config(format!("session {id}'s wrapper (pid {}) is gone", row.pid)));
+    }
+    Ok(row.pid)
+}
+
+/// The executable `session drop-transport` signals: the wrapper.
+pub const WRAPPER_EXE: &str = "ai-env-claude";
+
+/// What the system says of a live `pid`: its executable's file name and
+/// when it started (unix seconds); `None` when it is gone or cannot be read.
+#[cfg(target_vendor = "apple")]
+fn process_identity(pid: u32) -> Option<(String, u64)> {
+    use std::os::unix::ffi::OsStringExt;
+    let pid = libc::c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+    let mut buf = vec![0u8; usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).ok()?];
+    let cap = u32::try_from(buf.len()).ok()?;
+    // SAFETY: proc_pidpath writes at most `cap` bytes into `buf`, which this function owns and sized to `cap`.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), cap) };
+    buf.truncate(usize::try_from(n).ok().filter(|n| *n > 0)?);
+    let name = PathBuf::from(std::ffi::OsString::from_vec(buf)).file_name()?.to_string_lossy().into_owned();
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: proc_pidinfo writes at most `size` bytes, one `proc_bsdinfo`, into `info`.
+    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+    if got != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole struct (it returned its size), and it was zeroed before.
+    let info = unsafe { info.assume_init() };
+    Some((name, info.pbi_start_tvsec))
+}
+
+/// What the system says of a live `pid` (see the Mac's): `/proc/<pid>/exe`'s
+/// file name, and its start from `/proc/<pid>/stat` and the boot time.
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Option<(String, u64)> {
+    let name = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?.file_name()?.to_string_lossy().into_owned();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Past the command's closing parenthesis the fields start at the third; the start time is the 22nd.
+    let ticks: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()?;
+    let boot: u64 = std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|h| *h > 0)?;
+    Some((name, boot + ticks / hz))
+}
+
+/// No way to read a process here: nothing is ever confirmed.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+fn process_identity(_pid: u32) -> Option<(String, u64)> {
+    None
+}
+
+/// Before `session drop-transport` signals `pid`, the wrapper of `row`
+/// ([`drop_transport_target`]'s pid): still alive as an [`WRAPPER_EXE`]
+/// (its executable's file name), started no later than the row was first
+/// written (a pid the system gave a later process is never signalled; the
+/// wrapper writes its row only after it started). `Config` naming why.
+pub fn confirm_wrapper(row: &SessionRow, pid: u32) -> Result<(), BridgeError> {
+    judge_wrapper(row, pid, process_identity(pid))
+}
+
+/// [`confirm_wrapper`]'s verdict on what the system says of `pid`
+/// (`identity`: its executable's file name and start, `None`: unreadable).
+fn judge_wrapper(row: &SessionRow, pid: u32, identity: Option<(String, u64)>) -> Result<(), BridgeError> {
+    let id = &row.session_id;
+    let created = time::parse_rfc3339_utc(&row.created).ok_or_else(|| BridgeError::Config(format!("session {id}'s row has no creation time: its wrapper (pid {pid}) cannot be confirmed")))?;
+    let Some((name, started)) = identity else {
+        return Err(BridgeError::Config(format!("session {id}'s wrapper (pid {pid}) is gone or cannot be read")));
+    };
+    if name != WRAPPER_EXE {
+        return Err(BridgeError::Config(format!("pid {pid} is {name}, not {WRAPPER_EXE}: session {id}'s wrapper is gone and its pid reused")));
+    }
+    if started > created {
+        return Err(BridgeError::Config(format!("pid {pid} started after session {id}'s row was written: its wrapper is gone and its pid reused")));
+    }
+    Ok(())
+}
+
+/// `ai-env session drop-transport UUID` (S8 T8.6): the owning wrapper closes
+/// its session's socket from its side, and the session reattaches by its
+/// reconnect rules (the row `detached`, then `active` again), no line lost
+/// or doubled: [`drop_transport_target`], [`confirm_wrapper`], then
+/// [`DROP_TRANSPORT_SIGNAL`] to that wrapper. A non-uuid is a usage error
+/// (exit 2); an unknown session, or one that is not an active remote
+/// session of a live wrapper, exits 1 naming why.
+pub fn cmd_drop_transport(uuid: &str) -> crate::errors::Result<()> {
+    if !is_uuid(uuid) {
+        return Err(CliError::Usage(format!("not a session id: {uuid}")));
+    }
+    let paths = Paths::resolve()?;
+    let Some(row) = read(&paths, uuid)? else {
+        bail!("no session {uuid}");
+    };
+    let pid = drop_transport_target(&row)?;
+    confirm_wrapper(&row, pid)?;
+    let target = libc::pid_t::try_from(pid).map_err(|_| CliError::Msg(format!("pid {pid} is no process id")))?;
+    // SAFETY: kill(2) of a live process confirmed to be the session's wrapper, with a signal it handles.
+    if unsafe { libc::kill(target, DROP_TRANSPORT_SIGNAL) } != 0 {
+        bail!("session {uuid}'s wrapper (pid {pid}) could not be signalled: {}", std::io::Error::last_os_error());
+    }
+    outln!("session {uuid}: its wrapper (pid {pid}) drops the transport and reattaches (session show {uuid}: detached, then active)");
     Ok(())
 }
 
@@ -769,15 +911,15 @@ mod tests {
         let scratch = p.scratch().join(id(1));
         std::fs::create_dir_all(scratch.join("projects").join("slug")).unwrap();
         std::fs::write(scratch.join("projects").join("slug").join("x.jsonl"), "{}\n").unwrap();
-        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: true });
+        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: true, removed_quarantine: false });
         assert!(!scratch.exists() && !path_for(&p, &id(1)).unwrap().exists());
         assert!(decoy.is_dir());
         assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport::default(), "nothing left");
 
         write(&p, &row(2, "")).unwrap();
-        assert_eq!(forget(&p, &id(2)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false });
+        assert_eq!(forget(&p, &id(2)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false });
         std::fs::create_dir_all(p.scratch().join(id(3))).unwrap();
-        assert_eq!(forget(&p, &id(3)).unwrap(), ForgetReport { removed_row: false, removed_scratch: true });
+        assert_eq!(forget(&p, &id(3)).unwrap(), ForgetReport { removed_row: false, removed_scratch: true, removed_quarantine: false });
     }
 
     #[test]
@@ -791,7 +933,7 @@ mod tests {
         std::fs::create_dir_all(p.scratch()).unwrap();
         let link = p.scratch().join(id(1));
         symlink(&target, &link).unwrap();
-        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false });
+        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false });
         assert!(is_symlink(&link), "the link stays");
         assert_eq!(std::fs::read_to_string(target.join("keep.txt")).unwrap(), "keep");
     }
@@ -826,6 +968,96 @@ mod tests {
         assert!(row_path.exists() && p.scratch().join(id(1)).is_dir(), "nothing removed");
     }
 
+    /// T8.6's control: only an active remote session whose wrapper lives is
+    /// signalled, with SIGUSR2; each refusal says why.
+    #[test]
+    fn drop_transport_targets_a_live_active_remote_wrapper_only() {
+        assert_eq!(DROP_TRANSPORT_SIGNAL, libc::SIGUSR2);
+        let live = SessionRow { status: "active".into(), mode: "remote".into(), pid: std::process::id(), ..row(1, "") };
+        assert_eq!(drop_transport_target(&live).unwrap(), std::process::id());
+        for (r, why) in [
+            (SessionRow { status: "detached".into(), ..live.clone() }, "is detached, not active"),
+            (SessionRow { status: "closed".into(), ..live.clone() }, "is closed, not active"),
+            (SessionRow { status: String::new(), ..live.clone() }, "is of no status"),
+            (SessionRow { mode: "local-child".into(), ..live.clone() }, "runs local-child, not remote"),
+            (SessionRow { pid: i32::MAX as u32, ..live.clone() }, "is gone"),
+            (SessionRow { pid: 0, ..live.clone() }, "(pid 0) is gone"),
+        ] {
+            let e = drop_transport_target(&r).unwrap_err();
+            assert!(matches!(e, BridgeError::Config(_)) && e.to_string().contains(why), "{e}");
+        }
+    }
+
+    /// S8: forget also removes the session's quarantine (its settings
+    /// captures), never through a link: a symlinked one, or a symlinked
+    /// `quarantine` above it, is left alone, and so is its target.
+    #[test]
+    fn forget_removes_the_sessions_quarantine_never_through_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        write(&p, &row(1, "")).unwrap();
+        let settings = p.quarantine_session(&id(1)).join("settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(settings.join("start.json"), "{}\n").unwrap();
+        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: true });
+        assert!(!p.quarantine_session(&id(1)).exists() && p.quarantine().is_dir(), "the session's own directory only");
+        assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: true }).as_deref(), Some(" (row, quarantine)"));
+        let target = d.path().join("precious");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "keep").unwrap();
+        symlink(&target, p.quarantine_session(&id(2))).unwrap();
+        write(&p, &row(2, "")).unwrap();
+        assert_eq!(forget(&p, &id(2)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false });
+        assert!(is_symlink(&p.quarantine_session(&id(2))) && target.join("keep.txt").is_file(), "the link and its target stay");
+        // An active session of a live wrapper keeps its quarantine with its row.
+        let mut live = row(3, "");
+        live.status = "active".into();
+        live.pid = std::process::id();
+        write(&p, &live).unwrap();
+        std::fs::create_dir_all(p.quarantine_session(&id(3))).unwrap();
+        assert!(forget(&p, &id(3)).is_err());
+        assert!(p.quarantine_session(&id(3)).is_dir());
+        // `quarantine` itself a symlink: never followed, the session's directory at its target kept.
+        let d2 = tempfile::tempdir().unwrap();
+        let p2 = paths_in(&d2);
+        let elsewhere = d2.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(id(4))).unwrap();
+        std::fs::write(elsewhere.join(id(4)).join("keep.txt"), "keep").unwrap();
+        symlink(&elsewhere, p2.quarantine()).unwrap();
+        write(&p2, &row(4, "")).unwrap();
+        assert_eq!(forget(&p2, &id(4)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false });
+        assert!(is_symlink(&p2.quarantine()) && elsewhere.join(id(4)).join("keep.txt").is_file(), "the link and the session's directory at its target stay");
+    }
+
+    /// `session drop-transport` signals only the wrapper that wrote the row:
+    /// an `ai-env-claude` started no later than the row was written; another
+    /// program, a pid the system gave a later process, a pid that cannot be
+    /// read or a row without its creation time are refused. What the system
+    /// says of a pid is its executable's file name and its start.
+    #[test]
+    fn only_an_ai_env_claude_started_before_its_row_is_the_wrapper() {
+        let created = 1_790_000_000;
+        let wrote = SessionRow { status: "active".into(), mode: "remote".into(), pid: 4242, created: time::rfc3339_utc(created), ..row(1, "") };
+        let who = |name: &str, started: u64| Some((name.to_string(), started));
+        judge_wrapper(&wrote, 4242, who(WRAPPER_EXE, created)).unwrap();
+        judge_wrapper(&wrote, 4242, who(WRAPPER_EXE, created - 60)).unwrap();
+        for (identity, row, why) in [
+            (who(WRAPPER_EXE, created + 1), wrote.clone(), "pid 4242 started after session"),
+            (who("sleep", created - 60), wrote.clone(), "pid 4242 is sleep, not ai-env-claude"),
+            (None, wrote.clone(), "(pid 4242) is gone or cannot be read"),
+            (who(WRAPPER_EXE, created), SessionRow { created: String::new(), ..wrote.clone() }, "no creation time"),
+        ] {
+            let e = judge_wrapper(&row, 4242, identity).unwrap_err();
+            assert!(matches!(e, BridgeError::Config(_)) && e.to_string().contains(why), "{why}: {e}");
+        }
+        let (name, started) = process_identity(std::process::id()).expect("this process");
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(Some(name.as_str()), exe.file_name().and_then(|n| n.to_str()), "its executable's file name");
+        assert!(started > 0 && started <= time::unix_now(), "{started}");
+        assert_eq!(process_identity(i32::MAX as u32), None);
+        assert_eq!(process_identity(0), None);
+    }
+
     #[test]
     fn forget_allows_an_active_row_whose_pid_is_dead() {
         let d = tempfile::tempdir().unwrap();
@@ -834,7 +1066,7 @@ mod tests {
         r.status = "active".into();
         r.pid = i32::MAX as u32;
         write(&p, &r).unwrap();
-        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false });
+        assert_eq!(forget(&p, &id(1)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false });
     }
 
     #[test]
@@ -848,7 +1080,7 @@ mod tests {
         assert!(p.scratch().join("x").is_dir());
         std::fs::create_dir_all(p.sessions()).unwrap();
         std::fs::write(path_for(&p, &id(6)).unwrap(), "not = = toml").unwrap();
-        assert_eq!(forget(&p, &id(6)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false });
+        assert_eq!(forget(&p, &id(6)).unwrap(), ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false });
     }
 
     #[test]
@@ -908,9 +1140,10 @@ mod tests {
         r.status = "active".into();
         r.mode = "local-scratch".into();
         assert_eq!(list_line(&r), format!("{}  active  local-scratch  2026-09-25T10:00:00Z  -tmp-x", id(1)));
-        assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: false }), Some(" (row)"));
-        assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: true }), Some(" (row, scratch dir)"));
-        assert_eq!(forget_suffix(ForgetReport { removed_row: false, removed_scratch: true }), Some(" (scratch dir)"));
+        assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false }).as_deref(), Some(" (row)"));
+        assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: true, removed_quarantine: false }).as_deref(), Some(" (row, scratch dir)"));
+        assert_eq!(forget_suffix(ForgetReport { removed_row: false, removed_scratch: true, removed_quarantine: false }).as_deref(), Some(" (scratch dir)"));
+        assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: true }).as_deref(), Some(" (row, quarantine)"));
         assert_eq!(forget_suffix(ForgetReport::default()), None);
     }
 

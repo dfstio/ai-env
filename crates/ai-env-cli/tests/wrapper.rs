@@ -6,7 +6,9 @@
 //! and the argv log never touch the developer's `~/.config/ai-env`. Nothing
 //! here mutates the test process's environment: every variable is set on the
 //! child `Command` (the `s7` signal tests set one signal's disposition around
-//! a spawn, serialized, and put it back).
+//! a spawn, serialized, and put it back). S8: the remote mode's routes (where
+//! the mode comes from, and every route it execs) need no shim; the
+//! synthetic-oauth tests of `s7` also run on the remote link (`on_links!`).
 mod common;
 
 use ai_env_cli::bridge::census::CENSUS_VALUE_ALLOWLIST;
@@ -21,14 +23,18 @@ fn wrapper() -> &'static str {
 
 /// Variables a developer's shell may carry that would steer the wrapper (the
 /// kill switch, the lab knobs, a config-path override, the S2 pump mode and
-/// its knobs — a set mode would turn these exec tests into piped runs — and
-/// what S7's `local-scratch` login reads: the token, the keystore directory
-/// and its two lab knobs).
-const WRAPPER_ENV: [&str; 13] = [
+/// its knobs — a set mode would turn these exec tests into piped runs — what
+/// S7's `local-scratch` login reads: the token, the keystore directory and
+/// its two lab knobs; and S8's VM pin and transcript knob, the remote
+/// session's lab knobs and its trace) or the fake (`tests/fakes/claude.sh`'s
+/// knobs but the argv log `command` sets). Every `AI_ENV_BRIDGE_*` knob the
+/// code reads is here but the bridge root (`tests/infra/image.rs` checks it).
+const WRAPPER_ENV: [&str; 24] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
     "AI_ENV_BRIDGE_MODE",
+    "AI_ENV_BRIDGE_VM",
     "AI_ENV_BRIDGE_MIRROR_ROOT",
     "AI_ENV_BRIDGE_LAB_IGNORE_EOF",
     "AI_ENV_BRIDGE_LAB_STDOUT_NOISE",
@@ -36,8 +42,18 @@ const WRAPPER_ENV: [&str; 13] = [
     "AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS",
     "AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS",
     "AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS",
+    "AI_ENV_BRIDGE_LAB_TRANSCRIPT",
+    "AI_ENV_BRIDGE_LAB_FAKE_API",
+    "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
+    "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
+    "AI_ENV_BRIDGE_LAB_AGENT_ADDR",
+    "AI_ENV_BRIDGE_LAB_FAKE_SHELL",
+    "AI_ENV_BRIDGE_TRACE",
     "AI_ENV_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "FAKE_STDOUT",
+    "FAKE_ECHO_STDIN",
+    "FAKE_EXIT",
 ];
 
 /// Lossy text of a captured stream, for assertions and their messages.
@@ -347,6 +363,25 @@ fn census_records_env_names_only() {
     assert!(!file.contains(&canary), "an allowlisted value reached the census unscrubbed");
     let row = fake.only_row();
     assert_eq!(row["env_selected"]["CLAUDE_CONFIG_DIR"], format!("/x/sk-ant-[redacted:len={}]", canary.len()), "{row}");
+}
+
+/// `ai-env-claude --help` (or `-h`) alone prints the wrapper's own usage and
+/// exits 0: nothing is read, nothing written, and no claude runs, although
+/// a `--help` taken as the real binary's path would reach the local fallback
+/// and the PATH here holds an executable `claude` (the kill switch set too).
+#[test]
+fn help_prints_the_wrappers_usage_and_runs_no_claude() {
+    let fake = FakeClaude::new();
+    let path = fake.tmp().to_string_lossy().into_owned();
+    for (flag, envs) in [("--help", vec![("PATH", path.as_str())]), ("-h", vec![("PATH", path.as_str())]), ("--help", vec![("PATH", path.as_str()), ("AI_ENV_BRIDGE_LOCAL", "1")])] {
+        let out = fake.command(Path::new(flag), &[], &envs).current_dir(fake.tmp()).output().expect("spawn wrapper");
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{flag}: {stdout}{stderr}");
+        assert!(stdout.starts_with("ai-env-claude ") && stdout.contains("(usage: ai-env-claude <realBinary> <claude args…> | --version | --help)"), "{flag}: {stdout}");
+        assert!(stderr.is_empty(), "{flag}: {stderr}");
+    }
+    assert!(fake.logged().is_empty(), "a claude ran: {:?}", fake.logged());
+    assert!(!fake.census_path().exists(), "the help wrote a census row");
 }
 
 #[test]
@@ -780,6 +815,299 @@ fn unset_mode_session_still_execs() {
     assert!(row.get("end").is_none(), "{row}");
 }
 
+// ---- S8: the remote mode's routes (plan §1, L1): every one here execs, no shim --------------
+
+/// A `bridge.toml` whose only root is `root`, in `[wrapper] mode = "remote"`.
+fn remote_toml(root: &Path) -> String {
+    format!("{}[wrapper]\nmode = \"remote\"\n", FakeClaude::roots_toml(root))
+}
+
+/// No pump ran: no `wrapper.log`, no `state/`, no `audit.jsonl` (the census row is the exec's only record).
+fn assert_no_pump_state(fake: &FakeClaude) {
+    assert!(!wrapper_log_path(fake).exists(), "an exec writes no wrapper.log");
+    assert!(!fake.bridge_dir().join("state").exists(), "an exec creates no state/ (sessions, workspaces, VMs)");
+    assert!(!fake.bridge_dir().join("audit.jsonl").exists(), "an exec audits nothing");
+}
+
+/// The kill switch wins over the remote mode, from the config or the
+/// variable: a session under the roots execs the real binary verbatim
+/// (`--add-dir` kept, no `--session-mirror`), with no census row, no log and
+/// no state, as it does in passthrough.
+#[test]
+fn kill_switch_wins_over_remote_mode() {
+    for (config, mode) in [(true, None), (false, Some("remote")), (true, Some("remote"))] {
+        let fake = FakeClaude::new();
+        if config {
+            fake.with_bridge_toml(&remote_toml(fake.tmp()));
+        }
+        let mut envs = vec![("AI_ENV_BRIDGE_LOCAL", "1")];
+        envs.extend(mode.map(|m| ("AI_ENV_BRIDGE_MODE", m)));
+        let out = fake.run_in(fake.tmp(), &STREAM_JSON, &envs);
+        assert_eq!(out.status.code(), Some(0), "config {config}, {mode:?}: {}", text(&out.stderr));
+        assert!(out.stderr.is_empty(), "config {config}, {mode:?}: {}", text(&out.stderr));
+        assert_eq!(fake.logged(), STREAM_JSON, "config {config}, {mode:?}: exec'd verbatim");
+        assert!(!fake.census_path().exists(), "config {config}, {mode:?}: the kill switch records nothing");
+        assert_no_pump_state(&fake);
+        assert!(!fake.bridge_dir().join("logs").exists(), "config {config}, {mode:?}: no log at all");
+    }
+}
+
+/// `auth status --json` is never a session: in remote mode, under the roots,
+/// it execs verbatim; the census row says the mode and why no prewarm went
+/// out (no Touch ID GUI verdict yet: `prewarm:skipped(touchid_gui)`).
+#[test]
+fn remote_mode_auth_status_execs_locally() {
+    let fake = FakeClaude::new();
+    fake.with_bridge_toml(&FakeClaude::roots_toml(fake.tmp()));
+    let out = fake.run_in(fake.tmp(), &AUTH_STATUS, &[("AI_ENV_BRIDGE_MODE", "remote")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), AUTH_STATUS, "exec'd verbatim");
+    let row = fake.only_row();
+    assert_eq!((row["route"].as_str(), row["reason"].as_str()), (Some("local"), Some("subcommand:auth")), "{row}");
+    assert_eq!(row["note"], "mode:remote; prewarm:skipped(touchid_gui)", "{row}");
+    assert!(row.get("end").is_none(), "exec leaves no end row: {row}");
+    assert_no_pump_state(&fake);
+}
+
+/// A session outside every root in remote mode is the Mac's: it execs
+/// verbatim (`--add-dir` kept, no `--session-mirror`), the row a local one
+/// with reason `outside_roots` and the mode noted.
+#[test]
+fn remote_mode_outside_roots_execs_with_reason_outside_roots() {
+    let fake = FakeClaude::new();
+    let other = tempfile::tempdir().unwrap();
+    fake.with_bridge_toml(&FakeClaude::roots_toml(other.path()));
+    let out = fake.run_in(fake.tmp(), &STREAM_JSON, &[("AI_ENV_BRIDGE_MODE", "remote")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), STREAM_JSON, "exec'd verbatim");
+    let row = fake.only_row();
+    assert_eq!((row["route"].as_str(), row["reason"].as_str(), row["note"].as_str()), (Some("local"), Some("outside_roots"), Some("mode:remote")), "{row}");
+    assert_no_pump_state(&fake);
+}
+
+/// Remote mode without a `bridge.toml` has no roots: a session execs
+/// verbatim, reason `unconfigured`, the mode noted.
+#[test]
+fn remote_mode_unconfigured_execs_locally() {
+    let fake = FakeClaude::new();
+    let out = fake.run_in(fake.tmp(), &STREAM_JSON, &[("AI_ENV_BRIDGE_MODE", "remote")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), STREAM_JSON, "exec'd verbatim");
+    let row = fake.only_row();
+    assert_eq!((row["route"].as_str(), row["reason"].as_str(), row["note"].as_str()), (Some("local"), Some("unconfigured"), Some("mode:remote")), "{row}");
+    assert_no_pump_state(&fake);
+}
+
+/// `mcp add` in remote mode, under the roots, still runs on the Mac (it
+/// edits the Mac's `~/.claude.json`, which no VM session reads): exec'd
+/// verbatim, its one stderr line, the census note with the mode after it.
+#[test]
+fn remote_mode_mcp_add_notes_the_mac_config() {
+    let fake = FakeClaude::new();
+    fake.with_bridge_toml(&FakeClaude::roots_toml(fake.tmp()));
+    let args = ["mcp", "add", "--scope", "user", "--transport", "stdio", "--", "github", "npx", "-y", "@x/server"];
+    let out = fake.run_in(fake.tmp(), &args, &[("AI_ENV_BRIDGE_MODE", "remote")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "ai-env-claude: mcp add edits the Mac's ~/.claude.json; VM sessions see committed .mcp.json\n");
+    assert_eq!(fake.logged(), args, "exec'd verbatim");
+    let row = fake.only_row();
+    assert_eq!((row["route"].as_str(), row["reason"].as_str()), (Some("local"), Some("subcommand:mcp")), "{row}");
+    assert_eq!(row["note"], "mcp add edits the Mac's ~/.claude.json; mode:remote", "{row}");
+    assert_no_pump_state(&fake);
+}
+
+/// Where the mode comes from (L1): `[wrapper] mode = "remote"` in
+/// bridge.toml notes `mode:remote(config)`; `AI_ENV_BRIDGE_MODE` overrides
+/// it either way (`passthrough` over the config's remote, earning no note,
+/// and `remote` over the config's passthrough); an empty or unknown value
+/// names no mode, so the config decides, noted beside it with one stderr
+/// line. Read on `--version`, which execs in every mode; then a session
+/// under the roots of a remote config execs verbatim under the variable's
+/// `passthrough`.
+#[test]
+fn the_remote_mode_comes_from_the_config_and_the_variable_overrides_it() {
+    let passthrough = |root: &Path| format!("{}[wrapper]\nmode = \"passthrough\"\n", FakeClaude::roots_toml(root));
+    let cases: [(bool, Option<&str>, Option<&str>, &str); 6] = [
+        (true, None, Some("mode:remote(config)"), ""),
+        (true, Some("passthrough"), None, ""),
+        (false, Some("remote"), Some("mode:remote"), ""),
+        (true, Some(""), Some("mode_invalid:; mode:remote(config)"), "ai-env-claude: AI_ENV_BRIDGE_MODE= unknown; remote\n"),
+        (true, Some("garbage"), Some("mode_invalid:garbage; mode:remote(config)"), "ai-env-claude: AI_ENV_BRIDGE_MODE=garbage unknown; remote\n"),
+        (false, Some("garbage"), Some("mode_invalid:garbage"), "ai-env-claude: AI_ENV_BRIDGE_MODE=garbage unknown; passthrough\n"),
+    ];
+    for (remote, var, note, err) in cases {
+        let fake = FakeClaude::new();
+        fake.with_bridge_toml(&if remote { remote_toml(fake.tmp()) } else { passthrough(fake.tmp()) });
+        let envs: Vec<(&str, &str)> = var.map(|v| ("AI_ENV_BRIDGE_MODE", v)).into_iter().collect();
+        let out = fake.run_in(fake.tmp(), &["--version"], &envs);
+        let case = format!("config remote {remote}, AI_ENV_BRIDGE_MODE {var:?}");
+        assert_eq!(out.status.code(), Some(0), "{case}: {}", text(&out.stderr));
+        assert_eq!(text(&out.stderr), err, "{case}");
+        assert_eq!(fake.logged(), ["--version"], "{case}: exec'd");
+        let row = fake.only_row();
+        assert_eq!((row["reason"].as_str(), row["note"].as_str()), (Some("version"), note), "{case}: {row}");
+        assert_no_pump_state(&fake);
+    }
+    let fake = FakeClaude::new();
+    fake.with_bridge_toml(&remote_toml(fake.tmp()));
+    let out = fake.run_in(fake.tmp(), &STREAM_JSON, &[("AI_ENV_BRIDGE_MODE", "passthrough")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert_eq!(fake.logged(), STREAM_JSON, "the variable's passthrough execs a session under the roots verbatim");
+    let row = fake.only_row();
+    assert_eq!((row["route"].as_str(), row["note"].as_str()), (Some("remote"), None), "{row}");
+    assert_no_pump_state(&fake);
+}
+
+/// A `[wrapper] mode` nobody knows is taken as remote, so a session under
+/// the roots fails closed at the remote session's prechecks (P0): exit 1,
+/// one line naming the key and the kill switch, the census's end row and
+/// one `session_remote_failed`; the real binary never runs on the Mac.
+#[test]
+fn an_unknown_config_mode_fails_a_session_under_the_roots_closed() {
+    let fake = FakeClaude::new();
+    fake.with_bridge_toml(&format!("{}[wrapper]\nmode = \"remotely\"\n", FakeClaude::roots_toml(fake.tmp())));
+    let out = fake.run_in(fake.tmp(), &STREAM_JSON, &[]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let last = err.lines().last().unwrap_or_default();
+    assert!(last.starts_with("ai-env-claude: config: [wrapper].mode = \"remotely\": must be") && last.ends_with("; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally"), "{err}");
+    assert!(err.lines().all(|l| l.starts_with("ai-env-claude: ")), "the wrapper's voice only: {err}");
+    assert!(fake.logged().is_empty(), "the real binary never ran on the Mac");
+    let rows = fake.census();
+    assert_eq!(rows.len(), 2, "a start row and an end row: {rows:?}");
+    let note = rows[1]["note"].as_str().unwrap_or_default();
+    assert!(note.starts_with("mode_invalid:remotely(config); ") && note.contains("end:spawn_failed") && note.contains("step:precheck"), "{note}");
+    assert_eq!(rows[1]["exit"], 1, "{}", rows[1]);
+    let audit = std::fs::read_to_string(fake.bridge_dir().join("audit.jsonl")).unwrap_or_default();
+    let failed: Vec<serde_json::Value> = audit.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["event"] == "session_remote_failed").collect();
+    assert_eq!(failed.len(), 1, "{audit}");
+    assert_eq!((failed[0]["detail"]["step"].as_str(), failed[0]["detail"]["code"].as_str(), failed[0]["detail"]["why"].as_str()), (Some("precheck"), Some("1"), Some("config")), "{audit}");
+}
+
+/// The first line of the error `<tmp>/bridge/bridge.toml` fails to load with
+/// (what the census start row notes, and P0's line quotes).
+fn load_error_line(fake: &FakeClaude) -> String {
+    use ai_env_cli::bridge::config::{BridgeConfig, Paths};
+    let error = BridgeConfig::load(&Paths::from_root_and_env(fake.bridge_dir(), None)).expect_err("a bridge.toml that does not load").to_string();
+    error.lines().next().unwrap_or_default().to_string()
+}
+
+/// CUSTODY-1: a bridge.toml that does not load (an unknown key, another
+/// `[aws].region`, a wrong type, a misspelt `roots`, no TOML at all, a file
+/// that cannot be read) never turns a remote session under the roots into a
+/// run on the Mac. The wrapper still reads the file's mode and roots as
+/// plain TOML (or takes the variable's mode), and P0 fails the session
+/// closed: exit 1, one line quoting the load error's first line (no TOML
+/// snippet) then the kill switch, the census's end row and one
+/// `session_remote_failed`. A mode that cannot be read is taken as remote,
+/// as an unknown one is; roots that cannot be read hold every cwd.
+#[test]
+fn a_remote_bridge_toml_that_does_not_parse_fails_closed() {
+    use ai_env_cli::bridge::remote::Failure;
+    type Toml = fn(&Path) -> Option<String>;
+    // (what, the file for a root, AI_ENV_BRIDGE_MODE, the start row's mode note); `None`: bridge.toml is a directory.
+    let cases: [(&str, Toml, Option<&str>, &str); 8] = [
+        ("an unknown key", |r| Some(format!("{}[vm]\nmax_idle = 300\n", remote_toml(r))), None, "mode:remote(config)"),
+        ("another region", |r| Some(format!("{}[aws]\nregion = \"eu-west-3\"\n", remote_toml(r))), None, "mode:remote(config)"),
+        ("a wrong type", |r| Some(format!("{}strip_debug = \"yes\"\n", remote_toml(r))), None, "mode:remote(config)"),
+        ("a misspelt roots key", |r| Some(format!("[workspaces]\nroot = [{r:?}]\n[wrapper]\nmode = \"remote\"\n")), None, "mode:remote(config)"),
+        ("the variable over an unknown key", |r| Some(format!("{}[vm]\nmax_idle = 300\n", FakeClaude::roots_toml(r))), Some("remote"), "mode:remote"),
+        ("no TOML at all, with the variable", |r| Some(format!("{}[wrapper]\nmode = \"remote\"\n", remote_toml(r))), Some("remote"), "mode:remote"),
+        ("no TOML at all", |r| Some(format!("{}[wrapper]\nmode = \"remote\"\n", remote_toml(r))), None, "mode_unreadable(config)"),
+        ("a file that cannot be read", |_| None, None, "mode_unreadable(config)"),
+    ];
+    for (what, toml, var, mode_note) in cases {
+        let fake = FakeClaude::new();
+        match toml(fake.tmp()) {
+            Some(text) => fake.with_bridge_toml(&text),
+            None => std::fs::create_dir_all(fake.bridge_dir().join("bridge.toml")).unwrap(),
+        }
+        let first = load_error_line(&fake);
+        let envs: Vec<(&str, &str)> = var.map(|v| ("AI_ENV_BRIDGE_MODE", v)).into_iter().collect();
+        let out = fake.run_in(fake.tmp(), &STREAM_JSON, &envs);
+        let err = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{what}: {err}");
+        assert_eq!(err, format!("ai-env-claude: {}\n", Failure::Config { first_line: first.clone() }.line()), "{what}: one line");
+        assert!(err.starts_with("ai-env-claude: config: ") && err.ends_with("; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally\n"), "{what}: {err}");
+        assert!(!err.contains("max_idle") && !err.contains("strip_debug"), "{what}: the error's first line only, no TOML snippet: {err}");
+        assert!(fake.logged().is_empty(), "{what}: the real binary never ran on the Mac");
+        let rows = fake.census();
+        assert_eq!(rows.len(), 2, "{what}: a start row and an end row: {rows:?}");
+        assert_eq!((rows[0]["route"].as_str(), rows[0]["reason"].as_str()), (Some("remote"), Some("session")), "{what}: {}", rows[0]);
+        assert_eq!(rows[0]["note"], format!("{first}; {mode_note}"), "{what}");
+        let end = rows[1]["note"].as_str().unwrap_or_default();
+        assert!(end.starts_with(&format!("{first}; {mode_note}; end:spawn_failed; ")) && end.ends_with("; step:precheck"), "{what}: {end}");
+        assert_eq!(rows[1]["exit"], 1, "{what}: {}", rows[1]);
+        let audit = std::fs::read_to_string(fake.bridge_dir().join("audit.jsonl")).unwrap_or_default();
+        let failed: Vec<serde_json::Value> = audit.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["event"] == "session_remote_failed").collect();
+        assert_eq!(failed.len(), 1, "{what}: {audit}");
+        assert_eq!((failed[0]["detail"]["step"].as_str(), failed[0]["detail"]["code"].as_str(), failed[0]["detail"]["why"].as_str()), (Some("precheck"), Some("1"), Some("config")), "{what}: {audit}");
+    }
+}
+
+/// CUSTODY-1's boundary: a bridge.toml that does not load changes nothing
+/// for what is not a remote session under its roots. Passthrough (the
+/// file's, no mode at all, or the variable's over a remote file or one that
+/// is no TOML) execs a session verbatim as S1 does, the load error noted,
+/// reason `unconfigured`; in remote mode a session outside the roots the
+/// file names, `auth status` and `--version` exec; `local-child` still
+/// pipes the session through the local pump, reason `unconfigured`.
+#[test]
+fn a_broken_bridge_toml_still_execs_what_is_not_a_remote_session_under_its_roots() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let broken = |toml: String| format!("{toml}[vm]\nmax_idle = 300\n");
+    // Each file for a root (the run's own directory, its cwd).
+    let passthrough = |r: &Path| broken(format!("{}[wrapper]\nmode = \"passthrough\"\n", FakeClaude::roots_toml(r)));
+    let no_mode = |r: &Path| broken(FakeClaude::roots_toml(r));
+    let remote = |r: &Path| broken(remote_toml(r));
+    let no_toml = |r: &Path| format!("{}[wrapper]\nmode = \"remote\"\n", remote_toml(r));
+    let outside = |_: &Path| broken(remote_toml(elsewhere.path()));
+    // (what, the file, AI_ENV_BRIDGE_MODE, argv, the row's route and reason, the note after the load error)
+    type Case<'a> = (&'a str, &'a dyn Fn(&Path) -> String, Option<&'a str>, &'a [&'a str], (&'a str, &'a str), &'a str);
+    let cases: [Case<'_>; 7] = [
+        ("the file's passthrough", &passthrough, None, &STREAM_JSON, ("local", "unconfigured"), ""),
+        ("no mode at all", &no_mode, None, &STREAM_JSON, ("local", "unconfigured"), ""),
+        ("the variable's passthrough", &remote, Some("passthrough"), &STREAM_JSON, ("local", "unconfigured"), ""),
+        ("the variable's passthrough over no TOML", &no_toml, Some("passthrough"), &STREAM_JSON, ("local", "unconfigured"), ""),
+        ("outside the roots", &outside, None, &STREAM_JSON, ("local", "outside_roots"), "; mode:remote(config)"),
+        ("auth status", &remote, None, &AUTH_STATUS, ("local", "subcommand:auth"), "; mode:remote(config); prewarm:skipped(unconfigured)"),
+        ("--version", &remote, None, &["--version"], ("local", "version"), "; mode:remote(config)"),
+    ];
+    for (what, toml, var, args, (route, reason), notes) in cases {
+        let fake = FakeClaude::new();
+        fake.with_bridge_toml(&toml(fake.tmp()));
+        let first = load_error_line(&fake);
+        let envs: Vec<(&str, &str)> = var.map(|v| ("AI_ENV_BRIDGE_MODE", v)).into_iter().collect();
+        let out = fake.run_in(fake.tmp(), args, &envs);
+        assert_eq!(out.status.code(), Some(0), "{what}: {}", text(&out.stderr));
+        assert!(out.stderr.is_empty(), "{what}: {}", text(&out.stderr));
+        assert_eq!(fake.logged(), args, "{what}: exec'd verbatim");
+        let row = fake.only_row();
+        assert_eq!((row["route"].as_str(), row["reason"].as_str()), (Some(route), Some(reason)), "{what}: {row}");
+        assert_eq!(row["note"], format!("{first}{notes}"), "{what}");
+        assert_no_pump_state(&fake);
+    }
+    // local-child pipes the session as it does with no usable bridge.toml: the local pump's child, never P0.
+    let fake = FakeClaude::new();
+    fake.with_bridge_toml(&broken(remote_toml(fake.tmp())));
+    let first = load_error_line(&fake);
+    let out = fake.run_in(fake.tmp(), &STREAM_JSON, &[("AI_ENV_BRIDGE_MODE", "local-child")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let piped: Vec<String> = STREAM_JSON.iter().map(|a| (*a).to_string()).chain(["--session-mirror".to_string()]).collect();
+    assert_eq!(fake.logged(), piped, "the local child, --add-dir kept, one --session-mirror");
+    let rows = fake.census();
+    assert_eq!(rows.len(), 2, "a start row and the pump's end row: {rows:?}");
+    assert_eq!((rows[0]["route"].as_str(), rows[0]["reason"].as_str()), (Some("local"), Some("unconfigured")), "{}", rows[0]);
+    assert_eq!(rows[0]["note"], format!("{first}; mode:local-child"));
+    assert_eq!(rows[1]["exit"], 0, "{}", rows[1]);
+    let audit = std::fs::read_to_string(fake.bridge_dir().join("audit.jsonl")).unwrap_or_default();
+    assert!(!audit.contains("session_remote_failed"), "no remote session: {audit}");
+}
+
 // ---- S7: local-scratch with the sealed setup-token; the synthetic-oauth knob ----------------
 
 /// S7 (W7) through the real wrapper and the pump harness of `tests/common`,
@@ -798,8 +1126,16 @@ fn unset_mode_session_still_execs() {
 /// the run as it is. The signal tests set the disposition a wrapper inherits
 /// around its spawn (serialized, then put back): the only process-wide state
 /// this file touches.
+///
+/// S8 (plans/s8-design-tests.md §2.2): the four synthetic-oauth tests of a
+/// `local-child` run on both links (`on_links!`). The `local-scratch`
+/// credential tests stay local: a remote session's token is its pipeline's,
+/// one Touch ID per process (D1), `tests/remote_pump.rs`'s
+/// `the_vm_argv_has_session_mirror_and_no_add_dir_or_debug_and_one_touch_id`
+/// and `a_resume_miss_retries_on_the_same_vm_with_its_transcript_and_no_second_touch_id`.
 mod s7 {
     use super::common::{env_log_field, is_init, is_response_to, is_result_for, note_has, uuid, Harness, Prepared};
+    use crate::on_links;
     use ai_env_cli::bridge::pump::{INITIALIZE_WINDOW, SYNTHETIC_OAUTH_KNOB, UNSEAL_TIMEOUT_KNOB};
     use serde_json::Value;
     use sha2::Digest as _;
@@ -1750,110 +2086,135 @@ mod s7 {
         v["type"] == "control_request" && v["request"]["subtype"] == "oauth_token_refresh"
     }
 
-    /// With the lab knob the pump sends the extension one `oauth_token_refresh`
-    /// right after the `initialize` response, and the end row records the
-    /// class of the answer — the stock extension's error text, a null or
-    /// missing token, or a token by its length only — while the answer itself
-    /// never reaches the child.
-    #[test]
-    fn synthetic_oauth_records_the_answer_class_and_never_forwards_it() {
-        let t = token("Syn3");
-        let secret = random_part(&t);
-        let cases: [(String, String); 4] = [
-            (r#""subtype":"error","error":"getOAuthToken callback is not provided.""#.into(), "error(getOAuthToken callback is not provided.)".into()),
-            (r#""subtype":"success","response":{"accessToken":null}"#.into(), "null".into()),
-            (r#""subtype":"success","response":{}"#.into(), "absent".into()),
-            (format!(r#""subtype":"success","response":{{"accessToken":"{t}"}}"#), format!("token(len={})", t.len())),
-        ];
-        for (inner, want) in cases {
-            let mut h = Harness::spawn("local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "30000")]);
-            let init = send_init(&mut h, secret);
-            let req = await_frame(&mut h, is_synthetic_request, T, secret);
-            let id = req["request_id"].as_str().expect("a request id").to_string();
-            let out = h.out_json();
-            let at_response = out.iter().position(|v| is_response_to(v, &init)).expect("the initialize response");
-            let at_request = out.iter().position(is_synthetic_request).unwrap();
-            assert!(at_response < at_request, "sent once the session is initialized");
-            send_line(&mut h, &answer(&id, &inner), secret);
-            let u = send_turn(&mut h, "after the synthetic answer", secret);
-            await_frame(&mut h, |v| is_result_for(v, &u), T, secret);
-            h.close_stdin();
-            let status = await_exit(&mut h, EXIT, secret);
-            assert!(status.code() == Some(0), "exit {:?}\n{}", status.code(), masked(&h, secret));
-            assert_eq!(h.out_matching(is_synthetic_request).len(), 1, "one synthetic request");
-            assert!(h.stdin_of(1).iter().all(|l| !l.contains(&id)), "the answer reached the child: {want}");
-            assert_end_note(&h, &format!("synthetic_oauth:{want}"), secret);
-            let rows = h.audit_events("synthetic_oauth");
-            assert!(rows.len() == 1, "{}", mask(&format!("{:#?}", h.audit_rows()), secret));
-            assert_audit(&h, "synthetic_oauth", "class", &want, secret);
-            assert_nowhere(&mut h, secret);
+    on_links!(
+        /// With the lab knob the pump sends the extension one `oauth_token_refresh`
+        /// right after the `initialize` response, and the end row records the
+        /// class of the answer — the stock extension's error text, a null or
+        /// missing token, or a token by its length only — while the answer itself
+        /// never reaches the child (on the remote link the VM's CLI, nor any
+        /// file of the rig: the VM's disk included).
+        synthetic_oauth_records_the_answer_class_and_never_forwards_it,
+        |link| {
+            let t = token("Syn3");
+            let secret = random_part(&t);
+            let cases: [(String, String); 4] = [
+                (r#""subtype":"error","error":"getOAuthToken callback is not provided.""#.into(), "error(getOAuthToken callback is not provided.)".into()),
+                (r#""subtype":"success","response":{"accessToken":null}"#.into(), "null".into()),
+                (r#""subtype":"success","response":{}"#.into(), "absent".into()),
+                (format!(r#""subtype":"success","response":{{"accessToken":"{t}"}}"#), format!("token(len={})", t.len())),
+            ];
+            for (inner, want) in cases {
+                let mut h = Harness::spawn_on(link, "local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "30000")]);
+                let init = send_init(&mut h, secret);
+                let req = await_frame(&mut h, is_synthetic_request, T, secret);
+                let id = req["request_id"].as_str().expect("a request id").to_string();
+                let out = h.out_json();
+                let at_response = out.iter().position(|v| is_response_to(v, &init)).expect("the initialize response");
+                let at_request = out.iter().position(is_synthetic_request).unwrap();
+                assert!(at_response < at_request, "sent once the session is initialized");
+                send_line(&mut h, &answer(&id, &inner), secret);
+                let u = send_turn(&mut h, "after the synthetic answer", secret);
+                await_frame(&mut h, |v| is_result_for(v, &u), T, secret);
+                h.close_stdin();
+                let status = await_exit(&mut h, EXIT, secret);
+                assert!(status.code() == Some(0), "exit {:?}\n{}", status.code(), masked(&h, secret));
+                assert_eq!(h.out_matching(is_synthetic_request).len(), 1, "one synthetic request");
+                assert!(h.stdin_of(1).iter().all(|l| !l.contains(&id)), "the answer reached the child: {want}");
+                assert_end_note(&h, &format!("synthetic_oauth:{want}"), secret);
+                let rows = h.audit_events("synthetic_oauth");
+                assert!(rows.len() == 1, "{}", mask(&format!("{:#?}", h.audit_rows()), secret));
+                assert_audit(&h, "synthetic_oauth", "class", &want, secret);
+                h.assert_remote_end(link);
+                assert_nowhere(&mut h, secret);
+            }
         }
-    }
+    );
 
-    /// No answer within the wait is `none`, and an answer that comes later is
-    /// still the pump's own: dropped, never forwarded to the child, the class
-    /// unchanged.
-    #[test]
-    fn synthetic_oauth_without_an_answer_in_time_is_none_and_a_late_one_is_dropped() {
-        let mut h = Harness::spawn("local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "300")]);
-        h.send_initialize();
-        let req = h.expect_out(is_synthetic_request, T);
-        let id = req["request_id"].as_str().expect("a request id").to_string();
-        h.wait_until("the synthetic wait ran out", T, |h| !h.audit_events("synthetic_oauth").is_empty());
-        assert_eq!(h.audit_events("synthetic_oauth")[0]["detail"]["class"], "none");
-        h.send(&answer(&id, r#""subtype":"error","error":"late""#));
-        let u = h.send_user("after the late answer");
-        h.expect_out(|v| is_result_for(v, &u), T);
-        h.close_stdin();
-        let (status, _) = h.wait(EXIT);
-        assert_eq!(status.code(), Some(0), "{}", h.transcript());
-        assert!(h.stdin_of(1).iter().all(|l| !l.contains(&id)), "the late answer reached the child");
-        assert!(note_has(&h.end_note(), "synthetic_oauth:none"), "{}", h.end_note());
-        assert_eq!(h.audit_events("synthetic_oauth").len(), 1, "the late answer changes nothing");
-    }
+    on_links!(
+        /// No answer within the wait is `none`, and an answer that comes later is
+        /// still the pump's own: dropped, never forwarded to the child, the class
+        /// unchanged.
+        synthetic_oauth_without_an_answer_in_time_is_none_and_a_late_one_is_dropped,
+        |link| {
+            let mut h = Harness::spawn_on(link, "local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "300")]);
+            h.send_initialize();
+            let req = h.expect_out(is_synthetic_request, T);
+            let id = req["request_id"].as_str().expect("a request id").to_string();
+            h.wait_until("the synthetic wait ran out", T, |h| !h.audit_events("synthetic_oauth").is_empty());
+            assert_eq!(h.audit_events("synthetic_oauth")[0]["detail"]["class"], "none");
+            h.send(&answer(&id, r#""subtype":"error","error":"late""#));
+            let u = h.send_user("after the late answer");
+            h.expect_out(|v| is_result_for(v, &u), T);
+            h.close_stdin();
+            let (status, _) = h.wait(EXIT);
+            assert_eq!(status.code(), Some(0), "{}", h.transcript());
+            assert!(h.stdin_of(1).iter().all(|l| !l.contains(&id)), "the late answer reached the child");
+            assert!(note_has(&h.end_note(), "synthetic_oauth:none"), "{}", h.end_note());
+            assert_eq!(h.audit_events("synthetic_oauth").len(), 1, "the late answer changes nothing");
+            h.assert_remote_end(link);
+        }
+    );
 
-    /// Plan step B11 offline: a piped session with the knob, answered as the
-    /// stock extension answers, then `ai-env wrapper census --record-probes`
-    /// on that census: `stock-ext-oauth` keeps its verdict from the env names
-    /// and carries the answer in its note, printed and recorded.
-    #[test]
-    fn record_probes_puts_the_stock_extensions_answer_in_the_stock_ext_oauth_note() {
-        let mut h = Harness::spawn("local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "30000"), ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")]);
-        h.send_initialize();
-        let req = h.expect_out(is_synthetic_request, T);
-        let id = req["request_id"].as_str().expect("a request id").to_string();
-        h.send(&answer(&id, r#""subtype":"error","error":"getOAuthToken callback is not provided.""#));
-        let u = h.send_user("one turn");
-        h.expect_out(|v| is_result_for(v, &u), T);
-        h.close_stdin();
-        let (status, _) = h.wait(EXIT);
-        assert_eq!(status.code(), Some(0), "{}", h.transcript());
-        let out = Command::new(env!("CARGO_BIN_EXE_ai-env"))
-            .args(["wrapper", "census", "--record-probes"])
-            .env("HOME", h.root())
-            .env("AI_ENV_BRIDGE_DIR", h.bridge())
-            .env_remove("AI_ENV_BRIDGE_CONFIG")
-            .output()
-            .expect("spawn ai-env");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.status.code(), Some(0), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
-        let note = "the extension answered the synthetic oauth_token_refresh with error(getOAuthToken callback is not provided.)";
-        assert!(stdout.contains(&format!("recorded stock-ext-oauth=absent (expected absent)\n  {note}\n")), "{stdout}");
-        let probes = std::fs::read_to_string(h.bridge().join("lab").join("probes.jsonl")).expect("the probes were recorded");
-        let row: Value = probes.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).rfind(|r| r["probe"] == "stock-ext-oauth").expect("a stock-ext-oauth row");
-        assert_eq!((row["verdict"].as_str(), row["note"].as_str()), (Some("absent"), Some(note)));
-    }
+    on_links!(
+        /// Plan step B11 offline: a piped session with the knob, answered as the
+        /// stock extension answers, then `ai-env wrapper census --record-probes`
+        /// on that census: `stock-ext-oauth` keeps its verdict from the env names
+        /// and carries the answer in its note, printed and recorded (on the
+        /// remote link from a census that holds the remote session's rows: its
+        /// end row is a cold start and no warm row exists, so S8's `init-wrapper`
+        /// is recorded as `gap:warm`, the one verdict that differs: exit 1 after
+        /// writing).
+        record_probes_puts_the_stock_extensions_answer_in_the_stock_ext_oauth_note,
+        |link| {
+            let mut h = Harness::spawn_on(link, "local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "30000"), ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")]);
+            h.send_initialize();
+            let req = h.expect_out(is_synthetic_request, T);
+            let id = req["request_id"].as_str().expect("a request id").to_string();
+            h.send(&answer(&id, r#""subtype":"error","error":"getOAuthToken callback is not provided.""#));
+            let u = h.send_user("one turn");
+            h.expect_out(|v| is_result_for(v, &u), T);
+            h.close_stdin();
+            let (status, _) = h.wait(EXIT);
+            assert_eq!(status.code(), Some(0), "{}", h.transcript());
+            let out = Command::new(env!("CARGO_BIN_EXE_ai-env"))
+                .args(["wrapper", "census", "--record-probes"])
+                .env("HOME", h.root())
+                .env("AI_ENV_BRIDGE_DIR", h.bridge())
+                .env_remove("AI_ENV_BRIDGE_CONFIG")
+                .output()
+                .expect("spawn ai-env");
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            if link.is_remote() {
+                let gap = "init-wrapper=gap:warm (expected within-budget)";
+                assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+                assert!(stdout.contains(&format!("recorded {gap}\n")), "{stdout}");
+                assert!(stderr.lines().any(|l| l.ends_with(&format!("probe verdict differs from the expectation: {gap}"))), "only init-wrapper differs: {stderr}");
+            } else {
+                assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+            }
+            let note = "the extension answered the synthetic oauth_token_refresh with error(getOAuthToken callback is not provided.)";
+            assert!(stdout.contains(&format!("recorded stock-ext-oauth=absent (expected absent)\n  {note}\n")), "{stdout}");
+            let probes = std::fs::read_to_string(h.bridge().join("lab").join("probes.jsonl")).expect("the probes were recorded");
+            let row: Value = probes.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).rfind(|r| r["probe"] == "stock-ext-oauth").expect("a stock-ext-oauth row");
+            assert_eq!((row["verdict"].as_str(), row["note"].as_str()), (Some("absent"), Some(note)));
+            h.assert_remote_end(link);
+        }
+    );
 
-    /// A session that never initializes sends nothing: `unsent`.
-    #[test]
-    fn synthetic_oauth_is_unsent_before_the_session_is_initialized() {
-        let mut h = Harness::spawn("local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "300")]);
-        h.close_stdin();
-        let (status, _) = h.wait(EXIT);
-        assert_eq!(status.code(), Some(0), "{}", h.transcript());
-        assert!(h.out_matching(is_synthetic_request).is_empty());
-        assert!(note_has(&h.end_note(), "synthetic_oauth:unsent"), "{}", h.end_note());
-    }
+    on_links!(
+        /// A session that never initializes sends nothing: `unsent` (on the
+        /// remote link the host's EOF cancels the pending start).
+        synthetic_oauth_is_unsent_before_the_session_is_initialized,
+        |link| {
+            let mut h = Harness::spawn_on(link, "local-child", &[], &[(SYNTHETIC_OAUTH_KNOB, "300")]);
+            h.close_stdin();
+            let (status, _) = h.wait(EXIT);
+            assert_eq!(status.code(), Some(0), "{}", h.transcript());
+            assert!(h.out_matching(is_synthetic_request).is_empty());
+            assert!(note_has(&h.end_note(), "synthetic_oauth:unsent"), "{}", h.end_note());
+            h.assert_remote_end(link);
+        }
+    );
 
     /// F25: a resumed chat that its seed retry initialized — generation 1
     /// reports the resume miss before it answers `initialize`, as the CLI
@@ -1896,5 +2257,49 @@ mod s7 {
             }
             assert!(note_has(&h.end_note(), "synthetic_oauth:error(getOAuthToken callback is not provided.)"), "after_ack {after_ack}: {}", h.end_note());
         }
+    }
+
+    // -- S8 W1 in a local mode: the initialize answer's pid, the drop-transport signal -----------
+
+    /// S8 L9 in every piped mode: a local child's answer to the host's
+    /// `initialize` reaches the host with the wrapper's pid (the process the
+    /// extension spawned), never the CLI's; the end row says it was rewritten.
+    #[test]
+    fn a_local_child_answers_initialize_with_the_wrappers_pid() {
+        let mut h = Harness::spawn("local-child", &[], &[]);
+        let init = h.send_initialize();
+        let answer = h.expect_out(|v| is_response_to(v, &init), T);
+        let cli = h.fake_pid(1).expect("the CLI's pid");
+        assert_ne!(cli, h.pid());
+        assert_eq!(answer["response"]["response"]["pid"].as_u64(), Some(u64::from(h.pid())), "{answer}");
+        h.close_stdin();
+        let (status, _) = h.wait(EXIT);
+        assert_eq!(status.code(), Some(0), "{}", h.transcript());
+        assert!(note_has(&h.end_note(), "pid_rewrite:ok"), "{}", h.end_note());
+    }
+
+    /// `session drop-transport`'s signal (`registry::DROP_TRANSPORT_SIGNAL`)
+    /// is answered in every piped mode: a local child's wrapper, started with
+    /// the signal at its default (which would end it), takes one mid-session,
+    /// leaves its child alone, goes on, and exits 0 at the host's EOF.
+    #[test]
+    fn a_local_child_wrapper_outlives_the_drop_transport_signal() {
+        use ai_env_cli::bridge::registry::DROP_TRANSPORT_SIGNAL;
+        let mut h = {
+            let _serial = DISPOSITIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _set = Disposition::set(DROP_TRANSPORT_SIGNAL, libc::SIG_DFL);
+            Harness::prepare().spawn("local-child", &[], &[])
+        };
+        let init = h.send_initialize();
+        h.expect_out(|v| is_response_to(v, &init), T);
+        signal(&h, DROP_TRANSPORT_SIGNAL);
+        let u = h.send_user("after the drop-transport signal");
+        h.expect_out(|v| is_result_for(v, &u), T);
+        assert!(!h.exited_now(), "the signal ended the wrapper\n{}", h.transcript());
+        h.close_stdin();
+        let (status, _) = h.wait(EXIT);
+        assert_eq!(status.code(), Some(0), "{}", h.transcript());
+        assert_eq!(h.spawn_count(), 1, "the local child was left alone");
+        assert!(h.wrapper_log().contains("drop-transport signal"), "{}", h.wrapper_log());
     }
 }

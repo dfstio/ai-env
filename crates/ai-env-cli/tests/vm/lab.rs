@@ -20,7 +20,13 @@
 //! judged, and OPEN. S6: the agent-transport probes refuse under the fake
 //! and end their VMs; a Ctrl-C during a live probe still ends every VM it
 //! started (exit 3, nothing recorded), SIGTERM and SIGHUP too (exit 143), and
-//! a SIGINT ignored when `lab run` started stays ignored.
+//! a SIGINT ignored when `lab run` started stays ignored. S8: the four
+//! probes in `lab list`; the dup probes recorded only with the census
+//! evidence of a remote resume; fresh-claude-json refused outside a git
+//! workspace under the roots, and run end to end on the emulated platform
+//! (the remote rig of `tests/common/remote.rs`: the fake API, the routed
+//! endpoint, the in-process shim and its real helper, the fake claude as the
+//! VM's; the shim feature only).
 use super::cli::{code, stderr, stdout, World};
 use crate::common::CONNECTOR;
 use ai_env_cli::bridge::api::{Call, FakeFailure};
@@ -30,6 +36,15 @@ use ai_env_cli::bridge::infra::InfraState;
 use ai_env_cli::wire::time::unix_now;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// S8's shared harness: the remote rig, which fresh-claude-json's offline
+/// run takes for the platform. It brings its own copy of the fake endpoint
+/// (`tests/vm.rs` loads that file for the S6 tests too): the two copies'
+/// types never meet.
+#[cfg(feature = "shim")]
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/mod.rs"]
+mod rig;
 
 fn fixture(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("s4").join(name).display().to_string()
@@ -497,6 +512,302 @@ fn lab_unknown_probe_exit_2_and_s1_s3_probes_point_to_their_command() {
     let o = w.run(&["lab", "run", "setup-token-prefix"]);
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("recorded by: ai-env creds setup-token"), "{}", stderr(&o));
+    // S8: init-wrapper comes from the census, the dup probes from what Cursor showed (by hand only).
+    let o = w.run(&["lab", "run", "init-wrapper"]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("recorded by: ai-env wrapper census --record-probes"), "{}", stderr(&o));
+    for probe in ["dup-init", "dup-user-replay"] {
+        let o = w.run(&["lab", "run", probe]);
+        assert_eq!(code(&o), 2, "{probe}");
+        assert!(stderr(&o).contains(&format!("recorded by: ai-env lab run {probe} --manual VERDICT")), "{probe}: {}", stderr(&o));
+    }
+    assert_eq!(w.state().calls.len(), 0, "refused before any call");
+}
+
+/// `lab list` shows the four S8 probes with their source, recorder and exact
+/// expectation, nothing recorded yet. fresh-claude-json seeds the current
+/// directory's workspace into its VM, so it resolves that first, before any
+/// call or Touch ID: outside the roots, or a root that is no git repository,
+/// it refuses (exit 9) naming the probe, and nothing is recorded.
+#[test]
+fn lab_list_shows_the_four_s8_probes_and_fresh_claude_json_needs_a_git_workspace_under_the_roots() {
+    let w = World::new("");
+    let o = w.run(&["lab", "list", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let listed = list.as_array().unwrap();
+    for (name, source, expected, recorder) in [
+        ("dup-init", "cursor", "no-duplicate", "ai-env lab run dup-init --manual VERDICT (after a resume in Cursor)"),
+        ("dup-user-replay", "cursor", "no-duplicate", "ai-env lab run dup-user-replay --manual VERDICT (after a resume in Cursor)"),
+        ("fresh-claude-json", "live", "no-stall", "ai-env lab run fresh-claude-json"),
+        ("init-wrapper", "census", "within-budget", "ai-env wrapper census --record-probes"),
+    ] {
+        let r = listed.iter().find(|r| r["probe"] == name).unwrap_or_else(|| panic!("{name} missing from lab list"));
+        assert_eq!((r["stage"].as_str(), r["source"].as_str(), r["expected"].as_str(), r["recorded_by"].as_str()), (Some("S8"), Some(source), Some(expected), Some(recorder)), "{name}: {r}");
+        assert!(r["last_verdict"].is_null(), "{name}: nothing recorded yet");
+    }
+    assert_eq!(listed.iter().filter(|r| r["stage"] == "S8").count(), 4, "exactly four S8 probes");
+    let says = "lab run fresh-claude-json seeds the current directory's workspace into its fresh VM, as a session's is: ";
+    let outside = w.cmd(&["lab", "run", "fresh-claude-json"]).current_dir(w.root().join("outside")).output().unwrap();
+    assert_eq!(code(&outside), 9, "{}", stderr(&outside));
+    assert!(stderr(&outside).contains(says) && stderr(&outside).contains("is outside [workspaces].roots"), "{}", stderr(&outside));
+    let no_git = w.cmd(&["lab", "run", "fresh-claude-json"]).current_dir(w.ws()).output().unwrap();
+    assert_eq!(code(&no_git), 9, "{}", stderr(&no_git));
+    let ws = fs::canonicalize(w.ws()).unwrap();
+    assert!(stderr(&no_git).contains(&format!("{says}{} is no git repository; run it from a git workspace under the roots", ws.display())), "{}", stderr(&no_git));
+    for o in [&outside, &no_git] {
+        assert!(!stderr(o).contains("not built"), "{}", stderr(o));
+    }
+    assert!(rows(&w, "fresh-claude-json").is_empty(), "nothing recorded");
+    assert_eq!(w.state().calls.len(), 0, "refused before any call");
+}
+
+/// A session id of the picker's shape, built at run time.
+fn session_id(n: u32) -> String {
+    format!("{n:08x}-0000-4000-8000-{:012x}", u64::from(n) << 16)
+}
+
+/// `logs/census.jsonl` of `w` holding these rows, one JSON line each.
+fn plant_census(w: &World, rows: &[serde_json::Value]) {
+    let logs = w.bridge().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(logs.join("census.jsonl"), rows.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+}
+
+/// A remote session's census rows: its start row (Cursor's argv with
+/// `--resume=SID`), and its end row with `tail` after the start row's note.
+fn remote_resume(pid: u32, sid: &str, tail: &str) -> [serde_json::Value; 2] {
+    let start = serde_json::json!({
+        "v": 1, "ts": "2026-10-13T09:30:00Z", "start": 1_791_000_000_000u64 + u64::from(pid), "pid": pid, "ppid": 700, "ext": "2.1.296", "route": "remote", "reason": "session",
+        "argv": ["/Users/mike/.cargo/bin/ai-env-claude", "/Users/mike/.cursor/extensions/anthropic.claude-code-2.1.296-darwin-arm64/resources/native-binary/claude", "--output-format", "stream-json", format!("--resume={sid}")],
+        "cwd": "/Users/mike/Documents/DeFi/ai-env", "env_names": ["HOME"], "env_selected": {}, "note": "mode:remote(config)",
+    });
+    let mut end = start.clone();
+    end["end"] = serde_json::json!(1_791_000_009_000u64 + u64::from(pid));
+    end["exit"] = serde_json::json!(0);
+    end["note"] = serde_json::json!(format!("mode:remote(config); {tail}"));
+    [start, end]
+}
+
+/// The dup probes (S8 T8.5) record what Cursor showed only with the census
+/// evidence of a remote resume into a VM without its transcript, which the
+/// row's note carries (the operator's note after it); without it (a resume
+/// on the VM that held the transcript, or one whose upload came before a
+/// spawn that failed) nothing is recorded (exit 1, naming the evidence),
+/// and a verdict that is neither no-duplicate nor duplicate:<what> is
+/// refused first (exit 2). A recorded duplicate fails the command after it
+/// is written. No AWS call.
+#[test]
+fn lab_dup_probes_need_the_census_evidence_of_a_remote_resume() {
+    let w = World::new("");
+    let o = w.run(&["lab", "run", "dup-init", "--manual", "no-duplicate"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("dup-init: no remote resume in the census; the dup probes need a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, or respawns:1 or more)"), "{}", stderr(&o));
+    assert!(stderr(&o).trim_end().ends_with("; nothing recorded"), "{}", stderr(&o));
+    for bad in ["ok", "duplicate:"] {
+        let o = w.run(&["lab", "run", "dup-user-replay", "--manual", bad]);
+        assert_eq!(code(&o), 2, "{bad}: {}", stderr(&o));
+        assert!(stderr(&o).contains("dup-user-replay: the verdict is no-duplicate, or duplicate:<what Cursor showed twice>"), "{bad}: {}", stderr(&o));
+    }
+    let sid = session_id(0x5a1);
+    // The same-VM resume of T8.4 is no evidence: its VM held the transcript.
+    let held = remote_resume(4100, &sid, "end:eof; child_pid:-; respawns:0; init_ms:2900; vm:microvm-a; vm_how:reused; transcript:already_there");
+    plant_census(&w, &held);
+    let o = w.run(&["lab", "run", "dup-init", "--manual", "no-duplicate"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("the newest remote resume (session {sid}, started 2026-10-13T09:30:00Z) found its VM holding the transcript (transcript:already_there, respawns:0)")), "{}", stderr(&o));
+    // A reopen whose transcript went up before its spawn failed never answered initialize: Cursor showed nothing.
+    let mut census = held.to_vec();
+    let mut failed = remote_resume(4150, &sid, "end:spawn_failed; child_pid:-; respawns:0; vm:microvm-b; vm_how:started; transcript:uploaded");
+    failed[1]["exit"] = serde_json::json!(8);
+    census.extend(failed);
+    plant_census(&w, &census);
+    let o = w.run(&["lab", "run", "dup-init", "--manual", "no-duplicate"]);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("the newest remote resume (session {sid}, started 2026-10-13T09:30:00Z) never answered initialize (end:spawn_failed, exit 8)")), "{}", stderr(&o));
+    assert!(rows(&w, "dup-init").is_empty(), "nothing recorded");
+    // T8.5: the reopen into a new VM, its transcript uploaded before the spawn.
+    census.extend(remote_resume(4200, &sid, "end:eof; child_pid:-; respawns:0; init_ms:9100; vm:microvm-b; vm_how:started; transcript:uploaded"));
+    plant_census(&w, &census);
+    let o = w.run(&["lab", "run", "dup-init", "--manual", "no-duplicate", "--note", "one init after the reopen"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let row = rows(&w, "dup-init").pop().unwrap();
+    assert_eq!((row["verdict"].as_str(), row["stage"].as_str(), row["expected"].as_str()), (Some("no-duplicate"), Some("S8"), Some("no-duplicate")));
+    let evidence = format!("census: session {sid} resumed in remote mode at 2026-10-13T09:30:00Z (wrapper pid 4200) on microvm-b (vm_how:started): transcript:uploaded, respawns:0, init_ms:9100, end:eof, exit 0");
+    assert_eq!(row["note"].as_str(), Some(format!("{evidence}; one init after the reopen").as_str()));
+    let o = w.run(&["lab", "run", "dup-user-replay", "--manual", "duplicate:the replayed message shown twice"]);
+    assert_eq!(code(&o), 1, "recorded, then the verdict misses its expectation: {}", stderr(&o));
+    assert!(stderr(&o).contains("probe verdict differs from the expectation: dup-user-replay=duplicate:the replayed message shown twice (expected no-duplicate)"), "{}", stderr(&o));
+    let row = rows(&w, "dup-user-replay").pop().unwrap();
+    assert_eq!((row["verdict"].as_str(), row["note"].as_str()), (Some("duplicate:the replayed message shown twice"), Some(evidence.as_str())));
+    assert_eq!(w.state().calls.len(), 0, "no AWS call");
+}
+
+/// The probe rows `rig`'s `lab run` recorded for `probe`.
+#[cfg(feature = "shim")]
+fn rig_rows(rig: &rig::remote::RemoteRig, probe: &str) -> Vec<serde_json::Value> {
+    let text = fs::read_to_string(rig.bridge().join("lab").join("probes.jsonl")).unwrap_or_default();
+    text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["probe"] == probe).collect()
+}
+
+/// A new remote rig in `root` for one run of fresh-claude-json (the VM's
+/// terminate puts the rig's one shim into its drain), the VM's fake claude
+/// with `knobs`, its token's arrival logged (`token.log`) and the names of
+/// the environment it was started with (`env-names.log`).
+#[cfg(feature = "shim")]
+fn fresh_rig(root: &Path, knobs: &[(&str, &str)]) -> rig::remote::RemoteRig {
+    let rig = rig::remote::RemoteRig::new(root);
+    let (token_log, names_log) = (root.join("token.log").display().to_string(), root.join("env-names.log").display().to_string());
+    let mut vm = vec![("FAKE_TOKEN_LOG", token_log.as_str()), ("FAKE_ENV_NAMES_LOG", names_log.as_str())];
+    vm.extend_from_slice(knobs);
+    rig.set_vm_knobs(&vm);
+    rig
+}
+
+/// `ai-env lab run fresh-claude-json` from `rig`'s workspace, to its end (bounded).
+#[cfg(feature = "shim")]
+fn run_fresh(rig: &rig::remote::RemoteRig) -> std::process::Output {
+    let mut cmd = rig.ai_env(&["lab", "run", "fresh-claude-json"]);
+    cmd.current_dir(rig.work()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    finished(cmd.spawn().expect("spawn ai-env"))
+}
+
+/// S8 T8.7 offline (L7): `ai-env lab run fresh-claude-json` on the emulated
+/// platform, from the rig's workspace. It starts a vpc VM of its own (label
+/// `probe:fresh-claude-json`), seeds the workspace into it (the clone at the
+/// identical VM path, HEAD the Mac's), reads the project's keys of the
+/// agent's `.claude.json` (none: fresh), delivers the token on fd 3 and
+/// starts the VM's claude as Cursor starts a chat's (the extension's argv
+/// sanitised: no debug flag, `--session-mirror` last; the session's
+/// environment with the extension's entrypoint, and the proxy variables) in
+/// that path: `initialize`, then one turn. The fake answers both: no-stall,
+/// one Touch ID (combined.env), the VM terminated. With `FAKE_ONBOARDING` it
+/// answers nothing: stall:initialize after Cursor's window (6 s under the
+/// rig's backoff), its stderr line in the note, the command failing after
+/// the row is written, its VM terminated too. The token is in neither
+/// output. With `FAKE_EXIT_AFTER_INIT` it answers `initialize` and ends
+/// before the turn's result: stall:turn, its exit named; there the agent's
+/// `.claude.json` holds the project's entry, whose keys the note names
+/// before and after. Last, `[wrapper].env_extra` naming an AWS variable
+/// refuses the probe before any Touch ID (exit 9, no VM, nothing recorded).
+#[cfg(feature = "shim")]
+#[test]
+fn fresh_claude_json_runs_offline_on_the_emulated_platform() {
+    let cursor_args = [
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--permission-prompt-tool",
+        "stdio",
+        "--setting-sources=user,project,local",
+        "--permission-mode",
+        "default",
+        "--include-partial-messages",
+        "--enable-auth-status",
+        "--no-chrome",
+        "--replay-user-messages",
+        "--session-mirror",
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let rig = fresh_rig(&root.join("answers"), &[]);
+    let before = rig.decrypts();
+    let o = run_fresh(&rig);
+    let (out, err) = (stdout(&o), stderr(&o));
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(out.contains("recorded fresh-claude-json=no-stall (expected no-stall)"), "{out}");
+    let row = rig_rows(&rig, "fresh-claude-json").pop().expect("a fresh-claude-json row");
+    assert_eq!((row["verdict"].as_str(), row["stage"].as_str()), (Some("no-stall"), Some("S8")), "{row}");
+    assert!(row["claude"].as_str().is_some() && row["shim"].as_str().is_some(), "stamped with the VM's /health: {row}");
+    let note = row["note"].as_str().unwrap();
+    let vm_cwd = rig.vm_cwd();
+    let head = format!(": the seed of {vm_cwd}: seeded; projects[the path] in the agent's .claude.json before: none (fresh); claude as Cursor starts a chat (15 arguments, CLAUDE_CODE_ENTRYPOINT=claude-vscode): answered initialize in ");
+    assert!(note.contains(&head), "{note}");
+    assert!(note.contains(" ms; the turn's result in ") && note.ends_with(" ms (success); it asked its host: nothing; its first stderr line: none; projects[the path] after: none (fresh)"), "{note}");
+    let fake = rig.fake();
+    let vm = fake.vms.values().find(|v| note.starts_with(&format!("{}: ", v.id))).expect("the note names the probe's VM");
+    assert!(vm.state.is_terminal(), "the terminate guard ended {}", vm.id);
+    assert_eq!(fake.vms.len(), 1, "one VM");
+    let checkout = rig.vm_path(&rig.work());
+    let head_there = std::process::Command::new(rig::git_real()).args(["-C", &checkout.display().to_string(), "rev-parse", "HEAD"]).env_clear().env("PATH", "/usr/bin:/bin").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&head_there.stdout).trim(), rig.head(), "the workspace was cloned at its VM path, at the Mac's HEAD");
+    let argv = fs::read_to_string(root.join("answers").join("argv.log")).unwrap();
+    assert_eq!(argv.lines().collect::<Vec<_>>(), [&["--- gen 1"][..], &cursor_args[..]].concat(), "Cursor's argv as the wrapper sends it");
+    let stdin = fs::read_to_string(root.join("answers").join("stdin.log")).unwrap();
+    let asked: Vec<&str> = stdin.lines().filter_map(|l| l.strip_prefix("1\t")).collect();
+    assert_eq!(asked.len(), 2, "initialize, then the turn: {stdin}");
+    assert!(asked[0].contains("\"request_id\":\"fresh-claude-json-1\"") && asked[0].contains("\"subtype\":\"initialize\""), "{stdin}");
+    assert!(asked[1].starts_with("{\"type\":\"user\"") && asked[1].contains("Reply with exactly OK"), "{stdin}");
+    let token_log = fs::read_to_string(root.join("answers").join("token.log")).unwrap();
+    assert_eq!(token_log.trim(), format!("gen 1 source=fd len={} sha8={} fdvar=3 envvar=absent", rig.token().len(), &sha256_hex(rig.token())[..8]), "the token on fd 3 alone");
+    // What claude was started with: the session's environment (the extension's entrypoint, the wrapper's own names)
+    // and the proxy variables; nothing of AWS.
+    let started_with = fs::read_to_string(root.join("answers").join("env-names.log")).unwrap();
+    let (entrypoint, names) = started_with.trim().split_once(" names=").unwrap_or_else(|| panic!("one gen 1 line: {started_with}"));
+    assert_eq!(entrypoint, "gen 1 CLAUDE_CODE_ENTRYPOINT=claude-vscode", "{started_with}");
+    let names: Vec<&str> = names.split(',').collect();
+    for name in ["DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"] {
+        assert!(names.contains(&name), "{name} missing: {started_with}");
+    }
+    assert!(!names.iter().any(|n| n.starts_with("AWS_")), "{started_with}");
+    assert_eq!(rig.decrypts() - before, 1, "one Touch ID: the runtime key and the token from combined.env");
+    for text in [&out, &err] {
+        assert!(!text.contains(&rig.token()[13..]), "the token is in the output");
+    }
+    drop(rig);
+
+    let rig = fresh_rig(&root.join("onboarding"), &[("FAKE_ONBOARDING", "1")]);
+    let o = run_fresh(&rig);
+    let (out, err) = (stdout(&o), stderr(&o));
+    assert_eq!(code(&o), 1, "{out}\n{err}");
+    assert!(err.contains("probe verdict differs from the expectation: fresh-claude-json=stall:initialize (expected no-stall)"), "{err}");
+    let row = rig_rows(&rig, "fresh-claude-json").pop().expect("the stall is recorded");
+    assert_eq!(row["verdict"].as_str(), Some("stall:initialize"), "{row}");
+    let note = row["note"].as_str().unwrap();
+    assert!(note.contains("before: none (fresh); claude as Cursor starts a chat (15 arguments, CLAUDE_CODE_ENTRYPOINT=claude-vscode): no answer to initialize within 6 s (then claude exited 1); no turn sent; it asked its host: nothing; its first stderr line: fake claude: onboarding (FAKE_ONBOARDING): waiting for an answer on a terminal; nothing is answered; projects[the path] after: none (fresh)"), "{note}");
+    let stdin = fs::read_to_string(root.join("onboarding").join("stdin.log")).unwrap();
+    assert_eq!(stdin.lines().count(), 1, "the initialize alone: no turn after no answer: {stdin}");
+    assert!(rig.fake().vms.values().all(|v| v.state.is_terminal()), "the terminate guard ended the VM");
+    for text in [&out, &err] {
+        assert!(!text.contains(&rig.token()[13..]), "the token is in the output");
+    }
+    drop(rig);
+
+    // A claude that answers initialize, then ends before its first turn's result: stall:turn, naming its exit. The
+    // agent's .claude.json already holds the project's entry here: the note names its keys, before and after.
+    let rig = fresh_rig(&root.join("prompted"), &[("FAKE_EXIT_AFTER_INIT", "3:fake claude: a prompt nobody answers")]);
+    let config_dir = rig.vm_home().join(".claude");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join(".claude.json"), serde_json::json!({"projects": {rig.vm_cwd(): {"hasTrustDialogAccepted": false}}}).to_string()).unwrap();
+    let o = run_fresh(&rig);
+    assert_eq!(code(&o), 1, "{}\n{}", stdout(&o), stderr(&o));
+    let row = rig_rows(&rig, "fresh-claude-json").pop().expect("the stall is recorded");
+    let note = row["note"].as_str().unwrap();
+    assert_eq!(row["verdict"].as_str(), Some("stall:turn"), "{row}");
+    assert!(note.contains(" ms; claude exited 3 before the turn's result; it asked its host: nothing; its first stderr line: fake claude: a prompt nobody answers;"), "{note}");
+    assert!(note.contains("; projects[the path] in the agent's .claude.json before: hasTrustDialogAccepted=false; claude as Cursor starts a chat"), "{note}");
+    assert!(note.ends_with("; projects[the path] after: hasTrustDialogAccepted=false"), "{note}");
+    assert!(rig.fake().vms.values().all(|v| v.state.is_terminal()), "the terminate guard ended the VM");
+
+    // A configured name the session refuses refuses the probe before any Touch ID, as a session's P0 does: exit 9,
+    // no decrypt, no VM, nothing recorded.
+    let config = rig.bridge().join("bridge.toml");
+    let toml = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("{toml}\n[wrapper]\nenv_extra = [\"AWS_SECRET_ACCESS_KEY\"]\n")).unwrap();
+    let (decrypts, vms, recorded) = (rig.decrypts(), rig.fake().vms.len(), rig_rows(&rig, "fresh-claude-json").len());
+    let o = run_fresh(&rig);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("[wrapper].env_extra names AWS_SECRET_ACCESS_KEY: "), "{}", stderr(&o));
+    assert_eq!((rig.decrypts(), rig.fake().vms.len(), rig_rows(&rig, "fresh-claude-json").len()), (decrypts, vms, recorded), "no Touch ID, no VM, no row");
+}
+
+/// The lowercase hex sha256 of `s`.
+#[cfg(feature = "shim")]
+fn sha256_hex(s: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[test]
@@ -510,7 +821,7 @@ fn probe_rows_of_the_old_schema_parse_in_lab_list() {
     let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entry = list.as_array().unwrap().iter().find(|r| r["probe"] == "entrypoint").unwrap();
     assert_eq!(entry["last_verdict"], "claude-vscode");
-    assert_eq!(list.as_array().unwrap().len(), 26, "S1/S3 3, S4 9, S5 2, S6 7, S7 5");
+    assert_eq!(list.as_array().unwrap().len(), 30, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4");
 }
 
 #[test]

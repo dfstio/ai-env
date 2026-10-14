@@ -52,7 +52,7 @@ use crate::shim::peer::{drain, Peer, PeerFacts};
 pub use crate::shim::spawn::ConnGen;
 use crate::shim::spawn::{Outbox, SpawnRequest};
 use crate::wire::frame::{
-    ClientInfo, CredentialErrCode, ErrorCode, Frame, HelloErrCode, ResumePoint, SpawnErrCode, SpawnId, WireError, CAP_CREDENTIAL_CACHE, CLOSE_GOING_AWAY, CLOSE_HELLO_DEADLINE, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, CLOSE_WIRE_VERSION, CONTROL_FRAME_MAX, HELLO_DEADLINE, IDLE_DEFAULT_S,
+    ClientInfo, CredentialErrCode, ErrorCode, Frame, HelloErrCode, ResumePoint, SpawnErrCode, SpawnId, WireError, CLOSE_GOING_AWAY, CLOSE_HELLO_DEADLINE, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, CLOSE_WIRE_VERSION, CONTROL_FRAME_MAX, HELLO_DEADLINE, IDLE_DEFAULT_S,
     IDLE_MAX_S, IDLE_MIN_S, MAX_UNAUTHENTICATED, SEND_TIMEOUT, WIRE_VERSION, WS_MAX_MESSAGE,
 };
 use crate::wire::redact::Secret;
@@ -598,7 +598,7 @@ impl Session {
             run_hook_seen: h.run_hook_seen,
             spawns,
             resumed,
-            caps: vec![CAP_CREDENTIAL_CACHE.to_string()],
+            caps: self.state.caps(),
             credential: self.state.spawns.credential_view(),
         };
         self.state.agents.authenticate(gen);

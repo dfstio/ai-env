@@ -36,7 +36,7 @@ use crate::bridge::vm::registry::VmRow;
 use crate::wire::frame::{Deliver, Sig, SpawnId};
 use crate::wire::redact::Secret;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -158,6 +158,11 @@ pub struct SpawnSpec {
     pub cwd: Option<String>,
     pub env: BTreeMap<String, String>,
     pub detach_grace_s: Option<u32>,
+    /// The spawn's id when the caller names it (S8: a remote session knows
+    /// its spawn before `spawned`, for the registry row and an orphan's
+    /// detach); a fresh uuid v7 when `None`. A uuid v7 ([`SpawnId::new_v7`]):
+    /// the shim refuses any other.
+    pub id: Option<SpawnId>,
 }
 
 impl std::fmt::Debug for SpawnSpec {
@@ -208,6 +213,38 @@ pub struct Delivery {
     /// The value is registered with the scrubber ([`Delivery::keep_masked`])
     /// until it is dropped.
     masked: bool,
+    /// What the session did with it ([`Delivery::report`]).
+    report: DeliveryReport,
+}
+
+/// What became of a [`Delivery`] in its session (S8: the remote session's
+/// census word), shared with whoever took [`Delivery::report`]: the value
+/// went out (a `credential` frame), or the VM's cache held the seal when
+/// the spawn was offered it. Ids and flags only, never the value.
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryReport(Arc<AtomicU8>);
+
+impl DeliveryReport {
+    const SENT: u8 = 1;
+    const HELD: u8 = 2;
+
+    /// The VM's cache held the seal when the session offered the spawn the
+    /// credential, and the value never went out: the VM's own copy served
+    /// the CLI (`credential:cached` in the census).
+    #[must_use]
+    pub fn held_by_vm(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & (Self::SENT | Self::HELD) == Self::HELD
+    }
+
+    /// The value left in a `credential` frame (recorded before it leaves).
+    pub(crate) fn note_sent(&self) {
+        self.0.fetch_or(Self::SENT, Ordering::SeqCst);
+    }
+
+    /// The VM's cache held the seal: nothing sent.
+    pub(crate) fn note_held(&self) {
+        self.0.fetch_or(Self::HELD, Ordering::SeqCst);
+    }
 }
 
 impl Delivery {
@@ -218,7 +255,14 @@ impl Delivery {
         if parts.one_shot && parts.secret.is_none() {
             return Err(BridgeError::CredentialMissing("a one-spawn credential needs its value".into()));
         }
-        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false })
+        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false, report: DeliveryReport::default() })
+    }
+
+    /// What the session does with this delivery, to read after it took it
+    /// (S8: a remote session's census says `cached` when the VM held it).
+    #[must_use]
+    pub fn report(&self) -> DeliveryReport {
+        self.report.clone()
     }
 
     /// Keep the value masked by the scrubber until this delivery drops it
@@ -250,6 +294,16 @@ impl Delivery {
             )),
             _ => r.policy(&self.vm_id),
         })
+    }
+
+    /// Bind the delivery to `pass`, a later gate pass for the same VM that
+    /// stands at `now_unix` (else the gate's refusal, exit 9, and the old
+    /// pass kept): S8's re-gate without a prompt once the pass the delivery
+    /// was built on passed half its life (a slow seed beside it).
+    pub fn rebind(&mut self, pass: &GatePass, now_unix: u64) -> Result<(), BridgeError> {
+        pass.check(&self.vm_id, now_unix).map_err(|r| r.policy(&self.vm_id))?;
+        self.pass = pass.clone();
+        Ok(())
     }
 
     /// The delivery goes only to the VM its pass was minted for (exit 9),
@@ -349,7 +403,7 @@ impl std::fmt::Debug for Start {
 }
 
 /// Consumer → session. `Stdin` and `StdinEof` go on `input` (in order);
-/// `Signal` and `Detach` on `control`. `Debug` shows sizes, never the bytes.
+/// `Signal`, `Detach` and `DropSocket` on `control`. `Debug` shows sizes, never the bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SpawnInput {
     /// At most `CHUNK_MAX` bytes.
@@ -362,6 +416,11 @@ pub enum SpawnInput {
     /// while disconnected it returns that at once (the shim's detach grace
     /// then ends the spawn). One whose send failed goes out on the next socket.
     Detach { is_final: bool },
+    /// S8 `ai-env session drop-transport` (T8.6): the socket that carries the
+    /// spawn is closed from this side, a loss the session reattaches from by
+    /// its reconnect rules (`SpawnEvent::Link(false)`, then `Link(true)`).
+    /// Nothing while no socket carries the spawn.
+    DropSocket,
 }
 
 impl std::fmt::Debug for SpawnInput {
@@ -371,6 +430,7 @@ impl std::fmt::Debug for SpawnInput {
             SpawnInput::StdinEof => f.write_str("StdinEof"),
             SpawnInput::Signal(sig) => write!(f, "Signal({sig:?})"),
             SpawnInput::Detach { is_final } => write!(f, "Detach(final={is_final})"),
+            SpawnInput::DropSocket => f.write_str("DropSocket"),
         }
     }
 }
@@ -591,6 +651,23 @@ mod tests {
         assert!(!masked(&plain), "nothing kept, nothing registered");
     }
 
+    /// S8 P3b: a delivery is bound again only to a pass that stands for its
+    /// own VM; a refused one leaves it on the pass it had.
+    #[test]
+    fn a_delivery_rebinds_to_a_later_pass_of_its_own_vm_only() {
+        let now = 1_790_000_000;
+        let parts = || DeliveryParts { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), tag: "seal".into(), deliver: Deliver::Fd, secret: None, one_shot: false };
+        let mut d = Delivery::new(&GatePass::for_tests("microvm-1", now - 60), "microvm-1", now, parts()).unwrap();
+        assert_eq!(d.pass.at_unix(), now - 60);
+        d.rebind(&GatePass::for_tests("microvm-1", now), now).unwrap();
+        assert_eq!(d.pass.at_unix(), now, "the new pass");
+        let other = d.rebind(&GatePass::for_tests("microvm-2", now), now).unwrap_err();
+        assert_eq!(crate::errors::CliError::from(other).exit_code(), 9);
+        let stale = GatePass::for_tests("microvm-1", now - crate::bridge::egress::GATE_PASS_MAX_AGE_S - 1);
+        assert!(d.rebind(&stale, now).is_err(), "a pass too old");
+        assert_eq!(d.pass.at_unix(), now, "kept on the pass it had");
+    }
+
     #[test]
     fn consumed_keeps_the_highest_seq() {
         let c = Consumed::default();
@@ -607,6 +684,7 @@ mod tests {
             cwd: Some("/home/agent/work".into()),
             env: BTreeMap::from([("LANG".to_string(), "private-env-value".to_string())]),
             detach_grace_s: Some(30),
+            id: None,
         };
         let shown = [
             format!("{spec:?}"),
