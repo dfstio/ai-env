@@ -305,6 +305,11 @@ impl FormState {
                 self.status = format!("{} — fix or Esc this value before saving", self.status);
                 return Ok(Action::Continue);
             }
+            // A save asked for at the quit prompt leaves it: the prompt would hide the status line, where the event
+            // loop says `saved (…)` or `SAVE FAILED: …`; Ctrl+C/Ctrl+Q then quits, or asks again if it failed.
+            if matches!(self.mode, Mode::ConfirmQuit) {
+                self.mode = Mode::Browse;
+            }
             return Ok(Action::Save);
         }
         if ctrl && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('c')) {
@@ -845,14 +850,16 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut FormState, scratch: &Scratch) {
         frame.render_widget(line, row_area);
     }
 
-    // Status / confirm prompts.
+    // Status / confirm prompts. The quit keys are named as Ctrl+C/Ctrl+Q: Cursor's and VS Code's terminals take
+    // Ctrl+Q for themselves, and Ctrl+C is the same quit request (handle_key). The help line leads with them, so a
+    // narrow terminal panel, which clips the line on the right, still shows them.
     let status = match &state.mode {
         Mode::ConfirmDelete(_) => "delete this entry? [y/N]".to_owned(),
         Mode::ConfirmQuit => {
             if state.read_only {
                 "quit? [y/N]".to_owned()
             } else {
-                "quit WITHOUT saving? [y/N]  (Ctrl+S saves)".to_owned()
+                "quit WITHOUT saving? [y/N]  (Ctrl+S saves, then Ctrl+C/Ctrl+Q quits)".to_owned()
             }
         }
         _ => state.status.clone(),
@@ -866,9 +873,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &mut FormState, scratch: &Scratch) {
     let help = match &state.mode {
         Mode::Browse => {
             if state.read_only {
-                "\u{2191}\u{2193} move · Enter reveal · Esc conceal · Ctrl+Q quit (read-only)"
+                "Ctrl+C/Ctrl+Q quit · \u{2191}\u{2193} move · Enter reveal · Esc conceal (read-only)"
             } else {
-                "\u{2191}\u{2193} move · Enter reveal/edit · a add · c comment · r rename · d delete · u undo · Ctrl+S save · Ctrl+Q quit"
+                "Ctrl+C/Ctrl+Q quit · Ctrl+S save · \u{2191}\u{2193} move · Enter reveal/edit · a add · c comment · r rename · d delete · u undo"
             }
         }
         Mode::EditValue { .. } => "Enter seal · Esc discard · values re-seal after 30s idle",
@@ -1173,6 +1180,54 @@ mod tests {
         assert_eq!(st.handle_key(ctrl('q'), &mut scratch, &prekey).unwrap(), Action::Continue);
         assert!(matches!(st.mode, Mode::ConfirmQuit));
         assert_eq!(st.handle_key(key(KeyCode::Char('y')), &mut scratch, &prekey).unwrap(), Action::Quit);
+    }
+
+    /// Cursor's and VS Code's terminals take Ctrl+Q for themselves: the
+    /// browse and read-only footers and the quit prompt name Ctrl+C, the same
+    /// quit request, beside it, as drawn on the screen. The footers lead with
+    /// the quit keys, so a narrow terminal panel, which clips them on the
+    /// right, still shows them; a save asked for at the prompt leaves it, so
+    /// the status line shows the save's outcome.
+    #[test]
+    fn footers_and_quit_prompt_name_ctrl_c() {
+        // The screen's last two lines at `width` columns: the status (or a prompt), then the help line.
+        fn bottom(width: u16, st: &mut FormState, scratch: &Scratch) -> (String, String) {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 6)).unwrap();
+            term.draw(|frame| draw(frame, st, scratch)).unwrap();
+            let buf = term.backend().buffer();
+            let line = |y: u16| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_owned();
+            (line(buf.area.height - 2), line(buf.area.height - 1))
+        }
+        const BROWSE: &str = " Ctrl+C/Ctrl+Q quit · Ctrl+S save · \u{2191}\u{2193} move · Enter reveal/edit · a add · c comment · r rename · d delete · u undo";
+        const PROMPT: &str = " quit WITHOUT saving? [y/N]  (Ctrl+S saves, then Ctrl+C/Ctrl+Q quits)";
+        let (mut st, mut scratch, prekey) = setup("A=1\n");
+        assert_eq!(bottom(160, &mut st, &scratch).1, BROWSE);
+        // A panel 40 columns wide: the quit keys and the save still show.
+        assert!(bottom(40, &mut st, &scratch).1.starts_with(" Ctrl+C/Ctrl+Q quit · Ctrl+S save · "), "{:?}", bottom(40, &mut st, &scratch));
+        // A change, then Ctrl+C: the prompt.
+        st.handle_key(key(KeyCode::Enter), &mut scratch, &prekey).unwrap();
+        st.handle_key(key(KeyCode::Char('x')), &mut scratch, &prekey).unwrap();
+        st.handle_key(key(KeyCode::Enter), &mut scratch, &prekey).unwrap();
+        assert_eq!(st.handle_key(ctrl('c'), &mut scratch, &prekey).unwrap(), Action::Continue);
+        assert_eq!(bottom(160, &mut st, &scratch).0, PROMPT);
+        // Its hint holds. Ctrl+S asks for the save and leaves the prompt, so the status line shows what the event loop
+        // says: after a failed save (`dirty` kept) Ctrl+C asks again; after a save (the event loop clears `dirty`) it
+        // quits at once.
+        assert_eq!(st.handle_key(ctrl('s'), &mut scratch, &prekey).unwrap(), Action::Save);
+        st.status = "SAVE FAILED: no space left on device".into();
+        assert_eq!(bottom(160, &mut st, &scratch), (" SAVE FAILED: no space left on device".to_owned(), BROWSE.to_owned()));
+        assert_eq!(st.handle_key(ctrl('c'), &mut scratch, &prekey).unwrap(), Action::Continue);
+        assert_eq!(bottom(160, &mut st, &scratch).0, PROMPT);
+        assert_eq!(st.handle_key(ctrl('s'), &mut scratch, &prekey).unwrap(), Action::Save);
+        st.dirty = false;
+        st.status = "saved (re-encrypted with key \"k\")".into();
+        assert_eq!(bottom(160, &mut st, &scratch), (" saved (re-encrypted with key \"k\")".to_owned(), BROWSE.to_owned()));
+        assert_eq!(st.handle_key(ctrl('c'), &mut scratch, &prekey).unwrap(), Action::Quit);
+        // Read-only.
+        let doc = Document::seal_from(parse_lines("A=1\n").unwrap(), &prekey).unwrap();
+        let mut ro = FormState::new(doc, ".env".into(), true);
+        assert_eq!(bottom(160, &mut ro, &scratch).1, " Ctrl+C/Ctrl+Q quit · \u{2191}\u{2193} move · Enter reveal · Esc conceal (read-only)");
+        assert!(bottom(40, &mut ro, &scratch).1.starts_with(" Ctrl+C/Ctrl+Q quit · "), "{:?}", bottom(40, &mut ro, &scratch));
     }
 
     #[test]

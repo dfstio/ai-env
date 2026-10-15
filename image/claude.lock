@@ -1,8 +1,8 @@
 # Claude Code binary baked into the MicroVM image. Written by `make claude-pin`
-# from https://downloads.claude.ai/claude-code-releases/2.1.296/manifest.json;
+# from https://downloads.claude.ai/claude-code-releases/2.1.300/manifest.json;
 # the Dockerfile verifies size and SHA-256, then `claude --version`.
-CLAUDE_VERSION=2.1.296
+CLAUDE_VERSION=2.1.300
 CLAUDE_PLATFORM=linux-arm64
-CLAUDE_SHA256=f1f6e96e0d8342b9dbf41d7e88255397a6a52ce3d8736ad6a4c6b59c9b62fefa
-CLAUDE_SIZE=256434168
-CLAUDE_BUILD_DATE=2026-10-09T14:46:35Z
+CLAUDE_SHA256=ae2295ae2da156936bf5831ab01971ce924d0c9a0af174e28d96fffa8d5fa0a6
+CLAUDE_SIZE=266264568
+CLAUDE_BUILD_DATE=2026-10-14T13:29:53Z

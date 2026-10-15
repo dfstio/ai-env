@@ -125,9 +125,14 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   what every VM may reach: it is the user's call.
 - An ops command (`ai-env egress status`, `ai-env proxy start`, `make infra-status`, `make gates`,
   `make logs`, …) asks the user for one Touch ID; under `ai-env as` it asks for none.
-- In the user's shell a bare `aws` call has no credentials, by design, and ai-env never falls back
-  to the shell's own AWS settings. For a read, run `ai-env as ops -- aws …` (the user answers one
-  Touch ID); never point `AWS_PROFILE` or `~/.aws` somewhere else to get around it.
+- In the user's shell a bare `aws` call finds no credentials of the stack's account, by design (it
+  fails, or answers as another account's default profile), and ai-env never falls back to the
+  shell's own AWS settings. For a read, run `ai-env as ops -- aws …` (the user answers one Touch
+  ID); never point `AWS_PROFILE` or `~/.aws` somewhere else to get around it. ai-env needs the
+  account root's key only for the bootstrap and break-glass, the user's decisions, which load it
+  into a terminal of their own, closed afterwards (README "Break-glass"). Otherwise never suggest
+  loading it into a terminal used for ai-env (the runners ignore it, but a plain `aws` call there
+  would run as the root).
 - `make -n TARGET` shows what a target would run and asks for nothing.
 - On `AccessDenied`, report the action and the resource the error names, and stop: never retry
   with other credentials. A missing right is a change to `infra/policies.ts` that the user deploys

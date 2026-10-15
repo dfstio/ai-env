@@ -197,7 +197,11 @@ fn pin_check_bundle_mismatch_exits_1() {
     assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
     let err = stderr(&o);
     assert!(err.contains("lock 2.1.283") && err.contains("Cursor bundle 2.1.290"), "the highest darwin-arm64 bundle wins: {err}");
-    assert!(err.contains("make claude-update (or make claude-pin CLAUDE_VERSION=2.1.290 && make test-docker)"), "{err}");
+    // The route that always works leads (make claude-update refuses before the bootstrap: no deployer key yet).
+    assert!(
+        err.contains("differs from the Cursor bundle 2.1.290  <- make claude-pin CLAUDE_VERSION=2.1.290 && make test-docker (once the stack has its deployer, make claude-update does both and the deploy)"),
+        "{err}"
+    );
     // --bundle-version prints that version and nothing else (make claude-update reads it), the lock untouched.
     let before = std::fs::read(&lock).unwrap();
     let o = run(&mut ai_env(t, &["infra", "pin", "--bundle-version"]));

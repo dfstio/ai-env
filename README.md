@@ -411,10 +411,10 @@ records a verdict for what it could not see. ai-env-ops holds what the probe nee
 `logs:FilterLogEvents` and `logs:Unmask` on the log groups whose name holds `cloudtrail`, which ops
 does not (every such group holds the whole account's API record). So the printed
 `aws logs filter-log-events … --unmask` command for a group of this account starts with
-`ai-env as deployer --` (one paste; a bare `aws` has no credentials on this Mac), or with the runner
-the probe ran under when that was `ai-env as ambient` (an agent's session in another account, where
-the stack's deployer does not exist) or `ai-env as root`; its redirect and the
-`ai-env lab run … --log` after it run as printed. An organization trail's group belongs to
+`ai-env as deployer --` (one paste; a bare `aws` has no credentials of the stack's account on this
+Mac), or with the runner the probe ran under when that was `ai-env as ambient` (an agent's session
+in another account, where the stack's deployer does not exist) or `ai-env as root`; its redirect and
+the `ai-env lab run … --log` after it run as printed. An organization trail's group belongs to
 the account that owns the trail: its command is printed without the runner, to run with credentials
 of that account.
 
@@ -520,7 +520,7 @@ make preview-scratch [EGRESS_MODE=firewall] [NEGATIVE=…]   # read-only Pulumi 
                                #   (this shell's own credentials, an agent's account)
 make deploy                    # (deployer: one paste) plan check + replacement guard, pulumi up, connector-wait, proxy reload,
                                #   egress status (its preview runs --non-interactive: export PULUMI_CONFIG_PASSPHRASE_FILE
-                               #   for a passphrase stack)
+                               #   for a passphrase stack, or run it under ai-env run -f with the sealed passphrase: Identities)
 make infra-status WRITE=1      # (ops: one Touch ID) adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
 make s5-smoke                  # three `vm smoke --egress vpc --json` passes (the runtime key's Touch ID each); the echo must be
                                #   exactly the connector
@@ -1178,12 +1178,18 @@ from `credentials/ops.env` (unsealed once per process, with the note
 exit 5 and `no AWS operator identity: …` (`infra status` still writes and exits 0: its live reads
 are skipped and recorded as `live read failed: no AWS operator identity: …`). The shell's own
 credentials (`AWS_PROFILE`, `~/.aws`, exported keys) count only when `ai-env as root` or
-`ai-env as ambient` declared them, and must then be the account root's, or must not be. Once root's
-key is retired (below) the shell holds no AWS credentials at all, so a bare `aws` call fails
-(`Unable to locate credentials`) by design: run it as `ai-env as ops -- aws …`, or as the deployer
-for a write. P8 of `make s3-preflight PHASE=b`, which `make deploy` runs first, admits only the
-stack's deployer: the account root only for the bootstrap or with `BREAKGLASS=1`, never ops, the
-runtime key or another user.
+`ai-env as ambient` declared them, and must then be the account root's, or must not be. ai-env never
+needs root's key after the bootstrap (only break-glass would), so a terminal used for ai-env holds
+no credentials of the stack's account: a bare `aws` call there fails
+(`Unable to locate credentials`), or answers as another account's default profile from `~/.aws`, by
+design: run it as `ai-env as ops -- aws …`, or as the deployer for a write. Never paste root's env
+into such a terminal, nor load root's key from the shell's startup files or the default profile of
+`~/.aws/credentials`: the runners ignore it, but a plain `aws` call and anything else started from
+that terminal would run as the root. The bootstrap and break-glass are the exception: they load it
+without echo into a terminal of their own, closed afterwards (below). P8 of
+`make s3-preflight PHASE=b`, which `make deploy` runs first, admits only the stack's deployer: the
+account root only for the bootstrap or with `BREAKGLASS=1`, never ops, the runtime key or another
+user.
 
 **What each command asks for:**
 
@@ -1223,6 +1229,45 @@ runtime key or another user.
   `-p` there. `make -j` is not for tiered targets (two runners would ask at once);
 - `vm`, `box` and the wrapper's sessions are unchanged: the runtime key's Touch ID.
 
+**The stack's passphrase in a clean terminal.** `make deploy` (and `make claude-update` when it
+deploys) runs Pulumi's preview `--non-interactive`, so a passphrase stack needs
+`PULUMI_CONFIG_PASSPHRASE_FILE` or `PULUMI_CONFIG_PASSPHRASE` in its environment. In a terminal that
+exports neither, `make deploy` stops at its plan check, before anything is deployed (after the zip
+build, the paste and the preflight: `pulumi preview --json failed …: nothing deployed`), and
+`make claude-update` before its first step
+(`claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first …`); both name the two routes. Instead
+of exporting one in every terminal, seal the passphrase once into an ai-env container under the
+bridge keystore key (`[creds].key`, `ai-env-bridge` by default), then set its value in
+`ai-env edit`:
+
+```sh
+printf 'PULUMI_CONFIG_PASSPHRASE=\n' | ai-env encrypt -k ai-env-bridge - > "$HOME/.config/ai-env/pulumi.env"
+ai-env edit "$HOME/.config/ai-env/pulumi.env"
+```
+
+In the editor: Enter on its line, the passphrase inside single quotes (taken literally), Enter,
+`Ctrl+S`, `Ctrl+C`. If you paste it (from Strongbox, say), copy it with Handoff and any clipboard
+history off, as for the keys, and clear the clipboard after the paste (`pbcopy </dev/null`). The
+first line writes a new container over any earlier one: to change the value later, run only the
+second. Then run the deploy under `ai-env run -f`, which hands the passphrase to that one command's
+process tree: one Touch ID for the passphrase, one paste for the deployer's key:
+
+```sh
+ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- ai-env as deployer -- make deploy
+```
+
+`make claude-update` takes the same wrapper (it then asks for its identity as usual), and so does
+`make preview`, each a command of its own: pasted together, the later lines could reach the
+deployer's key prompts.
+
+```sh
+ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- make claude-update
+```
+
+```sh
+ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- ai-env as deployer -- make preview
+```
+
 **When the deployer lacks a right.** A deploy that stops on `AccessDenied` names the action. Add it to
 `infra/policies.ts`, then run `ai-env as deployer -- make deploy-policies deploy` (one paste): the
 deploy's gates, a `pulumi up` of the five stack policies alone, then the deploy. While the stack's
@@ -1242,10 +1287,12 @@ is skipped until `make infra-status WRITE=1` has recorded the two users after th
 #### The bootstrap
 
 The full runbook, with what each step prints and costs, is part B0 of `plans/s8-operators-plan.md`.
-In short: once, as the account root, with root's access key in the shell. Until the stack exports a
-deployer, the deployer-tier targets run under `ai-env as root` (said on stderr) and ask for no paste.
-Between `make install` and the bootstrap deploy the egress commands fail: the new ai-env sends proxy
-documents the stack does not have yet. One command at a time:
+In short: once, as the account root, with root's access key in one terminal of its own, for steps 1
+and 2 only. Load it there with the `read -rs` line of Break-glass (below), which keeps it out of the
+shell's history, never with an `export` that carries its values. Until the stack exports a
+deployer, the deployer-tier targets run under `ai-env as root` (said on stderr) and ask for no
+paste. Between `make install` and the bootstrap deploy the egress commands fail: the new ai-env
+sends proxy documents the stack does not have yet. One command at a time:
 
 1. `make test-docker deploy`: Pulumi creates the two new users, their two policies, six attachments
    and the three proxy documents, replaces the three deploy policies once (their descriptions
@@ -1257,13 +1304,27 @@ documents the stack does not have yet. One command at a time:
    clipboard history off: its marker must not paste on another Apple device. If it does, hand nothing
    over by either route (the console's copies cross the same clipboard, unmarked): turn off Handoff
    (System Settings, General, AirDrop & Handoff) and check again.
-3. `make infra-status WRITE=1`, then the checks: `make gates` shows G7 ✓, and
-   `ai-env as deployer -- make preview REFRESH=1 deploy` is the deployer's first run (one paste, no
-   changes).
-4. Retire root's access key: deactivate it in the console (as root, with MFA), check that a bare
-   `aws sts get-caller-identity` now fails, delete it, and remove root's lines from
-   `~/.aws/credentials` and any `AWS_*` export from the shell's startup files. Then
-   `ai-env as ops -- ai-env doctor` shows `the account root has no access key`.
+3. Close the root's terminal, then in a new one: `make infra-status WRITE=1`, then the checks:
+   `make gates` shows G7 ✓, and `ai-env as deployer -- make preview REFRESH=1 deploy` is the
+   deployer's first run (one paste, no changes; under `ai-env run -f` with the sealed passphrase,
+   above).
+4. Root's access key: ai-env never needs it again (only break-glass would), so deleting it is
+   optional. Delete it when nothing else uses it (IAM console as root, with MFA: Security
+   credentials, Access keys); `ai-env as ops -- ai-env doctor` then shows
+   `[ok ] the account root has no access key`, and warns `[!! ] the account root has an access key`
+   while one exists (a deactivated one counts). While it exists, never paste root's env into a
+   terminal used for ai-env, nor load it from the shell's startup files or the default profile of
+   `~/.aws/credentials`: the runners ignore it, but a plain `aws` call and anything else started
+   from that terminal would run as the root.
+
+While root's key is live, it must not sit in the shell's history either: the `read -rs` line leaves
+none there, but a pasted `export` does. This counts the lines of `~/.zsh_history` that assign its
+secret (it prints a number only); above 0, close every other terminal (a shell writes its history
+when it exits), then remove those lines in an editor:
+
+```sh
+grep -c 'AWS_SECRET_ACCESS_KEY=' "$HOME/.zsh_history"
+```
 
 #### Rotation
 
@@ -1280,22 +1341,22 @@ over, verifies it, and deletes the old one last:
   `make operator-keys`, and the old key it deletes last is the one the run was started with, so run
   it alone and paste the new one from then on.
 
-A step that fails says what to delete or restore by hand. A bare `aws` call has no credentials once
-root's key is retired, so every `aws iam …` line it prints starts with the runner that can run it,
-the make target's own and the CLI's alike (the sealing check's two-key refusal, the delete command
-of a key that was not stored or handed over): `ai-env as deployer --` (one paste), or
-`ai-env as root --` when the run was the account root's (`make operator-keys`, break-glass), to
-paste in its terminal. `ai-env creds forget --ops` lists, and with `--yes` removes,
+A step that fails says what to delete or restore by hand. A bare `aws` call has no credentials of the
+stack's account in a terminal used for ai-env, so every `aws iam …` line it prints starts with the
+runner that can run it, the make target's own and the CLI's alike (the sealing check's two-key
+refusal, the delete command of a key that was not stored or handed over): `ai-env as deployer --`
+(one paste), or `ai-env as root --` when the run was the account root's (`make operator-keys`,
+break-glass), to paste in its terminal. `ai-env creds forget --ops` lists, and with `--yes` removes,
 `credentials/ops.env` and its backups, then prints the IAM commands that delete its key, already in
 that form.
 
 #### Break-glass
 
 The account root is needed again only when the deployer cannot act (its Strongbox entry is lost, or
-its own policies no longer let it fix them) and for teardown. Create a root access key in the console
-(as root, with MFA; copy each value with its copy button and never download the .csv, with Handoff
-and any clipboard history off) and load it into one terminal without echo; the line then clears the
-clipboard:
+its own policies no longer let it fix them) and for teardown. Load root's access key into one
+terminal of its own without echo (when none is left, create one in the console: as root, with MFA;
+copy each value with its copy button and never download the .csv, with Handoff and any clipboard
+history off); the line then clears the clipboard:
 
 ```sh
 read -rs 'AWS_ACCESS_KEY_ID?root access key id: '; echo; read -rs 'AWS_SECRET_ACCESS_KEY?root secret access key: '; echo; pbcopy </dev/null; export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
@@ -1306,18 +1367,20 @@ ignored): for a lost Strongbox entry `make deployer-key ROTATE=1 BREAKGLASS=1`, 
 broke `make deploy BREAKGLASS=1`, for teardown `make destroy CONFIRM=destroy-dev BREAKGLASS=1`. The
 target runs under `ai-env as root`, says so on stderr, and P8 shows `[-  ] P8 BREAK-GLASS: …`.
 Destroy is the account root's alone, since it deletes the operator users themselves; its checklist
-adds the two users, every `ai-env-*` policy, `credentials/ops.env`, the Strongbox entry and root's
-key. Afterwards, in the same terminal:
+adds the two users, every `ai-env-*` policy, `credentials/ops.env` and the Strongbox entry, and ends
+with root's key (item 15: unset, this terminal closed, the key deleted when nothing else uses it).
+Afterwards, in the same terminal:
 
 ```sh
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 ```
 
-and delete root's access key in the console again. Then
-`ai-env as ops -- ai-env doctor | sed -E 's/[0-9]{12}/ACCOUNT/'` must show
+then close it. As after the bootstrap, deleting root's access key is optional: delete it when
+nothing else uses it (a key created for this break-glass included); then
+`ai-env as ops -- ai-env doctor | sed -E 's/[0-9]{12}/ACCOUNT/'` shows
 `[ok ] the account root has no access key` (a deactivated key still counts). A teardown leaves no
-ops key for that check: there, the console's Access keys list must be empty (the checklist's item
-15).
+ops key for that check: there, the IAM console shows what is left (as the root: Security
+credentials, Access keys).
 
 ### Access-control policies (`keygen --access-control`)
 
@@ -1350,7 +1413,8 @@ A secure form-style editor: variable **names** are listed, every **value** stays
 memory**, inside a locked, guard-paged buffer. Values re-seal after 30s idle. `Enter`
 reveals/commits, `Esc` discards, `a` adds, `r` renames, `d` deletes, `u` undoes (sealed
 history), `Ctrl+S` saves (streams values one at a time into age — never a whole-file
-plaintext buffer), `Ctrl+Q` quits.
+plaintext buffer), `Ctrl+C` or `Ctrl+Q` quits (Cursor's and VS Code's terminals keep `Ctrl+Q` for
+themselves).
 
 The in-memory sealing follows OpenSSH's ssh-agent key-shielding design: an ephemeral 16 KiB
 prekey in mlocked guard-paged memory, per-value XChaCha20-Poly1305 cells bound to their

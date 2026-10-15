@@ -137,7 +137,7 @@ IMAGE_WAIT_SH       = ( $(OPS) wait; st=$$?; \
 # five documents known in that plan, D18); any refusal stops it.
 PLAN_GATE           = echo "cd $(INFRA) && pulumi preview --json --stack $(STACK): the plan check and the replacement guard"; \
                         plan=$$(cd $(INFRA) && $(PULUMI_ENV) pulumi preview --json --show-sames --show-reads --non-interactive --stack $(STACK)) \
-                          || { st=$$?; printf '%s' "$$plan" | $(OPS) plan-errors; echo "$(1): pulumi preview --json failed (exit $$st): nothing deployed (a passphrase stack needs PULUMI_CONFIG_PASSPHRASE_FILE: --non-interactive cannot prompt)"; exit 1; }; \
+                          || { st=$$?; printf '%s' "$$plan" | $(OPS) plan-errors; echo "$(1): pulumi preview --json failed (exit $$st): nothing deployed (a passphrase stack needs PULUMI_CONFIG_PASSPHRASE_FILE: --non-interactive cannot prompt, or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"))"; exit 1; }; \
                         printf '%s' "$$plan" | $(OPS) plan-gate$(if $(2), $(2))
 # deploy-policies' targets: the stack's five managed policies (infra/policies.ts), the only resources it updates.
 STACK_POLICIES     := ai-env-deploy ai-env-deploy-egress ai-env-deploy-dns ai-env-deployer ai-env-ops
@@ -186,7 +186,8 @@ preview-run:
 # inventory and the egress spec, and the replacement guard: nothing the connector's ENIs pin is replaced, and the VPC's
 # Amazon DNS is not turned on, while a connector exists); either refusal stops the deploy before `pulumi up`. The
 # preview is --non-interactive (its stdout is captured, so it could not prompt): a passphrase stack needs
-# PULUMI_CONFIG_PASSPHRASE_FILE in the environment. Once `pulumi up` has started, ops.sh post-deploy runs on every
+# PULUMI_CONFIG_PASSPHRASE_FILE in the environment, or PULUMI_CONFIG_PASSPHRASE from a sealed file under `ai-env run -f`
+# (README "Identities"). Once `pulumi up` has started, ops.sh post-deploy runs on every
 # exit: after image-wait and connector-wait succeeded the whole of it (egress reload --if-changed when the proxy runs,
 # the vpc VM warning, the egress-check line on a new image version, egress status as the out-of-band drift check:
 # `pulumi up` does not refresh; drift fails the deploy at the end), after any failure the reload and the warnings
@@ -389,7 +390,7 @@ operator-keys-run:
 	$(AI_ENV) creds aws-set --check --user $(OPS_USER)
 	@$(KEY_ISSUE) deployer-key $(DEPLOYER_USER) handover first
 	@$(KEY_ISSUE) ops-key $(OPS_USER) sealed first
-	@echo "operator-keys: done. Next (README \"Identities\"): make infra-status WRITE=1, the checks, then retire root's access key"
+	@echo "operator-keys: done. Next (README \"Identities\"): close this terminal; in a new one, make infra-status WRITE=1, then the checks. ai-env no longer needs root's access key: delete it when nothing else uses it"
 
 # destroy deletes the operator users themselves (forceDestroy) and the policies the deployer holds: as the deployer it
 # would lose its rights half-way, so the account root runs it, BREAKGLASS=1 only (L8); destroy-run's identity line, the

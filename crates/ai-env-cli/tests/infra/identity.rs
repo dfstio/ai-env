@@ -494,7 +494,7 @@ fn as_root_and_as_ambient_keep_the_ambient_chain_and_refuse_the_wrong_identity()
     write_state(&env, |_| {});
     let out = try_as("root", &[("FAKE_AWS_CALLER", "root")]);
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
-    assert!(said(&out, "ai-env: warning: the stack already has ai-env-deployer: delete root's access key again afterwards (IAM console, Security credentials) and use ai-env as deployer"), "{}", stderr(&out));
+    assert!(said(&out, "ai-env: warning: the stack already has ai-env-deployer: use ai-env as deployer; afterwards unset root's key and close this terminal (README \"Break-glass\")"), "{}", stderr(&out));
     let out = try_as("root", &[("FAKE_AWS_CALLER", "root@999999999999")]);
     assert_eq!(code(&out), Some(9), "{}", stderr(&out));
     assert_eq!(stderr(&out), format!("ai-env: as root: this is the account root of {OTHER}, but the stack (state/infra.toml) is in account {STACK}\n"));
@@ -794,7 +794,7 @@ fn doctor_never_unseals_and_names_ai_env_as_ops_for_a_root_caller() {
     let out = doctor(&[("FAKE_AWS_CALLER", "root")]);
     assert!(has(&out, "[-  ] operator identity: none declared (doctor never unseals credentials/ops.env)  <- ai-env as ops -- ai-env doctor (one Touch ID)"), "{}", stdout(&out));
     assert!(
-        has(&out, "[!! ] the ambient aws CLI credentials are the account ROOT: operator commands never use them; delete root's access key  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy"),
+        has(&out, "[!! ] the ambient aws CLI credentials are the account ROOT: operator commands never use them, but a plain aws call here runs as the root; outside the bootstrap and break-glass, keep root's key out of a terminal used for ai-env (README \"Identities\")  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy"),
         "{}",
         stdout(&out)
     );
@@ -807,7 +807,7 @@ fn doctor_never_unseals_and_names_ai_env_as_ops_for_a_root_caller() {
     let out = doctor(&[marker, ("FAKE_AWS_CALLER", "root"), ("FAKE_AWS_ROOT_KEYS", "1")]);
     assert!(has(&out, "[!! ] operator identity is the account ROOT (ai-env as root: the bootstrap and break-glass only)  <- ai-env as ops -- ai-env doctor"), "{}", stdout(&out));
     assert!(
-        has(&out, "[!! ] the account root has an access key (AccountAccessKeysPresent=1, active or deactivated)  <- delete it once ai-env-deployer works (IAM console, Security credentials)"),
+        has(&out, "[!! ] the account root has an access key (AccountAccessKeysPresent=1, active or deactivated)  <- ai-env needs it only for the bootstrap and break-glass: delete it when nothing else uses it (IAM console, Security credentials), and never load it into a terminal used for ai-env day to day"),
         "{}",
         stdout(&out)
     );

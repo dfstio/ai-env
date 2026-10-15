@@ -309,7 +309,7 @@ pub fn row_ambient_identity(sts: Option<Result<&str, &str>>) -> DoctorLine {
         Some(Ok(json)) => match parse_caller(json) {
             Ok(v) if v.is_root() => DoctorLine::row(
                 Tag::Warn,
-                "the ambient aws CLI credentials are the account ROOT: operator commands never use them; delete root's access key  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy",
+                "the ambient aws CLI credentials are the account ROOT: operator commands never use them, but a plain aws call here runs as the root; outside the bootstrap and break-glass, keep root's key out of a terminal used for ai-env (README \"Identities\")  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy",
             ),
             Ok(v) => DoctorLine::row(Tag::Skip, format!("ambient aws CLI identity {} (not used by operator commands)", v.arn)),
             Err(e) => not_used(&e),
@@ -383,7 +383,10 @@ fn deployer_keys_args() -> [&'static str; 8] {
 
 /// The account root's access keys (`summary`: the `iam get-account-summary`
 /// output; `None` without an identity): any, active or deactivated, is a
-/// warning until it is deleted.
+/// warning until it is deleted. ai-env needs one only for the bootstrap and
+/// break-glass, and something else may: deleting it is the user's call, and
+/// the hint says when, in words true under any identity (`ai-env as root`
+/// before the bootstrap's `make operator-keys` included).
 #[must_use]
 pub fn row_root_access_keys(summary: Option<Result<&str, &str>>) -> DoctorLine {
     let not_checked = |why: &str| DoctorLine::row(Tag::Skip, format!("the account root's access keys: not checked ({why})"));
@@ -396,7 +399,7 @@ pub fn row_root_access_keys(summary: Option<Result<&str, &str>>) -> DoctorLine {
         Some(0) => DoctorLine::row(Tag::Ok, "the account root has no access key"),
         Some(n) => DoctorLine::row(
             Tag::Warn,
-            format!("the account root has an access key (AccountAccessKeysPresent={n}, active or deactivated)  <- delete it once ai-env-deployer works (IAM console, Security credentials)"),
+            format!("the account root has an access key (AccountAccessKeysPresent={n}, active or deactivated)  <- ai-env needs it only for the bootstrap and break-glass: delete it when nothing else uses it (IAM console, Security credentials), and never load it into a terminal used for ai-env day to day"),
         ),
         None => not_checked("no SummaryMap.AccountAccessKeysPresent in the get-account-summary output"),
     }
@@ -2565,7 +2568,7 @@ mod tests {
     fn ambient_root_row_names_ai_env_as_ops() {
         let (tag, t) = text(&row_ambient_identity(Some(Ok("{\"Account\": \"123456789012\", \"Arn\": \"arn:aws:iam::123456789012:root\"}"))));
         assert_eq!(tag, Tag::Warn);
-        assert_eq!(t, "the ambient aws CLI credentials are the account ROOT: operator commands never use them; delete root's access key  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy");
+        assert_eq!(t, "the ambient aws CLI credentials are the account ROOT: operator commands never use them, but a plain aws call here runs as the root; outside the bootstrap and break-glass, keep root's key out of a terminal used for ai-env (README \"Identities\")  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy");
         let row = row_ambient_identity(Some(Ok("{\"Account\": \"123456789012\", \"Arn\": \"arn:aws:iam::123456789012:user/agent\"}")));
         assert_eq!(text(&row), (Tag::Skip, "ambient aws CLI identity arn:aws:iam::123456789012:user/agent (not used by operator commands)".into()));
         let row = row_ambient_identity(Some(Err("Unable to locate credentials. You can configure credentials by running \"aws configure\".")));
@@ -2630,7 +2633,7 @@ mod tests {
         assert_eq!(text(&row_root_access_keys(Some(Ok(&summary(0))))), (Tag::Ok, "the account root has no access key".into()));
         assert_eq!(
             text(&row_root_access_keys(Some(Ok(&summary(1))))),
-            (Tag::Warn, "the account root has an access key (AccountAccessKeysPresent=1, active or deactivated)  <- delete it once ai-env-deployer works (IAM console, Security credentials)".into())
+            (Tag::Warn, "the account root has an access key (AccountAccessKeysPresent=1, active or deactivated)  <- ai-env needs it only for the bootstrap and break-glass: delete it when nothing else uses it (IAM console, Security credentials), and never load it into a terminal used for ai-env day to day".into())
         );
         assert!(text(&row_root_access_keys(Some(Ok(&summary(2))))).1.contains("AccountAccessKeysPresent=2"));
         assert_eq!(text(&row_root_access_keys(Some(Err("AccessDenied")))), (Tag::Skip, "the account root's access keys: not checked (AccessDenied)".into()));

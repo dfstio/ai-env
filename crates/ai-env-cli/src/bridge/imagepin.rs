@@ -134,7 +134,13 @@ pub fn cmd_pin(manifest: Option<&Path>, lock: &Path, check_bundle: bool, bundle_
         outln!("pin: lock {} equals the Cursor bundle", pin.version);
         return Ok(());
     }
-    Err(CliError::Msg(format!("pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-update (or make claude-pin CLAUDE_VERSION={bundle} && make test-docker)", pin.version, lock.display())))
+    // The pin and the test first: they always work, while make claude-update refuses before the bootstrap (no
+    // deployer key exists to ask for).
+    Err(CliError::Msg(format!(
+        "pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-pin CLAUDE_VERSION={bundle} && make test-docker (once the stack has its deployer, make claude-update does both and the deploy)",
+        pin.version,
+        lock.display()
+    )))
 }
 
 #[cfg(test)]

@@ -2708,7 +2708,7 @@ fn the_destroy_checklist_names_the_egress_leftovers() {
         "\n     aws iam list-policies --scope Local --query \"Policies[?starts_with(PolicyName, 'ai-env-')].PolicyName\" --output text --region eu-central-1\n",
         "no ai-env-* policy left (ai-env-deploy, ai-env-deploy-egress, ai-env-deploy-dns, ai-env-deployer, ai-env-ops)",
         "\n     cd infra && pulumi stack rm dev\n",
-        "the account root ran this destroy (BREAKGLASS=1): delete its access key again (IAM console as the root, with MFA: Security credentials, Access keys)",
+        "the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README \"Break-glass\"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)",
     ] {
         assert!(text.contains(want), "want {want}: {text}");
     }
@@ -3012,6 +3012,11 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
     let out = d.deploy(&failed, &[("FAKE_PULUMI_PREVIEW_RC", "255")]);
     let text = all(&out);
     assert!(!out.status.success() && text.contains("deploy: pulumi preview --json failed (exit 255): nothing deployed") && text.contains("the program threw: egress guard refused something"), "{text}");
+    // The two routes to the stack's passphrase: the exported file, or the sealed one under ai-env run -f.
+    assert!(
+        text.contains("nothing deployed (a passphrase stack needs PULUMI_CONFIG_PASSPHRASE_FILE: --non-interactive cannot prompt, or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"))"),
+        "{text}"
+    );
     let c = calls(d.t.path());
     assert!(!c.iter().any(|l| l.starts_with("check-plan") || l.starts_with("pulumi up")), "{c:#?}");
 }
@@ -3030,7 +3035,8 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
 /// and never repeats them, prints the summary once, checks the identity (ops.sh identity; refused after the pass before
 /// it pinned or tested, it says what that pass left) and runs every other step as that identity. Under a runner that
 /// covers the tier it asks nothing; a cancelled runner changes nothing after it. A deploy due before the bootstrap (no
-/// deployer exported, so no deployer key) is the account root's: refused before anything runs.
+/// deployer exported, so no deployer key) is the account root's: refused before anything runs, naming what to run
+/// instead (the pin and make test-docker when due, then make deploy as the account root).
 #[test]
 fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
     const TTY: (&str, &str) = ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1");
@@ -3064,6 +3070,8 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         PendingDeploy,
         /// The stack before the bootstrap: its outputs name no operator user.
         NoDeployer,
+        /// The stack before the bootstrap, and make test-docker passed for the current zip of the bundle (as Stamped).
+        NoDeployerStamped,
         /// The lock tracked by git and changed (a fake git, which logs whether a key reached it).
         LockTracked,
     }
@@ -3103,7 +3111,8 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         c("a failed check", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![status, check], vec!["STOPPED at step 3/3 (ai-env egress check --if-needed: exit 3)"]),
         c("a rollback", "2.1.287", "2.1.287", "2.1.287", vec![], World::Rollback, 1, vec![status], vec!["new VMs start image version 3.0, not the deployed 4.0 (a rollback with make image-deactivate or image-activate?)", "make image-activate VERSION=4.0", "STOPPED at step 2/3"]),
         c("no terminal", "2.1.288", "2.1.287", "2.1.287", vec![PASS], World::Plain, 1, vec![], vec!["claude-update: needs a terminal"]),
-        c("no passphrase", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Plain, 1, vec![], vec!["claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first"]),
+        // Both routes to the passphrase: the exported file, or the sealed one under ai-env run -f (README "Identities").
+        c("no passphrase", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Plain, 1, vec![], vec!["claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the dev stack's passphrase: make deploy's preview runs --non-interactive), or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"): nothing changed"]),
         c("Docker down", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DOCKER_RC", "1")], World::Plain, 1, vec![], vec!["claude-update: Docker does not answer (docker info)"]),
         c("make -k", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -k")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
         c("a variable is no flag", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
@@ -3166,8 +3175,17 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
     case.under = Some("ops");
     cases.push(case);
     // A deploy due before the bootstrap: the stack exports no deployer, so there is no key to ask for; that deploy is the
-    // account root's (make deploy runs it as the root). Refused before anything runs, the pin and the test included (D15).
-    cases.push(c("a deploy due before the bootstrap", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::NoDeployer, 1, vec![], vec!["claude-update: a deploy is due, but stack dev exports no deployer yet", "README \"The bootstrap\"", "nothing changed"]));
+    // account root's (make deploy runs it as the root). Refused before anything runs, the pin and the test included (D15),
+    // naming what to run instead from the steps it decided: the pin and make test-docker when they are due, then make
+    // deploy as the account root.
+    let no_deployer = "claude-update: a deploy is due, but stack dev exports no deployer yet, so there is no deployer key to ask for: that deploy is the bootstrap, the account root's (README \"The bootstrap\"): nothing changed";
+    for (what, bundle, locked, deployed, world, instead) in [
+        ("a deploy due before the bootstrap", "2.1.288", "2.1.287", "2.1.287", World::NoDeployer, "claude-update: run instead: make claude-pin CLAUDE_VERSION=2.1.288, make test-docker, then make deploy as the account root (the bootstrap)"),
+        ("a deploy due before the bootstrap, the bundle pinned", "2.1.287", "2.1.287", "2.1.286", World::NoDeployer, "claude-update: run instead: make test-docker, then make deploy as the account root (the bootstrap)"),
+        ("a deploy due before the bootstrap, the zip tested", "2.1.287", "2.1.287", "2.1.286", World::NoDeployerStamped, "claude-update: run instead: make deploy as the account root (the bootstrap)"),
+    ] {
+        cases.push(c(what, bundle, locked, deployed, full.clone(), world, 1, vec![], vec![no_deployer, instead]));
+    }
     // The identity refused under the runner, after the pass before it pinned and tested: that pass's work is said, never
     // "nothing changed" (D24). The deployer's key answers as another user here.
     let refused = "claude-update: the identity of this run is refused: user/rust: not the deployer of stack dev (user/ai-env-deployer)";
@@ -3213,7 +3231,7 @@ exit 0"#,
         o["latestActiveImageVersion"] = json!(if case.world == World::Rollback { "4.0" } else { "3.0" });
         o["bucket"] = json!("ai-env-artifacts-0000000");
         o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
-        write_outputs(t, &if case.world == World::NoDeployer { o } else { with_operators(o) });
+        write_outputs(t, &if matches!(case.world, World::NoDeployer | World::NoDeployerStamped) { o } else { with_operators(o) });
         if case.world == World::LockTracked {
             // git: each call logged with the marker and whether a credential reached it (never a value); the lock is
             // tracked (ls-files) and changed (diff --quiet exits 1).
@@ -3228,7 +3246,7 @@ exit 0"#,
         let built_from = if case.world == World::OtherZip { "fedcba9876543210" } else { "0123456789abcdef" };
         std::fs::write(t.join("aws/image/uri"), format!("s3://ai-env-artifacts-0000000/ai-env/image-{built_from}.zip")).unwrap();
         seed_proxy(t, if case.world == World::ProxyStopped { "stopped" } else { "running" });
-        if matches!(case.world, World::Stamped | World::StampedStale | World::StampedOtherClaude) {
+        if matches!(case.world, World::Stamped | World::StampedStale | World::StampedOtherClaude | World::NoDeployerStamped) {
             std::fs::create_dir_all(t.join("out")).unwrap();
             std::fs::write(t.join("out/image.zip"), "a zip").unwrap();
             let claude = if case.world == World::StampedOtherClaude { "2.1.286" } else { case.bundle };
@@ -3661,7 +3679,7 @@ fn breakglass_counts_only_on_the_make_command_line() {
         let text = all(&out);
         assert_eq!(out.status.success(), ok, "{args:?} {envs:?}: {text}");
         if ok {
-            assert!(text.contains("preview: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")") && text.contains("a preview"), "{text}");
+            assert!(text.contains("preview: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; afterwards unset root's key and close this terminal (README \"Break-glass\")") && text.contains("a preview"), "{text}");
         } else {
             assert!(text.contains("preview: identity root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line"), "{text}");
             assert!(!calls(t).iter().any(|l| l.starts_with("pulumi preview")), "{:#?}", calls(t));
@@ -3762,7 +3780,7 @@ fn p8_admits_only_the_stacks_deployer_the_bootstrap_and_a_loud_break_glass() {
     let cases: Vec<Case> = vec![
         ("the deployer", Some(stack.clone()), vec!["PHASE=b"], deployer.clone(), "[ok ] P8 deploy identity user/ai-env-deployer (the deployer of stack dev)"),
         ("the bootstrap", Some(bootstrap), vec!["PHASE=b"], root.clone(), "[ok ] P8 deploy identity root: the bootstrap deploy (stack dev exports no deployer yet: this deploy creates user/ai-env-deployer and user/ai-env-ops; then make operator-keys, as the account root, once)"),
-        ("break-glass", Some(stack.clone()), vec!["PHASE=b", "BREAKGLASS=1"], root.clone(), "[-  ] P8 BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")"),
+        ("break-glass", Some(stack.clone()), vec!["PHASE=b", "BREAKGLASS=1"], root.clone(), "[-  ] P8 BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; afterwards unset root's key and close this terminal (README \"Break-glass\")"),
         ("BREAKGLASS=1 in the environment", Some(stack.clone()), vec!["PHASE=b"], [root.clone(), env(&[("BREAKGLASS", "1")])].concat(), "[NO ] P8 deploy identity root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line"),
         ("the root without its runner", Some(stack.clone()), vec!["PHASE=b", "BREAKGLASS=1"], env(&[("FAKE_AWS_CALLER", "root")]), "[NO ] P8 deploy identity root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused"),
         ("the ops key", Some(stack.clone()), vec!["PHASE=b"], super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL), "[NO ] P8 deploy identity user/ai-env-ops: the ops key cannot deploy: run the make target itself (not its -run target): it asks for the deployer's key"),
@@ -3823,9 +3841,9 @@ fn ops_sh_identity_admits_each_tier_by_its_table() {
         (&["root-keys", "operator-keys"][..], vec![(s("FAKE_AWS_CALLER"), s("root"))], 1, "operator-keys: identity root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused\n"),
         (&["root-keys", "operator-keys"][..], deployer.clone(), 1, "operator-keys: identity user/ai-env-deployer: make operator-keys is the account root's, once, after the bootstrap deploy; the deployer rotates: make ops-key ROTATE=1, make deployer-key ROTATE=1\n"),
         (&["deployer", "deploy"][..], deployer, 0, "deploy: identity user/ai-env-deployer (the deployer of stack dev)\n"),
-        (&["deployer", "deploy"][..], [root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 0, "deploy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")\n"),
+        (&["deployer", "deploy"][..], [root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 0, "deploy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; afterwards unset root's key and close this terminal (README \"Break-glass\")\n"),
         // breakglass (destroy-run): the account root under its runner with BREAKGLASS=1, and nobody else (D5).
-        (&["breakglass", "destroy"][..], [root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 0, "destroy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")\n"),
+        (&["breakglass", "destroy"][..], [root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 0, "destroy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; afterwards unset root's key and close this terminal (README \"Break-glass\")\n"),
         (&["breakglass", "destroy"][..], root.clone(), 1, "destroy: identity root: break-glass only: BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")\n"),
         (&["breakglass", "destroy"][..], vec![(s("FAKE_AWS_CALLER"), s("root")), (s("BREAKGLASS"), s("1"))], 1, "destroy: identity root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused\n"),
         (&["breakglass", "destroy"][..], [ops.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 1, "destroy: identity user/ai-env-ops: break-glass only: the account root's, with BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")\n"),
@@ -3895,7 +3913,7 @@ fn operator_keys_issues_the_first_keys_as_the_root_and_a_rerun_resumes() {
         std::fs::remove_file(t.join("calls.log")).ok();
         tier_make(t, &bin, args, false, envs)
     };
-    let done = "operator-keys: done. Next (README \"Identities\"): make infra-status WRITE=1, the checks, then retire root's access key";
+    let done = "operator-keys: done. Next (README \"Identities\"): close this terminal; in a new one, make infra-status WRITE=1, then the checks. ai-env no longer needs root's access key: delete it when nothing else uses it";
     let out = run(&["operator-keys"], &root);
     let text = all(&out);
     assert!(out.status.success(), "{text}");

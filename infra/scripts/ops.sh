@@ -382,7 +382,7 @@ operator users are gone): paste each command line on its own; its step's numbere
      $(verified_note)
  14. optional, the stack's own record in the Pulumi backend:
      cd infra && pulumi stack rm $stack
- 15. the account root ran this destroy (BREAKGLASS=1): delete its access key again (IAM console as the root, with MFA: Security credentials, Access keys)
+ 15. the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README "Break-glass"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)
 EOF
 }
 
@@ -1144,7 +1144,8 @@ make_switch() (
 #   3. else, after the preconditions (a terminal for Pulumi's confirmation and the Touch ID; the Pulumi passphrase in
 #      the environment, as make deploy's preview runs --non-interactive; Docker answering; and, outside a runner that
 #      covers the deployer, a stack that exports its deployer: before the bootstrap there is no deployer key to ask
-#      for, and that deploy is the account root's), so that nothing changes when they fail: `make claude-pin
+#      for, and that deploy is the account root's, so the refusal names the pin and make test-docker when they are due,
+#      then make deploy as the root), so that nothing changes when they fail: `make claude-pin
 #      CLAUDE_VERSION=B` (when L != B), `make test-docker` (skipped when it already passed for the current zip of B:
 #      make deploy rebuilds the zip, and its P12 refuses one that differs), then the runner and the AWS identity of the
 #      run (below), the marker, `make deploy EXPECT_BUILD_FAILURE=` (Pulumi asks before it changes anything; the T3.4
@@ -1173,7 +1174,7 @@ make_switch() (
 # never matches), so a runner that did not take is never asked for again.
 cmd_claude_update() {
     local lock=${LOCK:?} releases=${CLAUDE_RELEASES:-} bundle locked deployed active latest="" outputs steps s n=0 total st proxy proxy_before="" pinned=0 tested=0 deploying=0 marker
-    local pending="$out/claude-update.pending" decided="" stale_marker=0 read_proxy=0 tier why line handed="" h_pin="" h_test="" left
+    local pending="$out/claude-update.pending" decided="" stale_marker=0 read_proxy=0 tier why line handed="" h_pin="" h_test="" left todo=""
     need_ai_env
     if make_switch ik; then echo "claude-update: not under make -i or -k (a failing preflight or test must stop the deploy): run make claude-update without them"; exit 2; fi
     if make_switch p; then echo "claude-update: not under make -p (it prints every variable at the end of every make it reaches, the environment's too: under the runner this run asks for, the operator key and its secret): run make claude-update without it"; exit 2; fi
@@ -1207,7 +1208,7 @@ cmd_claude_update() {
             exit 1
         fi
         test -n "${PULUMI_CONFIG_PASSPHRASE:-}${PULUMI_CONFIG_PASSPHRASE_FILE:-}" \
-            || { echo "claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the $stack stack's passphrase: make deploy's preview runs --non-interactive): nothing changed"; exit 1; }
+            || { echo "claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the $stack stack's passphrase: make deploy's preview runs --non-interactive), or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"): nothing changed"; exit 1; }
         docker info >/dev/null 2>&1 || { echo "claude-update: Docker does not answer (docker info), and make test-docker needs it: start Docker, then make claude-update: nothing changed"; exit 1; }
         steps="deploy status active proxy check"
         deploying=1
@@ -1233,8 +1234,18 @@ cmd_claude_update() {
         fi
         # Before the bootstrap the stack exports no deployer, so there is no deployer key to ask for: that deploy is the
         # account root's (make deploy runs it as the root; a run under ai-env as root covers the tier and comes not here).
+        # The refusal names what to run instead, from the steps decided above: the pin and make test-docker when due
+        # (neither needs AWS), then make deploy as the account root.
         if [ "$tier" = deployer ] && [ -z "$(printf '%s' "$outputs" | jsq 'j.deployerUserName' 2>/dev/null)" ]; then
             echo "claude-update: a deploy is due, but stack $stack exports no deployer yet, so there is no deployer key to ask for: that deploy is the bootstrap, the account root's (README \"The bootstrap\"): nothing changed"
+            for s in $steps; do
+                case "$s" in
+                pin) todo="${todo}make claude-pin CLAUDE_VERSION=$bundle, " ;;
+                test) todo="${todo}make test-docker, " ;;
+                *) break ;;
+                esac
+            done
+            echo "claude-update: run instead: ${todo:+${todo}then }make deploy as the account root (the bootstrap)"
             exit 1
         fi
         for s in $steps; do
@@ -1379,7 +1390,7 @@ identity_say() {
 # by infra.mk's IDENTITY from the make command line alone). What it calls says nothing: its one line is all (P8's row).
 cmd_identity() {
     local tier=${1:-} label=${2:-} marker=${AI_ENV_BRIDGE_AS:-} arn who acct outputs facts stack_acct stack_deployer stack_ops
-    local glass="BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")"
+    local glass="BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; afterwards unset root's key and close this terminal (README \"Break-glass\")"
     local glass_only="break-glass only: BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")"
     case "$tier" in
     deployer | ops | root-keys | breakglass) ;;

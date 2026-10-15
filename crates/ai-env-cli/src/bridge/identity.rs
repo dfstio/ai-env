@@ -2115,7 +2115,7 @@ fn as_root(account: Option<&str>, command: &[String], shown: &str) -> Result<()>
         return Err(CliError::Policy(format!("as root: this is the account root of {}, but the stack ({}) is in account {want}", v.account, exp.source.unwrap_or("no source"))));
     }
     if stack_has_deployer(&paths) {
-        voice::warn("the stack already has ai-env-deployer: delete root's access key again afterwards (IAM console, Security credentials) and use ai-env as deployer");
+        voice::warn("the stack already has ai-env-deployer: use ai-env as deployer; afterwards unset root's key and close this terminal (README \"Break-glass\")");
     }
     audit_as("root", None, Some(&v.account), command);
     voice::note(&format!("as the account ROOT of account {} (the bootstrap and break-glass only): {shown}", masked_account(&v.account)));
