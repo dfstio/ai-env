@@ -31,6 +31,11 @@ pub fn ai_env(tmp: &Path, args: &[&str]) -> Command {
         .env("AI_ENV_BRIDGE_DIR", tmp.join("bridge"))
         .env("AI_ENV_DIR", tmp.join("keys"))
         .env_remove("AI_ENV_BRIDGE_CONFIG")
+        // A debug ai-env that reaches the clipboard runs this instead of the
+        // real /usr/bin/osascript, which would write the user's clipboard:
+        // it fails, so the code under test fails closed. A test that needs
+        // the fake (tests/fakes/osascript.sh) sets the knob after this.
+        .env("AI_ENV_BRIDGE_LAB_OSASCRIPT", "/usr/bin/false")
         .stdin(Stdio::null());
     cmd
 }

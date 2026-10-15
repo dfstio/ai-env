@@ -131,9 +131,11 @@ ai-env keys    add-recipient NAME RECIPIENT [--label TEXT] [--rekey DIR] [--yes]
 ai-env keys    restore NAME [--rekey DIR] [--new-recovery]   # recreate from Strongbox identity
 ai-env rekey   [DIR] [--dry-run] [--yes]                  # re-encrypt containers under DIR
 ai-env verify-recovery NAME                               # the quarterly drill
-ai-env doctor [--json]                                    # environment + repo health check (exit 1 on any [NO ] row)
+ai-env doctor [--json]                                    # environment + repo health check (exit 1 on any [NO ] row);
+                                                          #   its AWS rows only under ai-env as: ai-env as ops -- ai-env doctor
 ai-env gates  [--json] [--only G1,G3] [--out FILE]        # MicroVM bridge pre-code gates → plans/gates.md (bridge feature);
-                                                          #   --only re-measures a subset: nothing is written, go/no-go is not evaluated
+                                                          #   --only re-measures a subset: nothing is written, go/no-go is not evaluated;
+                                                          #   G2 and G7 run as the operator, G7 simulating ai-env-deployer and ai-env-ops
 ai-env wrapper install [--write] [--permission-mode M] [--mode passthrough|remote]   # point Cursor's claudeProcessWrapper at the sibling
                                                           #   ai-env-claude; --mode also sets [wrapper].mode in bridge.toml (S8)
                                                           #   (dry run unless --write; backs up settings.json, and bridge.toml with --mode; bridge feature)
@@ -145,9 +147,15 @@ ai-env infra  pin [--manifest FILE | --check-bundle | --bundle-version] [--lock 
 ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi outputs + a live image read → bridge.toml [aws] + state/infra.toml
 ai-env infra  base-image [--name al2023-1] [--version 1]  # the pinned managed base image is AVAILABLE
 ai-env infra  versions-diff --before F --after F [--record-probe]   # image versions around a deploy (bridge feature)
-ai-env creds  aws-set [--user ai-env-runtime] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin
+ai-env creds  aws-set [--user ai-env-runtime|ai-env-ops] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin:
+                                                          #   ai-env-runtime's into credentials/aws.env, ai-env-ops' into credentials/ops.env
+ai-env creds  aws-verify [--user ai-env-runtime|ai-env-ops]   # one Touch ID: the sealed key alone must answer as its user (retried while IAM propagates)
+ai-env creds  deployer-key [--account ACCOUNT] | deployer-key --clipboard-check   # create-access-key's JSON on stdin → the deployer's
+                                                          #   Strongbox entry through this Mac's concealed clipboard, pasted back, checked;
+                                                          #   never stored here / only a marker, which must not paste on another Apple device
 ai-env creds  setup-token [--stdin|--from-env] [--no-combined] [--force]   # seal the Claude setup-token (asked for hidden) (S7)
-ai-env creds  status [--json] [--unseal] | forget [--yes]  # what is sealed, without Touch ID / delete the token and its copies
+ai-env creds  status [--json] [--unseal] | forget [--yes] [--ops]  # what is sealed, without Touch ID / delete the token and its copies
+                                                          #   (--ops: only credentials/ops.env and its backups; the IAM commands are printed)
 ai-env vm     images [--managed] | list [--all] | status ID | health ID   # MicroVMs of the ai-env image (bridge feature)
 ai-env vm     run [--workspace PATH] [--max-duration S] [--egress internet|vpc] [--shell] [--json] …
 ai-env vm     token ID [--port 8080|8082|9418] [--minutes M] [--reveal]   # the value only with --reveal
@@ -161,10 +169,12 @@ ai-env vm     health ID --detail [--json]                  # /health/detail with
 ai-env box    seed [WORKSPACE] [--branch B] [--no-wip] [--replace] [--dry-run] [--max-mib N] [--json]   # the checkout into its VM at the same path (S8)
 ai-env box    fetch [UUID|WORKSPACE] [--wip] [--dry-run] [--max-mib N] [--json]   # the VM's commits and snapshots → refs/remotes/box/* (S8)
 ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]   # probes → lab/probes.jsonl
-ai-env egress status [--json] | env [--shell] | reload [--if-changed]   # S5 operator commands (the operator's aws CLI; bridge feature)
-ai-env egress allow SLUG HOST [--remove] | suspend HOST [--restore]    # per-workspace extras (global on the proxy) / the kill switch
+ai-env egress status [--json] | env [--shell] | reload [--if-changed]   # S5 operator commands, as ai-env-ops (see Identities; bridge feature)
+ai-env egress allow SLUG HOST [--remove] | suspend HOST [--restore]    # per-workspace extras (global on the proxy; allow: the deployer only) / the kill switch
 ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a vpc VM: direct egress and DNS closed, the allowlist working → state/egress-verified.toml
-ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress)
+ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress), as ai-env-ops
+ai-env as     deployer|ops|root|ambient [--account ACCOUNT] -- CMD ARGS...   # run CMD as one AWS identity, the marker AI_ENV_BRIDGE_AS set (Identities)
+ai-env as     --check deployer|ops|root|ambient                # make's guard: exit 0 when this process already runs as it, else 9
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
 ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
 ```
@@ -184,9 +194,11 @@ stderr: a signal that cuts the last output short leaves it a second more, and a 
 gets none. After SIGTERM or SIGHUP it exits 143, after a Ctrl-C before the command started (or a
 second one while the connection is down) 130, and after a closed stdout 0, whatever the command did.
 
-`ai-env doctor` exits `1` when any row is `[NO ]` and `5` when AWS credentials are unavailable;
-every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings) never
-change the exit code.
+`ai-env doctor` exits `1` when any row is `[NO ]` and `5` when AWS refuses the key of the identity it
+runs under; every row is printed first. Rows marked `[-  ]` (not configured yet) and `[!! ]` (warnings)
+never change the exit code. Doctor never unseals a key: its AWS rows run only under an identity
+`ai-env as` declared, so `ai-env as ops -- ai-env doctor` (one Touch ID) is the full check (see
+Identities).
 
 ### The Cursor wrapper (stages S1–S2)
 
@@ -286,14 +298,22 @@ grant).
 ```sh
 make image-zip                 # vm-build + stage + scan + zip
 make test-docker               # the shim in the base image (L1) and the built image (L2), then `vm exec` on L2; stamps the zip
-make s3-preflight PHASE=a      # build-side preconditions, one row each
-make check-policies preview-scratch   # IAM Access Analyzer + a throwaway-backend Pulumi preview (read-only)
-make deploy                    # (Mike) Pulumi up of infra/ in eu-central-1, then waits for the image build
-make infra-status WRITE=1      # stack outputs (+ the image's live state) → bridge.toml [aws] (comments kept) + state/infra.toml
-make runtime-key               # seal a key of the ai-env-runtime user under the bridge keystore key
-make claude-update             # (Mike, at a terminal) follow the Cursor extension's Claude Code: claude-pin, test-docker,
-                               #   deploy, infra-status WRITE=1, proxy-start, egress check --if-needed (only what is
-                               #   not current; rerun resumes)
+make s3-preflight PHASE=a      # build-side preconditions, one row each; P11 runs ai-env infra base-image, an operator command:
+                               #   an agent in its own account: ai-env as ambient -- make s3-preflight PHASE=a;
+                               #   on this Mac: ai-env as ops -- make s3-preflight PHASE=a
+make check-policies preview-scratch   # IAM Access Analyzer + a throwaway-backend Pulumi preview (read-only; this shell's own
+                               #   credentials, an agent's; on this Mac: ai-env as ops -- make check-policies, and
+                               #   ai-env as deployer -- make preview-scratch, whose program reads the AMI parameter)
+make deploy                    # (deployer: one paste, after the zip is built; the bootstrap as the account root)
+                               #   Pulumi up of infra/ in eu-central-1, then waits for the image build
+make infra-status WRITE=1      # (ops: one Touch ID) stack outputs (+ the image's live state) → bridge.toml [aws] (comments kept)
+                               #   + state/infra.toml
+make runtime-key               # (deployer: one paste) seal a key of the ai-env-runtime user under the bridge keystore key,
+                               #   rebuild combined.env (one Touch ID when a setup-token is sealed), then verify it (one
+                               #   Touch ID); ROTATE=1 replaces it
+make claude-update             # (at a terminal; asks once: the deployer's key when it deploys, else ops' Touch ID) follow the
+                               #   Cursor extension's Claude Code: claude-pin, test-docker, deploy, infra-status WRITE=1, proxy-start,
+                               #   egress check --if-needed (only what is not current; rerun resumes)
 ```
 
 `make claude-update` reads the version of the installed Cursor bundle (`ai-env infra pin
@@ -304,32 +324,52 @@ all three agree it runs `make infra-status WRITE=1`, checks that new VMs start t
 version (a rollback with `make image-deactivate`/`image-activate` stops it, and so does an
 `[aws].image_version` that pins another version or is written in a form the script does not read)
 and runs `ai-env egress check --if-needed`, which starts no VM once the version new VMs run has a
-pass bound to its build and to the connector's live facts. Otherwise
-it checks the preconditions first (not under `make -i`/`-k`, a terminal, the Pulumi passphrase in
-the environment, Docker and the AWS identity answering), then pins, runs `make test-docker` (unless
-it already passed for the current zip), `make deploy` (the plan gate, then Pulumi's own
-confirmation), `make infra-status WRITE=1`, the same active-version check, `make proxy-start` (the
-check needs squid serving) and the egress check for the new image version (one Touch ID). The first
-failure stops it naming the step; running it again resumes (once it has started a deploy, a marker
-in `target/image` makes the rerun finish every remaining step, `make proxy-start` included). Near
-the image-version quota it lists old versions to deactivate, never one a VM still runs. It cannot
-run unattended (Pulumi's confirmation and the Touch ID are the point); Cursor updates the extension
-on its own unless its Auto Update is off. The new `image/claude.lock` is left for review and commit.
+pass bound to its build and to the connector's live facts. It never runs under `make -i`, `-k` or
+`-p`, nor with `BREAKGLASS=1` on its command line (break-glass is `make deploy BREAKGLASS=1`, then
+the steps by hand). Otherwise it checks the preconditions first (a terminal, the Pulumi passphrase
+in the environment, Docker, and a stack that exports its deployer: before the bootstrap there is no
+deployer key, and that deploy is the account root's, "The bootstrap" under Identities), then pins,
+runs `make test-docker` (unless it already passed for the current zip), `make deploy` (the plan
+gate, then Pulumi's own confirmation),
+`make infra-status WRITE=1`, the same active-version check, `make proxy-start` (the check needs
+squid serving) and the egress check for the new image version (its VM costs the runtime key's Touch
+ID). It asks once for the AWS identity the run needs, after the steps that need none (the pin and
+`make test-docker` run without any key) and before the first that does: the deployer's key (one
+paste) when a deploy is due, else ops' Touch ID, announced on stderr as
+`claude-update: this run needs ai-env as deployer (a deploy is due): asking once, …`. Every later
+step runs under that identity, which must be one of the stack's (`claude-update: identity …`; a
+refusal there, after the pin and `make test-docker` ran, says what they left: the new lock and the
+stamp stay, and a rerun goes on from them), and
+under `ai-env as deployer -- make claude-update` it asks for nothing more. The first failure stops
+it naming the step; running it again resumes (once it has started a deploy, a marker in
+`target/image` makes the rerun finish every remaining step, `make proxy-start` included). Near the
+image-version quota it lists old versions to deactivate, never one a VM still runs. It cannot run
+unattended (the paste or Touch ID, Pulumi's confirmation and the check's Touch ID are the point);
+Cursor updates the extension on its own unless its Auto Update is off. The new `image/claude.lock`
+is left for review and commit.
 
-Pulumi state stays in the operator's local backend; `infra/Pulumi.dev.yaml` and
+Pulumi state stays in a local backend on the deploying Mac; `infra/Pulumi.dev.yaml` and
 `infra/config/dev.env` (budget email and limit) are not committed — copy the `.example` files. No
-secret ever enters Pulumi config, outputs or state: the runtime user's access key is created by
-`make runtime-key`, piped straight into `ai-env creds aws-set` and sealed to
-`~/.config/ai-env/bridge/credentials/aws.env`.
+secret ever enters Pulumi config, outputs or state. Pulumi creates the three IAM users
+(`ai-env-runtime`, `ai-env-deployer`, `ai-env-ops`) and their rights, never an access key (an
+`aws.iam.AccessKey` would write its secret into the state; the stack's guard and plan check refuse
+one). Each key is created out of band, `aws iam create-access-key` piped straight into ai-env: the
+runtime user's by `make runtime-key` into `ai-env creds aws-set`, sealed to
+`~/.config/ai-env/bridge/credentials/aws.env`; ai-env-ops' by `make ops-key` (the first one by
+`make operator-keys`) into `ai-env creds aws-set --user ai-env-ops`, sealed to
+`credentials/ops.env`; ai-env-deployer's by `make operator-keys` (later
+`make deployer-key ROTATE=1`) into `ai-env creds deployer-key`, which hands it over to its
+Strongbox entry and writes it to no file (see Identities, below).
 
 ### MicroVM lifecycle (stage S4)
 
 `ai-env vm` starts, inspects and stops MicroVMs of the image S3 deployed. Every command that talks
 to AWS unseals the runtime principal's key from `credentials/aws.env` in-process (one Touch ID per
-command; `[aws] credentials = "profile:<name>"` reads that one profile instead) and never hands it
-to a child process. The region, the control-plane URL and the TLS policy (TLS 1.3 to the MicroVM
-endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code; `AWS_REGION`,
-`AWS_ENDPOINT_URL*`, `AWS_PROFILE` and `~/.aws/config` cannot move them.
+command; `[aws] credentials = "profile:<name>"` reads that one profile instead, a mode refused with
+exit 1 under `ai-env as deployer` or `ai-env as ops`, which hide `~/.aws` from their commands) and
+never hands it to a child process. The region, the control-plane URL and the TLS policy (TLS 1.3 to
+the MicroVM endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code;
+`AWS_REGION`, `AWS_ENDPOINT_URL*`, `AWS_PROFILE` and `~/.aws/config` cannot move them.
 
 - `vm run` always passes an idle policy (`[vm] max_idle_s`, `suspended_s`, `auto_resume`), resolves
   the image version live (`active` = the latest SUCCESSFUL/ACTIVE), writes a pending row under
@@ -354,22 +394,33 @@ endpoint, Amazon Root CA 1–4 only, proxy variables ignored) are pinned in code
 terminate) their own short VMs; `hooks-port`, `hooks-source-ip`, `runtime-env`, `disk-budget` and
 the second pass of `snapshot-uniqueness` read a runtime log (`make logs SINCE=30m > FILE`, then
 `--log FILE`; the shim logs one `ai-env: run-report` line after `/run` and at `/terminate`);
-`cloudtrail-payload ID` asks AWS as the operator's own `aws` identity (within 7 days of the VM's end, while
-its row exists): RunMicrovm is a CloudTrail data event (resource type `AWS::Lambda::MicrovmImage`, off by
-default, never in event history). It checks the trails and the CloudTrail service-linked channels of
-eu-central-1 — CloudWatch's CloudTrail ingestion runs through one, as does Security Lake. A trail or
+`cloudtrail-payload ID` asks AWS as the operator, ai-env-ops (one Touch ID, none under `ai-env as`;
+see Identities), within 7 days of the VM's end while its row exists: RunMicrovm is a CloudTrail data
+event (resource type `AWS::Lambda::MicrovmImage`, off by default, never in event history). It checks
+the trails and the CloudTrail service-linked channels of eu-central-1 — CloudWatch's CloudTrail
+ingestion runs through one, as does Security Lake. A trail or
 CloudWatch channel that takes RunMicrovm → the probe prints how to fetch the record (the trail's S3 log
 file, or an `aws logs filter-log-events … --unmask` command per log group) and reads it with `--log FILE`
 (raw or OCSF CloudWatch records; a CloudWatch copy may be transformed, the row notes where it came from);
 another service's channel → read it there and record with `--manual`; nothing → it prints the
 `--manual not-logged` command to run once you have confirmed what it cannot see (CloudTrail Lake event
 data stores, channels homed in other Regions, organization-level CloudWatch or Security Lake). It never
-records a verdict for what it could not see. The identity needs `cloudtrail:DescribeTrails`,
-`GetEventSelectors`, `ListChannels`, `GetChannel`, `logs:DescribeLogGroups`, and for the printed command
-`logs:FilterLogEvents` and `logs:Unmask`.
+records a verdict for what it could not see. ai-env-ops holds what the probe needs:
+`cloudtrail:DescribeTrails`, `GetEventSelectors`, `ListChannels`, `GetChannel` and
+`logs:DescribeLogGroups`. Reading a CloudTrail log group is the deployer's: it holds
+`logs:FilterLogEvents` and `logs:Unmask` on the log groups whose name holds `cloudtrail`, which ops
+does not (every such group holds the whole account's API record). So the printed
+`aws logs filter-log-events … --unmask` command for a group of this account starts with
+`ai-env as deployer --` (one paste; a bare `aws` has no credentials on this Mac), or with the runner
+the probe ran under when that was `ai-env as ambient` (an agent's session in another account, where
+the stack's deployer does not exist) or `ai-env as root`; its redirect and the
+`ai-env lab run … --log` after it run as printed. An organization trail's group belongs to
+the account that owns the trail: its command is printed without the runner, to run with credentials
+of that account.
 
 ```sh
-make test-aws-readonly         # part A: TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm (read-only)
+make test-aws-readonly         # part A, this shell's own credentials (an agent's account; no runner): TLS to the MicroVM proxy,
+                               #   managed images, ListMicrovms, GetMicrovm (read-only)
 make s4-smoke                  # T4.1: three `vm smoke --max-duration 900 --json` passes → target/s4/smoke.jsonl
 make test-aws [SLOW=1] [PROBES=1]   # the live suite (+ the 6-minute token-expiry test, + re-recorded probes)
 ```
@@ -408,16 +459,30 @@ still get created).
   never in user data. `ai-env-proxy-reload` on the instance validates every line, `squid -k parse`s
   the staged config, swaps it in with `squid.conf` last, restarts squid when a host leaves the set (open
   tunnels close) and rolls back on any failure; squid never starts on the package's default config.
-- **Operator commands** (`ai-env egress …`, `ai-env proxy …`) are the operator's own `aws` CLI calls
-  (region and endpoint pinned; the account must be the connector's), reading the stack's ids from
-  `state/infra.toml`: `egress allow SLUG HOST [--remove]`, `egress suspend HOST [--restore]` (a concurrent
+  What runs on the instance comes only from three fixed SSM Command documents the stack creates from
+  `infra/proxy/documents/`: `ai-env-proxy-reload` (one parameter, `mode`: `apply` or `if-changed`),
+  `ai-env-proxy-status` and `ai-env-proxy-patch`, each sent at `--document-version $DEFAULT`.
+  `AWS-RunShellScript` is never sent, and IAM lets ai-env-ops and ai-env-deployer send these three
+  and nothing else, to the proxy instance only. A `state/infra.toml` that names other documents than
+  this ai-env sends stops the commands with exit 1 (update ai-env, or `make infra-status WRITE=1`).
+- **Operator commands** (`ai-env egress …`, `ai-env proxy …`) call the `aws` CLI as ai-env-ops
+  (region and endpoint pinned; the account must be the connector's): the key of the `ai-env as`
+  runner, else `credentials/ops.env` (one Touch ID per command), never the shell's own AWS settings
+  (see Identities). They read the stack's ids from `state/infra.toml`:
+  `egress allow SLUG HOST [--remove]`, `egress suspend HOST [--restore]` (a concurrent
   write is detected after the fact from the parameter's version, never prevented; any failure after a
   removal says `STILL ALLOWED on the proxy` and exits 7; an AWS service host (`amazonaws.com`,
   `amazonaws.com.cn`, the `.aws` domain) is refused with exit 9, and one already listed shows as drift in
   `egress status`: a VM reads its execution role's keys from IMDS, and those keys work at AWS endpoints
   and nowhere else), `egress reload [--if-changed]`, `egress status` (connector, ENIs, routes, security groups,
   NACL, VPC DNS and DHCP, no endpoints, NAT, peering or IPv6, the proxy serving exactly the parameters
-  the stack rendered; any drift is exit 1), `egress env`, `proxy stop|start|patch`.
+  the stack rendered; any drift is exit 1), `egress env` (no AWS call), `proxy stop|start|patch`.
+  `egress allow` (adding or `--remove`) writes `extras`, which widens what every vpc VM may reach, so
+  it needs the deployer: as ai-env-ops it is refused before any Touch ID or AWS call (exit 9, naming
+  `ai-env as deployer -- ai-env egress allow SLUG HOST`), and IAM denies ai-env-ops that write anyway.
+  `egress suspend` and `--restore` stay ai-env-ops' (`suspended` is the one parameter it may write).
+  An `AccessDenied` from a proxy document ends with
+  `(only ai-env-ops and ai-env-deployer may send the proxy documents: run it under ai-env as ops --)`.
 - **`egress check`** starts its own `--egress vpc --shell` VM and runs, through the platform shell,
   curl and dig cases: direct egress and DNS must be closed, the allowlist must answer (401 from the API)
   and refuse the rest. The case markers are VM-reported, so a pass also needs the VM-independent
@@ -450,23 +515,31 @@ still get created).
   `internet` VM.
 
 ```sh
-make test-proxy                # squid on AL2023 in Docker: the allowlist, rebinding, reload, rollback (+ real systemd)
+make test-proxy                # squid on AL2023 in Docker: the allowlist, rebinding, reload, rollback (+ real systemd); no AWS
 make preview-scratch [EGRESS_MODE=firewall] [NEGATIVE=…]   # read-only Pulumi preview + the plan check and its negatives
-make deploy                    # (Mike) plan check + replacement guard, pulumi up, connector-wait, proxy reload, egress status
-                               # (its preview runs --non-interactive: export PULUMI_CONFIG_PASSPHRASE_FILE for a passphrase stack)
-make infra-status WRITE=1      # adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
-make s5-smoke                  # three `vm smoke --egress vpc --json` passes; the echo must be exactly the connector
-make test-egress               # the live egress tests (direct closed, allowlist, extra + removal, after resume); a skipped proof fails it
-make connector-probe CONFIRM=create-probe-connector   # a throw-away connector: RunMicrovm while PENDING, the activation time (~4.5 min), deleted on every path
-ai-env egress check            # the recorded proof the credential gate needs (re-run after every new image version; --if-needed: none when the version new VMs run has it)
-make egress-logs [FOLLOW=1]    # squid's access log (hosts only, never a path)
-make proxy-stop                # when idle: stops the proxy (no vpc VM has egress then); proxy-start brings it back
+                               #   (this shell's own credentials, an agent's account)
+make deploy                    # (deployer: one paste) plan check + replacement guard, pulumi up, connector-wait, proxy reload,
+                               #   egress status (its preview runs --non-interactive: export PULUMI_CONFIG_PASSPHRASE_FILE
+                               #   for a passphrase stack)
+make infra-status WRITE=1      # (ops: one Touch ID) adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
+make s5-smoke                  # three `vm smoke --egress vpc --json` passes (the runtime key's Touch ID each); the echo must be
+                               #   exactly the connector
+make test-egress               # (deployer: one paste; the VMs' Touch IDs) the live egress tests (direct closed, allowlist,
+                               #   extra + removal, after resume); a skipped proof fails it
+make connector-probe CONFIRM=create-probe-connector   # (deployer: one paste; the probe VM's Touch ID) a throw-away connector:
+                               #   RunMicrovm while PENDING, the activation time (~4.5 min), deleted on every path
+ai-env egress check            # (the ops key's Touch ID, then the runtime key's for its VM; under ai-env as deployer only the
+                               #   VM's) the recorded proof the credential gate needs (re-run after every new image version;
+                               #   --if-needed: no VM when the version new VMs run has it)
+make egress-logs [FOLLOW=1]    # (ops: one Touch ID) squid's access log (hosts only, never a path)
+make proxy-stop                # (ops: one Touch ID) when idle: stops the proxy (no vpc VM has egress then); proxy-start brings it back
 ```
 
 `ai-env doctor` shows `[NO ]` for the egress row while `[egress] require = true` (the default) and no
 connector is configured; a stopped proxy is `[-  ]`, never `[NO ]`. Its DNS row says whether the newest
 `dns-path` verdict is accepted, and shows the exact `accept_platform_dns = "<ip>"` line to write when the
-value names no resolver.
+value names no resolver. The proxy row, like every row that asks AWS, needs an identity: under
+`ai-env as ops -- ai-env doctor` it is checked, otherwise it reads `not checked (no operator identity: …)`.
 
 ### Agent transport (stage S6)
 
@@ -906,7 +979,7 @@ ai-env wrapper settings-sync UUID --rule 'Bash(git status)' --write   # into ima
 ```
 
 ```sh
-make test-docker deploy   # the image with the rule (test-docker builds the zip and stamps it)
+make test-docker deploy   # the image with the rule (test-docker builds the zip and stamps it; deploy asks for the deployer's key)
 ```
 
 **Not supported in a remote chat:**
@@ -1038,6 +1111,214 @@ wrapper's log records both: the transcript knob as `skip_transcript`, the agent 
 `LAB KNOBS ACTIVE` line the CLI prints on stderr. The live Makefile targets drop both, and release
 builds compile them out.
 
+### Identities: the deployer, ops and the runtime key
+
+The AWS side has three IAM users, all made by Pulumi and none with a key in Pulumi (see the S3 notes
+above). Every command that calls AWS runs as one of them, and the account root only for the
+bootstrap and break-glass (below):
+
+- **The deployer**, `ai-env-deployer`, changes the stack: `make deploy` and `make preview`, the
+  stack's five IAM policies (`make deploy-policies`), every access key (its own, ops' and the runtime
+  user's), image versions and connectors, and `ai-env egress allow`; it holds everything ops may do
+  too. Inside the account it is admin-equivalent, so the protection is its key, which lives only in
+  its Strongbox entry (`ai-env-deployer`, in Strongbox's own encrypted database) and in no file
+  ai-env writes. A command that needs it asks once for that entry's two fields, at two no-echo
+  prompts on the terminal, clears the clipboard, and checks the key with sts against the stack's
+  account before anything runs.
+- **Ops**, `ai-env-ops`, runs the daily operator commands: the egress and proxy commands but
+  `egress allow`, `make infra-status`, `make gates`, the read-only image, connector and log targets,
+  `ai-env lab run cloudtrail-payload` and doctor's AWS rows. It may start and stop the proxy
+  instance, send it the three proxy documents, write the `suspended` list and read what those
+  commands read. It may not send any other document or reach any other instance, write `extras`,
+  `allow` or `squid.conf`, make any IAM write (its own key included), pass a role or deploy. Its key
+  is sealed in `credentials/ops.env` under the bridge keystore key, like the runtime key: one Touch ID
+  per command outside a runner, none under `ai-env as`.
+- **The runtime principal**, `ai-env-runtime`, is unchanged: VMs and Cursor sessions, its key in
+  `credentials/aws.env` (and `combined.env`), one Touch ID per credentialed `vm`, `box` or wrapper
+  command.
+
+**The runner.** `ai-env as IDENTITY -- CMD ARGS...` replaces itself with the command, run as one
+identity (the command's exit status is the runner's): `deployer` (the key pasted, as above), `ops`
+(`credentials/ops.env`, one Touch ID), `root` (the shell's own credentials, which must be the
+account root's: the bootstrap and break-glass only) or `ambient` (the shell's own credentials,
+declared and never the root's; their account and rights are not checked, so it is only for an
+agent's read-only session in another account, never for credentials of the stack's account).
+Under `deployer` and `ops` the command gets the key in `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` and nothing that could select other credentials: `AWS_PROFILE`, session
+tokens, role and web-identity variables, `AWS_CONTAINER_*` and `AWS_ENDPOINT_URL*` are removed,
+`AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` point at `/dev/null`, IMDS is off and the
+region is pinned. It also gets the marker `AI_ENV_BRIDGE_AS` (`deployer:ABCD` or `ops:ABCD`, the
+key id's last four characters, or `root`, or `ambient`), which only `ai-env as` sets (never export
+it by hand): a nested `ai-env as`, or a make target, whose identity the marker covers runs at once,
+with no prompt, no Touch ID and no audit row (the deployer covers ops, root covers both, ambient
+covers ops and ambient), and a key marker whose key is no longer in the environment is refused
+(exit 9). A nested `ai-env as root` is refused under every marker, root's own included, and so is
+`ai-env as ambient` under any marker but ambient (exit 9: start it from a terminal of its own);
+make's root tier checks `ai-env as --check root` first, so under the root marker it runs its target
+without nesting one. `ai-env as --check IDENTITY` is make's guard: exit 0 when the marker covers it,
+else 9. A fresh run writes an `as_identity` audit row and ends with one note naming the identity
+and the command, such as `as ai-env-ops (key ...WXYZ, credentials/ops.env): make gates` (an
+account shows as `…9012`); before it, `as deployer` asks for the paste and says it cleared the
+clipboard, and `as root` warns when the stack already has its deployer. The runner's own exits: 1 a
+malformed paste or the stack's account unknown (`--account` names it), 2 a usage error (a malformed
+`--account`, no command after `--`), 3 cancelled, 4 no keystore key, 5 the key refused, no
+terminal, no `ops.env` or no ambient credentials, 7 the deployer key's check failed otherwise, 9
+another user, the root, another account or a marker it does not accept. While the command runs, the
+key sits in the environment of its process tree, where the user's other processes could read it; it
+is gone when the command ends. Never run a shell or another long-lived program under
+`ai-env as deployer` or `ai-env as ops` (such as `ai-env as deployer -- zsh`): the key would stay in
+its environment, and in everything started from it, until it exits. Put several goals in one make
+run instead.
+
+**Nothing falls back to the shell's own AWS settings.** Every `aws` call of an operator command (the
+egress and proxy commands, `infra status` and `infra base-image`, `gates`, `creds aws-set --check`,
+lab's `connector-pending` and `cloudtrail-payload`) runs as the runner's identity, else as ai-env-ops
+from `credentials/ops.env` (unsealed once per process, with the note
+`operator ai-env-ops (key ...WXYZ, credentials/ops.env)`), else not at all: the command stops with
+exit 5 and `no AWS operator identity: …` (`infra status` still writes and exits 0: its live reads
+are skipped and recorded as `live read failed: no AWS operator identity: …`). The shell's own
+credentials (`AWS_PROFILE`, `~/.aws`, exported keys) count only when `ai-env as root` or
+`ai-env as ambient` declared them, and must then be the account root's, or must not be. Once root's
+key is retired (below) the shell holds no AWS credentials at all, so a bare `aws` call fails
+(`Unable to locate credentials`) by design: run it as `ai-env as ops -- aws …`, or as the deployer
+for a write. P8 of `make s3-preflight PHASE=b`, which `make deploy` runs first, admits only the
+stack's deployer: the account root only for the bootstrap or with `BREAKGLASS=1`, never ops, the
+runtime key or another user.
+
+**What each command asks for:**
+
+- the deployer-tier make targets ask for the deployer's key once per top-level make run, after any
+  build (the target's own build runs without the key): `deploy`, `preview` (`REFRESH=1` adds
+  `--refresh`), `deploy-policies`, `runtime-key`, `ops-key`, `deployer-key`, `image-activate`,
+  `image-deactivate`, `image-prune YES=1`, `image-delete`, `connector-probe`, `connector-delete` and
+  `test-egress`; several goals share one paste under
+  `ai-env as deployer -- make preview REFRESH=1 deploy`. These targets never compile with the key:
+  the tiered ones build first without it, `make test-docker` builds, runs Docker and tests without
+  it (`image-zip` and `vm-build` build without it whoever calls them), `make install` builds
+  without it, and `make test-aws` and `make test-aws-readonly` build their tests without it before
+  they run with it. The other build and test targets (`build`, `test`, `lint`, the smokes) keep
+  whatever key their shell holds, so put none of them after `ai-env as deployer --` or into the
+  break-glass terminal (`make test-docker deploy` asks once anyway, after the build);
+- the ops tier asks for one Touch ID: `image-wait`, `image-status`, `image-versions`, `image-builds`,
+  `image-prune` without `YES=1`, `connector-status`, `connector-wait`, `logs`, `egress-logs` and
+  `acceptance`, and the one-command targets `infra-status`, `gates`, `check-base-image`,
+  `proxy-start`, `proxy-stop`, `proxy-patch` and `allowlist-reload`, whose one `ai-env` command
+  resolves its identity itself, as `ai-env egress …` and `ai-env proxy …` typed by hand do; none
+  asks again under `ai-env as ops --` or `ai-env as deployer --`;
+- `ai-env egress allow` needs the deployer (`ai-env as deployer -- ai-env egress allow SLUG HOST`),
+  `ai-env egress check` costs the ops key's Touch ID and then the runtime key's for its VM, and
+  `make claude-update` asks once for the identity the run needs (S3, above);
+- `ai-env doctor` asks for nothing, and its one AWS call is a plain sts call that warns when the
+  shell's own credentials are the account root's; `ai-env as ops -- ai-env doctor` (one Touch ID)
+  adds the rows that call AWS: the operator identity (checked with sts), the deployer's key count
+  (one is the norm), whether the account root still has an access key (a deactivated one counts),
+  the proxy, the base image and the quota. The ops key row (from its file's notes: the user, the
+  last four characters and the day it was sealed) and the deployer row show either way, and
+  `ai-env creds status` shows the ops key and the deployer without a Touch ID;
+- `make -n TARGET` (and `-q`, `-t`) asks for nothing: it shows the runner it would call, then the
+  recipe. Every tiered target refuses `make -i` (a refused identity would be ignored) and `make -p`
+  (`-n` beside it or not: make prints every variable when it ends, and the make under the runner
+  would print the key), before its build or its runner; `make claude-update` refuses both too. A make
+  typed under `ai-env as` holds the key itself and prints it under `-p` whatever the target, so never
+  `-p` there. `make -j` is not for tiered targets (two runners would ask at once);
+- `vm`, `box` and the wrapper's sessions are unchanged: the runtime key's Touch ID.
+
+**When the deployer lacks a right.** A deploy that stops on `AccessDenied` names the action. Add it to
+`infra/policies.ts`, then run `ai-env as deployer -- make deploy-policies deploy` (one paste): the
+deploy's gates, a `pulumi up` of the five stack policies alone, then the deploy. While the stack's
+plan holds one of the five documents unknown, as it does whenever the proxy is to be replaced
+(ai-env-ops' document names the instance), deploy-policies refuses before `pulumi up` (exit 1,
+nothing deployed): its targeted `pulumi up` would render that document from the old instance and
+apply what no check compared. Run `ai-env as deployer -- make deploy` instead: the whole plan
+applies the new document with the rest. If a step still stops on that `AccessDenied` (it ran before
+the policy step had landed), run the deploy again after about 15 s; break-glass is for a policy step
+that is itself refused. The deployer may version its five policies but never create or delete one,
+and may neither detach nor delete itself; the plan check refuses any replace or delete of its user,
+attachments or policies, and any provider replace. G7 of `make gates` proves the split from
+`state/infra.toml`, with no sts call of its own, so its verdict is the same whoever runs it: it
+simulates ai-env-deployer (its four pairs allowed) and ai-env-ops (twenty deploy actions denied), and
+is skipped until `make infra-status WRITE=1` has recorded the two users after the bootstrap.
+
+#### The bootstrap
+
+The full runbook, with what each step prints and costs, is part B0 of `plans/s8-operators-plan.md`.
+In short: once, as the account root, with root's access key in the shell. Until the stack exports a
+deployer, the deployer-tier targets run under `ai-env as root` (said on stderr) and ask for no paste.
+Between `make install` and the bootstrap deploy the egress commands fail: the new ai-env sends proxy
+documents the stack does not have yet. One command at a time:
+
+1. `make test-docker deploy`: Pulumi creates the two new users, their two policies, six attachments
+   and the three proxy documents, replaces the three deploy policies once (their descriptions
+   changed; part B0 first checks that nothing holds them) and updates the image.
+2. `make operator-keys` (the account root, once; a rerun resumes): the deployer's first key goes onto
+   its Strongbox entry through the clipboard, is pasted back and verified, then ai-env-ops' key is
+   sealed into `credentials/ops.env` and verified (one Touch ID). Before it, on this first
+   hand-over, run `ai-env creds deployer-key --clipboard-check` with any clipboard manager or
+   clipboard history off: its marker must not paste on another Apple device. If it does, hand nothing
+   over by either route (the console's copies cross the same clipboard, unmarked): turn off Handoff
+   (System Settings, General, AirDrop & Handoff) and check again.
+3. `make infra-status WRITE=1`, then the checks: `make gates` shows G7 ✓, and
+   `ai-env as deployer -- make preview REFRESH=1 deploy` is the deployer's first run (one paste, no
+   changes).
+4. Retire root's access key: deactivate it in the console (as root, with MFA), check that a bare
+   `aws sts get-caller-identity` now fails, delete it, and remove root's lines from
+   `~/.aws/credentials` and any `AWS_*` export from the shell's startup files. Then
+   `ai-env as ops -- ai-env doctor` shows `the account root has no access key`.
+
+#### Rotation
+
+All three run as the deployer and ask for its key once; each creates the new key, seals or hands it
+over, verifies it, and deletes the old one last:
+
+- `make ops-key ROTATE=1`, which is also how a new Mac gets its ops key, once that Mac has the
+  stack's Pulumi state (the local backend and `infra/Pulumi.dev.yaml`, from the old one) and
+  `state/infra.toml` (copied too, or written by `make infra-status WRITE=1`, which writes it without
+  an operator identity): `ops.sh identity` refuses while the stack's outputs cannot be read, and
+  `ai-env as deployer` takes the stack's account from that file;
+- `make runtime-key ROTATE=1` (`credentials/aws.env`; `combined.env` is rebuilt, as before);
+- `make deployer-key ROTATE=1`: the new key goes onto the Strongbox entry as with
+  `make operator-keys`, and the old key it deletes last is the one the run was started with, so run
+  it alone and paste the new one from then on.
+
+A step that fails says what to delete or restore by hand. A bare `aws` call has no credentials once
+root's key is retired, so every `aws iam …` line it prints starts with the runner that can run it,
+the make target's own and the CLI's alike (the sealing check's two-key refusal, the delete command
+of a key that was not stored or handed over): `ai-env as deployer --` (one paste), or
+`ai-env as root --` when the run was the account root's (`make operator-keys`, break-glass), to
+paste in its terminal. `ai-env creds forget --ops` lists, and with `--yes` removes,
+`credentials/ops.env` and its backups, then prints the IAM commands that delete its key, already in
+that form.
+
+#### Break-glass
+
+The account root is needed again only when the deployer cannot act (its Strongbox entry is lost, or
+its own policies no longer let it fix them) and for teardown. Create a root access key in the console
+(as root, with MFA; copy each value with its copy button and never download the .csv, with Handoff
+and any clipboard history off) and load it into one terminal without echo; the line then clears the
+clipboard:
+
+```sh
+read -rs 'AWS_ACCESS_KEY_ID?root access key id: '; echo; read -rs 'AWS_SECRET_ACCESS_KEY?root secret access key: '; echo; pbcopy </dev/null; export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+```
+
+Then run the one command needed, with `BREAKGLASS=1` on the make command line (exported, it is
+ignored): for a lost Strongbox entry `make deployer-key ROTATE=1 BREAKGLASS=1`, when self-management
+broke `make deploy BREAKGLASS=1`, for teardown `make destroy CONFIRM=destroy-dev BREAKGLASS=1`. The
+target runs under `ai-env as root`, says so on stderr, and P8 shows `[-  ] P8 BREAK-GLASS: …`.
+Destroy is the account root's alone, since it deletes the operator users themselves; its checklist
+adds the two users, every `ai-env-*` policy, `credentials/ops.env`, the Strongbox entry and root's
+key. Afterwards, in the same terminal:
+
+```sh
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+```
+
+and delete root's access key in the console again. Then
+`ai-env as ops -- ai-env doctor | sed -E 's/[0-9]{12}/ACCOUNT/'` must show
+`[ok ] the account root has no access key` (a deactivated key still counts). A teardown leaves no
+ops key for that check: there, the console's Access keys list must be empty (the checklist's item
+15).
+
 ### Access-control policies (`keygen --access-control`)
 
 `any-biometry-or-passcode` (default — Touch ID with password fallback; works in clamshell) ·
@@ -1118,6 +1399,13 @@ the diffs annoy you.
 - A MicroVM whose egress echo is not exactly what its egress requires is terminated and never
   returned, reused or adopted (S5); no credential enters a VM that `egress::credential_gate`
   refuses.
+- An operator command's `aws` children run as exactly one identity: the key of the `ai-env as`
+  runner, else the sealed `credentials/ops.env`; the shell's own AWS settings only when
+  `ai-env as root` or `ai-env as ambient` declared them. A key reaches a child through its
+  environment only, ai-env never writes the deployer's key to a file (it lives in its Strongbox
+  entry only), ai-env-ops is refused
+  `egress allow` before any AWS call, and every proxy command sends one of the stack's three
+  documents, never `AWS-RunShellScript` (S8 operators).
 
 ## Workspace
 
@@ -1140,7 +1428,8 @@ make check-bins check-features check-msrv         # packaging invariants
 make vm-build                                     # cargo lambda build --arm64 (shim only) → image/ai-env
 make image-zip test-docker                        # the S3 image: stage + scan + zip, then the opt-in Docker tests
 make vm-run ARGS='shim --help'                    # run image/ai-env inside the AL2023 arm64 base image
-make gates                                        # G1–G8 pre-code gates → plans/gates.md
+make gates                                        # G1–G8 pre-code gates → plans/gates.md (ops: one Touch ID, none under
+                                                  #   ai-env as; G7 simulates ai-env-deployer and ai-env-ops)
 cargo test                                        # everything except hardware
 AI_ENV_SE_TESTS=1 cargo test -- --ignored         # real enclave round-trips (this Mac only)
 ```

@@ -75,13 +75,14 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// Variables a developer's shell may carry that would steer the wrapper, the
 /// fake claude, the fake age or the fake git (S7's `local-scratch` login: the
 /// keystore, the token's descriptor and the unseal; S8's VM pin, its
-/// transcript knob and the knobs of the remote session's fakes); removed
-/// from every harness run before the test's own `envs`. Every
+/// transcript knob and the knobs of the remote session's fakes; the S8
+/// operators' `ai-env as` marker and the pasteboard's osascript knob);
+/// removed from every harness run before the test's own `envs`. Every
 /// `AI_ENV_BRIDGE_*` knob the code reads is here but the bridge root, and
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 78] = [
+pub const REMOVED_ENV: [&str; 80] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -101,6 +102,9 @@ pub const REMOVED_ENV: [&str; 78] = [
     "AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS",
     "AI_ENV_BRIDGE_LAB_TRANSCRIPT",
     "AI_ENV_BRIDGE_TRACE",
+    // S8 operators: the marker `ai-env as` leaves, and the pasteboard's osascript (debug builds).
+    "AI_ENV_BRIDGE_AS",
+    "AI_ENV_BRIDGE_LAB_OSASCRIPT",
     "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",

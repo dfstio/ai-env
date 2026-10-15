@@ -89,7 +89,9 @@ const DEADLINE: Duration = Duration::from_secs(120);
 
 /// `common::run` under [`DEADLINE`] (this shadows it for the whole file): the
 /// output is drained on two threads, the child killed when the deadline
-/// passes and the test failed naming the command.
+/// passes and the test failed naming the command by its program and
+/// arguments only (S8 operators: its environment holds the operator's key,
+/// and std's `Debug` of a `Command` prints every variable set on it).
 fn run(cmd: &mut Command) -> Output {
     use std::io::Read;
     use std::process::Stdio;
@@ -111,7 +113,8 @@ fn run(cmd: &mut Command) -> Output {
         if start.elapsed() > DEADLINE {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{cmd:?} still running after {DEADLINE:?}: killed");
+            let args: Vec<_> = cmd.get_args().collect();
+            panic!("{} {args:?} still running after {DEADLINE:?}: killed", cmd.get_program().to_string_lossy());
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -186,7 +189,10 @@ fn fake_bin(t: &Path) -> PathBuf {
 /// fake holds no image (ResourceNotFoundException) unless a test sets
 /// `FAKE_AWS_IMAGE_STATE`, and answers no `get-network-connector` (exit 2,
 /// "unsupported command") unless a test sets `FAKE_AWS_ANSWERS` (see
-/// [`answers`]); no `FAKE_AWS_*` of the developer's shell leaks in.
+/// [`answers`]); no `FAKE_AWS_*` of the developer's shell leaks in. S8
+/// operators: run as `ai-env as ops` leaves it (the ops key and its marker:
+/// the live reads are the operator's); a test that needs another identity
+/// sets it after this.
 fn infra_status(t: &Path, args: &[&str]) -> Command {
     let mut all = vec!["infra", "status"];
     all.extend_from_slice(args);
@@ -197,6 +203,7 @@ fn infra_status(t: &Path, args: &[&str]) -> Command {
             cmd.env_remove(&k);
         }
     }
+    cmd.envs(super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL));
     cmd
 }
 
@@ -581,6 +588,81 @@ fn status_refuses_a_foreign_or_managed_connector_and_a_public_proxy_ip() {
     assert!(stderr(&o).contains("is in account 999999999999, but the stack's accountId is in account 123456789012; nothing written"), "{}", stderr(&o));
     assert!(!log.exists(), "no aws call");
     assert_eq!(tree(&bridge(t)), before, "nothing under the bridge dir changed");
+}
+
+/// S8 operators: the operator users, their policies and the proxy's SSM
+/// documents land in `state/infra.toml`; a user output of another account
+/// or name, or a document this ai-env does not send, is refused like a
+/// foreign connector (exit 7, before any aws call, nothing written).
+#[test]
+fn status_records_the_operator_identities_and_refuses_foreign_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let mut v = outputs("eu-central-1");
+    let operator_outputs = [
+        ("deployerUserName", "ai-env-deployer"),
+        ("deployerUserArn", "arn:aws:iam::123456789012:user/ai-env-deployer"),
+        ("opsUserName", "ai-env-ops"),
+        ("opsUserArn", "arn:aws:iam::123456789012:user/ai-env-ops"),
+        ("deployerPolicyArn", "arn:aws:iam::123456789012:policy/ai-env-deployer"),
+        ("opsPolicyArn", "arn:aws:iam::123456789012:policy/ai-env-ops"),
+        ("proxyReloadDocument", "ai-env-proxy-reload"),
+        ("proxyStatusDocument", "ai-env-proxy-status"),
+        ("proxyPatchDocument", "ai-env-proxy-patch"),
+    ];
+    for (k, value) in operator_outputs {
+        v[k] = serde_json::json!(value);
+    }
+    let json = write_json(t, "outputs.json", &v);
+    let o = run(&mut infra_status(t, &["--json-in", json.to_str().unwrap(), "--write"]));
+    assert!(o.status.success(), "{}{}", stdout(&o), stderr(&o));
+    let s = read_infra_state(&Paths::from_root_and_env(bridge(t), None)).unwrap().unwrap();
+    assert_eq!((s.deployer_user_arn.as_deref(), s.ops_user_arn.as_deref()), (Some("arn:aws:iam::123456789012:user/ai-env-deployer"), Some("arn:aws:iam::123456789012:user/ai-env-ops")));
+    assert_eq!((s.proxy_reload_document.as_deref(), s.proxy_status_document.as_deref(), s.proxy_patch_document.as_deref()), (Some("ai-env-proxy-reload"), Some("ai-env-proxy-status"), Some("ai-env-proxy-patch")));
+    let before = tree(&bridge(t));
+    let log = t.join("aws.log");
+    for (key, bad, want) in [
+        ("deployerUserArn", "arn:aws:iam::999999999999:user/ai-env-deployer", "is not arn:aws:iam::123456789012:user/ai-env-deployer (the stack's account, the user's name); nothing written"),
+        ("opsUserArn", "arn:aws:iam::123456789012:user/rust", "is not arn:aws:iam::123456789012:user/ai-env-ops (the stack's account, the user's name); nothing written"),
+        ("proxyReloadDocument", "AWS-RunShellScript", "is not ai-env-proxy-reload, the document this ai-env sends: update ai-env; nothing written"),
+    ] {
+        let mut bad_outputs = v.clone();
+        bad_outputs[key] = serde_json::json!(bad);
+        let json = write_json(t, &format!("bad-{key}.json"), &bad_outputs);
+        let o = run(infra_status(t, &["--json-in", json.to_str().unwrap(), "--write"]).env("FAKE_AWS_LOG", &log));
+        assert_eq!(o.status.code(), Some(7), "{key}: {}{}", stdout(&o), stderr(&o));
+        assert_eq!(stderr(&o), format!("ai-env: stack output {key} {bad:?} {want}\n"));
+        assert_eq!(stdout(&o), "", "{key}: nothing shown either");
+    }
+    assert!(!log.exists(), "no aws call");
+    assert_eq!(tree(&bridge(t)), before, "nothing changed");
+}
+
+/// S8 operators: without an operator identity (no `ai-env as …`, no sealed
+/// `credentials/ops.env`) the live reads are skipped, never made on the
+/// shell's own credentials: a note says how to give one, the state records
+/// both reads as failed and why, and the write still happens.
+#[test]
+fn status_without_an_identity_records_the_live_reads_as_not_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let json = write_json(t, "outputs.json", &outputs("eu-central-1"));
+    let log = t.join("aws.log");
+    let no_operator = "no AWS operator identity: no ai-env as … runs this command and the ops key is not sealed (credentials/ops.env): seal it with ai-env as deployer -- make ops-key, or run the command under ai-env as deployer --";
+    let o = run(infra_status(t, &["--json-in", json.to_str().unwrap(), "--write"])
+        .env("AI_ENV_BRIDGE_AS", "")
+        .env("AWS_ACCESS_KEY_ID", "")
+        .env("AWS_SECRET_ACCESS_KEY", "")
+        .env("FAKE_AWS_LOG", &log)
+        .env("FAKE_AWS_IMAGE_STATE", "UPDATED"));
+    assert!(o.status.success(), "a skipped read never blocks the write: {}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).lines().any(|l| l == "ai-env: no AWS operator identity: the live reads are skipped (ai-env as ops -- make infra-status)"), "{}", stderr(&o));
+    assert!(stdout(&o).contains(&format!("image state: CREATED from the stack outputs; the live get-microvm-image failed: {no_operator}\n")), "{}", stdout(&o));
+    assert!(!log.exists(), "never the shell's own credentials");
+    let s = read_infra_state(&Paths::from_root_and_env(bridge(t), None)).unwrap().unwrap();
+    let failed = format!("pulumi outputs (live read failed: {no_operator})");
+    assert_eq!((s.image_state.as_deref(), s.image_state_source.as_deref()), (Some("CREATED"), Some(failed.as_str())));
+    assert_eq!((s.connector_state.as_deref(), s.connector_state_source.as_deref()), (None, Some(failed.as_str())));
 }
 
 /// The live connector read fails (the fake answers exit 254 with the CLI's

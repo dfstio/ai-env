@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "2.2",
+  "description": "ai-env egress proxy: security updates of the latest AL2023 release, then a squid restart",
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "patch",
+      "inputs": {
+        "timeoutSeconds": "1800",
+        "runCommand": [
+          "set -e",
+          "echo \"before: $(rpm -q system-release) $(rpm -q squid)\"",
+          "dnf -y upgrade --security --releasever=latest",
+          "echo \"after: $(rpm -q system-release) $(rpm -q squid)\"",
+          "systemctl restart squid"
+        ]
+      }
+    }
+  ]
+}

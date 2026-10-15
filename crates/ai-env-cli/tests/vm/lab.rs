@@ -189,12 +189,19 @@ impl Ct {
         if let Some(l) = &log_arg {
             args.extend(["--log", l.as_str()]);
         }
-        let mut c = self.w.cmd(&args);
-        c.env("PATH", &self.path).env("FAKE_AWS_LOG", &self.aws_log);
+        let mut c = self.cmd(&args);
         for (k, v) in env {
             c.env(k, v);
         }
         c.output().unwrap()
+    }
+
+    /// `ai-env <args>` with the fake aws first on PATH, its calls logged, run
+    /// as `ai-env as ops` leaves it (S8 operators: the ops key and its marker).
+    fn cmd(&self, args: &[&str]) -> std::process::Command {
+        let mut c = self.w.cmd(args);
+        c.env("PATH", &self.path).env("FAKE_AWS_LOG", &self.aws_log).envs(crate::aws_keys::identity_env("ops", crate::aws_keys::OPS_TAIL));
+        c
     }
 
     fn rows(&self) -> Vec<serde_json::Value> {
@@ -267,8 +274,21 @@ fn lab_cloudtrail_fixture_verdicts() {
     assert_eq!(code(&cw), 1, "{}", stderr(&cw));
     let err = stderr(&cw);
     assert!(err.contains(&format!("--log-group-name 'aws-cloudtrail-logs-1' --filter-pattern '\"{id}\"'")) && !err.contains("aws-cloudtrail-logs-1:*"), "{err}");
+    assert!(err.contains("aws-cloudtrail-logs-1: ai-env as deployer -- aws logs filter-log-events --region eu-central-1 "), "this account's group, read as ai-env-deployer (A11): {err}");
     assert!(err.contains("s3://trail-bucket/p/AWSLogs/"), "the S3 route stays next to the CloudWatch command: {err}");
     assert!(!t.calls().lines().any(|l| l.starts_with("logs ")), "{}", t.calls());
+    // gap-a: under the account root's runner, or an ambient one (SKILL.md's route for another account, whose own
+    // credentials the probe read: the stack's deployer does not exist there), the command starts with that runner.
+    for (word, caller) in [("ambient", "rust"), ("root", "root")] {
+        let mut c = t.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+        c.env("AI_ENV_BRIDGE_AS", word).env("FAKE_AWS_CALLER", caller).env_remove("AWS_ACCESS_KEY_ID").env_remove("AWS_SECRET_ACCESS_KEY");
+        c.env("FAKE_AWS_TRAILS_FILE", &to_cw).env("FAKE_AWS_SELECTORS_FILE", &selectors);
+        let o = c.output().unwrap();
+        assert_eq!(code(&o), 1, "{word}: {}", stderr(&o));
+        let err = stderr(&o);
+        let cmd = format!("aws-cloudtrail-logs-1: ai-env as {word} -- aws logs filter-log-events --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com --log-group-name 'aws-cloudtrail-logs-1' ");
+        assert!(err.contains(&cmd) && !err.contains("ai-env as deployer --"), "{word}: {err}");
+    }
     // A group in another Region: no command, never another --region.
     let far = trail(serde_json::json!({"CloudWatchLogsLogGroupArn": "arn:aws:logs:us-east-1:123456789012:log-group:far-group:*"}));
     let o = t.lab(&[("FAKE_AWS_TRAILS_FILE", &far), ("FAKE_AWS_SELECTORS_FILE", &selectors)], None);
@@ -281,6 +301,7 @@ fn lab_cloudtrail_fixture_verdicts() {
     assert_eq!(code(&o), 1, "{}", stderr(&o));
     let err = stderr(&o);
     assert!(err.contains("an organization trail owned by account 123456789012") && err.contains("run it with credentials of account 123456789012") && err.contains("--log-group-name 'aws-cloudtrail-logs-org'"), "{err}");
+    assert!(err.contains("which owns the group): aws logs filter-log-events ") && !err.contains("ai-env as "), "the owner account's credentials, never a key of this stack: {err}");
     // A trail entry without TrailARN, and a covering trail next to an unreadable channel: exit 7, no hints.
     let nameless = t.write("trails-noarn.json", serde_json::json!({"trailList": [{"Name": "t"}]}));
     let o = t.lab(&[("FAKE_AWS_TRAILS_FILE", &nameless)], None);
@@ -291,8 +312,8 @@ fn lab_cloudtrail_fixture_verdicts() {
     assert!(!stderr(&o).contains("s3://"), "{}", stderr(&o));
     // What cannot be read fails closed (exit 7, nothing recorded): the listings and a trail's selectors.
     for (op, env) in [("cloudtrail describe-trails", vec![]), ("cloudtrail list-channels", vec![]), ("cloudtrail get-event-selectors", vec![("FAKE_AWS_TRAILS_FILE", trails.as_path())])] {
-        let mut c = t.w.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
-        c.env("PATH", &t.path).env("FAKE_AWS_LOG", &t.aws_log).env("FAKE_AWS_FAIL_OP", op);
+        let mut c = t.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+        c.env("FAKE_AWS_FAIL_OP", op);
         for (k, v) in &env {
             c.env(k, v);
         }
@@ -378,9 +399,11 @@ fn lab_cloudtrail_channels_and_cloudwatch() {
     assert_eq!(code(&o), 1, "{}", stderr(&o));
     let err = stderr(&o);
     let start_ms = (ai_env_cli::wire::time::parse_rfc3339_utc(&t.created).unwrap() - 300) * 1000;
+    // S8 operators: as ai-env-deployer, whose key reads them unmasked (contracts A11; the shell's own aws CLI has no key
+    // once root's is retired).
     for (g, n) in [("aws/cloudtrail/data", 1), ("aws-cloudtrail-logs-7", 2)] {
         let cmd = format!(
-            "aws logs filter-log-events --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com --log-group-name '{g}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json"
+            "{g}: ai-env as deployer -- aws logs filter-log-events --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com --log-group-name '{g}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json"
         );
         assert!(err.contains(&cmd), "{g}: {err}");
     }
@@ -389,10 +412,18 @@ fn lab_cloudtrail_channels_and_cloudwatch() {
     assert!(err.contains("aws/cloudtrail/newclass (log class unknown") && !err.contains("--log-group-name 'aws/cloudtrail/newclass'"), "{err}");
     assert!(err.contains("a name this probe does not print into a command") && !err.contains("bad'name'"), "an unsafe name never reaches a command: {err}");
     assert!(!err.contains("--manual not-logged"), "{err}");
-    // No group found: find it by hand, never the not-logged command.
+    // No group found: find it by hand, never the not-logged command; fetched as the deployer (A11).
     let o = with(&listing("l-cw2.json", &[&cw], None), &[]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
     assert!(stderr(&o).contains("find its log group") && !stderr(&o).contains("--manual not-logged"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("fetch the record with ai-env as deployer -- aws logs filter-log-events --unmask, then:"), "{}", stderr(&o));
+    // gap-a: an ambient probe (another account's own credentials) names its own runner, in the prose too.
+    let mut c = t.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+    c.env("AI_ENV_BRIDGE_AS", "ambient").env_remove("AWS_ACCESS_KEY_ID").env_remove("AWS_SECRET_ACCESS_KEY");
+    c.env("FAKE_AWS_CHANNELS_FILE", listing("l-cw2a.json", &[&cw], None)).env("FAKE_AWS_CHANNEL_DIR", &chan_dir);
+    let o = c.output().unwrap();
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("fetch the record with ai-env as ambient -- aws logs filter-log-events --unmask, then:") && !stderr(&o).contains("ai-env as deployer --"), "{}", stderr(&o));
     // Security Lake, and a service channel whose selectors cannot be read: read it there, record by hand — and
     // no logs call (the log groups are only asked for with a CloudWatch keeper).
     for (arn, why) in [(&sl, "its selectors take RunMicrovm"), (&blind, "its selectors cannot be read")] {
@@ -423,8 +454,8 @@ fn lab_cloudtrail_channels_and_cloudwatch() {
     assert_eq!(code(&o), 1, "{}", stderr(&o));
     assert!(stderr(&o).contains("aws/cloudtrail/data") && !stderr(&o).contains("--manual not-logged"), "{}", stderr(&o));
     // Endless pages: the bound fails closed.
-    let mut c = t.w.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
-    c.env("PATH", &t.path).env("FAKE_AWS_LOG", &t.aws_log).env("FAKE_AWS_CHANNELS_ENDLESS", "1");
+    let mut c = t.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+    c.env("FAKE_AWS_CHANNELS_ENDLESS", "1");
     let o = c.output().unwrap();
     assert_eq!(code(&o), 7, "{}", stderr(&o));
     assert!(stderr(&o).contains("more than 50 pages"), "{}", stderr(&o));
@@ -441,8 +472,8 @@ fn lab_cloudtrail_channels_and_cloudwatch() {
     let missing = listing("l-missing.json", &["arn:aws:cloudtrail:eu-central-1:123456789012:channel/nodoc"], None);
     let o = with(&missing, &[]);
     assert_eq!(code(&o), 7, "{}", stderr(&o));
-    let mut c = t.w.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
-    c.env("PATH", &t.path).env("FAKE_AWS_LOG", &t.aws_log).env("FAKE_AWS_CHANNELS_FILE", listing("l-cw3.json", &[&cw], None)).env("FAKE_AWS_CHANNEL_DIR", &chan_dir).env("FAKE_AWS_FAIL_OP", "logs describe-log-groups");
+    let mut c = t.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+    c.env("FAKE_AWS_CHANNELS_FILE", listing("l-cw3.json", &[&cw], None)).env("FAKE_AWS_CHANNEL_DIR", &chan_dir).env("FAKE_AWS_FAIL_OP", "logs describe-log-groups");
     let o = c.output().unwrap();
     assert_eq!(code(&o), 7, "{}", stderr(&o));
     assert!(t.rows().is_empty(), "nothing recorded so far");
@@ -471,8 +502,8 @@ fn lab_cloudtrail_channels_and_cloudwatch() {
     // Every aws call: one of the five read-only operations, --region eu-central-1, its service's pinned endpoint —
     // with AWS_ENDPOINT_URL set.
     t.reset_calls();
-    let mut c = t.w.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
-    c.env("PATH", &t.path).env("FAKE_AWS_LOG", &t.aws_log).env("AWS_ENDPOINT_URL", "http://127.0.0.1:9");
+    let mut c = t.cmd(&["lab", "run", "cloudtrail-payload", id.as_str()]);
+    c.env("AWS_ENDPOINT_URL", "http://127.0.0.1:9");
     let selectors = t.write("selectors-all.json", serde_json::json!({"AdvancedEventSelectors": data_selectors()}));
     let trails = t.write("trails-all.json", serde_json::json!({"trailList": [{"Name": "t", "TrailARN": "arn:aws:cloudtrail:eu-central-1:123456789012:trail/t", "HomeRegion": "eu-central-1", "S3BucketName": "b"}]}));
     c.env("FAKE_AWS_CHANNELS_FILE", listing("l-all.json", &[&rex, &cw], None)).env("FAKE_AWS_CHANNEL_DIR", &chan_dir).env("FAKE_AWS_TRAILS_FILE", &trails).env("FAKE_AWS_SELECTORS_FILE", &selectors);
@@ -905,7 +936,8 @@ fn fake_aws(w: &World) -> (PathBuf, PathBuf) {
 
 /// `ai-env <args>` in `w` with the fake aws first on a pinned PATH (each
 /// call logged to `aws.log`; sts must carry its endpoint too), its answers,
-/// a Parameter Store, and `env`.
+/// a Parameter Store, run as `ai-env as ops` leaves it (S8 operators: the ops
+/// key and its marker), and `env`.
 fn s5_run_env(w: &World, args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
     let (bin, answers) = fake_aws(w);
     // Every run starts the per-operation call counters (`<op>.N.json` answers) afresh.
@@ -916,6 +948,7 @@ fn s5_run_env(w: &World, args: &[&str], env: &[(&str, &Path)]) -> std::process::
     }
     let mut c = w.cmd(args);
     c.env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("FAKE_AWS_LOG", w.root().join("aws.log")).env("FAKE_AWS_PIN_ALL", "1").env("FAKE_AWS_ANSWERS", &answers).env("FAKE_AWS_SSM_DIR", w.root().join("ssm"));
+    c.envs(crate::aws_keys::identity_env("ops", crate::aws_keys::OPS_TAIL));
     for (k, v) in env {
         c.env(k, v);
     }
@@ -1234,8 +1267,8 @@ fn green_network_with(vm_toml: &str, extras: &str, suspended: &str) -> World {
     let counts = format!("allowed={} extras={} suspended={}", parse_hosts(NET_ALLOW).unwrap().len(), parse_extras(&extras).unwrap().len(), parse_hosts(&suspended).unwrap().len());
     let status = format!("squid-6.13-1.amzn2023.0.1.aarch64\nsquid=active {counts} {} parse=ok applied=yes\n", sums.join(" "));
     let invocation = serde_json::json!({
-        "CommandId": "0b1c2d3e-0000-4000-8000-000000000001", "InstanceId": "i-0123456789abcdef0", "Comment": "ai-env", "DocumentName": "AWS-RunShellScript",
-        "DocumentVersion": "$DEFAULT", "PluginName": "aws:runShellScript", "ResponseCode": 0, "ExecutionStartDateTime": "2026-10-01T10:00:00.100Z",
+        "CommandId": "0b1c2d3e-0000-4000-8000-000000000001", "InstanceId": "i-0123456789abcdef0", "Comment": "ai-env", "DocumentName": "ai-env-proxy-status",
+        "DocumentVersion": "$DEFAULT", "PluginName": "status", "ResponseCode": 0, "ExecutionStartDateTime": "2026-10-01T10:00:00.100Z",
         "ExecutionElapsedTime": "PT0.4S", "ExecutionEndDateTime": "2026-10-01T10:00:00.500Z", "Status": "Success", "StatusDetails": "Success",
         "StandardOutputContent": status, "StandardOutputUrl": "", "StandardErrorContent": "", "StandardErrorUrl": "",
         "CloudWatchOutputConfig": {"CloudWatchLogGroupName": "", "CloudWatchOutputEnabled": false}

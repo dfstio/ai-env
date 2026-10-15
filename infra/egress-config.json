@@ -17,5 +17,8 @@
   "operatorRoleName": "ai-env-egress-operator",
   "proxyInstanceProfileName": "ai-env-egress-proxy",
   "vmSecurityGroupName": "ai-env-vm-egress",
-  "proxySecurityGroupName": "ai-env-proxy"
+  "proxySecurityGroupName": "ai-env-proxy",
+  "reloadDocumentName": "ai-env-proxy-reload",
+  "statusDocumentName": "ai-env-proxy-status",
+  "patchDocumentName": "ai-env-proxy-patch"
 }

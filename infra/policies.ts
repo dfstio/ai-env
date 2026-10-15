@@ -1,5 +1,5 @@
 // Every IAM document of the ai-env stack, as pure functions of (account id, region, names). The scratch:* markers are
-// edited by `make preview-scratch NEGATIVE=iam-widen` in a scratch copy.
+// edited by `make preview-scratch NEGATIVE=iam-widen|identity-widen` in a scratch copy.
 //
 // Why pure: the same documents are created by Pulumi (iam.ts) and checked before any deploy by
 // `make check-policies` (scripts/print-policies.ts → Access Analyzer validate-policy + simulate-custom-policy),
@@ -19,6 +19,12 @@
 // the deploy policy. CreateNetworkConnector is the only connector call with the lambda:SubnetIds /
 // lambda:SecurityGroupIds keys (IAM service reference, 1 Oct 2026); the network-connector resource type is the
 // account's `network-connector:*`.
+//
+// S8 operators (plans/s8-operators-plan.md §1) adds the operator identities: the users ai-env-deployer (its key in
+// Strongbox only, pasted per command) and ai-env-ops (its key sealed in credentials/ops.env, opened by Touch ID), the
+// deployer's supplement ai-env-deployer and ai-env-ops' own policy. The deployer holds the three deploy policies, its
+// supplement and ai-env-ops; ops holds ai-env-ops alone. Every key is issued out of band (D17, D23): no document here
+// is ever a key's, and the stack holds no access key.
 
 /** The one region: the MicroVM API answers 403 elsewhere. Never taken from config or the environment. */
 export const REGION = "eu-central-1";
@@ -32,6 +38,50 @@ export const DEPLOY_POLICY_NAME = "ai-env-deploy";
 /** S5: the egress statements of the deploy policy, in two more documents (one managed policy holds at most 6144 characters). */
 export const DEPLOY_EGRESS_POLICY_NAME = "ai-env-deploy-egress";
 export const DEPLOY_DNS_POLICY_NAME = "ai-env-deploy-dns";
+/** S8 operators: the deploy identity, whose long-term key lives in Strongbox only (`ai-env as deployer`). */
+export const DEPLOYER_USER_NAME = "ai-env-deployer";
+/** S8 operators: the daily operator, whose key is sealed in credentials/ops.env (`ai-env as ops`, one Touch ID). */
+export const OPS_USER_NAME = "ai-env-ops";
+/** The deployer's supplement: the ops user and its key, the deployer's own keys and policy attachments. */
+export const DEPLOYER_POLICY_NAME = "ai-env-deployer";
+/** The operator's policy, held by ai-env-ops and by ai-env-deployer (the deployer covers ops). */
+export const OPS_POLICY_NAME = "ai-env-ops";
+/** The managed policies ai-env-deployer holds: five of the ten a user may hold. */
+export const DEPLOYER_POLICIES = [DEPLOY_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOYER_POLICY_NAME, OPS_POLICY_NAME] as const;
+/** The stack's managed policies: exactly the deployer's five (it manages their versions, never creates or deletes one). */
+export const STACK_POLICIES: readonly string[] = DEPLOYER_POLICIES;
+/** The stack's IAM users. None has an access key in the stack, ever (D17, D23): keys are issued out of band. */
+export const STACK_USERS = [RUNTIME_USER_NAME, OPS_USER_NAME, DEPLOYER_USER_NAME] as const;
+/** Which user holds which managed policy: the deployer its five, ops its one; nothing else is ever attached. */
+export const USER_POLICY_ATTACHMENTS: readonly (readonly [string, string])[] = [
+    ...DEPLOYER_POLICIES.map((p) => [DEPLOYER_USER_NAME, p] as const),
+    [OPS_USER_NAME, OPS_POLICY_NAME],
+];
+/** The Pulumi (and plan) name of a user's policy attachment: `<user>--<policy>`. */
+export function attachmentName(user: string, policy: string): string {
+    return `${user}--${policy}`;
+}
+/**
+ * The managed policies' descriptions, frozen at the bootstrap: IAM cannot update a description in place, so a change
+ * replaces the policy, which check-plan refuses once the stack has its deployer (an attached policy cannot be
+ * deleted mid-deploy). ASCII only. A Map, never an object literal: a name like `constructor` finds nothing.
+ */
+export const POLICY_DESCRIPTIONS: ReadonlyMap<string, string> = new Map([
+    [DEPLOY_POLICY_NAME, "ai-env deploy/destroy (held by ai-env-deployer): Cloud Control, the image, bucket, logs, budget, roles, the runtime user and the stack's managed policies"],
+    [DEPLOY_EGRESS_POLICY_NAME, "ai-env deploy/destroy, egress side (held by ai-env-deployer): VPC, security groups, proxy instance, parameters, SSM documents, roles"],
+    [DEPLOY_DNS_POLICY_NAME, "ai-env deploy/destroy, egress dnsMode firewall (held by ai-env-deployer): DNS Firewall and query logging"],
+    [DEPLOYER_POLICY_NAME, "ai-env deployer identity (held by ai-env-deployer): the ai-env-ops user and its key, the deployer's own keys and policy attachments"],
+    [OPS_POLICY_NAME, "ai-env operator (held by ai-env-ops and ai-env-deployer): proxy start/stop, the fixed proxy SSM documents, the suspended list, read-only status"],
+]);
+/** The frozen description of one of the stack's managed policies (throws for any other name). */
+export function policyDescription(name: string): string {
+    const d = POLICY_DESCRIPTIONS.get(name);
+    if (d === undefined) throw new Error(`policyDescription: ${name} is not one of the stack's managed policies (${STACK_POLICIES.join(", ")})`);
+    return d;
+}
+/** The two service quotas ai-env reads (doctor's MicroVM memory row, preflight P15's VPC count). */
+export const MICROVM_MEMORY_QUOTA = "lambda/L-CD1C0CC4";
+export const VPC_QUOTA = "vpc/L-F678F1CE";
 /** IAM's limit on a managed policy (characters without whitespace); `make check-policies` asserts every document against it. */
 export const MANAGED_POLICY_MAX_CHARS = 6144;
 export const BUDGET_NAME = "ai-env-monthly";
@@ -52,8 +102,8 @@ export const EC2_SERVICE = "ec2.amazonaws.com";
 /**
  * Not trusted: the other candidate principal of the connector's operator role, never seen assuming it (T5.1's CloudTrail
  * AssumeRole events, 1 and 2 Oct 2026, both connector creations: lambda.amazonaws.com only). The deploy policy's
- * PassOperatorRole still accepts it as iam:PassedToService, that value being unmeasured (the root deploy identity
- * bypasses the deploy policy).
+ * PassOperatorRole still accepts it as iam:PassedToService, that value being unmeasured until ai-env-deployer's first
+ * connector creation (every earlier one ran as the account root, which no policy binds).
  */
 export const NETWORK_CONNECTORS_SERVICE = "network-connectors.lambda.amazonaws.com";
 /** The SSM agent's actions (without ssm:GetParameter on "*"), for the proxy instance. */
@@ -88,6 +138,16 @@ export interface EgressNames {
      * the very ARN the document names.
      */
     connectorArn?: string;
+    /** S8 operators: the proxy's three SSM Command documents (egress-config.json), the only ones ops may send. */
+    reloadDocumentName: string;
+    statusDocumentName: string;
+    patchDocumentName: string;
+    /**
+     * The proxy instance's id, which exists only once the stack created it: opsPolicy scopes start, stop and
+     * SendCommand to exactly this instance's ARN (never a tag: the deploy policy's ec2:CreateTags could tag any
+     * instance into ops' reach), so the ops policy gets a new version whenever the proxy is replaced.
+     */
+    proxyInstanceId?: string;
 }
 
 export interface Names {
@@ -137,9 +197,36 @@ export function egressLogGroupArns(n: Names): string[] {
     return groupArns(n, n.egress.logGroup);
 }
 
+/** The four proxy parameters `<prefix>/<name>` (contract 2); extras and suspended are owned by `ai-env egress` after creation. */
+export const PROXY_PARAMETERS = ["squid.conf", "allow", "extras", "suspended"] as const;
+export type ProxyParameter = (typeof PROXY_PARAMETERS)[number];
+
 /** The proxy's SSM parameters `<prefix>/*` (a name starting with `/` follows `parameter` directly). */
 export function proxyParameterArn(n: Names, name = "*"): string {
     return `arn:aws:ssm:${n.region}:${n.accountId}:parameter${n.egress.parameterPrefix}/${name}`;
+}
+
+/** The proxy's three SSM documents (account-owned: the account is in the ARN, unlike AWS-RunShellScript's). */
+export function proxyDocumentArns(n: Names): string[] {
+    const { reloadDocumentName, statusDocumentName, patchDocumentName } = n.egress;
+    return [reloadDocumentName, statusDocumentName, patchDocumentName].map((d) => `arn:aws:ssm:${n.region}:${n.accountId}:document/${d}`);
+}
+
+/** The proxy instance's ARN (opsPolicy's ProxyInstance and ProxyCommands); throws without the instance id. */
+export function proxyInstanceArn(n: Names): string {
+    const id = n.egress.proxyInstanceId;
+    if (id === undefined) throw new Error("opsPolicy: the proxy instance id is required (ProxyInstance, ProxyCommands)");
+    return `arn:aws:ec2:${n.region}:${n.accountId}:instance/${id}`;
+}
+
+/** An IAM user of this account. */
+export function userArn(n: Names, user: string): string {
+    return `arn:aws:iam::${n.accountId}:user/${user}`;
+}
+
+/** A customer-managed policy of this account. */
+export function policyArn(n: Names, policy: string): string {
+    return `arn:aws:iam::${n.accountId}:policy/${policy}`;
 }
 
 /** This account's network connectors (the resource type's ARN carries an id or a name; both are under `:*`). */
@@ -156,7 +243,7 @@ export function dnsQueryLogGroupName(squidLogGroup: string): string {
     return squidLogGroup.replace(/\/[^/]*$/, "/dns");
 }
 
-function dnsQueryLogGroupArns(n: Names): string[] {
+export function dnsQueryLogGroupArns(n: Names): string[] {
     return groupArns(n, dnsQueryLogGroupName(n.egress.logGroup));
 }
 
@@ -253,9 +340,10 @@ export const RUNTIME_LIST_ACTIONS = ["lambda:ListMicrovms", "lambda:ListManagedM
  *
  * GetNetworkConnector is back in S7 (D5), on exactly the egress connector and nothing else: the credential gate
  * compares the connector's live configuration with the one the recorded `ai-env egress check` verified, and it must
- * do so with the runtime key, so delivering a credential never depends on the operator's profile or the Python aws
- * CLI. It reads non-secret configuration only; creating, updating and deleting a connector, and every call on
- * INTERNET_EGRESS or any other connector, stay implicitly denied (`make check-policies` simulates each).
+ * do so with the runtime key, so delivering a credential never depends on an operator identity (ai-env-ops'
+ * credentials/ops.env) or the Python aws CLI. It reads non-secret configuration only; creating, updating and deleting
+ * a connector, and every call on INTERNET_EGRESS or any other connector, stay implicitly denied (`make check-policies`
+ * simulates each).
  *
  * iam:PassRole on the execution role is measured necessary (S4 T4.1, 30 Sep 2026): RunMicrovm with
  * --execution-role-arn was denied iam:PassRole under `StringEquals iam:PassedToService = lambda.amazonaws.com`
@@ -276,7 +364,7 @@ export function connectorArns(n: Names): string[] {
  * MacRuntimePolicy on the user ai-env-runtime (the key the bridge holds). Everything else is implicitly denied:
  * creating, updating or deleting images and versions, every cloudformation:, budgets:, s3:, logs: action, every
  * other iam: action, every network connector call but PassNetworkConnector, and every ssm: and ec2: action (the
- * proxy and its parameters are the operator's).
+ * proxy and its parameters are ai-env-ops' and ai-env-deployer's).
  */
 /**
  * The egress connector's two ARNs: the one the service reports (Pulumi's `arn` output, in the `nc-…` id form, as
@@ -298,17 +386,21 @@ export function runtimePolicy(n: Names): PolicyDocument {
         { Sid: "ListMicrovms", Effect: "Allow", Action: RUNTIME_LIST_ACTIONS, Resource: ["*"] },
         { Sid: "PassNetworkConnector", Effect: "Allow", Action: [PASS_CONNECTOR_ACTION], Resource: ["*"] },
         { Sid: "ReadTheEgressConnector", Effect: "Allow", Action: [GET_CONNECTOR_ACTION], Resource: egressConnectorArns(n) },
-        { Sid: "PassExecutionRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, EXECUTION_ROLE_NAME)] }, // scratch:runtime
+        { Sid: "PassExecutionRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, EXECUTION_ROLE_NAME)] },
     );
 }
 
 /**
- * ai-env-deploy: what a non-administrator would need to run `make deploy` / `make destroy`, except creating,
- * changing or deleting ai-env-deploy itself, which needs an administrator (the stack creates it; it is attached to
- * nothing: `rust` is an administrator). Validated for names by Access Analyzer, not for sufficiency. It is not a
- * privilege boundary (it can write the runtime user's policy and pass the build role); it only reads itself, so a
- * principal holding it cannot rewrite it. S5 adds the network connector here and the rest of the egress side in
- * ai-env-deploy-egress and ai-env-deploy-dns (deployEgressPolicy, deployDnsPolicy): a deployer holds all three.
+ * ai-env-deploy, held by ai-env-deployer (S8 operators): what `make deploy` needs as that user, the stack's five
+ * managed policies included, which it manages through StackPolicies (their reads, versions and tags: the
+ * five-version limit, a rollback) but never creates or deletes (no iam:CreatePolicy or DeletePolicy: they all exist
+ * from the bootstrap, which the account root runs once). Validated for names by Access Analyzer, not yet for
+ * sufficiency: part B's first deployer preview and deploy prove it, and `make deploy-policies` adds a right it lacks.
+ * It is not a privilege boundary: with the deployer's other policies it is admin-equivalent inside the account (it
+ * writes the runtime user's policy, passes the build role and versions its own documents); the protection is the
+ * offline key. `make destroy` runs as the account root (it deletes the operator users themselves). S5 adds the
+ * network connector here and the rest of the egress side in ai-env-deploy-egress and ai-env-deploy-dns
+ * (deployEgressPolicy, deployDnsPolicy).
  */
 export function deployPolicy(n: Names): PolicyDocument {
     const acct = n.accountId;
@@ -367,9 +459,13 @@ export function deployPolicy(n: Names): PolicyDocument {
                 "iam:ListSSHPublicKeys", "iam:DeleteSSHPublicKey", "iam:ListServiceSpecificCredentials", "iam:DeleteServiceSpecificCredential",
                 "iam:ListMFADevices", "iam:DeactivateMFADevice", "iam:GetLoginProfile", "iam:DeleteLoginProfile"],
         },
+        // S8 operators: the stack's five managed policies, the deployer's own included. A policy update is a new default
+        // version (CreatePolicyVersion, after DeletePolicyVersion of the oldest at IAM's five), SetDefaultPolicyVersion
+        // rolls one back; no CreatePolicy or DeletePolicy (check-plan refuses replacing or deleting them).
         {
-            Sid: "ReadDeployPolicy", Effect: "Allow", Resource: [DEPLOY_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_DNS_POLICY_NAME].map((p) => `arn:aws:iam::${acct}:policy/${p}`),
-            Action: ["iam:GetPolicy", "iam:GetPolicyVersion", "iam:ListPolicyVersions", "iam:ListPolicyTags", "iam:ListEntitiesForPolicy"],
+            Sid: "StackPolicies", Effect: "Allow", Resource: STACK_POLICIES.map((p) => policyArn(n, p)),
+            Action: ["iam:GetPolicy", "iam:GetPolicyVersion", "iam:ListPolicyVersions", "iam:ListPolicyTags", "iam:ListEntitiesForPolicy",
+                "iam:CreatePolicyVersion", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:TagPolicy", "iam:UntagPolicy"],
         },
         {
             Sid: "ArtifactsBucket", Effect: "Allow", Resource: [bucket],
@@ -395,8 +491,10 @@ export function deployPolicy(n: Names): PolicyDocument {
 
 /**
  * ai-env-deploy-egress (S5): the VPC, subnets, route tables, security groups, the proxy instance with its role,
- * profile, parameters and log group, and the operator role. Like ai-env-deploy: attached to nothing, names proven by
- * Access Analyzer, not sufficiency.
+ * profile, parameters and log group, and the operator role; S8 operators adds the proxy's three SSM documents
+ * (ProxyDocuments: their whole lifecycle, never ssm:ModifyDocumentPermission, so a document can never be shared).
+ * Held by ai-env-deployer like ai-env-deploy; names proven by Access Analyzer, not sufficiency. Sending the documents
+ * is ai-env-ops' (opsPolicy's ProxyCommands), which the deployer holds too: one source of truth.
  */
 export function deployEgressPolicy(n: Names): PolicyDocument {
     const acct = n.accountId;
@@ -429,6 +527,13 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
         },
         // The AL2023 AMI id (an AWS public parameter, no account in its ARN).
         { Sid: "AmiParameter", Effect: "Allow", Resource: [`arn:aws:ssm:${n.region}::parameter/aws/service/ami-amazon-linux-latest/*`], Action: ["ssm:GetParameter", "ssm:GetParameters"] },
+        // S8 operators: the proxy's documents (create with tags, read until active, update then make it the default,
+        // delete).
+        {
+            Sid: "ProxyDocuments", Effect: "Allow", Resource: proxyDocumentArns(n),
+            Action: ["ssm:CreateDocument", "ssm:UpdateDocument", "ssm:UpdateDocumentDefaultVersion", "ssm:DeleteDocument", "ssm:DescribeDocument", "ssm:GetDocument",
+                "ssm:DescribeDocumentPermission", "ssm:ListDocumentVersions", "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"],
+        },
         {
             Sid: "EgressLogGroup", Effect: "Allow", Resource: egressLogGroupArns(n),
             Action: ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy", "logs:TagResource", "logs:UntagResource",
@@ -489,6 +594,114 @@ export function deployDnsPolicy(n: Names): PolicyDocument {
     );
 }
 
+/**
+ * ai-env-deployer (S8 operators): the deployer's supplement next to the three deploy policies and ai-env-ops. The ops
+ * user's whole lifecycle and keys (`make ops-key`, and the cleanup its forceDestroy does, as RuntimeUser in
+ * deployPolicy); attaching or detaching exactly ai-env-ops on it; and on the deployer itself its reads, tags and key
+ * rotation (`make deployer-key ROTATE=1`) and attaching one of its own five policies, nothing else: no DeleteUser,
+ * PutUserPolicy, login profile, group membership or DetachUserPolicy on itself (check-plan refuses any replace or
+ * delete of the deployer's user, attachments and policies once it exists, so Pulumi never needs them; the account
+ * root deletes them, `make destroy BREAKGLASS=1`). ListVirtualMFADevices (forceDestroy's MFA lookup) and
+ * ListAllMyBuckets (the destroy checklist) have no resource type. CloudTrailLogs serves the `aws logs
+ * filter-log-events … --unmask` command `ai-env lab run cloudtrail-payload` prints per CloudTrail log group: reading the
+ * account's API record unmasked is the deployer's, never the daily ops key's (S8 fix round, contracts §13). Admin-
+ * equivalent with the deploy policies, not a boundary.
+ */
+export function deployerPolicy(n: Names): PolicyDocument {
+    return doc(
+        {
+            Sid: "OpsUser", Effect: "Allow", Resource: [userArn(n, OPS_USER_NAME)],
+            Action: ["iam:CreateUser", "iam:GetUser", "iam:DeleteUser", "iam:TagUser", "iam:UntagUser", "iam:ListUserTags", "iam:ListUserPolicies",
+                "iam:ListAttachedUserPolicies", "iam:ListGroupsForUser", "iam:ListAccessKeys", "iam:CreateAccessKey", "iam:UpdateAccessKey", "iam:DeleteAccessKey",
+                "iam:GetAccessKeyLastUsed", "iam:ListSigningCertificates", "iam:DeleteSigningCertificate", "iam:ListSSHPublicKeys", "iam:DeleteSSHPublicKey",
+                "iam:ListServiceSpecificCredentials", "iam:DeleteServiceSpecificCredential", "iam:ListMFADevices", "iam:DeactivateMFADevice",
+                "iam:GetLoginProfile", "iam:DeleteLoginProfile"],
+        },
+        {
+            Sid: "OpsPolicyAttachment", Effect: "Allow", Resource: [userArn(n, OPS_USER_NAME)], Action: ["iam:AttachUserPolicy", "iam:DetachUserPolicy"],
+            Condition: { ArnEquals: { "iam:PolicyARN": [policyArn(n, OPS_POLICY_NAME)] } },
+        },
+        {
+            Sid: "DeployerUser", Effect: "Allow", Resource: [userArn(n, DEPLOYER_USER_NAME)],
+            Action: ["iam:GetUser", "iam:TagUser", "iam:UntagUser", "iam:ListUserTags", "iam:ListUserPolicies", "iam:ListAttachedUserPolicies", "iam:ListGroupsForUser",
+                "iam:ListAccessKeys", "iam:CreateAccessKey", "iam:UpdateAccessKey", "iam:DeleteAccessKey", "iam:GetAccessKeyLastUsed"],
+        },
+        {
+            Sid: "DeployerPolicyAttachments", Effect: "Allow", Resource: [userArn(n, DEPLOYER_USER_NAME)], Action: ["iam:AttachUserPolicy"],
+            Condition: { ArnEquals: { "iam:PolicyARN": DEPLOYER_POLICIES.map((p) => policyArn(n, p)) } }, // scratch:deployer-attach
+        },
+        // The log groups are found at run time (a trail's own group, CloudWatch's CloudTrail ingestion), so no narrower name
+        // exists. The trailing * also matches a group's `:*` form (Access Analyzer reports a second ARN for it as redundant).
+        { Sid: "CloudTrailLogs", Effect: "Allow", Resource: [`arn:aws:logs:${n.region}:${n.accountId}:log-group:*cloudtrail*`], Action: ["logs:FilterLogEvents", "logs:Unmask"] },
+        { Sid: "DeployerUnscoped", Effect: "Allow", Resource: ["*"], Action: ["iam:ListVirtualMFADevices", "s3:ListAllMyBuckets"] },
+    );
+}
+
+/**
+ * ai-env-ops (S8 operators), held by ai-env-ops and by ai-env-deployer: the daily operator commands and the reads of
+ * every status, nothing that deploys or widens egress (O3, O4). Each action is traced to its caller in
+ * plans/s8-operators-design.md B5, plus two the ops-tier targets call: lambda:ListMicrovms (`make image-prune`'s dry
+ * run) and lambda:GetMicrovmImageVersion (`make claude-update`'s active-version check).
+ *   - Reads on "*" (no resource type): the SSM command and agent reads, the ec2 Describe* calls of egress status and
+ *     preflight P14 and P15, the DNS Firewall association list, the lambda connector, image and MicroVM lists, the log
+ *     group list, the four CloudTrail reads of `ai-env lab run cloudtrail-payload`, the account summary (doctor's root
+ *     key row) and the two policy checks of `make check-policies`.
+ *   - ec2:StartInstances and StopInstances on the proxy instance's ARN only (an ARN, never a tag: the deploy policy's
+ *     ec2:CreateTags could tag any instance into reach); no ModifyInstanceAttribute (user data runs as root at the next
+ *     start), CreateTags or any other write.
+ *   - ssm:SendCommand on exactly the three proxy documents plus that instance (SendCommand authorizes the document
+ *     and every target separately): never AWS-RunShellScript, another document or instance, nor StartSession.
+ *   - The four proxy parameters read; only `suspended` written (O3: widening egress, `extras`, is the deployer's).
+ *   - Reads of the stack's own resources: the DNS Firewall rules, domains and config, the account's connectors, the
+ *     image with its versions and builds, the stack's three log groups (never a CloudTrail group: the command
+ *     cloudtrail-payload prints for one is the deployer's, deployerPolicy's CloudTrailLogs), two service quotas, the
+ *     three users (G7's simulation, doctor's key rows, `creds aws-set --check`), the ai-env-* and the two AWS managed
+ *     policies, the Lambda service-linked role (P16).
+ * No IAM write (its own keys included), no iam:PassRole, no image, connector, Cloud Control, S3, budget or logs write.
+ * `make check-policies` simulates both sides (its section 6).
+ */
+export function opsPolicy(n: Names): PolicyDocument {
+    const acct = n.accountId;
+    const instance = proxyInstanceArn(n);
+    return doc(
+        {
+            Sid: "OpsUnscoped", Effect: "Allow", Resource: ["*"],
+            Action: ["ssm:GetCommandInvocation", "ssm:DescribeInstanceInformation",
+                "ec2:DescribeInstances", "ec2:DescribeNetworkInterfaces", "ec2:DescribeRouteTables", "ec2:DescribeNetworkAcls", "ec2:DescribeSecurityGroups",
+                "ec2:DescribeVpcs", "ec2:DescribeVpcAttribute", "ec2:DescribeDhcpOptions", "ec2:DescribeVpcEndpoints", "ec2:DescribeVpcPeeringConnections",
+                "ec2:DescribeNatGateways", "ec2:DescribeVpcBlockPublicAccessOptions", "ec2:DescribeVpcBlockPublicAccessExclusions",
+                "route53resolver:ListFirewallRuleGroupAssociations",
+                "lambda:ListNetworkConnectors", "lambda:ListMicrovmImages", "lambda:ListManagedMicrovmImages", "lambda:ListManagedMicrovmImageVersions", "lambda:ListMicrovms",
+                "logs:DescribeLogGroups", "cloudtrail:DescribeTrails", "cloudtrail:GetEventSelectors", "cloudtrail:ListChannels", "cloudtrail:GetChannel",
+                "iam:GetAccountSummary", "access-analyzer:ValidatePolicy", "iam:SimulateCustomPolicy"],
+        },
+        { Sid: "ProxyInstance", Effect: "Allow", Resource: [instance], Action: ["ec2:StartInstances", "ec2:StopInstances"] },
+        { Sid: "ProxyCommands", Effect: "Allow", Resource: [...proxyDocumentArns(n), instance], Action: ["ssm:SendCommand"] },
+        { Sid: "ReadProxyParameters", Effect: "Allow", Resource: PROXY_PARAMETERS.map((p) => proxyParameterArn(n, p)), Action: ["ssm:GetParameters", "ssm:GetParameterHistory"] },
+        { Sid: "WriteSuspendedParameter", Effect: "Allow", Resource: [proxyParameterArn(n, "suspended")], Action: ["ssm:PutParameter"] },
+        {
+            Sid: "DnsFirewallReads", Effect: "Allow", Resource: [`arn:aws:route53resolver:${n.region}:${acct}:*`],
+            Action: ["route53resolver:ListFirewallRules", "route53resolver:ListFirewallDomains", "route53resolver:GetFirewallConfig"],
+        },
+        { Sid: "ReadConnectors", Effect: "Allow", Resource: accountConnectorArns(n), Action: [GET_CONNECTOR_ACTION] },
+        {
+            Sid: "ReadImage", Effect: "Allow", Resource: [imageArn(n)],
+            Action: ["lambda:GetMicrovmImage", "lambda:GetMicrovmImageVersion", "lambda:ListMicrovmImageVersions", "lambda:ListMicrovmImageBuilds"],
+        },
+        { Sid: "ReadLogs", Effect: "Allow", Resource: [...logGroupArns(n), ...egressLogGroupArns(n), ...dnsQueryLogGroupArns(n)], Action: ["logs:FilterLogEvents", "logs:StartLiveTail"] },
+        { Sid: "ReadQuotas", Effect: "Allow", Resource: [MICROVM_MEMORY_QUOTA, VPC_QUOTA].map((q) => `arn:aws:servicequotas:${n.region}:${acct}:${q}`), Action: ["servicequotas:GetServiceQuota"] },
+        {
+            Sid: "StackUsers", Effect: "Allow", Resource: STACK_USERS.map((u) => userArn(n, u)),
+            Action: ["iam:SimulatePrincipalPolicy", "iam:ListAccessKeys", "iam:ListAttachedUserPolicies", "iam:ListUserPolicies", "iam:ListGroupsForUser"],
+        },
+        { Sid: "ReadPolicies", Effect: "Allow", Resource: [...MANAGED_POLICY_ARNS, policyArn(n, `${PROJECT}-*`)], Action: ["iam:GetPolicy", "iam:GetPolicyVersion"] },
+        {
+            Sid: "ReadLambdaServiceLinkedRole", Effect: "Allow", Resource: [`arn:aws:iam::${acct}:role/aws-service-role/${LAMBDA_SERVICE}/AWSServiceRoleForLambda`],
+            Action: ["iam:GetRole"],
+        },
+    );
+}
+
 export type PolicyKind = "identity" | "trust";
 
 export interface NamedPolicy {
@@ -508,6 +721,8 @@ export function allPolicies(n: Names): NamedPolicy[] {
         { name: "deploy", kind: "identity", document: deployPolicy(n) },
         { name: "deploy-egress", kind: "identity", document: deployEgressPolicy(n) },
         { name: "deploy-dns", kind: "identity", document: deployDnsPolicy(n) },
+        { name: "deployer", kind: "identity", document: deployerPolicy(n) },
+        { name: "ops", kind: "identity", document: opsPolicy(n) },
         { name: "proxy-trust", kind: "trust", document: proxyTrustPolicy() },
         { name: "proxy", kind: "identity", document: proxyRolePolicy(n) },
         { name: "operator-trust", kind: "trust", document: operatorTrustPolicy() },

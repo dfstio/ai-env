@@ -123,12 +123,34 @@ impl RuntimeCreds {
 /// is the explicit `[creds].key` (never tag matching; missing → exit 4); `age
 /// -d` runs once with exactly that identity (one Touch ID; cancel → exit 3);
 /// the plaintext is parsed by [`parse_runtime_env`] inside its zeroizing
-/// buffer. Anything but `"container"` / `"profile:<name>"` is exit 1.
+/// buffer. Anything but `"container"` / `"profile:<name>"` is exit 1. S8
+/// operators: profile mode is refused (exit 1) under `ai-env as deployer|ops`,
+/// whose pinned `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`
+/// (`/dev/null`) hide every profile.
 pub fn runtime_credentials(store: &Keystore, paths: &Paths, cfg: &BridgeConfig) -> Result<RuntimeCreds> {
+    runtime_credentials_under(store, paths, cfg, crate::bridge::identity::Marker::from_env())
+}
+
+/// [`runtime_credentials`] under `marker`: this process's
+/// (`Marker::from_env`), or the one a test gives, so its verdict never
+/// depends on the shell the tests run in.
+fn runtime_credentials_under(store: &Keystore, paths: &Paths, cfg: &BridgeConfig, marker: Option<std::result::Result<crate::bridge::identity::Marker, String>>) -> Result<RuntimeCreds> {
     match CredentialsSource::parse(&cfg.aws.credentials)? {
-        CredentialsSource::Profile(name) => Ok(RuntimeCreds::Profile(name)),
+        CredentialsSource::Profile(name) => match profile_under_runner(&name, marker) {
+            Some(refusal) => Err(CliError::Msg(refusal)),
+            None => Ok(RuntimeCreds::Profile(name)),
+        },
         CredentialsSource::Container => unseal(store, paths, &cfg.creds.key),
     }
+}
+
+/// The refusal of profile mode under a key marker (`deployer:` or `ops:`,
+/// whatever its key): `None` under no marker, `root` or `ambient`, which keep
+/// the aws CLI's own files.
+fn profile_under_runner(name: &str, marker: Option<std::result::Result<crate::bridge::identity::Marker, String>>) -> Option<String> {
+    matches!(marker, Some(Ok(crate::bridge::identity::Marker::Key { .. }))).then(|| {
+        format!("[aws].credentials = \"profile:{name}\" cannot be used under ai-env as \u{2026} (it hides ~/.aws from every child): run this outside it, or seal the runtime key (make runtime-key)")
+    })
 }
 
 fn unseal(store: &Keystore, paths: &Paths, key_name: &str) -> Result<RuntimeCreds> {
@@ -166,15 +188,23 @@ pub fn unseal_runtime_key(store: &Keystore, paths: &Paths, key_name: &str) -> Re
     Ok(pair)
 }
 
-/// Parse the plaintext `creds aws-set` sealed (`creds::render_env`): exactly
-/// the lines `AWS_ACCESS_KEY_ID=<AKIA + 16 of [A-Z0-9]>` and
+/// Parse the plaintext `creds aws-set` sealed into `credentials/aws.env`
+/// ([`parse_key_env`] naming that file and `make runtime-key`).
+pub fn parse_runtime_env(plain: &[u8]) -> std::result::Result<(String, Zeroizing<String>), BridgeError> {
+    parse_key_env(plain, "credentials/aws.env", "re-seal the runtime key with `make runtime-key`")
+}
+
+/// Parse the plaintext `creds aws-set` sealed (`creds::render_env`) into
+/// `file` (`credentials/aws.env`, or S8's `credentials/ops.env`): exactly the
+/// lines `AWS_ACCESS_KEY_ID=<AKIA + 16 of [A-Z0-9]>` and
 /// `AWS_SECRET_ACCESS_KEY=<40 of [A-Za-z0-9/+]>`, in either order, each once,
 /// with an optional final newline. Both values are registered with the
 /// scrubber as soon as they are found (it keeps a copy for the life of the
-/// process, plan D3). Any other shape is `CredentialsUnavailable` (exit 5)
-/// naming the problem — a line number, a key name, a length — never a value.
-pub fn parse_runtime_env(plain: &[u8]) -> std::result::Result<(String, Zeroizing<String>), BridgeError> {
-    let bad = |why: String| BridgeError::CredentialsUnavailable(format!("credentials/aws.env: {why} (re-seal the runtime key with `make runtime-key`)"));
+/// process, plan D3). Any other shape is `CredentialsUnavailable` (exit 5),
+/// `<file>: <the problem> (<reseal>)`, naming the problem — a line number, a
+/// key name, a length — never a value.
+pub fn parse_key_env(plain: &[u8], file: &str, reseal: &str) -> std::result::Result<(String, Zeroizing<String>), BridgeError> {
+    let bad = |why: String| BridgeError::CredentialsUnavailable(format!("{file}: {why} ({reseal})"));
     let text = std::str::from_utf8(plain).map_err(|_| bad("the unsealed plaintext is not UTF-8".into()))?;
     let body = text.strip_suffix('\n').unwrap_or(text);
     if body.is_empty() {
@@ -217,11 +247,12 @@ fn unexpected_key(key: &str) -> String {
     }
 }
 
-/// Why `id` is not a long-term access key id; never echoes the value.
+/// Why `id` is not a long-term access key id; never echoes the value. The
+/// texts are `creds::key_id_fault`'s (one wording wherever a key is checked).
 fn key_id_fault(id: &str) -> Option<String> {
     if !id.starts_with(KEY_ID_PREFIX) {
         return Some(if id.starts_with("ASIA") {
-            "is a temporary STS key id (ASIA\u{2026}): the runtime key must be a long-term IAM user key (AKIA\u{2026})".into()
+            "is a temporary STS key id (ASIA\u{2026}), not a long-term IAM user key (AKIA\u{2026})".into()
         } else {
             format!("does not start with {KEY_ID_PREFIX}")
         });
@@ -944,6 +975,29 @@ mod tests {
         assert!(parse_runtime_env(&[0xff, 0xfe]).unwrap_err().to_string().contains("not UTF-8"));
     }
 
+    /// S8 operators: `parse_key_env` is the parser of every sealed key file;
+    /// its refusals name the file and how to seal it anew, and the runtime
+    /// key's are `parse_runtime_env`'s.
+    #[test]
+    fn parse_key_env_names_its_file_and_how_to_reseal_it() {
+        const OPS_FILE: &str = "credentials/ops.env";
+        const OPS_RESEAL: &str = "re-seal it with ai-env as deployer -- make ops-key ROTATE=1";
+        let (i, s) = (key_id("G7H8"), secret("vW9/"));
+        let (id, sec) = parse_key_env(env(&i, &s).as_bytes(), OPS_FILE, OPS_RESEAL).unwrap();
+        assert_eq!((id.as_str(), sec.as_str()), (i.as_str(), s.as_str()));
+        let temp = format!("ASIA{}", &i[4..]);
+        let cases = [
+            (format!("{ID_KEY}={i}\n"), "AWS_SECRET_ACCESS_KEY is missing"),
+            (env(&temp, &s), "AWS_ACCESS_KEY_ID is a temporary STS key id (ASIA\u{2026}), not a long-term IAM user key (AKIA\u{2026})"),
+        ];
+        for (plain, why) in &cases {
+            let ops = parse_key_env(plain.as_bytes(), OPS_FILE, OPS_RESEAL).unwrap_err();
+            assert_eq!(ops.to_string(), BridgeError::CredentialsUnavailable(format!("{OPS_FILE}: {why} ({OPS_RESEAL})")).to_string());
+            let runtime = parse_runtime_env(plain.as_bytes()).unwrap_err();
+            assert_eq!(runtime.to_string(), BridgeError::CredentialsUnavailable(format!("credentials/aws.env: {why} (re-seal the runtime key with `make runtime-key`)")).to_string(), "the runtime key's wording");
+        }
+    }
+
     #[test]
     fn runtime_creds_debug_and_describe_never_show_key_material() {
         let (i, s) = (key_id("E5F6"), secret("tU7/"));
@@ -966,7 +1020,10 @@ mod tests {
         let store = Keystore::resolve(Some(dir.path().join("keystore"))).unwrap();
         let mut cfg = BridgeConfig::default();
         cfg.aws.credentials = "profile:ai-env-ops".into();
-        assert_eq!(runtime_credentials(&store, &paths, &cfg).unwrap().describe(), "profile ai-env-ops");
+        // No marker, whatever the shell running the tests holds (S8 operators: a key marker refuses profile mode).
+        assert_eq!(runtime_credentials_under(&store, &paths, &cfg, None).unwrap().describe(), "profile ai-env-ops");
+        let e = runtime_credentials_under(&store, &paths, &cfg, Some(crate::bridge::identity::Marker::parse("ops:9002"))).unwrap_err();
+        assert!(e.exit_code() == 1 && e.to_string().starts_with("[aws].credentials = \"profile:ai-env-ops\" cannot be used under ai-env as"), "{e}");
         cfg.aws.credentials = "keychain".into();
         assert_eq!(runtime_credentials(&store, &paths, &cfg).unwrap_err().exit_code(), 1);
     }
@@ -1292,5 +1349,22 @@ mod tests {
         assert_eq!(input.get_egress_network_connectors(), &None);
         assert_eq!(input.get_execution_role_arn(), &None);
         assert_eq!(input.get_logging(), &None, "logging is never passed (plan §3)");
+    }
+
+    /// S8 operators: profile mode is refused under `ai-env as deployer|ops`
+    /// (its pinned `/dev/null` files hide every profile), never under no
+    /// marker, `root` or `ambient` (the aws CLI's own chain).
+    #[test]
+    fn profile_mode_is_refused_under_a_key_marker() {
+        use crate::bridge::identity::Marker;
+        for marker in [Marker::parse("deployer:9001"), Marker::parse("ops:9002")] {
+            assert_eq!(
+                profile_under_runner("ops-profile", Some(marker)).as_deref(),
+                Some("[aws].credentials = \"profile:ops-profile\" cannot be used under ai-env as \u{2026} (it hides ~/.aws from every child): run this outside it, or seal the runtime key (make runtime-key)")
+            );
+        }
+        for marker in [None, Some(Ok(Marker::Root)), Some(Ok(Marker::Ambient)), Some(Marker::parse("nobody"))] {
+            assert_eq!(profile_under_runner("ops-profile", marker), None);
+        }
     }
 }

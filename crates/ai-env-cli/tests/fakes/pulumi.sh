@@ -8,6 +8,13 @@
 #                               test wrote) and exits FAKE_PULUMI_PREVIEW_RC
 #                               (default 0); unset: refused
 #   pulumi stack output ...     prints the file FAKE_PULUMI_OUTPUTS; unset: refused
+#   pulumi stack output NAME [--stack S] [--cwd D] [--json]
+#                               (S8; NAME the first word that is neither an
+#                               option nor an option's value) that output's
+#                               value and a newline: a string as is (JSON-quoted
+#                               with --json), a number or boolean as written;
+#                               read with sed, so compact and pretty files both
+#                               work. No such key: pulumi's error, exit 255
 #   pulumi stack ls --json      [{"name": FAKE_PULUMI_STACK (default dev)}]
 #   pulumi whoami -v            a fake backend URL
 #   pulumi plugin ls --json     the two pinned resource plugins (aws 7.10.0,
@@ -48,7 +55,34 @@ case "${1:-} ${2:-}" in
     exit "${FAKE_PULUMI_PREVIEW_RC:-0}" ;;
   "stack output")
     test -n "${FAKE_PULUMI_OUTPUTS:-}" || { echo "fake pulumi: stack output refused (FAKE_PULUMI_OUTPUTS is not set)" >&2; exit 1; }
-    cat "$FAKE_PULUMI_OUTPUTS" ;;
+    shift 2
+    name=
+    json=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --stack|-s|--cwd|-C) shift ;;
+        --json) json=1 ;;
+        -*) ;;
+        *) test -n "$name" || name=$1 ;;
+      esac
+      test $# -eq 0 || shift
+    done
+    if [ -z "$name" ]; then
+      cat "$FAKE_PULUMI_OUTPUTS"
+      exit
+    fi
+    case "$name" in
+      *[!A-Za-z0-9_]*) echo "fake pulumi: unsupported output name $name" >&2; exit 2 ;;
+    esac
+    test -r "$FAKE_PULUMI_OUTPUTS" || { echo "fake pulumi: cannot read $FAKE_PULUMI_OUTPUTS" >&2; exit 1; }
+    # "=s<value>" for a string, "=v<value>" for a number or a boolean; nothing: no such key.
+    v=$(sed -n -E -e "s/.*\"$name\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/=s\\1/p" -e t \
+      -e "s/.*\"$name\"[[:space:]]*:[[:space:]]*(-?[0-9][0-9.eE+-]*|true|false).*/=v\\1/p" "$FAKE_PULUMI_OUTPUTS" | head -1)
+    case "$v" in
+      =s*) if [ "$json" = 1 ]; then printf '"%s"\n' "${v#=s}"; else printf '%s\n' "${v#=s}"; fi ;;
+      =v*) printf '%s\n' "${v#=v}" ;;
+      *) echo "error: current stack does not have output property '$name'" >&2; exit 255 ;;
+    esac ;;
   "stack ls")
     printf '[\n    {\n        "name": "%s",\n        "current": false\n    }\n]\n' "${FAKE_PULUMI_STACK:-dev}" ;;
   "whoami -v")

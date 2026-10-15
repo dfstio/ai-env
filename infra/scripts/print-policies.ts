@@ -2,12 +2,13 @@
 // with plain node, so it and policies.ts import nothing from Pulumi).
 //
 //   node print-policies.js --account-id <12 digits> --image-config infra/image-config.json --egress-config infra/egress-config.json
-//                          [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN]
+//                          [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--proxy-instance-id ID]
 //       one line per document: <name> TAB <IDENTITY_POLICY|RESOURCE_POLICY> TAB <resource type or ->
 //   ... --name <name>
 //       that document as compact JSON (what validate-policy / simulate-custom-policy take)
-//   ... --arn image|execution-role|build-role|egress|connector|connector-by-name|other-connector|proxy-parameter|squid-log-group|image-log-group|runtime-user|proxy-role|operator-role|
-//             ssm-instance-policy|operator-policy
+//   ... --arn image|execution-role|build-role|egress|connector|connector-by-name|other-connector|proxy-parameter|squid-log-group|image-log-group|
+//             dns-log-group|runtime-user|ops-user|deployer-user|proxy-role|operator-role|ssm-instance-policy|operator-policy|deploy-policy|
+//             deploy-egress-policy|deploy-dns-policy|deployer-policy|ops-policy
 //       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach)
 //
 // The egress documents (S5) are the proxy role's trust and inline policy and the operator role's trust and inline
@@ -17,16 +18,24 @@
 // as "another subnet" and "another group"). Deliberately no --arn kind for the VM subnet or group: the simulations
 // build those ARNs themselves, so a wrong ARN shape in policies.ts fails them.
 //
+// S8 operators: the operator identities' documents, `deployer` (ai-env-deployer's supplement) and `ops` (held by
+// ai-env-ops and ai-env-deployer), are listed too, so Access Analyzer and the size check cover them. The ops policy
+// names the proxy instance, whose id exists only in a stack: --proxy-instance-id, else a placeholder of the real shape
+// that differs from check-policies' "another instance" (all zeros). Deliberately no --arn kind for the proxy instance
+// or the documents either: check-policies builds them from egress-config.json's names. The users' and the stack's
+// policies' ARNs are printed (--arn), as the targets of section 6 and 7's simulations.
+//
 // The account id is passed in by the caller (from `aws sts get-caller-identity`) and only ever printed to stdout.
 import * as fs from "fs";
 import { egressNames, loadEgressConfig } from "../egress-spec";
 import {
-    BUCKET_PREFIX, BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, EXECUTION_ROLE_NAME, Names, REGION, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, allPolicies,
-    egressLogGroupArns, imageArn, internetEgressConnectorArn, logGroupArns, proxyParameterArn, roleArn,
+    BUCKET_PREFIX, BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME,
+    DEPLOY_POLICY_NAME, EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, OPS_USER_NAME, REGION, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, allPolicies, dnsQueryLogGroupArns,
+    egressLogGroupArns, imageArn, internetEgressConnectorArn, logGroupArns, policyArn, proxyParameterArn, roleArn, userArn,
 } from "../policies";
 
 function usage(msg: string): never {
-    process.stderr.write(`print-policies: ${msg}\nusage: print-policies --account-id <12 digits> --image-config <file> --egress-config <file> [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--name NAME | --arn KIND]\n`);
+    process.stderr.write(`print-policies: ${msg}\nusage: print-policies --account-id <12 digits> --image-config <file> --egress-config <file> [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--proxy-instance-id ID] [--name NAME | --arn KIND]\n`);
     process.exit(2);
 }
 
@@ -58,6 +67,8 @@ const names: Names = {
         // placeholder is in the service's own id form, so `--arn connector` and the document always name the same
         // ARN and the simulations mean what they say.
         connectorArn: args.get("connector-arn") ?? `arn:aws:lambda:${REGION}:${accountId}:network-connector:nc-00000000000000000`,
+        // And the proxy instance's id (S8 operators: opsPolicy scopes start, stop and SendCommand to exactly it).
+        proxyInstanceId: args.get("proxy-instance-id") ?? "i-0123456789abcdef0",
     },
 };
 const policies = allPolicies(names);
@@ -68,27 +79,36 @@ if (name !== undefined) {
     const p = policies.find((x) => x.name === name) ?? usage(`no policy named ${name}`);
     process.stdout.write(`${JSON.stringify(p.document)}\n`);
 } else if (arn !== undefined) {
-    const arns: Record<string, string> = {
-        image: imageArn(names),
-        "execution-role": roleArn(names, EXECUTION_ROLE_NAME),
-        "build-role": roleArn(names, BUILD_ROLE_NAME),
-        egress: internetEgressConnectorArn(REGION),
+    // A Map, never an object literal: a kind like `constructor` must not find Object.prototype's.
+    const arns = new Map<string, string>([
+        ["image", imageArn(names)],
+        ["execution-role", roleArn(names, EXECUTION_ROLE_NAME)],
+        ["build-role", roleArn(names, BUILD_ROLE_NAME)],
+        ["egress", internetEgressConnectorArn(REGION)],
         // Exactly what runtimePolicy's ReadTheEgressConnector names, so the simulations prove that grant (S7 D5): the
         // id form the service reports, and the name form the IAM service reference documents.
-        connector: names.egress.connectorArn as string,
-        "connector-by-name": `arn:aws:lambda:${REGION}:${accountId}:network-connector:${egressConfig.connectorName}`,
+        ["connector", names.egress.connectorArn as string],
+        ["connector-by-name", `arn:aws:lambda:${REGION}:${accountId}:network-connector:${egressConfig.connectorName}`],
         // Another connector of the same account: the Get grant must not reach it.
-        "other-connector": `arn:aws:lambda:${REGION}:${accountId}:network-connector:nc-11111111111111111`,
-        "proxy-parameter": proxyParameterArn(names, "allow"),
-        "squid-log-group": egressLogGroupArns(names)[0],
-        "image-log-group": logGroupArns(names)[0],
-        "runtime-user": `arn:aws:iam::${accountId}:user/${RUNTIME_USER_NAME}`,
-        "proxy-role": roleArn(names, egressConfig.proxyRoleName),
-        "operator-role": roleArn(names, egressConfig.operatorRoleName),
-        "ssm-instance-policy": SSM_INSTANCE_POLICY_ARN,
-        "operator-policy": CONNECTOR_OPERATOR_POLICY_ARN,
-    };
-    process.stdout.write(`${arns[arn] ?? usage(`no ARN kind ${arn}`)}\n`);
+        ["other-connector", `arn:aws:lambda:${REGION}:${accountId}:network-connector:nc-11111111111111111`],
+        ["proxy-parameter", proxyParameterArn(names, "allow")],
+        ["squid-log-group", egressLogGroupArns(names)[0]],
+        ["image-log-group", logGroupArns(names)[0]],
+        ["dns-log-group", dnsQueryLogGroupArns(names)[0]],
+        ["runtime-user", userArn(names, RUNTIME_USER_NAME)],
+        ["ops-user", userArn(names, OPS_USER_NAME)],
+        ["deployer-user", userArn(names, DEPLOYER_USER_NAME)],
+        ["proxy-role", roleArn(names, egressConfig.proxyRoleName)],
+        ["operator-role", roleArn(names, egressConfig.operatorRoleName)],
+        ["ssm-instance-policy", SSM_INSTANCE_POLICY_ARN],
+        ["operator-policy", CONNECTOR_OPERATOR_POLICY_ARN],
+        ["deploy-policy", policyArn(names, DEPLOY_POLICY_NAME)],
+        ["deploy-egress-policy", policyArn(names, DEPLOY_EGRESS_POLICY_NAME)],
+        ["deploy-dns-policy", policyArn(names, DEPLOY_DNS_POLICY_NAME)],
+        ["deployer-policy", policyArn(names, DEPLOYER_POLICY_NAME)],
+        ["ops-policy", policyArn(names, OPS_POLICY_NAME)],
+    ]);
+    process.stdout.write(`${arns.get(arn) ?? usage(`no ARN kind ${arn}`)}\n`);
 } else {
     for (const p of policies) {
         const [type, resource] = p.kind === "trust" ? ["RESOURCE_POLICY", "AWS::IAM::AssumeRolePolicyDocument"] : ["IDENTITY_POLICY", "-"];

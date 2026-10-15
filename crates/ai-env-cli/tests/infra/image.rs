@@ -44,7 +44,9 @@ impl Bounded for Command {
 fn run_bounded(cmd: &mut Command, during: impl FnOnce(u32)) -> Output {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
-    let what = format!("{cmd:?}");
+    // The program and its arguments only: std's Debug of a Command prints every variable set on it, and these tests set
+    // the runner's key on theirs (contracts §4.3).
+    let what = std::iter::once(cmd.get_program()).chain(cmd.get_args()).map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
     let mut child = cmd.process_group(0).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap_or_else(|e| panic!("{what}: {e}"));
     let start = Instant::now();
     let drain = |mut pipe: Box<dyn Read + Send>| {
@@ -91,6 +93,19 @@ fn signal_group(pid: u32, sig: libc::c_int) {
     unsafe { libc::kill(-(pid as libc::pid_t), sig) };
 }
 
+/// A child that cannot start (or outlives [`DEADLINE`]) is named by its program and arguments only: std's Debug of a
+/// Command prints every variable set on it, and the make tests set the runner's key on theirs (contracts §4.3, A8).
+#[test]
+fn a_child_is_named_by_its_program_and_arguments_never_its_environment() {
+    let secret = super::aws_keys::secret("Zq8+");
+    let mut cmd = Command::new("/nonexistent/f1-make");
+    cmd.arg("deploy").env("AWS_SECRET_ACCESS_KEY", &secret);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.bounded())).expect_err("a program that does not exist never runs");
+    let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(text.starts_with("/nonexistent/f1-make deploy: "), "named by its program and arguments: {text}");
+    assert!(!text.contains(&secret) && !text.contains("AWS_SECRET_ACCESS_KEY"), "the environment of the command in a panic: {text}");
+}
+
 fn fake(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fakes").join(name)
 }
@@ -120,6 +135,22 @@ fn make(tmp: &Path, bin: &Path, args: &[&str]) -> Command {
     isolate(&mut cmd, tmp).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
     cmd.args(["-s", "--no-print-directory", "-C", REPO]).args(args);
     cmd
+}
+
+/// What `$(MAKE)` is in the make these tests run (`make` from PATH; on macOS the xcrun shim runs Xcode's make under
+/// its full path, which make then names), as a runner line (`ai-env as T -- $(MAKE) ...`) shows it.
+fn make_path() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("m.mk"), "all:\n\t@echo '$(MAKE)'\n").unwrap();
+        let mut cmd = Command::new("make");
+        isolate(&mut cmd, t.path()).env("PATH", "/usr/bin:/bin");
+        let out = cmd.arg("-s").arg("-f").arg(t.path().join("m.mk")).bounded();
+        assert!(out.status.success(), "{}", all(&out));
+        stdout(&out).trim().to_string()
+    })
+    .clone()
 }
 
 fn all(o: &Output) -> String {
@@ -385,10 +416,17 @@ fn the_make_child_carries_no_outer_make_or_operator_state() {
 
 const MUST_NOT_RUN: &[&str] = &["aws", "pulumi", "docker", "curl", "gpg", "cargo", "npm", "node", "zip", "shasum", "rustup", "sleep"];
 
-/// `$(LAB_UNSET)` as the live recipes run it: the fourteen lab knobs
+/// `$(LAB_UNSET)` as the live recipes run it: the fifteen lab knobs
 /// (`the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read` holds the
 /// Makefile's list to every one the code and ops.sh read).
-const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS";
+const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT";
+
+/// The stand-in's log line of the operator CLI's keyless build (D18: infra.mk's `$(AI_ENV_BUILD)`, TIER's first
+/// step, and ops.sh's need_ai_env): `--version`, with no marker and no lab knob in its environment.
+const BUILT: &str = "--version [AI_ENV=unset]";
+
+/// `$(NO_KEY)` as the recipes run it (D18): the four variables no compile may see.
+const NO_KEY: &str = "env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS";
 
 #[test]
 fn make_n_of_the_part_b_targets_executes_nothing() {
@@ -439,7 +477,8 @@ fn test_docker_runs_both_docker_suites_before_the_stamp_and_stamps_nothing_after
     let order = [at("docker build --platform linux/arm64 -t ai-env-agent:local"), at(suites[0]), at(suites[1]), at("test-docker: ok, stamped")];
     assert!(order.windows(2).all(|w| w[0] < w[1]), "the image, shim_docker, docker_exec, then the stamp: {text}");
     let env: Vec<&str> = suites.iter().map(|s| text.lines().find(|l| l.contains(s)).unwrap().split("cargo +1.98.1").next().unwrap().trim()).collect();
-    assert!(env[0].starts_with("AI_ENV_DOCKER_TESTS=1 ") && env[0].contains(" AI_ENV_DOCKER_IMAGE='ai-env-agent:local' "), "{env:?}");
+    // Without an operator key or the runner's marker (D18): test-docker needs no AWS, and runs first under a runner too.
+    assert!(env[0].starts_with(&format!("{NO_KEY} AI_ENV_DOCKER_TESTS=1 ")) && env[0].contains(" AI_ENV_DOCKER_IMAGE='ai-env-agent:local' "), "{env:?}");
     assert_eq!(env[0], env[1], "both suites see the same Docker variables");
 
     let steps = ["image-zip", "image-build-local", "shim_docker", "docker_exec"];
@@ -662,40 +701,62 @@ fn s3_preflight_p3_needs_an_arm64_daemon_with_free_disk() {
     }
 }
 
-// ---- runtime-key (stateful fake aws, the ai-env stand-in) ----
+// ---- key-issue: the runtime, ops and deployer keys (ops.sh key-issue; stateful fake aws, the ai-env stand-in) ----
+//
+// runtime-key's recipe moved into `ops.sh key-issue` (S8 operators, contracts §9.7), which runtime-key, ops-key,
+// deployer-key and operator-keys share. These tests run it as infra.mk's KEY_ISSUE does, without the make target's
+// runner and identity line (tests of their own below): the label, the user, the mode, and ROTATE and AI_ENV_CLI in the
+// environment.
 
 fn key_id(n: u32) -> String {
     format!("AKIAFAKE{n:012}")
 }
 
-/// A temp tree for runtime-key: the stateful fake aws (state in `aws/`), a
-/// logged no-op `sleep`, the ai-env stand-in; `keys` access keys exist.
+/// A temp tree for key-issue: the stateful fake aws (state in `aws/`), pulumi and node (the hand-over reads the
+/// stack's account from its outputs: `outputs.json`, the S8 stack's), a logged no-op `sleep`, the ai-env stand-in;
+/// `keys` access keys of ai-env-runtime exist.
 fn rk_tree(keys: u32) -> (tempfile::TempDir, PathBuf) {
     let t = tempfile::tempdir().unwrap();
-    let bin = bin_with(t.path(), &[("aws-state.sh", "aws"), ("logged.sh", "sleep"), ("ai-env.sh", "ai-env-stand-in")]);
+    let bin = s5_bin(t.path());
+    bin_with(t.path(), &[("logged.sh", "sleep")]);
     let state = t.path().join("aws");
     std::fs::create_dir_all(&state).unwrap();
     let ids: String = (1..=keys).map(|n| key_id(n) + "\n").collect();
     std::fs::write(state.join("keys"), ids).unwrap();
     std::fs::write(state.join("next"), format!("{}\n", keys + 1)).unwrap();
+    write_outputs(t.path(), &with_operators(outputs()));
     (t, bin)
 }
 
-fn runtime_key(t: &Path, bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    make(t, bin, &["runtime-key"])
+/// `ops.sh key-issue <args>` as infra.mk's KEY_ISSUE runs it (ROTATE=1 among `envs` for a rotation).
+fn key_issue(t: &Path, bin: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new("/bin/bash");
+    isolate(&mut cmd, t).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    cmd.arg(Path::new(REPO).join("infra/scripts/ops.sh"))
+        .arg("key-issue")
         .args(args)
-        .arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display()))
+        .env("REGION", "eu-central-1")
+        .env("IMAGE_NAME", "ai-env-agent")
+        .env("IMAGE_OUT", t.join("out"))
+        .env("STACK", "dev")
+        .env("AI_ENV_CLI", bin.join("ai-env-stand-in"))
         .env("FAKE_AWS_STATE", t.join("aws"))
         .env("FAKE_AWS_LOG", t.join("aws.log"))
         .env("FAKE_AIENV_LOG", t.join("ai-env.log"))
+        .env("FAKE_PULUMI_OUTPUTS", t.join("outputs.json"))
         .env("FAKE_LOG", t.join("sleep.log"))
         .envs(envs.iter().copied())
         .bounded()
 }
 
-/// The stand-in's decrypts (`ai-env run`), one Touch ID prompt each.
+/// key-issue of the runtime key (runtime-key's), `envs` as given.
+fn runtime_key(t: &Path, bin: &Path, envs: &[(&str, &str)]) -> Output {
+    key_issue(t, bin, &["runtime-key", "ai-env-runtime", "sealed"], envs)
+}
+
+/// The stand-in's decrypts (`creds aws-verify`), one Touch ID prompt each.
 fn decrypts(t: &Path) -> Vec<String> {
-    lines_of(&t.join("ai-env.log")).into_iter().filter(|l| l.starts_with("run ")).collect()
+    lines_of(&t.join("ai-env.log")).into_iter().filter(|l| l.starts_with("creds aws-verify ")).collect()
 }
 
 fn aws_calls(t: &Path, prefix: &str) -> usize {
@@ -703,37 +764,59 @@ fn aws_calls(t: &Path, prefix: &str) -> usize {
 }
 
 fn delete_cmd(id: &str) -> String {
-    format!("aws iam delete-access-key --user-name ai-env-runtime --access-key-id {id} --region eu-central-1")
+    delete_cmd_of("ai-env-runtime", id)
 }
 
+/// The delete command key-issue prints, as it can run on this Mac, where a bare `aws` has no credentials (D13): under
+/// the deployer's runner (or none: these tests run key-issue directly), the deployer's.
+fn delete_cmd_of(user: &str, id: &str) -> String {
+    format!("ai-env as deployer -- aws iam delete-access-key --user-name {user} --access-key-id {id} --region eu-central-1")
+}
+
+/// D23: the new key's secret (what the stateful fake's create-access-key prints, built here as the fake builds it)
+/// crosses exactly one pipe, into the CLI: it is never in key-issue's output nor in any fake's log of the run in `t`.
+fn assert_secret_never_shown(t: &Path, out: &Output) {
+    let secret = "Fk9/".repeat(10);
+    assert!(!all(out).contains(&secret), "the new key's secret in the output: {}", all(out));
+    for log in ["aws.log", "ai-env.log", "calls.log", "sleep.log"] {
+        assert!(!read(&t.join(log)).contains(&secret), "the new key's secret in {log}");
+    }
+}
+
+/// IAM needs two more sts calls to propagate: the retries are aws-verify's own, one decrypt (one Touch ID prompt),
+/// and key-issue names no keystore key (the CLI reads the container's).
 #[test]
-fn runtime_key_verifies_once_with_the_key_the_container_names() {
-    // Sealed to a non-default [creds].key; IAM needs two more sts calls to propagate.
+fn runtime_key_verifies_once_in_creds_aws_verify_which_retries_while_iam_propagates() {
     let (t, bin) = rk_tree(0);
     std::fs::write(t.path().join("aws/sts-fails"), "2\n").unwrap();
-    let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AIENV_KEY", "team-key")]);
+    let out = runtime_key(t.path(), &bin, &[]);
     let all = all(&out);
-    assert!(out.status.success() && all.contains(&format!("the sealed key ...{} identifies as user/ai-env-runtime", &key_id(1)[16..])), "{all}");
+    assert!(out.status.success() && all.contains(&format!("runtime-key: the sealed key ...{} identifies as user/ai-env-runtime", &key_id(1)[16..])), "{all}");
     assert!(!all.contains(&key_id(1)), "a verified key is named by its tail only: {all}");
+    assert_secret_never_shown(t.path(), &out);
     let runs = decrypts(t.path());
-    assert_eq!(runs.len(), 1, "one decrypt, one Touch ID prompt: {runs:?}");
-    assert!(!runs[0].contains(" -k "), "ai-env run picks the key from the container: {runs:?}");
-    assert_eq!(aws_calls(t.path(), "sts get-caller-identity"), 3, "the retries run inside the child: {all}");
+    assert_eq!(runs, vec!["creds aws-verify --user ai-env-runtime [AI_ENV=unset]".to_string()], "one decrypt, one Touch ID prompt; no keystore key named");
+    assert_eq!(aws_calls(t.path(), "sts get-caller-identity"), 3, "the retries run inside aws-verify: {all}");
     assert_eq!(lines_of(&t.path().join("sleep.log")).len(), 2, "{all}");
     assert_eq!(lines_of(&t.path().join("aws/keys")), vec![key_id(1)]);
+    let sealed = read(&t.path().join("bridge/credentials/aws.env"));
+    assert_eq!(sealed, format!("FAKE-SEALED {}\n", key_id(1)), "sealed into aws.env");
+    assert!(!t.path().join("bridge/credentials/ops.env").exists(), "the runtime key never goes into ops.env");
 }
 
 #[test]
 fn runtime_key_stops_at_a_failed_decrypt_without_retrying() {
     let (t, bin) = rk_tree(0);
-    let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AIENV_RUN", "cancel")]);
+    let out = runtime_key(t.path(), &bin, &[("FAKE_AIENV_RUN", "cancel")]);
     let all = all(&out);
-    assert!(!out.status.success() && all.contains("ai-env run failed (exit 3)") && all.contains("NOT verified"), "{all}");
+    assert!(!out.status.success() && all.contains("runtime-key: ai-env creds aws-verify failed (exit 3)") && all.contains("NOT verified"), "{all}");
+    assert!(all.contains("  ai-env creds aws-verify --user ai-env-runtime\n"), "how to verify it again: {all}");
     assert!(!all.contains("IAM propagation"), "a cancelled prompt is not propagation: {all}");
     assert_eq!(decrypts(t.path()).len(), 1, "no second prompt: {all}");
     assert_eq!(aws_calls(t.path(), "sts "), 0, "{all}");
     assert_eq!(aws_calls(t.path(), "iam delete-access-key"), 0, "nothing deleted: {all}");
     assert_eq!(lines_of(&t.path().join("aws/keys")), vec![key_id(1)]);
+    assert_secret_never_shown(t.path(), &out);
 }
 
 #[test]
@@ -743,16 +826,17 @@ fn runtime_key_decides_from_iam_whether_a_key_was_created() {
     // not, by timing): either way the new id is named with its delete command.
     for (what, envs) in [("a lost response", [("FAKE_AWS_CREATE", "lost")]), ("a sealer that never read", [("FAKE_AIENV_SEAL", "early")])] {
         let (t, bin) = rk_tree(0);
-        let out = runtime_key(t.path(), &bin, &[], &envs);
+        let out = runtime_key(t.path(), &bin, &envs);
         let all = all(&out);
         assert!(!out.status.success(), "{what}: {all}");
         assert!(all.contains(&format!("the new key(s) {} are sealed nowhere", key_id(1))) && all.contains(&delete_cmd(&key_id(1))), "{what}: {all}");
         assert!(!all.contains("none was created") && !all.contains("no key was created"), "{what}: {all}");
         assert_eq!(decrypts(t.path()).len(), 0, "{what}: nothing to verify");
+        assert_secret_never_shown(t.path(), &out);
     }
     // Nothing created.
     let (t, bin) = rk_tree(0);
-    let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AWS_CREATE", "fail")]);
+    let out = runtime_key(t.path(), &bin, &[("FAKE_AWS_CREATE", "fail")]);
     let all = all(&out);
     assert!(!out.status.success() && all.contains("none was created") && !all.contains("delete-access-key --user-name"), "{all}");
 }
@@ -767,7 +851,7 @@ fn runtime_key_rotation_that_does_not_verify_prints_the_full_undo() {
         (t, bin, creds)
     };
     let (t, bin, creds) = setup();
-    let out = runtime_key(t.path(), &bin, &["ROTATE=1"], &[("FAKE_AWS_KEY_USER", "someone-else")]);
+    let out = runtime_key(t.path(), &bin, &[("ROTATE", "1"), ("FAKE_AWS_KEY_USER", "someone-else")]);
     let all_t = all(&out);
     assert!(!out.status.success(), "{all_t}");
     let baks: Vec<PathBuf> = std::fs::read_dir(&creds).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(".bak")).collect();
@@ -777,46 +861,61 @@ fn runtime_key_rotation_that_does_not_verify_prints_the_full_undo() {
     assert!(all_t.contains(&format!("mv \"{}\" \"{}\"", baks[0].display(), creds.join("aws.env").display())), "the undo restores the backup: {all_t}");
     assert!(all_t.contains(&format!("the previous key {} is still active and sealed in {}", key_id(1), baks[0].display())), "{all_t}");
     assert_eq!(lines_of(&t.path().join("aws/keys")), vec![key_id(1), key_id(2)], "nothing deleted");
+    assert_secret_never_shown(t.path(), &out);
 
     // The rotation that verifies deletes the old key.
     let (t, bin, _) = setup();
-    let out = runtime_key(t.path(), &bin, &["ROTATE=1"], &[]);
+    let out = runtime_key(t.path(), &bin, &[("ROTATE", "1")]);
     let all = all(&out);
     assert!(out.status.success() && all.contains(&format!("rotated; deleted the old key {}", key_id(1))), "{all}");
     assert_eq!(lines_of(&t.path().join("aws/keys")), vec![key_id(2)]);
+    assert_secret_never_shown(t.path(), &out);
 }
 
 #[test]
 fn runtime_key_names_every_extra_new_key_with_its_own_delete_command() {
     // A retried create-access-key left two new keys; aws-set sealed the second.
     let (t, bin) = rk_tree(0);
-    let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AWS_CREATE", "twice")]);
+    let out = runtime_key(t.path(), &bin, &[("FAKE_AWS_CREATE", "twice")]);
     let all = all(&out);
     assert!(out.status.success(), "the sealed key verifies: {all}");
     assert!(all.contains(&format!("the sealed key ...{} identifies as user/ai-env-runtime", &key_id(2)[16..])), "only the sealed id is named: {all}");
     assert!(all.contains(&format!("besides the sealed {}", key_id(2))) && all.contains(&delete_cmd(&key_id(1))), "the unsealed extra key gets its own delete command: {all}");
     assert!(!all.contains(&delete_cmd(&key_id(2))), "never the sealed one: {all}");
     assert!(!all.contains(&format!("{} {}", key_id(1), key_id(2))), "no two ids in one argument: {all}");
+    assert_secret_never_shown(t.path(), &out);
 
     // The same two keys, and the sealed one does not verify: the undo names
     // only the sealed id, the extra one keeps its own line.
     let (t, bin) = rk_tree(0);
-    let out = runtime_key(t.path(), &bin, &[], &[("FAKE_AWS_CREATE", "twice"), ("FAKE_AWS_KEY_USER", "someone-else")]);
+    let out = runtime_key(t.path(), &bin, &[("FAKE_AWS_CREATE", "twice"), ("FAKE_AWS_KEY_USER", "someone-else")]);
     let text = self::all(&out);
     assert!(!out.status.success(), "{text}");
     assert_eq!(text.matches(&delete_cmd(&key_id(2))).count(), 1, "the undo deletes the sealed key once: {text}");
     assert_eq!(text.matches(&delete_cmd(&key_id(1))).count(), 1, "the extra key: {text}");
     assert!(text.lines().all(|l| !(l.contains(&key_id(1)) && l.contains(&key_id(2)) && l.contains("--access-key-id"))), "no command names both: {text}");
+    assert_secret_never_shown(t.path(), &out);
 }
 
+/// Under `ai-env as deployer` (as make runs it), key-issue hands the runner's environment to the CLI as it is: the
+/// sealing and the verification see the runner's marker (and so its key) unchanged, and the new key never enters
+/// key-issue's own environment or any argv but a delete command; the sealed key alone reaching sts is the CLI's own
+/// scrub (`apply_key`, unit-tested in src/bridge/identity.rs), which the stand-in only mirrors.
 #[test]
-fn runtime_key_verifies_with_the_sealed_key_alone() {
-    // The operator's shell carries a session token (aws-vault, SSO): it must
-    // not reach the verification child, or sts rejects the sealed key.
+fn runtime_key_hands_the_runners_environment_to_the_cli_as_it_is() {
     let (t, bin) = rk_tree(0);
-    let out = runtime_key(t.path(), &bin, &[], &[("AWS_SECURITY_TOKEN", "operator-token"), ("AWS_SESSION_TOKEN", "operator-token"), ("AWS_CREDENTIAL_EXPIRATION", "2000-01-01T00:00:00Z")]);
+    let envs = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let out = runtime_key(t.path(), &bin, &pairs(&envs));
     let all = all(&out);
     assert!(out.status.success() && all.contains(&format!("the sealed key ...{} identifies as user/ai-env-runtime", &key_id(1)[16..])), "{all}");
+    let cli: Vec<String> = lines_of(&t.path().join("ai-env.log"));
+    assert_eq!(
+        cli,
+        [BUILT, "creds aws-set --user ai-env-runtime [AI_ENV=unset] [AS=deployer:9001]", "creds aws-verify --user ai-env-runtime [AI_ENV=unset] [AS=deployer:9001]"].map(String::from),
+        "the CLI built without the key first (D18), then sealing and verification under the runner's marker: {all}"
+    );
+    assert!(lines_of(&t.path().join("aws.log")).iter().all(|l| !l.contains(&key_id(1))), "the new key in an aws argv: {all}");
+    assert_secret_never_shown(t.path(), &out);
 }
 
 #[test]
@@ -827,10 +926,11 @@ fn runtime_key_never_deletes_the_key_the_verified_container_still_holds() {
     let creds = t.path().join("bridge/credentials");
     std::fs::create_dir_all(&creds).unwrap();
     std::fs::write(creds.join("aws.env"), format!("FAKE-SEALED {}\n", key_id(1))).unwrap();
-    let out = runtime_key(t.path(), &bin, &["ROTATE=1"], &[("FAKE_AIENV_SEAL_DIR", t.path().join("elsewhere").to_str().unwrap())]);
+    let out = runtime_key(t.path(), &bin, &[("ROTATE", "1"), ("FAKE_AIENV_SEAL_DIR", t.path().join("elsewhere").to_str().unwrap())]);
     let all = all(&out);
     assert!(!out.status.success() && all.contains(&format!("still holds the previous key {}", key_id(1))) && all.contains("Nothing deleted"), "{all}");
     assert_eq!(lines_of(&t.path().join("aws/keys")), vec![key_id(1), key_id(2)], "nothing deleted: {all}");
+    assert_secret_never_shown(t.path(), &out);
 }
 
 #[test]
@@ -840,7 +940,7 @@ fn runtime_key_verifies_even_when_the_listing_after_sealing_fails() {
     let creds = t.path().join("bridge/credentials");
     std::fs::create_dir_all(&creds).unwrap();
     std::fs::write(creds.join("aws.env"), format!("FAKE-SEALED {}\n", key_id(1))).unwrap();
-    let out = runtime_key(t.path(), &bin, &["ROTATE=1"], &[("FAKE_AWS_LIST_FAIL_FROM", "2"), ("FAKE_AWS_KEY_USER", "someone-else")]);
+    let out = runtime_key(t.path(), &bin, &[("ROTATE", "1"), ("FAKE_AWS_LIST_FAIL_FROM", "2"), ("FAKE_AWS_KEY_USER", "someone-else")]);
     let all = all(&out);
     assert!(!out.status.success(), "{all}");
     assert!(all.contains("cannot list the keys of ai-env-runtime after sealing") && all.contains("verifying the sealed key anyway"), "{all}");
@@ -849,6 +949,199 @@ fn runtime_key_verifies_even_when_the_listing_after_sealing_fails() {
     assert_eq!(bak.len(), 1, "{all}");
     assert!(all.contains(&delete_cmd(&key_id(2))) && all.contains(&format!("mv \"{}\"", bak[0].display())), "the full undo names the sealed id and the backup: {all}");
     assert_eq!(lines_of(&t.path().join("aws/keys")), vec![key_id(1), key_id(2)], "nothing deleted");
+    assert_secret_never_shown(t.path(), &out);
+}
+
+/// The ops key: sealed into credentials/ops.env (never aws.env), verified as user/ai-env-ops; `first` (operator-keys)
+/// skips a user that has a key, ROTATE=1 included; a second key, or one without ROTATE=1, is refused before anything
+/// is created; anything but the three (user, mode) pairs is usage, exit 2.
+#[test]
+fn key_issue_seals_the_ops_key_into_ops_env_and_first_skips_a_user_with_a_key() {
+    let (t, bin) = rk_tree(0);
+    let ops = |args: &[&str], envs: &[(&str, &str)]| key_issue(t.path(), &bin, args, envs);
+    let out = ops(&["ops-key", "ai-env-ops", "sealed"], &[]);
+    let text = all(&out);
+    assert!(out.status.success() && text.contains(&format!("ops-key: the sealed key ...{} identifies as user/ai-env-ops", &key_id(1)[16..])), "{text}");
+    assert_eq!(read(&t.path().join("bridge/credentials/ops.env")), format!("FAKE-SEALED {}\n", key_id(1)));
+    assert!(!t.path().join("bridge/credentials/aws.env").exists(), "the ops key never goes into aws.env");
+    assert_eq!(lines_of(&t.path().join("aws/keys.ai-env-ops")), vec![key_id(1)]);
+    assert_eq!(decrypts(t.path()), vec!["creds aws-verify --user ai-env-ops [AI_ENV=unset]".to_string()]);
+    assert_secret_never_shown(t.path(), &out);
+    let calls_before = lines_of(&t.path().join("aws.log")).len();
+    for envs in [&[][..], &[("ROTATE", "1")][..]] {
+        let out = ops(&["ops-key", "ai-env-ops", "sealed", "first"], envs);
+        assert!(out.status.success() && all(&out).contains("ops-key: ai-env-ops has its key already: skipped (a rerun resumes)"), "{envs:?}: {}", all(&out));
+    }
+    assert_eq!(lines_of(&t.path().join("aws.log")).len(), calls_before + 2, "a skip lists the keys and nothing else");
+    let out = ops(&["ops-key", "ai-env-ops", "sealed"], &[]);
+    assert!(!out.status.success() && all(&out).contains(&format!("ops-key: ai-env-ops already has a key ({}); ROTATE=1 seals a new one, then deletes it", key_id(1))), "{}", all(&out));
+    let out = ops(&["ops-key", "ai-env-ops", "sealed"], &[("ROTATE", "1")]);
+    assert!(out.status.success() && all(&out).contains(&format!("ops-key: rotated; deleted the old key {}", key_id(1))), "{}", all(&out));
+    assert_eq!(lines_of(&t.path().join("aws/keys.ai-env-ops")), vec![key_id(2)]);
+    std::fs::write(t.path().join("aws/keys.ai-env-ops"), format!("{}\n{}\n", key_id(2), key_id(7))).unwrap();
+    let out = ops(&["ops-key", "ai-env-ops", "sealed"], &[("ROTATE", "1")]);
+    let text = all(&out);
+    assert!(!out.status.success() && text.contains("ops-key: ai-env-ops has 2 access keys (the IAM maximum); delete the one that is not sealed first:"), "{text}");
+    let bads: [&[&str]; 5] = [&["ops-key", "ai-env-deployer", "sealed"], &["ops-key", "ai-env-ops", "handover"], &["ops-key", "ai-env-ops", "sealed", "twice"], &["", "ai-env-ops", "sealed"], &["ops-key"]];
+    for bad in bads {
+        let out = ops(bad, &[]);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", all(&out));
+        assert!(stderr(&out).starts_with("usage: ops.sh key-issue LABEL "), "{bad:?}: {}", all(&out));
+    }
+    assert_eq!(lines_of(&t.path().join("aws/keys.ai-env-ops")), vec![key_id(2), key_id(7)], "nothing created by a refusal");
+    assert!(!read(&t.path().join("aws.log")).contains(&"Fk9/".repeat(10)) && !read(&t.path().join("ai-env.log")).contains(&"Fk9/".repeat(10)), "the secret in a log");
+}
+
+/// key-issue of the deployer key (deployer-key's and operator-keys'): create-access-key piped into `ai-env creds
+/// deployer-key --account <the stack's accountId>` (the clipboard, the paste-back and sts are the CLI's own); its `id`
+/// line says it took the key, its exit is the verdict: 0 verified, 42 never answered and 9 another principal or
+/// account (does not identify: delete it, put the entry's previous values back), anything else (cancelled, a
+/// paste-back that never matched, the clipboard) held nowhere: delete it. Without an `id` line nothing was handed over
+/// and IAM says what was created. No accountId output: nothing is created.
+#[test]
+fn key_issue_hands_the_deployer_key_over_and_names_the_undo_of_every_failure() {
+    let deployer = |rk: u32, envs: &[(&str, &str)], prep: &dyn Fn(&Path)| {
+        let (t, bin) = rk_tree(0);
+        let keys: String = (1..=rk).map(|n| key_id(n) + "\n").collect();
+        std::fs::write(t.path().join("aws/keys.ai-env-deployer"), keys).unwrap();
+        std::fs::write(t.path().join("aws/next"), format!("{}\n", rk + 1)).unwrap();
+        prep(t.path());
+        let out = key_issue(t.path(), &bin, &["deployer-key", "ai-env-deployer", "handover"], envs);
+        assert_secret_never_shown(t.path(), &out);
+        (t, out)
+    };
+    let none = |_: &Path| {};
+    let new_id = key_id(1);
+    let del = delete_cmd_of("ai-env-deployer", &new_id);
+
+    // Verified: handed over to the stack's account, named by its tail.
+    let (t, out) = deployer(0, &[], &none);
+    let text = all(&out);
+    assert!(out.status.success() && text.contains(&format!("deployer-key: the key ...{} is in Strongbox and identifies as user/ai-env-deployer", &new_id[16..])), "{text}");
+    assert!(!stdout(&out).contains(&new_id), "a verified key is named by its tail only: {}", stdout(&out));
+    assert_eq!(lines_of(&t.path().join("ai-env.log")), vec![BUILT.to_string(), "creds deployer-key --account 123456789012 [AI_ENV=unset]".to_string()], "the CLI built first, without a key; the account is the stack's, from its outputs");
+    assert!(!t.path().join("bridge/credentials").exists(), "the deployer's key is sealed nowhere");
+
+    // The hand-over failed after it took the key: held nowhere you can rely on.
+    for (what, mode, rc) in [("cancelled", "cancel", "3"), ("a paste-back that never matched", "mismatch", "1"), ("the clipboard", "clipboard", "1")] {
+        let (t, out) = deployer(0, &[("FAKE_AIENV_HANDOVER", mode)], &none);
+        let text = all(&out);
+        assert!(!out.status.success(), "{what}: {text}");
+        assert!(text.contains(&format!("deployer-key: ai-env creds deployer-key failed (exit {rc}): the new key {new_id} is held nowhere you can rely on; delete it:\n  {del}\n")), "{what}: {text}");
+        assert_eq!(lines_of(&t.path().join("aws/keys.ai-env-deployer")), vec![new_id.clone()], "{what}: nothing deleted");
+    }
+    // Under the account root's runner (operator-keys, break-glass: the deployer may have no key at all) the commands are
+    // the root's, run in its terminal (D13).
+    let (_, out) = deployer(0, &[("FAKE_AIENV_HANDOVER", "cancel"), ("AI_ENV_BRIDGE_AS", "root")], &none);
+    let text = all(&out);
+    let root_del = format!("ai-env as root -- aws iam delete-access-key --user-name ai-env-deployer --access-key-id {new_id} --region eu-central-1");
+    assert!(text.contains(&format!("is held nowhere you can rely on; delete it:\n  {root_del}\n")) && !text.contains("ai-env as deployer --"), "{text}");
+
+    // Never answered (42), or another account (9): it does not identify; the undo names the entry's history.
+    let (_, out) = deployer(0, &[], &|t: &Path| std::fs::write(t.join("aws/sts-fails"), "8\n").unwrap());
+    let text = all(&out);
+    let undo = "If it never verifies, delete the new one and put the previous values back in the Strongbox entry (its history keeps them):";
+    assert!(!out.status.success() && text.contains(&format!("deployer-key: the key {new_id} does not identify as user/ai-env-deployer; the previous key (none) is kept. {undo}\n  {del}\n")), "{text}");
+    let (_, out) = deployer(0, &[], &|t: &Path| {
+        let mut o = with_operators(outputs());
+        o["accountId"] = json!("999999999999");
+        write_outputs(t, &o);
+    });
+    let text = all(&out);
+    assert!(!out.status.success() && text.contains("does not identify as user/ai-env-deployer") && text.contains(undo) && text.contains(&del), "{text}");
+
+    // A rotation: the old key deleted last, once the new one is in Strongbox and answers.
+    let (t, out) = deployer(1, &[("ROTATE", "1")], &none);
+    let text = all(&out);
+    let new2 = key_id(2);
+    assert!(out.status.success() && text.contains(&format!("deployer-key: the key ...{} is in Strongbox and identifies as user/ai-env-deployer", &new2[16..])), "{text}");
+    assert!(stdout(&out).ends_with(&format!("deployer-key: rotated; deleted the old key {}\n", key_id(1))), "the old key last: {text}");
+    assert_eq!(lines_of(&t.path().join("aws/keys.ai-env-deployer")), vec![new2.clone()]);
+    let (_, out) = deployer(1, &[], &none);
+    assert!(!out.status.success() && all(&out).contains(&format!("deployer-key: ai-env-deployer already has a key ({}); ROTATE=1 hands a new one over, then deletes it", key_id(1))), "{}", all(&out));
+    let (_, out) = deployer(2, &[("ROTATE", "1")], &none);
+    let two = "deployer-key: ai-env-deployer has 2 access keys (the IAM maximum); delete the one that is not in Strongbox first:\n  ai-env as deployer -- aws iam list-access-keys --user-name ai-env-deployer --region eu-central-1\n  ai-env as deployer -- aws iam delete-access-key --user-name ai-env-deployer --access-key-id <id> --region eu-central-1\n";
+    assert!(!out.status.success() && all(&out).contains(two), "{}", all(&out));
+
+    // A retried create left an extra key: its own delete command, never the handed-over one's.
+    let (_, out) = deployer(0, &[("FAKE_AWS_CREATE", "twice")], &none);
+    let text = all(&out);
+    assert!(out.status.success() && text.contains(&format!("IAM lists new key(s) held nowhere besides the handed-over {new2} (a retried create-access-key). Delete them:\n  {del}\n")), "{text}");
+    assert!(!text.contains(&delete_cmd_of("ai-env-deployer", &new2)), "{text}");
+
+    // Nothing handed over (no id line): IAM decides what to delete.
+    let (_, out) = deployer(0, &[("FAKE_AWS_CREATE", "lost")], &none);
+    let text = all(&out);
+    assert!(!out.status.success() && text.contains(&format!("deployer-key: the hand-over failed (create-access-key exit 255, deployer-key exit 1): the new key(s) {new_id} are held nowhere. Delete them:\n  {del}\n")), "{text}");
+    let (_, out) = deployer(0, &[("FAKE_AWS_CREATE", "fail")], &none);
+    assert!(!out.status.success() && all(&out).contains("deployer-key: create-access-key failed (exit 254) and IAM lists no new key of ai-env-deployer: none was created"), "{}", all(&out));
+
+    // No accountId: nothing created.
+    for (what, outputs) in [("no accountId", Some(outputs())), ("unreadable outputs", None)] {
+        let (t, out) = deployer(0, &[], &|t: &Path| match &outputs {
+            Some(o) => write_outputs(t, o),
+            None => std::fs::remove_file(t.join("outputs.json")).unwrap(),
+        });
+        let text = all(&out);
+        assert!(!out.status.success() && text.contains("deployer-key: the outputs of stack dev name no accountId: the hand-over needs the stack's account: nothing created"), "{what}: {text}");
+        assert_eq!(aws_calls(t.path(), "iam create-access-key"), 0, "{what}");
+        assert_eq!(lines_of(&t.path().join("ai-env.log")), vec![BUILT.to_string()], "{what}: deployer-key never ran (only the keyless build)");
+    }
+}
+
+/// key-issue's verdict on a sealed key reads aws-verify's `id` line (contracts §9.7 step 6, D9): exit 5 after it (six
+/// sts tries, none answered) is a key that does not identify, with its delete command; exit 5 without it (no sealed
+/// file where aws-verify looks) is aws-verify's own failure: NOT verified, how to verify it, nothing to delete.
+/// ROTATE=1 for a user with no key refuses before anything is created (step 1); a hand-over whose listing fails
+/// afterwards still judges the handed-over key (step 4's warning).
+#[test]
+fn key_issue_tells_a_key_that_never_answered_from_a_failed_verification() {
+    // Never answered: the sealed key is named in full, with the delete command; nothing is deleted.
+    let (t, bin) = rk_tree(0);
+    std::fs::write(t.path().join("aws/sts-fails"), "6\n").unwrap();
+    let out = key_issue(t.path(), &bin, &["ops-key", "ai-env-ops", "sealed"], &[]);
+    let text = all(&out);
+    let id = key_id(1);
+    let undo = format!("ops-key: the sealed key {id} does not identify as user/ai-env-ops; the previous key (none) is kept. If it never verifies, delete the new one:\n  {}\n", delete_cmd_of("ai-env-ops", &id));
+    assert!(!out.status.success() && text.contains(&undo) && !text.contains("NOT verified"), "{text}");
+    assert_eq!(decrypts(t.path()).len(), 1, "one decrypt: {text}");
+    assert_eq!(aws_calls(t.path(), "sts get-caller-identity"), 6, "aws-verify's six tries: {text}");
+    assert_eq!(lines_of(&t.path().join("aws/keys.ai-env-ops")), vec![id.clone()], "nothing deleted: {text}");
+    assert_secret_never_shown(t.path(), &out);
+
+    // No sealed file where aws-verify looks (no id line): its failure, not the key's verdict.
+    let (t, bin) = rk_tree(0);
+    let out = runtime_key(t.path(), &bin, &[("FAKE_AIENV_SEAL_DIR", t.path().join("elsewhere").to_str().unwrap())]);
+    let text = all(&out);
+    let failed = format!("runtime-key: ai-env creds aws-verify failed (exit 5): the sealed key {id} is NOT verified and nothing was deleted. Verify it with:\n  ai-env creds aws-verify --user ai-env-runtime\n");
+    assert!(!out.status.success() && text.contains(&failed), "{text}");
+    assert!(!text.contains("does not identify") && !text.contains("delete-access-key --user-name"), "nothing to delete for a key that was never checked: {text}");
+    assert_eq!(aws_calls(t.path(), "sts "), 0, "{text}");
+    assert_eq!(lines_of(&t.path().join("aws/keys")), vec![id.clone()]);
+    assert_secret_never_shown(t.path(), &out);
+
+    // ROTATE=1 without a key: refused before anything is created.
+    for (label, user, mode) in [("runtime-key", "ai-env-runtime", "sealed"), ("ops-key", "ai-env-ops", "sealed"), ("deployer-key", "ai-env-deployer", "handover")] {
+        let (t, bin) = rk_tree(0);
+        let out = key_issue(t.path(), &bin, &[label, user, mode], &[("ROTATE", "1")]);
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(1), "{label}: {text}");
+        let route = if mode == "handover" { "make operator-keys (as the account root)".to_string() } else { format!("make {label}") };
+        assert!(stdout(&out).ends_with(&format!("{label}: ROTATE=1, but {user} has no key: {route}\n")), "{label}: {text}");
+        assert_eq!(aws_calls(t.path(), "iam create-access-key"), 0, "{label}: nothing created: {text}");
+        assert_eq!(lines_of(&t.path().join("ai-env.log")), vec![BUILT.to_string()], "{label}: no CLI call but the keyless build: {text}");
+    }
+
+    // The hand-over's listing afterwards fails: a warning, and the handed-over key judged all the same.
+    let (t, bin) = rk_tree(0);
+    let out = key_issue(t.path(), &bin, &["deployer-key", "ai-env-deployer", "handover"], &[("FAKE_AWS_LIST_FAIL_FROM", "2")]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    let said = stdout(&out);
+    let warning = "deployer-key: warning: cannot list the keys of ai-env-deployer after the hand-over (exit 254); judging the handed-over key anyway\n";
+    let verified = format!("deployer-key: the key ...{} is in Strongbox and identifies as user/ai-env-deployer\n", &id[16..]);
+    assert!(said.find(warning).is_some_and(|w| said.find(&verified).is_some_and(|v| w < v)), "the warning, then the verdict: {text}");
+    assert_secret_never_shown(t.path(), &out);
 }
 
 // ---- ops.sh wait (D29) ----
@@ -986,7 +1279,7 @@ fn ai_env_from_the_environment_never_reaches_a_recipe() {
     let stand_in = bin.join("ai-env-stand-in");
     let out = make(t.path(), &bin, &["check-base-image"]).arg(format!("AI_ENV={}", stand_in.display())).env("AI_ENV", "1").env("FAKE_AIENV_LOG", &log).env("FAKE_LOG", &tools).bounded();
     assert!(out.status.success(), "{}", all(&out));
-    assert_eq!(lines_of(&log), vec!["infra base-image --name al2023-1 --version 1 [AI_ENV=unset]".to_string()]);
+    assert_eq!(lines_of(&log), vec![BUILT.to_string(), "infra base-image --name al2023-1 --version 1 [AI_ENV=unset]".to_string()], "built first, without a key (D18), then the check");
     assert_eq!(read(&tools), "", "cargo never ran");
 }
 
@@ -1030,7 +1323,7 @@ fn image_and_base_names_come_from_image_config_json() {
     let out = make(t.path(), &bin, &["check-base-image", &arg]).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).env("FAKE_AIENV_LOG", &log).bounded();
     assert!(!out.status.success() && all(&out).contains("baseImage.name or baseImage.version missing from"), "{}", all(&out));
     assert_eq!(read(&log), "", "ai-env never ran");
-    let out = make(t.path(), &bin, &["image-status", &arg]).env("FAKE_LOG", t.path().join("tools.log")).bounded();
+    let out = make(t.path(), &bin, &["image-status", &arg]).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).env("FAKE_LOG", t.path().join("tools.log")).bounded();
     assert!(!out.status.success() && all(&out).contains("IMAGE_NAME is empty"), "{}", all(&out));
     assert_eq!(read(&t.path().join("tools.log")), "", "aws never ran");
 }
@@ -1183,6 +1476,15 @@ fn outputs() -> Value {
 /// `<tmp>/outputs.json`, which the fake pulumi prints for `stack output`.
 fn write_outputs(t: &Path, o: &Value) {
     std::fs::write(t.join("outputs.json"), o.to_string()).unwrap();
+}
+
+/// `o` as a stack the S8 operators' bootstrap deployed exports it: its account and the two operator users, which
+/// infra.mk's TIER (ops.sh stack-deployer) and ops.sh identity read.
+fn with_operators(mut o: Value) -> Value {
+    o["accountId"] = json!("123456789012");
+    o["deployerUserName"] = json!("ai-env-deployer");
+    o["opsUserName"] = json!("ai-env-ops");
+    o
 }
 
 /// state/infra.toml as the real `ai-env infra status --write` renders `o`
@@ -1669,7 +1971,7 @@ fn connector_probe_measures_a_pending_connector_and_deletes_it_on_every_path() {
     let out = probe(t.path(), &bin, &[("FAKE_AWS_DELETE_CONNECTOR", "fail")]);
     let name = probe_name(&calls(t.path()));
     let err = stderr(&out);
-    assert!(!out.status.success() && err.contains(&format!("DELETING {name} FAILED 6 times")) && err.contains(&format!("aws lambda-core delete-network-connector --identifier {name} {LAMBDA_PIN}")), "{}", all(&out));
+    assert!(!out.status.success() && err.contains(&format!("DELETING {name} FAILED 6 times")) && err.contains(&format!("\n  ai-env as deployer -- aws lambda-core delete-network-connector --identifier {name} {LAMBDA_PIN}\n")), "{}", all(&out));
     assert_eq!(calls(t.path()).iter().filter(|l| l.starts_with("lambda-core delete-network-connector")).count(), 6);
 }
 
@@ -1687,9 +1989,10 @@ fn vm_guard_refuses_while_a_connector_other_than_the_stacks_exists() {
     let text = all(&out);
     assert!(!out.status.success() && text.contains("network connectors other than the stack's ai-env-egress exist"), "{text}");
     assert!(text.contains(&format!("  ai-env-egress-probe-1790000000 PENDING arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress-probe-1790000000 (subnets: {VM_SUBNET})")), "{text}");
-    // A delete command for ours only: a probe of the stack's connector, or one on the VM subnet.
+    // A delete command for ours only: a probe of the stack's connector, or one on the VM subnet; the deployer's, as it
+    // can run on this Mac (D13: a bare aws has no credentials).
     for ours in ["ai-env-egress-probe-1790000000", "hand-made"] {
-        assert!(text.contains(&format!("    aws lambda-core delete-network-connector {LAMBDA_PIN} --identifier {ours}\n")), "{ours}: {text}");
+        assert!(text.contains(&format!("    ai-env as deployer -- aws lambda-core delete-network-connector {LAMBDA_PIN} --identifier {ours}\n")), "{ours}: {text}");
     }
     assert!(text.contains("  other-project ACTIVE ") && text.contains("(subnets: subnet-0fff0000aaaa1111b)"), "{text}");
     assert!(text.contains(&format!("not on the VM subnet {VM_SUBNET} nor a probe of ai-env-egress: it may be another project's (no delete command")), "{text}");
@@ -1701,10 +2004,12 @@ fn vm_guard_refuses_while_a_connector_other_than_the_stacks_exists() {
         std::fs::remove_dir_all(t.path().join("aws/connectors").join(name)).unwrap();
     }
 
-    // make connector-delete stops there: the stack's connector stays.
+    // make connector-delete (as the deployer) stops there: the stack's connector stays.
+    write_outputs(t.path(), &with_operators(outputs()));
     let mut cmd = make(t.path(), &bin, &["connector-delete", "CONFIRM=delete-connector"]);
-    let out = s5_env(&mut cmd, t.path()).bounded();
+    let out = s5_env(&mut cmd, t.path()).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).bounded();
     assert!(!out.status.success() && all(&out).contains("other than the stack's"), "{}", all(&out));
+    assert!(all(&out).contains("connector-delete: identity user/ai-env-deployer (the deployer of stack dev)"), "{}", all(&out));
     assert!(!t.path().join("aws/deleted").exists() && t.path().join("aws/connectors").join(CONNECTOR).is_dir());
 
     // The stack's connector alone passes on to the VM check; a failed listing refuses.
@@ -1713,6 +2018,30 @@ fn vm_guard_refuses_while_a_connector_other_than_the_stacks_exists() {
     assert!(out.status.success() && all(&out).contains("vm-guard: no network connector but the stack's ai-env-egress") && all(&out).contains("no image ai-env-agent, hence no VM of it"), "{}", all(&out));
     let out = ops5(t.path(), &bin, &["vm-guard"]).env("FAKE_AWS_FAIL_OP", "lambda-core list-network-connectors").bounded();
     assert!(!out.status.success() && all(&out).contains("list-network-connectors failed"), "{}", all(&out));
+}
+
+/// vm-guard's VM check (before destroy, image-delete and connector-delete): a VM of the image that is not TERMINATED
+/// refuses, listed, and the hint is the CLI's own terminate (TerminateMicrovm is the runtime key's, A24), never a bare
+/// `aws`, which has no credentials on the Mac; once every VM is TERMINATED it passes.
+#[test]
+fn vm_guard_refuses_a_vm_not_terminated_and_names_ai_env_vm_terminate() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = s5_bin(t.path());
+    seed_connector(t.path(), CONNECTOR, "ACTIVE");
+    set_image(t.path(), "UPDATED", "3", "", "2026-10-01T10:00:00.000000+00:00");
+    std::fs::write(t.path().join("aws/vms"), "microvm-0aaa 3 RUNNING\nmicrovm-0bbb 2 TERMINATED\nmicrovm-0ccc 2 SUSPENDED\n").unwrap();
+    let out = ops5(t.path(), &bin, &["vm-guard"]).bounded();
+    let text = all(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    let want = "vm-guard: no network connector but the stack's ai-env-egress\nrefusing: VMs of ai-env-agent are not TERMINATED:\n  microvm-0aaa\tRUNNING\t3\n  microvm-0ccc\tSUSPENDED\t2\nterminate them first, each with the runtime key's Touch ID (--yes for a VM this Mac has no row of): ai-env vm terminate <id>\n";
+    assert_eq!(stdout(&out), want, "{text}");
+    assert!(!text.contains("terminate-microvm") && !text.contains("aws lambda-microvms"), "never a bare aws: {text}");
+    let c = calls(t.path());
+    assert_eq!(c.iter().filter(|l| l.starts_with("lambda-microvms list-microvms ")).count(), 1, "{c:#?}");
+    // Every VM TERMINATED: it passes.
+    std::fs::write(t.path().join("aws/vms"), "microvm-0aaa 3 TERMINATED\nmicrovm-0ccc 2 TERMINATED\n").unwrap();
+    let out = ops5(t.path(), &bin, &["vm-guard"]).bounded();
+    assert!(out.status.success() && stdout(&out).ends_with("vm-guard: every VM of ai-env-agent is TERMINATED\n"), "{}", all(&out));
 }
 
 #[test]
@@ -1738,10 +2067,12 @@ fn connector_delete_runs_vm_guard_first_waits_until_gone_and_names_the_state_fix
     let t = tempfile::tempdir().unwrap();
     let bin = s5_bin(t.path());
     seed_connector(t.path(), CONNECTOR, "ACTIVE");
+    write_outputs(t.path(), &with_operators(outputs()));
     let mut cmd = make(t.path(), &bin, &["connector-delete", "CONFIRM=delete-connector", "CONNECTOR_WAIT_POLL=1"]);
-    let out = s5_env(&mut cmd, t.path()).bounded();
+    let out = s5_env(&mut cmd, t.path()).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).bounded();
     let text = all(&out);
     assert!(out.status.success() && text.contains("connector-delete: ai-env-egress is gone after"), "{text}");
+    assert!(text.contains("connector-delete: identity user/ai-env-deployer (the deployer of stack dev)"), "as the deployer: {text}");
     assert!(text.contains("cd infra && pulumi state delete '<that urn>' --stack dev"), "{text}");
     let verified = format!("state/egress-verified.toml ({}/state/egress-verified.toml): its records are bound to the deleted connector's Id and no longer admit anything; remove it", t.path().join("bridge").display());
     assert!(text.contains(&verified), "{text}");
@@ -2146,9 +2477,12 @@ fn the_makefile_parses_without_egress_config_json_and_its_egress_targets_refuse(
     assert!(dry.status.success() && stdout(&dry).contains("test -n \"\" || { echo \"egress-logs: no logGroup in infra/egress-config.json\""), "{}", all(&dry));
     let logs = run(&["egress-logs"]);
     assert!(!logs.status.success() && all(&logs).contains("egress-logs: no logGroup in infra/egress-config.json"), "{}", all(&logs));
-    let wait = run(&["connector-wait"]);
+    assert_eq!(calls(t.path()), Vec::<String>::new(), "the log group's check comes before the runner: nothing ran");
+    let stand_in = format!("AI_ENV={}", bin.join("ai-env-stand-in").display());
+    let wait = run(&["connector-wait", stand_in.as_str()]);
     assert!(!wait.status.success() && all(&wait).contains("no connectorName in"), "{}", all(&wait));
-    assert_eq!(calls(t.path()), Vec::<String>::new(), "nothing ran without the names");
+    let c = calls(t.path());
+    assert_eq!(c, [BUILT.to_string(), "as --check ops [AI_ENV=unset]".to_string(), format!("as ops -- {} --no-print-directory connector-wait-run [AI_ENV=unset]", make_path())], "the keyless build, the runner, then nothing ran without the names");
 }
 
 #[test]
@@ -2162,11 +2496,14 @@ fn egress_logs_and_the_proxy_targets_call_their_commands() {
         let out = s5_env(&mut cmd, t.path()).arg(&stand_in).envs(envs.iter().copied()).bounded();
         (out, calls(t.path()))
     };
+    // egress-logs runs as ai-env-ops: the CLI built without a key (D18), the runner (one Touch ID), then the read under
+    // its key.
+    let runner = [BUILT.to_string(), "as --check ops [AI_ENV=unset]".to_string(), format!("as ops -- {} --no-print-directory egress-logs-run [AI_ENV=unset]", make_path())];
     let (out, c) = run(&["egress-logs"], &[]);
     assert!(out.status.success() && stdout(&out).contains("TCP_TUNNEL/200 5120 CONNECT api.anthropic.com:443"), "{}", all(&out));
-    assert_eq!(c, vec!["logs tail /ai-env/egress/squid --since 1h --format short --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com"]);
+    assert_eq!(c, [&runner[..], &["logs tail /ai-env/egress/squid --since 1h --format short --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com".to_string()]].concat());
     let (_, c) = run(&["egress-logs", "FOLLOW=1", "SINCE=15m"], &[]);
-    assert_eq!(c, vec!["logs tail /ai-env/egress/squid --since 15m --format short --follow --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com"]);
+    assert_eq!(c, [&runner[..], &["logs tail /ai-env/egress/squid --since 15m --format short --follow --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com".to_string()]].concat(), "the switches reach the make under the runner");
     for (args, want) in [
         (&["allowlist-reload"][..], "egress reload [AI_ENV=unset]"),
         (&["proxy-stop"][..], "proxy stop [AI_ENV=unset]"),
@@ -2176,38 +2513,49 @@ fn egress_logs_and_the_proxy_targets_call_their_commands() {
     ] {
         let (out, c) = run(args, &[]);
         assert!(out.status.success(), "{args:?}: {}", all(&out));
-        assert_eq!(c, vec![want.to_string()], "{args:?}");
+        assert_eq!(c, vec![BUILT.to_string(), want.to_string()], "{args:?}: built first, without a key (D18), then the one command");
     }
     let (_, c) = run(&["proxy-stop"], &[("YES", "1")]);
-    assert_eq!(c, vec!["proxy stop [AI_ENV=unset]".to_string()], "YES=1 in the environment is ignored");
+    assert_eq!(c, vec![BUILT.to_string(), "proxy stop [AI_ENV=unset]".to_string()], "YES=1 in the environment is ignored");
     let (out, _) = run(&["proxy-stop"], &[("FAKE_AIENV_PROXY_RC", "9")]);
     assert!(!out.status.success() && all(&out).contains("Error 9"), "the operator CLI's refusal stops make: {}", all(&out));
 }
 
-/// A fake `cargo` for test-egress: logs its argv, the egress switches and any
-/// lab knob it sees, prints a live test's skip line to stderr when
-/// FAKE_CARGO_SKIP is set, then exits FAKE_CARGO_RC, or (FAKE_CARGO_MARKER
-/// set) touches the marker and sleeps until a signal ends it.
+/// A fake `cargo` for test-egress: logs its argv, the egress switches, any
+/// lab knob it sees, and the runner's marker and whether a credential is in its
+/// environment (`[KEY]`: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN, never a value); a compile
+/// (`--no-run`) then passes;
+/// a test run prints a live test's skip line to stderr when FAKE_CARGO_SKIP is
+/// set, then exits FAKE_CARGO_RC, or (FAKE_CARGO_MARKER set) touches the
+/// marker and sleeps until a signal ends it.
 const CARGO_FAKE: &str = r##"lab=$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | sort | tr '\n' ' ')
-printf 'cargo %s [AI_ENV_AWS_TESTS=%s AI_ENV_EGRESS_TESTS=%s]%s\n' "$*" "${AI_ENV_AWS_TESTS:-}" "${AI_ENV_EGRESS_TESTS:-}" "${lab:+ [LAB=${lab% }]}" >> "$FAKE_AIENV_LOG"
+k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
+printf 'cargo %s [AI_ENV_AWS_TESTS=%s AI_ENV_EGRESS_TESTS=%s]%s%s%s\n' "$*" "${AI_ENV_AWS_TESTS:-}" "${AI_ENV_EGRESS_TESTS:-}" "${lab:+ [LAB=${lab% }]}" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+case " $* " in *" --no-run "*) exit 0 ;; esac
 if [ -n "${FAKE_CARGO_SKIP:-}" ]; then echo "live_egress_extra_and_removal: skipped: github.com is allowlisted outside this test" >&2; fi
 if [ -n "${FAKE_CARGO_MARKER:-}" ]; then touch "$FAKE_CARGO_MARKER"; exec sleep 60; fi
 exit "${FAKE_CARGO_RC:-0}""##;
 
+/// test-egress (S8 operators: as the deployer, whose key alone may write the extras its tests add) compiles the
+/// tests first, outside the runner and without any key (D18), then runs them under it, and removes the test's entry
+/// on every exit, as the deployer too.
 #[test]
 fn test_egress_removes_the_test_entry_on_every_exit() {
-    let removal = "egress allow ai-env-test github.com --remove [AI_ENV=unset]";
+    let removal = "egress allow ai-env-test github.com --remove [AI_ENV=unset] [AS=deployer:9001]";
     let setup = || {
         let t = tempfile::tempdir().unwrap();
-        let bin = bin_with(t.path(), &[("ai-env.sh", "ai-env-stand-in")]);
+        let bin = s5_bin(t.path());
         script(&bin.join("cargo"), CARGO_FAKE);
+        write_outputs(t.path(), &with_operators(outputs()));
         (t, bin)
     };
     let test_egress = |t: &Path, bin: &Path| {
         let mut cmd = make(t, bin, &["test-egress"]);
-        cmd.arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display())).env("FAKE_AIENV_LOG", t.join("calls.log"));
+        s5_env(&mut cmd, t).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display()));
         cmd
     };
+    // The cargo, runner and egress lines (the identity's aws and pulumi reads are in the log too).
+    let ours = |t: &Path| calls(t).into_iter().filter(|l| l.starts_with("cargo ") || l.starts_with("as ") || l.starts_with("egress ")).collect::<Vec<_>>();
     // Success and failure: the tests ran with the switches, then the removal.
     for (rc, ok) in [("0", true), ("101", false)] {
         let (t, bin) = setup();
@@ -2215,10 +2563,15 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
         let text = all(&out);
         assert_eq!(out.status.success(), ok, "cargo exit {rc}: {text}");
         assert!(text.contains("test-egress: removing the test allowlist entry (ai-env egress allow ai-env-test github.com --remove)"), "it says what it does: {text}");
-        let c = calls(t.path());
-        assert_eq!(c.len(), 2, "{c:#?}");
-        assert!(c[0].starts_with("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture [AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1]"), "{c:#?}");
-        assert_eq!(c[1], removal);
+        assert!(text.contains("test-egress: identity user/ai-env-deployer (the deployer of stack dev)"), "{text}");
+        let c = ours(t.path());
+        assert_eq!(c.len(), 6, "{c:#?}");
+        let compile = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run [AI_ENV_AWS_TESTS= AI_ENV_EGRESS_TESTS=]";
+        assert_eq!(c[0], compile, "compiled first, with no key and no marker");
+        assert_eq!(c[1..3], ["as --check deployer [AI_ENV=unset]".to_string(), format!("as deployer -- {} --no-print-directory test-egress-run [AI_ENV=unset]", make_path())]);
+        assert_eq!(c[3], compile, "test-egress-run checks the build again under the runner, still with no key and no marker (D18)");
+        assert_eq!(c[4], "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture [AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1] [AS=deployer:9001] [KEY]", "run as the deployer");
+        assert_eq!(c[5], removal);
     }
     // A live test that skipped its proof (github.com allowlisted outside it) is no pass, though cargo exits 0; the
     // removal runs all the same, and the output's copy is gone.
@@ -2226,12 +2579,14 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
     let out = test_egress(t.path(), &bin).env("FAKE_CARGO_SKIP", "1").env("TMPDIR", t.path()).bounded();
     let text = all(&out);
     assert!(!out.status.success() && text.contains("live_egress_extra_and_removal: skipped:") && text.contains("test-egress: a live egress test skipped its proof (its skipped: line above), so this is not a pass"), "{text}");
-    assert_eq!(calls(t.path()).last().map(String::as_str), Some(removal), "{text}");
+    assert_eq!(ours(t.path()).last().map(String::as_str), Some(removal), "{text}");
     assert!(std::fs::read_dir(t.path()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("ai-env-test-egress.")), "the log is removed on exit");
     // A removal that fails is loud and fails the target.
     let (t, bin) = setup();
+    // Its command is the deployer's, which alone may write the extras (D13: ops is refused, a bare command has no key).
     let out = test_egress(t.path(), &bin).env("FAKE_AIENV_ALLOW_RC", "7").bounded();
-    assert!(!out.status.success() && all(&out).contains("test-egress: the removal FAILED: github.com may still be allowed for every vpc VM"), "{}", all(&out));
+    let failed = "test-egress: the removal FAILED: github.com may still be allowed for every vpc VM: run ai-env as deployer -- ai-env egress allow ai-env-test github.com --remove";
+    assert!(!out.status.success() && all(&out).contains(failed), "{}", all(&out));
     // Ctrl-C while the tests run (SIGINT to the whole foreground group): removed all the same.
     let (t, bin) = setup();
     let marker = t.path().join("running");
@@ -2246,7 +2601,13 @@ fn test_egress_removes_the_test_entry_on_every_exit() {
         signal_group(pid, libc::SIGINT);
     });
     assert!(!out.status.success(), "{}", all(&out));
-    assert_eq!(calls(t.path()).last().map(String::as_str), Some(removal), "{:?}: {}", calls(t.path()), all(&out));
+    assert_eq!(ours(t.path()).last().map(String::as_str), Some(removal), "{:?}: {}", calls(t.path()), all(&out));
+    // The compile that fails stops it before the runner asks anything.
+    let (t, bin) = setup();
+    script(&bin.join("cargo"), "printf 'cargo %s\\n' \"$*\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" --no-run \"*) exit 101 ;; esac\nexit 0");
+    let out = test_egress(t.path(), &bin).bounded();
+    assert!(!out.status.success(), "{}", all(&out));
+    assert_eq!(ours(t.path()), vec!["cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run".to_string()], "nothing after a failed compile: {}", all(&out));
 }
 
 #[test]
@@ -2275,6 +2636,8 @@ fn the_live_s5_targets_drop_every_lab_knob() {
     let bin = s5_bin(t.path());
     script(&bin.join("cargo"), CARGO_FAKE);
     seed_connector(t.path(), CONNECTOR, "ACTIVE");
+    // test-egress and connector-probe run as the deployer (S8 operators): its runner, `ai-env as`, is live too.
+    write_outputs(t.path(), &with_operators(outputs()));
     let stand_in = format!("AI_ENV={}", bin.join("ai-env-stand-in").display());
     let record = json!({"backend": "sdk", "egress_ok": true, "exec_ok": true, "cred_ok": true}).to_string();
     let run = |args: &[&str]| {
@@ -2302,8 +2665,14 @@ fn the_live_s5_targets_drop_every_lab_knob() {
     }
     let c = calls(t.path());
     let children: Vec<&String> = c.iter().filter(|l| l.contains("[AI_ENV=") || l.starts_with("cargo ")).collect();
-    assert_eq!(children.len(), 3 + 3 + 3 + 2 + 1 + 1 + 1 + 4 + 1 + 1, "three s5, s6 and s7 smokes, test-egress's cargo and removal, test-claude's and test-aws's cargo, the probe's lab run, the four operator calls, s8-smoke's and test-cursor's cargo: {children:#?}");
-    assert!(children.iter().all(|l| !l.contains("[LAB=")), "a lab knob reached a live command: {children:#?}");
+    assert_eq!(
+        children.len(),
+        3 + 3 + 3 + (1 + 1 + 2 + 1 + 1 + 2) + 1 + 2 + (1 + 2 + 1 + 1) + 4 * 2 + 1 + 1,
+        "three s5, s6 and s7 smokes, test-egress's compile, keyless build (D18), runner (its check and its run), test-egress-run's compile and keyless build again, cargo and removal, test-claude's cargo, test-aws's keyless compile (D2) and cargo, the probe's keyless build, runner, ops.sh's keyless build and lab run, the four operator calls each after its keyless build, s8-smoke's and test-cursor's cargo: {children:#?}"
+    );
+    assert_eq!(c.iter().filter(|l| *l == BUILT).count(), 2 + 2 + 4, "{children:#?}");
+    assert_eq!(c.iter().filter(|l| l.starts_with("as deployer -- ")).count(), 2, "{children:#?}");
+    assert!(children.iter().all(|l| !l.contains("[LAB=")), "a lab knob reached a live command (the runner included): {children:#?}");
     // The control: a target that keeps the knobs hands them on, and the stand-in sees them.
     let out = run(&["check-base-image"]);
     assert!(out.status.success(), "{}", all(&out));
@@ -2321,17 +2690,58 @@ fn the_destroy_checklist_names_the_egress_leftovers() {
     let text = stdout(&out);
     assert!(out.status.success(), "{}", all(&out));
     for want in [
-        &format!("aws lambda-core list-network-connectors {LAMBDA_PIN}   # no ai-env-egress, no ai-env-egress-probe-* connector") as &str,
-        "aws ec2 describe-vpcs --filters Name=cidr,Values=10.42.0.0/16 Name=tag:Project,Values=ai-env --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com",
+        &format!("  8. no ai-env-egress, no ai-env-egress-probe-* connector:\n     aws lambda-core list-network-connectors {LAMBDA_PIN}\n") as &str,
+        "\n     aws ec2 describe-vpcs --filters Name=cidr,Values=10.42.0.0/16 Name=tag:Project,Values=ai-env --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n",
         "aws ec2 describe-network-acls --filters Name=tag:Name,Values=ai-env-egress-vms",
         "Name=tag:Name,Values=ai-env-egress-proxy",
         "aws ssm get-parameters --names /ai-env/proxy/squid.conf /ai-env/proxy/allow /ai-env/proxy/extras /ai-env/proxy/suspended",
-        "--log-group-name-prefix /ai-env/egress --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com   # no /ai-env/egress/squid",
+        "no /ai-env/egress/squid (nor /ai-env/egress/dns):\n",
+        "\n     aws logs describe-log-groups --log-group-name-prefix /ai-env/egress --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com\n",
         "aws iam get-role --role-name ai-env-egress-operator --region eu-central-1; aws iam get-role --role-name ai-env-egress-proxy --region eu-central-1",
         "remove egress_connector_arn and proxy_private_ip",
         &format!("state/egress-verified.toml ({}/state/egress-verified.toml): its records are bound to the deleted connector's Id and no longer admit anything; remove it", t.path().join("bridge").display()),
+        // S8 operators: the two operator users, every ai-env-* policy (not only ai-env-deploy), the ops key, the
+        // Strongbox entry, and the root's key that ran the destroy.
+        "  4. NoSuchEntity for each of the three users (forceDestroy removed their access keys):\n     aws iam get-user --user-name ai-env-runtime --region eu-central-1\n     aws iam get-user --user-name ai-env-deployer --region eu-central-1\n     aws iam get-user --user-name ai-env-ops --region eu-central-1\n",
+        "\n     rm \"${AI_ENV_BRIDGE_DIR:-$HOME/.config/ai-env/bridge}/credentials/aws.env\" \"${AI_ENV_BRIDGE_DIR:-$HOME/.config/ai-env/bridge}/credentials/ops.env\"\n",
+        "delete the Strongbox entry ai-env-deployer",
+        "\n     aws iam list-policies --scope Local --query \"Policies[?starts_with(PolicyName, 'ai-env-')].PolicyName\" --output text --region eu-central-1\n",
+        "no ai-env-* policy left (ai-env-deploy, ai-env-deploy-egress, ai-env-deploy-dns, ai-env-deployer, ai-env-ops)",
+        "\n     cd infra && pulumi stack rm dev\n",
+        "the account root ran this destroy (BREAKGLASS=1): delete its access key again (IAM console as the root, with MFA: Security credentials, Access keys)",
     ] {
         assert!(text.contains(want), "want {want}: {text}");
+    }
+    assert!(!text.contains("PolicyName=='ai-env-deploy'"), "every ai-env-* policy, not ai-env-deploy alone: {text}");
+    // Pasted into zsh, whose interactive shell takes a `#` for an argument (no INTERACTIVE_COMMENTS by default), and an
+    // unquoted `(`, `*`, `?` or `[` for syntax or a glob (D25): each command stands on a line of its own, after the
+    // indent, with none of them outside quotes; what a step should show is its numbered line, which holds no command.
+    let unquoted = |l: &str| {
+        let (mut sq, mut dq) = (false, false);
+        l.chars().any(|ch| match ch {
+            '\'' if !dq => {
+                sq = !sq;
+                false
+            }
+            '"' if !sq => {
+                dq = !dq;
+                false
+            }
+            '#' => true,
+            '(' | ')' | '*' | '?' | '[' | ']' => !sq && !dq,
+            _ => false,
+        })
+    };
+    let is_command = |l: &str| ["aws ", "rm ", "cd "].iter().any(|c| l.trim_start().starts_with(c));
+    let commands: Vec<&str> = text.lines().filter(|l| is_command(l)).collect();
+    assert!(commands.len() >= 20, "{text}");
+    for line in &commands {
+        assert!(line.starts_with("     ") && !unquoted(line), "a command line a paste into zsh would break: {line}");
+    }
+    for line in text.lines().map(str::trim_start) {
+        if let Some((n, rest)) = line.split_once(". ").filter(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            assert!(!is_command(rest), "step {n}: a command on its numbered line: {line}");
+        }
     }
     assert_eq!(calls(t.path()), Vec::<String>::new(), "the checklist only prints");
 }
@@ -2369,7 +2779,8 @@ impl DeployTree {
         script(&t.path().join("llvm/llvm-nm"), "exit 0");
         script(&t.path().join("llvm/llvm-objdump"), "echo '0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.17) memcpy'");
         std::fs::write(t.path().join("fresh"), arm64_elf("fresh bootstrap")).unwrap();
-        write_outputs(t.path(), &outputs());
+        // The stack's deployer exists (S8 operators): make deploy runs as it.
+        write_outputs(t.path(), &with_operators(outputs()));
         write_infra_state(t.path(), &bin, &outputs());
         set_image(t.path(), "UPDATED", "2", "", "2026-09-29T10:00:00.123000+00:00");
         seed_connector(t.path(), CONNECTOR, "ACTIVE");
@@ -2383,9 +2794,14 @@ impl DeployTree {
     }
 
     fn deploy(&self, p: &Value, envs: &[(&str, &str)]) -> Output {
+        self.run("deploy", p, envs)
+    }
+
+    /// `make <target>` (deploy, deploy-policies) in the tree, the plan `p` its preview's.
+    fn run(&self, target: &str, p: &Value, envs: &[(&str, &str)]) -> Output {
         let t = self.t.path();
         std::fs::write(t.join("plan.json"), p.to_string()).unwrap();
-        let mut cmd = make_in(t, &self.bin, &self.w, &["deploy"]);
+        let mut cmd = make_in(t, &self.bin, &self.w, &[target]);
         s5_env(&mut cmd, t)
             .arg(format!("AI_ENV={}", self.bin.join("ai-env-stand-in").display()))
             .arg(format!("CARGO_LAMBDA={}", self.bin.join("cargo-lambda").display()))
@@ -2466,6 +2882,23 @@ fn deploy_runs_the_plan_gate_first_and_the_egress_steps_last() {
     }
     assert_eq!(c.iter().filter(|l| l.starts_with("pulumi preview")).count(), 1, "one preview: {c:#?}");
     assert!(!c.iter().any(|l| l.contains("FORBIDDEN")), "{c:#?}");
+    // S8 operators: the zip was built before the runner, which asked once; everything after it ran as the deployer.
+    let runner = format!("as deployer -- {} --no-print-directory deploy-run [AI_ENV=unset]", make_path());
+    assert_eq!(c.iter().filter(|l| l.starts_with("as ")).cloned().collect::<Vec<_>>(), ["as --check deployer [AI_ENV=unset]".to_string(), runner.clone()], "one runner: {c:#?}");
+    let r = at(&c, &runner);
+    assert!(at(&c, "infra scan ") < r, "the zip's scan before the runner: {c:#?}");
+    assert_eq!(c.iter().filter(|l| l.starts_with("infra scan ")).count(), 1, "the zip is built once, in the wrapper; deploy-run never builds it again: {c:#?}");
+    let asked = at(&c, "as --check deployer");
+    assert!(c[asked - 1] == BUILT && c[..asked].iter().filter(|l| *l == BUILT).count() == 2, "the zip's version read, then TIER's keyless build of the CLI (D18), before it asks: {c:#?}");
+    for (i, l) in c.iter().enumerate().filter(|(_, l)| l.contains("[AI_ENV=") && !l.starts_with("as ")) {
+        if l.starts_with("--version ") {
+            // The zip's version read and every keyless build (TIER's, s3-preflight's, ops.sh post-deploy's).
+            assert!(!l.contains("[AS="), "a build or version read under the marker: {l}: {c:#?}");
+            continue;
+        }
+        assert_eq!(l.ends_with(" [AS=deployer:9001]"), i > r, "the stand-in's calls after the runner, and only those, as the deployer: {l}: {c:#?}");
+    }
+    assert!(text.contains("deploy: identity user/ai-env-deployer (the deployer of stack dev)") && text.contains("[ok ] P8 deploy identity user/ai-env-deployer (the deployer of stack dev)"), "{text}");
     let lines = [
         "replacement guard: aws:ec2/instance:Instance ai-env-egress-proxy will be replaced",
         "fake pulumi: up",
@@ -2506,13 +2939,13 @@ fn deploy_runs_the_reload_and_the_warnings_on_every_exit_after_pulumi_up_and_fai
     assert!(at(&c, "pulumi up --stack dev") < at(&c, "egress reload --if-changed [AI_ENV=unset]"), "{c:#?}");
     assert!(!c.iter().any(|l| l.starts_with("lambda-core get-network-connector") || l.starts_with("egress status")), "no connector-wait, no drift check: {c:#?}");
     assert!(text.contains("deploy: warning: state/vms rows that may still run a vpc VM: mvm-a;") && text.contains("deploy: egress status skipped: the deploy failed"), "{text}");
-    assert!(text.contains("make: *** [deploy] Error 1"), "the image-wait's failure is the deploy's: {text}");
+    assert!(text.contains("*** [deploy-run] Error 1") && text.contains("make: *** [deploy] Error 2"), "the image-wait's failure is the deploy's: {text}");
 
     // `pulumi up` itself fails: the same egress steps, its exit status.
     let d = DeployTree::new(CHECK_PLAN_FAKE);
     let out = d.deploy(&deploy_plan(&[]), &[("FAKE_PULUMI_UP_RC", "255")]);
     let text = all(&out);
-    assert!(!out.status.success() && text.contains("make: *** [deploy] Error 255") && text.contains("deploy: egress status skipped: the deploy failed"), "{text}");
+    assert!(!out.status.success() && text.contains("*** [deploy-run] Error 255") && text.contains("deploy: egress status skipped: the deploy failed"), "{text}");
     assert!(calls(d.t.path()).iter().any(|l| l.starts_with("egress reload --if-changed")), "{:?}", calls(d.t.path()));
 
     // A connector that never turns ACTIVE: the egress steps all the same.
@@ -2528,7 +2961,7 @@ fn deploy_runs_the_reload_and_the_warnings_on_every_exit_after_pulumi_up_and_fai
     let out = d.deploy(&deploy_plan(&[]), &[("FAKE_AIENV_STATUS_RC", "1"), ("FAKE_AIENV_DRIFT", "sg-proxy")]);
     let text = all(&out);
     assert!(!out.status.success() && text.contains("deploy: DRIFT: ai-env egress status found drift in sg-proxy") && text.contains("new image version"), "{text}");
-    assert_eq!(calls(d.t.path()).last().map(String::as_str), Some("egress status [AI_ENV=unset]"), "the drift check is the last step");
+    assert_eq!(calls(d.t.path()).last().map(String::as_str), Some("egress status [AI_ENV=unset] [AS=deployer:9001]"), "the drift check is the last step, as the deployer");
     let d = DeployTree::new(CHECK_PLAN_FAKE);
     let out = d.deploy(&deploy_plan(&[]), &[("FAKE_AIENV_STATUS_RC", "7")]);
     assert!(out.status.success() && all(&out).contains("deploy: warning: ai-env egress status exit 7"), "{}", all(&out));
@@ -2586,10 +3019,18 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
 /// `make claude-update` (ops.sh claude-update): it follows the installed Cursor bundle, does only what is not current
 /// (pin, test-docker unless it passed for the zip, deploy, infra-status, the live active version, proxy-start, the
 /// egress check --if-needed), stops at the first failure naming the step, refuses before changing anything without a
-/// terminal, the passphrase, Docker, the AWS identity, a bundle, or under make -i or -k, stops on a rollback or a pin
-/// it cannot follow, resumes all of a deploy's steps after a failure past it (the marker), and says what it found on
-/// the way (the release site, a downgrade, a proxy it started, VMs on another version, the version count and which old
-/// versions no VM runs).
+/// terminal, the passphrase, Docker, a bundle, or under make -i, -k or -p (whose data base would print the runner's key:
+/// an option's argument, -I's directory, is no switch), stops on a rollback or a pin it cannot follow, resumes all of a
+/// deploy's steps after a failure past it (the marker), and says what it found on the way (the release site, a
+/// downgrade, a proxy it started, VMs on another version, the version count and which old versions no VM runs, a lock to
+/// commit: git runs without the key).
+/// S8 operators: it asks once for the identity the run needs, ai-env as deployer when a deploy is due, else ai-env as
+/// ops: after the steps that need no AWS (pin, test-docker: without any key, as the fake make records) and before the
+/// first that does; it runs itself again under the runner, which then sees the lock and test-docker's stamp current
+/// and never repeats them, prints the summary once, checks the identity (ops.sh identity; refused after the pass before
+/// it pinned or tested, it says what that pass left) and runs every other step as that identity. Under a runner that
+/// covers the tier it asks nothing; a cancelled runner changes nothing after it. A deploy due before the bootstrap (no
+/// deployer exported, so no deployer key) is the account root's: refused before anything runs.
 #[test]
 fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
     const TTY: (&str, &str) = ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1");
@@ -2621,6 +3062,10 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         Pending,
         PendingOther,
         PendingDeploy,
+        /// The stack before the bootstrap: its outputs name no operator user.
+        NoDeployer,
+        /// The lock tracked by git and changed (a fake git, which logs whether a key reached it).
+        LockTracked,
     }
     struct Case<'a> {
         what: &'a str,
@@ -2632,15 +3077,29 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         code: i32,
         steps: Vec<&'a str>,
         wants: Vec<&'a str>,
+        /// The runner the run asks for (`ai-env as <tier> --`), if it gets that far.
+        runner: Option<&'a str>,
+        /// The marker of a runner the whole run is under (`deployer`, `ops`), whose key the stand-in's tails give.
+        under: Option<&'a str>,
     }
     let full = vec![TTY, PASS];
-    let c = |what, bundle, locked, deployed, envs: Vec<(&'static str, &'static str)>, world, code, steps: Vec<&'static str>, wants: Vec<&'static str>| Case { what, bundle, locked, deployed, envs, world, code, steps, wants };
-    let cases: Vec<Case> = vec![
-        c("up to date", "2.1.287", "2.1.287", "2.1.287", vec![], World::Plain, 0, vec![status, check], vec!["claude-update: 2.1.287 is pinned and deployed: nothing to build or deploy", "claude-update [2/3] new VMs start the deployed image version", "claude-update: new VMs start image version 3.0, the deployed one, built from ai-env/image-0123456789abcdef.zip", "done: new VMs start image version 3.0 with Claude Code 2.1.287"]),
-        c("a new bundle", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "claude-update [6/7] make proxy-start (squid serving the deployed parameters)", "the new pin rests on the release manifest over HTTPS only", "make test-egress, the broader live test the deploy names, is not part of the daily update"]),
-        c("pinned, not deployed", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Plain, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker"]),
+    let c = |what, bundle, locked, deployed, envs: Vec<(&'static str, &'static str)>, world, code, steps: Vec<&'static str>, wants: Vec<&'static str>| {
+        // The run asks once, after the steps that need no AWS, for the deployer when it deploys, else for ops.
+        let runner = if steps.contains(&deploy) || (code == 3 && steps.contains(&test)) {
+            Some("deployer")
+        } else if steps.iter().any(|s| !s.starts_with("make --no-print-directory claude-pin") && *s != test) {
+            Some("ops")
+        } else {
+            None
+        };
+        Case { what, bundle, locked, deployed, envs, world, code, steps, wants, runner, under: None }
+    };
+    let mut cases: Vec<Case> = vec![
+        c("up to date", "2.1.287", "2.1.287", "2.1.287", vec![], World::Plain, 0, vec![status, check], vec!["claude-update: 2.1.287 is pinned and deployed: nothing to build or deploy", "claude-update [2/3] new VMs start the deployed image version", "claude-update: new VMs start image version 3.0, the deployed one, built from ai-env/image-0123456789abcdef.zip", "done: new VMs start image version 3.0 with Claude Code 2.1.287", "claude-update: this run needs ai-env as ops (the status and the egress check): asking once, before the first step that needs AWS", "claude-update: identity user/ai-env-ops (the operator of stack dev)"]),
+        c("a new bundle", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "claude-update [2/7] make test-docker", "claude-update: this run needs ai-env as deployer (a deploy is due): asking once, before the first step that needs AWS", "claude-update: make test-docker already passed for", "claude-update: identity user/ai-env-deployer (the deployer of stack dev)", "claude-update [1/5] make deploy", "claude-update [4/5] make proxy-start (squid serving the deployed parameters)", "the new pin rests on the release manifest over HTTPS only", "make test-egress, the broader live test the deploy names, is not part of the daily update"]),
+        c("pinned, not deployed", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Plain, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "!the new pin rests"]),
         c("the zip already tested", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Stamped, 0, vec![deploy, status, proxy, check], vec!["make test-docker already passed for", "claude-update [1/5] make deploy"]),
-        c("a failed deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_MAKE_FAIL", "deploy")], World::Plain, 2, vec![PIN288, test, deploy], vec!["claude-update: STOPPED at step 3/7 (make deploy: exit 2)"]),
+        c("a failed deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_MAKE_FAIL", "deploy")], World::Plain, 2, vec![PIN288, test, deploy], vec!["claude-update: STOPPED at step 1/5 (make deploy: exit 2)"]),
         c("a failed check", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![status, check], vec!["STOPPED at step 3/3 (ai-env egress check --if-needed: exit 3)"]),
         c("a rollback", "2.1.287", "2.1.287", "2.1.287", vec![], World::Rollback, 1, vec![status], vec!["new VMs start image version 3.0, not the deployed 4.0 (a rollback with make image-deactivate or image-activate?)", "make image-activate VERSION=4.0", "STOPPED at step 2/3"]),
         c("no terminal", "2.1.288", "2.1.287", "2.1.287", vec![PASS], World::Plain, 1, vec![], vec!["claude-update: needs a terminal"]),
@@ -2654,7 +3113,8 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         c("the release site ahead", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_LATEST", "2.1.289")], World::Plain, 0, vec![status, check], vec!["the release site's latest 2.1.289 is newer than the Cursor bundle 2.1.287", "once Cursor updates the extension, run make claude-update again"]),
         c("the bundle ahead", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_LATEST", "2.1.286")], World::Plain, 0, vec![status, check], vec!["the Cursor bundle 2.1.287 is ahead of the release site's latest 2.1.286"]),
         c("a downgrade", "2.1.286", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN286, test, deploy, status, proxy, check], vec!["a DOWNGRADE: the Cursor bundle 2.1.286 is older than the deployed 2.1.287"]),
-        c("no lock", "2.1.288", "", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["image/claude.lock (none)"]),
+        // The summary is said under the runner, after the pin made the lock.
+        c("no lock", "2.1.288", "", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "image/claude.lock 2.1.288; deployed 2.1.287"]),
         c("a stopped proxy", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::ProxyStopped, 0, vec![test, deploy, status, proxy, check], vec!["claude-update: the proxy was stopped before this run and runs now: make proxy-stop when idle"]),
         c("a VM on another version", "2.1.287", "2.1.287", "2.1.287", vec![], World::OlderVm, 0, vec![status, check], vec!["VMs still on another image version, and its claude: microvm-older (2.0)"]),
         c("the deploy left another version", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DEPLOYS", "2.1.287")], World::Plain, 1, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: the stack now reports Claude Code 2.1.287, not the Cursor bundle's 2.1.288 (did the extension update during the run?): run make claude-update again"]),
@@ -2668,24 +3128,79 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         c("make -s -i", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -si")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
         c("a long option and a variable", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", " --no-print-directory -- kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
         c("make -j", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", " --jobserver-fds=3,4 -j")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
-        c("a stamp of another zip", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedStale, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "!already passed"]),
-        c("a stamp of another claude", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedOtherClaude, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "!already passed"]),
+        // make -p prints every environment variable at the end of every make under it, the runner's key among them (D1).
+        c("make -p", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", "p")], World::Plain, 2, vec![], vec!["claude-update: not under make -p (", "!not under make -i"]),
+        c("make -s -p", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -sp")], World::Plain, 2, vec![], vec!["claude-update: not under make -p ("]),
+        c("make -p with nothing to deploy", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "p -- kind=1")], World::Plain, 2, vec![], vec!["claude-update: not under make -p ("]),
+        // `make -s -I /tmp/kip -p` writes `spI /tmp/kip`: the directory is -I's argument, not switches (no i, k or p).
+        c("an option's argument is no switch", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "sI /tmp/kip")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
+        c("an include directory beside -p", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "spI /tmp/kip")], World::Plain, 2, vec![], vec!["claude-update: not under make -p ("]),
+        // A stale stamp is not honoured: test-docker runs before the runner, and the run under it finds its own stamp.
+        c("a stamp of another zip", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedStale, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "make test-docker already passed for"]),
+        c("a stamp of another claude", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedOtherClaude, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "make test-docker already passed for"]),
         c("pinned to the deployed version", "2.1.287", "2.1.287", "2.1.287", vec![], World::PinnedDeployed, 0, vec![status, check], vec!["bridge.toml's [aws].image_version = \"3\" pins new VMs to the deployed 3.0 today, but no later update will reach them"]),
         c("a pin it cannot read", "2.1.287", "2.1.287", "2.1.287", vec![], World::PinnedUnreadable, 1, vec![status], vec!["bridge.toml names image_version in a form this script does not read (aws = { image_version = \"1\" })", "STOPPED at step 2/3"]),
-        c("a failed check after a deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![PIN288, test, deploy, status, proxy, check], vec!["STOPPED at step 7/7 (ai-env egress check --if-needed: exit 3)"]),
+        c("a failed check after a deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![PIN288, test, deploy, status, proxy, check], vec!["STOPPED at step 5/5 (ai-env egress check --if-needed: exit 3)"]),
         c("a deploy's run resumed", "2.1.287", "2.1.287", "2.1.287", vec![], World::Pending, 0, vec![status, proxy, check], vec!["claude-update: 2.1.287 is deployed, and the run that deployed it stopped before its end", "claude-update [3/4] make proxy-start", "the proxy was stopped before this run and runs now", "make test-egress, the broader live test the deploy names"]),
         c("another bundle's marker", "2.1.287", "2.1.287", "2.1.287", vec![], World::PendingOther, 0, vec![status, check], vec!["is pinned and deployed", "!stopped before its end", "!make test-egress"]),
         c("a new bundle after an unfinished run", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::PendingDeploy, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["the proxy was stopped before this run and runs now: make proxy-stop when idle"]),
+        // The runner refused: the steps before it ran, nothing after it.
+        c("a cancelled runner", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_AIENV_AS", "cancel")], World::Plain, 3, vec![PIN288, test], vec!["ai-env: as deployer: nothing was pasted: cancelled, nothing was run", "!claude-update: Cursor bundle"]),
+        c("a cancelled Touch ID", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_AS", "cancel")], World::Plain, 3, vec![], vec!["ai-env: cancelled", "!claude-update: Cursor bundle"]),
     ];
+    cases.last_mut().unwrap().runner = Some("ops");
+    // Under a runner that covers the tier: no ask, one pass, the steps numbered as one plan; pin and test-docker
+    // still without the key.
+    for (what, under, bundle, steps, wants) in [
+        ("a deploy under the deployer's runner", "deployer", "2.1.288", vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "claude-update [6/7] make proxy-start", "!asking once"]),
+        ("the status under the ops runner", "ops", "2.1.287", vec![status, check], vec!["claude-update [3/3] ai-env egress check --if-needed", "!asking once"]),
+        ("the status under the deployer's runner, which covers ops", "deployer", "2.1.287", vec![status, check], vec!["is pinned and deployed", "!asking once"]),
+    ] {
+        let mut case = c(what, bundle, "2.1.287", "2.1.287", full.clone(), World::Plain, 0, steps, wants);
+        case.runner = None;
+        case.under = Some(under);
+        cases.push(case);
+    }
+    // A deploy is due, but the run is under the ops key: the deployer is asked (an escalation).
+    let mut case = c("a deploy under the ops runner", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: this run needs ai-env as deployer (a deploy is due)"]);
+    case.under = Some("ops");
+    cases.push(case);
+    // A deploy due before the bootstrap: the stack exports no deployer, so there is no key to ask for; that deploy is the
+    // account root's (make deploy runs it as the root). Refused before anything runs, the pin and the test included (D15).
+    cases.push(c("a deploy due before the bootstrap", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::NoDeployer, 1, vec![], vec!["claude-update: a deploy is due, but stack dev exports no deployer yet", "README \"The bootstrap\"", "nothing changed"]));
+    // The identity refused under the runner, after the pass before it pinned and tested: that pass's work is said, never
+    // "nothing changed" (D24). The deployer's key answers as another user here.
+    let refused = "claude-update: the identity of this run is refused: user/rust: not the deployer of stack dev (user/ai-env-deployer)";
+    for (what, locked, deployed, steps, left) in [
+        ("the identity refused after the pin", "2.1.287", "2.1.287", vec![PIN288, test], "nothing deployed: the pass before the runner pinned image/claude.lock to 2.1.288 and passed make test-docker (kept: make claude-update again resumes)"),
+        ("the identity refused after test-docker", "2.1.288", "2.1.287", vec![test], "nothing deployed: the pass before the runner passed make test-docker (kept: make claude-update again resumes)"),
+    ] {
+        let mut case = c(what, "2.1.288", locked, deployed, vec![TTY, PASS, ("FAKE_AWS_KEY_USERS", "9001:rust 9002:ai-env-ops")], World::Plain, 1, steps, vec![refused, left, "!nothing changed"]);
+        case.runner = Some("deployer");
+        cases.push(case);
+    }
+    // The lock tracked and changed: said at the end, git run without the key and without an fsmonitor (D17).
+    cases.push(c("a lock to commit", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::LockTracked, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: image/claude.lock changed: review and commit it"]));
     for case in cases {
         let what = case.what;
         let tmp = tempfile::tempdir().unwrap();
         let t = tmp.path();
         let bin = s5_bin(t);
-        // A deploy moves the stack outputs' claudeVersion to the version it deployed (FAKE_DEPLOYS).
+        // The steps' make: each call logged with the marker and whether a credential (the key, its secret or a
+        // session token) is in its environment (never a value); claude-pin writes the lock and test-docker the zip,
+        // its image.json and its stamp, as the real ones do; a deploy moves the stack outputs' claudeVersion to the
+        // version it deployed (FAKE_DEPLOYS).
         script(
             &bin.join("make"),
-            "echo \"make $*\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" ${FAKE_MAKE_FAIL:-none} \"*) exit 2 ;; esac\ncase \" $* \" in *\" deploy \"*) sed -i '' \"s/\\\"claudeVersion\\\":\\\"[^\\\"]*\\\"/\\\"claudeVersion\\\":\\\"$FAKE_DEPLOYS\\\"/\" \"$FAKE_PULUMI_OUTPUTS\" ;; esac\nexit 0",
+            r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
+printf 'make %s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+case " $* " in *" ${FAKE_MAKE_FAIL:-none} "*) exit 2 ;; esac
+case " $* " in
+  *" claude-pin "*) for a in "$@"; do case "$a" in CLAUDE_VERSION=*) printf 'CLAUDE_VERSION=%s\nCLAUDE_PLATFORM=linux-arm64\n' "${a#CLAUDE_VERSION=}" > "$LOCK" ;; esac; done ;;
+  *" test-docker "*) v=$(sed -n 's/^CLAUDE_VERSION=//p' "$LOCK"); mkdir -p "$IMAGE_OUT"; printf 'a zip of %s' "$v" > "$IMAGE_OUT/image.zip"; printf '{"claudeVersion":"%s"}\n' "$v" > "$IMAGE_OUT/image.json"; shasum -a 256 "$IMAGE_OUT/image.zip" | cut -d' ' -f1 > "$IMAGE_OUT/test-docker.ok" ;;
+  *" deploy "*) sed -i '' "s/\"claudeVersion\":\"[^\"]*\"/\"claudeVersion\":\"$FAKE_DEPLOYS\"/" "$FAKE_PULUMI_OUTPUTS" ;;
+esac
+exit 0"#,
         );
         script(&bin.join("docker"), "exit \"${FAKE_DOCKER_RC:-0}\"");
         script(&bin.join("curl"), "test -n \"${FAKE_LATEST:-}\" || exit 6\necho \"$FAKE_LATEST\"");
@@ -2698,7 +3213,15 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         o["latestActiveImageVersion"] = json!(if case.world == World::Rollback { "4.0" } else { "3.0" });
         o["bucket"] = json!("ai-env-artifacts-0000000");
         o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
-        write_outputs(t, &o);
+        write_outputs(t, &if case.world == World::NoDeployer { o } else { with_operators(o) });
+        if case.world == World::LockTracked {
+            // git: each call logged with the marker and whether a credential reached it (never a value); the lock is
+            // tracked (ls-files) and changed (diff --quiet exits 1).
+            script(
+                &bin.join("git"),
+                "k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}\nprintf 'git %s%s%s\\n' \"$*\" \"${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}\" \"${k:+ [KEY]}\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" diff \"*) exit 1 ;; esac\nexit 0",
+            );
+        }
         std::fs::create_dir_all(t.join("aws/image")).unwrap();
         std::fs::write(t.join("aws/image/state"), "UPDATED").unwrap();
         std::fs::write(t.join("aws/image/active"), "3.0").unwrap();
@@ -2744,6 +3267,11 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
             std::fs::write(rows.join("microvm-same.toml"), "v = 1\nstatus = \"running\"\nid = \"microvm-same\"\nimage_version = \"3.0\"\n").unwrap();
             std::fs::write(rows.join("microvm-gone.toml"), "v = 1\nstatus = \"terminated\"\nid = \"microvm-gone\"\nimage_version = \"1.0\"\n").unwrap();
         }
+        let under: Vec<(String, String)> = match case.under {
+            Some("deployer") => super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL),
+            Some(_) => super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL),
+            None => vec![],
+        };
         let out = ops5(t, &bin, &["claude-update"])
             .current_dir(t)
             .env("LOCK", "image/claude.lock")
@@ -2751,6 +3279,7 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
             .env("CLAUDE_GPG_FPR", "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
             .env("FAKE_AIENV_BUNDLE", case.bundle)
             .env("FAKE_DEPLOYS", case.bundle)
+            .envs(under.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .envs(case.envs.iter().copied())
             .bounded();
         let text = all(&out);
@@ -2771,17 +3300,1347 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
             seeded.map(String::from)
         };
         assert_eq!(marker, want_marker, "{what}: the resume marker: {text}");
-        let ran: Vec<String> = calls(t).into_iter().filter(|l| l.starts_with("make ") || l.starts_with("egress check")).map(|l| l.split(" [AI_ENV=").next().unwrap().to_string()).collect();
+        let c = calls(t);
+        let ran: Vec<String> = c.iter().filter(|l| l.starts_with("make ") || l.starts_with("egress check")).map(|l| l.split(" [").next().unwrap().to_string()).collect();
         assert_eq!(ran, case.steps, "{what}: {text}");
+        // One ask at most, for the tier the run needs, from the pass outside any runner.
+        let asked: Vec<&String> = c.iter().filter(|l| l.starts_with("as ") && !l.starts_with("as --check ")).collect();
+        match case.runner {
+            Some(tier) => {
+                assert_eq!(asked.len(), 1, "{what}: one runner: {c:#?}");
+                assert!(asked[0].starts_with(&format!("as {tier} -- env AI_ENV_CLI={} /bin/bash ", bin.join("ai-env-stand-in").display())) && asked[0].contains("/infra/scripts/ops.sh claude-update [AI_ENV=unset]"), "{what}: {}", asked[0]);
+            }
+            None => assert_eq!(asked, Vec::<&String>::new(), "{what}: no runner"),
+        }
+        // pin and test-docker never see a key; every other step runs as the identity of the run.
+        let marker_of = match (case.under, case.runner) {
+            (_, Some("deployer")) | (Some("deployer"), None) => "deployer:9001",
+            _ => "ops:9002",
+        };
+        for l in c.iter().filter(|l| l.starts_with("make ")) {
+            let keyless = l.contains(" claude-pin ") || l.contains(" test-docker");
+            assert_eq!(!l.contains(" [KEY]") && !l.contains(" [AS="), keyless, "{what}: {l}");
+            if !keyless {
+                assert!(l.ends_with(&format!(" [AS={marker_of}] [KEY]")), "{what}: {l}");
+            }
+        }
+        if case.code == 0 || case.steps.iter().any(|s| s.starts_with("make --no-print-directory infra-status") || *s == deploy) {
+            assert_eq!(text.matches("claude-update: Cursor bundle ").count(), 1, "{what}: the summary once, under the runner: {text}");
+        }
         if case.code == 0 {
             assert!(text.contains("claude-update: done: new VMs start image version 3.0 with Claude Code "), "{what}: {text}");
-            assert!(!text.contains("review and commit"), "{what}: the lock is outside any work tree here: {text}");
+            if case.world != World::LockTracked {
+                assert!(!text.contains("review and commit"), "{what}: the lock is outside any work tree here: {text}");
+            }
         } else {
             assert!(!text.contains("claude-update: done"), "{what}: {text}");
         }
-        if case.steps.is_empty() {
-            assert!(text.contains("nothing changed") || text.contains("not under make -i or -k"), "{what}: a refusal says nothing changed: {text}");
+        if case.world == World::LockTracked {
+            // The pass under the deployer's runner: git without its key or marker, and without an fsmonitor hook or
+            // daemon (one would outlive the run holding them).
+            let git: Vec<&String> = c.iter().filter(|l| l.starts_with("git ")).collect();
+            assert_eq!(git, ["git -c core.fsmonitor=false ls-files --error-unmatch -- image/claude.lock", "git -c core.fsmonitor=false diff --quiet -- image/claude.lock"], "{what}: {c:#?}");
         }
+        if case.steps.is_empty() && case.code != 3 {
+            assert!(text.contains("nothing changed") || text.contains("claude-update: not under make -"), "{what}: a refusal says nothing changed: {text}");
+        }
+    }
+
+    // The identity of the run is checked under the runner before any step that needs AWS: the account root (an
+    // ambient root, the bootstrap's) is refused for an ops run, nothing changed.
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = s5_bin(t);
+    script(&bin.join("make"), "printf 'make %s\\n' \"$*\" >> \"$FAKE_AIENV_LOG\"\nexit 0");
+    std::fs::create_dir_all(t.join("image")).unwrap();
+    std::fs::write(t.join("image/claude.lock"), "CLAUDE_VERSION=2.1.287\n").unwrap();
+    let mut o = with_operators(outputs());
+    o["claudeVersion"] = json!("2.1.287");
+    write_outputs(t, &o);
+    let out = ops5(t, &bin, &["claude-update"])
+        .current_dir(t)
+        .env("LOCK", "image/claude.lock")
+        .env("FAKE_AIENV_BUNDLE", "2.1.287")
+        .envs(super::aws_keys::marker_env("ambient").iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .env("FAKE_AWS_CALLER", "root")
+        .bounded();
+    let text = all(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("claude-update: the identity of this run is refused: root: an ops step runs as ai-env-ops or the deployer, never the account root (break-glass: make deploy BREAKGLASS=1, then the remaining steps by hand): nothing changed"), "{text}");
+    assert!(!calls(t).iter().any(|l| l.starts_with("make ") || l.starts_with("egress check") || l.starts_with("ec2 ")), "nothing ran: {:?}", calls(t));
+
+    // A deploy is due under the account root's runner (it covers the deployer): once the stack has its deployer the
+    // deployer tier refuses the root, and an exported BREAKGLASS=1 is set aside (claude-update is never break-glass:
+    // make deploy BREAKGLASS=1, then the steps by hand). Nothing ran, not even pin or test-docker; nothing was asked.
+    script(&bin.join("docker"), "exit 0");
+    for envs in [&[][..], &[("BREAKGLASS", "1")][..]] {
+        std::fs::remove_file(t.join("calls.log")).ok();
+        let out = ops5(t, &bin, &["claude-update"])
+            .current_dir(t)
+            .env("LOCK", "image/claude.lock")
+            .env("FAKE_AIENV_BUNDLE", "2.1.288")
+            .env("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")
+            .env("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")
+            .envs(super::aws_keys::marker_env("root").iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .env("FAKE_AWS_CALLER", "root")
+            .envs(envs.iter().copied())
+            .bounded();
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(1), "{envs:?}: {text}");
+        assert!(text.contains("claude-update: the identity of this run is refused: root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line: nothing changed"), "{envs:?}: {text}");
+        assert!(!text.contains("BREAK-GLASS"), "{envs:?}: {text}");
+        assert!(
+            !calls(t).iter().any(|l| l.starts_with("make ") || l.starts_with("egress check") || (l.starts_with("as ") && !l.starts_with("as --check "))),
+            "{envs:?}: nothing ran, nothing asked: {:?}",
+            calls(t)
+        );
+    }
+
+    // A runner that does not take (it runs the command without a marker that covers the tier): asked for once, never
+    // again; the pass under it stops before the first step that needs AWS.
+    script(
+        &bin.join("ai-env-nomarker"),
+        "case \"${1:-} ${2:-}\" in\n  \"as ops\"|\"as deployer\")\n    printf 'nomarker %s\\n' \"$*\" >> \"$FAKE_AIENV_LOG\"\n    shift 2\n    test \"${1:-}\" != -- || shift\n    exec \"$@\" ;;\nesac\nexec \"$(dirname \"$0\")/ai-env-stand-in\" \"$@\"",
+    );
+    std::fs::remove_file(t.join("calls.log")).ok();
+    let out = ops5(t, &bin, &["claude-update"]).current_dir(t).env("LOCK", "image/claude.lock").env("FAKE_AIENV_BUNDLE", "2.1.287").env("AI_ENV_CLI", bin.join("ai-env-nomarker")).bounded();
+    let text = all(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("claude-update: this run is under ai-env as ops, but ai-env as --check ops still fails: stopped before the first step that needs AWS"), "{text}");
+    let c = calls(t);
+    assert_eq!(c.iter().filter(|l| l.starts_with("nomarker as ops -- ")).count(), 1, "asked for once: {c:#?}");
+    assert!(!c.iter().any(|l| l.starts_with("make ") || l.starts_with("egress check")), "no step ran: {c:#?}");
+}
+
+// ---- S8 operators: TIER, ops.sh identity and stack-deployer, P8, operator-keys, deploy-policies, destroy ----
+//
+// plans/s8-operators-contracts.md §9. A tiered target X is a wrapper (its help, its prechecks, one line
+// `$(call TIER,<tier>,X) $(MAKE) --no-print-directory X-run`) and X-run, the recipe, which runs under `ai-env as
+// <tier> --` (here the stand-in: it puts the tail-9001 or 9002 key and its marker in X-run's environment, as the
+// runner does). MAKE= a logging stand-in stops a run at the runner's child, to look at the runner alone.
+
+/// Every tiered target of the Makefiles: its tier (`image-prune` with YES=1 is the deployer's), and what its wrapper's
+/// prechecks need on the command line.
+const TIERED: &[(&str, &str, &[&str])] = &[
+    ("deploy", "deployer", &[]),
+    ("preview", "deployer", &[]),
+    ("deploy-policies", "deployer", &[]),
+    ("runtime-key", "deployer", &[]),
+    ("ops-key", "deployer", &[]),
+    ("deployer-key", "deployer", &["ROTATE=1"]),
+    ("image-activate", "deployer", &["VERSION=3"]),
+    ("image-deactivate", "deployer", &["VERSION=3"]),
+    ("image-prune", "ops", &[]),
+    ("image-delete", "deployer", &["CONFIRM=delete-image"]),
+    ("connector-probe", "deployer", &["CONFIRM=create-probe-connector"]),
+    ("connector-delete", "deployer", &["CONFIRM=delete-connector"]),
+    ("test-egress", "deployer", &[]),
+    ("image-wait", "ops", &[]),
+    ("image-status", "ops", &[]),
+    ("image-versions", "ops", &[]),
+    ("image-builds", "ops", &[]),
+    ("connector-status", "ops", &[]),
+    ("connector-wait", "ops", &[]),
+    ("logs", "ops", &[]),
+    ("egress-logs", "ops", &[]),
+    ("acceptance", "ops", &[]),
+    ("operator-keys", "root", &[]),
+    ("destroy", "root", &["CONFIRM=destroy-dev", "BREAKGLASS=1"]),
+];
+
+/// The tiered targets as runs: TIERED, and image-prune with YES=1.
+fn tiered_runs() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+    let mut runs: Vec<_> = TIERED.iter().map(|(t, tier, args)| (*t, *tier, args.to_vec())).collect();
+    runs.push(("image-prune", "deployer", vec!["YES=1"]));
+    runs
+}
+
+/// The marker the stand-in's runner leaves for a tier.
+fn marker_of(tier: &str) -> &'static str {
+    match tier {
+        "deployer" => "deployer:9001",
+        "ops" => "ops:9002",
+        _ => "root",
+    }
+}
+
+/// A `$(MAKE)` (and a `cargo`) that only log, into FAKE_AIENV_LOG: `make <argv>`, then ` [AS=<marker>]` and ` [KEY]`
+/// when the runner's marker or a credential (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN) is in its
+/// environment (never a value).
+const LOGGED_MAKE: &str = r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
+printf '%s %s%s%s\n' "$(basename "$0" | sed 's/^fake-//')" "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+exit "${FAKE_MAKE_RC:-0}""#;
+
+/// A `cargo` whose `run ... -- ARGS` is the stand-in's `ARGS` (the Makefile's default AI_ENV is `cargo run`): every
+/// call logged first, as [`LOGGED_MAKE`] logs (`cargo <argv>`, ` [AS=<marker>]`, ` [KEY]`), so a test sees whether a
+/// compile (`cargo run` builds the tree when it changed) ever had a credential or the marker in its environment; a
+/// `build` or `test` passes.
+const CARGO_RUN: &str = r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
+printf 'cargo %s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+case " $* " in *" run "*" -- "*) ;; *) exit 0 ;; esac
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$(dirname "$0")/ai-env-stand-in" "$@""#;
+
+/// A tier world: the S5 fakes (the stateful aws, pulumi, the stand-in, node), a logging `fake-make` and `cargo`, and
+/// the outputs of a stack that has its deployer.
+fn tier_world(t: &Path) -> PathBuf {
+    let bin = s5_bin(t);
+    script(&bin.join("fake-make"), LOGGED_MAKE);
+    script(&bin.join("cargo"), LOGGED_MAKE);
+    bin_with(t, &[("logged.sh", "sleep")]);
+    write_outputs(t, &with_operators(outputs()));
+    bin
+}
+
+/// `make -C <repo> <args> AI_ENV=<stand-in>` in a tier world, `MAKE=<fake-make>` when `fake_make`.
+fn tier_make(t: &Path, bin: &Path, args: &[&str], fake_make: bool, envs: &[(&str, &str)]) -> Output {
+    let mut cmd = make(t, bin, args);
+    s5_env(&mut cmd, t).arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display()));
+    if fake_make {
+        cmd.arg(format!("MAKE={}", bin.join("fake-make").display()));
+    }
+    cmd.envs(envs.iter().copied()).bounded()
+}
+
+/// String pairs as `envs` takes them.
+fn pairs(v: &[(String, String)]) -> Vec<(&str, &str)> {
+    v.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// Each tiered target, run for real with its prechecks met: exactly one runner, `ai-env as <tier> -- $(MAKE)
+/// --no-print-directory X-run`, after `ai-env as --check <tier>` (and the root's, for the root tier), its X-run then
+/// under that identity's key and marker; the deployer's wrappers that build the image zip (and test-egress, its tests)
+/// build first, with no key and no marker.
+#[test]
+fn every_tiered_target_runs_exactly_one_runner_line() {
+    let cases = tiered_runs();
+    let runs: Vec<(tempfile::TempDir, PathBuf, Output)> = std::thread::scope(|s| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|(target, tier, args)| {
+                s.spawn(move || {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let bin = tier_world(tmp.path());
+                    let envs: &[(&str, &str)] = if *tier == "root" { &[("FAKE_AWS_CALLER", "root")] } else { &[] };
+                    let out = tier_make(tmp.path(), &bin, &[&[*target][..], args.as_slice()].concat(), true, envs);
+                    (tmp, bin, out)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for ((target, tier, args), (tmp, bin, out)) in cases.iter().zip(&runs) {
+        let what = format!("{target} {}", args.join(" "));
+        let text = all(out);
+        assert!(out.status.success(), "{what}: {text}");
+        let c = calls(tmp.path());
+        let fake_make = bin.join("fake-make");
+        let runners: Vec<&String> = c.iter().filter(|l| l.starts_with("as ") && !l.starts_with("as --check ")).collect();
+        assert_eq!(runners, [&format!("as {tier} -- {} --no-print-directory {target}-run [AI_ENV=unset]", fake_make.display())], "{what}: exactly one runner: {c:#?}");
+        let checks: Vec<&String> = c.iter().filter(|l| l.starts_with("as --check ")).collect();
+        let want_checks: &[&str] = match (*tier, *target) {
+            ("root", "destroy") => &["as --check root [AI_ENV=unset]"],
+            ("root", _) => &["as --check root [AI_ENV=unset]", "as --check root [AI_ENV=unset]"],
+            ("deployer", _) => &["as --check deployer [AI_ENV=unset]"],
+            _ => &["as --check ops [AI_ENV=unset]"],
+        };
+        assert_eq!(checks, want_checks, "{what}: {c:#?}");
+        let makes: Vec<&String> = c.iter().filter(|l| l.starts_with("make ") || l.starts_with("cargo ")).collect();
+        let key = if *tier == "root" { "" } else { " [KEY]" };
+        let run = format!("make --no-print-directory {target}-run [AS={}]{key}", marker_of(tier));
+        let built: Vec<String> = match *target {
+            "deploy" | "preview" | "deploy-policies" => vec!["make --no-print-directory image-zip".to_string()],
+            "test-egress" => vec!["cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run".to_string()],
+            _ => vec![],
+        };
+        assert_eq!(makes, built.iter().chain([&run]).collect::<Vec<_>>(), "{what}: the build first, keyless; then X-run alone, as the tier: {c:#?}");
+        if !built.is_empty() {
+            assert!(at(&c, &built[0]) < at(&c, "as --check "), "{what}: built before the runner asks: {c:#?}");
+        }
+        // TIER's own first step: the operator CLI built without a key or the marker (D18), right before its first
+        // `as --check`, and only once.
+        assert_eq!(c.iter().filter(|l| *l == BUILT).count(), 1, "{what}: {c:#?}");
+        assert_eq!(c[at(&c, "as --check ") - 1], BUILT, "{what}: TIER builds first: {c:#?}");
+        // The deployer tier reads whether the stack has its deployer (a local read) before it asks; the others do not.
+        let reads = c.iter().filter(|l| l.starts_with("pulumi stack output --json")).count();
+        assert_eq!(reads, usize::from(*tier == "deployer"), "{what}: {c:#?}");
+        assert_eq!(text.contains("BREAKGLASS=1 on the make command line"), *target == "destroy", "{what}: {text}");
+    }
+}
+
+/// `make -n` (and --dry-run, --just-print, -s -n, an outer make's MAKEFLAGS=n, -t and -q) of every tiered target
+/// asks nothing and runs nothing: no runner, no tool, not even ops.sh's read of the outputs; the -n forms print the
+/// runner (`: <ai-env> as <tier> --;`, the root's under BREAKGLASS=1) and X-run's recipe. In a copy of the make files,
+/// which none of the forms changes.
+#[test]
+fn make_n_and_the_other_dry_forms_never_run_the_runner_or_a_tool() {
+    type Form = (&'static str, &'static [&'static str], &'static [(&'static str, &'static str)]);
+    let forms: [Form; 7] = [
+        ("-n", &["-n"], &[]),
+        ("--dry-run", &["--dry-run"], &[]),
+        ("--just-print", &["--just-print"], &[]),
+        ("-s -n", &["-s", "-n"], &[]),
+        ("an outer make's n", &[], &[("MAKEFLAGS", "n")]),
+        ("-t", &["-t"], &[]),
+        ("-q", &["-q"], &[]),
+    ];
+    let cases = tiered_runs();
+    std::thread::scope(|s| {
+        for (target, tier, args) in &cases {
+            s.spawn(move || {
+                let tmp = tempfile::tempdir().unwrap();
+                let t = tmp.path();
+                let w = planted_repo(t, true);
+                let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).chain([("ai-env.sh", "ai-env-stand-in")]).collect();
+                let bin = bin_with(t, &fakes);
+                let stand_in = bin.join("ai-env-stand-in");
+                let dry_tier = if args.contains(&"BREAKGLASS=1") { "root" } else { *tier };
+                for (form, flags, envs) in forms {
+                    let what = format!("{form} {target} {}", args.join(" "));
+                    let out = make_in(t, &bin, &w, flags)
+                        .arg(target)
+                        .args(args)
+                        .arg(format!("AI_ENV={}", stand_in.display()))
+                        .env("FAKE_LOG", t.join("tools.log"))
+                        .env("FAKE_AIENV_LOG", t.join("runner.log"))
+                        .envs(envs.iter().copied())
+                        .bounded();
+                    assert_eq!(read(&t.join("tools.log")), "", "{what}: a tool ran: {}", all(&out));
+                    assert_eq!(read(&t.join("runner.log")), "", "{what}: the runner ran: {}", all(&out));
+                    if !matches!(form, "-t" | "-q") {
+                        assert!(out.status.success(), "{what}: {}", all(&out));
+                        let text = stdout(&out);
+                        let runner = format!(": {} as {dry_tier} --; {} --no-print-directory {target}-run\n", stand_in.display(), make_path());
+                        assert_eq!(text.matches(&runner).count(), 1, "{what}: the runner shown once: {text}");
+                        assert!(!text.contains(" as --check "), "{what}: {text}");
+                    }
+                }
+                assert!(!w.join("target").exists(), "{target}: a dry form made {}", w.join("target").display());
+                assert_eq!(std::fs::read_dir(&w).unwrap().count(), 3, "{target}: a dry form wrote into the tree");
+            });
+        }
+    });
+}
+
+/// BREAKGLASS=1 counts only on the make command line: there TIER runs X-run as the account root (saying so) and
+/// X-run's identity line admits the root, loudly; exported in the environment it changes nothing.
+#[test]
+fn breakglass_counts_only_on_the_make_command_line() {
+    let note = "deployer-key: BREAKGLASS=1 on the make command line: ai-env as root (the account root's own credentials; README \"Break-glass\")";
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let out = tier_make(t, &bin, &["deployer-key", "ROTATE=1", "BREAKGLASS=1"], true, &[("FAKE_AWS_CALLER", "root")]);
+    assert!(out.status.success() && stderr(&out).contains(note), "{}", all(&out));
+    let c = calls(t);
+    assert!(c.contains(&format!("as root -- {} --no-print-directory deployer-key-run [AI_ENV=unset]", bin.join("fake-make").display())) && c.contains(&"make --no-print-directory deployer-key-run [AS=root]".to_string()), "{c:#?}");
+    assert!(!c.iter().any(|l| l.starts_with("as --check deployer") || l.starts_with("pulumi ")), "BREAKGLASS=1 neither checks the deployer nor reads the outputs: {c:#?}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let out = tier_make(t, &bin, &["deployer-key", "ROTATE=1"], true, &[("BREAKGLASS", "1"), ("FAKE_AWS_CALLER", "root")]);
+    assert!(out.status.success() && !all(&out).contains("BREAKGLASS=1"), "{}", all(&out));
+    assert!(calls(t).contains(&"make --no-print-directory deployer-key-run [AS=deployer:9001] [KEY]".to_string()), "{:#?}", calls(t));
+
+    // X-run's identity line, under the root's runner: the command line's BREAKGLASS=1 admits the root (and the preview
+    // runs); the environment's is set aside (the root is refused before anything runs).
+    // (the make arguments, the environment, admitted)
+    type Run<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], bool);
+    let cases: [Run; 2] = [(&["preview-run", "BREAKGLASS=1"], &[], true), (&["preview-run"], &[("BREAKGLASS", "1")], false)];
+    for (args, envs, ok) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bin = tier_world(t);
+        let plan = t.join("plan.txt");
+        std::fs::write(&plan, "a preview\n").unwrap();
+        let mut envs = envs.to_vec();
+        envs.extend([("FAKE_AWS_CALLER", "root"), ("AI_ENV_BRIDGE_AS", "root"), ("FAKE_PULUMI_PREVIEW", plan.to_str().unwrap())]);
+        let out = tier_make(t, &bin, args, false, &envs);
+        let text = all(&out);
+        assert_eq!(out.status.success(), ok, "{args:?} {envs:?}: {text}");
+        if ok {
+            assert!(text.contains("preview: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")") && text.contains("a preview"), "{text}");
+        } else {
+            assert!(text.contains("preview: identity root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line"), "{text}");
+            assert!(!calls(t).iter().any(|l| l.starts_with("pulumi preview")), "{:#?}", calls(t));
+        }
+    }
+}
+
+/// The deployer tier runs as the account root only for the bootstrap: when the stack's outputs are read and export
+/// no deployer yet. Outputs that cannot be read keep the deployer (its paste), never the shell's own credentials. A
+/// runner that already covers the tier (the deployer's, or the root's typed by hand) runs X-run at once; the ops tier
+/// never reads the outputs.
+#[test]
+fn the_bootstrap_runs_as_the_root_only_while_the_stack_exports_no_deployer() {
+    let note = "runtime-key: stack dev exports no deployer yet: the bootstrap, as the account root (ai-env as root)";
+    let mut no_deployer = outputs();
+    no_deployer["accountId"] = json!("123456789012");
+    type Case<'a> = (&'a str, Option<Value>, Vec<(String, String)>, &'a [&'a str], &'a str);
+    // (what, the outputs (none: unreadable), the environment, the runner's calls, the marker X-run runs under)
+    let root_env = vec![("FAKE_AWS_CALLER".to_string(), "root".to_string())];
+    let cases: Vec<Case> = vec![
+        ("the stack has its deployer", Some(with_operators(outputs())), vec![], &["as --check deployer", "as deployer --"], "deployer:9001"),
+        ("the bootstrap", Some(no_deployer.clone()), root_env.clone(), &["as --check deployer", "as --check root", "as root --"], "root"),
+        ("unreadable outputs", None, root_env, &["as --check deployer", "as deployer --"], "deployer:9001"),
+        ("under the deployer's runner", Some(no_deployer.clone()), super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL), &["as --check deployer"], "deployer:9001"),
+        ("the bootstrap under ai-env as root", Some(no_deployer), super::aws_keys::marker_env("root"), &["as --check deployer"], "root"),
+    ];
+    for (what, outs, env, runner, marker) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bin = tier_world(t);
+        match &outs {
+            Some(o) => write_outputs(t, o),
+            None => std::fs::remove_file(t.join("outputs.json")).unwrap(),
+        }
+        let out = tier_make(t, &bin, &["runtime-key"], true, &pairs(&env));
+        let text = all(&out);
+        assert!(out.status.success(), "{what}: {text}");
+        let c = calls(t);
+        let asked: Vec<&str> = c.iter().filter(|l| l.starts_with("as ")).map(|l| if l.starts_with("as --check") { l.split(" [").next().unwrap() } else { &l[..l.find(" -- ").unwrap() + 3] }).collect();
+        assert_eq!(asked, runner, "{what}: {c:#?}");
+        let key = if marker == "root" { "" } else { " [KEY]" };
+        assert_eq!(c.iter().filter(|l| l.starts_with("make ")).collect::<Vec<_>>(), [&format!("make --no-print-directory runtime-key-run [AS={marker}]{key}")], "{what}: {c:#?}");
+        assert_eq!(text.contains(note), what == "the bootstrap", "{what}: {text}");
+        if outs.is_none() {
+            assert!(text.contains("ops.sh: pulumi stack output --stack dev failed"), "{what}: the unreadable outputs are named: {text}");
+        }
+    }
+    // The ops tier never reads the outputs (an unreadable stack is no reason to refuse a status).
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    std::fs::remove_file(t.join("outputs.json")).unwrap();
+    let out = tier_make(t, &bin, &["image-status"], true, &[]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert!(!calls(t).iter().any(|l| l.starts_with("pulumi ")), "{:#?}", calls(t));
+}
+
+/// `make s3-preflight` with the stateful aws, pulumi (the stack's outputs `outputs`; none: unreadable) and the S3
+/// fakes; its `[..]` rows.
+fn preflight_p8(t: &Path, outputs: Option<&Value>, args: &[&str], envs: &[(&str, &str)]) -> (Output, Vec<String>) {
+    let mut fakes = vec![("docker.sh", "docker"), ("curl.sh", "curl"), ("ai-env.sh", "ai-env-stand-in"), ("aws-state.sh", "aws"), ("pulumi.sh", "pulumi")];
+    fakes.extend(["npm", "zip", "gpg", "rustup", "cargo"].iter().map(|n| ("logged.sh", *n)));
+    let bin = bin_with(t, &fakes);
+    std::os::unix::fs::symlink(node().expect("node is required: ops.sh reads JSON with it (s3-preflight P4)"), bin.join("node")).unwrap();
+    std::fs::create_dir_all(t.join("aws")).unwrap();
+    if let Some(o) = outputs {
+        write_outputs(t, o);
+    }
+    let out = make(t, &bin, &["s3-preflight"])
+        .args(args)
+        .arg(format!("IMAGE_OUT={}", t.join("out").display()))
+        .arg(format!("AI_ENV={}", bin.join("ai-env-stand-in").display()))
+        .env("FAKE_LOG", t.join("tools.log"))
+        .env("FAKE_AWS_STATE", t.join("aws"))
+        .env("FAKE_AWS_LOG", t.join("calls.log"))
+        .env("FAKE_PULUMI_OUTPUTS", t.join("outputs.json"))
+        .envs(envs.iter().copied())
+        .bounded();
+    let rows = stdout(&out).lines().filter(|l| l.starts_with('[')).map(str::to_string).collect();
+    (out, rows)
+}
+
+/// P8 (contracts §9.5): PHASE=b's row is ops.sh identity deployer's one line: the stack's deployer, the bootstrap's
+/// account root, a loud break-glass row (BREAKGLASS=1 on the command line), and a [NO ] for everything else (the root
+/// otherwise, the ops and runtime keys, another user or account, no credentials, a key beside a profile, outputs that
+/// cannot be read, a root marker over another caller). PHASE=a only names this shell's own identity.
+#[test]
+fn p8_admits_only_the_stacks_deployer_the_bootstrap_and_a_loud_break_glass() {
+    let s = |v: &str| v.to_string();
+    let env = |v: &[(&str, &str)]| v.iter().map(|(k, x)| (s(k), s(x))).collect::<Vec<_>>();
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let root = env(&[("FAKE_AWS_CALLER", "root"), ("AI_ENV_BRIDGE_AS", "root")]);
+    let runtime = vec![(s("AWS_ACCESS_KEY_ID"), super::aws_keys::key_id(super::aws_keys::RUNTIME_TAIL)), (s("AWS_SECRET_ACCESS_KEY"), super::aws_keys::secret("Rt5+"))];
+    let stack = with_operators(outputs());
+    let mut bootstrap = outputs();
+    bootstrap["accountId"] = json!("123456789012");
+    type Case = (&'static str, Option<Value>, Vec<&'static str>, Vec<(String, String)>, &'static str);
+    let cases: Vec<Case> = vec![
+        ("the deployer", Some(stack.clone()), vec!["PHASE=b"], deployer.clone(), "[ok ] P8 deploy identity user/ai-env-deployer (the deployer of stack dev)"),
+        ("the bootstrap", Some(bootstrap), vec!["PHASE=b"], root.clone(), "[ok ] P8 deploy identity root: the bootstrap deploy (stack dev exports no deployer yet: this deploy creates user/ai-env-deployer and user/ai-env-ops; then make operator-keys, as the account root, once)"),
+        ("break-glass", Some(stack.clone()), vec!["PHASE=b", "BREAKGLASS=1"], root.clone(), "[-  ] P8 BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")"),
+        ("BREAKGLASS=1 in the environment", Some(stack.clone()), vec!["PHASE=b"], [root.clone(), env(&[("BREAKGLASS", "1")])].concat(), "[NO ] P8 deploy identity root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line"),
+        ("the root without its runner", Some(stack.clone()), vec!["PHASE=b", "BREAKGLASS=1"], env(&[("FAKE_AWS_CALLER", "root")]), "[NO ] P8 deploy identity root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused"),
+        ("the ops key", Some(stack.clone()), vec!["PHASE=b"], super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL), "[NO ] P8 deploy identity user/ai-env-ops: the ops key cannot deploy: run the make target itself (not its -run target): it asks for the deployer's key"),
+        ("the runtime key", Some(stack.clone()), vec!["PHASE=b"], runtime, "[NO ] P8 deploy identity user/ai-env-runtime: the runtime key cannot deploy: make deploy asks for the deployer's key"),
+        ("another user", Some(stack.clone()), vec!["PHASE=b"], vec![], "[NO ] P8 deploy identity user/rust: not the deployer of stack dev (user/ai-env-deployer): make deploy asks for that user's key and never uses this shell's own AWS settings (AWS_PROFILE, ~/.aws)"),
+        ("another account", Some(stack.clone()), vec!["PHASE=b"], env(&[("FAKE_AWS_CALLER", "rust@999999999999")]), "[NO ] P8 deploy identity user/rust of another AWS account than stack dev's (its accountId output): make deploy asks for the deployer's key of the stack's account"),
+        ("no credentials", Some(stack.clone()), vec!["PHASE=b"], env(&[("FAKE_AWS_CALLER", "none")]), "[NO ] P8 deploy identity none: no AWS credentials answer: make deploy asks for the deployer's key; P8 alone: ai-env as deployer -- make s3-preflight PHASE=b"),
+        ("a key and a profile", Some(stack.clone()), vec!["PHASE=b"], [deployer.clone(), env(&[("AWS_PROFILE", "rust")])].concat(), "[NO ] P8 deploy identity AWS_ACCESS_KEY_ID and AWS_PROFILE are both set: the aws CLI takes the key, Pulumi's providers may take the profile: unset AWS_PROFILE"),
+        ("unreadable outputs", None, vec!["PHASE=b"], deployer, "[NO ] P8 deploy identity user/ai-env-deployer: the outputs of stack dev cannot be read (pulumi stack output --stack dev): whether it has a deployer, and its account, are unknown: refused"),
+        ("a root marker over another caller", Some(stack.clone()), vec!["PHASE=b"], env(&[("AI_ENV_BRIDGE_AS", "root")]), "[NO ] P8 deploy identity user/rust: under ai-env as root, but not the account root: refused"),
+        ("PHASE=a", Some(stack.clone()), vec!["PHASE=a"], vec![], "[ok ] P8 identity user/rust (PHASE=a reads only; PHASE=b admits only the stack's deployer)"),
+        ("PHASE=a without credentials", Some(stack), vec!["PHASE=a"], env(&[("FAKE_AWS_CALLER", "none")]), "[NO ] P8 no AWS credentials (PHASE=a: this shell's own, the agent's; on this Mac: ai-env as ops -- make s3-preflight)"),
+    ];
+    let runs: Vec<(Output, Vec<String>)> = std::thread::scope(|sc| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|(_, outs, args, envs, _)| {
+                sc.spawn(move || {
+                    let t = tempfile::tempdir().unwrap();
+                    preflight_p8(t.path(), outs.as_ref(), args, &pairs(envs))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for ((what, _, _, _, want), (out, rows)) in cases.iter().zip(runs) {
+        assert_eq!(row(&rows, "P8"), *want, "{what}: {}", all(&out));
+        assert_eq!(rows.iter().filter(|r| r.contains("] P8 ")).count(), 1, "{what}: one P8 row: {rows:?}");
+        if want.starts_with("[NO ]") {
+            assert!(!out.status.success(), "{what}: a [NO ] row fails the preflight");
+        }
+    }
+}
+
+/// ops.sh identity TIER [LABEL] beyond the deployer tier P8 shows: the ops tier (claude-update's) admits ai-env-ops
+/// and the deployer, refuses the root and any other; root-keys (make operator-keys) admits the account root under its
+/// runner once the stack exports both users; breakglass (destroy-run) admits the account root under its runner with
+/// BREAKGLASS=1, whatever the stack exports, and refuses every user. With a label each line reads `LABEL: identity
+/// <text>`, a break-glass one `LABEL: BREAK-GLASS: ...`; an unknown tier is usage, exit 2, before any call.
+#[test]
+fn ops_sh_identity_admits_each_tier_by_its_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let identity = |args: &[&str], envs: &[(String, String)]| ops5(t, &bin, &[&["identity"][..], args].concat()).envs(pairs(envs)).bounded();
+    let s = |v: &str| v.to_string();
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let ops = super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL);
+    let root = vec![(s("FAKE_AWS_CALLER"), s("root")), (s("AI_ENV_BRIDGE_AS"), s("root"))];
+    // (the arguments, the environment, the exit, the one line)
+    type Case<'a> = (&'a [&'a str], Vec<(String, String)>, i32, &'a str);
+    let cases: Vec<Case> = vec![
+        (&["ops"][..], ops.clone(), 0, "user/ai-env-ops (the operator of stack dev)\n"),
+        (&["ops", "claude-update"][..], deployer.clone(), 0, "claude-update: identity user/ai-env-deployer (the deployer of stack dev, which covers ops)\n"),
+        (&["ops", "claude-update"][..], root.clone(), 1, "claude-update: identity root: an ops step runs as ai-env-ops or the deployer, never the account root (break-glass: make deploy BREAKGLASS=1, then the remaining steps by hand)\n"),
+        (&["ops"][..], vec![], 1, "user/rust: not ai-env-ops or the deployer of stack dev\n"),
+        (&["root-keys", "operator-keys"][..], root.clone(), 0, "operator-keys: identity root of stack dev's account, which exports user/ai-env-deployer and user/ai-env-ops: the bootstrap keys\n"),
+        (&["root-keys", "operator-keys"][..], vec![(s("FAKE_AWS_CALLER"), s("root"))], 1, "operator-keys: identity root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused\n"),
+        (&["root-keys", "operator-keys"][..], deployer.clone(), 1, "operator-keys: identity user/ai-env-deployer: make operator-keys is the account root's, once, after the bootstrap deploy; the deployer rotates: make ops-key ROTATE=1, make deployer-key ROTATE=1\n"),
+        (&["deployer", "deploy"][..], deployer, 0, "deploy: identity user/ai-env-deployer (the deployer of stack dev)\n"),
+        (&["deployer", "deploy"][..], [root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 0, "deploy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")\n"),
+        // breakglass (destroy-run): the account root under its runner with BREAKGLASS=1, and nobody else (D5).
+        (&["breakglass", "destroy"][..], [root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 0, "destroy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")\n"),
+        (&["breakglass", "destroy"][..], root.clone(), 1, "destroy: identity root: break-glass only: BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")\n"),
+        (&["breakglass", "destroy"][..], vec![(s("FAKE_AWS_CALLER"), s("root")), (s("BREAKGLASS"), s("1"))], 1, "destroy: identity root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused\n"),
+        (&["breakglass", "destroy"][..], [ops.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat(), 1, "destroy: identity user/ai-env-ops: break-glass only: the account root's, with BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")\n"),
+        (&["deployer"][..], ops, 1, "user/ai-env-ops: the ops key cannot deploy: run the make target itself (not its -run target): it asks for the deployer's key\n"),
+    ];
+    for (args, envs, code, want) in &cases {
+        let out = identity(args, envs);
+        assert_eq!((out.status.code(), stdout(&out).as_str(), stderr(&out).as_str()), (Some(*code), *want, ""), "{args:?} {envs:?}");
+    }
+    // root-keys before the bootstrap (no deployerUserName), and with the deployer alone (no opsUserName).
+    for drop in ["deployerUserName", "opsUserName"] {
+        let mut o = with_operators(outputs());
+        o.as_object_mut().unwrap().remove(drop);
+        write_outputs(t, &o);
+        let out = identity(&["root-keys", "operator-keys"], &root);
+        assert_eq!((out.status.code(), stdout(&out)), (Some(1), s("operator-keys: identity root: stack dev exports no user/ai-env-deployer yet: run the bootstrap deploy first (make deploy, as the account root)\n")), "{drop}");
+    }
+    // A stack without its operators (an older one, or a bootstrap half done) is the root's to destroy all the same.
+    write_outputs(t, &outputs());
+    let out = identity(&["breakglass", "destroy"], &[root.clone(), vec![(s("BREAKGLASS"), s("1"))]].concat());
+    assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+    assert!(stdout(&out).starts_with("destroy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line"), "{}", all(&out));
+    std::fs::remove_file(t.join("calls.log")).unwrap();
+    for bad in [&["bogus"][..], &[][..]] {
+        let out = identity(bad, &[]);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", all(&out));
+        assert!(stderr(&out).starts_with("usage: ops.sh identity deployer|ops|root-keys|breakglass [LABEL]"), "{}", all(&out));
+    }
+    assert_eq!(calls(t), Vec::<String>::new(), "usage before any call");
+}
+
+/// ops.sh stack-deployer (infra.mk's TIER): the deployerUserName output and a newline, nothing before the bootstrap
+/// (exit 0 both); outputs that cannot be read, or are not JSON, exit 1 naming the read.
+#[test]
+fn stack_deployer_prints_the_deployer_nothing_before_the_bootstrap_and_fails_on_unreadable_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let run = || ops5(t, &bin, &["stack-deployer"]).bounded();
+    let out = run();
+    assert_eq!((out.status.code(), stdout(&out)), (Some(0), "ai-env-deployer\n".to_string()), "{}", all(&out));
+    write_outputs(t, &outputs());
+    let out = run();
+    assert_eq!((out.status.code(), stdout(&out)), (Some(0), String::new()), "{}", all(&out));
+    std::fs::write(t.join("outputs.json"), "not json").unwrap();
+    let out = run();
+    assert_eq!(out.status.code(), Some(1), "{}", all(&out));
+    std::fs::remove_file(t.join("outputs.json")).unwrap();
+    let out = run();
+    assert!(out.status.code() == Some(1) && stdout(&out).is_empty() && stderr(&out).contains("ops.sh: pulumi stack output --stack dev failed"), "{}", all(&out));
+    assert!(calls(t).iter().all(|l| l.starts_with("pulumi stack output --json --stack dev --cwd ")), "a local read alone: {:#?}", calls(t));
+}
+
+/// make operator-keys (the account root's, once, after the bootstrap deploy): under `ai-env as root`, the identity
+/// (root-keys), the ops key's sealing check, then the deployer's key handed over and the ops key sealed, each
+/// verified; a rerun, or one after a half-done run, resumes (a user with a key is skipped). Refused before anything
+/// is created: before the bootstrap, a caller that is not the root (the runner), and its X-run typed under the
+/// deployer's key or without the root's runner.
+#[test]
+fn operator_keys_issues_the_first_keys_as_the_root_and_a_rerun_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    std::fs::create_dir_all(t.join("aws")).unwrap();
+    let root = [("FAKE_AWS_CALLER", "root")];
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        std::fs::remove_file(t.join("calls.log")).ok();
+        tier_make(t, &bin, args, false, envs)
+    };
+    let done = "operator-keys: done. Next (README \"Identities\"): make infra-status WRITE=1, the checks, then retire root's access key";
+    let out = run(&["operator-keys"], &root);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    let said = stdout(&out);
+    let order = [
+        "operator-keys: identity root of stack dev's account, which exports user/ai-env-deployer and user/ai-env-ops: the bootstrap keys",
+        "[ok ] fake aws-set --check",
+        &format!("deployer-key: the key ...{} is in Strongbox and identifies as user/ai-env-deployer", &key_id(1)[16..]),
+        &format!("ops-key: the sealed key ...{} identifies as user/ai-env-ops", &key_id(2)[16..]),
+        done,
+    ];
+    let mut last = 0;
+    for want in order {
+        last = said[last..].find(want).unwrap_or_else(|| panic!("{want} missing or out of order: {text}")) + last;
+    }
+    let c = calls(t);
+    assert_eq!(c.iter().filter(|l| l.starts_with("as root -- ")).count(), 1, "{c:#?}");
+    assert!(c.contains(&"creds aws-set --check --user ai-env-ops [AI_ENV=unset] [AS=root]".to_string()) && c.contains(&"creds deployer-key --account 123456789012 [AI_ENV=unset] [AS=root]".to_string()), "{c:#?}");
+    assert!(at(&c, "creds deployer-key ") < at(&c, "creds aws-set --user ai-env-ops"), "the deployer's key first: {c:#?}");
+    assert_eq!(c[at(&c, "creds aws-set --check --user ai-env-ops") - 1], BUILT, "operator-keys-run builds the CLI without the key before it calls it (D18): {c:#?}");
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-deployer")), vec![key_id(1)]);
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-ops")), vec![key_id(2)]);
+    assert_eq!(read(&t.join("bridge/credentials/ops.env")), format!("FAKE-SEALED {}\n", key_id(2)));
+    assert!(!t.join("bridge/credentials/aws.env").exists(), "the runtime key is runtime-key's");
+
+    // A rerun: both skipped, done again.
+    let out = run(&["operator-keys"], &root);
+    let text = all(&out);
+    assert!(out.status.success() && text.contains("deployer-key: ai-env-deployer has its key already: skipped (a rerun resumes)") && text.contains("ops-key: ai-env-ops has its key already: skipped (a rerun resumes)") && text.contains(done), "{text}");
+    assert!(!calls(t).iter().any(|l| l.starts_with("iam create-access-key")), "{:#?}", calls(t));
+    // After a run that stopped between the two: the deployer skipped, the ops key issued.
+    std::fs::write(t.join("aws/keys.ai-env-ops"), "").unwrap();
+    std::fs::remove_file(t.join("bridge/credentials/ops.env")).unwrap();
+    let out = run(&["operator-keys"], &root);
+    let text = all(&out);
+    assert!(out.status.success() && text.contains("deployer-key: ai-env-deployer has its key already: skipped") && text.contains(&format!("ops-key: the sealed key ...{} identifies as user/ai-env-ops", &key_id(3)[16..])), "{text}");
+
+    // Refusals, nothing created.
+    let keys = |t: &Path| (read(&t.join("aws/keys.ai-env-deployer")), read(&t.join("aws/keys.ai-env-ops")));
+    let before = keys(t);
+    let mut no_users = outputs();
+    no_users["accountId"] = json!("123456789012");
+    write_outputs(t, &no_users);
+    let out = run(&["operator-keys"], &root);
+    assert!(!out.status.success() && all(&out).contains("operator-keys: identity root: stack dev exports no user/ai-env-deployer yet: run the bootstrap deploy first (make deploy, as the account root)"), "{}", all(&out));
+    write_outputs(t, &with_operators(outputs()));
+    let out = run(&["operator-keys"], &[]);
+    assert!(!out.status.success() && all(&out).contains("ai-env: as root: the aws CLI's credentials are arn:aws:iam::123456789012:user/rust, not the account root"), "the runner refuses another caller: {}", all(&out));
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let out = run(&["operator-keys-run"], &pairs(&deployer));
+    assert!(!out.status.success() && all(&out).contains("operator-keys: identity user/ai-env-deployer: make operator-keys is the account root's, once, after the bootstrap deploy; the deployer rotates: make ops-key ROTATE=1, make deployer-key ROTATE=1"), "{}", all(&out));
+    let out = run(&["operator-keys-run"], &root);
+    assert!(!out.status.success() && all(&out).contains("operator-keys: identity root: not under ai-env as root"), "{}", all(&out));
+    assert_eq!(keys(t), before, "nothing created by a refusal");
+}
+
+/// make destroy deletes the operator users themselves: the account root's alone, with BREAKGLASS=1 on the command line
+/// after CONFIRM, checked before the runner asks (and again in destroy-run, which is never typed, and whose identity
+/// line, the break-glass tier, admits the account root under its runner alone); then, as the root, vm-guard, pulumi
+/// destroy and the checklist.
+#[test]
+fn destroy_is_the_account_roots_with_breakglass_only() {
+    let refusal = "destroy: it deletes the operator users themselves: as the account root only: make destroy CONFIRM=destroy-dev BREAKGLASS=1 (README \"Break-glass\")";
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    // (the make arguments, the environment)
+    type Run<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
+    let cases: [Run; 3] = [(&["destroy", "CONFIRM=destroy-dev"], &[]), (&["destroy", "CONFIRM=destroy-dev"], &[("BREAKGLASS", "1")]), (&["destroy-run", "CONFIRM=destroy-dev"], &[])];
+    for (args, envs) in cases {
+        let out = tier_make(t, &bin, args, false, envs);
+        assert!(!out.status.success() && all(&out).contains(refusal), "{args:?} {envs:?}: {}", all(&out));
+        assert_eq!(calls(t), Vec::<String>::new(), "{args:?} {envs:?}: nothing ran");
+    }
+    let out = tier_make(t, &bin, &["destroy", "BREAKGLASS=1"], false, &[]);
+    assert!(!out.status.success() && all(&out).contains("set CONFIRM=destroy-dev on the command line") && !all(&out).contains(refusal), "CONFIRM first: {}", all(&out));
+    assert_eq!(calls(t), Vec::<String>::new());
+
+    // destroy-run typed by hand under the deployer's runner, both switches given: the wrapper's root tier never ran, so
+    // destroy-run's own identity line refuses every user, the deployer included (L8: it would delete the operator users
+    // and its own rights half-way); nothing after it runs (D5).
+    seed_connector(t, CONNECTOR, "ACTIVE");
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let mut envs = pairs(&deployer);
+    envs.push(("FAKE_PULUMI_ALLOW", "destroy"));
+    let out = tier_make(t, &bin, &["destroy-run", "CONFIRM=destroy-dev", "BREAKGLASS=1"], false, &envs);
+    let text = all(&out);
+    let deployer_refused = "destroy: identity user/ai-env-deployer: break-glass only: the account root's, with BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")";
+    assert!(!out.status.success() && text.contains(deployer_refused), "{text}");
+    let c = calls(t);
+    assert!(!c.iter().any(|l| l.starts_with("pulumi destroy") || l.starts_with("lambda-core ") || l.starts_with("lambda-microvms ")), "nothing after the identity line: {c:#?}");
+    std::fs::remove_file(t.join("calls.log")).unwrap();
+
+    // The real thing, as the root: the identity, vm-guard, pulumi destroy (its own confirmation), the checklist.
+    let out = tier_make(t, &bin, &["destroy", "CONFIRM=destroy-dev", "BREAKGLASS=1"], false, &[("FAKE_AWS_CALLER", "root"), ("FAKE_PULUMI_ALLOW", "destroy")]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    let said = stdout(&out);
+    let mut last = 0;
+    for want in ["destroy: BREAK-GLASS: root, with BREAKGLASS=1 on the make command line", "vm-guard: no network connector but the stack's ai-env-egress", "fake pulumi: destroy --stack dev", "Post-destroy checklist", "aws iam get-user --user-name ai-env-deployer"] {
+        last = said[last..].find(want).unwrap_or_else(|| panic!("{want} missing or out of order: {text}")) + last;
+    }
+    let c = calls(t);
+    assert!(c.contains(&format!("as root -- {} --no-print-directory destroy-run [AI_ENV=unset]", make_path())), "{c:#?}");
+    assert!(c.contains(&"pulumi destroy --stack dev".to_string()) && !c.iter().any(|l| l.contains("FORBIDDEN")), "no --yes: {c:#?}");
+}
+
+/// deploy-policies: the zip first (no key), then as the deployer the identity, deploy's gates (s3-preflight PHASE=b,
+/// check-policies, the plan gate over the whole stack), then `pulumi up` of exactly the five stack policies (each by
+/// its URN), and its note; nothing else of deploy (no snapshot, no wait, no egress step). preview's REFRESH=1 counts
+/// only on the command line.
+#[test]
+fn deploy_policies_updates_the_five_stack_policies_only_and_preview_refreshes_on_request() {
+    let five = ["ai-env-deploy", "ai-env-deploy-egress", "ai-env-deploy-dns", "ai-env-deployer", "ai-env-ops"];
+    let urns: Vec<String> = five.iter().map(|p| format!("--target urn:pulumi:dev::ai-env::aws:iam/policy:Policy::{p}")).collect();
+    // deploy's plan with the five policies, each document known (a JSON string) but `unknown`'s, which holds Pulumi's
+    // unknown value (as while the proxy instance, which ai-env-ops' document names, is replaced), and none of `without`.
+    let policies_plan = |unknown: &str, without: &str| {
+        let steps: Vec<(&str, &str, &str)> = five.iter().filter(|p| **p != without).map(|p| ("same", "aws:iam/policy:Policy", *p)).collect();
+        let mut p = deploy_plan(&steps);
+        for s in p["steps"].as_array_mut().unwrap().iter_mut().filter(|s| s["newState"]["type"] == "aws:iam/policy:Policy") {
+            let name = s["urn"].as_str().unwrap().rsplit("::").next().unwrap().to_string();
+            let doc = if name == unknown { "04da6b54-80e4-46f7-96ec-b56ff0331ba9".to_string() } else { json!({"Version": "2012-10-17", "Statement": [{"Sid": name}]}).to_string() };
+            s["newState"]["inputs"] = json!({"name": name, "policy": doc});
+        }
+        p
+    };
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.run("deploy-policies", &policies_plan("", ""), &[]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    let c = calls(d.t.path());
+    let up: Vec<&String> = c.iter().filter(|l| l.starts_with("pulumi up")).collect();
+    assert_eq!(up, [&format!("pulumi up --stack dev {}", urns.join(" "))], "the five policies and nothing else: {c:#?}");
+    let order = ["infra scan ", "as --check deployer", "as deployer -- ", "sts get-caller-identity", "check-policies eu-central-1", "pulumi preview --json --show-sames --show-reads --non-interactive --stack dev", "check-plan --mode none", "pulumi up --stack dev --target "];
+    let mut last = 0;
+    for want in order {
+        last = c[last..].iter().position(|l| l.contains(want)).unwrap_or_else(|| panic!("{want} missing or out of order: {c:#?}")) + last;
+    }
+    assert!(!c.iter().any(|l| l.starts_with("lambda-microvms") || l.starts_with("egress ") || l.starts_with("lambda-core get-network-connector")), "no snapshot, wait or egress step: {c:#?}");
+    assert_eq!(c.iter().filter(|l| l.starts_with("infra scan ")).count(), 1, "the zip built once, in the wrapper, before the runner: {c:#?}");
+    let asked = at(&c, "as --check deployer");
+    assert!(c[asked - 1] == BUILT && c[..asked].iter().filter(|l| *l == BUILT).count() == 2, "the zip's version read, then TIER's keyless build of the CLI (D18), before it asks: {c:#?}");
+    assert!(text.contains("deploy-policies: identity user/ai-env-deployer (the deployer of stack dev)") && stdout(&out).ends_with("deploy-policies: done: wait about 15 s for IAM, then make deploy\n"), "{text}");
+    // Its plan gate refuses like deploy's: nothing updated.
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.run("deploy-policies", &policies_plan("", ""), &[("FAKE_CHECK_PLAN_RC", "1")]);
+    assert!(!out.status.success() && all(&out).contains("deploy: the plan check refused the plan (exit 1, above)"), "{}", all(&out));
+    assert!(!calls(d.t.path()).iter().any(|l| l.starts_with("pulumi up")));
+    // A document the plan holds unknown (the plan check accepts it while a resource it names is replaced) would be
+    // rendered anew by the targeted pulumi up, from the old resource, and applied uncompared: refused (D18), as is a
+    // policy the plan does not hold; make deploy takes the same plan whole.
+    for (what, unknown, without, said) in [
+        ("an unknown document", "ai-env-ops", "", "deploy-policies: the plan holds the document of ai-env-ops unknown"),
+        ("a policy missing from the plan", "", "ai-env-deployer", "deploy-policies: the plan holds no step of the policy ai-env-deployer"),
+    ] {
+        let d = DeployTree::new(CHECK_PLAN_FAKE);
+        let out = d.run("deploy-policies", &policies_plan(unknown, without), &[]);
+        let text = all(&out);
+        assert!(!out.status.success() && text.contains(said) && text.contains("deploy: refused before pulumi up: nothing deployed"), "{what}: {text}");
+        assert!(!calls(d.t.path()).iter().any(|l| l.starts_with("pulumi up")), "{what}");
+    }
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.deploy(&policies_plan("ai-env-ops", ""), &[]);
+    assert!(out.status.success() && !all(&out).contains("deploy-policies:"), "{}", all(&out));
+
+    // preview: REFRESH=1 on the command line adds --refresh.
+    let tmp = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(tmp.path(), &fakes);
+    let dry = |args: &[&str], envs: &[(&str, &str)]| stdout(&make(tmp.path(), &bin, &["-n", "preview"]).args(args).envs(envs.iter().copied()).bounded());
+    assert!(dry(&["REFRESH=1"], &[]).contains("pulumi preview --diff --stack dev --refresh\n"));
+    assert!(dry(&[], &[("REFRESH", "1")]).contains("pulumi preview --diff --stack dev\n"), "REFRESH=1 in the environment is ignored");
+    assert_eq!(read(&tmp.path().join("tools.log")), "");
+}
+
+/// `make help` lists the new targets and every tiered one with its tier first, never an X-run; and in the make files
+/// every recipe line that names $(MAKE) is a sub-make or the one TIER line of a tiered target, whose X-run exists
+/// and is phony (GNU make runs a line naming $(MAKE) even under -n: anything else on it would run in a dry run).
+#[test]
+fn make_help_lists_the_new_targets_and_every_make_line_is_a_sub_make_or_a_tier_line() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = bin_with(t.path(), &[]);
+    let out = make(t.path(), &bin, &["help"]).bounded();
+    assert!(out.status.success(), "{}", all(&out));
+    let help: Vec<(String, String)> = stdout(&out)
+        .lines()
+        .map(|l| {
+            let l = l.replace("\u{1b}[36m", "").replace("\u{1b}[0m", "");
+            let (name, text) = l.split_once(' ').unwrap();
+            (name.to_string(), text.trim_start().to_string())
+        })
+        .collect();
+    let text_of = |target: &str| help.iter().find(|(n, _)| n == target).map(|(_, t)| t.clone()).unwrap_or_else(|| panic!("{target} not in make help: {help:#?}"));
+    for target in ["deploy-policies", "ops-key", "deployer-key", "operator-keys"] {
+        text_of(target);
+    }
+    for (target, tier, _) in TIERED {
+        let text = text_of(target);
+        assert!(text.starts_with(&format!("({tier}")), "{target}'s help starts with its tier: {text}");
+        assert!(help.iter().all(|(n, _)| *n != format!("{target}-run")), "{target}-run is in make help");
+    }
+
+    let mk = format!("{}\n{}", read(&Path::new(REPO).join("Makefile")), read(&Path::new(REPO).join("infra/infra.mk")));
+    // The .PHONY lines and their continuations.
+    let mut phony: BTreeSet<&str> = BTreeSet::new();
+    let mut more = false;
+    for line in mk.lines() {
+        if line.starts_with(".PHONY:") || more {
+            phony.extend(line.trim_start_matches(".PHONY:").split_whitespace().filter(|w| *w != "\\"));
+            more = line.ends_with('\\');
+        }
+    }
+    let mut rule = "";
+    let mut tier_lines: Vec<(String, String)> = vec![];
+    for line in mk.lines() {
+        if let Some((name, _)) = line.split_once(':').filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')) {
+            rule = name;
+            continue;
+        }
+        let Some(cmd) = line.strip_prefix('\t') else { continue };
+        if !cmd.contains("$(MAKE)") {
+            continue;
+        }
+        let cmd = cmd.trim_start_matches('@');
+        if let Some(rest) = cmd.strip_prefix("$(call TIER,") {
+            assert!(rest.ends_with(&format!(",{rule}) $(MAKE) --no-print-directory {rule}-run")), "{rule}: its TIER line: {cmd}");
+            tier_lines.push((rule.to_string(), cmd.to_string()));
+            continue;
+        }
+        // A sub-make: `$(MAKE) <options, targets, variables>`, the image zip's under $(NO_KEY) (D18), nothing else.
+        let sub = cmd.strip_prefix("$(NO_KEY) ").unwrap_or(cmd);
+        let args = sub.strip_prefix("$(MAKE) ").unwrap_or_else(|| panic!("{rule}: a line naming $(MAKE) that is not a sub-make: {cmd}"));
+        assert!(!args.contains(['$', ';', '|', '&', '<', '>', '`']), "{rule}: a sub-make line that does more: {cmd}");
+    }
+    let mut tiered: Vec<&str> = TIERED.iter().map(|(t, _, _)| *t).collect();
+    tiered.sort_unstable();
+    let mut with_tier: Vec<&str> = tier_lines.iter().map(|(r, _)| r.as_str()).collect();
+    with_tier.sort_unstable();
+    assert_eq!(with_tier, tiered, "one TIER line per tiered target, and none elsewhere");
+    for target in tiered {
+        assert!(mk.lines().any(|l| l == format!("{target}-run:")), "{target}-run is not defined");
+        assert!(phony.contains(target) && phony.contains(format!("{target}-run").as_str()), "{target} and {target}-run are phony: {phony:?}");
+    }
+
+    // The recipe lines of a rule (its tab-indented lines, the tab dropped).
+    let recipe = |rule: &str| -> Vec<&str> {
+        let mut lines = mk.lines().skip_while(|l| !l.strip_prefix(rule).is_some_and(|r| r == ":" || r.starts_with(": ")));
+        assert!(lines.next().is_some(), "no rule {rule}");
+        lines.map_while(|l| l.strip_prefix('\t')).collect()
+    };
+    // Each X-run: its CONFIRM and BREAKGLASS rechecks (nothing that runs), then the identity line of its tier (contracts
+    // §9.3: the deployer's; image-prune's with YES=1 alone; destroy's the break-glass tier, the account root's alone;
+    // operator-keys' root-keys), then its make -i and -p refusal; an ops X-run, which has no identity line, starts with
+    // the refusal (acceptance's with its own -i text, then the -p one). Each wrapper's refusal is the line before its
+    // TIER line. The refusal is a $(error) make expands with the whole recipe, before any line runs, wherever it stands.
+    let rechecks = ["@$(IMAGE_DELETE_CONFIRM)", "@$(CONNECTOR_PROBE_CONFIRM)", "@$(CONNECTOR_DELETE_CONFIRM)", "@$(DESTROY_CONFIRM)", "@$(DESTROY_BREAKGLASS)"];
+    let acceptance_refusal = "@$(if $(findstring i,$(MAKE_SWITCHES)),$(error acceptance: not under make -i ";
+    let acceptance_p = "$(call NOT_UNDER_P,acceptance)";
+    for (target, tier, _) in TIERED {
+        let refusal = format!("@$(call NOT_UNDER_I_OR_P,{target})");
+        let run = recipe(&format!("{target}-run"));
+        let first = run.iter().position(|l| !rechecks.contains(l)).unwrap_or_else(|| panic!("{target}-run runs nothing: {run:?}"));
+        let identity = match (*target, *tier) {
+            ("image-prune", _) => Some("$(if $(filter 1,$(call cmdline,YES)),@$(IDENTITY) deployer image-prune)".to_string()),
+            ("operator-keys", _) => Some("@$(IDENTITY) root-keys operator-keys".to_string()),
+            ("destroy", _) => Some("@$(IDENTITY) breakglass destroy".to_string()),
+            (_, "deployer") => Some(format!("@$(IDENTITY) deployer {target}")),
+            _ => None,
+        };
+        match identity {
+            Some(id) => {
+                assert_eq!(run[first], id, "{target}-run: its first line that runs is its identity line: {run:#?}");
+                assert_eq!(run[first + 1], refusal, "{target}-run: the make -i and -p refusal after the identity line: {run:#?}");
+            }
+            None if *target == "acceptance" => assert!(first == 0 && run[0].starts_with(acceptance_refusal) && run[0].ends_with(acceptance_p), "{run:#?}"),
+            None => assert!(first == 0 && run[0] == refusal, "{target}-run: an ops X-run starts with its make -i and -p refusal: {run:#?}"),
+        }
+        let wrapper = recipe(target);
+        let at_tier = wrapper.iter().position(|l| l.starts_with("@$(call TIER,")).unwrap_or_else(|| panic!("{target}: no TIER line: {wrapper:#?}"));
+        let before = wrapper[at_tier.saturating_sub(1)];
+        assert!(at_tier > 0 && (before == refusal || (*target == "acceptance" && before.starts_with(acceptance_refusal) && before.ends_with(acceptance_p))), "{target}: the make -i and -p refusal right before the runner: {wrapper:#?}");
+    }
+    // D18: the wrappers' compiles carry $(NO_KEY), first, and NO_KEY unsets all four (the key, its secret, a session
+    // token, the marker); so does the keyless build of the operator CLI, and ops.sh's NO_KEY_ENV.
+    for target in ["deploy", "preview", "deploy-policies"] {
+        assert_eq!(recipe(target)[0], "$(NO_KEY) $(MAKE) --no-print-directory image-zip", "{target}: the zip built first, without a key");
+    }
+    // D2: the live tests a runner may run build their tests without the key first (the run keeps it), test-aws's probes
+    // their CLI too; test-docker, which needs no AWS, drops it from every step, and so do the image's build (image-zip,
+    // vm-build) and make install (B0.1 runs it in the root's terminal).
+    for target in ["test-aws", "test-aws-readonly"] {
+        assert_eq!(recipe(target)[0], "$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run", "{target}: its tests built first, without a key");
+    }
+    assert!(recipe("test-aws").iter().any(|l| l.contains("$(AI_ENV_BUILD) || exit $$?; rc=0; for p in ")), "test-aws: the probes' CLI built first, without a key");
+    let docker = recipe("test-docker");
+    let steps: Vec<&&str> = docker.iter().filter(|l| !l.starts_with("  ") && !l.starts_with('@')).collect();
+    assert!(steps.len() == 4 && steps.iter().all(|l| l.starts_with("$(NO_KEY) ")), "test-docker: every step without a key: {docker:#?}");
+    assert_eq!(recipe("image-zip")[..2], ["$(NO_KEY) $(MAKE) vm-build", "$(NO_KEY) $(MAKE) image-stage-scan"], "image-zip: its sub-makes without a key");
+    assert!(recipe("image-zip").iter().any(|l| l.contains(" shim=$$($(NO_KEY) $(AI_ENV) --version | ")), "image-zip: the CLI's version read without a key");
+    assert!(recipe("vm-build").iter().any(|l| l.contains("; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) \"$$cl\" lambda build ")), "vm-build: cargo-lambda without a key");
+    assert!(recipe("install")[0].starts_with("$(NO_KEY) $(CARGO) install "), "install: without a key");
+    assert!(recipe("test-egress")[0].starts_with("$(NO_KEY) $(LAB_UNSET) $(CARGO) test ") && recipe("test-egress")[0].ends_with(" --no-run"), "test-egress: its tests built first, without a key");
+    assert_eq!(recipe("gates")[0], "@$(NO_KEY) $(CARGO) build -q -p $(PKG) --bin ai-env", "gates: the tree's ai-env built first, without a key");
+    for target in ["infra-status", "allowlist-reload", "proxy-stop", "proxy-start", "proxy-patch", "s3-preflight"] {
+        assert_eq!(recipe(target)[0], "@$(AI_ENV_BUILD)", "{target}: the operator CLI built first, without a key");
+    }
+    assert_eq!(recipe("check-base-image")[1], "@$(AI_ENV_BUILD)", "check-base-image: built after its precheck, before its one command");
+    // The X-runs that call the CLI before anything else builds it build it first themselves, so one typed by hand under
+    // a runner compiles nothing with the key; test-egress-run checks its tests' build again too.
+    for target in ["image-wait", "runtime-key", "ops-key", "operator-keys", "test-egress"] {
+        let run = recipe(&format!("{target}-run"));
+        let built = run.iter().position(|l| *l == "@$(AI_ENV_BUILD)").unwrap_or_else(|| panic!("{target}-run builds no CLI: {run:#?}"));
+        let call = run.iter().position(|l| l.contains("$(AI_ENV) ") || l.contains("$(IMAGE_WAIT_SH)")).unwrap_or_else(|| panic!("{target}-run calls no CLI: {run:#?}"));
+        assert!(built < call, "{target}-run: built before its first call: {run:#?}");
+    }
+    let run = recipe("test-egress-run");
+    let tests = run.iter().position(|l| l.contains(" --ignored live_egress_ ")).unwrap();
+    assert!(run[..tests].contains(&"$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run"), "test-egress-run: its tests built without the key before they run: {run:#?}");
+    let vars = make_vars(t.path(), &[]);
+    assert_eq!(vars["NO_KEY"], NO_KEY);
+    assert_eq!(vars["AI_ENV_BUILD"], "$(NO_KEY) $(LAB_UNSET) $(AI_ENV) --version >/dev/null");
+    assert!(vars["TIER_SH"].starts_with("tier() { t=$$1; x=$$2; shift 2; $(AI_ENV_BUILD) || return $$?; "), "TIER builds first: {}", vars["TIER_SH"]);
+    let ops = read(&Path::new(REPO).join("infra/scripts/ops.sh"));
+    assert!(ops.contains(&format!("\nNO_KEY_ENV=({NO_KEY})\n")), "ops.sh's NO_KEY_ENV is $(NO_KEY)");
+}
+
+/// D18, nested (contracts §9.3): a make typed under `ai-env as` (`ai-env as deployer -- make preview deploy`,
+/// claude-update's make deploy) holds the runner's key, its secret and its marker, here with a session token beside
+/// them. No compile sees any of them: the wrapper's image zip and test-egress's test build, then TIER's own build of the
+/// operator CLI with the Makefile's default AI_ENV (`cargo run`, which compiles the tree when it changed; here
+/// [`CARGO_RUN`]), the first `cargo` call, before `ai-env as --check`, the first that sees the key; X-run then runs as
+/// the runner's identity (a logging MAKE). The one-command operator targets, check-base-image, s3-preflight (P9 to P11
+/// run the CLI) and gates build first the same way, and so does break-glass, the account root's own key exported in
+/// the shell; and ops.sh's own calls of the CLI (key-issue's here: need_ai_env). The live tests a runner may run
+/// (test-aws, test-aws-readonly) are built without the key before they run with it, and test-docker, which needs no
+/// AWS, runs without it whole, also as the first goal before a deploy.
+#[test]
+fn a_make_under_a_runner_compiles_nothing_with_the_key() {
+    let s = |v: &str| v.to_string();
+    let token = (s("AWS_SESSION_TOKEN"), s("a-session-token-of-the-shell"));
+    let deployer = [super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL), vec![token.clone()]].concat();
+    let ops = [super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL), vec![token]].concat();
+    // Break-glass: the account root's own access key in the shell (here a key the fakes answer as the root).
+    let root = vec![(s("AWS_ACCESS_KEY_ID"), super::aws_keys::key_id("9009")), (s("AWS_SECRET_ACCESS_KEY"), super::aws_keys::secret("Rt5+")), (s("FAKE_AWS_KEY_USERS"), s("9009:root"))];
+    let cli = |args: &str| format!("cargo +1.98.1 run -q -p ai-env-cli --bin ai-env -- {args}");
+    let build = cli("--version");
+    let (d, o) = (" [AS=deployer:9001] [KEY]", " [AS=ops:9002] [KEY]");
+    // test-docker's steps as the logging MAKE and cargo record them: the image's two sub-makes, then its two suites.
+    let docker = vec![
+        s("make image-zip"),
+        s("make image-build-local"),
+        s("cargo +1.98.1 test -p ai-env-cli --no-default-features --features shim --test shim_docker -- --ignored --test-threads=1"),
+        s("cargo +1.98.1 test -p ai-env-cli --test docker_exec -- --ignored --test-threads=1"),
+    ];
+    // (the make arguments, the environment, a logging MAKE, the `cargo` and `make` calls in order; <bin> the fakes)
+    type Case = (Vec<&'static str>, Vec<(String, String)>, bool, Vec<String>);
+    let mut cases: Vec<Case> = ["deploy", "preview", "deploy-policies"]
+        .into_iter()
+        .map(|x| (vec![x], deployer.clone(), true, vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory {x}-run{d}")]))
+        .collect();
+    cases.extend([
+        (vec!["test-egress"], deployer.clone(), true, vec![s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory test-egress-run{d}")]),
+        (vec!["runtime-key"], deployer.clone(), true, vec![build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory runtime-key-run{d}")]),
+        (vec!["image-status"], ops.clone(), true, vec![build.clone(), cli("as --check ops") + o, format!("make --no-print-directory image-status-run{o}")]),
+        (vec!["allowlist-reload"], ops.clone(), false, vec![build.clone(), cli("egress reload") + o]),
+        (vec!["proxy-start"], ops.clone(), false, vec![build.clone(), cli("proxy start") + o]),
+        (vec!["infra-status", "WRITE=1"], ops.clone(), false, vec![build.clone(), cli("infra status --stack dev --write") + o]),
+        (vec!["check-base-image"], ops.clone(), false, vec![build.clone(), cli("infra base-image --name al2023-1 --version 1") + o]),
+        (vec!["gates"], ops.clone(), false, vec![s("cargo +1.98.1 build -q -p ai-env-cli --bin ai-env"), cli("gates") + o]),
+        (vec!["s3-preflight", "PHASE=b"], deployer.clone(), false, vec![build.clone(), cli("creds aws-set --check") + d, cli("infra pin --check-bundle --lock image/claude.lock") + d, cli("infra base-image --name al2023-1 --version 1") + d]),
+        // An X-run typed under the runner (here the deployer's key alone: a session token would fail its identity's sts
+        // check), for real: it builds before it calls the CLI, and so does key-issue.
+        (
+            vec!["runtime-key-run"],
+            super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL),
+            false,
+            vec![build.clone(), cli("creds aws-set --check") + d, build.clone(), cli("creds aws-set --user ai-env-runtime") + d, cli("creds aws-verify --user ai-env-runtime") + d],
+        ),
+        (
+            vec!["deployer-key", "ROTATE=1", "BREAKGLASS=1"],
+            root,
+            true,
+            vec![build.clone(), cli("as --check root") + " [KEY]", cli("as root -- <bin>/fake-make --no-print-directory deployer-key-run") + " [KEY]", s("make --no-print-directory deployer-key-run [AS=root] [KEY]")],
+        ),
+        // The live tests a runner may run (test-aws's help: the suspension's Touch IDs are the runner's then; the part-A
+        // reads as ai-env as ops): their tests built first without the key, then run with it (D2); the probes' CLI
+        // built first too.
+        (
+            vec!["test-aws", "PROBES=1"],
+            deployer.clone(),
+            false,
+            [
+                vec![s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run"), s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored --test-threads=1 --nocapture") + d, build.clone()],
+                ["payload-size", "no-traffic-before-run", "snapshot-uniqueness", "idle-policy-limits"].iter().map(|p| cli(&format!("lab run {p}")) + d).collect(),
+            ]
+            .concat(),
+        ),
+        (
+            vec!["test-aws-readonly"],
+            ops.clone(),
+            false,
+            vec![s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run"), s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws -- --ignored readonly_ --test-threads=1 --nocapture") + o],
+        ),
+        // test-docker needs no AWS: nothing of it sees the key, alone or as the first goal of `ai-env as deployer --
+        // make test-docker deploy` (plan §7's several goals under one ask; B0.3 in the root's terminal alike).
+        (vec!["test-docker"], deployer.clone(), true, docker.clone()),
+        (
+            vec!["test-docker", "deploy"],
+            deployer.clone(),
+            true,
+            [docker, vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory deploy-run{d}")]].concat(),
+        ),
+    ]);
+    let runs: Vec<(tempfile::TempDir, PathBuf, Output)> = std::thread::scope(|sc| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|(args, envs, fake_make, _)| {
+                sc.spawn(move || {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let t = tmp.path();
+                    let bin = tier_world(t);
+                    script(&bin.join("cargo"), CARGO_RUN);
+                    // P3 and P5 of s3-preflight: no daemon, no network.
+                    bin_with(t, &[("docker.sh", "docker"), ("curl.sh", "curl")]);
+                    // The zip test-docker stamps (its image targets are the logging MAKE's).
+                    std::fs::create_dir_all(t.join("out")).unwrap();
+                    std::fs::write(t.join("out/image.zip"), "a zip").unwrap();
+                    let mut cmd = make(t, &bin, args);
+                    s5_env(&mut cmd, t).arg(format!("IMAGE_OUT={}", t.join("out").display()));
+                    if *fake_make {
+                        cmd.arg(format!("MAKE={}", bin.join("fake-make").display()));
+                    }
+                    let out = cmd.envs(pairs(envs)).bounded();
+                    (tmp, bin, out)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for ((args, _, _, want), (tmp, bin, out)) in cases.iter().zip(&runs) {
+        let what = args.join(" ");
+        let c: Vec<String> = calls(tmp.path()).into_iter().filter(|l| l.starts_with("cargo ") || l.starts_with("make ")).map(|l| l.replace(&bin.display().to_string(), "<bin>")).collect();
+        assert_eq!(&c, want, "{what}: the compiles first, with no key, no secret, no session token and no marker: {}", all(out));
+        if what != "s3-preflight PHASE=b" {
+            assert!(out.status.success(), "{what}: {}", all(out));
+        }
+    }
+
+    // ops.sh's own calls of the CLI (key-issue, post-deploy, connector-probe, claude-update: need_ai_env): the CLI
+    // built without the key first.
+    let (t, bin) = rk_tree(0);
+    script(&bin.join("cargo"), CARGO_RUN);
+    let ai_env = format!("{} +1.98.1 run -q -p ai-env-cli --bin ai-env --", bin.join("cargo").display());
+    let mut envs = pairs(&deployer);
+    envs.push(("AI_ENV_CLI", ai_env.as_str()));
+    let out = runtime_key(t.path(), &bin, &envs);
+    assert!(out.status.success(), "{}", all(&out));
+    let c: Vec<String> = lines_of(&t.path().join("ai-env.log")).into_iter().filter(|l| l.starts_with("cargo ")).collect();
+    assert_eq!(c, [build, cli("creds aws-set --user ai-env-runtime") + d, cli("creds aws-verify --user ai-env-runtime") + d], "{}", all(&out));
+    assert_secret_never_shown(t.path(), &out);
+}
+
+/// make -i would ignore a refused identity, a missing CONFIRM or BREAKGLASS, and run the steps after it (as the account
+/// root, or this shell's own credentials): every tiered target refuses it, and so does its X-run typed by hand, before
+/// anything runs (a $(error) make expands with the whole recipe), however make got the -i (the switch, an outer make's
+/// MAKEFLAGS). Nothing runs: no build, no runner, no tool.
+#[test]
+fn make_i_is_refused_by_every_tiered_target_and_its_run_before_anything_runs() {
+    let cases = tiered_runs();
+    std::thread::scope(|sc| {
+        for (target, _, args) in &cases {
+            let target: &str = target;
+            sc.spawn(move || {
+                let tmp = tempfile::tempdir().unwrap();
+                let t = tmp.path();
+                let bin = tier_world(t);
+                let refusal = if target == "acceptance" {
+                    "*** acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it.".to_string()
+                } else {
+                    format!("*** {target}: not under make -i (a refused identity, or a missing CONFIRM or BREAKGLASS, would be ignored and the steps after it run): run make {target} without it.")
+                };
+                let run = format!("{target}-run");
+                // (what, the goal, make's own flags, the environment)
+                type Form<'a> = (&'a str, &'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
+                let forms: [Form; 4] = [
+                    ("-i", target, &["-i"], &[]),
+                    ("an outer make's i", target, &[], &[("MAKEFLAGS", "i")]),
+                    ("-i, X-run by hand", run.as_str(), &["-i"], &[]),
+                    ("-i, X-run under the deployer's runner", run.as_str(), &["-i"], &[("AI_ENV_BRIDGE_AS", "deployer:9001")]),
+                ];
+                for (what, goal, flags, envs) in forms {
+                    std::fs::remove_file(t.join("calls.log")).ok();
+                    let argv: Vec<&str> = flags.iter().copied().chain([goal]).chain(args.iter().copied()).collect();
+                    let out = tier_make(t, &bin, &argv, false, envs);
+                    let text = all(&out);
+                    assert_eq!(out.status.code(), Some(2), "{target} {what}: {text}");
+                    assert!(stderr(&out).contains(&refusal), "{target} {what}: {text}");
+                    assert_eq!(calls(t), Vec::<String>::new(), "{target} {what}: something ran: {text}");
+                }
+            });
+        }
+    });
+}
+
+/// make -p prints its data base when it ends, every variable with its value, the environment's among them, and
+/// MAKEFLAGS hands the -p to every sub-make: X-run's, under the runner, would print the operator key and its secret, and
+/// so would every make nested under it (D1). Every tiered target refuses -p as it refuses -i, before its build, its
+/// runner or anything else runs, however make got it (the switch, beside -n or -s, an outer make's MAKEFLAGS), and so
+/// does its X-run typed by hand. The real make runs X-run here: a runner that started would leave the stand-in's key
+/// in the data base. (A make typed under a runner holds the key itself, and prints it under -p whatever its makefile
+/// says: never -p there.)
+#[test]
+fn make_p_is_refused_by_every_tiered_target_and_its_run_before_any_key_is_there_to_print() {
+    // The stand-in runner's secret and its two key ids (tests/fakes/ai-env.sh).
+    let secret = "Dm7/".repeat(10);
+    let ids = [super::aws_keys::key_id(super::aws_keys::DEPLOYER_TAIL), super::aws_keys::key_id(super::aws_keys::OPS_TAIL)];
+    let cases = tiered_runs();
+    std::thread::scope(|sc| {
+        for (target, _, args) in &cases {
+            let (target, secret, ids): (&str, &str, &[String; 2]) = (target, &secret, &ids);
+            sc.spawn(move || {
+                let tmp = tempfile::tempdir().unwrap();
+                let t = tmp.path();
+                let bin = tier_world(t);
+                let refusal = format!("*** {target}: not under make -p (it prints every variable when it ends, the environment's too: under the runner, the operator key and its secret): run make {target} without it.");
+                let run = format!("{target}-run");
+                // (what, the goal, make's own flags, the environment)
+                type Form<'a> = (&'a str, &'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
+                let forms: [Form; 5] = [
+                    ("-p", target, &["-p"], &[]),
+                    ("--print-data-base", target, &["--print-data-base"], &[]),
+                    ("-p beside -n", target, &["-np"], &[]),
+                    ("an outer make's p", target, &[], &[("MAKEFLAGS", "p")]),
+                    ("-p, X-run by hand", run.as_str(), &["-p"], &[]),
+                ];
+                for (what, goal, flags, envs) in forms {
+                    std::fs::remove_file(t.join("calls.log")).ok();
+                    let argv: Vec<&str> = flags.iter().copied().chain([goal]).chain(args.iter().copied()).collect();
+                    let out = tier_make(t, &bin, &argv, false, envs);
+                    let text = all(&out);
+                    assert!(!text.contains(secret) && ids.iter().all(|id| !text.contains(id.as_str())), "{target} {what}: a key in make's data base");
+                    assert_eq!(out.status.code(), Some(2), "{target} {what}: {}", stderr(&out));
+                    assert!(stderr(&out).contains(&refusal), "{target} {what}: {}", stderr(&out));
+                    assert_eq!(calls(t), Vec::<String>::new(), "{target} {what}: something ran: {}", stderr(&out));
+                }
+            });
+        }
+    });
+}
+
+/// AI_ENV_PASTE_STDIN=1 (a test session's leftover) never reaches a runner: the make targets' operator CLI is a debug
+/// build (cargo run), whose `ai-env as deployer` would read the key from a stdin that is not a terminal (D11). TIER's
+/// two runner calls drop it (its keyless build, which reads no paste, shows it reached make), and so does ops.sh for
+/// every command, claude-update's runner among them.
+#[test]
+fn the_debug_paste_knob_never_reaches_a_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let out = tier_make(t, &bin, &["runtime-key"], true, &[("AI_ENV_PASTE_STDIN", "1")]);
+    assert!(out.status.success(), "{}", all(&out));
+    let c = calls(t);
+    assert_eq!(c.iter().filter(|l| l.starts_with("--version ")).collect::<Vec<_>>(), ["--version [AI_ENV=unset] [PASTE=1]"], "the knob reached make: {c:#?}");
+    let runner: Vec<&String> = c.iter().filter(|l| l.starts_with("as ")).collect();
+    assert_eq!(runner.len(), 2, "{c:#?}");
+    assert!(runner.iter().all(|l| !l.contains("[PASTE")), "the knob reached the runner: {runner:#?}");
+
+    // claude-update, nothing to deploy: every call of the operator CLI, its runner's included, is without it.
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = s5_bin(t);
+    script(&bin.join("make"), "exit 0");
+    std::fs::create_dir_all(t.join("image")).unwrap();
+    std::fs::write(t.join("image/claude.lock"), "CLAUDE_VERSION=2.1.287\n").unwrap();
+    let mut o = with_operators(outputs());
+    o["claudeVersion"] = json!("2.1.287");
+    write_outputs(t, &o);
+    let _ = ops5(t, &bin, &["claude-update"]).current_dir(t).env("LOCK", "image/claude.lock").env("FAKE_AIENV_BUNDLE", "2.1.287").env("AI_ENV_PASTE_STDIN", "1").bounded();
+    let c = calls(t);
+    assert!(c.iter().any(|l| l.starts_with("as ops -- ")), "{c:#?}");
+    assert!(c.iter().filter(|l| l.contains("[AI_ENV=")).all(|l| !l.contains("[PASTE")), "the knob reached the operator CLI: {c:#?}");
+}
+
+/// make claude-update is never break-glass: BREAKGLASS=1 on its make command line, which MAKEFLAGS would hand to its
+/// nested make deploy (TIER then asks for ai-env as root under the deployer's runner, refused after the paste), stops
+/// it before ops.sh runs, exit 2 (D15); exported in the environment it counts for nothing, as everywhere.
+#[test]
+fn claude_update_refuses_breakglass_on_its_command_line_before_anything_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let out = tier_make(t, &bin, &["claude-update", "BREAKGLASS=1"], false, &[]);
+    let text = all(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("claude-update: never break-glass (BREAKGLASS=1 is on the make command line): as the account root, run make deploy BREAKGLASS=1, then the remaining steps by hand (README \"Break-glass\"): nothing changed"), "{text}");
+    assert_eq!(calls(t), Vec::<String>::new(), "nothing ran: {text}");
+    // Exported, it is no refusal: ops.sh runs (and stops here at the Cursor bundle it cannot read).
+    let out = tier_make(t, &bin, &["claude-update"], false, &[("BREAKGLASS", "1")]);
+    let text = all(&out);
+    assert!(!text.contains("never break-glass") && text.contains("claude-update: cannot read the Cursor bundle's version"), "{text}");
+}
+
+/// The key targets through make, as Mike types them (contracts §9.8): TIER asks for the deployer (the stand-in's
+/// runner); X-run's identity line, the CLI's sealing check (`creds aws-set --check`, ops-key's with `--user
+/// ai-env-ops`), then key-issue with its target's label, user and mode. ROTATE=1 counts only on the command line: an
+/// exported one rotates nothing, and deployer-key's wrapper refuses without it (exit 2, before anything runs).
+/// deployer-key ROTATE=1 hands the new key over, then the running key deletes itself, the last call. An X-run typed
+/// under the deployer's runner runs at once.
+#[test]
+fn the_key_targets_issue_through_make_as_the_deployer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    std::fs::create_dir_all(t.join("aws")).unwrap();
+    std::fs::write(t.join("aws/keys"), format!("{}\n", key_id(1))).unwrap();
+    std::fs::write(t.join("aws/next"), "2\n").unwrap();
+    let creds = t.join("bridge/credentials");
+    std::fs::create_dir_all(&creds).unwrap();
+    std::fs::write(creds.join("aws.env"), format!("FAKE-SEALED {}\n", key_id(1))).unwrap();
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        std::fs::remove_file(t.join("calls.log")).ok();
+        let out = tier_make(t, &bin, args, false, envs);
+        assert_secret_never_shown(t, &out);
+        (all(&out), out, calls(t))
+    };
+    let in_order = |what: &str, c: &[String], wants: &[String]| {
+        let mut last = 0;
+        for want in wants {
+            last = c[last..].iter().position(|l| l == want).unwrap_or_else(|| panic!("{what}: {want} missing or out of order: {c:#?}")) + last;
+        }
+    };
+    let as_deployer = |x: &str| format!("as deployer -- {} --no-print-directory {x}-run [AI_ENV=unset]", make_path());
+    let d = "[AI_ENV=unset] [AS=deployer:9001]";
+
+    // runtime-key ROTATE=1: the runner, the identity, the check, key-issue as the deployer; the old key deleted last.
+    let (text, out, c) = run(&["runtime-key", "ROTATE=1"], &[]);
+    assert!(out.status.success(), "{text}");
+    for want in ["runtime-key: identity user/ai-env-deployer (the deployer of stack dev)", "[ok ] fake aws-set --check", &format!("runtime-key: the sealed key ...{} identifies as user/ai-env-runtime", &key_id(2)[16..]), &format!("runtime-key: rotated; deleted the old key {}", key_id(1))] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    in_order(
+        "runtime-key",
+        &c,
+        &[BUILT.to_string(), as_deployer("runtime-key"), format!("creds aws-set --check {d}"), BUILT.to_string(), format!("creds aws-set --user ai-env-runtime {d}"), format!("creds aws-verify --user ai-env-runtime {d}"), format!("iam delete-access-key --user-name ai-env-runtime --access-key-id {} --region eu-central-1", key_id(1))],
+    );
+    assert_eq!(lines_of(&t.join("aws/keys")), vec![key_id(2)]);
+    assert_eq!(read(&creds.join("aws.env")), format!("FAKE-SEALED {}\n", key_id(2)));
+
+    // ops-key, the first: sealed into ops.env, its check names the user.
+    let (text, out, c) = run(&["ops-key"], &[]);
+    assert!(out.status.success() && text.contains("ops-key: identity user/ai-env-deployer (the deployer of stack dev)") && text.contains(&format!("ops-key: the sealed key ...{} identifies as user/ai-env-ops", &key_id(3)[16..])), "{text}");
+    in_order("ops-key", &c, &[as_deployer("ops-key"), format!("creds aws-set --check --user ai-env-ops {d}"), format!("creds aws-set --user ai-env-ops {d}"), format!("creds aws-verify --user ai-env-ops {d}")]);
+    assert_eq!(read(&creds.join("ops.env")), format!("FAKE-SEALED {}\n", key_id(3)));
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-ops")), vec![key_id(3)]);
+
+    // ROTATE=1 only exported: refused before anything is created.
+    let (text, out, c) = run(&["ops-key"], &[("ROTATE", "1")]);
+    assert!(!out.status.success() && text.contains(&format!("ops-key: ai-env-ops already has a key ({}); ROTATE=1 seals a new one, then deletes it", key_id(3))), "{text}");
+    assert!(!c.iter().any(|l| l.starts_with("iam create-access-key") || l.starts_with("iam delete-access-key")), "{c:#?}");
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-ops")), vec![key_id(3)]);
+
+    // ops-key ROTATE=1 on the command line: rotated.
+    let (text, out, _) = run(&["ops-key", "ROTATE=1"], &[]);
+    assert!(out.status.success() && text.contains(&format!("ops-key: rotated; deleted the old key {}", key_id(3))), "{text}");
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-ops")), vec![key_id(4)]);
+    assert_eq!(read(&creds.join("ops.env")), format!("FAKE-SEALED {}\n", key_id(4)));
+
+    // ops-key-run typed under the deployer's runner: no runner asked, the same recipe. (The previous rotation's backup
+    // goes first: the sealer names a backup by the second, and refuses one that exists.)
+    for e in std::fs::read_dir(&creds).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bak")) {
+        std::fs::remove_file(e.path()).unwrap();
+    }
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let (text, out, c) = run(&["ops-key-run", "ROTATE=1"], &pairs(&deployer));
+    assert!(out.status.success() && text.contains("ops-key: identity user/ai-env-deployer (the deployer of stack dev)") && text.contains(&format!("ops-key: rotated; deleted the old key {}", key_id(4))), "{text}");
+    assert!(!c.iter().any(|l| l.starts_with("as ")), "a covered X-run asks nothing: {c:#?}");
+    assert_eq!(c[at(&c, &format!("creds aws-set --check --user ai-env-ops {d}")) - 1], BUILT, "X-run builds the CLI without the key before it calls it (D18): {c:#?}");
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-ops")), vec![key_id(5)]);
+
+    // deployer-key without ROTATE=1 on the command line: exit 2 before anything runs.
+    for envs in [&[][..], &[("ROTATE", "1")][..]] {
+        let (text, out, c) = run(&["deployer-key"], envs);
+        assert_eq!(out.status.code(), Some(2), "{envs:?}: {text}");
+        assert!(text.contains("deployer-key: ROTATE=1 only (the first deployer key is make operator-keys's, as the account root, once)") && text.contains("[deployer-key] Error 2"), "{envs:?}: {text}");
+        assert_eq!(c, Vec::<String>::new(), "{envs:?}: nothing ran");
+    }
+
+    // deployer-key ROTATE=1: the new key handed over and verified, then the running key (the runner's) deleted last.
+    let running = super::aws_keys::key_id(super::aws_keys::DEPLOYER_TAIL);
+    std::fs::write(t.join("aws/keys.ai-env-deployer"), format!("{running}\n")).unwrap();
+    let (text, out, c) = run(&["deployer-key", "ROTATE=1"], &[]);
+    assert!(out.status.success() && text.contains("deployer-key: identity user/ai-env-deployer (the deployer of stack dev)"), "{text}");
+    assert!(text.contains(&format!("deployer-key: the key ...{} is in Strongbox and identifies as user/ai-env-deployer", &key_id(6)[16..])), "{text}");
+    assert!(stdout(&out).ends_with(&format!("deployer-key: rotated; deleted the old key {running}\n")), "{text}");
+    in_order("deployer-key", &c, &[as_deployer("deployer-key"), format!("creds deployer-key --account 123456789012 {d}")]);
+    let delete = format!("iam delete-access-key --user-name ai-env-deployer --access-key-id {running} --region eu-central-1");
+    assert_eq!(c.iter().rfind(|l| l.starts_with("iam ") || l.starts_with("sts ")), Some(&delete), "the running key deletes itself, the last call: {c:#?}");
+    assert_eq!(lines_of(&t.join("aws/keys.ai-env-deployer")), vec![key_id(6)]);
+}
+
+/// The wrappers' prechecks that need no AWS stop before the runner asks (nothing pasted for a typo) and count only on
+/// the command line: deployer-key's ROTATE=1 (exit 2), image-delete's CONFIRM, image-activate's and
+/// image-deactivate's VERSION (exit 2). The X-runs that delete or create something check their CONFIRM again, so one
+/// typed by hand under the deployer's runner runs nothing either, not even its identity line.
+#[test]
+fn the_wrapper_prechecks_and_the_run_rechecks_stop_before_anything_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    let under = pairs(&deployer);
+    let rotate = "deployer-key: ROTATE=1 only (the first deployer key is make operator-keys's, as the account root, once)".to_string();
+    let version = |x: &str| format!("{x}: VERSION=<n> is required on the command line (make image-versions lists them)");
+    let confirm = |v: &str| format!("set CONFIRM={v} on the command line");
+    let s = |v: &str| v.to_string();
+    // (the make arguments, the environment, the rule that failed and its exit, the refusal)
+    type Case<'a> = (Vec<String>, Vec<(&'a str, &'a str)>, String, String);
+    let mut cases: Vec<Case> = vec![
+        (vec![s("deployer-key")], vec![], s("[deployer-key] Error 2"), rotate.clone()),
+        (vec![s("deployer-key")], vec![("ROTATE", "1")], s("[deployer-key] Error 2"), rotate.clone()),
+        (vec![s("deployer-key"), s("ROTATE=yes")], vec![], s("[deployer-key] Error 2"), rotate),
+        (vec![s("image-delete")], vec![], s("[image-delete] Error 1"), confirm("delete-image")),
+        (vec![s("image-delete")], vec![("CONFIRM", "delete-image")], s("[image-delete] Error 1"), confirm("delete-image")),
+        (vec![s("image-delete"), s("CONFIRM=delete-imagex")], vec![], s("[image-delete] Error 1"), confirm("delete-image")),
+    ];
+    for x in ["image-activate", "image-deactivate"] {
+        cases.push((vec![s(x)], vec![], format!("[{x}] Error 2"), version(x)));
+        cases.push((vec![s(x)], vec![("VERSION", "3")], format!("[{x}] Error 2"), version(x)));
+    }
+    for (x, v) in [("image-delete", "delete-image"), ("connector-probe", "create-probe-connector"), ("connector-delete", "delete-connector")] {
+        cases.push((vec![format!("{x}-run")], under.clone(), format!("[{x}-run] Error 1"), confirm(v)));
+        let mut exported = under.clone();
+        exported.push(("CONFIRM", v));
+        cases.push((vec![format!("{x}-run")], exported, format!("[{x}-run] Error 1"), confirm(v)));
+    }
+    cases.push((vec![s("destroy-run"), s("BREAKGLASS=1")], under.clone(), s("[destroy-run] Error 1"), confirm("destroy-dev")));
+    for (args, envs, error, refusal) in &cases {
+        std::fs::remove_file(t.join("calls.log")).ok();
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = tier_make(t, &bin, &argv, false, envs);
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?} {envs:?}: {text}");
+        assert!(text.contains(refusal.as_str()) && text.contains(error.as_str()), "{args:?} {envs:?}: {text}");
+        assert_eq!(calls(t), Vec::<String>::new(), "{args:?} {envs:?}: something ran");
     }
 }
 
@@ -2842,6 +4701,9 @@ fn make_n_of_the_s8_targets_names_their_commands_and_runs_nothing() {
     assert_eq!(dry(&["doc-test"], &[]), format!("{cargo} --test readme\n"));
 
     let text = dry(&["acceptance", &format!("ACCEPT_BIN={}", pair.display())], &[]).replace("\\\n", " ");
+    // The runner first (S8 operators: the steps run as ai-env-ops), only shown in a dry run; then acceptance-run.
+    let (runner, text) = text.split_once('\n').unwrap();
+    assert_eq!(runner, format!(": cargo +1.98.1 run -q -p ai-env-cli --bin ai-env -- as ops --; {} --no-print-directory acceptance-run", make_path()));
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), ACCEPT_STEPS.len() + 1, "one line per step, then the verdict: {text}");
     let shell = format!("set -uo pipefail; unset {} AI_ENV_BRIDGE_LOCAL AI_ENV_BRIDGE_MODE AI_ENV_BRIDGE_VM AI_ENV_BRIDGE_MIRROR_ROOT; a=\"{}/target/s8/acceptance/", LAB_UNSET.replace("env -u ", "").replace(" -u ", " "), w.canonicalize().unwrap().display());
@@ -2946,11 +4808,11 @@ case "${1:-} ${2:-}" in
     fi
     if [ "$1" = doctor ]; then
       region="[ok ] region eu-central-1 (pinned in code)"
-      if [ -n "${AWS_REGION:-}" ] && [ "${FAKE_ACCEPT_REGION:-}" != ignore ]; then
+      if [ "${AWS_REGION:-eu-central-1}" != eu-central-1 ] && [ "${FAKE_ACCEPT_REGION:-}" != ignore ]; then
         region="[!! ] region eu-central-1 (pinned in code)  <- env AWS_REGION=$AWS_REGION ignored (region pinned to eu-central-1)"
       fi
       printf '%s\n' "ai-env doctor" "  $region" "  [ok ] ai-env-claude next to ai-env ($here/ai-env-claude)"
-      if [ -n "${AWS_REGION:-}" ]; then exit "${FAKE_ACCEPT_REGION_RC:-0}"; fi
+      if [ "${AWS_REGION:-eu-central-1}" != eu-central-1 ]; then exit "${FAKE_ACCEPT_REGION_RC:-0}"; fi
       exit "${FAKE_ACCEPT_DOCTOR_RC:-0}"
     fi
     echo "dry run: settings.json not written"
@@ -3010,7 +4872,9 @@ exec "$FAKE_ACCEPT_WRAPPER" "$@""##;
 /// an image, the egress connector and `[egress].require`), the tools negative
 /// g's doctor probes as logged fakes first on PATH, and ACCEPT_BIN's pair as
 /// [`ACCEPT_AI_ENV`] and [`ACCEPT_WRAPPER`]; `lone` is the real `ai-env`
-/// alone in a directory (negative g's product).
+/// alone in a directory (negative g's product). AI_ENV, whose `as` runs the
+/// steps as ai-env-ops (S8 operators), is the stand-in, logging to
+/// `runner.log`.
 struct Acceptance {
     t: tempfile::TempDir,
     w: PathBuf,
@@ -3025,7 +4889,8 @@ impl Acceptance {
         let root = t.path().canonicalize().unwrap();
         let w = planted_repo(&root, true);
         std::fs::create_dir_all(w.join("target/s8")).unwrap();
-        let fakes: Vec<(&str, &str)> = ["aws", "claude", "rustup", "zig", "cargo-lambda", "age", "pulumi", "docker", "curl"].iter().map(|n| ("logged.sh", *n)).collect();
+        let mut fakes: Vec<(&str, &str)> = ["aws", "claude", "rustup", "zig", "cargo-lambda", "age", "pulumi", "docker", "curl"].iter().map(|n| ("logged.sh", *n)).collect();
+        fakes.push(("ai-env.sh", "ai-env-stand-in"));
         let bin = bin_with(&root, &fakes);
         let pair = root.join("pair");
         script(&pair.join("ai-env"), ACCEPT_AI_ENV);
@@ -3056,6 +4921,8 @@ impl Acceptance {
             .args(flags)
             .arg("acceptance")
             .arg(format!("ACCEPT_BIN={accept_bin}"))
+            .arg(format!("AI_ENV={}", self.bin.join("ai-env-stand-in").display()))
+            .env("FAKE_AIENV_LOG", root.join("runner.log"))
             .env("FAKE_LOG", root.join("tools.log"))
             .env("FAKE_ACCEPT_LOG", root.join("accept.log"))
             .env("FAKE_ACCEPT_REAL", bin())
@@ -3068,6 +4935,11 @@ impl Acceptance {
     /// The pair's calls, in order.
     fn calls(&self) -> Vec<String> {
         lines_of(&self.root().join("accept.log"))
+    }
+
+    /// The AI_ENV stand-in's calls: the runner's.
+    fn runner(&self) -> Vec<String> {
+        lines_of(&self.root().join("runner.log"))
     }
 
     /// The census rows the real wrapper wrote.
@@ -3193,6 +5065,9 @@ fn acceptance_runs_each_step_and_negative_and_stops_at_the_first_that_fails() {
         assert_eq!(a.w.join("target/s8").exists(), *world != World::NoS8, "{what}: target/s8 stays when it was there before, and goes when the run made it: {text}");
         let calls = a.calls();
         assert!(calls.iter().all(|c| !c.contains("[LAB=")), "{what}: a lab knob reached the pair: {calls:#?}");
+        // One runner, ai-env as ops, before any step, after the CLI's keyless build (D18); it drops the caller's lab
+        // knobs.
+        assert_eq!(a.runner(), [BUILT.to_string(), "as --check ops [AI_ENV=unset]".to_string(), format!("as ops -- {} --no-print-directory acceptance-run [AI_ENV=unset]", make_path())], "{what}: the steps run as ai-env-ops");
         let ok = |step: &str| text.contains(&format!("acceptance: {step}: ok ("));
         match fails {
             None => {
@@ -3201,7 +5076,13 @@ fn acceptance_runs_each_step_and_negative_and_stops_at_the_first_that_fails() {
                 assert!(at.windows(2).all(|p| p[0] < p[1]), "{what}: the steps in order: {text}");
                 assert!(text.ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; target/s8/acceptance removed\n"), "{what}: {text}");
                 assert_eq!(calls[calls.len() - 2..], ["ai-env vm smoke --max-duration 900 --json", "ai-env vm list --json"], "{what}: the two Touch IDs last: {calls:#?}");
-                assert!(lines_of(&a.root().join("tools.log")).contains(&"aws sts get-caller-identity --region eu-central-1 --output json".to_string()), "{what}: negative g's doctor is the real one (its probes ran)");
+                // Its identity probe, in the region it pins. Not the whole line: S8 operators' doctor (W2a) runs its
+                // operator identity row under the runner's marker (the steps run under ai-env as ops) through
+                // bridge::awscli, which may add its pinned --endpoint-url.
+                assert!(
+                    lines_of(&a.root().join("tools.log")).iter().any(|l| l.starts_with("aws sts get-caller-identity ") && l.contains(" --region eu-central-1")),
+                    "{what}: negative g's doctor is the real one (its probes ran)"
+                );
             }
             Some((step, want)) => {
                 assert!(!out.status.success(), "{what}: {text}");
@@ -3258,6 +5139,7 @@ fn acceptance_refuses_make_i_before_any_step() {
         assert_eq!(out.status.code(), Some(2), "{what}: {text}");
         assert!(text.contains(refusal) && !text.contains("acceptance: roots"), "{what}: {text}");
         assert_eq!(a.calls(), Vec::<String>::new(), "{what}: the pair ran");
+        assert_eq!(a.runner(), Vec::<String>::new(), "{what}: the runner asked before the refusal");
         assert!(!a.w.join("target/s8/acceptance").exists(), "{what}: a step's directory was made");
     }
     let a = Acceptance::new(&lone);

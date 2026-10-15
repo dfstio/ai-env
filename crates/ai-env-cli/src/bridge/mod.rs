@@ -9,7 +9,10 @@
 //! the S8 remote sessions: the pump's remote child and its pipeline
 //! (`remote`), the workspace data plane (`workspace`, `codeout`,
 //! `dataplane`, `boxcmd` for `ai-env box`), the settings capture
-//! (`settings_capture`) and who speaks on stderr (`voice`).
+//! (`settings_capture`) and who speaks on stderr (`voice`). The S8
+//! operators: the AWS identity of every operator `aws` child and the `ai-env
+//! as` runner (`identity`), the concealed clipboard (`pasteboard`) and the
+//! deployer key's hand-over through it (`handover`).
 //! Nothing here is compiled into the VM image.
 pub mod agent;
 pub mod api;
@@ -26,12 +29,15 @@ pub mod doctor;
 pub mod egress;
 pub mod errors;
 pub mod gates;
+pub mod handover;
 pub mod hoststate;
+pub mod identity;
 pub mod imagepin;
 pub mod infra;
 pub mod lab;
 pub mod logging;
 pub mod mirror;
+pub mod pasteboard;
 pub mod probes;
 pub mod pump;
 pub mod registry;

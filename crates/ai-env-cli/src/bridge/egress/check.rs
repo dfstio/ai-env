@@ -93,13 +93,19 @@
 //! terminated first); a failure before the judgement keeps its own class (7
 //! AWS, 8 the VM lost, 9 the egress gate); 1 a configuration problem (no
 //! connector, a `--vm` whose row is not a `vpc` + `--shell` VM that passed
-//! the egress gate, the aws CLI's credentials of another account); 3 Ctrl-C
-//! (the check's VM is terminated; nothing recorded or revoked).
+//! the egress gate, the operator's credentials of another account, a
+//! `state/infra.toml` naming other proxy documents than this ai-env sends);
+//! 3 Ctrl-C (the check's VM is terminated; nothing recorded or revoked).
+//! S8 operators: the operator identity (`ai-env as …`, else
+//! `credentials/ops.env` and its Touch ID, before the runtime key's) is
+//! resolved right after the connector; without one the check is exit 5, and
+//! its refusals keep their class.
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::awscli;
 use crate::bridge::config::{is_rfc1918, BridgeConfig, Paths};
 use crate::bridge::egress::{dns_accepted, is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, DNS_RULE, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
 use crate::bridge::errors::BridgeError;
+use crate::bridge::identity;
 use crate::bridge::infra::read_infra_state;
 use crate::bridge::probes::{is_empty_noerror, is_platform_resolver, verdict_dns_path, DnsReply, DNS_NO_EXAMPLE, DNS_NO_EXAMPLE_SAID};
 use crate::bridge::transport::ShellAuth;
@@ -1506,6 +1512,13 @@ fn check_plan(ctx: &Ctx) -> Result<run::RunPlan> {
 pub fn cmd_check(store: &Keystore, vm: Option<&str>, keep: bool, json: bool, if_needed: bool) -> Result<()> {
     let ctx = Ctx::load()?;
     let connector = configured_connector(&ctx.cfg)?;
+    // S8 operators: the check's network verification sends the proxy's status document, so a stale ai-env is
+    // refused before any VM or Touch ID (an unreadable state lets the check go on: that verification reads it
+    // again); then the operator identity, its Touch ID before the runtime key's.
+    if let Ok(Some(state)) = read_infra_state(&ctx.paths) {
+        super::cli::check_documents_of(&ctx.paths, &state)?;
+    }
+    identity::operator().map_err(|e| identity::labelled("egress check", e))?;
     if if_needed {
         // Resolved from exactly what the check's own RunMicrovm would get (a value it refuses never skips).
         let plan = check_plan(&ctx)?;
@@ -1529,7 +1542,7 @@ pub fn cmd_check(store: &Keystore, vm: Option<&str>, keep: bool, json: bool, if_
         Some(id) => Target::Existing(Box::new(existing_vm(&ctx, id, &connector)?)),
         None => Target::Start(Box::new(check_plan(&ctx)?)),
     };
-    awscli::require_operator_account(&connector).map_err(|e| CliError::Msg(format!("egress check: {e}")))?;
+    awscli::require_operator_account(&connector).map_err(|e| identity::labelled("egress check", e))?;
     proxy_running(&ctx)?;
     let rt = runtime()?;
     let outcome = rt.block_on(async {

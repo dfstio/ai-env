@@ -155,7 +155,7 @@ pub enum Cmd {
         name: String,
     },
     /// Check age, the plugin, the keystore, and the current directory's .env
-    /// (exit 1 when any row is [NO ], 5 when credentials are unavailable)
+    /// (exit 1 when any row is [NO ], 5 when AWS refuses the key of the identity ai-env as declared)
     Doctor {
         /// Machine-readable output
         #[arg(long)]
@@ -216,17 +216,33 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: LabCmd,
     },
-    /// The S5 egress allowlist on the shared proxy: status, allow, suspend, reload, env, check (the aws CLI as the operator)
+    /// The S5 egress allowlist on the shared proxy: status, allow, suspend, reload, env, check (as ai-env-ops: the key of ai-env as …, else credentials/ops.env; allow as ai-env-deployer)
     #[cfg(feature = "bridge")]
     Egress {
         #[command(subcommand)]
         cmd: EgressCmd,
     },
-    /// The S5 egress proxy instance: stop, start, patch (the aws CLI as the operator)
+    /// The S5 egress proxy instance: stop, start, patch (as ai-env-ops: the key of ai-env as …, else credentials/ops.env)
     #[cfg(feature = "bridge")]
     Proxy {
         #[command(subcommand)]
         cmd: ProxyCmd,
+    },
+    /// Run CMD as one AWS operator identity: deployer (its key pasted from Strongbox), ops (credentials/ops.env, one Touch ID), root (the bootstrap and break-glass only) or ambient (the aws CLI's own credentials, never the root)
+    #[cfg(feature = "bridge")]
+    As {
+        /// Who runs it: deployer, ops, root or ambient
+        #[arg(value_enum)]
+        identity: crate::bridge::identity::Identity,
+        /// The stack's 12-digit account when neither state/infra.toml nor bridge.toml [aws] names it
+        #[arg(long, value_name = "ACCOUNT")]
+        account: Option<String>,
+        /// Only check that this process already runs as IDENTITY (the make guard): exit 0 silently, else 9; nothing runs
+        #[arg(long, conflicts_with = "command")]
+        check: bool,
+        /// The command to run (after --); it replaces ai-env and keeps its own exit status
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required_unless_present = "check")]
+        command: Vec<String>,
     },
     /// VM mode: the MicroVM image entrypoint (PID 1); also runs natively for tests
     #[cfg(feature = "shim")]
@@ -630,8 +646,10 @@ pub enum LabCmd {
 }
 
 /// `ai-env egress …` (feature `bridge`): the S5 allowlist on the shared proxy.
-/// Every command is the aws CLI as the operator (the account of
-/// `[aws].egress_connector_arn`), never the runtime key.
+/// Every AWS call runs as the operator identity (S8: the key `ai-env as …`
+/// left, else `credentials/ops.env`, one Touch ID; `allow` only as
+/// ai-env-deployer), of the account of `[aws].egress_connector_arn`, never
+/// the runtime key.
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum EgressCmd {
@@ -688,7 +706,9 @@ pub enum EgressCmd {
     },
 }
 
-/// `ai-env proxy …` (feature `bridge`): the S5 proxy instance, as the operator.
+/// `ai-env proxy …` (feature `bridge`): the S5 proxy instance, as the
+/// operator identity (S8: the key `ai-env as …` left, else
+/// `credentials/ops.env`).
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum ProxyCmd {
@@ -788,9 +808,9 @@ pub enum InfraCmd {
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum CredsCmd {
-    /// Seal the JSON of `aws iam create-access-key` (read from stdin) into credentials/aws.env
+    /// Seal the JSON of `aws iam create-access-key` (read from stdin): ai-env-runtime's key into credentials/aws.env, ai-env-ops' into credentials/ops.env
     AwsSet {
-        /// IAM user the access key must belong to
+        /// IAM user the access key must belong to: ai-env-runtime (credentials/aws.env) or ai-env-ops (credentials/ops.env); the deployer's key is never stored here (creds deployer-key)
         #[arg(long, default_value = "ai-env-runtime")]
         user: String,
         /// Preflight only: keystore key, recovery recipient, age, writable target, fewer than two existing keys
@@ -799,6 +819,21 @@ pub enum CredsCmd {
         /// Seal even when the keystore key has no recovery recipient
         #[arg(long)]
         force: bool,
+    },
+    /// Check a sealed AWS key (one Touch ID): aws sts get-caller-identity with that key alone must answer as its user, retried while IAM propagates; `id` and `arn` lines on stdout when it is not a terminal
+    AwsVerify {
+        /// ai-env-runtime (credentials/aws.env) or ai-env-ops (credentials/ops.env)
+        #[arg(long, default_value = "ai-env-runtime")]
+        user: String,
+    },
+    /// Hand a new ai-env-deployer key over to its Strongbox entry: pipe in the JSON of `aws iam create-access-key --user-name ai-env-deployer --output json`; this Mac's clipboard (concealed) carries it, it is pasted back, then checked with sts; it is never stored here
+    DeployerKey {
+        /// The stack's 12-digit account when neither state/infra.toml nor bridge.toml [aws] names it
+        #[arg(long, value_name = "ACCOUNT", conflicts_with = "clipboard_check")]
+        account: Option<String>,
+        /// Only check the clipboard: a harmless marker goes on it as the key would (this Mac only, concealed); it must not paste on another Apple device
+        #[arg(long)]
+        clipboard_check: bool,
     },
     /// Seal the Claude setup-token (what `claude setup-token` prints) into credentials/setup-token.env; asks for it hidden
     SetupToken {
@@ -824,12 +859,60 @@ pub enum CredsCmd {
         #[arg(long)]
         unseal: bool,
     },
-    /// Delete the sealed setup-token, combined.env and their backups (a dry run without --yes)
+    /// Delete the sealed setup-token, combined.env and their backups (a dry run without --yes); with --ops only credentials/ops.env and its backups
     Forget {
         /// Delete (default: list what would be deleted)
         #[arg(long)]
         yes: bool,
+        /// The ops key instead: credentials/ops.env and its backups, nothing else (its key is then deleted in IAM: the commands are printed)
+        #[arg(long)]
+        ops: bool,
     },
+}
+
+/// The parse checks of the S8 operators' creds commands (`aws-set --user`,
+/// `aws-verify`, `deployer-key`, `forget --ops`).
+#[cfg(all(test, feature = "bridge"))]
+#[allow(clippy::items_after_test_module)]
+mod creds_cmd_tests {
+    use super::{Cli, Cmd, CredsCmd};
+    use clap::{CommandFactory as _, Parser as _};
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["ai-env", "creds"].into_iter().chain(args.iter().copied()))
+    }
+
+    fn creds(args: &[&str]) -> CredsCmd {
+        match parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}")).cmd {
+            Cmd::Creds { cmd } => cmd,
+            _ => panic!("{args:?}: not creds"),
+        }
+    }
+
+    #[test]
+    fn the_operator_key_commands_parse() {
+        let CredsCmd::AwsSet { user, check: true, force: false } = creds(&["aws-set", "--user", "ai-env-ops", "--check"]) else { panic!("aws-set --user --check") };
+        assert_eq!(user, "ai-env-ops");
+        let CredsCmd::AwsVerify { user } = creds(&["aws-verify"]) else { panic!("aws-verify") };
+        assert_eq!(user, "ai-env-runtime", "the default user");
+        let CredsCmd::AwsVerify { user } = creds(&["aws-verify", "--user", "ai-env-ops"]) else { panic!("aws-verify --user") };
+        assert_eq!(user, "ai-env-ops");
+        let CredsCmd::DeployerKey { account: None, clipboard_check: false } = creds(&["deployer-key"]) else { panic!("deployer-key") };
+        let CredsCmd::DeployerKey { account, clipboard_check: false } = creds(&["deployer-key", "--account", "123456789012"]) else { panic!("deployer-key --account") };
+        assert_eq!(account.as_deref(), Some("123456789012"));
+        let CredsCmd::DeployerKey { account: None, clipboard_check: true } = creds(&["deployer-key", "--clipboard-check"]) else { panic!("deployer-key --clipboard-check") };
+        let CredsCmd::Forget { yes: true, ops: true } = creds(&["forget", "--ops", "--yes"]) else { panic!("forget --ops --yes") };
+        let CredsCmd::Forget { yes: false, ops: false } = creds(&["forget"]) else { panic!("forget") };
+        for bad in [&["deployer-key", "--clipboard-check", "--account", "123456789012"][..], &["deployer-key", "--account"], &["aws-verify", "--user"], &["aws-verify", "extra"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        // Listed in `creds --help`, each with its one-line about.
+        let mut cli = Cli::command();
+        let help = cli.find_subcommand_mut("creds").expect("creds").render_help().to_string();
+        for sub in ["aws-set", "aws-verify", "deployer-key", "setup-token", "status", "forget"] {
+            assert!(help.contains(sub), "{sub}: {help}");
+        }
+    }
 }
 
 /// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands, and
@@ -986,7 +1069,9 @@ pub fn run(cli: Cli) -> Result<()> {
         return crate::shim::wshelper::run(args);
     }
     let store = Keystore::resolve(cli.key_dir)?;
-    match cli.cmd {
+    #[cfg(feature = "bridge")]
+    crate::bridge::identity::init(&store);
+    let r = match cli.cmd {
         Cmd::Keygen { name, access_control, strongbox_entry, no_recovery } => {
             let age = age_cmd::AgeTool::probe()?;
             ceremony::keygen(
@@ -1091,11 +1176,14 @@ pub fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "bridge")]
         Cmd::Creds { cmd } => match cmd {
             CredsCmd::AwsSet { user, check, force } => crate::bridge::creds::cmd_aws_set(&store, &user, check, force),
+            CredsCmd::AwsVerify { user } => crate::bridge::creds::cmd_aws_verify(&store, &user),
+            CredsCmd::DeployerKey { account, clipboard_check } => crate::bridge::handover::cmd_deployer_key(&store, account.as_deref(), clipboard_check),
             CredsCmd::SetupToken { stdin, from_env, no_combined, force } => {
                 crate::bridge::setup_token::cmd_setup_token(&store, crate::bridge::setup_token::SetupTokenOpts { stdin, from_env, no_combined, force })
             }
             CredsCmd::Status { json, unseal } => crate::bridge::setup_token::cmd_status(&store, json, unseal),
-            CredsCmd::Forget { yes } => crate::bridge::setup_token::cmd_forget(yes),
+            CredsCmd::Forget { yes, ops: false } => crate::bridge::setup_token::cmd_forget(yes),
+            CredsCmd::Forget { yes, ops: true } => crate::bridge::setup_token::cmd_forget_ops(yes),
         },
         #[cfg(feature = "bridge")]
         Cmd::Vm { cmd } => crate::bridge::vm::cmd::main(&store, cmd),
@@ -1107,16 +1195,22 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Egress { cmd } => crate::bridge::egress::cli::main(&store, cmd),
         #[cfg(feature = "bridge")]
         Cmd::Proxy { cmd } => crate::bridge::egress::cli::proxy_main(cmd),
+        #[cfg(feature = "bridge")]
+        Cmd::As { identity, account, check, command } => crate::bridge::identity::cmd_as(&store, identity, account.as_deref(), check, &command),
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
         #[cfg(feature = "shim")]
         Cmd::ShimIo(_) => unreachable!("shim-io is dispatched before the keystore is resolved"),
-    }
+    };
+    #[cfg(feature = "bridge")]
+    crate::bridge::identity::forget();
+    r
 }
 
 /// `ai-env doctor`: the classic rows, plus the bridge rows when built with
-/// the `bridge` feature. Exit 1 on any `[NO ]`, 5 when credentials are
-/// unavailable, else 0.
+/// the `bridge` feature. Exit 1 on any `[NO ]`, 5 when AWS refuses the key
+/// of the identity `ai-env as` declared (S8 operators: the only case, §8.2),
+/// else 0.
 fn doctor(store: &Keystore, file: &std::path::Path, json: bool) -> Result<()> {
     #[allow(unused_mut)]
     let mut lines = commands::doctor_lines(store, file)?;
@@ -1246,6 +1340,22 @@ mod tests {
         let missing: Vec<&str> = wants.iter().filter(|(help, want)| !help.contains(want)).map(|(_, want)| *want).collect();
         assert!(missing.is_empty(), "missing {missing:?}:\n{forget}\n{seed}");
     }
+
+    /// S8 operators: `egress` and `proxy` say who their AWS calls run as (the
+    /// operator identity, never the shell's own aws CLI), and `doctor` what
+    /// its exit 5 means now: the declared identity's key refused.
+    #[test]
+    fn the_operator_commands_name_their_identity_in_the_help() {
+        let cli = Cli::command();
+        let about = |name: &str| cli.find_subcommand(name).and_then(clap::Command::get_about).map(ToString::to_string).unwrap_or_else(|| panic!("{name} has an about"));
+        for name in ["egress", "proxy"] {
+            let text = about(name);
+            assert!(text.contains("(as ai-env-ops: the key of ai-env as …, else credentials/ops.env") && !text.contains("aws CLI"), "{name}: {text}");
+        }
+        assert!(about("egress").ends_with("; allow as ai-env-deployer)"), "{}", about("egress"));
+        let doctor = about("doctor");
+        assert!(doctor.ends_with("(exit 1 when any row is [NO ], 5 when AWS refuses the key of the identity ai-env as declared)") && !doctor.contains("credentials are unavailable"), "{doctor}");
+    }
 }
 
 #[cfg(all(test, feature = "shim"))]
@@ -1296,5 +1406,47 @@ mod shim_io_tests {
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "bridge"))]
+mod as_tests {
+    use super::{Cli, Cmd};
+    use crate::bridge::identity::Identity;
+    use clap::{CommandFactory as _, Parser as _};
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["ai-env", "as"].into_iter().chain(args.iter().copied()))
+    }
+
+    /// `ai-env as` (S8 operators §3.2): the identity, `--account`, `--check`
+    /// and the command after `--`, whose own flags stay its own; `--check`
+    /// takes no command and a run needs one; the help says what each
+    /// identity is.
+    #[test]
+    fn as_parses_identity_account_check_and_the_command() {
+        let Cmd::As { identity: Identity::Deployer, account: None, check: false, command } = parse(&["deployer", "--", "make", "deploy", "-n"]).unwrap().cmd else { panic!("as deployer") };
+        assert_eq!(command, ["make", "deploy", "-n"]);
+        let Cmd::As { identity: Identity::Deployer, account: Some(account), command, .. } = parse(&["--account", "123456789012", "deployer", "--", "true"]).unwrap().cmd else { panic!("--account") };
+        assert_eq!((account.as_str(), command), ("123456789012", vec!["true".to_string()]));
+        let Cmd::As { identity: Identity::Ops, command, .. } = parse(&["ops", "aws", "sts", "get-caller-identity", "--region", "eu-central-1"]).unwrap().cmd else { panic!("without --") };
+        assert_eq!(command, ["aws", "sts", "get-caller-identity", "--region", "eu-central-1"]);
+        for (word, want) in [("ops", Identity::Ops), ("root", Identity::Root), ("ambient", Identity::Ambient), ("deployer", Identity::Deployer)] {
+            let Cmd::As { identity, check: true, command, account: None } = parse(&["--check", word]).unwrap().cmd else { panic!("--check {word}") };
+            assert_eq!((identity, command.is_empty()), (want, true));
+        }
+        for bad in [&["admin", "--", "true"][..], &["deployer"], &["--check", "ops", "--", "true"], &["--check"], &[]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        // Right after the identity a flag is `as`'s own (`--help` is its help, never a command); once the command
+        // starts, every word is the command's.
+        assert_eq!(parse(&["deployer", "--help"]).err().map(|e| e.kind()), Some(clap::error::ErrorKind::DisplayHelp));
+        let Cmd::As { identity: Identity::Ops, check: true, .. } = parse(&["ops", "--check"]).unwrap().cmd else { panic!("ops --check") };
+        let Cmd::As { command, check: false, .. } = parse(&["ops", "make", "--help", "--check"]).unwrap().cmd else { panic!("the command's flags") };
+        assert_eq!(command, ["make", "--help", "--check"]);
+        let help = Cli::command().find_subcommand_mut("as").expect("as").render_help().to_string();
+        let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("Run CMD as one AWS operator identity: deployer (its key pasted from Strongbox), ops (credentials/ops.env, one Touch ID), root (the bootstrap and break-glass only) or ambient (the aws CLI's own credentials, never the root)"), "{help}");
+        assert!(help.contains("--account") && help.contains("--check"), "{help}");
     }
 }

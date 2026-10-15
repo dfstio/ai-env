@@ -12,29 +12,54 @@
 // resource of the plan must be one of the stack inventory (egress-spec.ts stackInventory), by type and name, with
 // exact counts; each egress resource's inputs must satisfy the spec's predicates; every reference is checked by
 // URN (property dependencies) and, where the ids are known (a resource the plan keeps: its oldState id), by value;
-// every IAM document (trust, inline, user and
-// managed policy) must be the policies.ts function's output for that resource, for the account given (the caller
-// reads it from `aws sts get-caller-identity`; it is only ever an argument); the parameters `ai-env egress` owns
-// may only be created, never updated or replaced (that would reset them). It runs in `make preview-scratch` and in
-// `make deploy` over the real stack's preview before `pulumi up`. The plan carries the account id: it is read from
-// stdin only and never written anywhere; the report names resources and inputs, never documents. A --json plan has
-// no stack outputs: `make preview-scratch` checks those over the text preview.
+// every IAM document (trust, inline, user and managed policy) must be the policies.ts function's output for that
+// resource, for the account given (the caller reads it from `aws sts get-caller-identity`; it is only ever an
+// argument); the parameters `ai-env egress` owns may only be created, never updated or replaced (that would reset
+// them). It runs in `make preview-scratch` and in `make deploy` over the real stack's preview before `pulumi up`. The
+// plan carries the account id: it is read from stdin only and never written anywhere; the report names resources and
+// inputs, never documents. A --json plan has no stack outputs: `make preview-scratch` checks those over the text
+// preview.
+//
+// S8 operators (plans/s8-operators-plan.md §1, contracts §1.1, D12): the three users (forceDestroy, no key, no path or
+// boundary), the five managed policies (their frozen descriptions, their documents, ai-env-ops' built from the proxy
+// instance), the six attachments (ai-env-deployer holds exactly its five, ai-env-ops exactly ai-env-ops, by URN and by
+// value, against the holdings written out here, which policies.ts must match), MacRuntimePolicy on ai-env-runtime (by
+// URN and by value: the runtime grants never follow another user) and the proxy's three SSM documents
+// (exactly the files of proxy/documents next to --egress-config, and checkProxyDocument); no resource retained on
+// delete, protected or deleted with another; never a provider replaced; ai-env-deployer created only after its five
+// policies; and once the plan's old state holds the user ai-env-deployer, no replace or delete of that user, its five
+// attachments or the five stack policies (before it, the bootstrap, as the account root, may replace the three deploy
+// policies once, for their frozen descriptions).
 //
 // Exit: 0 the plan matches; 1 it does not (each violation on stderr); 2 bad arguments or not a JSON plan.
 import * as fs from "fs";
+import * as path from "path";
 import {
-    DNS_MODES, egressNames, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY, NET, NaclRuleSpec, PARAMETER_MAX_BYTES, PROVIDERS,
-    PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, RouteSpec, RuleSpec, VM_SG_DESCRIPTION, assertEgressSpec, checkNacl, checkRoutes, checkRule,
-    checkVpcDns, dnsQueryLogGroup, egressSpec, loadEgressConfig, ruleOwner, stackInventory,
+    DNS_MODES, DOCUMENT_ROLES, egressNames, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY, NET, NaclRuleSpec,
+    PARAMETER_MAX_BYTES, PROVIDERS, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, RouteSpec, RuleSpec, VM_SG_DESCRIPTION, assertEgressSpec,
+    checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, egressSpec, loadEgressConfig, readProxyDocuments,
+    ruleOwner, stackInventory,
 } from "../egress-spec";
 import {
-    BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_POLICY_NAME, EXECUTION_ROLE_NAME, Names,
-    PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, buildRolePolicy, deployDnsPolicy, deployEgressPolicy, deployPolicy, roleArn,
-    executionRolePolicy, lambdaTrustPolicy, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy, runtimePolicy,
+    BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_POLICY_NAME,
+    EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, STACK_POLICIES,
+    STACK_USERS, USER_POLICY_ATTACHMENTS, attachmentName, buildRolePolicy, deployDnsPolicy, deployEgressPolicy, deployPolicy, deployerPolicy, executionRolePolicy,
+    lambdaTrustPolicy, operatorRolePolicy, operatorTrustPolicy, opsPolicy, policyArn, proxyRolePolicy, proxyTrustPolicy, roleArn, runtimePolicy,
 } from "../policies";
 
 /** The budget's services, written out again (not imported from budget.ts): an edit there must show up here. */
 const BUDGET_SERVICES = ["AWS Lambda", "Amazon Elastic Compute Cloud - Compute", "EC2 - Other", "Amazon Virtual Private Cloud", "AmazonCloudWatch", "Amazon Route 53"];
+/**
+ * Who holds which managed policy, the stack's users and its managed policies (contracts §1.1), written out again (not
+ * imported from policies.ts, whose USER_POLICY_ATTACHMENTS, STACK_USERS and STACK_POLICIES iam.ts, the inventory and the
+ * guard all follow): a change to who holds what must be made here too, where review sees it, or every plan is refused.
+ */
+const HOLDINGS: readonly (readonly [string, string])[] = [
+    ["ai-env-deployer", "ai-env-deploy"], ["ai-env-deployer", "ai-env-deploy-egress"], ["ai-env-deployer", "ai-env-deploy-dns"], ["ai-env-deployer", "ai-env-deployer"],
+    ["ai-env-deployer", "ai-env-ops"], ["ai-env-ops", "ai-env-ops"],
+];
+const USERS = ["ai-env-runtime", "ai-env-ops", "ai-env-deployer"];
+const MANAGED_POLICIES = ["ai-env-deploy", "ai-env-deploy-egress", "ai-env-deploy-dns", "ai-env-deployer", "ai-env-ops"];
 /** How a preview spells a value it does not know yet. */
 const UNKNOWN = "04da6b54-80e4-46f7-96ec-b56ff0331ba9";
 /** Steps whose resource is gone after the update; every other step's new state is part of the stack. */
@@ -57,7 +82,8 @@ const mode = args.get("mode") ?? usage("--mode is required (none or firewall)");
 if (!(DNS_MODES as readonly string[]).includes(mode)) usage(`--mode must be one of ${DNS_MODES.join(", ")}`);
 const accountId = args.get("account-id") ?? usage("--account-id is required (aws sts get-caller-identity --query Account)");
 if (!/^[0-9]{12}$/.test(accountId)) usage("--account-id must be 12 digits");
-const cfg = loadEgressConfig(args.get("egress-config") ?? usage("--egress-config is required"));
+const egressConfigFile = args.get("egress-config") ?? usage("--egress-config is required");
+const cfg = loadEgressConfig(egressConfigFile);
 const imageFile = args.get("image-config") ?? usage("--image-config is required");
 const imageRaw = JSON.parse(fs.readFileSync(imageFile, "utf-8"));
 const image = { imageName: String(imageRaw.imageName), logGroup: String(imageRaw.logGroup) };
@@ -77,6 +103,11 @@ interface State {
     parent?: string;
     provider?: string;
     protect?: boolean;
+    retainOnDelete?: boolean;
+    /** The URN of the resource whose deletion stands for this one's: Pulumi then never calls this one's Delete. */
+    deletedWith?: string;
+    /** Every resource this one depends on (dependsOn and its inputs' dependencies), by URN. */
+    dependencies?: string[];
     inputs?: Record<string, unknown>;
     propertyDependencies?: Record<string, string[]>;
 }
@@ -96,6 +127,9 @@ interface Res {
     parent: string;
     provider: string;
     protect: boolean;
+    retain: boolean;
+    deletedWith: string;
+    dependencies: string[];
     i: Record<string, unknown>;
     deps: Record<string, string[]>;
 }
@@ -136,8 +170,36 @@ for (const s of plan.steps ?? []) {
     const id = st.id || (s.op === "same" || s.op === "update" ? s.oldState?.id : undefined) || "";
     byUrn.set(st.urn, {
         op: s.op, urn: st.urn, type: st.type, name: st.urn.split("::").pop() ?? "", custom: st.custom !== false, id, parent: st.parent ?? "",
-        provider: st.provider ?? "", protect: st.protect === true, i: st.inputs ?? {}, deps: st.propertyDependencies ?? {},
+        provider: st.provider ?? "", protect: st.protect === true, retain: st.retainOnDelete === true,
+        deletedWith: st.deletedWith === undefined || st.deletedWith === null || st.deletedWith === "" ? "" : String(st.deletedWith),
+        dependencies: Array.isArray(st.dependencies) ? st.dependencies : [], i: st.inputs ?? {}, deps: st.propertyDependencies ?? {},
     });
+}
+
+// ---- lifecycle (D12): the deployer's identity is never replaced or deleted once it exists; a provider never ----
+// The plan's old state holds the user ai-env-deployer from the bootstrap on (its step carries an oldState; iam.ts
+// creates it only after its five policies). Before it, the bootstrap (as the account root) may replace the three
+// deploy policies, once, for their frozen descriptions: no user holds them yet. From then on a replace or delete of the
+// deployer's user, of one of its five attachments or of one of the five stack policies is refused: an attached policy
+// cannot be deleted (DeleteConflict), a replaced one would leave the deployer without it mid-deploy, and only the
+// account root removes the identity (make destroy BREAKGLASS=1). A replaced provider would replace every resource it
+// manages.
+const LIFECYCLE = new Set(["replace", "create-replacement", "delete-replaced", "delete"]);
+const REPLACING = new Set(["replace", "create-replacement", "delete-replaced"]);
+const stepName = (s: Step) => s.urn.split("::").pop() ?? "";
+const stepType = (s: Step) => (s.newState ?? s.oldState)?.type ?? s.urn.split("::").slice(-2, -1)[0] ?? "";
+const deployerIdentity = new Set([
+    `aws:iam/user:User::${DEPLOYER_USER_NAME}`,
+    ...MANAGED_POLICIES.map((p) => `aws:iam/policy:Policy::${p}`),
+    ...HOLDINGS.filter(([u]) => u === DEPLOYER_USER_NAME).map(([u, p]) => `aws:iam/userPolicyAttachment:UserPolicyAttachment::${attachmentName(u, p)}`),
+]);
+const deployerExists = (plan.steps ?? []).some((s) => s.oldState?.type === "aws:iam/user:User" && stepName(s) === DEPLOYER_USER_NAME);
+for (const s of plan.steps ?? []) {
+    const type = stepType(s), name = stepName(s);
+    if (type.startsWith("pulumi:providers:") && REPLACING.has(s.op)) bad(`${type} ${name}: a ${s.op} step of a provider (it would replace every resource it manages): refused`);
+    if (deployerExists && LIFECYCLE.has(s.op) && deployerIdentity.has(`${type}::${name}`)) {
+        bad(`${type} ${name}: a ${s.op} step of ai-env-deployer's identity, which the stack already has (an attached policy cannot be deleted, and the deployer would lose a right mid-deploy): only the bootstrap replaces the deploy policies, once; the account root alone removes the identity`);
+    }
 }
 const all = [...byUrn.values()];
 const stacks = all.filter((r) => r.type === STACK_TYPE);
@@ -173,6 +235,8 @@ for (const r of all) {
     if (!r.custom) bad(`${r.type} ${r.name}: a component resource (the stack has none)`);
     if (r.parent !== stackUrn) bad(`${r.type} ${r.name}: its parent is ${r.parent || "none"}, not the stack`);
     if (r.protect) bad(`${r.type} ${r.name}: protected (no Pulumi protect anywhere: make destroy must work)`);
+    if (r.retain) bad(`${r.type} ${r.name}: retainOnDelete (nothing outlives make destroy: the account root removes the operator identities too)`);
+    if (r.deletedWith !== "") bad(`${r.type} ${r.name}: deletedWith ${r.deletedWith.split("::").slice(-2).join("::")} (its provider's Delete would never run when that resource goes too: nothing outlives make destroy)`);
     if (r.i.region !== undefined && r.i.region !== REGION) bad(`${r.type} ${r.name}: region ${json(r.i.region)}, not ${REGION}`);
     if (r.type.startsWith("pulumi:providers:")) {
         for (const k of userKeys(r.i)) if (!PROVIDER_INPUTS.includes(k)) bad(`provider ${r.name}: input ${k} is outside the allowlist (${json(r.i[k]).slice(0, 200)})`);
@@ -185,7 +249,7 @@ for (const r of all) {
 }
 
 // ---- helpers over the egress resources ----
-const EMPTY: Res = { op: "", urn: "(missing)", type: "", name: "", custom: true, id: "", parent: "", provider: "", protect: false, i: {}, deps: {} };
+const EMPTY: Res = { op: "", urn: "(missing)", type: "", name: "", custom: true, id: "", parent: "", provider: "", protect: false, retain: false, deletedWith: "", dependencies: [], i: {}, deps: {} };
 const one = (type: string, name: string): Res => (found.get(type) ?? []).find((r) => r.name === name) ?? EMPTY;
 const eq = (what: string, got: unknown, want: unknown) => { if (json(got) !== json(want)) bad(`${what}: ${json(got)}, expected ${json(want)}`); };
 const present = (r: Res, k: string) => { if (r.i[k] === undefined || r.i[k] === null || r.i[k] === "") bad(`${r.type} ${r.name}: input ${k} missing`); };
@@ -211,6 +275,7 @@ const T = {
     instance: "aws:ec2/instance:Instance", profile: "aws:iam/instanceProfile:InstanceProfile", role: "aws:iam/role:Role", rolePolicy: "aws:iam/rolePolicy:RolePolicy",
     attachment: "aws:iam/rolePolicyAttachment:RolePolicyAttachment", parameter: "aws:ssm/parameter:Parameter", logGroup: "aws:cloudwatch/logGroup:LogGroup",
     connector: "aws-native:lambda:NetworkConnector", budget: "aws:budgets/budget:Budget",
+    user: "aws:iam/user:User", policy: "aws:iam/policy:Policy", userAttachment: "aws:iam/userPolicyAttachment:UserPolicyAttachment", document: "aws:ssm/document:Document",
     fwList: "aws:route53/resolverFirewallDomainList:ResolverFirewallDomainList", fwGroup: "aws:route53/resolverFirewallRuleGroup:ResolverFirewallRuleGroup",
     fwRule: "aws:route53/resolverFirewallRule:ResolverFirewallRule", fwAssoc: "aws:route53/resolverFirewallRuleGroupAssociation:ResolverFirewallRuleGroupAssociation",
     fwConfig: "aws:route53/resolverFirewallConfig:ResolverFirewallConfig", queryLog: "aws:route53/resolverQueryLogConfig:ResolverQueryLogConfig",
@@ -248,6 +313,9 @@ const names: Names = {
         // The connector's ARN, which the runtime policy names (S7 D5). On an existing stack it is the connector's
         // own id in oldState; while the connector is being created it is unknown, the one case iamDoc accepts.
         connectorArn: connectorArnOf() ?? UNKNOWN,
+        // The proxy instance's id, which the ops policy names (S8 operators): likewise its oldState id, unknown only
+        // while the instance is created or replaced (then so is the ops policy's document, which iamDoc accepts).
+        proxyInstanceId: idOf(one(T.instance, NET.instance)) ?? UNKNOWN,
     },
 };
 /**
@@ -317,6 +385,9 @@ for (const r of found.get("aws:iam/rolePolicy:RolePolicy") ?? []) {
 for (const r of found.get("aws:iam/userPolicy:UserPolicy") ?? []) {
     if (r.name !== RUNTIME_POLICY_NAME) continue;
     ref(r, "user", [(found.get("aws:iam/user:User") ?? []).find((u) => u.name === RUNTIME_USER_NAME) ?? EMPTY]);
+    // By value too wherever it is known (a stack's plan, or a literal in a fresh one), as the attachments' users below: on
+    // another user (ai-env-ops, say) the runtime grants would follow it (RunMicrovm, the shell token, PassRole).
+    if (known(r.i.user) && r.i.user !== RUNTIME_USER_NAME) bad(`${r.type} ${r.name}: user ${r.i.user} is not ${RUNTIME_USER_NAME}`);
     iamDoc(r, "policy", "runtimePolicy", () => runtimePolicy(names));
     // ReadTheEgressConnector names the connector (S7 D5), so the document must be built from that resource: a program
     // naming any other connector, or a wildcard, would not depend on it. As with the operator role's Deny, the
@@ -326,7 +397,10 @@ for (const r of found.get("aws:iam/userPolicy:UserPolicy") ?? []) {
         bad(`${r.type} ${r.name}: policy does not depend on ${conn.urn.split("::").slice(-2).join("::")} (runtimePolicy's ReadTheEgressConnector names the egress connector)`);
     }
 }
-const managed = new Map<string, (n: Names) => PolicyDocument>([[DEPLOY_POLICY_NAME, deployPolicy], [DEPLOY_EGRESS_POLICY_NAME, deployEgressPolicy], [DEPLOY_DNS_POLICY_NAME, deployDnsPolicy]]);
+const managed = new Map<string, (n: Names) => PolicyDocument>([
+    [DEPLOY_POLICY_NAME, deployPolicy], [DEPLOY_EGRESS_POLICY_NAME, deployEgressPolicy], [DEPLOY_DNS_POLICY_NAME, deployDnsPolicy],
+    [DEPLOYER_POLICY_NAME, deployerPolicy], [OPS_POLICY_NAME, opsPolicy],
+]);
 for (const r of found.get("aws:iam/policy:Policy") ?? []) {
     const fn = managed.get(r.name);
     if (fn !== undefined) iamDoc(r, "policy", fn.name, () => fn(names));
@@ -521,9 +595,100 @@ if (cfg.dnsMode === "firewall") {
         ref(qa, "resourceId", [vpc]);
     }
 }
+
+// ---- S8 operators: the users, the stack's managed policies, who holds which, the proxy's documents ----
+// policies.ts's lists, which the program, the inventory and the guard follow, against the ones written out above.
+const sorted = (xs: readonly string[]) => [...xs].sort();
+const holdings = sorted(HOLDINGS.map(([u, p]) => attachmentName(u, p)));
+eq("policies.ts USER_POLICY_ATTACHMENTS (who holds which policy: contracts §1.1)", sorted(USER_POLICY_ATTACHMENTS.map(([u, p]) => attachmentName(u, p))), holdings);
+eq("the plan's user policy attachments (who holds which policy: contracts §1.1)", sorted((found.get(T.userAttachment) ?? []).map((r) => r.name)), holdings);
+eq("policies.ts STACK_USERS (contracts §1.1)", sorted(STACK_USERS), sorted(USERS));
+eq("policies.ts STACK_POLICIES (contracts §1.1)", sorted(STACK_POLICIES), sorted(MANAGED_POLICIES));
+// The users: forceDestroy (make destroy, the account root's, also removes the keys issued out of band), no IAM path
+// (the ARNs the policies, outputs and G7 name) and no permissions boundary. No key, login profile or group membership
+// of theirs is in the inventory, so none can be in a plan that passes.
+for (const u of USERS) {
+    const r = one(T.user, u);
+    if (r === EMPTY) continue;
+    eq(`user ${u} name`, r.i.name, u);
+    eq(`user ${u} forceDestroy`, r.i.forceDestroy, true);
+    if (r.i.path !== undefined && r.i.path !== "/") bad(`${r.type} ${u}: path ${json(r.i.path)}, not / (the user ARNs the policies and outputs name)`);
+    absent(r, ["permissionsBoundary"]);
+}
+// ai-env-deployer comes into being only after its five policies (iam.ts's dependsOn): D12 reads the end of the bootstrap
+// from that user in the old state, so a bootstrap that fails half way must not leave the user behind, or every rerun's
+// replace of the three deploy policies would be refused as a change to the deployer's identity.
+const deployerUser = one(T.user, DEPLOYER_USER_NAME);
+if (deployerUser !== EMPTY && CREATING.has(deployerUser.op)) {
+    const before = MANAGED_POLICIES.map((p) => one(T.policy, p)).filter((p) => p !== EMPTY && !deployerUser.dependencies.includes(p.urn));
+    if (before.length > 0) {
+        bad(`${deployerUser.type} ${DEPLOYER_USER_NAME}: a ${deployerUser.op} step that does not depend on ${before.map((p) => p.urn.split("::").slice(-2).join("::")).join(", ")} (iam.ts creates the deployer only after its five policies: D12 reads the end of the bootstrap from that user in the old state)`);
+    }
+}
+// The managed policies: their names and frozen descriptions (a new description replaces the policy); their documents
+// are compared above (iamDoc). ai-env-ops' names the proxy instance, so it must be built from that resource: a program
+// naming another instance, or a wildcard, would not depend on it (a fresh stack's preview leaves the document unknown).
+for (const p of MANAGED_POLICIES) {
+    const r = one(T.policy, p);
+    if (r === EMPTY) continue;
+    eq(`policy ${p} name`, r.i.name, p);
+    eq(`policy ${p} description`, r.i.description, POLICY_DESCRIPTIONS.get(p));
+    if (r.i.path !== undefined && r.i.path !== "/") bad(`${r.type} ${p}: path ${json(r.i.path)}, not / (the policy ARNs the attachments and outputs name)`);
+    absent(r, ["namePrefix"]);
+}
+const opsPolicyRes = one(T.policy, OPS_POLICY_NAME);
+if (opsPolicyRes !== EMPTY && inst !== EMPTY && !(opsPolicyRes.deps.policy ?? []).includes(inst.urn)) {
+    bad(`${opsPolicyRes.type} ${OPS_POLICY_NAME}: policy does not depend on ${inst.urn.split("::").slice(-2).join("::")} (opsPolicy's ProxyInstance and ProxyCommands name the proxy instance)`);
+}
+// Who holds which: exactly HOLDINGS (the inventory counts them, and policies.ts must agree, above), each binding the
+// user and the stack's policy its name says, by URN and, where known, by value. So ai-env-deployer holds exactly its
+// five policies and ai-env-ops exactly ai-env-ops; MacRuntimePolicy stays on ai-env-runtime (above). An unknown
+// policyArn is accepted only while that policy is created or replaced (the first deploy, the bootstrap's three
+// replaced deploy policies).
+for (const [u, p] of HOLDINGS) {
+    const a = one(T.userAttachment, attachmentName(u, p));
+    if (a === EMPTY) continue;
+    const user = one(T.user, u), policy = one(T.policy, p);
+    for (const k of userKeys(a.i)) if (k !== "user" && k !== "policyArn") bad(`${a.type} ${a.name}: input ${k} must be unset (an attachment binds one user and one policy)`);
+    ref(a, "user", [user]);
+    if (known(a.i.user) && a.i.user !== u) bad(`${a.type} ${a.name}: user ${a.i.user} is not ${u}`);
+    ref(a, "policyArn", [policy], false);
+    if (known(a.i.policyArn)) {
+        if (a.i.policyArn !== policyArn(names, p)) bad(`${a.type} ${a.name}: policyArn ${a.i.policyArn} is not arn:aws:iam::…:policy/${p} (the stack's policy ${p})`);
+    } else if (!CREATING.has(policy.op)) {
+        bad(`${a.type} ${a.name}: policyArn is unknown on a ${a.op} step while ${p} is neither created nor replaced: cannot prove it is that policy`);
+    }
+}
+// The proxy's documents: exactly the files of proxy/documents next to --egress-config, character for character in
+// their canonical JSON (what the program passes, and what SSM receives: a string that only parses to the same JSON, a
+// duplicate key say, is refused as the guard refuses it), and the predicates, which hold those files themselves (a
+// free-form parameter, an {{ssm:…}} reference, another step...); never shared (permissions), versioned by name or
+// given attachments.
+const documentDir = path.join(path.dirname(egressConfigFile), "proxy", "documents");
+let documentFiles: ProxyDocuments | undefined;
+try {
+    documentFiles = readProxyDocuments(documentDir);
+} catch (e) {
+    bad(`the proxy documents (${documentDir}): ${(e as Error).message}`);
+}
+for (const role of DOCUMENT_ROLES) {
+    const d = one(T.document, documentNames(cfg)[role]);
+    if (d === EMPTY) continue;
+    eq(`document ${d.name} name`, d.i.name, d.name);
+    eq(`document ${d.name} type, format and target`, [d.i.documentType, d.i.documentFormat, d.i.targetType], ["Command", "JSON", "/AWS::EC2::Instance"]);
+    absent(d, ["permissions", "attachmentsSources", "versionName"]);
+    const content = d.i.content;
+    if (typeof content !== "string" || !known(content)) {
+        bad(`${d.type} ${d.name}: content is ${content === UNKNOWN ? "unknown" : "missing"}, not the literal ${documentFile(role)}`);
+        continue;
+    }
+    if (documentFiles !== undefined && content !== documentFiles[role]) bad(`${d.type} ${d.name}: content is not ${documentFile(role)}`);
+    for (const p of checkProxyDocument(role, content)) bad(`${d.type} ${d.name}: ${p}`);
+}
+
 if (problems.length > 0) {
     process.stderr.write(`check-plan: the plan does not match the stack inventory and the egress spec (dnsMode ${cfg.dnsMode}):\n`);
     for (const p of problems) process.stderr.write(`  - ${p}\n`);
     process.exit(1);
 }
-console.log(`check-plan: ok (${all.length} resources, dnsMode ${cfg.dnsMode}: inventory, providers, egress inputs and references by URN)`);
+console.log(`check-plan: ok (${all.length} resources, dnsMode ${cfg.dnsMode}: inventory, providers, egress inputs and references by URN, the operator identities and the proxy documents)`);

@@ -9,7 +9,8 @@
 #   aws iam create-access-key --user-name U ...  the create-access-key JSON of
 #                                                key number FAKE_AWS_KEYS + 1
 #   aws iam delete-access-key ...                no output, exit 0
-#   aws sts get-caller-identity ...              user FAKE_AWS_CALLER (rust)
+#   aws sts get-caller-identity ...              the caller: the key's user, else
+#                                                FAKE_AWS_CALLER (rust); see S8 below
 #   aws lambda-microvms get-microvm-image --image-identifier A ...
 #                                                the image A in FAKE_AWS_IMAGE_STATE
 #                                                (unset: the fake account holds no
@@ -46,7 +47,7 @@
 #                   session (exit 255); =nouser: the iam *-access-key calls
 #                   fail like the real CLI for a user that does not exist yet
 #                   (NoSuchEntity on stderr, exit 254), other calls work
-#   FAKE_AWS_CALLER the user name get-caller-identity reports (default rust)
+#   FAKE_AWS_CALLER the caller without a key (default user rust; S8 forms below)
 #   FAKE_AWS_IMAGE_STATE   get-microvm-image's state (CREATED, UPDATED, ...)
 #   FAKE_AWS_IMAGE_ACTIVE  its latestActiveImageVersion, a number (unset: null)
 #   FAKE_AWS_IMAGE_FAILED  its latestFailedImageVersion, a number (unset: null)
@@ -78,6 +79,53 @@
 #                          get-parameter --name N and get-parameters --names N…
 #                          answer the real JSON shape (missing names under
 #                          InvalidParameters).
+# S8 operators (plans/s8-operators-contracts.md §10.1, §10.2). A fake key id is
+# AKIAFAKE and 12 digits; its last four are its tail (9001 the deployer, 9002
+# ops, 9003 runtime).
+#   aws sts get-caller-identity ...   with AWS_ACCESS_KEY_ID set: a session
+#       token beside it (AWS_SESSION_TOKEN, AWS_SECURITY_TOKEN) is
+#       InvalidClientTokenId, an AWS_SECRET_ACCESS_KEY that is not 40
+#       characters SignatureDoesNotMatch, a tail FAKE_AWS_KEY_USERS does not
+#       list InvalidClientTokenId (each exit 254); a listed tail answers as its
+#       user. Without a key: FAKE_AWS_CALLER. FAKE_AWS_ANSWERS still answers first.
+#   aws iam simulate-principal-policy --policy-source-arn P --action-names A...
+#       [--resource-arns R...]   a result per action and resource (no
+#       --resource-arns: the resource *): allowed when FAKE_AWS_SIM_ALLOW lists
+#       the pair, else implicitDeny; a P ending in :root is InvalidInput (254)
+#   aws iam get-account-summary   its SummaryMap, AccountAccessKeysPresent
+#       FAKE_AWS_ROOT_KEYS (default 0)
+#   aws ssm send-command ...   a guard, after FAKE_AWS_FAIL(_OP) and before
+#       FAKE_AWS_ANSWERS: only the documents ai-env-proxy-reload, -status and
+#       -patch (another one: AccessDeniedException), each with
+#       --document-version $DEFAULT (else InvalidDocumentVersion) and
+#       --parameters exactly {"mode":["apply"]} or {"mode":["if-changed"]} for
+#       reload, none for status and patch (else InvalidParameters), each exit
+#       254; no --document-name: the usage error (252)
+#   AWS_PROFILE set with AWS_CONFIG_FILE=/dev/null: every call but --version
+#       fails like the real CLI (the profile cannot be found, exit 255)
+#   FAKE_AWS_KEY_USERS  space-separated TAIL:USER or TAIL:USER@ACCOUNT (USER
+#                       root: the account root; ACCOUNT default 123456789012);
+#                       default 9001:ai-env-deployer 9002:ai-env-ops
+#                       9003:ai-env-runtime
+#   FAKE_AWS_CALLER     USER or USER@ACCOUNT; root (or root@ACCOUNT): the
+#                       account root; none: no credentials ("Unable to locate
+#                       credentials", exit 253)
+#   FAKE_AWS_SIM_ALLOW  space-separated USER|ACTION|SUFFIX: USER is the last
+#                       path segment of --policy-source-arn, the resource ARN
+#                       ends with SUFFIX (* matches only the resource *)
+#   FAKE_AWS_SIM_SHAPE  nested: one result per action (EvalResourceName *,
+#                       allowed only when every resource is) with
+#                       ResourceSpecificResults; else one per action and
+#                       resource, in argument order
+#   FAKE_AWS_ENV_LOG    one line per call but --version: "<service> <operation>
+#                       | <names> | <pins>". The names set among
+#                       AI_ENV_BRIDGE_AS, AWS_ACCESS_KEY_ID,
+#                       AWS_SECRET_ACCESS_KEY, the 14 credential selectors of
+#                       src/bridge/identity.rs (in its order), then every
+#                       AWS_CONTAINER_* and AWS_ENDPOINT_URL* name, sorted; each
+#                       pin set as NAME=<value> when the value is /dev/null,
+#                       true, eu-central-1 or empty, else NAME=other; "-" for
+#                       none. No other value is ever logged.
 set -u
 if [ -n "${FAKE_AWS_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
@@ -85,6 +133,33 @@ fi
 if [ "${1:-}" = --version ]; then
   echo 'aws-cli/2.0.0 Python/3 fake'
   exit 0
+fi
+if [ -n "${FAKE_AWS_ENV_LOG:-}" ]; then
+  # Names only; a pin's value only when it is one ai-env sets.
+  env_names=
+  for env_n in AI_ENV_BRIDGE_AS AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN \
+    AWS_SECURITY_TOKEN AWS_CREDENTIAL_EXPIRATION AWS_ACCESS_KEY AWS_SECRET_KEY AWS_ROLE_ARN AWS_ROLE_SESSION_NAME \
+    AWS_WEB_IDENTITY_TOKEN_FILE AWS_ACCOUNT_ID AWS_SDK_LOAD_CONFIG AWS_EC2_METADATA_SERVICE_ENDPOINT \
+    AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE; do
+    eval "env_set=\${$env_n+x}"
+    test -z "$env_set" || env_names="${env_names:+$env_names }$env_n"
+  done
+  for env_n in $(env | sed -n 's/^\(AWS_CONTAINER_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(AWS_ENDPOINT_URL[A-Za-z0-9_]*\)=.*/\1/p' | LC_ALL=C sort -u); do
+    env_names="${env_names:+$env_names }$env_n"
+  done
+  env_pins=
+  for env_n in AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_EC2_METADATA_DISABLED AWS_IGNORE_CONFIGURED_ENDPOINT_URLS \
+    AWS_REGION AWS_DEFAULT_REGION AWS_PAGER; do
+    eval "env_set=\${$env_n+x} env_v=\${$env_n-}"
+    if [ -n "$env_set" ]; then
+      case "$env_v" in
+        /dev/null|true|eu-central-1|'') ;;
+        *) env_v=other ;;
+      esac
+      env_pins="${env_pins:+$env_pins }$env_n=$env_v"
+    fi
+  done
+  printf '%s %s | %s | %s\n' "${1:-}" "${2:-}" "${env_names:--}" "${env_pins:--}" >> "$FAKE_AWS_ENV_LOG"
 fi
 region=
 user=
@@ -101,19 +176,38 @@ param_value=
 param_value_set=0
 overwrite=0
 names=
-in_names=0
+actions=
+resources=
+source_arn=
+doc_name=
+doc_set=0
+doc_version=
+params=
+params_set=0
+multi=
 prev=
 for a in "$@"; do
-  if [ "$in_names" = 1 ]; then
+  # A multi-value option (--names, --action-names, --resource-arns) takes the words up to the next --option.
+  if [ -n "$multi" ]; then
     case "$a" in
-      --*) in_names=0 ;;
-      *) names="$names
-$a"; prev=$a; continue ;;
+      --*) multi= ;;
+      *)
+        case "$multi" in
+          names) names="$names
+$a" ;;
+          actions) actions="$actions
+$a" ;;
+          *) resources="$resources
+$a" ;;
+        esac
+        prev=$a; continue ;;
     esac
   fi
   case "$a" in
     --overwrite) overwrite=1 ;;
-    --names) in_names=1 ;;
+    --names) multi=names ;;
+    --action-names) multi=actions ;;
+    --resource-arns) multi=resources ;;
   esac
   case "$prev" in
     --endpoint-url) endpoint=$a ;;
@@ -128,6 +222,10 @@ $a"; prev=$a; continue ;;
     --channel) channel=$a ;;
     --log-group-name-pattern) pattern=$a ;;
     --log-group-class) log_class=$a ;;
+    --policy-source-arn) source_arn=$a ;;
+    --document-name) doc_name=$a; doc_set=1 ;;
+    --document-version) doc_version=$a ;;
+    --parameters) params=$a; params_set=1 ;;
   esac
   prev=$a
 done
@@ -145,6 +243,12 @@ if [ -n "$want_endpoint" ] && [ "$endpoint" != "$want_endpoint" ]; then
     echo "fake aws: $1 calls must carry --endpoint-url $want_endpoint (got '${endpoint}')" >&2
     exit 252
   fi
+fi
+# A profile with the config file pinned to /dev/null (ai-env as deployer|ops leaves AWS_PROFILE out): the real
+# CLI fails before any request.
+if [ -n "${AWS_PROFILE:-}" ] && [ "${AWS_CONFIG_FILE:-}" = /dev/null ]; then
+  printf '\nThe config profile (%s) could not be found\n' "$AWS_PROFILE" >&2
+  exit 255
 fi
 if [ "${FAKE_AWS_FAIL:-0}" = 1 ]; then
   echo 'An error occurred (ExpiredToken) when calling the operation: the fake session expired' >&2
@@ -166,6 +270,102 @@ fi
 if [ -n "${FAKE_AWS_FAIL_OP:-}" ] && [ "${1:-} ${2:-}" = "$FAKE_AWS_FAIL_OP" ]; then
   printf '\nAn error occurred (AccessDeniedException) when calling the %s operation: fake denial\n' "${2:-}" >&2
   exit 254
+fi
+
+# key_user <tail>: FAKE_AWS_KEY_USERS' entry for a key id's last four characters ("USER" or "USER@ACCOUNT"),
+# else nothing and status 1 (matched as a string: no word splitting, no globbing).
+key_user() {
+  ku=" ${FAKE_AWS_KEY_USERS:-9001:ai-env-deployer 9002:ai-env-ops 9003:ai-env-runtime} "
+  case "$ku" in
+    *" $1:"*) ku=${ku#*" $1:"}; printf '%s' "${ku%% *}"; return 0 ;;
+  esac
+  return 1
+}
+# caller <operation>: who signs this call, as the CLI and AWS see it: sets caller_arn, caller_acct and caller_uid,
+# or prints their refusal (naming <operation>) and exits as they do.
+caller() {
+  if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
+    if [ -n "${AWS_SESSION_TOKEN:-}${AWS_SECURITY_TOKEN:-}" ]; then
+      printf '\nAn error occurred (InvalidClientTokenId) when calling the %s operation: The security token included in the request is invalid.\n' "$1" >&2
+      exit 254
+    fi
+    caller_secret=${AWS_SECRET_ACCESS_KEY:-}
+    if [ "${#caller_secret}" -ne 40 ]; then
+      printf '\nAn error occurred (SignatureDoesNotMatch) when calling the %s operation: The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method. Consult the service documentation for details.\n' "$1" >&2
+      exit 254
+    fi
+    caller_secret=
+    caller_tail=${AWS_ACCESS_KEY_ID#"${AWS_ACCESS_KEY_ID%????}"}
+    if ! caller_who=$(key_user "$caller_tail"); then
+      printf '\nAn error occurred (InvalidClientTokenId) when calling the %s operation: The security token included in the request is invalid.\n' "$1" >&2
+      exit 254
+    fi
+  else
+    caller_who=${FAKE_AWS_CALLER:-rust}
+    if [ "$caller_who" = none ]; then
+      echo 'Unable to locate credentials. You can configure credentials by running "aws configure".' >&2
+      exit 253
+    fi
+  fi
+  caller_acct=123456789012
+  case "$caller_who" in
+    *@*) caller_acct=${caller_who#*@}; caller_who=${caller_who%%@*} ;;
+  esac
+  if [ "$caller_who" = root ]; then
+    caller_arn="arn:aws:iam::$caller_acct:root"
+    caller_uid=$caller_acct
+  else
+    caller_arn="arn:aws:iam::$caller_acct:user/$caller_who"
+    caller_uid=AIDAFAKEFAKEFAKEFAKE
+  fi
+}
+# sim_allowed <user> <action> <resource>: FAKE_AWS_SIM_ALLOW lists the pair.
+sim_allowed() {
+  printf '%s\n' "${FAKE_AWS_SIM_ALLOW:-}" | tr ' ' '\n' | {
+    while IFS= read -r sim_e; do
+      case "$sim_e" in
+        "$1|$2|"*) sim_s=${sim_e#"$1|$2|"} ;;
+        *) continue ;;
+      esac
+      if [ "$sim_s" = '*' ]; then
+        [ "$3" != '*' ] || exit 0
+      else
+        case "$3" in *"$sim_s") exit 0 ;; esac
+      fi
+    done
+    exit 1
+  }
+}
+
+# The send-command guard: the CLI sends only the three fixed proxy documents, at $DEFAULT, with the reload
+# document's one parameter; an accepted call goes on to FAKE_AWS_ANSWERS.
+if [ "${1:-} ${2:-}" = "ssm send-command" ]; then
+  if [ "$doc_set" != 1 ]; then
+    echo 'aws: error: the following arguments are required: --document-name' >&2
+    exit 252
+  fi
+  case "$doc_name" in
+    ai-env-proxy-reload|ai-env-proxy-status|ai-env-proxy-patch)
+      if [ "$doc_version" != '$DEFAULT' ]; then
+        printf '\nAn error occurred (InvalidDocumentVersion) when calling the SendCommand operation: the fake takes %s only at --document-version $DEFAULT\n' "$doc_name" >&2
+        exit 254
+      fi
+      case "$doc_name:$params_set:$params" in
+        'ai-env-proxy-reload:1:{"mode":["apply"]}'|'ai-env-proxy-reload:1:{"mode":["if-changed"]}'|ai-env-proxy-status:0:|ai-env-proxy-patch:0:) ;;
+        ai-env-proxy-reload:*)
+          printf '\nAn error occurred (InvalidParameters) when calling the SendCommand operation: %s takes exactly --parameters {"mode":["apply"]} or {"mode":["if-changed"]}\n' "$doc_name" >&2
+          exit 254 ;;
+        *)
+          printf '\nAn error occurred (InvalidParameters) when calling the SendCommand operation: %s takes no --parameters\n' "$doc_name" >&2
+          exit 254 ;;
+      esac ;;
+    *)
+      caller SendCommand
+      doc_acct=$caller_acct
+      case "$doc_name" in AWS-*) doc_acct= ;; esac
+      printf '\nAn error occurred (AccessDeniedException) when calling the SendCommand operation: User: %s is not authorized to perform: ssm:SendCommand on resource: arn:aws:ssm:eu-central-1:%s:document/%s because no identity-based policy allows the ssm:SendCommand action\n' "$caller_arn" "$doc_acct" "$doc_name" >&2
+      exit 254 ;;
+  esac
 fi
 if [ -n "${FAKE_AWS_ANSWERS:-}" ] && [ -n "${2:-}" ]; then
   op="${1:-}.${2:-}"
@@ -230,8 +430,61 @@ case "${1:-} ${2:-}" in
     printf '{\n    "AccessKey": {\n        "UserName": "%s",\n        "AccessKeyId": "%s",\n        "Status": "Active",\n        "SecretAccessKey": "%s",\n        "CreateDate": "%s"\n    }\n}\n' \
       "$user" "$(key_id $((keys + 1)))" "$secret" "$created" ;;
   "iam delete-access-key") ;;
+  "iam simulate-principal-policy")
+    if [ -z "$source_arn" ] || [ -z "$actions" ]; then
+      echo 'aws: error: the following arguments are required: --policy-source-arn, --action-names' >&2
+      exit 252
+    fi
+    case "$source_arn" in
+      *:root)
+        printf '\nAn error occurred (InvalidInput) when calling the SimulatePrincipalPolicy operation: Invalid Entity Arn: %s does not clearly define entity type and name.\n' "$source_arn" >&2
+        exit 254 ;;
+    esac
+    sim_user=${source_arn##*/}
+    test -n "$resources" || resources='*'
+    # One word per line, never globbed (a resource may be *).
+    sim_ifs=$IFS
+    IFS='
+'
+    set -f
+    printf '{\n    "EvaluationResults": ['
+    sep=
+    for sim_a in $actions; do
+      if [ "${FAKE_AWS_SIM_SHAPE:-}" = nested ]; then
+        sim_d=allowed
+        for sim_r in $resources; do
+          sim_allowed "$sim_user" "$sim_a" "$sim_r" || sim_d=implicitDeny
+        done
+        printf '%s\n        {\n            "EvalActionName": "%s",\n            "EvalResourceName": "*",\n            "EvalDecision": "%s",\n            "MatchedStatements": [],\n            "MissingContextValues": [],\n            "ResourceSpecificResults": [' \
+          "$sep" "$sim_a" "$sim_d"
+        rsep=
+        for sim_r in $resources; do
+          if sim_allowed "$sim_user" "$sim_a" "$sim_r"; then sim_d=allowed; else sim_d=implicitDeny; fi
+          printf '%s\n                {\n                    "EvalResourceName": "%s",\n                    "EvalResourceDecision": "%s"\n                }' "$rsep" "$sim_r" "$sim_d"
+          rsep=,
+        done
+        printf '\n            ]\n        }'
+      else
+        for sim_r in $resources; do
+          if sim_allowed "$sim_user" "$sim_a" "$sim_r"; then sim_d=allowed; else sim_d=implicitDeny; fi
+          printf '%s\n        {\n            "EvalActionName": "%s",\n            "EvalResourceName": "%s",\n            "EvalDecision": "%s",\n            "MatchedStatements": [],\n            "MissingContextValues": []\n        }' \
+            "$sep" "$sim_a" "$sim_r" "$sim_d"
+          sep=,
+        done
+      fi
+      sep=,
+    done
+    set +f
+    IFS=$sim_ifs
+    printf '\n    ]\n}\n' ;;
+  "iam get-account-summary")
+    case "${FAKE_AWS_ROOT_KEYS:-0}" in
+      *[!0-9]*) echo "fake aws: FAKE_AWS_ROOT_KEYS is not a number" >&2; exit 2 ;;
+    esac
+    printf '{\n    "SummaryMap": {\n        "AccountAccessKeysPresent": %s,\n        "AccountMFAEnabled": 1,\n        "Users": 3\n    }\n}\n' "${FAKE_AWS_ROOT_KEYS:-0}" ;;
   "sts get-caller-identity")
-    printf '{\n    "UserId": "AIDAFAKEFAKEFAKEFAKE",\n    "Account": "123456789012",\n    "Arn": "arn:aws:iam::123456789012:user/%s"\n}\n' "${FAKE_AWS_CALLER:-rust}" ;;
+    caller GetCallerIdentity
+    printf '{\n    "UserId": "%s",\n    "Account": "%s",\n    "Arn": "%s"\n}\n' "$caller_uid" "$caller_acct" "$caller_arn" ;;
   "lambda-microvms get-microvm-image")
     if [ -z "${FAKE_AWS_IMAGE_STATE:-}" ]; then
       printf '\nAn error occurred (ResourceNotFoundException) when calling the GetMicrovmImage operation: Image %s not found\n' "$image" >&2

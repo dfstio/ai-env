@@ -12,6 +12,13 @@
 //! process test runs in milliseconds whatever its machine's speed; a wait
 //! on an SSM command outlasts the command's execution timeout plus its
 //! delivery timeout.
+//!
+//! S8 operators: the proxy runs only the stack's three SSM Command documents
+//! ([`ProxyDoc`]: `ai-env-proxy-reload`, `-status`, `-patch`, made by Pulumi
+//! from `infra/proxy/documents/`), each sent at `--document-version
+//! $DEFAULT` with the reload's one allowed parameter; nothing sends
+//! `AWS-RunShellScript`, and ai-env-ops may send nothing else.
+use super::{DOCUMENT_VERSION, PATCH_DOCUMENT, RELOAD_DOCUMENT, RELOAD_MODES, RELOAD_MODE_PARAMETER, STATUS_DOCUMENT};
 use crate::bridge::awscli::aws_json;
 use crate::bridge::registry::ensure_private_dir;
 use serde_json::Value;
@@ -270,7 +277,7 @@ fn state_change(doc: &Value, key: &str, id: &str) -> String {
 
 // ---- SSM Run Command --------------------------------------------------------------------
 
-/// A finished `AWS-RunShellScript` invocation.
+/// A finished invocation of one of the proxy's documents on the proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// `Success`, `Failed`, `TimedOut`, `Cancelled`.
@@ -299,18 +306,76 @@ impl Invocation {
     }
 }
 
-/// The `--parameters` document of `AWS-RunShellScript`.
-#[must_use]
-pub fn shell_parameters(commands: &[&str], execution_timeout_s: u32) -> String {
-    serde_json::json!({ "commands": commands, "executionTimeout": [execution_timeout_s.to_string()] }).to_string()
+/// One of the proxy's SSM Command documents (`infra/proxy/documents/`): the
+/// only commands the proxy runs through SSM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyDoc {
+    /// `ai-env-proxy-reload`: apply the parameters (`--if-changed`: only when
+    /// they changed since the last apply).
+    Reload { if_changed: bool },
+    /// `ai-env-proxy-status`: `rpm -q squid`, then `ai-env-proxy-reload --status` (read-only).
+    Status,
+    /// `ai-env-proxy-patch`: the security updates of the newest AL2023 release, then a squid restart.
+    Patch,
 }
 
-/// `send-command` of `commands` as one `AWS-RunShellScript` script on
-/// `instance`: the command id.
-pub fn send_shell(instance: &str, commands: &[&str], comment: &str, execution_timeout_s: u32) -> Result<String, String> {
-    let params = shell_parameters(commands, execution_timeout_s);
-    let delivery = DELIVERY_S.to_string();
-    let doc = aws_json("ssm", &["send-command", "--instance-ids", instance, "--document-name", "AWS-RunShellScript", "--comment", comment, "--timeout-seconds", &delivery, "--parameters", &params])?;
+impl ProxyDoc {
+    /// [`RELOAD_DOCUMENT`], [`STATUS_DOCUMENT`] or [`PATCH_DOCUMENT`].
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ProxyDoc::Reload { .. } => RELOAD_DOCUMENT,
+            ProxyDoc::Status => STATUS_DOCUMENT,
+            ProxyDoc::Patch => PATCH_DOCUMENT,
+        }
+    }
+
+    /// The reload's `--parameters`, compact JSON of its one parameter
+    /// (`{"mode":["apply"]}`, `{"mode":["if-changed"]}`); the others take none.
+    #[must_use]
+    pub fn parameters(self) -> Option<String> {
+        match self {
+            ProxyDoc::Reload { if_changed } => Some(format!("{{\"{RELOAD_MODE_PARAMETER}\":[\"{}\"]}}", RELOAD_MODES[usize::from(if_changed)])),
+            ProxyDoc::Status | ProxyDoc::Patch => None,
+        }
+    }
+
+    /// The document's `timeoutSeconds`, which the wait outlasts.
+    #[must_use]
+    pub fn exec_s(self) -> u32 {
+        match self {
+            ProxyDoc::Reload { .. } => RELOAD_EXEC_S,
+            ProxyDoc::Status => STATUS_EXEC_S,
+            ProxyDoc::Patch => PATCH_EXEC_S,
+        }
+    }
+}
+
+/// The arguments of `aws ssm send-command` for `doc` on `instance`: the
+/// document by name at its default version (the literal `$DEFAULT`, no shell
+/// is involved), the delivery timeout, then the reload's parameters. Pure.
+#[must_use]
+pub fn send_args(instance: &str, doc: ProxyDoc, comment: &str) -> Vec<String> {
+    let mut args: Vec<String> = ["send-command", "--instance-ids", instance, "--document-name", doc.name(), "--document-version", DOCUMENT_VERSION, "--comment", comment, "--timeout-seconds"]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+    args.push(DELIVERY_S.to_string());
+    if let Some(parameters) = doc.parameters() {
+        args.push("--parameters".to_string());
+        args.push(parameters);
+    }
+    args
+}
+
+/// What an `AccessDenied` answer to `send-command` gets appended.
+const DENIED_HINT: &str = " (only ai-env-ops and ai-env-deployer may send the proxy documents: run it under ai-env as ops --)";
+
+/// `send-command` of `doc` on `instance`: the command id.
+pub fn send_document(instance: &str, doc: ProxyDoc, comment: &str) -> Result<String, String> {
+    let args = send_args(instance, doc, comment);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let doc = aws_json("ssm", &args).map_err(|e| if e.contains("AccessDenied") { format!("{e}{DENIED_HINT}") } else { e })?;
     let id = doc.get("Command").map(|c| text(c, "CommandId")).unwrap_or("");
     answer_id("aws ssm send-command", id).map(str::to_string)
 }
@@ -345,9 +410,9 @@ pub fn wait_invocation(command_id: &str, instance: &str, wait: Wait) -> Result<I
     Err(format!("SSM command {command_id} on {instance} did not finish within {} s ({last})", wait.budget().as_secs()))
 }
 
-/// [`send_shell`] then [`wait_invocation`].
-pub fn run_shell(instance: &str, commands: &[&str], comment: &str, execution_timeout_s: u32, wait: Wait) -> Result<Invocation, String> {
-    let id = send_shell(instance, commands, comment, execution_timeout_s)?;
+/// [`send_document`] then [`wait_invocation`].
+pub fn run_document(instance: &str, doc: ProxyDoc, comment: &str, wait: Wait) -> Result<Invocation, String> {
+    let id = send_document(instance, doc, comment)?;
     wait_invocation(&id, instance, wait)
 }
 
@@ -366,12 +431,45 @@ mod tests {
         const { assert!(RELOAD_EXEC_S >= 1500 && STATUS_EXEC_S >= 310) };
     }
 
+    /// S8 operators: every proxy command is one of the three documents, by
+    /// name, at `$DEFAULT`, with the delivery timeout; only the reload takes
+    /// parameters, exactly its mode, as compact JSON. No shell script, no
+    /// `AWS-RunShellScript`, no `commands` parameter is ever sent.
     #[test]
-    fn shell_parameters_are_one_json_document() {
-        let p = shell_parameters(&["rpm -q squid || true", "/usr/local/sbin/ai-env-proxy-reload --status"], 300);
-        let v: Value = serde_json::from_str(&p).unwrap();
-        assert_eq!(v["commands"][1], "/usr/local/sbin/ai-env-proxy-reload --status");
-        assert_eq!(v["executionTimeout"][0], "300");
+    fn proxy_documents_send_their_name_default_version_and_allowed_parameters() {
+        let i = "i-0123456789abcdef0";
+        let send = |doc: ProxyDoc| send_args(i, doc, "ai-env egress status");
+        let common = |name: &str| -> Vec<String> {
+            ["send-command", "--instance-ids", i, "--document-name", name, "--document-version", "$DEFAULT", "--comment", "ai-env egress status", "--timeout-seconds", "60"].iter().map(|a| (*a).to_string()).collect()
+        };
+        let mut apply = common("ai-env-proxy-reload");
+        apply.extend(["--parameters".to_string(), r#"{"mode":["apply"]}"#.to_string()]);
+        assert_eq!(send(ProxyDoc::Reload { if_changed: false }), apply);
+        let mut if_changed = common("ai-env-proxy-reload");
+        if_changed.extend(["--parameters".to_string(), r#"{"mode":["if-changed"]}"#.to_string()]);
+        assert_eq!(send(ProxyDoc::Reload { if_changed: true }), if_changed);
+        assert_eq!(send(ProxyDoc::Status), common("ai-env-proxy-status"));
+        assert_eq!(send(ProxyDoc::Patch), common("ai-env-proxy-patch"));
+        let docs = [ProxyDoc::Reload { if_changed: false }, ProxyDoc::Reload { if_changed: true }, ProxyDoc::Status, ProxyDoc::Patch];
+        for doc in docs {
+            let args = send(doc).join(" ");
+            assert!(!args.contains("AWS-RunShellScript") && !args.contains("commands") && !args.contains("executionTimeout"), "{args}");
+            if let Some(p) = doc.parameters() {
+                let v: Value = serde_json::from_str(&p).unwrap();
+                let modes: Vec<&str> = v.as_object().unwrap().iter().flat_map(|(k, v)| {
+                    assert_eq!(k, RELOAD_MODE_PARAMETER);
+                    v.as_array().unwrap().iter().map(|m| m.as_str().unwrap())
+                }).collect();
+                assert!(modes.len() == 1 && RELOAD_MODES.contains(&modes[0]), "{p}");
+            }
+        }
+        assert_eq!(docs.map(ProxyDoc::name), [RELOAD_DOCUMENT, RELOAD_DOCUMENT, STATUS_DOCUMENT, PATCH_DOCUMENT]);
+        assert_eq!(docs.map(ProxyDoc::exec_s), [RELOAD_EXEC_S, RELOAD_EXEC_S, STATUS_EXEC_S, PATCH_EXEC_S]);
+        // A wait outlasts its document's own timeout and the delivery.
+        for (doc, wait) in [(ProxyDoc::Reload { if_changed: false }, Wait::RELOAD), (ProxyDoc::Status, Wait::STATUS), (ProxyDoc::Patch, Wait::PATCH)] {
+            assert!(wait.budget() >= Duration::from_secs(u64::from(doc.exec_s() + DELIVERY_S)), "{doc:?}");
+        }
+        assert!(DENIED_HINT.starts_with(" (only ai-env-ops and ai-env-deployer may send the proxy documents"));
     }
 
     #[test]

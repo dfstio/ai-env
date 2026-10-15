@@ -9,11 +9,17 @@
 // program registers; and scripts/check-plan.ts, the final word, applies them again to the planned inputs of
 // `pulumi preview --json` (after every transform) with the references checked by URN. The config holds no account
 // data; a Rust test (bridge/egress/mod.rs EGRESS_CONSTS) pins every key.
+//
+// S8 operators: the proxy's three SSM Command documents are files too (infra/proxy/documents/{reload,status,patch}.json,
+// read here in their canonical form, readProxyDocuments) and pass the same three layers: assertProxyDocuments before
+// any resource, the guard (each document's content must be its file and pass checkProxyDocument), and check-plan (the
+// planned content against the files next to its --egress-config, then the same predicates). A Rust test
+// (bridge/egress/mod.rs the_proxy_documents_are_what_the_cli_sends) holds the same files to what the CLI sends.
 import * as fs from "fs";
 import * as path from "path";
 import {
-    BUCKET_PREFIX, BUDGET_NAME, BUILD_ROLE_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_POLICY_NAME, EXECUTION_ROLE_NAME, EgressNames,
-    REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, dnsQueryLogGroupName,
+    BUCKET_PREFIX, BUDGET_NAME, BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, EgressNames, PROXY_PARAMETERS, REGION, RUNTIME_POLICY_NAME, STACK_POLICIES, STACK_USERS,
+    USER_POLICY_ATTACHMENTS, attachmentName, dnsQueryLogGroupName,
 } from "./policies";
 
 export const DNS_MODES = ["none", "firewall"] as const;
@@ -42,10 +48,15 @@ export interface EgressConfig {
     proxyInstanceProfileName: string;
     vmSecurityGroupName: string;
     proxySecurityGroupName: string;
+    /** S8 operators: the proxy's three SSM Command documents (infra/proxy/documents/{reload,status,patch}.json). */
+    reloadDocumentName: string;
+    statusDocumentName: string;
+    patchDocumentName: string;
 }
 
 const STRING_KEYS = ["vpcCidr", "proxySubnetCidr", "vmSubnetCidr", "azId", "proxyIp", "instanceType", "dnsMode", "logGroup", "parameterPrefix",
-    "connectorName", "proxyRoleName", "operatorRoleName", "proxyInstanceProfileName", "vmSecurityGroupName", "proxySecurityGroupName"] as const;
+    "connectorName", "proxyRoleName", "operatorRoleName", "proxyInstanceProfileName", "vmSecurityGroupName", "proxySecurityGroupName",
+    "reloadDocumentName", "statusDocumentName", "patchDocumentName"] as const;
 const NUMBER_KEYS = ["proxyPort", "logRetentionDays"] as const;
 const KEYS: readonly string[] = [...STRING_KEYS, ...NUMBER_KEYS, "resolvers", "enableDnsQueryLog"];
 
@@ -63,19 +74,21 @@ export function loadEgressConfig(file = path.join(__dirname, "egress-config.json
 }
 
 /**
- * What policies.ts needs (the IAM documents of the proxy and operator roles, and the deploy policy); the VM subnet
- * and security group ids, which the deploy policy and the operator role's Deny name, come from the stack.
+ * What policies.ts needs (the IAM documents of the proxy and operator roles, the deploy policies and the ops policy);
+ * the VM subnet and security group ids, which the deploy policy and the operator role's Deny name, the connector's
+ * ARN (the runtime policy) and the proxy instance's id (the ops policy) come from the stack.
  */
 export function egressNames(cfg: EgressConfig): EgressNames {
     return {
         parameterPrefix: cfg.parameterPrefix, logGroup: cfg.logGroup, proxyRoleName: cfg.proxyRoleName, operatorRoleName: cfg.operatorRoleName,
         proxyInstanceProfileName: cfg.proxyInstanceProfileName, connectorName: cfg.connectorName,
+        reloadDocumentName: cfg.reloadDocumentName, statusDocumentName: cfg.statusDocumentName, patchDocumentName: cfg.patchDocumentName,
     };
 }
 
-/** The four proxy parameters `<prefix>/<name>` (contract 2); extras and suspended are owned by `ai-env egress` after creation. */
-export const PROXY_PARAMETERS = ["squid.conf", "allow", "extras", "suspended"] as const;
-export type ProxyParameter = (typeof PROXY_PARAMETERS)[number];
+/** The four proxy parameters (defined in policies.ts, which the ops policy needs them in; re-exported for the rest). */
+export { PROXY_PARAMETERS };
+export type { ProxyParameter } from "./policies";
 /** The standard tier's limit, also the rendered squid.conf's bound. */
 export const PARAMETER_MAX_BYTES = 4096;
 
@@ -342,6 +355,10 @@ export function checkVpcDns(cfg: EgressConfig, enableDnsSupport: unknown, enable
 }
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+/** SSM's document name rule. */
+const DOCUMENT_NAME = /^[A-Za-z0-9_.-]{3,128}$/;
+/** SSM reserves these prefixes for AWS's own documents (AWS-RunShellScript, Amazon…, amzn…), in any case. */
+const RESERVED_DOCUMENT_PREFIX = /^(aws|amazon|amzn)/i;
 const LOG_RETENTION_DAYS = [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653];
 
 /**
@@ -405,6 +422,14 @@ export function assertEgressSpec(spec: EgressSpec): void {
     if (cfg.vmSecurityGroupName.startsWith(`${cfg.proxySecurityGroupName}-`) || cfg.proxySecurityGroupName.startsWith(`${cfg.vmSecurityGroupName}-`)) {
         err("one security group name must not prefix the other (rule names are <sg name>-…)");
     }
+    // S8 operators: the proxy's documents, account-owned (the account is in their ARN, which the ops policy names).
+    const docNames = documentNames(cfg);
+    for (const role of DOCUMENT_ROLES) {
+        const k = `${role}DocumentName`, v = docNames[role];
+        if (!DOCUMENT_NAME.test(v)) err(`${k} ${v} is not an SSM document name (3 to 128 of A-Z a-z 0-9 _ . -)`);
+        else if (RESERVED_DOCUMENT_PREFIX.test(v)) err(`${k} ${v} starts with a prefix SSM reserves for AWS's own documents (aws, amazon or amzn, in any case)`);
+    }
+    if (new Set(DOCUMENT_ROLES.map((r) => docNames[r])).size !== DOCUMENT_ROLES.length) err("reloadDocumentName, statusDocumentName and patchDocumentName must be three distinct names");
 
     // The network resources themselves.
     if (spec.vpc.cidr !== cfg.vpcCidr) err(`the VPC's CIDR ${spec.vpc.cidr} is not vpcCidr ${cfg.vpcCidr}`);
@@ -441,6 +466,147 @@ export function assertEgressSpec(spec: EgressSpec): void {
     if (errors.length > 0) throw new Error(`egress spec (infra/egress-spec.ts, infra/egress-config.json) refused:\n  - ${errors.join("\n  - ")}`);
 }
 
+// ---- the proxy's SSM documents (S8 operators) ----
+
+/** The three Command documents, by role: reload (apply the parameters), status (read-only), patch (security updates). */
+export const DOCUMENT_ROLES = ["reload", "status", "patch"] as const;
+export type DocumentRole = (typeof DOCUMENT_ROLES)[number];
+/** Role → the document's canonical content, JSON.stringify(JSON.parse(file)): whitespace never matters. */
+export type ProxyDocuments = Record<DocumentRole, string>;
+
+/** Each document's name (egress-config.json): the Pulumi and the AWS name alike. */
+export function documentNames(cfg: EgressConfig): Record<DocumentRole, string> {
+    return { reload: cfg.reloadDocumentName, status: cfg.statusDocumentName, patch: cfg.patchDocumentName };
+}
+
+/**
+ * Each step's execution timeout, the one the CLI waits out (bridge/egress/ops.rs RELOAD_EXEC_S, STATUS_EXEC_S,
+ * PATCH_EXEC_S; the Rust test holds the files to those).
+ */
+export const DOCUMENT_TIMEOUTS: Readonly<Record<DocumentRole, string>> = { reload: "1500", status: "400", patch: "1800" };
+
+/** A document's file as every refusal names it (relative to the repository). */
+export function documentFile(role: DocumentRole): string {
+    return `infra/proxy/documents/${role}.json`;
+}
+
+/** The documents of <dir> (default: this infra/'s proxy/documents), each in its canonical form; throws on a file that is not JSON. */
+export function readProxyDocuments(dir = path.join(__dirname, "proxy", "documents")): ProxyDocuments {
+    const out = {} as ProxyDocuments;
+    for (const role of DOCUMENT_ROLES) {
+        const file = path.join(dir, `${role}.json`);
+        const text = fs.readFileSync(file, "utf-8");
+        try {
+            out[role] = JSON.stringify(JSON.parse(text));
+        } catch (e) {
+            throw new Error(`${file}: not JSON (${(e as Error).message})`);
+        }
+    }
+    return out;
+}
+
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const sameKeys = (o: Record<string, unknown>, want: readonly string[]) => JSON.stringify(Object.keys(o).sort()) === JSON.stringify([...want].sort());
+/** A parameter value: a plain word, so nothing a shell would read reaches the script through {{ … }}. */
+const PARAMETER_VALUE = /^[a-z][a-z-]{0,31}$/;
+const PARAMETER_KEYS = ["type", "description", "allowedValues", "default"];
+/** What SSM resolves in a Command document itself, on the instance: never in ours. */
+const RESOLVED_REFERENCE = /^(ssm|ssm-secure|resolve)\s*:/i;
+
+/** Every string in a JSON value. */
+function strings(v: unknown): string[] {
+    if (typeof v === "string") return [v];
+    if (Array.isArray(v)) return v.flatMap(strings);
+    if (isObject(v)) return Object.values(v).flatMap(strings);
+    return [];
+}
+
+/**
+ * What a proxy document may be, whatever its file says (the guard and check-plan hold each document's content to its
+ * file; these predicates hold the file): schemaVersion "2.2"; exactly the keys schemaVersion, description and
+ * mainSteps, and parameters on the reload document only; exactly one step, aws:runShellScript, named after the role,
+ * whose inputs are exactly runCommand (a list of strings) and its fixed timeoutSeconds; every parameter a String with
+ * a non-empty allowedValues of plain words, its default one of them, and no other key (no allowedPattern, StringList,
+ * MapList or displayType); every {{ … }} a declared parameter, never an {{ssm:…}}, {{ssm-secure:…}} or {{resolve:…}}
+ * reference. Empty when the document is allowed, else why not.
+ */
+export function checkProxyDocument(role: DocumentRole, text: string): string[] {
+    const problems: string[] = [];
+    const bad = (msg: string) => problems.push(msg);
+    let doc: unknown;
+    try {
+        doc = JSON.parse(text);
+    } catch (e) {
+        return [`not JSON (${(e as Error).message})`];
+    }
+    if (!isObject(doc)) return ["not a JSON object"];
+    const allowed = ["schemaVersion", "description", "mainSteps", ...(role === "reload" ? ["parameters"] : [])];
+    const extra = Object.keys(doc).filter((k) => !allowed.includes(k));
+    const missing = ["schemaVersion", "description", "mainSteps"].filter((k) => !(k in doc));
+    if (extra.length > 0) bad(`key ${extra.join(", ")} outside ${allowed.join(", ")}${role === "reload" ? "" : " (only the reload document takes parameters)"}`);
+    if (missing.length > 0) bad(`key ${missing.join(", ")} missing`);
+    if (doc.schemaVersion !== "2.2") bad(`schemaVersion must be "2.2", got ${JSON.stringify(doc.schemaVersion)}`);
+    if (typeof doc.description !== "string" || doc.description === "") bad("description must be a non-empty string");
+
+    const steps = doc.mainSteps;
+    if (!Array.isArray(steps) || steps.length !== 1) bad(`mainSteps must be exactly one step, got ${Array.isArray(steps) ? steps.length : JSON.stringify(steps)}`);
+    else {
+        const step = steps[0];
+        if (!isObject(step) || !sameKeys(step, ["action", "name", "inputs"])) bad(`the step's keys must be exactly action, name, inputs, got ${isObject(step) ? Object.keys(step).join(", ") : JSON.stringify(step)}`);
+        else {
+            if (step.action !== "aws:runShellScript" || step.name !== role) bad(`the step must be aws:runShellScript named ${role}, got ${JSON.stringify(step.action)} named ${JSON.stringify(step.name)}`);
+            const inputs = step.inputs;
+            if (!isObject(inputs) || !sameKeys(inputs, ["runCommand", "timeoutSeconds"])) bad(`the step's inputs must be exactly runCommand and timeoutSeconds, got ${isObject(inputs) ? Object.keys(inputs).join(", ") : JSON.stringify(inputs)}`);
+            else {
+                if (inputs.timeoutSeconds !== DOCUMENT_TIMEOUTS[role]) bad(`timeoutSeconds must be "${DOCUMENT_TIMEOUTS[role]}" (what the CLI waits out), got ${JSON.stringify(inputs.timeoutSeconds)}`);
+                const run = inputs.runCommand;
+                if (!Array.isArray(run) || run.length === 0 || run.some((l) => typeof l !== "string")) bad("runCommand must be a non-empty list of strings");
+            }
+        }
+    }
+
+    const declared = new Set<string>();
+    if (doc.parameters !== undefined) {
+        if (!isObject(doc.parameters)) bad("parameters must be an object");
+        else {
+            for (const [p, def] of Object.entries(doc.parameters)) {
+                declared.add(p);
+                if (!isObject(def)) { bad(`parameter ${p} is not an object`); continue; }
+                const other = Object.keys(def).filter((k) => !PARAMETER_KEYS.includes(k));
+                if (other.length > 0) bad(`parameter ${p}: ${other.join(", ")} outside ${PARAMETER_KEYS.join(", ")}`);
+                if (def.type !== "String") bad(`parameter ${p} must be of type String, got ${JSON.stringify(def.type)}`);
+                const values = def.allowedValues;
+                if (!Array.isArray(values) || values.length === 0) {
+                    bad(`parameter ${p} has no allowedValues (a free-form parameter would run anything on the proxy)`);
+                    continue;
+                }
+                const words = values.filter((v) => typeof v !== "string" || !PARAMETER_VALUE.test(v));
+                if (words.length > 0) bad(`parameter ${p}: allowedValues ${JSON.stringify(words)} are not plain words (${PARAMETER_VALUE.source})`);
+                if (def.default !== undefined && !values.includes(def.default)) bad(`parameter ${p}: default ${JSON.stringify(def.default)} is not one of its allowedValues`);
+            }
+        }
+    }
+    for (const s of strings(doc)) {
+        for (const m of s.matchAll(/\{\{([^{}]*)\}\}/g)) {
+            const inner = m[1].trim();
+            if (RESOLVED_REFERENCE.test(inner)) bad(`${m[0]} is a reference SSM resolves on the instance (ssm:, ssm-secure: and resolve: are refused)`);
+            else if (!declared.has(inner)) bad(`${m[0]} names no declared parameter`);
+        }
+        const rest = s.replace(/\{\{([^{}]*)\}\}/g, "");
+        if (rest.includes("{{") || rest.includes("}}")) bad(`an unbalanced {{ or }} in ${JSON.stringify(s).slice(0, 80)}`);
+    }
+    return problems;
+}
+
+/**
+ * Throws, naming every violation of every document, before any resource is registered (index.ts, through its
+ * scratch:assert-documents marker, which `make preview-scratch NEGATIVE=document-widen` disables in a scratch copy).
+ */
+export function assertProxyDocuments(documents: ProxyDocuments): void {
+    const errors = DOCUMENT_ROLES.flatMap((role) => checkProxyDocument(role, documents[role]).map((p) => `${documentFile(role)}: ${p}`));
+    if (errors.length > 0) throw new Error(`egress spec (infra/egress-spec.ts, infra/proxy/documents) refused:\n  - ${errors.join("\n  - ")}`);
+}
+
 // ---- the inventory: every resource the stack may hold ----
 
 /** Pulumi type → the Pulumi names of its resources (empty: the type is absent). */
@@ -459,10 +625,15 @@ export const PROVIDER_INPUTS = ["region", "version", "skipCredentialsValidation"
     "sharedCredentialsFile", "sharedCredentialsFiles", "sharedConfigFiles"];
 
 /**
- * Every resource of the stack, by type and Pulumi name: S3's (index.ts, image.ts, iam.ts, budget.ts) and the egress
- * side's for the configured mode. The guard refuses any resource outside it (CloudFormation stacks, Cloud Control
- * and other generic resources, SSM associations, extra providers, components); check-plan.ts counts the planned
- * resources against it exactly. A resource added to the program must be added here, or the preview fails.
+ * Every resource of the stack, by type and Pulumi name: S3's (index.ts, image.ts, iam.ts, budget.ts), the egress
+ * side's for the configured mode, and S8 operators' (iam.ts: the users ai-env-deployer and ai-env-ops, the policies
+ * ai-env-deployer and ai-env-ops, the six user policy attachments; egress.ts: the proxy's three SSM documents). The
+ * guard refuses any resource outside it (CloudFormation stacks, Cloud Control and other generic resources, SSM
+ * associations, extra providers, components, and every IAM kind the operator identities must never have: an access
+ * key, a login profile, a group or group membership, a PolicyAttachment or UserPolicyAttachmentsExclusive, an
+ * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 67 in
+ * dnsMode none, 72 in firewall, the stack included. A resource added to the program must be added here, or the
+ * preview fails.
  */
 export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory {
     const firewall = cfg.dnsMode === "firewall";
@@ -481,9 +652,12 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         // The operator role's is its Deny (policies.ts operatorRolePolicy): an inline policy on the role itself is
         // refused by the guard and the plan check.
         ["aws:iam/rolePolicy:RolePolicy", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName]],
-        ["aws:iam/user:User", [RUNTIME_USER_NAME]],
+        // S8 operators: ai-env-runtime (S3), ai-env-ops and ai-env-deployer; MacRuntimePolicy stays the only inline
+        // user policy (on ai-env-runtime); the five managed policies are attached as USER_POLICY_ATTACHMENTS says.
+        ["aws:iam/user:User", [...STACK_USERS]],
         ["aws:iam/userPolicy:UserPolicy", [RUNTIME_POLICY_NAME]],
-        ["aws:iam/policy:Policy", [DEPLOY_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_DNS_POLICY_NAME]],
+        ["aws:iam/policy:Policy", [...STACK_POLICIES]],
+        ["aws:iam/userPolicyAttachment:UserPolicyAttachment", USER_POLICY_ATTACHMENTS.map(([u, p]) => attachmentName(u, p))],
         ["aws-native:lambda:MicrovmImage", [image.imageName]],
         ["aws:budgets/budget:Budget", [BUDGET_NAME]],
         // S5 egress.
@@ -504,6 +678,8 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["aws:iam/instanceProfile:InstanceProfile", [cfg.proxyInstanceProfileName]],
         ["aws:ec2/instance:Instance", [NET.instance]],
         ["aws:ssm/parameter:Parameter", PROXY_PARAMETERS.map((p) => `ai-env-proxy-${p}`)],
+        // S8 operators: the proxy's documents, the only ones ai-env-ops may send.
+        ["aws:ssm/document:Document", DOCUMENT_ROLES.map((r) => documentNames(cfg)[r])],
         ["aws-native:lambda:NetworkConnector", [cfg.connectorName]],
         ["aws:route53/resolverFirewallDomainList:ResolverFirewallDomainList", firewall ? [NET.firewall] : []],
         ["aws:route53/resolverFirewallRuleGroup:ResolverFirewallRuleGroup", firewall ? [NET.firewall] : []],

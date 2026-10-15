@@ -8,6 +8,8 @@
 //! (`vm/egress.rs`) and `ai-env egress|proxy …` as processes over the fake
 //! aws CLI (`vm/egress_cli.rs`). S6: `ai-env vm exec|attach|…` as processes
 //! (`vm/exec_cli.rs`) over the fake endpoint (`common/fake_endpoint.rs`).
+//! S8 operators: the AWS key shapes and the `ai-env as` environment of the
+//! operator commands (`common/aws_keys.rs`).
 //! Each area lives in its own file under tests/vm/ (declared with `#[path]`,
 //! so the undeclared-test lint only sees this root). Nothing here touches
 //! AWS, the real bridge directory or the process environment; polls are
@@ -33,3 +35,5 @@ mod egress_cli;
 mod exec_cli;
 #[path = "common/fake_endpoint.rs"]
 mod fake_endpoint;
+#[path = "common/aws_keys.rs"]
+mod aws_keys;

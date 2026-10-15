@@ -1,7 +1,7 @@
 {
     "Command": {
         "CommandId": "0b1c2d3e-0000-4000-8000-000000000001",
-        "DocumentName": "AWS-RunShellScript",
+        "DocumentName": "ai-env-proxy-status",
         "DocumentVersion": "$DEFAULT",
         "Comment": "ai-env",
         "InstanceIds": [

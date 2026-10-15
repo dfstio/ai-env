@@ -656,7 +656,7 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
         }
     }
     let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
-    let mut tty = match tty {
+    let tty = match tty {
         Ok(t) => t,
         Err(_) => {
             // No controlling terminal. If stdin is piped (scripts, tests),
@@ -673,6 +673,53 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
             ));
         }
     };
+    read_echo_off(tty, prompt)
+}
+
+/// [`read_secret_tty_only`]'s refusal when this process has no controlling
+/// terminal (exit 5).
+pub const NO_TTY: &str = "no terminal (/dev/tty) to read it from: it is never read from a pipe, a file or the environment";
+
+/// Read a secret line from `/dev/tty` only (S8 operators: the deployer key
+/// `ai-env as deployer` asks for, the hand-over's Enter prompts and
+/// paste-backs): the prompt goes to `/dev/tty`, the line is read with echo off
+/// and any unread input is flushed, as in [`read_secret_from_tty`], but there
+/// is no fallback: without `/dev/tty` it is exit 5 ([`NO_TTY`]), never a read
+/// from stdin. Debug builds only: `AI_ENV_PASTE_STDIN=1` with a stdin that is
+/// not a terminal reads the line from stdin, the prompt on stderr (the tests'
+/// pipe); release builds ignore the variable. An empty line is returned as
+/// it is (callers treat it as cancelled).
+pub fn read_secret_tty_only(prompt: &str) -> Result<Zeroizing<String>> {
+    use std::io::IsTerminal;
+    let knob = std::env::var("AI_ENV_PASTE_STDIN").ok();
+    if tty_only_reads_stdin(cfg!(debug_assertions), knob.as_deref(), std::io::stdin().is_terminal()) {
+        eprint!("{prompt}");
+        return read_secret_line(&mut stdin_file()?);
+    }
+    read_secret_dev_tty(prompt)
+}
+
+/// [`read_secret_tty_only`] without the debug builds' stdin knob, in any
+/// build: `/dev/tty` or exit 5 ([`NO_TTY`]). For a command whose stdin is
+/// never the person (the hand-over's is the JSON pipe), where
+/// `AI_ENV_PASTE_STDIN=1` left exported could only answer its prompts from
+/// that pipe.
+pub fn read_secret_dev_tty(prompt: &str) -> Result<Zeroizing<String>> {
+    let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty").map_err(|_| CliError::AuthUnavailable(NO_TTY.into()))?;
+    read_echo_off(tty, prompt)
+}
+
+/// Does [`read_secret_tty_only`] read stdin instead of `/dev/tty`? Only in a
+/// debug build (`debug`), with `AI_ENV_PASTE_STDIN` exactly `1` (`knob`) and
+/// a stdin that is not a terminal.
+fn tty_only_reads_stdin(debug: bool, knob: Option<&str>, stdin_is_terminal: bool) -> bool {
+    debug && knob == Some("1") && !stdin_is_terminal
+}
+
+/// The prompt on `tty`, then one line read from it with echo off; on the way
+/// out the terminal is restored and every unread byte of input is flushed
+/// (`TCSAFLUSH`), so the rest of a multi-line paste never reaches the shell.
+fn read_echo_off(mut tty: fs::File, prompt: &str) -> Result<Zeroizing<String>> {
     tty.write_all(prompt.as_bytes())?;
     tty.flush()?;
 
@@ -716,4 +763,26 @@ pub fn read_secret_from_tty(prompt: &str) -> Result<Zeroizing<String>> {
     }
     let _ = tty.write_all(b"\n");
     read_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tty-only reader (S8 operators) reads stdin only in a debug build,
+    /// with `AI_ENV_PASTE_STDIN=1` and a stdin that is not a terminal (the
+    /// tests' pipe); a release build ignores the variable, and anything else
+    /// reads `/dev/tty` or refuses with exit 5.
+    #[test]
+    fn the_tty_only_reader_takes_stdin_only_in_debug_builds_with_the_knob() {
+        assert!(tty_only_reads_stdin(true, Some("1"), false), "debug, the knob, a pipe: the tests' path");
+        for (knob, stdin_is_terminal) in [(Some("1"), false), (Some("1"), true), (None, false), (Some("0"), false)] {
+            assert!(!tty_only_reads_stdin(false, knob, stdin_is_terminal), "a release build ignores AI_ENV_PASTE_STDIN={knob:?} (stdin a terminal: {stdin_is_terminal})");
+        }
+        for (knob, stdin_is_terminal) in [(Some("1"), true), (None, false), (Some("0"), false), (Some(""), false), (Some("1 "), false), (Some("yes"), false)] {
+            assert!(!tty_only_reads_stdin(true, knob, stdin_is_terminal), "AI_ENV_PASTE_STDIN={knob:?} (stdin a terminal: {stdin_is_terminal}): /dev/tty only");
+        }
+        let refused = CliError::AuthUnavailable(NO_TTY.into());
+        assert_eq!((refused.exit_code(), refused.to_string().as_str()), (5, "no terminal (/dev/tty) to read it from: it is never read from a pipe, a file or the environment"));
+    }
 }

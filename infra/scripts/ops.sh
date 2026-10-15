@@ -3,7 +3,10 @@
 # waiting for the build, versions and builds, rollback, pruning, the VM guard and the post-destroy checklist; and the
 # S5 egress helpers (plans/s5-plan.md "Makefile / ops"): the deploy's plan gate (the plan check and the replacement
 # guard over one `pulumi preview --json`), the connector's wait, status, probe and out-of-band delete, and the egress
-# steps that end a deploy.
+# steps that end a deploy; and the S8 operators' helpers (plans/s8-operators-contracts.md §9): which AWS identity may run
+# a step (identity), whether the stack has its deployer yet (stack-deployer, infra.mk's TIER), and issuing an access
+# key of the runtime, ops or deployer user (key-issue). Every operator step runs under `ai-env as` (infra.mk's TIER,
+# or claude-update's own re-exec): the key in its environment, never this shell's own AWS settings.
 #
 # Why a script: polling with a timeout, comparing against a snapshot and keep-N pruning do not fit one-line make
 # recipes, and this must run under macOS's /bin/bash 3.2. The image ARN is composed at run time from the caller
@@ -18,8 +21,11 @@
 #
 # Env (set by infra/infra.mk): REGION, IMAGE_NAME, IMAGE_OUT, STACK, IMAGE_WAIT_TIMEOUT, IMAGE_WAIT_POLL,
 # VERSIONS_WARN, VERSIONS_QUOTA, CONNECTOR_WAIT_TIMEOUT, CONNECTOR_WAIT_POLL; AI_ENV_CLI (connector-probe,
-# post-deploy and claude-update only: the make target's $(AI_ENV), split on blanks and not passed on to any child);
-# LOCK and CLAUDE_RELEASES (claude-update only).
+# post-deploy, key-issue and claude-update only: the make target's $(AI_ENV), split on blanks and not passed on to any
+# child); LOCK and CLAUDE_RELEASES (claude-update only); BREAKGLASS (identity only: 1 when given on the make command
+# line) and ROTATE (key-issue only, the same); AI_ENV_BRIDGE_AS, the marker `ai-env as` sets, read by identity, and by
+# the printed recovery commands, which start with the runner of the identity that must run them (as_writer).
+# AI_ENV_PASTE_STDIN, the debug builds' paste knob (a test session's leftover), is dropped for every command.
 set -euo pipefail
 # The aws CLI pages its output through less on a terminal (measured 1 Oct 2026: `make image-status` stopped in the
 # pager): never here.
@@ -41,6 +47,20 @@ lambda_url="https://lambda.$region.amazonaws.com"
 ec2_url="https://ec2.$region.amazonaws.com"
 ai_env_line=${AI_ENV_CLI:-}
 unset AI_ENV_CLI
+# The operator CLI the make targets run is a debug build (cargo run), whose `ai-env as deployer` reads the key from a
+# stdin that is not a terminal when AI_ENV_PASTE_STDIN=1: never from here (claude-update's runner, key-issue's CLI).
+unset AI_ENV_PASTE_STDIN
+
+# as_writer: how a printed recovery command that writes (an access key, a connector) starts on this Mac, where a bare
+# `aws` has no credentials: under the account root's runner (the bootstrap, operator-keys, break-glass: its terminal
+# holds the root's own credentials, and the deployer may have no key yet) `ai-env as root -- `, else
+# `ai-env as deployer -- `, who writes them in every other run.
+as_writer() {
+    case "${AI_ENV_BRIDGE_AS:-}" in
+    root) printf 'ai-env as root -- ' ;;
+    *) printf 'ai-env as deployer -- ' ;;
+    esac
+}
 
 # account_id: the caller's account; called as `x=$(account_id) || exit 1` (the exit below only leaves the substitution's
 # subshell).
@@ -281,7 +301,7 @@ cmd_vm_guard() {
             esac
             if [ "$ours" = 1 ]; then
                 echo "    delete it once no VM uses it, then wait until make connector-status no longer lists it:"
-                echo "    aws lambda-core delete-network-connector --region $region --endpoint-url $lambda_url --identifier $n"
+                echo "    $(as_writer)aws lambda-core delete-network-connector --region $region --endpoint-url $lambda_url --identifier $n"
             else
                 echo "    not on the VM subnet ${subnet:-(unknown)} nor a probe of $connector: it may be another project's (no delete command; remove it only if it is yours)"
             fi
@@ -296,7 +316,7 @@ cmd_vm_guard() {
     if [ -n "$alive" ]; then
         echo "refusing: VMs of $name are not TERMINATED:"
         printf '%s\n' "$alive" | sed 's/^/  /'
-        echo "terminate them first: aws lambda-microvms terminate-microvm --microvm-identifier <id> --region $region"
+        echo "terminate them first, each with the runtime key's Touch ID (--yes for a VM this Mac has no row of): ai-env vm terminate <id>"
         exit 1
     fi
     echo "vm-guard: every VM of $name is TERMINATED"
@@ -320,28 +340,49 @@ cmd_checklist() {
     vpc=$(econf vpcCidr)
     log_group=$(econf logGroup)
     prefix=$(econf parameterPrefix)
+    # Pasted into zsh (no INTERACTIVE_COMMENTS by default: a `#` is an argument, an unquoted `(` syntax), so no command
+    # line carries a comment or anything unquoted beyond its words: what it should show is on its step's numbered line.
     cat <<EOF
-Post-destroy checklist (read-only checks, region $region; each should show nothing of ai-env):
-  1. aws lambda-microvms list-microvm-images --region $region             # no $name (deleting an image should remove its versions and snapshots: record it)
-  2. aws lambda-microvms list-microvms --region $region                   # nothing of $name but TERMINATED
-  3. aws logs describe-log-groups --log-group-name-prefix /aws/lambda-microvms --region $region
+Post-destroy checklist (read-only checks, region $region), in this terminal (the account root's own credentials: the
+operator users are gone): paste each command line on its own; its step's numbered line says what it should show.
+  1. no image $name (deleting an image should remove its versions and snapshots: record it):
+     aws lambda-microvms list-microvm-images --region $region
+  2. nothing of $name but TERMINATED:
+     aws lambda-microvms list-microvms --region $region
+  3. no log group of the image:
+     aws logs describe-log-groups --log-group-name-prefix /aws/lambda-microvms --region $region
      aws logs describe-log-groups --log-group-name-prefix /aws/lambda/microvms --region $region
-  4. aws iam get-user --user-name ai-env-runtime --region $region         # NoSuchEntity (forceDestroy removed its access keys)
-     then delete the sealed key, now useless: rm "\${AI_ENV_BRIDGE_DIR:-\$HOME/.config/ai-env/bridge}/credentials/aws.env"
-  5. aws iam get-role --role-name ai-env-image-build --region $region; aws iam get-role --role-name ai-env-vm-exec --region $region
-     aws iam list-policies --scope Local --query "Policies[?PolicyName=='ai-env-deploy']" --region $region
-  6. aws s3api list-buckets --query "Buckets[?starts_with(Name, 'ai-env-artifacts-')].Name" --region $region
-  7. aws budgets describe-budgets --account-id "\$(aws sts get-caller-identity --query Account --output text --region $region)" --region $region   # no ai-env-monthly
-  8. aws lambda-core list-network-connectors --region $region --endpoint-url $lambda_url   # no $connector, no $connector-probe-* connector
-  9. aws ec2 describe-vpcs --filters Name=cidr,Values=$vpc Name=tag:Project,Values=ai-env --region $region --endpoint-url $ec2_url   # no egress VPC (its subnets, route tables, IGW and security groups go with it)
-     aws ec2 describe-network-acls --filters Name=tag:Name,Values=ai-env-egress-vms --region $region --endpoint-url $ec2_url   # the VM subnet's network ACL is gone
- 10. aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-egress-proxy --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region $region --endpoint-url $ec2_url   # the proxy instance: terminated only
- 11. aws ssm get-parameters --names $prefix/squid.conf $prefix/allow $prefix/extras $prefix/suspended --query InvalidParameters --region $region --endpoint-url https://ssm.$region.amazonaws.com   # all four listed: none exists
-     aws logs describe-log-groups --log-group-name-prefix ${log_group%/*} --region $region --endpoint-url https://logs.$region.amazonaws.com   # no $log_group (nor ${log_group%/*}/dns)
- 12. aws iam get-role --role-name $(econf operatorRoleName) --region $region; aws iam get-role --role-name $(econf proxyRoleName) --region $region; aws iam get-instance-profile --instance-profile-name $(econf proxyInstanceProfileName) --region $region   # NoSuchEntity each
+  4. NoSuchEntity for each of the three users (forceDestroy removed their access keys):
+     aws iam get-user --user-name ai-env-runtime --region $region
+     aws iam get-user --user-name ai-env-deployer --region $region
+     aws iam get-user --user-name ai-env-ops --region $region
+     then delete the sealed keys, now useless:
+     rm "\${AI_ENV_BRIDGE_DIR:-\$HOME/.config/ai-env/bridge}/credentials/aws.env" "\${AI_ENV_BRIDGE_DIR:-\$HOME/.config/ai-env/bridge}/credentials/ops.env"
+     and delete the Strongbox entry ai-env-deployer: its key went with the user
+  5. NoSuchEntity for both roles, and no ai-env-* policy left (ai-env-deploy, ai-env-deploy-egress, ai-env-deploy-dns, ai-env-deployer, ai-env-ops):
+     aws iam get-role --role-name ai-env-image-build --region $region; aws iam get-role --role-name ai-env-vm-exec --region $region
+     aws iam list-policies --scope Local --query "Policies[?starts_with(PolicyName, 'ai-env-')].PolicyName" --output text --region $region
+  6. no ai-env-artifacts-* bucket:
+     aws s3api list-buckets --query "Buckets[?starts_with(Name, 'ai-env-artifacts-')].Name" --region $region
+  7. no budget ai-env-monthly:
+     aws budgets describe-budgets --account-id "\$(aws sts get-caller-identity --query Account --output text --region $region)" --region $region
+  8. no $connector, no $connector-probe-* connector:
+     aws lambda-core list-network-connectors --region $region --endpoint-url $lambda_url
+  9. no egress VPC (its subnets, route tables, IGW and security groups go with it), and the VM subnet's network ACL gone:
+     aws ec2 describe-vpcs --filters Name=cidr,Values=$vpc Name=tag:Project,Values=ai-env --region $region --endpoint-url $ec2_url
+     aws ec2 describe-network-acls --filters Name=tag:Name,Values=ai-env-egress-vms --region $region --endpoint-url $ec2_url
+ 10. the proxy instance, terminated only:
+     aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-egress-proxy --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region $region --endpoint-url $ec2_url
+ 11. all four parameters listed as invalid (none exists), and no $log_group (nor ${log_group%/*}/dns):
+     aws ssm get-parameters --names $prefix/squid.conf $prefix/allow $prefix/extras $prefix/suspended --query InvalidParameters --region $region --endpoint-url https://ssm.$region.amazonaws.com
+     aws logs describe-log-groups --log-group-name-prefix ${log_group%/*} --region $region --endpoint-url https://logs.$region.amazonaws.com
+ 12. NoSuchEntity for each:
+     aws iam get-role --role-name $(econf operatorRoleName) --region $region; aws iam get-role --role-name $(econf proxyRoleName) --region $region; aws iam get-instance-profile --instance-profile-name $(econf proxyInstanceProfileName) --region $region
  13. bridge.toml [aws]: clear image_arn, execution_role_arn and budget_name, and remove egress_connector_arn and proxy_private_ip, by hand; delete state/infra.toml (infra status refuses a stack without outputs, so nothing rewrites it)
      $(verified_note)
- 14. optional: cd infra && pulumi stack rm $stack
+ 14. optional, the stack's own record in the Pulumi backend:
+     cd infra && pulumi stack rm $stack
+ 15. the account root ran this destroy (BREAKGLASS=1): delete its access key again (IAM console as the root, with MFA: Security credentials, Access keys)
 EOF
 }
 
@@ -367,12 +408,24 @@ need_connector() {
     test -n "$connector" || { echo "ops.sh: no connectorName in $infra/egress-config.json" >&2; exit 1; }
 }
 
-# need_ai_env: the ai-env command words of AI_ENV_CLI in the array ai_env.
+# The four variables a compile or a test must never see (D18): an operator key and the runner's marker.
+NO_KEY_ENV=(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS)
+
+# need_ai_env: the ai-env command words of AI_ENV_CLI in the array ai_env, built first without any key or marker in
+# its environment (D18): `<ai-env> --version`, which with the make targets' default (cargo run) compiles the tree when
+# it changed, so no later call compiles under the key `ai-env as` put in this process's environment (key-issue,
+# post-deploy, connector-probe and claude-update run under it).
 need_ai_env() {
+    local st
     test -n "$ai_env_line" || { echo "ops.sh: AI_ENV_CLI is empty (the make target passes \$(AI_ENV))" >&2; exit 1; }
     set -f
     ai_env=($ai_env_line)
     set +f
+    "${NO_KEY_ENV[@]}" "${ai_env[@]}" --version >/dev/null || {
+        st=$?
+        echo "ops.sh: $ai_env_line --version failed (exit $st, above): the operator CLI could not be built or run without a key" >&2
+        exit 1
+    }
 }
 
 in_words() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }
@@ -523,7 +576,7 @@ probe_cleanup() {
         fi
         if [ "$i" -ge "$PROBE_DELETE_TRIES" ]; then
             echo "connector-probe: DELETING $probe FAILED $i times: delete it by hand (it pins the VM subnet):" >&2
-            echo "  aws lambda-core delete-network-connector --identifier $probe --region $region --endpoint-url $lambda_url" >&2
+            echo "  $(as_writer)aws lambda-core delete-network-connector --identifier $probe --region $region --endpoint-url $lambda_url" >&2
             test "$rc" -ne 0 || rc=1
             break
         fi
@@ -732,8 +785,20 @@ for (const s of plan.steps) {
 # (scripts/check-plan.sh --mode <dnsMode> --account-id <the caller's>: the inventory, the egress spec and the IAM
 # documents, plans/s5-plan.md "W1 review") and the replacement guard both run, so both verdicts are shown; either
 # refusal is exit 1, before `pulumi up`. The account id is an argument only, never written.
+# --known-documents POLICY... (make deploy-policies, whose `pulumi up --target` updates those policies alone): each must
+# be in the plan with its document known. The plan check accepts an unknown document while a resource it names is
+# created or replaced (the proxy instance, for ai-env-ops'), and the whole deploy builds it from the new resource; a
+# targeted up replaces nothing, renders the document anew from the old resource and would apply what no check compared.
 cmd_plan_gate() {
-    local plan mode acct rc=0 st
+    local plan mode acct rc=0 st docs what p unsure=0
+    case "${1:-}" in
+    "") ;;
+    --known-documents)
+        shift
+        test $# -ge 1 || { echo "usage: ops.sh plan-gate [--known-documents POLICY...]" >&2; exit 2; }
+        ;;
+    *) echo "usage: ops.sh plan-gate [--known-documents POLICY...]" >&2; exit 2 ;;
+    esac
     plan=$(cat)
     test -n "$plan" || { echo "deploy: the preview printed no plan: nothing deployed"; exit 1; }
     mode=$(econf dnsMode)
@@ -745,6 +810,30 @@ cmd_plan_gate() {
         rc=1
     fi
     printf '%s' "$plan" | cmd_replace_guard || rc=1
+    if [ $# -ge 1 ]; then
+        docs=$(printf '%s' "$plan" | node -e '
+const UNKNOWN = "04da6b54-80e4-46f7-96ec-b56ff0331ba9";
+let plan;
+try { plan = JSON.parse(require("fs").readFileSync(0, "utf-8")); } catch (e) { console.log(`unreadable\t${e.message}`); process.exit(0); }
+const known = new Map();
+for (const s of plan.steps || []) {
+    const st = s.newState;
+    if (!st || st.type !== "aws:iam/policy:Policy") continue;
+    const v = (st.inputs || {}).policy;
+    known.set(String(s.urn).split("::").pop(), typeof v === "string" && v !== "" && v !== UNKNOWN);
+}
+for (const name of process.argv.slice(1)) console.log(`${!known.has(name) ? "missing" : known.get(name) ? "known" : "unknown"}\t${name}`);
+' "$@") || docs=$'unreadable\tnode failed'
+        while IFS=$'\t' read -r what p; do
+            case "$what" in
+            known) ;;
+            unknown) echo "deploy-policies: the plan holds the document of $p unknown (it names a resource the plan creates or replaces, such as the proxy instance): pulumi up --target would render it anew from the old resource and apply what no check compared: run make deploy, the whole plan, instead"; unsure=1 ;;
+            missing) echo "deploy-policies: the plan holds no step of the policy $p, which pulumi up --target would update"; unsure=1 ;;
+            *) echo "deploy-policies: the documents of the plan cannot be read (${p:-no answer}): refusing"; unsure=1 ;;
+            esac
+        done <<<"$docs"
+        if [ "$unsure" = 0 ]; then echo "deploy-policies: the plan holds every document of $* known: the targeted pulumi up applies what the plan check compared"; else rc=1; fi
+    fi
     test "$rc" -eq 0 || { echo "deploy: refused before pulumi up: nothing deployed"; exit 1; }
 }
 
@@ -1017,20 +1106,24 @@ older_vms_note() {
     test -z "$rows" || echo "claude-update: VMs still on another image version, and its claude:$rows; they keep it until ai-env vm terminate (ai-env vm list)"
 }
 
-# make_ignores_errors: the make that runs this recipe was given -i or -k (its MAKEFLAGS, as GNU make 3.81 and later
-# write it: a first word of option letters, or `-x` words after long options, then `--` and the variables; a variable
-# alone is the first word). Its children would inherit it and go on past a failed preflight or test. In a subshell:
-# no glob of a variable's value.
-make_ignores_errors() (
+# make_switch LETTERS: the make that runs this recipe was given one of these single-letter switches, read from its
+# MAKEFLAGS as the Makefile's MAKE_SWITCHES reads it (GNU make 3.81 and later write a first word of option letters, or
+# `-x` words after long options, then `--` and the variables; a variable alone is the first word; a word without a
+# dash after the first is an option's argument, such as -I's directory, and -j, -l, -O and -I words are no switches).
+# Its children inherit them: -i and -k would go on past a failed preflight or test, and -p prints every environment
+# variable at the end of every make, the runner's key among them. In a subshell: no glob of a variable's value.
+make_switch() (
     set -f
+    first=1
     for w in ${MAKEFLAGS:-}; do
         case "$w" in
         --) exit 1 ;;
-        --*) ;;
+        --* | -[jlOI]*) ;;
+        -*) case "${w#-}" in *["$1"]*) exit 0 ;; esac ;;
         *=*) exit 1 ;;
-        -*) case "${w#-}" in *[ik]*) exit 0 ;; esac ;;
-        *) case "$w" in *[ik]*) exit 0 ;; esac ;;
+        *) if [ "$first" = 1 ]; then case "$w" in *["$1"]*) exit 0 ;; esac; fi ;;
         esac
+        first=0
     done
     exit 1
 )
@@ -1048,23 +1141,42 @@ make_ignores_errors() (
 #      nothing): a run after a deploy whose check failed or was cancelled finishes it. When the marker
 #      $IMAGE_OUT/claude-update.pending names B (a deploy this command started, "B <proxy state before>", removed once
 #      a run is done), `make proxy-start` too, and the end notes of a deploy, the proxy's with the state that run found;
-#   3. else, after the preconditions (not under make -i or -k; a terminal for Pulumi's confirmation and the Touch ID;
-#      the Pulumi passphrase in the environment, as make deploy's preview runs --non-interactive; Docker answering;
-#      the AWS identity answering), so that nothing changes when they fail: `make claude-pin CLAUDE_VERSION=B` (when
-#      L != B), `make test-docker` (skipped when it already passed for the current zip of B: make deploy rebuilds the
-#      zip, and its P12 refuses one that differs), the marker, `make deploy EXPECT_BUILD_FAILURE=` (Pulumi asks before
-#      it changes anything; the T3.4 switch never reaches it), `make infra-status WRITE=1`, the live active version
-#      check, `make proxy-start` (the check needs squid serving; it also waits for a stopped proxy's boot), `ai-env
-#      egress check --if-needed`.
+#   3. else, after the preconditions (a terminal for Pulumi's confirmation and the Touch ID; the Pulumi passphrase in
+#      the environment, as make deploy's preview runs --non-interactive; Docker answering; and, outside a runner that
+#      covers the deployer, a stack that exports its deployer: before the bootstrap there is no deployer key to ask
+#      for, and that deploy is the account root's), so that nothing changes when they fail: `make claude-pin
+#      CLAUDE_VERSION=B` (when L != B), `make test-docker` (skipped when it already passed for the current zip of B:
+#      make deploy rebuilds the zip, and its P12 refuses one that differs), then the runner and the AWS identity of the
+#      run (below), the marker, `make deploy EXPECT_BUILD_FAILURE=` (Pulumi asks before it changes anything; the T3.4
+#      switch never reaches it), `make infra-status WRITE=1`, the live active version check, `make proxy-start` (the
+#      check needs squid serving; it also waits for a stopped proxy's boot), `ai-env egress check --if-needed`.
+# Never under make -i, -k or -p, whichever step is due (refused first: -i and -k would go on past a failed preflight or
+# test, and under -p every make the steps run would print its environment, the runner's key among them).
+# S8 operators: the identity. The decision above reads local files only; the run then needs one AWS identity, asked
+# once: the deployer when a deploy is due, else ops (contracts §9.10). The steps that need no AWS (make claude-pin: curl
+# and gpg; make test-docker: cargo, the image build, Docker) run first, outside the runner and without any key in
+# their environment (D18); then this script runs itself again under `ai-env as <tier>` (one paste, or one Touch ID),
+# which decides again: the lock and test-docker's stamp are current by then, so that pass never repeats them. In the
+# pass under the runner (or a run started under a covering one, where pin and test-docker come after it), the version
+# summary, then `ops.sh identity <tier>` (an operator of the stack's account, not the account root but the bootstrap's;
+# never break-glass, an exported BREAKGLASS set aside, and make claude-update refuses one on its command line), its
+# line said, then every step that needs AWS; a nested make deploy meets infra.mk's TIER under the deployer's marker and
+# runs at once (its zip rebuilt without the key). An identity refused there, after the pass before the runner pinned or
+# ran make test-docker, says so ("nothing deployed": the new lock and the stamp stay, and a rerun goes on from them);
+# else nothing changed.
 # The first failure stops it naming the step; make claude-update again resumes (every step is idempotent). The lock
-# changes in the tree: Mike reviews and commits it.
+# changes in the tree: Mike reviews and commits it (git, asked whether it changed, runs without the key or an
+# fsmonitor).
 # Env (infra.mk): AI_ENV_CLI, LOCK, CLAUDE_RELEASES, CLAUDE_GPG_FPR; AI_ENV_BRIDGE_LAB_ASSUME_TTY=1 (the tests only:
-# LAB_UNSET clears it on every make run) skips the terminal check.
+# LAB_UNSET clears it on every make run) skips the terminal check. CLAUDE_UPDATE_REEXEC: this script's own, from the
+# pass that asked for the runner to the pass under it (the same process id, `exec` all the way: an exported leftover
+# never matches), so a runner that did not take is never asked for again.
 cmd_claude_update() {
-    local lock=${LOCK:?} releases=${CLAUDE_RELEASES:-} bundle locked deployed active latest="" outputs steps s n=0 total st proxy proxy_before="" pinned=0 deploying=0 marker
-    local pending="$out/claude-update.pending"
+    local lock=${LOCK:?} releases=${CLAUDE_RELEASES:-} bundle locked deployed active latest="" outputs steps s n=0 total st proxy proxy_before="" pinned=0 tested=0 deploying=0 marker
+    local pending="$out/claude-update.pending" decided="" stale_marker=0 read_proxy=0 tier why line handed="" h_pin="" h_test="" left
     need_ai_env
-    if make_ignores_errors; then echo "claude-update: not under make -i or -k (a failing preflight or test must stop the deploy): run make claude-update without them"; exit 2; fi
+    if make_switch ik; then echo "claude-update: not under make -i or -k (a failing preflight or test must stop the deploy): run make claude-update without them"; exit 2; fi
+    if make_switch p; then echo "claude-update: not under make -p (it prints every variable at the end of every make it reaches, the environment's too: under the runner this run asks for, the operator key and its secret): run make claude-update without it"; exit 2; fi
     bundle=$("${ai_env[@]}" infra pin --bundle-version) || { st=$?; echo "claude-update: cannot read the Cursor bundle's version (ai-env infra pin --bundle-version: exit $st, above; exit 1 when no bundle is installed): nothing changed"; exit 1; }
     is_version "$bundle" || { echo "claude-update: ai-env infra pin --bundle-version printed \"$bundle\", not a version: nothing changed"; exit 1; }
     locked=$(sed -n 's/^CLAUDE_VERSION=//p' "$lock" 2>/dev/null | head -1 || true)
@@ -1072,6 +1184,75 @@ cmd_claude_update() {
     deployed=$(printf '%s' "$outputs" | jsq 'j.claudeVersion') || exit 1
     active=$(printf '%s' "$outputs" | jsq 'j.latestActiveImageVersion') || exit 1
     proxy=$(printf '%s' "$outputs" | jsq 'j.proxyInstanceId') || exit 1
+    if [ "$bundle" = "$locked" ] && [ "$bundle" = "$deployed" ]; then
+        marker=$(cat "$pending" 2>/dev/null || true)
+        case "$marker" in
+        "$bundle "?*)
+            # A deploy of this bundle that this command started did not finish its steps: resume them all.
+            proxy_before=${marker#* }
+            [ "$proxy_before" != unknown ] || proxy_before=""
+            decided="claude-update: $bundle is deployed, and the run that deployed it stopped before its end: its remaining steps (the status, the active version, the proxy, the egress check)"
+            steps="status active proxy check"
+            deploying=1
+            ;;
+        *)
+            stale_marker=1
+            decided="claude-update: $bundle is pinned and deployed: nothing to build or deploy; the status, then the egress check if the active image version has no pass"
+            steps="status active check"
+            ;;
+        esac
+    else
+        if [ "${AI_ENV_BRIDGE_LAB_ASSUME_TTY:-}" != 1 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+            echo "claude-update: needs a terminal (make deploy asks Pulumi's confirmation, the egress check one Touch ID: not from a pipe, cron or launchd): nothing changed"
+            exit 1
+        fi
+        test -n "${PULUMI_CONFIG_PASSPHRASE:-}${PULUMI_CONFIG_PASSPHRASE_FILE:-}" \
+            || { echo "claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the $stack stack's passphrase: make deploy's preview runs --non-interactive): nothing changed"; exit 1; }
+        docker info >/dev/null 2>&1 || { echo "claude-update: Docker does not answer (docker info), and make test-docker needs it: start Docker, then make claude-update: nothing changed"; exit 1; }
+        steps="deploy status active proxy check"
+        deploying=1
+        read_proxy=1
+        if [ "$bundle" != "$locked" ]; then
+            steps="pin test $steps"
+        elif [ -f "$out/test-docker.ok" ] && [ -f "$out/image.zip" ] && [ "$(cat "$out/test-docker.ok")" = "$(shasum -a 256 "$out/image.zip" | cut -d' ' -f1)" ] \
+            && [ "$(jsq 'j.claudeVersion' <"$out/image.json" 2>/dev/null)" = "$bundle" ]; then
+            decided="claude-update: make test-docker already passed for $out/image.zip (claude $bundle): not again (make deploy rebuilds the zip; its preflight P12 refuses one that differs)"
+        else
+            steps="test $steps"
+        fi
+    fi
+    total=$(wc -w <<<"$steps" | tr -d ' ')
+    tier=ops
+    case " $steps " in *" deploy "*) tier=deployer ;; esac
+    if ! "${ai_env[@]}" as --check "$tier" >/dev/null 2>&1; then
+        # Not under a runner that covers the tier: the steps that need no AWS first, then the runner, once.
+        handed=${CLAUDE_UPDATE_REEXEC:-}
+        if [ "${handed%% *}" = "$$" ]; then
+            echo "claude-update: this run is under ai-env as $tier, but ai-env as --check $tier still fails: stopped before the first step that needs AWS"
+            exit 1
+        fi
+        # Before the bootstrap the stack exports no deployer, so there is no deployer key to ask for: that deploy is the
+        # account root's (make deploy runs it as the root; a run under ai-env as root covers the tier and comes not here).
+        if [ "$tier" = deployer ] && [ -z "$(printf '%s' "$outputs" | jsq 'j.deployerUserName' 2>/dev/null)" ]; then
+            echo "claude-update: a deploy is due, but stack $stack exports no deployer yet, so there is no deployer key to ask for: that deploy is the bootstrap, the account root's (README \"The bootstrap\"): nothing changed"
+            exit 1
+        fi
+        for s in $steps; do
+            case "$s" in pin | test) ;; *) break ;; esac
+            n=$((n + 1))
+            claude_update_step "$s"
+        done
+        case "$tier" in deployer) why="a deploy is due" ;; *) why="the status and the egress check" ;; esac
+        echo "claude-update: this run needs ai-env as $tier ($why): asking once, before the first step that needs AWS" >&2
+        CLAUDE_UPDATE_REEXEC="$$ $pinned $tested"
+        export CLAUDE_UPDATE_REEXEC
+        exec "${ai_env[@]}" as "$tier" -- env AI_ENV_CLI="$ai_env_line" "$BASH" "${BASH_SOURCE[0]}" claude-update
+    fi
+    # Under the runner: what the pass before it did (pinned, tested), the summary, the identity, then every step.
+    case "${CLAUDE_UPDATE_REEXEC:-}" in "$$ "*) read -r h_pin h_test <<<"${CLAUDE_UPDATE_REEXEC#* }" ;; esac
+    if [ "$h_pin" = 1 ]; then pinned=1; fi
+    if [ "$h_test" = 1 ]; then tested=1; fi
+    unset CLAUDE_UPDATE_REEXEC
     if [ -n "$releases" ]; then
         latest=$(curl --proto '=https' --tlsv1.2 -fsS -m 10 "$releases/latest" 2>/dev/null | head -c 64 | tr -d '[:space:]' || true)
         is_version "$latest" || latest=""
@@ -1086,68 +1267,30 @@ cmd_claude_update() {
     if is_version "$deployed" && [ "$(vercmp "$bundle" "$deployed")" = older ]; then
         echo "claude-update: a DOWNGRADE: the Cursor bundle $bundle is older than the deployed $deployed (the extension went back): the image follows the bundle"
     fi
-    if [ "$bundle" = "$locked" ] && [ "$bundle" = "$deployed" ]; then
-        marker=$(cat "$pending" 2>/dev/null || true)
-        case "$marker" in
-        "$bundle "?*)
-            # A deploy of this bundle that this command started did not finish its steps: resume them all.
-            proxy_before=${marker#* }
-            [ "$proxy_before" != unknown ] || proxy_before=""
-            echo "claude-update: $bundle is deployed, and the run that deployed it stopped before its end: its remaining steps (the status, the active version, the proxy, the egress check)"
-            steps="status active proxy check"
-            deploying=1
-            ;;
-        *)
-            rm -f "$pending"
-            echo "claude-update: $bundle is pinned and deployed: nothing to build or deploy; the status, then the egress check if the active image version has no pass"
-            steps="status active check"
-            ;;
-        esac
-    else
-        if [ "${AI_ENV_BRIDGE_LAB_ASSUME_TTY:-}" != 1 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
-            echo "claude-update: needs a terminal (make deploy asks Pulumi's confirmation, the egress check one Touch ID: not from a pipe, cron or launchd): nothing changed"
-            exit 1
-        fi
-        test -n "${PULUMI_CONFIG_PASSPHRASE:-}${PULUMI_CONFIG_PASSPHRASE_FILE:-}" \
-            || { echo "claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the $stack stack's passphrase: make deploy's preview runs --non-interactive): nothing changed"; exit 1; }
-        docker info >/dev/null 2>&1 || { echo "claude-update: Docker does not answer (docker info), and make test-docker needs it: start Docker, then make claude-update: nothing changed"; exit 1; }
-        ( account_id ) >/dev/null || { echo "claude-update: the AWS identity does not answer (aws sts get-caller-identity, above): renew the session, then make claude-update: nothing changed"; exit 1; }
-        steps="deploy status active proxy check"
-        deploying=1
-        if [ "$bundle" != "$locked" ]; then
-            steps="pin test $steps"
-        elif [ -f "$out/test-docker.ok" ] && [ -f "$out/image.zip" ] && [ "$(cat "$out/test-docker.ok")" = "$(shasum -a 256 "$out/image.zip" | cut -d' ' -f1)" ] \
-            && [ "$(jsq 'j.claudeVersion' <"$out/image.json" 2>/dev/null)" = "$bundle" ]; then
-            echo "claude-update: make test-docker already passed for $out/image.zip (claude $bundle): not again (make deploy rebuilds the zip; its preflight P12 refuses one that differs)"
+    test -z "$decided" || echo "$decided"
+    # Never break-glass (the root's is make deploy BREAKGLASS=1, then the steps by hand): an exported BREAKGLASS is set
+    # aside, as make's IDENTITY sets aside any but the command line's. The admitted line is said too (the bootstrap's
+    # root among them). Refused, it says what the pass before the runner left: its pin and stamp stay current.
+    if ! line=$(BREAKGLASS= cmd_identity "$tier"); then
+        if [ "$pinned" = 1 ]; then
+            left="nothing deployed: the pass before the runner pinned $lock to $bundle and passed make test-docker (kept: make claude-update again resumes)"
+        elif [ "$tested" = 1 ]; then
+            left="nothing deployed: the pass before the runner passed make test-docker (kept: make claude-update again resumes)"
         else
-            steps="test $steps"
+            left="nothing changed"
         fi
-        if [ -n "$proxy" ]; then
-            proxy_before=$(aws ec2 describe-instances --instance-ids "$proxy" --region "$region" --endpoint-url "$ec2_url" --output json 2>/dev/null \
-                | jsq '(j.Reservations || []).flatMap((r) => r.Instances || []).map((i) => (i.State || {}).Name)' 2>/dev/null || true)
-        fi
+        echo "claude-update: the identity of this run is refused: $line: $left"
+        exit 1
     fi
-    total=$(wc -w <<<"$steps" | tr -d ' ')
+    echo "claude-update: identity $line"
+    if [ "$stale_marker" = 1 ]; then rm -f "$pending"; fi
+    if [ "$read_proxy" = 1 ] && [ -n "$proxy" ]; then
+        proxy_before=$(aws ec2 describe-instances --instance-ids "$proxy" --region "$region" --endpoint-url "$ec2_url" --output json 2>/dev/null \
+            | jsq '(j.Reservations || []).flatMap((r) => r.Instances || []).map((i) => (i.State || {}).Name)' 2>/dev/null || true)
+    fi
     for s in $steps; do
         n=$((n + 1))
-        case "$s" in
-        pin) update_step "$n/$total" "make claude-pin CLAUDE_VERSION=$bundle" make --no-print-directory claude-pin CLAUDE_VERSION="$bundle"; pinned=1 ;;
-        test) update_step "$n/$total" "make test-docker" make --no-print-directory test-docker ;;
-        deploy)
-            # A deploy this command starts: a rerun after any failure from here on still owes the proxy step. An
-            # unfinished run's marker keeps the proxy state that run found first (it may have started the proxy since).
-            marker=$(cat "$pending" 2>/dev/null || true)
-            case "$marker" in *" "?*) [ "${marker#* }" = unknown ] || proxy_before=${marker#* } ;; esac
-            mkdir -p "$out" && printf '%s %s\n' "$bundle" "${proxy_before:-unknown}" >"$pending"
-            # EXPECT_BUILD_FAILURE= : the T3.4 switch typed on claude-update's command line must not reach the
-            # deploy (it would skip P12, which the test-docker skip relies on).
-            update_step "$n/$total" "make deploy" make --no-print-directory deploy EXPECT_BUILD_FAILURE=
-            ;;
-        status) update_step "$n/$total" "make infra-status WRITE=1" make --no-print-directory infra-status WRITE=1 ;;
-        active) update_step "$n/$total" "new VMs start the deployed image version" active_is_deployed ;;
-        proxy) update_step "$n/$total" "make proxy-start (squid serving the deployed parameters)" make --no-print-directory proxy-start ;;
-        check) update_step "$n/$total" "ai-env egress check --if-needed" "${ai_env[@]}" egress check --if-needed ;;
-        esac
+        claude_update_step "$s"
     done
     if outputs=$(stack_outputs 2>/dev/null); then
         deployed=$(printf '%s' "$outputs" | jsq 'j.claudeVersion') || deployed=""
@@ -1170,8 +1313,367 @@ cmd_claude_update() {
         versions_note
         echo "claude-update: make test-egress, the broader live test the deploy names, is not part of the daily update: run it when the egress side changes"
     fi
-    if git ls-files --error-unmatch -- "$lock" >/dev/null 2>&1 && ! git diff --quiet -- "$lock" 2>/dev/null; then
+    # git needs no AWS: never with the runner's key, and never an fsmonitor (a hook or the daemon, which would outlive
+    # this run holding whatever environment started it).
+    if "${NO_KEY_ENV[@]}" git -c core.fsmonitor=false ls-files --error-unmatch -- "$lock" >/dev/null 2>&1 \
+        && ! "${NO_KEY_ENV[@]}" git -c core.fsmonitor=false diff --quiet -- "$lock" 2>/dev/null; then
         echo "claude-update: $lock changed: review and commit it"
+    fi
+}
+
+# claude_update_step <step>: step n of cmd_claude_update's total (its locals: n, total, bundle, pending, proxy_before,
+# pinned, tested). pin and test need no AWS: they run without any key in their environment (D18), as the first pass
+# does.
+claude_update_step() {
+    case "$1" in
+    pin)
+        update_step "$n/$total" "make claude-pin CLAUDE_VERSION=$bundle" "${NO_KEY_ENV[@]}" make --no-print-directory claude-pin CLAUDE_VERSION="$bundle"
+        pinned=1
+        ;;
+    test)
+        update_step "$n/$total" "make test-docker" "${NO_KEY_ENV[@]}" make --no-print-directory test-docker
+        tested=1
+        ;;
+    deploy)
+        # A deploy this command starts: a rerun after any failure from here on still owes the proxy step. An
+        # unfinished run's marker keeps the proxy state that run found first (it may have started the proxy since).
+        marker=$(cat "$pending" 2>/dev/null || true)
+        case "$marker" in *" "?*) [ "${marker#* }" = unknown ] || proxy_before=${marker#* } ;; esac
+        mkdir -p "$out" && printf '%s %s\n' "$bundle" "${proxy_before:-unknown}" >"$pending"
+        # EXPECT_BUILD_FAILURE= : the T3.4 switch typed on claude-update's command line must not reach the
+        # deploy (it would skip P12, which the test-docker skip relies on).
+        update_step "$n/$total" "make deploy" make --no-print-directory deploy EXPECT_BUILD_FAILURE=
+        ;;
+    status) update_step "$n/$total" "make infra-status WRITE=1" make --no-print-directory infra-status WRITE=1 ;;
+    active) update_step "$n/$total" "new VMs start the deployed image version" active_is_deployed ;;
+    proxy) update_step "$n/$total" "make proxy-start (squid serving the deployed parameters)" make --no-print-directory proxy-start ;;
+    check) update_step "$n/$total" "ai-env egress check --if-needed" "${ai_env[@]}" egress check --if-needed ;;
+    esac
+}
+
+# ---- S8 operators (plans/s8-operators-contracts.md §9) -----------------------------------------------------------------
+
+# identity_say <exit> <text> <label>: ops.sh identity's one line (`LABEL: identity <text>`, `LABEL: <text>` for a
+# BREAK-GLASS line, `<text>` without a label), then its exit.
+identity_say() {
+    if [ -z "$3" ]; then
+        printf '%s\n' "$2"
+    else
+        case "$2" in
+        BREAK-GLASS:*) printf '%s: %s\n' "$3" "$2" ;;
+        *) printf '%s: identity %s\n' "$3" "$2" ;;
+        esac
+    fi
+    exit "$1"
+}
+
+# identity TIER [LABEL]: whether this process may run a TIER step: deployer (a deployer make target: the first line of
+# its X-run, and P8), ops (claude-update), root-keys (make operator-keys) or breakglass (make destroy: the account root
+# alone, with BREAKGLASS=1; its X-run typed under the deployer's runner must not reach pulumi destroy, which as the
+# deployer would delete the operator users and its own rights half-way). One line on stdout, exit 0 (admitted) or 1
+# (refused); 2 for an unknown TIER. The caller is what `aws sts get-caller-identity` answers in this environment (under
+# ai-env as, the runner's key alone); its account, the ARN's fifth field, is compared, never printed. The stack's facts
+# come from its outputs (accountId, deployerUserName, opsUserName: a local read, no passphrase). The account root is
+# admitted only under the marker AI_ENV_BRIDGE_AS=root (ai-env as root, which infra.mk's TIER runs for the bootstrap
+# and for BREAKGLASS=1), and in the deployer tier, once the stack exports its deployer, only with BREAKGLASS=1 (set
+# by infra.mk's IDENTITY from the make command line alone). What it calls says nothing: its one line is all (P8's row).
+cmd_identity() {
+    local tier=${1:-} label=${2:-} marker=${AI_ENV_BRIDGE_AS:-} arn who acct outputs facts stack_acct stack_deployer stack_ops
+    local glass="BREAK-GLASS: root, with BREAKGLASS=1 on the make command line: no deploy policy applies; delete root's access key again afterwards (README \"Break-glass\")"
+    local glass_only="break-glass only: BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")"
+    case "$tier" in
+    deployer | ops | root-keys | breakglass) ;;
+    *)
+        echo "usage: ops.sh identity deployer|ops|root-keys|breakglass [LABEL]" >&2
+        exit 2
+        ;;
+    esac
+    if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_PROFILE:-}${AWS_DEFAULT_PROFILE:-}" ]; then
+        identity_say 1 "AWS_ACCESS_KEY_ID and AWS_PROFILE are both set: the aws CLI takes the key, Pulumi's providers may take the profile: unset AWS_PROFILE" "$label"
+    fi
+    if ! arn=$(aws sts get-caller-identity --region "$region" --query Arn --output text 2>/dev/null) || [ -z "$arn" ]; then
+        identity_say 1 "none: no AWS credentials answer: make deploy asks for the deployer's key; P8 alone: ai-env as deployer -- make s3-preflight PHASE=b" "$label"
+    fi
+    who=${arn##*:}
+    acct=$(printf '%s' "$arn" | cut -d: -f5)
+    if ! outputs=$(stack_outputs 2>/dev/null) \
+        || ! facts=$(printf '%s' "$outputs" | jsq '[j.accountId, j.deployerUserName, j.opsUserName].map((v) => (v === undefined || v === null ? "" : String(v)))' 2>/dev/null); then
+        identity_say 1 "$who: the outputs of stack $stack cannot be read (pulumi stack output --stack $stack): whether it has a deployer, and its account, are unknown: refused" "$label"
+    fi
+    stack_acct=$(sed -n 1p <<<"$facts")
+    stack_deployer=$(sed -n 2p <<<"$facts")
+    stack_ops=$(sed -n 3p <<<"$facts")
+    if [ -n "$stack_acct" ] && [ "$stack_acct" != "$acct" ]; then
+        identity_say 1 "$who of another AWS account than stack $stack's (its accountId output): make deploy asks for the deployer's key of the stack's account" "$label"
+    fi
+    if [ "$marker" = root ] && [ "$who" != root ]; then
+        identity_say 1 "$who: under ai-env as root, but not the account root: refused" "$label"
+    fi
+    case "$tier:$who" in
+    deployer:user/ai-env-deployer) identity_say 0 "user/ai-env-deployer (the deployer of stack $stack)" "$label" ;;
+    deployer:root | root-keys:root | breakglass:root)
+        if [ "$marker" != root ]; then
+            identity_say 1 "root: not under ai-env as root (make decides it: the bootstrap, or BREAKGLASS=1 on the make command line): refused" "$label"
+        fi
+        if [ "$tier" = breakglass ]; then
+            # Whatever the stack exports: a stack without its operators (older, or a bootstrap half done) is the root's
+            # to destroy too.
+            if [ "${BREAKGLASS:-}" = 1 ]; then identity_say 0 "$glass" "$label"; fi
+            identity_say 1 "root: $glass_only" "$label"
+        fi
+        if [ "$tier" = root-keys ]; then
+            if [ -n "$stack_deployer" ] && [ -n "$stack_ops" ]; then
+                identity_say 0 "root of stack $stack's account, which exports user/ai-env-deployer and user/ai-env-ops: the bootstrap keys" "$label"
+            fi
+            identity_say 1 "root: stack $stack exports no user/ai-env-deployer yet: run the bootstrap deploy first (make deploy, as the account root)" "$label"
+        fi
+        if [ -z "$stack_deployer" ]; then
+            identity_say 0 "root: the bootstrap deploy (stack $stack exports no deployer yet: this deploy creates user/ai-env-deployer and user/ai-env-ops; then make operator-keys, as the account root, once)" "$label"
+        fi
+        if [ "${BREAKGLASS:-}" = 1 ]; then
+            identity_say 0 "$glass" "$label"
+        fi
+        identity_say 1 "root: stack $stack has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line" "$label"
+        ;;
+    deployer:user/ai-env-ops) identity_say 1 "user/ai-env-ops: the ops key cannot deploy: run the make target itself (not its -run target): it asks for the deployer's key" "$label" ;;
+    deployer:user/ai-env-runtime) identity_say 1 "user/ai-env-runtime: the runtime key cannot deploy: make deploy asks for the deployer's key" "$label" ;;
+    deployer:*) identity_say 1 "$who: not the deployer of stack $stack (user/ai-env-deployer): make deploy asks for that user's key and never uses this shell's own AWS settings (AWS_PROFILE, ~/.aws)" "$label" ;;
+    ops:user/ai-env-ops) identity_say 0 "user/ai-env-ops (the operator of stack $stack)" "$label" ;;
+    ops:user/ai-env-deployer) identity_say 0 "user/ai-env-deployer (the deployer of stack $stack, which covers ops)" "$label" ;;
+    ops:root) identity_say 1 "root: an ops step runs as ai-env-ops or the deployer, never the account root (break-glass: make deploy BREAKGLASS=1, then the remaining steps by hand)" "$label" ;;
+    ops:*) identity_say 1 "$who: not ai-env-ops or the deployer of stack $stack" "$label" ;;
+    root-keys:*) identity_say 1 "$who: make operator-keys is the account root's, once, after the bootstrap deploy; the deployer rotates: make ops-key ROTATE=1, make deployer-key ROTATE=1" "$label" ;;
+    breakglass:*) identity_say 1 "$who: break-glass only: the account root's, with BREAKGLASS=1 on the make command line (make destroy deletes the operator users themselves; README \"Break-glass\")" "$label" ;;
+    esac
+}
+
+# stack-deployer: the stack's deployerUserName output and a newline, or nothing before the bootstrap deploy (the outputs
+# hold none); exit 0. Outputs that cannot be read: stack_outputs's line, exit 1 (infra.mk's TIER keeps the deployer
+# then: an unreadable stack is never taken for one without a deployer). A local read; no passphrase.
+cmd_stack_deployer() {
+    local outputs d
+    outputs=$(stack_outputs) || exit 1
+    d=$(printf '%s' "$outputs" | jsq 'j.deployerUserName') || exit 1
+    if [ -n "$d" ]; then printf '%s\n' "$d"; fi
+}
+
+key_issue_usage() {
+    echo "usage: ops.sh key-issue LABEL ai-env-runtime|ai-env-ops sealed [first] | key-issue LABEL ai-env-deployer handover [first]" >&2
+    exit 2
+}
+
+# key_issue_undo: the delete command of the new key (the verified id, else every new one IAM lists), and the sealed
+# container aws-set kept before a rotation (cmd_key_issue's locals: sid, new, old, user, bak, sealed, w).
+key_issue_undo() {
+    local k
+    for k in $([ -n "$sid" ] && echo "$sid" || echo "$new"); do echo "  ${w}aws iam delete-access-key --user-name $user --access-key-id $k --region $region"; done
+    test -n "$sid$new" || echo "  ${w}aws iam delete-access-key --user-name $user --access-key-id <the id not in (${old:-none})> --region $region"
+    if [ -n "$bak" ]; then echo "  mv \"$bak\" \"$sealed\""; fi
+}
+
+# key-issue LABEL USER MODE [first] (D23: no access key ever enters Pulumi, whose state would hold its secret): a new
+# access key of USER, delivered and verified, its secret crossing exactly one pipe, from create-access-key into the
+# CLI that takes it (zeroized memory); this script never holds it. MODE sealed (ai-env-runtime into
+# credentials/aws.env, ai-env-ops into credentials/ops.env): `ai-env creds aws-set --user USER`, then `ai-env creds
+# aws-verify --user USER` (one Touch ID; it retries sts while IAM propagates); handover (ai-env-deployer): `ai-env creds
+# deployer-key --account <the stack's>`, which puts the id, then the secret, on the clipboard (this Mac only,
+# concealed) for the Strongbox entry, takes them pasted back and checks the key with sts. Both print `id <the full id>`
+# and `arn <the ARN sts answered>` lines on stdout, which this captures. Whether a key was created is read from IAM
+# afterwards, never from an exit status (the key exists even when the CLI fails writing into a sealer that already
+# exited): a failure names the delete command of every new id. first (make operator-keys): only a user without a key
+# gets one, so a rerun resumes; never a rotation. ROTATE=1 issues and verifies a new key, then deletes the old one last
+# (under ai-env as deployer, deployer-key ROTATE=1 deletes the running key itself as its last call); when the new key
+# does not verify, the undo deletes it and restores the container aws-set kept as <file>.<unix seconds>.bak (sealed),
+# or says to put the Strongbox entry's previous values back (handover). LABEL is the make target, each line's prefix.
+# Every `aws iam` line it prints for Mike to run starts with the runner of the identity that runs it here (as_writer:
+# the deployer's, or the account root's in its own terminal): a bare `aws` has no credentials on this Mac.
+# Env: ROTATE (1 or empty: the make command line's), AI_ENV_CLI (the make target's $(AI_ENV)).
+cmd_key_issue() {
+    local label=${1:-} user=${2:-} mode=${3:-} first=${4:-} rotate=${ROTATE:-} sealed="" acct="" outputs kept nowhere tool failed route
+    local old n t0 out="" cst dst lst now new k bak f ts rc sid arn key extra undelivered verdict w
+    w=$(as_writer)
+    test $# -le 4 || key_issue_usage
+    case "$mode:$user" in
+    sealed:ai-env-runtime) sealed="${AI_ENV_BRIDGE_DIR:-$HOME/.config/ai-env/bridge}/credentials/aws.env" ;;
+    sealed:ai-env-ops) sealed="${AI_ENV_BRIDGE_DIR:-$HOME/.config/ai-env/bridge}/credentials/ops.env" ;;
+    handover:ai-env-deployer) ;;
+    *) key_issue_usage ;;
+    esac
+    case "$first" in "" | first) ;; *) key_issue_usage ;; esac
+    case "$label" in "" | *[!a-z0-9-]*) key_issue_usage ;; esac
+    need_ai_env
+    if [ -n "$first" ]; then rotate=""; fi
+    if [ "$mode" = sealed ]; then
+        kept="sealed" nowhere="sealed nowhere" tool="aws-set" failed="sealing failed"
+    else
+        kept="in Strongbox" nowhere="held nowhere" tool="deployer-key" failed="the hand-over failed"
+    fi
+    # The recipe's rules from here on: every status is read, nothing stops on its own.
+    set +e
+    old=$(aws iam list-access-keys --user-name "$user" --region "$region" --query 'AccessKeyMetadata[].AccessKeyId' --output text) || exit 1
+    old=${old/None/}
+    n=$(wc -w <<<"$old" | tr -d ' ')
+    if [ -n "$first" ] && [ "$n" -ge 1 ]; then
+        echo "$label: $user has its key already: skipped (a rerun resumes)"
+        exit 0
+    fi
+    if [ "$n" -ge 2 ]; then
+        echo "$label: $user has 2 access keys (the IAM maximum); delete the one that is not $kept first:"
+        echo "  ${w}aws iam list-access-keys --user-name $user --region $region"
+        echo "  ${w}aws iam delete-access-key --user-name $user --access-key-id <id> --region $region"
+        exit 1
+    fi
+    if [ "$n" -eq 1 ] && [ "$rotate" != 1 ]; then
+        if [ "$mode" = sealed ]; then
+            echo "$label: $user already has a key ($old); ROTATE=1 seals a new one, then deletes it"
+        else
+            echo "$label: $user already has a key ($old); ROTATE=1 hands a new one over, then deletes it"
+        fi
+        exit 1
+    fi
+    if [ "$n" -eq 0 ] && [ "$rotate" = 1 ]; then
+        if [ "$mode" = handover ]; then route="make operator-keys (as the account root)"; else route="make $label"; fi
+        echo "$label: ROTATE=1, but $user has no key: $route"; exit 1; fi
+    if [ "$mode" = handover ]; then
+        # creds deployer-key checks the pasted-back key against the stack's account: never this caller's (D10).
+        outputs=$(stack_outputs) && acct=$(printf '%s' "$outputs" | jsq 'j.accountId') || acct=""
+        case "$acct" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *)
+            echo "$label: the outputs of stack $stack name no accountId: the hand-over needs the stack's account: nothing created"
+            exit 1
+            ;;
+        esac
+    fi
+    t0=$(date +%s)
+    if [ "$mode" = sealed ]; then
+        aws iam create-access-key --user-name "$user" --output json --region "$region" | "${ai_env[@]}" creds aws-set --user "$user"
+        st=("${PIPESTATUS[@]}")
+        cst=${st[0]} dst=${st[1]}
+        undelivered=$([ "$dst" -ne 0 ] && echo 1)
+    else
+        out=$(aws iam create-access-key --user-name "$user" --output json --region "$region" | "${ai_env[@]}" creds deployer-key --account "$acct"
+            printf 'status %s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[1]}")
+        cst=$(sed -n 's/^status \([0-9]*\) [0-9]*$/\1/p' <<<"$out" | tail -1)
+        dst=$(sed -n 's/^status [0-9]* \([0-9]*\)$/\1/p' <<<"$out" | tail -1)
+        cst=${cst:-1} dst=${dst:-1}
+        # The hand-over took the key once it printed its id: from there its exit is the verdict's, below.
+        sid=$(sed -n 's/^id //p' <<<"$out" | head -1)
+        undelivered=$([ -z "$sid" ] && echo 1)
+    fi
+    now=$(aws iam list-access-keys --user-name "$user" --region "$region" --query 'AccessKeyMetadata[].AccessKeyId' --output text)
+    lst=$?
+    if [ "$lst" -ne 0 ]; then
+        if [ -n "$undelivered" ]; then
+            echo "$label: $failed (create-access-key exit $cst, $tool exit $dst) and the keys of $user cannot be listed (exit $lst): delete any key not in (${old:-none}):"
+            echo "  ${w}aws iam list-access-keys --user-name $user --region $region"
+            exit 1
+        fi
+        if [ "$mode" = sealed ]; then
+            echo "$label: warning: cannot list the keys of $user after sealing (exit $lst); verifying the sealed key anyway"
+        else
+            echo "$label: warning: cannot list the keys of $user after the hand-over (exit $lst); judging the handed-over key anyway"
+        fi
+        now=""
+    fi
+    new=""
+    for k in ${now/None/}; do case " $old " in *" $k "*) ;; *) new="${new:+$new }$k" ;; esac; done
+    if [ -n "$undelivered" ]; then
+        if [ -n "$new" ]; then
+            echo "$label: $failed (create-access-key exit $cst, $tool exit $dst): the new key(s) $new are $nowhere. Delete them:"
+            for k in $new; do echo "  ${w}aws iam delete-access-key --user-name $user --access-key-id $k --region $region"; done
+        elif [ "$cst" -ne 0 ]; then
+            echo "$label: create-access-key failed (exit $cst) and IAM lists no new key of $user: none was created"
+        else
+            echo "$label: $failed ($tool exit $dst), and IAM does not list the new key yet: delete any key of $user not in (${old:-none}):"
+            echo "  ${w}aws iam list-access-keys --user-name $user --region $region"
+        fi
+        exit 1
+    fi
+    bak=""
+    if [ "$mode" = sealed ] && [ "$rotate" = 1 ]; then
+        for f in "$sealed".*.bak; do
+            ts=${f##*.env.}
+            ts=${ts%.bak}
+            case "$ts" in '' | *[!0-9]*) continue ;; esac
+            if [ "$ts" -ge "$t0" ]; then bak=$f; fi
+        done
+    fi
+    if [ "$mode" = sealed ]; then
+        out=$("${ai_env[@]}" creds aws-verify --user "$user")
+        rc=$?
+    else
+        rc=$dst
+    fi
+    sid=$(sed -n 's/^id //p' <<<"$out" | head -1)
+    arn=$(sed -n 's/^arn //p' <<<"$out" | head -1)
+    key=${sid:-${new:-(not listed yet)}}
+    case "$sid:$new" in :*" "*) key="one of ($new)" ;; esac
+    if [ "$mode" = sealed ] && [ -n "$sid" ]; then
+        case " $old " in *" $sid "*)
+            echo "$label: the container ai-env creds aws-verify verified ($sealed) still holds the previous key $sid: aws-set sealed the new key somewhere else. Nothing deleted; check AI_ENV_BRIDGE_DIR, then delete the key not in (${old:-none}) by hand:"
+            echo "  ${w}aws iam list-access-keys --user-name $user --region $region"
+            exit 1
+            ;;
+        esac
+    fi
+    extra=""
+    if [ -n "$sid" ]; then for k in $new; do test "$k" = "$sid" || extra="${extra:+$extra }$k"; done; fi
+    if [ -n "$extra" ]; then
+        if [ "$mode" = sealed ]; then
+            echo "$label: IAM lists new key(s) sealed nowhere besides the sealed $sid (a retried create-access-key). Delete them:"
+        else
+            echo "$label: IAM lists new key(s) held nowhere besides the handed-over $sid (a retried create-access-key). Delete them:"
+        fi
+        for k in $extra; do echo "  ${w}aws iam delete-access-key --user-name $user --access-key-id $k --region $region"; done
+    fi
+    # The verdict: the user's own key; a key that answered as another principal or never answered (the CLI's verdict:
+    # exit 9; aws-verify's exit 5 after its id line without an arn line; deployer-key's 42); or the CLI's own failure.
+    verdict=failed
+    case "$rc:$arn" in
+    0:*:user/"$user") verdict=identified ;;
+    0:* | 9:*) verdict=unverified ;;
+    5:)
+        if [ "$mode" = sealed ] && [ -n "$sid" ]; then verdict=unverified; fi
+        ;;
+    42:*)
+        if [ "$mode" = handover ]; then verdict=unverified; fi
+        ;;
+    esac
+    case "$verdict:$mode" in
+    identified:sealed) echo "$label: the sealed key ...${key: -4} identifies as user/$user" ;;
+    identified:handover) echo "$label: the key ...${key: -4} is in Strongbox and identifies as user/$user" ;;
+    unverified:*)
+        if [ -n "$bak" ]; then
+            echo "$label: the sealed key $key does not identify as user/$user. $sealed now holds it; the previous key $old is still active and sealed in $bak. If it never verifies, undo the rotation:"
+        elif [ "$mode" = sealed ]; then
+            echo "$label: the sealed key $key does not identify as user/$user; the previous key (${old:-none}) is kept. If it never verifies, delete the new one:"
+        else
+            echo "$label: the key $key does not identify as user/$user; the previous key (${old:-none}) is kept. If it never verifies, delete the new one and put the previous values back in the Strongbox entry (its history keeps them):"
+        fi
+        key_issue_undo
+        exit 1
+        ;;
+    failed:sealed)
+        echo "$label: ai-env creds aws-verify failed (exit $rc): the sealed key $key is NOT verified and nothing was deleted. Verify it with:"
+        echo "  ai-env creds aws-verify --user $user"
+        if [ "$rotate" = 1 ]; then
+            echo "If it identifies as user/$user, finish the rotation:"
+            echo "  ${w}aws iam delete-access-key --user-name $user --access-key-id $old --region $region"
+            echo "If it never does, undo the rotation:"
+            key_issue_undo
+        fi
+        exit 1
+        ;;
+    failed:handover)
+        echo "$label: ai-env creds deployer-key failed (exit $rc): the new key $key is held nowhere you can rely on; delete it:"
+        key_issue_undo
+        exit 1
+        ;;
+    esac
+    if [ "$rotate" = 1 ]; then
+        aws iam delete-access-key --user-name "$user" --access-key-id "$old" --region "$region" || exit 1
+        echo "$label: rotated; deleted the old key $old"
     fi
 }
 
@@ -1192,10 +1694,13 @@ connector-wait) cmd_connector_wait ;;
 connector-status) cmd_connector_status ;;
 connector-probe) cmd_connector_probe ;;
 connector-delete) cmd_connector_delete ;;
-plan-gate) cmd_plan_gate ;;
+plan-gate) cmd_plan_gate "$@" ;;
 replace-guard) cmd_replace_guard ;;
 plan-errors) cmd_plan_errors ;;
 post-deploy) cmd_post_deploy "$@" ;;
 claude-update) cmd_claude_update ;;
-*) echo "usage: ops.sh snapshot <prefix> | wait | status | versions | builds [VERSION] | set-status ACTIVE|INACTIVE VERSION | prune KEEP [1] | vm-guard | delete-image | checklist | connector-wait | connector-status | connector-probe | connector-delete | plan-gate | replace-guard | plan-errors | post-deploy [--after-failure] | claude-update (the plan on stdin for plan-gate, replace-guard, plan-errors)" >&2; exit 2 ;;
+identity) cmd_identity "$@" ;;
+stack-deployer) cmd_stack_deployer ;;
+key-issue) cmd_key_issue "$@" ;;
+*) echo "usage: ops.sh snapshot <prefix> | wait | status | versions | builds [VERSION] | set-status ACTIVE|INACTIVE VERSION | prune KEEP [1] | vm-guard | delete-image | checklist | connector-wait | connector-status | connector-probe | connector-delete | plan-gate [--known-documents POLICY...] | replace-guard | plan-errors | post-deploy [--after-failure] | claude-update | identity deployer|ops|root-keys|breakglass [LABEL] | stack-deployer | key-issue LABEL USER sealed|handover [first] (the plan on stdin for plan-gate, replace-guard, plan-errors)" >&2; exit 2 ;;
 esac

@@ -1918,6 +1918,17 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     // S8's fresh-claude-json seeds the current directory's workspace into its VM and starts claude there as Cursor
     // starts a chat: both made before any Touch ID (a refusal is exit 9, as a session's P0).
     let fresh = if name == "fresh-claude-json" { Some((fresh_workspace(&ctx)?, lab::CursorChat::new(&ctx.cfg)?)) } else { None };
+    // S8 operators: connector-pending reads the throw-away connector as the operator. Its identity and account
+    // answer come first (its Touch ID before the runtime key's, never on a runtime thread), its refusals keep
+    // their class, and an operator of another account than the connector's is refused here, before the runtime
+    // key is unsealed (the probe checks it again).
+    if name == "connector-pending" {
+        let label = |e| crate::bridge::identity::labelled("lab run connector-pending", e);
+        crate::bridge::identity::verified().map_err(label)?;
+        if let Some(arn) = id {
+            awscli::require_operator_account(arn).map_err(label)?;
+        }
+    }
     let rt = runtime()?;
     let credentialed = matches!(name, "fd-delivery" | "init-budget" | "fresh-claude-json");
     let outcome = rt.block_on(async {
@@ -2120,15 +2131,24 @@ fn s3_day(row: &VmRow) -> String {
 
 /// One `filter-log-events` command per log group, each into its own file (a later empty group must not overwrite
 /// a hit), then the probe over that file. Group names were checked to be shell-safe; the id is `[A-Za-z0-9-]`.
-fn filter_command(group: &str, id: &str, n: usize, start_ms: u64) -> String {
+/// S8 operators: `runner` starts it. A group of the probe's account is read under the runner of the identity the
+/// probe ran as ([`Operator::writer_runner`](crate::bridge::identity::Operator::writer_runner)): the deployer's
+/// (`ai-env as deployer -- `) for the ops key or a runner's, as reading the account's API record unmasked is the
+/// deployer's, never the daily ops key's (contracts A11), and the shell's own aws CLI has no credentials of the
+/// account once root's key is retired; the account root's or the ambient one's when the probe ran as that (another
+/// account's own credentials, where the stack's deployer does not exist). An organization trail's group is the
+/// owning account's, read with credentials of that account: `""`, the plain `aws`.
+fn filter_command(group: &str, id: &str, n: usize, start_ms: u64, runner: &str) -> String {
     format!(
-        "aws logs filter-log-events --region {REGION} --endpoint-url {} --log-group-name '{group}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json",
+        "{runner}aws logs filter-log-events --region {REGION} --endpoint-url {} --log-group-name '{group}' --filter-pattern '\"{id}\"' --start-time {start_ms} --unmask --output json > ~/ct-{id}-{n}.json && ai-env lab run cloudtrail-payload {id} --log ~/ct-{id}-{n}.json",
         awscli::LOGS_URL
     )
 }
 
 /// How to get the RunMicrovm record of `id` out of each keeper, one line each. Never a command for another Region.
-fn keeper_hints(keepers: &[Keeper], groups: &[(String, String)], id: &str, day: &str, start_ms: u64) -> Vec<String> {
+/// `runner` starts every `filter-log-events` of the probe's own account, the commands and the prose alike
+/// ([`filter_command`]).
+fn keeper_hints(keepers: &[Keeper], groups: &[(String, String)], id: &str, day: &str, start_ms: u64, runner: &str) -> Vec<String> {
     let mut n = 0;
     let mut out = Vec::new();
     for k in keepers {
@@ -2148,7 +2168,7 @@ fn keeper_hints(keepers: &[Keeper], groups: &[(String, String)], id: &str, day: 
                     (Some((r, g)), _) if r == REGION => {
                         n += 1;
                         let run_as = if *org { format!(" (run it with credentials of account {owner_acct}, which owns the group)") } else { String::new() };
-                        out.push(format!("trail {arn} also forwards to the CloudWatch Logs group {g}{run_as}: {}", filter_command(g, id, n, start_ms)));
+                        out.push(format!("trail {arn} also forwards to the CloudWatch Logs group {g}{run_as}: {}", filter_command(g, id, n, start_ms, if *org { "" } else { runner })));
                     }
                     (Some((r, g)), _) => out.push(format!("trail {arn} also forwards to the CloudWatch Logs group {g} in {r}, outside the {REGION} pin (no command)")),
                     (None, Some(raw)) => out.push(format!("trail {arn} also forwards to {raw}, which is not a log group name this probe prints")),
@@ -2157,18 +2177,18 @@ fn keeper_hints(keepers: &[Keeper], groups: &[(String, String)], id: &str, day: 
             }
             Keeper::Channel(v) if v.kind == "cloudwatch" => {
                 if groups.is_empty() {
-                    out.push(format!("channel {} (CloudWatch's CloudTrail ingestion) may keep RunMicrovm, but no CloudWatch Logs group with cloudtrail in its name was found in {REGION}: find its log group (CloudWatch → Log groups) and fetch the record with aws logs filter-log-events --unmask, then: ai-env lab run cloudtrail-payload {id} --log FILE", v.name));
+                    out.push(format!("channel {} (CloudWatch's CloudTrail ingestion) may keep RunMicrovm, but no CloudWatch Logs group with cloudtrail in its name was found in {REGION}: find its log group (CloudWatch → Log groups) and fetch the record with {runner}aws logs filter-log-events --unmask, then: ai-env lab run cloudtrail-payload {id} --log FILE", v.name));
                 }
                 for (g, class) in groups {
                     if !probes::is_safe_log_group_name(g) {
-                        out.push(format!("channel {} (CloudWatch) may have written it to the log group {g:?}, a name this probe does not print into a command: fetch the record with aws logs filter-log-events --unmask, then --log FILE", v.name));
+                        out.push(format!("channel {} (CloudWatch) may have written it to the log group {g:?}, a name this probe does not print into a command: fetch the record with {runner}aws logs filter-log-events --unmask, then --log FILE", v.name));
                     } else if class == "INFREQUENT_ACCESS" {
                         out.push(format!("channel {} (CloudWatch) may have written it to {g} (log class INFREQUENT_ACCESS: filter-log-events is not supported; search it with CloudWatch Logs Insights and record the verdict with --manual)", v.name));
                     } else if class != "STANDARD" {
                         out.push(format!("channel {} (CloudWatch) may have written it to {g} (log class {class}: not searchable with filter-log-events; record what it holds with --manual)", v.name));
                     } else {
                         n += 1;
-                        out.push(format!("channel {} (CloudWatch) may have written it to {g}: {}", v.name, filter_command(g, id, n, start_ms)));
+                        out.push(format!("channel {} (CloudWatch) may have written it to {g}: {}", v.name, filter_command(g, id, n, start_ms, runner)));
                     }
                 }
             }
@@ -2203,6 +2223,9 @@ fn cloudtrail(paths: &Paths, spec: &probes::ProbeSpec, id: &str, log: Option<&st
             Err(e) => Err(CliError::Msg(format!("cloudtrail-payload: {e}; nothing recorded"))),
         };
     }
+    // S8 operators: the reads below run as the operator identity, resolved first (its one Touch ID); the commands
+    // printed for a group of this account start with the runner that can read it unmasked (its writer_runner).
+    let op = crate::bridge::identity::operator().map_err(|e| crate::bridge::identity::labelled("lab run cloudtrail-payload", e))?;
     let cov = microvm_data_event_coverage().map_err(|e| CliError::Aws(format!("cloudtrail-payload: {e}; nothing recorded")))?;
     if !cov.unreadable.is_empty() {
         return Err(CliError::Aws(format!("cloudtrail-payload: could not read what {} logs; nothing recorded", cov.unreadable.join("; "))));
@@ -2210,7 +2233,7 @@ fn cloudtrail(paths: &Paths, spec: &probes::ProbeSpec, id: &str, log: Option<&st
     if !cov.keepers.is_empty() {
         let wants_groups = cov.keepers.iter().any(|k| matches!(k, Keeper::Channel(v) if v.kind == "cloudwatch"));
         let groups = if wants_groups { cloudtrail_log_groups().map_err(|e| CliError::Aws(format!("cloudtrail-payload: {e}; nothing recorded")))? } else { Vec::new() };
-        let hints = keeper_hints(&cov.keepers, &groups, id, &s3_day(&row), search_start_ms(&row));
+        let hints = keeper_hints(&cov.keepers, &groups, id, &s3_day(&row), search_start_ms(&row), op.writer_runner());
         return Err(CliError::Msg(format!("cloudtrail-payload: RunMicrovm records are not in event history; where they may be kept:\n  {}\nnothing recorded", hints.join("\n  "))));
     }
     let stores = if cov.stores_seen.is_empty() {
@@ -2271,15 +2294,42 @@ mod tests {
             log_group: group.map(|(r, g)| (r.to_string(), g.to_string())),
             org,
         };
-        let hints = keeper_hints(&[trail(false, Some(("eu-central-1", "g1")))], &[], "microvm-x", "2026-09-30", 1_000);
+        const AS_D: &str = "ai-env as deployer -- ";
+        let hints = keeper_hints(&[trail(false, Some(("eu-central-1", "g1")))], &[], "microvm-x", "2026-09-30", 1_000, AS_D);
         assert_eq!(hints.len(), 2, "{hints:?}");
         assert!(hints[0].contains("s3://b/AWSLogs/") && hints[0].contains("CloudTrail/eu-central-1/2026/09/30/"), "the day of the VM's start: {hints:?}");
         assert!(hints[1].contains("--log-group-name 'g1'") && hints[1].contains("--start-time 1000 ") && hints[1].contains("~/ct-microvm-x-1.json"), "{hints:?}");
-        let org = keeper_hints(&[trail(true, Some(("eu-central-1", "g2")))], &[], "microvm-x", "2026-09-30", 1_000);
+        // S8 operators: this account's group is read as ai-env-deployer (A11); the shell's own aws CLI has no key of it.
+        let command = |runner: &str| format!(": {runner}aws logs filter-log-events --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com --log-group-name 'g1' --filter-pattern '\"microvm-x\"' --start-time 1000 --unmask --output json > ~/ct-microvm-x-1.json && ai-env lab run cloudtrail-payload microvm-x --log ~/ct-microvm-x-1.json");
+        assert!(hints[1].ends_with(&command(AS_D)), "{hints:?}");
+        // Under the runner the probe ran as when that is not the deployer's (gap-a): an ambient one reads another
+        // account, where the stack's deployer does not exist; the account root's, its own.
+        for runner in ["ai-env as ambient -- ", "ai-env as root -- "] {
+            let hints = keeper_hints(&[trail(false, Some(("eu-central-1", "g1")))], &[], "microvm-x", "2026-09-30", 1_000, runner);
+            assert!(hints[1].ends_with(&command(runner)) && !hints[1].contains(AS_D), "{hints:?}");
+        }
+        let org = keeper_hints(&[trail(true, Some(("eu-central-1", "g2")))], &[], "microvm-x", "2026-09-30", 1_000, AS_D);
         assert!(org[0].contains("owned by account 123456789012") && org[1].contains("run it with credentials of account 123456789012"), "{org:?}");
-        let far = keeper_hints(&[trail(false, Some(("us-east-1", "g3")))], &[], "microvm-x", "2026-09-30", 1_000);
+        assert!(org[1].contains("): aws logs filter-log-events ") && !org[1].contains("ai-env as "), "the owner account's credentials, never a key of this stack: {org:?}");
+        let far = keeper_hints(&[trail(false, Some(("us-east-1", "g3")))], &[], "microvm-x", "2026-09-30", 1_000, AS_D);
         assert!(far[1].contains("g3 in us-east-1") && !far.iter().any(|h| h.contains("filter-log-events")), "{far:?}");
-        assert_eq!(keeper_hints(&[trail(false, None)], &[], "microvm-x", "2026-09-30", 1_000).len(), 1, "S3 only");
+        assert_eq!(keeper_hints(&[trail(false, None)], &[], "microvm-x", "2026-09-30", 1_000, AS_D).len(), 1, "S3 only");
+        // CloudWatch's ingestion channel: the prose routes name the same runner as the commands.
+        let cw = Keeper::Channel(probes::ChannelView {
+            name: "aws-service-channel/cloudwatch/x".into(),
+            arn: "arn:aws:cloudtrail:eu-central-1:123456789012:channel/cw".into(),
+            cover: probes::ChannelCover::Logs,
+            kind: "cloudwatch".into(),
+            destinations: vec![("AWS_SERVICE".into(), "cloudwatch".into())],
+        });
+        let ambient = "ai-env as ambient -- ";
+        let none = keeper_hints(std::slice::from_ref(&cw), &[], "microvm-x", "2026-09-30", 1_000, ambient);
+        assert!(none[0].contains("fetch the record with ai-env as ambient -- aws logs filter-log-events --unmask, then:") && !none[0].contains(AS_D), "{none:?}");
+        let groups = [("odd'name".to_string(), "STANDARD".to_string()), ("aws/cloudtrail/data".to_string(), "STANDARD".to_string())];
+        let named = keeper_hints(std::slice::from_ref(&cw), &groups, "microvm-x", "2026-09-30", 1_000, ambient);
+        assert!(named[0].contains("fetch the record with ai-env as ambient -- aws logs filter-log-events --unmask, then --log FILE"), "{named:?}");
+        assert!(named[1].contains(": ai-env as ambient -- aws logs filter-log-events --region eu-central-1 ") && named[1].contains("--log-group-name 'aws/cloudtrail/data'"), "{named:?}");
+        assert!(!named.iter().any(|h| h.contains(AS_D)), "{named:?}");
     }
 
     /// `vm smoke --exec`'s verdict on its record: steps that all passed

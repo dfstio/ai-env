@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "2.2",
+  "description": "ai-env egress proxy: the squid package and ai-env-proxy-reload --status (read-only)",
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "status",
+      "inputs": {
+        "timeoutSeconds": "400",
+        "runCommand": [
+          "rpm -q squid || true",
+          "/usr/local/sbin/ai-env-proxy-reload --status"
+        ]
+      }
+    }
+  ]
+}

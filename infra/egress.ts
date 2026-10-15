@@ -2,7 +2,9 @@
 // VPC without Amazon DNS, the proxy subnet (0.0.0.0/0 → IGW) and the VM subnet (no route at all, its own NACL), the
 // two security groups, the squid proxy instance with its role, profile, SSM parameters and log group, the
 // connector's operator role (with an inline Deny confining its ENIs to the VM subnet and the VM security group) and
-// the aws-native NetworkConnector `ai-env-egress` whose ENIs sit in the VM subnet.
+// the aws-native NetworkConnector `ai-env-egress` whose ENIs sit in the VM subnet. S8 operators adds the proxy's three
+// SSM Command documents (infra/proxy/documents, egress-config.json's names): the only commands ai-env-ops and
+// ai-env-deployer may send, and only to the proxy instance (AWS-RunShellScript is never sent).
 //
 // Why this shape: MicroVMs on the connector can only reach TCP 3128 on the proxy's address, which CONNECTs to an
 // allowlist. Every network resource is built from the spec in egress-spec.ts after assertEgressSpec accepted it.
@@ -10,8 +12,10 @@
 // checks every resource the program registers, anywhere, and the network resources input by input, then seals
 // transform registration. The final word is scripts/check-plan.ts over `pulumi preview --json` (the engine does
 // not order stack transforms, and a preview cannot compare unknown ids). No Pulumi `protect` (it would make `make
-// destroy` refuse): `make deploy`'s replacement guard covers the VPC, subnets, SGs and connector. The proxy
-// configuration lives in SSM Parameter Store, never in user-data (a user-data change replaces the instance).
+// destroy` refuse), no `retainOnDelete` and no `deletedWith` anywhere (destroy, the account root's alone, removes the
+// operator identities too): the guard refuses all three; `make deploy`'s replacement guard covers the VPC, subnets, SGs and
+// connector, and check-plan refuses replacing or deleting the deployer's identity. The proxy configuration lives in
+// SSM Parameter Store, never in user-data (a user-data change replaces the instance).
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -19,12 +23,14 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsnative from "@pulumi/aws-native";
 import {
-    AMI_PARAMETER, EgressConfig, EgressSpec, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY, ImageNames, NET, NaclRuleSpec,
-    PARAMETER_MAX_BYTES, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyParameter, RouteSpec, RuleSpec, SgKey, VM_SG_DESCRIPTION, checkNacl, checkRoutes, checkRule,
-    checkVpcDns, dnsQueryLogGroup, inInventory, ruleName, ruleOwner, stackInventory,
+    AMI_PARAMETER, DOCUMENT_ROLES, DocumentRole, EgressConfig, EgressSpec, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY,
+    ImageNames, NET, NaclRuleSpec, PARAMETER_MAX_BYTES, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, ProxyParameter, RouteSpec, RuleSpec, SgKey,
+    VM_SG_DESCRIPTION, checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, inInventory, ruleName, ruleOwner,
+    stackInventory,
 } from "./egress-spec";
 import {
-    CONNECTOR_OPERATOR_POLICY_ARN, Names, REGION, SSM_INSTANCE_POLICY_ARN, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy,
+    CONNECTOR_OPERATOR_POLICY_ARN, Names, POLICY_DESCRIPTIONS, REGION, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, USER_POLICY_ATTACHMENTS, attachmentName, operatorRolePolicy,
+    operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy,
 } from "./policies";
 
 /** The operator role must be assumable before CreateNetworkConnector (IAM is eventually consistent; image.ts waits 15 s). */
@@ -130,6 +136,8 @@ const T = {
     user: "aws:iam/user:User",
     userPolicy: "aws:iam/userPolicy:UserPolicy",
     policy: "aws:iam/policy:Policy",
+    userAttachment: "aws:iam/userPolicyAttachment:UserPolicyAttachment",
+    document: "aws:ssm/document:Document",
     budget: "aws:budgets/budget:Budget",
     image: "aws-native:lambda:MicrovmImage",
     fwDomainList: "aws:route53/resolverFirewallDomainList:ResolverFirewallDomainList",
@@ -221,9 +229,10 @@ function sealTransforms(): void {
  * associations, extra providers, components...) is refused, and every resource of the inventory has its inputs
  * checked; the network resources against the spec's predicates, input by input. It throws, failing the preview or
  * update. In a preview of new resources the references (vpcId, subnet and SG ids) are unknown: check-plan.ts checks
- * them by URN; during an update the guard compares them with the ids the egress resources got.
+ * them by URN; during an update the guard compares them with the ids the egress resources got. `documents` are the
+ * proxy's SSM documents as index.ts read them (readProxyDocuments): each Document resource must carry exactly its file.
  */
-export function guardEgress(spec: EgressSpec, image: ImageNames): EgressGuard {
+export function guardEgress(spec: EgressSpec, image: ImageNames, documents: ProxyDocuments): EgressGuard {
     const cfg = spec.cfg;
     const inventory = stackInventory(cfg, image);
     const ids = new Map<IdKey, Promise<string>>();
@@ -234,13 +243,22 @@ export function guardEgress(spec: EgressSpec, image: ImageNames): EgressGuard {
     const parameterNames = new Map<string, string>(PROXY_PARAMETERS.map((p) => [`ai-env-proxy-${p}`, `${cfg.parameterPrefix}/${p}`]));
     const logGroups = new Map<string, string>([["image-log-group", image.logGroup], [NET.logGroup, cfg.logGroup], [NET.dnsLogGroup, dnsQueryLogGroup(cfg)]]);
     const attachments = new Map<string, string>([[`${cfg.proxyRoleName}-ssm`, SSM_INSTANCE_POLICY_ARN], [cfg.operatorRoleName, CONNECTOR_OPERATOR_POLICY_ARN]]);
+    // S8 operators: which user and policy each user policy attachment binds, and which document each name is.
+    const userAttachments = new Map<string, readonly [string, string]>(USER_POLICY_ATTACHMENTS.map(([u, p]) => [attachmentName(u, p), [u, p] as const]));
+    const documentRoles = new Map<string, DocumentRole>(DOCUMENT_ROLES.map((r) => [documentNames(cfg)[r], r]));
 
-    async function check(type: string, name: string, custom: boolean, props: Props): Promise<string[]> {
+    async function check(type: string, name: string, custom: boolean, props: Props, opts: pulumi.ResourceOptions): Promise<string[]> {
         const problems: string[] = [];
         const waits: Promise<void>[] = [];
         const bad = (msg: string) => problems.push(msg);
         if (!custom) return [`component resources are refused (the stack has none): ${type} ${name}`];
         if (!inInventory(inventory, type, name)) return [`not in the stack inventory (infra/egress-spec.ts stackInventory): ${type} ${name}`];
+        // No resource keeps itself out of `make destroy`, or out of its own deletion (contracts §1.1). deletedWith does
+        // the same: when the named resource goes in the same run, Pulumi never calls this one's Delete (it would leave
+        // ai-env-deployer, its key and its policies behind a `make destroy` that reports success).
+        if (opts.protect === true) bad("protect is refused (make destroy must work)");
+        if (opts.retainOnDelete === true) bad("retainOnDelete is refused (make destroy removes every resource of the stack, the operator identities included)");
+        if (opts.deletedWith !== undefined && opts.deletedWith !== null) bad("deletedWith is refused (make destroy deletes every resource of the stack itself, the operator identities included)");
         // Only these inputs may be set; any other is outside the spec.
         const only = (...keys: string[]) => {
             for (const [k, v] of Object.entries(props)) if (isSet(v) && !keys.includes(k)) bad(`input ${k} is outside the stack spec`);
@@ -425,7 +443,11 @@ export function guardEgress(spec: EgressSpec, image: ImageNames): EgressGuard {
             eq("name", logGroups.get(name));
             break;
         // IAM: the inputs iam.ts and egress.ts set, nothing else (no managedPolicyArns, inlinePolicies or permissions
-        // boundary on a role). The documents themselves are compared by check-plan.ts, which knows the account id.
+        // boundary on a role; on a user only its name, forceDestroy and tags; MacRuntimePolicy, the inventory's only user
+        // policy, stays on ai-env-runtime; a user policy attachment binds exactly the stack's user and policy its name
+        // says). A user known here (an update, or a literal) is compared; in a fresh preview it is another resource's
+        // output, unknown, and check-plan.ts holds it by URN. The policy documents themselves are compared by
+        // check-plan.ts, which knows the account id.
         case T.role:
             only("name", "description", "assumeRolePolicy", "tags");
             eq("name", name);
@@ -437,15 +459,42 @@ export function guardEgress(spec: EgressSpec, image: ImageNames): EgressGuard {
         case T.user:
             only("name", "forceDestroy", "tags");
             eq("name", name);
+            eq("forceDestroy", true);
             break;
         case T.userPolicy:
             only("name", "user", "policy");
             eq("name", name);
+            // On another user (ai-env-ops, say) the runtime grants would follow it: RunMicrovm, the shell token, PassRole.
+            if (props.user !== UNKNOWN) eq("user", RUNTIME_USER_NAME);
             break;
         case T.policy:
             only("name", "description", "policy", "tags");
             eq("name", name);
+            // Frozen: IAM cannot change a description in place, so a new one replaces the policy.
+            eq("description", POLICY_DESCRIPTIONS.get(name));
             break;
+        case T.userAttachment: {
+            const [user, policy] = userAttachments.get(name)!;
+            only("user", "policyArn");
+            if (props.user !== UNKNOWN) eq("user", user);
+            const arn = props.policyArn;
+            if (arn !== UNKNOWN && !(typeof arn === "string" && /^arn:aws:iam::[0-9]{12}:policy\/[A-Za-z0-9+=,.@_-]+$/.test(arn) && arn.slice(arn.lastIndexOf("/") + 1) === policy)) {
+                bad(`policyArn must be the stack's policy ${policy}, got ${show(arn)}`);
+            }
+            break;
+        }
+        case T.document: {
+            const role = documentRoles.get(name)!;
+            only("name", "content", "documentType", "documentFormat", "targetType", "tags", "region");
+            eq("name", name);
+            eq("documentType", "Command");
+            eq("documentFormat", "JSON");
+            eq("targetType", "/AWS::EC2::Instance");
+            if (typeof props.content !== "string") { bad(`content must be a literal, the canonical ${documentFile(role)}`); break; }
+            if (props.content !== documents[role]) bad(`content is not ${documentFile(role)}`);
+            for (const p of checkProxyDocument(role, props.content)) bad(p);
+            break;
+        }
         case T.instanceProfile:
             only("name", "role", "tags");
             eq("name", name);
@@ -509,7 +558,7 @@ export function guardEgress(spec: EgressSpec, image: ImageNames): EgressGuard {
     }
 
     const guard: pulumi.ResourceTransform = async (args) => {
-        const problems = await check(args.type, args.name, args.custom, (await settle(args.props)) as Props);
+        const problems = await check(args.type, args.name, args.custom, (await settle(args.props)) as Props, args.opts ?? {});
         if (problems.length > 0) throw new Error(`egress guard (infra/egress.ts) refused ${args.type} ${args.name}: ${problems.join("; ")}`);
         return undefined;
     };
@@ -547,6 +596,8 @@ export interface Egress {
     proxyRole: aws.iam.Role;
     operatorRole: aws.iam.Role;
     connector: awsnative.lambda.NetworkConnector;
+    /** S8 operators: the proxy's SSM Command documents by role (reload, status, patch). */
+    documents: Record<DocumentRole, aws.ssm.Document>;
     /** Lowercase hex SHA-256 of the exact `squid.conf` and `allow` values the program writes (`ai-env egress status` compares the live ones). */
     squidConfSha256: string;
     allowSha256: string;
@@ -567,9 +618,10 @@ const OWNED_IGNORE = ["allowedPattern", "arn", "dataType", "description", "insec
 
 /**
  * The egress resources, every one with the Pulumi name the inventory lists. The scratch:* markers are edited by
- * `make preview-scratch NEGATIVE=dns-support-on-in-none-mode|miswired|dns-firewall-qtype|iam-widen` in a scratch copy.
+ * `make preview-scratch NEGATIVE=dns-support-on-in-none-mode|miswired|dns-firewall-qtype|iam-widen|document-widen` in a
+ * scratch copy. `docs` are the proxy's documents as index.ts read and asserted them (readProxyDocuments).
  */
-export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi.Output<Names>, tags: Record<string, string>, providers: EgressProviders): Egress {
+export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi.Output<Names>, docs: ProxyDocuments, tags: Record<string, string>, providers: EgressProviders): Egress {
     const cfg = spec.cfg;
     const opts = { provider: providers.aws };
     const named = (name: string) => ({ ...tags, Name: name });
@@ -648,6 +700,16 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
             name: `${cfg.parameterPrefix}/${p}`, type: "String", tier: "Standard", dataType: "text", insecureValue: values[p],
             description: owned ? `ai-env egress proxy ${p} (owned by ai-env egress after creation)` : `ai-env egress proxy ${p} (from infra/proxy)`, tags,
         }, { ...opts, ignoreChanges: owned ? OWNED_IGNORE : [] });
+    }
+
+    // S8 operators: the proxy's documents, the only commands ai-env-ops (and the deployer) may send it. The content is
+    // the file's canonical JSON; never permissions (a shared document), versionName or attachments.
+    const documents = {} as Record<DocumentRole, aws.ssm.Document>;
+    for (const role of DOCUMENT_ROLES) {
+        const name = documentNames(cfg)[role];
+        documents[role] = new aws.ssm.Document(name, {
+            name, documentType: "Command", documentFormat: "JSON", targetType: "/AWS::EC2::Instance", content: docs[role], tags, // scratch:document
+        }, opts);
     }
 
     const proxyRole = new aws.iam.Role(cfg.proxyRoleName, {
@@ -749,7 +811,7 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
 
     const sha256 = (value: string) => crypto.createHash("sha256").update(value, "utf-8").digest("hex");
     return {
-        vpc, vmSubnet, vmSecurityGroup: sgs.vm, proxySecurityGroup: sgs.proxy, instance, logGroup, parameters, proxyRole, operatorRole, connector,
+        vpc, vmSubnet, vmSecurityGroup: sgs.vm, proxySecurityGroup: sgs.proxy, instance, logGroup, parameters, proxyRole, operatorRole, connector, documents,
         squidConfSha256: sha256(values["squid.conf"]), allowSha256: sha256(values.allow),
     };
 }

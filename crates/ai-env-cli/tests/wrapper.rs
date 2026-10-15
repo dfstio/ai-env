@@ -25,11 +25,12 @@ fn wrapper() -> &'static str {
 /// kill switch, the lab knobs, a config-path override, the S2 pump mode and
 /// its knobs — a set mode would turn these exec tests into piped runs — what
 /// S7's `local-scratch` login reads: the token, the keystore directory and
-/// its two lab knobs; and S8's VM pin and transcript knob, the remote
-/// session's lab knobs and its trace) or the fake (`tests/fakes/claude.sh`'s
-/// knobs but the argv log `command` sets). Every `AI_ENV_BRIDGE_*` knob the
-/// code reads is here but the bridge root (`tests/infra/image.rs` checks it).
-const WRAPPER_ENV: [&str; 24] = [
+/// its two lab knobs; S8's VM pin and transcript knob, the remote session's
+/// lab knobs and its trace; and the S8 operators' `ai-env as` marker and the
+/// pasteboard's osascript knob) or the fake (`tests/fakes/claude.sh`'s knobs
+/// but the argv log `command` sets). Every `AI_ENV_BRIDGE_*` knob the code
+/// reads is here but the bridge root (`tests/infra/image.rs` checks it).
+const WRAPPER_ENV: [&str; 26] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -49,6 +50,8 @@ const WRAPPER_ENV: [&str; 24] = [
     "AI_ENV_BRIDGE_LAB_AGENT_ADDR",
     "AI_ENV_BRIDGE_LAB_FAKE_SHELL",
     "AI_ENV_BRIDGE_TRACE",
+    "AI_ENV_BRIDGE_AS",
+    "AI_ENV_BRIDGE_LAB_OSASCRIPT",
     "AI_ENV_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "FAKE_STDOUT",

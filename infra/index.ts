@@ -1,7 +1,10 @@
 // ai-env S3 infrastructure (plans/s3-plan.md §8, §9): the artifacts bucket with the hash-keyed image zip, the log
-// group, the build and execution roles, the runtime user ai-env-runtime, the unattached ai-env-deploy policy, the
-// monthly budget and the aws-native MicrovmImage ai-env-agent. S5 (plans/s5-plan.md) adds the egress side
-// (egress.ts): a VPC without Amazon DNS, the squid proxy and the network connector `ai-env-egress`.
+// group, the build and execution roles, the runtime user ai-env-runtime, the ai-env-deploy policy, the monthly budget
+// and the aws-native MicrovmImage ai-env-agent. S5 (plans/s5-plan.md) adds the egress side (egress.ts): a VPC without
+// Amazon DNS, the squid proxy and the network connector `ai-env-egress`. S8 operators (plans/s8-operators-plan.md)
+// adds the operator identities (iam.ts): the users ai-env-deployer and ai-env-ops, without any key, holding the stack's
+// policies (the deployer the three deploy policies, its supplement and ai-env-ops; ops ai-env-ops), and the proxy's
+// three SSM documents (egress.ts, from infra/proxy/documents). The account root runs the bootstrap deploy once.
 //
 // Why it looks like this: the MicroVM API exists in one region only, so both providers are explicit objects with
 // the region from a constant and the program refuses a stack whose aws:region or aws-native:region says otherwise
@@ -15,7 +18,7 @@ import * as aws from "@pulumi/aws";
 import * as awsnative from "@pulumi/aws-native";
 import { budgetSettings, createBudget } from "./budget";
 import { createEgress, guardEgress } from "./egress";
-import { assertEgressSpec, egressNames, egressSpec, loadEgressConfig } from "./egress-spec";
+import { assertEgressSpec, assertProxyDocuments, egressNames, egressSpec, loadEgressConfig, readProxyDocuments } from "./egress-spec";
 import { createIam } from "./iam";
 import { createArtifacts, createImage, loadImageConfig, loadImageJson } from "./image";
 import { Names, PROJECT, REGION } from "./policies";
@@ -46,13 +49,17 @@ function loadEnvConfig(file: string): Record<string, string> {
 
 // The egress spec (S5): refused before any resource is registered, then guarded: the transform checks every resource
 // registered after this line against the stack inventory, wherever in the program it comes from, and later
-// transform registrations throw. `make preview-scratch NEGATIVE=...` disables the assert through its scratch:assert
-// marker (and the guard through egress.ts's scratch:guard), so the next layer alone must refuse.
+// transform registrations throw. `make preview-scratch NEGATIVE=...` disables the asserts through their scratch:assert
+// and scratch:assert-documents markers (and the guard through egress.ts's scratch:guard), so the next layer alone must
+// refuse. S8 operators: the proxy's SSM documents (infra/proxy/documents) are read once, asserted like the spec, and
+// the guard holds each Document resource to exactly what was read.
 const egressConfig = loadEgressConfig();
 const egress = egressSpec(egressConfig);
 assertEgressSpec(egress); // scratch:assert
+const documents = readProxyDocuments();
+assertProxyDocuments(documents); // scratch:assert-documents
 const imageConfig = loadImageConfig();
-const guard = guardEgress(egress, imageConfig);
+const guard = guardEgress(egress, imageConfig, documents);
 
 const envFile = path.join(__dirname, "config", `${stack}.env`);
 const budget = budgetSettings(loadEnvConfig(envFile), envFile);
@@ -67,9 +74,9 @@ const artifacts = createArtifacts(imageConfig, imageJson, tags, awsProvider);
 const names: pulumi.Output<Names> = pulumi.all([accountId, artifacts.bucket.bucket]).apply(([acct, bucket]) => ({
     accountId: acct, region: REGION, bucket, imageName: imageConfig.imageName, logGroup: imageConfig.logGroup, egress: egressNames(egressConfig),
 }));
-const net = createEgress(egress, guard, names, tags, { aws: awsProvider, native: nativeProvider });
-// The (unattached) deploy policy waits for the VM subnet and security group (its CreateNetworkConnector condition), as does
-// the operator role's Deny in egress.ts (its NotResource).
+const net = createEgress(egress, guard, names, documents, tags, { aws: awsProvider, native: nativeProvider });
+// The deploy policy (ai-env-deployer's) waits for the VM subnet and security group (its CreateNetworkConnector
+// condition), as does the operator role's Deny in egress.ts (its NotResource).
 const deployNames: pulumi.Output<Names> = pulumi.all([names, net.vmSubnet.id, net.vmSecurityGroup.id]).apply(([n, vmSubnetId, vmSecurityGroupId]) => ({
     ...n, egress: { ...n.egress, vmSubnetId, vmSecurityGroupId },
 }));
@@ -78,7 +85,13 @@ const deployNames: pulumi.Output<Names> = pulumi.all([names, net.vmSubnet.id, ne
 const runtimeNames: pulumi.Output<Names> = pulumi.all([names, net.connector.arn]).apply(([n, connectorArn]) => ({
     ...n, egress: { ...n.egress, connectorArn },
 }));
-const iam = createIam(names, deployNames, runtimeNames, tags, awsProvider);
+// S8 operators: the ops policy waits for the proxy instance, whose ARN scopes start, stop and SendCommand (never a
+// tag); a replaced proxy gives the policy a new version. `make preview-scratch NEGATIVE=miswired` builds it from another
+// resource's id through the scratch:ops-names marker (check-plan holds the document to that dependency).
+const opsNames: pulumi.Output<Names> = pulumi.all([names, net.instance.id]).apply(([n, proxyInstanceId]) => ({ // scratch:ops-names
+    ...n, egress: { ...n.egress, proxyInstanceId },
+}));
+const iam = createIam(names, deployNames, runtimeNames, opsNames, tags, awsProvider);
 const image = createImage(imageConfig, REGION, tags, { buildRole: iam.buildRole, buildPolicy: iam.buildPolicy, artifacts }, nativeProvider);
 const monthly = createBudget(budget, REGION, tags, awsProvider);
 
@@ -119,3 +132,16 @@ export const parameterPrefix = egressConfig.parameterPrefix;
 // compares the live parameters with them (state/infra.toml).
 export const squidConfSha256 = net.squidConfSha256;
 export const allowSha256 = net.allowSha256;
+// S8 operators (contracts §1.2; `ai-env infra status` records them in state/infra.toml): names and ARNs only, never a
+// key. The absence of deployerUserName means the stack has no deployer yet (the bootstrap, as the account root).
+export const deployerUserName = iam.deployerUser.name;
+export const deployerUserArn = iam.deployerUser.arn;
+export const opsUserName = iam.opsUser.name;
+export const opsUserArn = iam.opsUser.arn;
+export const deployerPolicyArn = iam.deployerPolicy.arn;
+export const opsPolicyArn = iam.opsPolicy.arn;
+export const deployEgressPolicyArn = iam.deployEgressPolicy.arn;
+export const deployDnsPolicyArn = iam.deployDnsPolicy.arn;
+export const proxyReloadDocument = net.documents.reload.name;
+export const proxyStatusDocument = net.documents.status.name;
+export const proxyPatchDocument = net.documents.patch.name;

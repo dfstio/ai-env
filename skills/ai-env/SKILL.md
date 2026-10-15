@@ -1,6 +1,6 @@
 ---
 name: ai-env
-description: Work with ai-env encrypted .env files and ai-env MicroVM sessions — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, or when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env).
+description: Work with ai-env encrypted .env files, ai-env MicroVM sessions and ai-env's AWS side — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env), or before a make target, aws call or ai-env command reaches ai-env's AWS account (make deploy, ai-env as, ai-env egress).
 ---
 
 # ai-env — encrypted .env files
@@ -95,7 +95,48 @@ Mac again.
 **Exits Cursor shows** as `Claude Code process exited with code N`, the last stderr line
 (`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed (nothing started;
 reopen the chat) · `5` no Touch ID in time, no sealed setup-token, or Anthropic refused it
-(`ai-env creds status`) · `7` AWS, or a VM image older than remote sessions (`make deploy`) · `8`
-the VM is gone or unreachable (reopen the chat from the picker) · `9` a policy refusal: a
-secret or a widening setting in what the seed would carry (`ai-env box seed` lists the
-findings), a workspace that is not a git repository, or too many VMs (`ai-env vm list`).
+(`ai-env creds status`) · `7` AWS, or a VM image older than remote sessions (`make deploy`,
+which asks the user for the deployer's key) · `8` the VM is gone or unreachable (reopen the chat
+from the picker) · `9` a policy refusal: a secret or a widening setting in what the seed would
+carry (`ai-env box seed` lists the findings), a workspace that is not a git repository, or too
+many VMs (`ai-env vm list`).
+
+## Deploying and operating the AWS side
+
+Three IAM users run the bridge's AWS account (README, "Identities"): `ai-env-deployer` deploys
+and issues keys (its key lives only in the user's Strongbox and is pasted per command),
+`ai-env-ops` runs the daily operator commands (the egress and proxy commands but
+`ai-env egress allow`, which is the deployer's, `make infra-status`, `make gates`, the logs; its key
+is sealed in the bridge's `credentials/ops.env` and opened by Touch ID), and `ai-env-runtime` starts
+the VMs and sessions (`credentials/aws.env`, Touch ID).
+
+- **Never** read, print, store or paste an AWS key, and never read the bridge's
+  `credentials/*.env` or anything under `~/.aws`. Never run `ai-env creds deployer-key`,
+  `ai-env creds aws-set` or `ai-env creds aws-verify` for the user's keys, and never copy an `id`
+  or `arn` line, or the key id in a printed `aws iam delete-access-key` command, into notes or plans.
+- Never start a deployer-tier target (`make deploy`, `make preview`, `make runtime-key`,
+  `make ops-key`, `make deployer-key`, `make image-activate`, …), `ai-env as deployer …`,
+  `ai-env egress allow` or `make claude-update` yourself: give the user the exact command to run in a
+  terminal of their own, and wait for its result. The deployer's key is pasted at a no-echo prompt on
+  `/dev/tty` only: from a shell without a terminal the command stops there with
+  `as deployer: no terminal to paste the key into …` (the runner's exit 5); started from your shell,
+  the paste would put the key into a process tree you control, and in a terminal you share it could
+  land in your own input. Never type, pipe or paste anything into it. `ai-env egress allow` widens
+  what every VM may reach: it is the user's call.
+- An ops command (`ai-env egress status`, `ai-env proxy start`, `make infra-status`, `make gates`,
+  `make logs`, …) asks the user for one Touch ID; under `ai-env as` it asks for none.
+- In the user's shell a bare `aws` call has no credentials, by design, and ai-env never falls back
+  to the shell's own AWS settings. For a read, run `ai-env as ops -- aws …` (the user answers one
+  Touch ID); never point `AWS_PROFILE` or `~/.aws` somewhere else to get around it.
+- `make -n TARGET` shows what a target would run and asks for nothing.
+- On `AccessDenied`, report the action and the resource the error names, and stop: never retry
+  with other credentials. A missing right is a change to `infra/policies.ts` that the user deploys
+  (`make deploy-policies`), and break-glass (the account root, `BREAKGLASS=1`) is the user's
+  decision alone.
+- Your own read-only checks in another account, on your session's own credentials:
+  `make check-policies` and `make preview-scratch` run on them as they are; an `ai-env` operator
+  command, and `make s3-preflight PHASE=a` and `make check-base-image` (both run
+  `ai-env infra base-image`), need `ai-env as ambient -- …` (refused when those credentials are the
+  account root's; never use it with credentials of the stack's own account). Their output may name
+  the account: keep it on the terminal, and mask it (`sed -E 's/[0-9]{12}/ACCOUNT/'`) before it goes
+  into a file.

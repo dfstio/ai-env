@@ -23,11 +23,18 @@
 //! interrupted never leaves a stale copy of a replaced token on disk, and
 //! one whose source another command sealed anew (or forgot) while it waited
 //! builds none from the replaced one.
+//!
+//! S8 operators: `creds status` also shows the ops key (`credentials/ops.env`,
+//! with what its notes recorded at sealing, read without a Touch ID) and the
+//! deployer `state/infra.toml` records (its key lives in Strongbox only);
+//! `creds forget --ops` removes `ops.env` and its backups, and nothing else,
+//! and says how to delete the key in IAM, which ai-env cannot do.
 use crate::age_cmd::AgeTool;
 use crate::bridge::audit;
 use crate::bridge::config::{BridgeConfig, CredentialsSource, Paths};
 use crate::bridge::creds::{aws_env_state, key_name, preflight_for, seal_file, AwsEnvState};
 use crate::bridge::errors::BridgeError;
+use crate::bridge::identity::{KeyNotes, OPS_USER};
 use crate::commands::Tag;
 use crate::container;
 use crate::errors::{CliError, Result};
@@ -383,21 +390,24 @@ pub enum OpenFault {
 }
 
 /// One sealed file: its state, which keystore key opens it (by recipient
-/// tag, no prompt), and its recorded metadata.
+/// tag, no prompt), and its recorded metadata: a setup-token's
+/// ([`Recorded`]) and a sealed AWS key's ([`KeyNotes`], S8 operators).
 #[derive(Debug, Clone)]
 pub struct FileFacts {
     pub path: PathBuf,
     pub state: AwsEnvState,
     pub opens_with: Option<std::result::Result<String, OpenFault>>,
     pub recorded: Recorded,
+    pub key_notes: KeyNotes,
 }
 
 fn file_facts(store: &Keystore, path: PathBuf) -> FileFacts {
     let state = aws_env_state(&path);
-    let (mut opens_with, mut recorded) = (None, Recorded::default());
+    let (mut opens_with, mut recorded, mut key_notes) = (None, Recorded::default(), KeyNotes::default());
     if state == AwsEnvState::Sealed {
         if let Some(text) = crate::bridge::registry::read_regular_file(&path).ok().flatten() {
             recorded = Recorded::of(&text);
+            key_notes = KeyNotes::of(&text);
             opens_with = Some(match container::read(&text).and_then(|c| crate::select::resolve_for_decrypt(store, None, &c)) {
                 Ok(k) => Ok(k),
                 Err(e @ CliError::NoKey(_)) => Err(OpenFault::NoKey(e.to_string())),
@@ -405,7 +415,7 @@ fn file_facts(store: &Keystore, path: PathBuf) -> FileFacts {
             });
         }
     }
-    FileFacts { path, state, opens_with, recorded }
+    FileFacts { path, state, opens_with, recorded, key_notes }
 }
 
 /// The backups a sealing command left beside `file` (`<name>.<unix>.bak`).
@@ -866,6 +876,60 @@ fn state_text(f: &FileFacts) -> (Tag, String) {
     }
 }
 
+/// The ops key's row (S8 operators): its state as `aws.env`'s (the same key
+/// faults), and for a sealed one what its notes recorded at sealing, read
+/// without a Touch ID and not authenticated: `ai-env-ops ...WXYZ, sealed
+/// 2026-10-14` (the UTC day).
+fn ops_text(f: &FileFacts) -> (Tag, String) {
+    if f.state == AwsEnvState::Absent {
+        return (Tag::Skip, format!("ops.env: absent (the {OPS_USER} key: ai-env as deployer -- make ops-key)"));
+    }
+    let (tag, mut text) = state_text(f);
+    if f.state == AwsEnvState::Sealed {
+        text.push_str(&format!("; recorded at sealing, not authenticated: {}", recorded_key(&f.key_notes)));
+    }
+    (tag, text)
+}
+
+/// `ai-env-ops ...WXYZ, sealed 2026-10-14`, or as much of it as the notes
+/// hold (an older or hand-made container may hold none).
+fn recorded_key(notes: &KeyNotes) -> String {
+    let who = match (notes.user.as_deref(), notes.key_id_last4.as_deref()) {
+        (Some(user), Some(tail)) => format!("{} ...{tail}", scrub(user)),
+        (Some(user), None) => format!("{} (its last four not recorded)", scrub(user)),
+        (None, Some(tail)) => format!("a key ...{tail} (its user not recorded)"),
+        (None, None) => "nothing (no notes)".to_string(),
+    };
+    match notes.sealed_day() {
+        Some(day) => format!("{who}, sealed {day}"),
+        None if notes.user.is_some() || notes.key_id_last4.is_some() => format!("{who}, its sealing day not recorded"),
+        None => who,
+    }
+}
+
+/// The resource part of an ARN, after its fifth colon (`user/ai-env-deployer`):
+/// a row shows no account.
+fn arn_resource(arn: &str) -> &str {
+    arn.splitn(6, ':').nth(5).unwrap_or(arn)
+}
+
+/// The deployer `state/infra.toml` records (S8 operators), from that file
+/// only: its key lives in Strongbox, never under `credentials/`.
+fn deployer_text(state: &std::result::Result<Option<crate::bridge::infra::InfraState>, BridgeError>) -> (Tag, String) {
+    match state {
+        Err(e) => (Tag::Warn, format!("deployer: state/infra.toml unreadable ({e})")),
+        Ok(state) => match recorded_deployer(state.as_ref()) {
+            Some(arn) => (Tag::Ok, format!("deployer {} (state/infra.toml): its key lives in Strongbox only (ai-env as deployer -- … asks for it)", arn_resource(arn))),
+            None => (Tag::Skip, "deployer: none recorded in state/infra.toml (the bootstrap deploy, then make infra-status WRITE=1)".into()),
+        },
+    }
+}
+
+/// `deployer_user_arn` of the state, when it records one.
+fn recorded_deployer(state: Option<&crate::bridge::infra::InfraState>) -> Option<&str> {
+    state.and_then(|s| s.deployer_user_arn.as_deref()).map(str::trim).filter(|a| !a.is_empty())
+}
+
 fn combined_text(paths: &Paths, mode: &std::result::Result<(), String>, token_sealed: bool) -> (Tag, String) {
     combined_line(&combined_state(paths), mode, token_sealed)
 }
@@ -904,12 +968,14 @@ pub fn cmd_status(store: &Keystore, json: bool, unseal: bool) -> Result<()> {
     let cfg = BridgeConfig::load(&paths)?.unwrap_or_default();
     let now = unix_now();
     let aws = file_facts(store, paths.aws_env());
+    let ops = file_facts(store, paths.ops_env());
+    let infra = crate::bridge::infra::read_infra_state(&paths);
     let token = file_facts(store, paths.setup_token_env());
     // As `vm exec` reads it (M53): a store that cannot be read is shown as such, never as no refusal.
     let rejected = crate::bridge::agent::credential::seal_tag(&token.path).map_or(Ok(None), |tag| crate::bridge::agent::credential::read_rejection(&paths, &tag));
     let mode = container_mode(&paths);
     let combined = combined_state(&paths);
-    let backups: Vec<(String, usize)> = ["aws.env", "setup-token.env", "combined.env"].iter().map(|f| ((*f).to_string(), backups_of(&paths, f).len())).collect();
+    let backups: Vec<(String, usize)> = ["aws.env", "ops.env", "setup-token.env", "combined.env"].iter().map(|f| ((*f).to_string(), backups_of(&paths, f).len())).collect();
     let (gate_tag, gate_text) = gate_line(&paths, &cfg, now);
     let held = holders(&paths);
     let creds_ok = cfg.creds.validate().map_err(|e| e.to_string());
@@ -924,18 +990,31 @@ pub fn cmd_status(store: &Keystore, json: bool, unseal: bool) -> Result<()> {
         None
     };
     if json {
+        let state = |s: &AwsEnvState| match s {
+            AwsEnvState::Absent => "absent".to_string(),
+            AwsEnvState::Sealed => "sealed".to_string(),
+            AwsEnvState::NotSealed(w) => format!("not-sealed: {w}"),
+        };
         let file = |f: &FileFacts| {
             serde_json::json!({
                 "path": f.path.display().to_string(),
-                "state": match &f.state { AwsEnvState::Absent => "absent".to_string(), AwsEnvState::Sealed => "sealed".to_string(), AwsEnvState::NotSealed(w) => format!("not-sealed: {w}") },
+                "state": state(&f.state),
                 "opens_with": f.opens_with.as_ref().and_then(|r| r.as_ref().ok()),
                 "recorded": { "prefix": f.recorded.prefix, "chars": f.recorded.chars, "sealed_at": f.recorded.sealed_at.map(rfc3339_utc), "days_left": f.recorded.days_left(now) },
             })
         };
+        let n = &ops.key_notes;
         let doc = serde_json::json!({
             "creds": { "key": cfg.creds.key, "mode": cfg.creds.mode, "deliver": cfg.creds.deliver, "unseal_timeout_s": cfg.creds.unseal_timeout_s, "valid": creds_ok.as_ref().err() },
             "aws_credentials": cfg.aws.credentials,
             "aws_env": file(&aws),
+            "ops_env": {
+                "path": ops.path.display().to_string(),
+                "state": state(&ops.state),
+                "opens_with": ops.opens_with.as_ref().and_then(|r| r.as_ref().ok()),
+                "recorded": { "user": n.user, "key_id_last4": n.key_id_last4, "sealed_at": n.sealed_at.map(rfc3339_utc) },
+            },
+            "deployer_user_arn": infra.as_ref().ok().and_then(|s| recorded_deployer(s.as_ref())),
             "setup_token_env": file(&token),
             "rejected": rejected.as_ref().ok().and_then(Option::as_ref).map(|r| serde_json::json!({"at": r.at, "vm": r.vm})),
             "rejected_error": rejected.as_ref().err(),
@@ -960,6 +1039,10 @@ pub fn cmd_status(store: &Keystore, json: bool, unseal: bool) -> Result<()> {
     )?;
     row(Tag::Ok, format!("[aws].credentials {}", cfg.aws.credentials))?;
     let (tag, text) = state_text(&aws);
+    row(tag, text)?;
+    let (tag, text) = ops_text(&ops);
+    row(tag, text)?;
+    let (tag, text) = deployer_text(&infra);
     row(tag, text)?;
     let (tag, mut text) = state_text(&token);
     if token.state == AwsEnvState::Sealed {
@@ -1098,6 +1181,53 @@ pub fn cmd_forget(yes: bool) -> Result<()> {
     );
     if let Err(e) = audit::append(&paths.audit(), &row) {
         eprintln!("warning: the audit row was not written: {e}");
+    }
+    if !failed.is_empty() {
+        return Err(CliError::Msg(format!("could not delete: {}", failed.join("; "))));
+    }
+    outln!("deleted {} file(s)", files.len());
+    Ok(())
+}
+
+/// `ai-env creds forget --ops [--yes]` (S8 operators): `credentials/ops.env`
+/// and its `ops.env.<unix>.bak` backups, nothing else, a dry run without
+/// `--yes`; then how to delete the key in IAM (ai-env cannot), naming its
+/// last four as the notes recorded them.
+pub fn cmd_forget_ops(yes: bool) -> Result<()> {
+    let paths = Paths::resolve()?;
+    let ops = paths.ops_env();
+    let notes = match aws_env_state(&ops) {
+        AwsEnvState::Sealed => crate::bridge::registry::read_regular_file(&ops).ok().flatten().map(|text| KeyNotes::of(&text)).unwrap_or_default(),
+        _ => KeyNotes::default(),
+    };
+    let mut files: Vec<PathBuf> = [ops].into_iter().filter(|p| std::fs::symlink_metadata(p).is_ok()).collect();
+    files.extend(backups_of(&paths, "ops.env"));
+    let verb = if yes { "deleting" } else { "would delete" };
+    if files.is_empty() {
+        outln!("nothing to delete: no ops.env or backup of it under {}", paths.credentials().display());
+    }
+    for f in &files {
+        outln!("{verb} {}", f.display());
+    }
+    let key = notes.key_id_last4.as_deref().map_or_else(|| "the key (its last four not recorded)".to_string(), |tail| format!("the key ...{tail}"));
+    outln!("ai-env cannot deactivate {key}: delete it in IAM:");
+    outln!("  ai-env as deployer -- aws iam list-access-keys --user-name {OPS_USER} --region {}", crate::bridge::config::REGION);
+    outln!("  ai-env as deployer -- aws iam delete-access-key --user-name {OPS_USER} --access-key-id <id> --region {}", crate::bridge::config::REGION);
+    if !yes {
+        outln!("dry run: nothing deleted; pass --yes to delete");
+        return Ok(());
+    }
+    let mut failed = Vec::new();
+    for f in &files {
+        if let Err(e) = std::fs::remove_file(f) {
+            if e.kind() != ErrorKind::NotFound {
+                failed.push(format!("{}: {e}", f.display()));
+            }
+        }
+    }
+    let row = audit::AuditRow::new("creds_forget", None, audit::detail(&[("ops", "true".to_string()), ("files", files.len().to_string()), ("failed", failed.len().to_string())]));
+    if let Err(e) = audit::append(&paths.audit(), &row) {
+        crate::bridge::voice::warn(&format!("the audit row was not written: {e}"));
     }
     if !failed.is_empty() {
         return Err(CliError::Msg(format!("could not delete: {}", failed.join("; "))));
@@ -1399,5 +1529,47 @@ mod tests {
         let says = format!("{} is not an ai-env container (plaintext?): move it away (and rotate the key it holds), then seal the runtime key with `make runtime-key`", paths.aws_env().display());
         assert_eq!(why, says);
         assert!(!paths.combined_env().exists(), "nothing built");
+    }
+
+    /// S8 operators: `creds status`'s ops key row (the file's state as aws.env's,
+    /// then what its notes recorded, the UTC day) and the deployer row (what
+    /// state/infra.toml records, never an account).
+    #[test]
+    fn the_ops_key_and_deployer_rows() {
+        let notes = KeyNotes { kind: Some("aws-key".into()), user: Some(OPS_USER.into()), key_id_last4: Some("WXYZ".into()), sealed_at: Some(1_791_979_200) };
+        let facts = |state: AwsEnvState, opens_with: Option<std::result::Result<String, OpenFault>>, key_notes: KeyNotes| FileFacts {
+            path: PathBuf::from("/b/credentials/ops.env"),
+            state,
+            opens_with,
+            recorded: Recorded::default(),
+            key_notes,
+        };
+        let row = |f: FileFacts| ops_text(&f);
+        assert_eq!(row(facts(AwsEnvState::Absent, None, KeyNotes::default())), (Tag::Skip, "ops.env: absent (the ai-env-ops key: ai-env as deployer -- make ops-key)".to_string()));
+        assert_eq!(row(facts(AwsEnvState::NotSealed("is a symlink".into()), None, KeyNotes::default())), (Tag::No, "ops.env is a symlink".to_string()));
+        assert_eq!(
+            row(facts(AwsEnvState::Sealed, Some(Ok("ai-env-bridge".into())), notes.clone())),
+            (Tag::Ok, "ops.env: sealed, opens with key ai-env-bridge; recorded at sealing, not authenticated: ai-env-ops ...WXYZ, sealed 2026-10-14".to_string())
+        );
+        let (tag, text) = row(facts(AwsEnvState::Sealed, Some(Err(OpenFault::NoKey("no keystore key opens it".into()))), notes.clone()));
+        assert!(tag == Tag::No && text == "ops.env: sealed, but no keystore key opens it; recorded at sealing, not authenticated: ai-env-ops ...WXYZ, sealed 2026-10-14", "{text}");
+        let (tag, text) = row(facts(AwsEnvState::Sealed, Some(Err(OpenFault::Unknown("odd header".into()))), KeyNotes::default()));
+        assert!(tag == Tag::Warn && text.ends_with("which key opens it is unknown (odd header); recorded at sealing, not authenticated: nothing (no notes)"), "{text}");
+        let partial = KeyNotes { sealed_at: None, ..notes.clone() };
+        assert_eq!(recorded_key(&partial), "ai-env-ops ...WXYZ, its sealing day not recorded");
+        assert_eq!(recorded_key(&KeyNotes { user: None, ..notes.clone() }), "a key ...WXYZ (its user not recorded), sealed 2026-10-14");
+        assert_eq!(recorded_key(&KeyNotes { key_id_last4: None, ..notes }), "ai-env-ops (its last four not recorded), sealed 2026-10-14");
+
+        use crate::bridge::infra::InfraState;
+        let arn = "arn:aws:iam::123456789012:user/ai-env-deployer";
+        let state = InfraState { deployer_user_arn: Some(arn.into()), ..InfraState::default() };
+        let (tag, text) = deployer_text(&Ok(Some(state.clone())));
+        assert_eq!((tag, text.as_str()), (Tag::Ok, "deployer user/ai-env-deployer (state/infra.toml): its key lives in Strongbox only (ai-env as deployer -- … asks for it)"));
+        assert!(!text.contains("123456789012"), "a row shows no account");
+        let none = (Tag::Skip, "deployer: none recorded in state/infra.toml (the bootstrap deploy, then make infra-status WRITE=1)".to_string());
+        assert_eq!(deployer_text(&Ok(None)), none);
+        assert_eq!(deployer_text(&Ok(Some(InfraState { deployer_user_arn: Some(" ".into()), ..state }))), none);
+        assert_eq!(deployer_text(&Err(BridgeError::Config("x cannot be parsed".into()))), (Tag::Warn, "deployer: state/infra.toml unreadable (config: x cannot be parsed)".to_string()));
+        assert_eq!((arn_resource(arn), arn_resource("not-an-arn")), ("user/ai-env-deployer", "not-an-arn"));
     }
 }

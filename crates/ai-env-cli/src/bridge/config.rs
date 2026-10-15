@@ -91,6 +91,14 @@ impl Paths {
         self.credentials().join("aws.env")
     }
 
+    /// `credentials/ops.env`: the `ai-env-ops` operator's access key (S8
+    /// operators: `make ops-key`), unsealed by `ai-env as ops` and by an
+    /// operator command that runs under no `ai-env as` (`bridge::identity`).
+    #[must_use]
+    pub fn ops_env(&self) -> PathBuf {
+        self.credentials().join("ops.env")
+    }
+
     /// `credentials/setup-token.env`: the Claude setup-token (S7 `creds setup-token`).
     #[must_use]
     pub fn setup_token_env(&self) -> PathBuf {
@@ -1033,6 +1041,7 @@ mod tests {
         assert_eq!(p.probes(), PathBuf::from("/r/lab/probes.jsonl"));
         assert_eq!(p.credentials(), PathBuf::from("/r/credentials"));
         assert_eq!(p.aws_env(), PathBuf::from("/r/credentials/aws.env"));
+        assert_eq!(p.ops_env(), PathBuf::from("/r/credentials/ops.env"));
         assert_eq!(p.infra_state(), PathBuf::from("/r/state/infra.toml"));
         assert_eq!(p.egress_lock(), PathBuf::from("/r/state/egress.lock"));
         assert_eq!(p.egress_verified(), PathBuf::from("/r/state/egress-verified.toml"));

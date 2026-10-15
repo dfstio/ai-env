@@ -200,6 +200,14 @@ pub struct RunOpts {
     pub command: Vec<String>,
 }
 
+/// The marker `ai-env as` (S8 operators, `bridge::identity`) leaves in its
+/// command's environment: `deployer:<tail>` or `ops:<tail>` (the last four
+/// characters of the key id in `AWS_ACCESS_KEY_ID`), `root` or `ambient`.
+/// Not feature-gated: [`run`] drops it from a child whose decrypted container
+/// sets `AWS_ACCESS_KEY_ID`, since it would then name a key the child no
+/// longer has.
+pub const RUNNER_MARKER: &str = "AI_ENV_BRIDGE_AS";
+
 /// The centerpiece: run CMD with the decrypted variables injected. Secrets
 /// travel only in the child's envp — never argv, never a file.
 pub fn run(store: &Keystore, age: &AgeTool, opts: &RunOpts) -> Result<()> {
@@ -218,14 +226,7 @@ pub fn run(store: &Keystore, age: &AgeTool, opts: &RunOpts) -> Result<()> {
         .map_err(|_| CliError::Msg("decrypted content is not UTF-8".into()))?;
     let vars = crate::dotenv::parse(text)?;
 
-    let mut cmd = std::process::Command::new(&opts.command[0]);
-    cmd.args(&opts.command[1..]);
-    for name in container::CONTAINER_VARS {
-        cmd.env_remove(name);
-    }
-    for (k, v) in &vars {
-        cmd.env(k, v);
-    }
+    let mut cmd = run_child(&opts.command[0], &opts.command[1..], &vars);
     drop(plaintext);
 
     #[cfg(unix)]
@@ -239,6 +240,30 @@ pub fn run(store: &Keystore, age: &AgeTool, opts: &RunOpts) -> Result<()> {
         let status = cmd.status()?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// [`run`]'s child: `program args…` without the container's own variables,
+/// with the decrypted ones, and without [`RUNNER_MARKER`] when they set
+/// `AWS_ACCESS_KEY_ID` (an `ai-env run -f credentials/aws.env -- aws …` under
+/// `ai-env as deployer`): the marker would name the key `ai-env as` gave, not
+/// this one. Without such a key it is inherited as it is. A container never
+/// sets the marker itself (only `ai-env as` does): its own value is skipped.
+fn run_child(program: &str, args: &[String], vars: &[(String, String)]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    for name in container::CONTAINER_VARS {
+        cmd.env_remove(name);
+    }
+    for (k, v) in vars {
+        if k == RUNNER_MARKER {
+            continue;
+        }
+        cmd.env(k, v);
+    }
+    if vars.iter().any(|(k, _)| k == "AWS_ACCESS_KEY_ID") {
+        cmd.env_remove(RUNNER_MARKER);
+    }
+    cmd
 }
 
 // ---- which / info -----------------------------------------------------------
@@ -1070,7 +1095,7 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor_exit_code, doctor_json, doctor_report, json_string, DoctorLine, Tag};
+    use super::{doctor_exit_code, doctor_json, doctor_report, json_string, run_child, DoctorLine, Tag, RUNNER_MARKER};
     use crate::errors::CliError;
 
     fn ok(text: &str) -> DoctorLine {
@@ -1079,6 +1104,46 @@ mod tests {
 
     fn no(text: &str) -> DoctorLine {
         DoctorLine::row(Tag::No, text)
+    }
+
+    // ---- run's child ------------------------------------------------------
+
+    /// `(name, value)` of every variable `cmd` sets (`Some`) or removes (`None`).
+    fn child_envs(vars: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+        let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        let cmd = run_child("printenv", &["PATH".to_string()], &vars);
+        assert_eq!(cmd.get_program(), "printenv");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["PATH"], "the command's own arguments only");
+        cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect()
+    }
+
+    /// S8 operators: a container that sets an AWS key replaces the key `ai-env
+    /// as` left in the environment, so the child loses the marker naming that
+    /// key; any other container leaves the marker alone, and a marker the
+    /// container sets itself never reaches the child.
+    #[test]
+    fn the_run_child_drops_the_runner_marker_only_when_the_container_sets_a_key() {
+        assert_eq!(RUNNER_MARKER, "AI_ENV_BRIDGE_AS");
+        let keyed = child_envs(&[("AWS_ACCESS_KEY_ID", "key-id-of-the-test"), ("AWS_SECRET_ACCESS_KEY", "secret-of-the-test")]);
+        assert!(keyed.contains(&(RUNNER_MARKER.to_string(), None)), "the marker is removed: {keyed:?}");
+        assert!(keyed.contains(&("AWS_ACCESS_KEY_ID".to_string(), Some("key-id-of-the-test".to_string()))), "{keyed:?}");
+        let plain = child_envs(&[("DATABASE_URL", "postgres://localhost/test"), ("AWS_REGION", "eu-central-1")]);
+        assert!(plain.iter().all(|(k, _)| k != RUNNER_MARKER), "inherited as it is: {plain:?}");
+        let secret_only = child_envs(&[("AWS_SECRET_ACCESS_KEY", "secret-of-the-test")]);
+        assert!(secret_only.iter().all(|(k, _)| k != RUNNER_MARKER), "only the key id names a key: {secret_only:?}");
+        // A container that sets the marker itself: its value never reaches the child; with a key the marker is
+        // removed, without one the inherited marker (if any) stays as it is.
+        let both = child_envs(&[(RUNNER_MARKER, "ops:9002"), ("AWS_ACCESS_KEY_ID", "key-id-of-the-test")]);
+        assert!(both.contains(&(RUNNER_MARKER.to_string(), None)), "{both:?}");
+        assert!(!both.iter().any(|(k, v)| k == RUNNER_MARKER && v.is_some()), "{both:?}");
+        let marker_only = child_envs(&[(RUNNER_MARKER, "root"), ("DATABASE_URL", "postgres://localhost/test")]);
+        assert!(marker_only.iter().all(|(k, _)| k != RUNNER_MARKER), "the container's own marker is skipped, the inherited one untouched: {marker_only:?}");
+        assert!(marker_only.contains(&("DATABASE_URL".to_string(), Some("postgres://localhost/test".to_string()))), "{marker_only:?}");
+        for envs in [&keyed, &plain, &secret_only, &marker_only] {
+            for name in crate::container::CONTAINER_VARS {
+                assert!(envs.contains(&(name.to_string(), None)), "{name} is removed as before: {envs:?}");
+            }
+        }
     }
 
     // ---- doctor_exit_code -------------------------------------------------

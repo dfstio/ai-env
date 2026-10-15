@@ -53,11 +53,25 @@ pub const LOG_GROUP: &str = "/ai-env/egress/squid";
 pub const PARAMS: [&str; 4] = ["squid.conf", "allow", "extras", "suspended"];
 /// Standard-tier SSM parameters hold at most 4 KB; a longer value is refused before any `put-parameter`.
 pub const PARAM_MAX_BYTES: usize = 4096;
+/// The proxy's three SSM Command documents (S8 operators), which Pulumi makes
+/// from `infra/proxy/documents/{reload,status,patch}.json`: the only documents
+/// ai-env-ops and ai-env-deployer may send, and only to the proxy instance
+/// (`AWS-RunShellScript` is never sent). A test holds the files to what the
+/// CLI sends.
+pub const RELOAD_DOCUMENT: &str = "ai-env-proxy-reload";
+pub const STATUS_DOCUMENT: &str = "ai-env-proxy-status";
+pub const PATCH_DOCUMENT: &str = "ai-env-proxy-patch";
+/// The reload document's one parameter, a `String` with these allowed values;
+/// the first is its default.
+pub const RELOAD_MODE_PARAMETER: &str = "mode";
+pub const RELOAD_MODES: [&str; 2] = ["apply", "if-changed"];
+/// `send-command --document-version`: the literal argument `$DEFAULT` (no shell is involved).
+pub const DOCUMENT_VERSION: &str = "$DEFAULT";
 
 /// Every key of `infra/egress-config.json` with its value as Rust sees it
 /// (numbers and booleans as text, arrays joined with `,`); a unit test reads
 /// the JSON and requires both to agree, key for key.
-pub const EGRESS_CONSTS: [(&str, &str); 19] = [
+pub const EGRESS_CONSTS: [(&str, &str); 22] = [
     ("vpcCidr", VPC_CIDR),
     ("proxySubnetCidr", PROXY_SUBNET_CIDR),
     ("vmSubnetCidr", VM_SUBNET_CIDR),
@@ -77,6 +91,9 @@ pub const EGRESS_CONSTS: [(&str, &str); 19] = [
     ("proxyInstanceProfileName", "ai-env-egress-proxy"),
     ("vmSecurityGroupName", "ai-env-vm-egress"),
     ("proxySecurityGroupName", "ai-env-proxy"),
+    ("reloadDocumentName", RELOAD_DOCUMENT),
+    ("statusDocumentName", STATUS_DOCUMENT),
+    ("patchDocumentName", PATCH_DOCUMENT),
 ];
 
 /// `<prefix>/<param>` (`/ai-env/proxy/allow`).
@@ -1095,6 +1112,65 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().filter(|l| l.trim_start().starts_with('"')).count(), EGRESS_CONSTS.len());
         assert_eq!(param_name("allow"), "/ai-env/proxy/allow");
+    }
+
+    /// `infra/proxy/documents/*.json` (S8 operators), which Pulumi turns into
+    /// the proxy's three SSM documents: one `aws:runShellScript` step each,
+    /// named for the document, with the execution timeout the CLI waits out
+    /// and exactly the script the CLI expects; reload alone has a parameter,
+    /// `mode`, which can only be one of [`RELOAD_MODES`]. Readers compare the
+    /// parsed form, so whitespace never matters.
+    #[test]
+    fn the_proxy_documents_are_what_the_cli_sends() {
+        use ops::{PATCH_EXEC_S, RELOAD, RELOAD_EXEC_S, STATUS_EXEC_S};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../infra/proxy/documents");
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap_or_else(|| panic!("not an object: {v}")).keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let strings = |v: &serde_json::Value| -> Vec<String> { v.as_array().unwrap_or_else(|| panic!("not an array: {v}")).iter().map(|x| x.as_str().unwrap().to_string()).collect() };
+        let reload = vec![
+            format!("case '{{{{ {RELOAD_MODE_PARAMETER} }}}}' in"),
+            format!("  {}) exec {RELOAD} ;;", RELOAD_MODES[0]),
+            format!("  {}) exec {RELOAD} --if-changed ;;", RELOAD_MODES[1]),
+            "  *) echo 'ai-env-proxy-reload: unknown mode; nothing changed' >&2; exit 1 ;;".to_string(),
+            "esac".to_string(),
+        ];
+        let status = vec!["rpm -q squid || true".to_string(), format!("{RELOAD} --status")];
+        let patch: Vec<String> = cli::PATCH_SCRIPT.iter().map(|l| (*l).to_string()).collect();
+        for (file, step, exec_s, script) in [("reload.json", "reload", RELOAD_EXEC_S, reload), ("status.json", "status", STATUS_EXEC_S, status), ("patch.json", "patch", PATCH_EXEC_S, patch)] {
+            let text = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(text.ends_with("}\n"), "{file}: one final newline");
+            let doc: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let mut want = vec!["description", "mainSteps", "schemaVersion"];
+            if step == "reload" {
+                want.push("parameters");
+            }
+            want.sort_unstable();
+            assert_eq!(keys(&doc), want, "{file}: its top-level keys");
+            assert_eq!(doc["schemaVersion"], "2.2", "{file}");
+            assert!(doc["description"].as_str().is_some_and(|d| d.starts_with("ai-env egress proxy: ")), "{file}: {}", doc["description"]);
+            let steps = doc["mainSteps"].as_array().unwrap_or_else(|| panic!("{file}: mainSteps"));
+            assert_eq!(steps.len(), 1, "{file}: one step");
+            assert_eq!(keys(&steps[0]), ["action", "inputs", "name"], "{file}: the step's keys");
+            assert_eq!((steps[0]["action"].as_str(), steps[0]["name"].as_str()), (Some("aws:runShellScript"), Some(step)), "{file}");
+            let inputs = &steps[0]["inputs"];
+            assert_eq!(keys(inputs), ["runCommand", "timeoutSeconds"], "{file}: the step's inputs");
+            assert_eq!(inputs["timeoutSeconds"].as_str(), Some(exec_s.to_string().as_str()), "{file}: the execution timeout the CLI waits out");
+            assert_eq!(strings(&inputs["runCommand"]), script, "{file}: the script");
+            if step == "reload" {
+                let params = &doc["parameters"];
+                assert_eq!(keys(params), [RELOAD_MODE_PARAMETER], "{file}: one parameter");
+                let mode = &params[RELOAD_MODE_PARAMETER];
+                assert_eq!(keys(mode), ["allowedValues", "default", "description", "type"], "{file}: the parameter's keys");
+                assert_eq!(mode["type"], "String", "{file}");
+                assert_eq!(strings(&mode["allowedValues"]), RELOAD_MODES, "{file}: only the modes the CLI sends");
+                assert_eq!(mode["default"].as_str(), Some(RELOAD_MODES[0]), "{file}: the default mode");
+            }
+        }
+        assert_eq!((RELOAD_DOCUMENT, STATUS_DOCUMENT, PATCH_DOCUMENT), ("ai-env-proxy-reload", "ai-env-proxy-status", "ai-env-proxy-patch"));
+        assert_eq!(DOCUMENT_VERSION, "$DEFAULT", "the literal argument");
     }
 
     #[test]

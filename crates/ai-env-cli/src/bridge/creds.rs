@@ -12,14 +12,29 @@
 //!
 //! A key that was created but not stored is a live credential nobody holds, so
 //! every failure after the input named a key ends with the exact
-//! `aws iam delete-access-key` command that removes it (the id is not secret).
+//! `aws iam delete-access-key` command that removes it (the id is not secret),
+//! started with the runner that can run it on this Mac (S8 operators: a bare
+//! `aws` has no credentials there once root's key is retired).
 //! `--check` is the same preflight without stdin, plus the IAM two-key limit,
 //! so the Makefile can refuse before it creates anything.
+//!
+//! S8 operators: `--user` picks the file, and nothing else is sealed:
+//! `ai-env-runtime` into `credentials/aws.env` (then `combined.env` is rebuilt,
+//! as before), `ai-env-ops` into `credentials/ops.env` with the key's notes
+//! (user, last four, the sealing time) and never into `aws.env` or
+//! `combined.env`. The deployer's key is refused before anything is read
+//! (exit 9): it lives in Strongbox only (`creds deployer-key`, `bridge::handover`).
+//! `creds aws-verify` unseals one of the two files (one Touch ID) and asks
+//! `aws sts get-caller-identity`, with that key alone, until IAM has
+//! propagated it: stdout carries the `id` and `arn` lines `make` reads, never
+//! scrubbed (the scrubber knows the id and would mask it).
 use crate::age_cmd::{find_in_path, AgeTool};
 use crate::bail;
 use crate::bridge::audit;
 use crate::bridge::config::{BridgeConfig, Paths, REGION};
 use crate::bridge::doctor::capture;
+use crate::bridge::identity::{writer_runner, KeyCheck, KeyFile, KeyNotes, KeyWait, Mismatch, DEPLOYER_USER, OPS_USER, RUNTIME_USER};
+use crate::bridge::voice;
 use crate::commands::Tag;
 use crate::container;
 use crate::errors::{CliError, Result};
@@ -86,15 +101,16 @@ struct RawKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Fault {
+pub(crate) enum Fault {
     /// Not the JSON of an active long-term key (exit 1).
     Malformed,
     /// A well-formed key of another IAM user (exit 9).
     ForeignUser,
 }
 
+/// Why the input names no key that may be sealed (or handed over).
 #[derive(Debug)]
-struct InputError {
+pub(crate) struct InputError {
     fault: Fault,
     message: String,
     /// `(user, id)` once both were well-formed: enough for the cleanup command.
@@ -103,10 +119,11 @@ struct InputError {
 
 impl InputError {
     /// The CLI error: the reason, then what to do about a key that exists in
-    /// IAM but was not stored.
-    fn into_cli(self, expected_user: &str) -> CliError {
+    /// IAM but was not `what` (`stored` by aws-set, `handed over` by the
+    /// hand-over): the delete command names the user the key belongs to.
+    pub(crate) fn into_cli(self, expected_user: &str, what: &str) -> CliError {
         let note = match &self.key {
-            Some((user, id)) => not_stored_note(user, id),
+            Some((user, id)) => cleanup_note(user, id, what),
             None => unknown_key_note(expected_user),
         };
         let message = format!("{}\n{note}", self.message);
@@ -130,10 +147,10 @@ fn valid_key_id(id: &str) -> bool {
 /// Why `id` is not a long-term access key id; the value itself is never echoed.
 /// The charset is checked before the length, so a length is only reported for
 /// ASCII input, where bytes and characters agree.
-fn key_id_fault(id: &str) -> Option<String> {
+pub(crate) fn key_id_fault(id: &str) -> Option<String> {
     if !id.starts_with(KEY_ID_PREFIX) {
         return Some(if id.starts_with("ASIA") {
-            "is a temporary STS key id (ASIA…): seal a long-term IAM user key (AKIA…)".into()
+            "is a temporary STS key id (ASIA…), not a long-term IAM user key (AKIA…)".into()
         } else {
             format!("does not start with {KEY_ID_PREFIX}")
         });
@@ -149,7 +166,7 @@ fn key_id_fault(id: &str) -> Option<String> {
 
 /// Why `secret` is not a secret access key; the value itself is never echoed.
 /// Charset before length, as in [`key_id_fault`].
-fn secret_fault(secret: &str) -> Option<String> {
+pub(crate) fn secret_fault(secret: &str) -> Option<String> {
     if !secret.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'+') {
         return Some("has a character outside A-Z a-z 0-9 / +".into());
     }
@@ -171,7 +188,9 @@ fn json_fault(e: &serde_json::Error) -> &'static str {
     }
 }
 
-fn parse_input(json: &[u8], expected_user: &str) -> std::result::Result<AccessKey, InputError> {
+/// [`parse_key_input`] with the refusal of another user's key naming what
+/// was refused: `seal` (aws-set) or `hand over` (the hand-over).
+pub(crate) fn parse_input(json: &[u8], expected_user: &str, verb: &str) -> std::result::Result<AccessKey, InputError> {
     let malformed = |message: String| InputError { fault: Fault::Malformed, message, key: None };
     if json.len() > MAX_INPUT {
         return Err(malformed(format!("stdin holds more than {} KiB: not the JSON of aws iam create-access-key", MAX_INPUT / 1024)));
@@ -198,7 +217,7 @@ fn parse_input(json: &[u8], expected_user: &str) -> std::result::Result<AccessKe
     // From here on the key is identifiable: every refusal carries the cleanup.
     let refuse = |fault: Fault, message: String| InputError { fault, message: scrub(&message).into_owned(), key: Some((user.clone(), id.clone())) };
     if user != expected_user {
-        return Err(refuse(Fault::ForeignUser, format!("the access key belongs to IAM user {user:?}, not {expected_user:?}: refusing to seal another principal's key")));
+        return Err(refuse(Fault::ForeignUser, format!("the access key belongs to IAM user {user:?}, not {expected_user:?}: refusing to {verb} another principal's key")));
     }
     match status.as_deref() {
         Some("Active") => {}
@@ -220,7 +239,7 @@ fn parse_input(json: &[u8], expected_user: &str) -> std::result::Result<AccessKe
 /// registered with the scrubber as soon as it is read. Errors name fields and
 /// user names, never a value of the id or the secret.
 pub fn parse_key_input(json: &[u8], expected_user: &str) -> std::result::Result<AccessKey, String> {
-    parse_input(json, expected_user).map_err(|e| e.message)
+    parse_input(json, expected_user, "seal").map_err(|e| e.message)
 }
 
 /// The plaintext sealed into `aws.env`: the two variables and nothing else.
@@ -242,7 +261,7 @@ pub fn render_env(key: &AccessKey) -> Zeroizing<String> {
 /// bytes, one more is an error. Each read asks for the whole remaining space
 /// (over 8 KiB for any real input), so std's stdin buffer is bypassed and the
 /// bytes land only here.
-fn read_input(r: &mut impl Read) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn read_input(r: &mut impl Read) -> Result<Zeroizing<Vec<u8>>> {
     let mut buf = Zeroizing::new(vec![0u8; MAX_INPUT + 1]);
     let mut n = 0;
     while n <= MAX_INPUT {
@@ -265,7 +284,7 @@ fn read_input(r: &mut impl Read) -> Result<Zeroizing<Vec<u8>>> {
 fn refuse_tty(stdin_is_tty: bool) -> Result<()> {
     if stdin_is_tty {
         return Err(CliError::Usage(
-            "stdin is a terminal: pipe the JSON of aws iam create-access-key into this command (make runtime-key does); never paste it".into(),
+            "stdin is a terminal: pipe the JSON of aws iam create-access-key into this command (make runtime-key and make ops-key do); never paste it".into(),
         ));
     }
     Ok(())
@@ -273,18 +292,36 @@ fn refuse_tty(stdin_is_tty: bool) -> Result<()> {
 
 // ---- cleanup notes -------------------------------------------------------------------
 
-/// The delete command needs the full access key id (an identifier, not a
-/// secret), so it is kept verbatim — the scrubber's key-id rule would mask it —
-/// while the user name still passes the scrubber.
-fn not_stored_note(user: &str, id: &str) -> String {
-    let tail = &id[id.len().saturating_sub(4)..];
-    let user = scrub(user);
-    format!("the access key ...{tail} of IAM user {user} was NOT stored; if you just created it, delete it:\n  aws iam delete-access-key --user-name {user} --access-key-id {id} --region {REGION}")
+/// What to do about a key that exists in IAM but was not `what` (`stored`,
+/// `handed over`): its exact delete command, naming `user`, the user it
+/// belongs to, started with the runner that can run it on this Mac, where a
+/// bare `aws` has no credentials once root's key is retired
+/// ([`writer_runner`]: the marker's, as ops.sh's `as_writer` chooses it). The
+/// delete command needs the full access key id (an identifier, not a secret),
+/// so it is kept verbatim — the scrubber's key-id rule, and its registry once
+/// `EnvKey::new` registered the id, would mask it — while the user name still
+/// passes the scrubber.
+pub(crate) fn cleanup_note(user: &str, id: &str, what: &str) -> String {
+    cleanup_note_as(writer_runner(), user, id, what)
 }
 
-fn unknown_key_note(user: &str) -> String {
+/// [`cleanup_note`] with its delete command started by `runner`.
+fn cleanup_note_as(runner: &str, user: &str, id: &str, what: &str) -> String {
+    let tail = &id[id.len().saturating_sub(4)..];
+    let user = scrub(user);
+    format!("the access key ...{tail} of IAM user {user} was NOT {what}; if you just created it, delete it:\n  {runner}aws iam delete-access-key --user-name {user} --access-key-id {id} --region {REGION}")
+}
+
+/// What to do when the input named no key: find the new one and delete it,
+/// each command started with [`writer_runner`]'s runner.
+pub(crate) fn unknown_key_note(user: &str) -> String {
+    unknown_key_note_as(writer_runner(), user)
+}
+
+/// [`unknown_key_note`] with its commands started by `runner`.
+fn unknown_key_note_as(runner: &str, user: &str) -> String {
     format!(
-        "no access key was stored; if aws iam create-access-key succeeded, find the new key and delete it:\n  aws iam list-access-keys --user-name {user} --region {REGION}\n  aws iam delete-access-key --user-name {user} --access-key-id <id> --region {REGION}"
+        "no access key was stored; if aws iam create-access-key succeeded, find the new key and delete it:\n  {runner}aws iam list-access-keys --user-name {user} --region {REGION}\n  {runner}aws iam delete-access-key --user-name {user} --access-key-id <id> --region {REGION}"
     )
 }
 
@@ -457,8 +494,10 @@ pub(crate) fn check_target_file(paths: &Paths, target: &Path) -> Check {
 
 /// The verdict on `aws iam list-access-keys` output: fewer than
 /// [`IAM_MAX_KEYS`] keys passes; at the maximum the check fails naming the
-/// existing ids (not secret) because the next create-access-key would fail.
-fn keys_verdict(user: &str, json: &str) -> Check {
+/// existing ids (not secret) because the next create-access-key would fail,
+/// with the delete command started by `runner` (the operator's
+/// [`Operator::writer_runner`](crate::bridge::identity::Operator::writer_runner)).
+fn keys_verdict(user: &str, json: &str, runner: &str) -> Check {
     #[derive(Deserialize)]
     struct List {
         #[serde(rename = "AccessKeyMetadata")]
@@ -474,7 +513,7 @@ fn keys_verdict(user: &str, json: &str) -> Check {
     if n >= IAM_MAX_KEYS {
         let ids: Vec<&str> = list.keys.iter().map(|k| if valid_key_id(&k.id) { k.id.as_str() } else { "(unexpected id)" }).collect();
         return Err(CliError::Policy(format!(
-            "IAM user {user} already has {n} access keys ({}), the IAM maximum: delete one first (aws iam delete-access-key --user-name {user} --access-key-id <id> --region {REGION})",
+            "IAM user {user} already has {n} access keys ({}), the IAM maximum: delete one first ({runner}aws iam delete-access-key --user-name {user} --access-key-id <id> --region {REGION})",
             ids.join(", ")
         )));
     }
@@ -486,13 +525,15 @@ fn keys_verdict(user: &str, json: &str) -> Check {
 /// `aws` from this same `PATH`, and the tests must be able to hide it.
 fn check_iam_keys(user: &str) -> Check {
     let path = std::env::var("PATH").unwrap_or_default();
-    let Some(aws) = find_in_path("aws", &path) else {
+    if find_in_path("aws", &path).is_none() {
         return Err(CliError::Msg(format!("aws CLI not found on PATH (needed to count the access keys of {user}): brew install awscli")));
-    };
-    let mut cmd = Command::new(&aws);
-    cmd.args(["iam", "list-access-keys", "--user-name", user, "--region", REGION, "--output", "json"])
-        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-        .env("AWS_PAGER", "");
+    }
+    // S8 operators: listed as the operator identity (ai-env as …, else credentials/ops.env and its one Touch ID,
+    // never the aws CLI's own chain); without one the row is the resolver's refusal (exit 5). The key reaches the
+    // child in its environment only, and the command is never Debug-formatted. The two-key row's delete command
+    // starts with the runner that can run it (D13: the deployer's, or the root's under the bootstrap's runner).
+    let op = crate::bridge::identity::operator().map_err(|e| crate::bridge::identity::labelled("creds aws-set --check", e))?;
+    let cmd: Command = crate::bridge::awscli::operator_program(&["iam", "list-access-keys", "--user-name", user, "--region", REGION, "--output", "json"]).map_err(CliError::AuthUnavailable)?;
     let out = capture(cmd, None, AWS_TIMEOUT).map_err(CliError::Aws)?;
     if !out.success {
         // Until `make deploy` the user does not exist: name that, not the API
@@ -504,7 +545,7 @@ fn check_iam_keys(user: &str) -> Check {
         let why = if first.is_empty() { format!("exit {}", out.code.map_or_else(|| "signal".into(), |c| c.to_string())) } else { scrub(&first).into_owned() };
         return Err(CliError::Aws(format!("aws iam list-access-keys --user-name {user}: {why}")));
     }
-    keys_verdict(user, &out.stdout)
+    keys_verdict(user, &out.stdout, op.writer_runner())
 }
 
 /// The rows both modes share: keystore key, recovery recipient, age, target.
@@ -586,10 +627,56 @@ pub(crate) struct Sealed {
 }
 
 /// Preflight, encrypt [`render_env`] to the key's recipients, sanity-check the
-/// ciphertext, back up an existing container, write the new one atomically.
-fn seal(store: &Keystore, paths: &Paths, key_name: &str, key: &AccessKey, force: bool) -> Result<Sealed> {
+/// ciphertext, back up an existing container, write the new one atomically
+/// into `target`'s file: `aws.env` as before (no notes), `ops.env` with the
+/// key's notes ([`KeyNotes::pairs`]: user, last four, the sealing time), what
+/// `creds status` and doctor show without a Touch ID.
+fn seal(store: &Keystore, paths: &Paths, key_name: &str, key: &AccessKey, target: KeyFile, force: bool) -> Result<Sealed> {
     let plaintext = render_env(key);
-    seal_file(store, paths, key_name, &paths.aws_env(), plaintext.as_bytes(), &[key.secret.expose().as_bytes()], &[], force)
+    let notes = match target {
+        KeyFile::Runtime => Vec::new(),
+        KeyFile::Ops => KeyNotes::pairs(OPS_USER, key.id_tail(), unix_now()),
+    };
+    let notes: Vec<(&str, &str)> = notes.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    seal_file(store, paths, key_name, &target.path(paths), plaintext.as_bytes(), &[key.secret.expose().as_bytes()], &notes, force)
+}
+
+/// The file `creds aws-set --user` seals into, decided before anything is
+/// read (`--check` included): `ai-env-runtime` → `credentials/aws.env`,
+/// `ai-env-ops` → `credentials/ops.env`. The deployer's key is never stored
+/// on this Mac (exit 9, with how to find and delete a key just created for
+/// it); any other user is a usage error (exit 2).
+pub(crate) fn seal_target(user: &str) -> Result<KeyFile> {
+    if !valid_user_name(user) {
+        return Err(CliError::Usage(format!("--user {user:?} is not an IAM user name ({USER_CHARS})")));
+    }
+    match user {
+        RUNTIME_USER => Ok(KeyFile::Runtime),
+        OPS_USER => Ok(KeyFile::Ops),
+        DEPLOYER_USER => Err(CliError::Policy(format!(
+            "--user {DEPLOYER_USER}: the deployer's key is never stored on this Mac: it lives in Strongbox and is pasted per command (ai-env as deployer -- …); hand a new one over with: {}aws iam create-access-key --user-name {DEPLOYER_USER} --output json | ai-env creds deployer-key\n{}",
+            writer_runner(),
+            unknown_key_note(DEPLOYER_USER)
+        ))),
+        _ => Err(CliError::Usage(format!("--user {user:?}: aws-set seals {RUNTIME_USER} (credentials/aws.env) or {OPS_USER} (credentials/ops.env)"))),
+    }
+}
+
+/// The sealed file `creds aws-verify --user` checks: `ai-env-runtime`'s or
+/// `ai-env-ops`'; the deployer's key is never sealed (exit 9), any other user
+/// is a usage error (exit 2).
+pub(crate) fn verify_target(user: &str) -> Result<KeyFile> {
+    match user {
+        RUNTIME_USER => Ok(KeyFile::Runtime),
+        OPS_USER => Ok(KeyFile::Ops),
+        DEPLOYER_USER => Err(CliError::Policy(format!("--user {DEPLOYER_USER}: its key is never sealed here: check it with ai-env as deployer -- true"))),
+        _ => Err(CliError::Usage(format!("--user {user:?}: aws-verify checks {RUNTIME_USER} (credentials/aws.env) or {OPS_USER} (credentials/ops.env)"))),
+    }
+}
+
+/// The file name of `target` (`aws.env`, `ops.env`): the audit rows' `file`.
+fn file_name(target: KeyFile, paths: &Paths) -> String {
+    target.path(paths).file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 /// Seal `plaintext` into `target` under `credentials/`: the preflight for
@@ -631,12 +718,16 @@ pub(crate) fn seal_file(store: &Keystore, paths: &Paths, key_name: &str, target:
 /// the first failure. Never reads stdin. The verdict does not depend on the
 /// printing: a closed stdout (`--check | head -1`) must not turn a failing
 /// check into the broken-pipe exit 0, so a write error counts only when every
-/// row passed (and a broken pipe is then success, as everywhere).
-fn run_check(store: &Keystore, user: &str, force: bool) -> Result<()> {
+/// row passed (and a broken pipe is then success, as everywhere). The target
+/// row is `target`'s file, the IAM row `target`'s user.
+fn run_check(store: &Keystore, target: KeyFile, force: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let name = key_name(&paths)?;
-    let (mut rows, _age) = preflight(store, &paths, &name, force);
-    rows.push(check_iam_keys(user));
+    let (mut rows, _age) = match target {
+        KeyFile::Runtime => preflight(store, &paths, &name, force),
+        KeyFile::Ops => preflight_for(store, &paths, &name, &target.path(&paths), force),
+    };
+    rows.push(check_iam_keys(target.user()));
     let mut write_error = None;
     for row in &rows {
         let printed = match row {
@@ -656,22 +747,21 @@ fn run_check(store: &Keystore, user: &str, force: bool) -> Result<()> {
     }
 }
 
-/// `ai-env creds aws-set [--user U] [--check] [--force]`.
+/// `ai-env creds aws-set [--user U] [--check] [--force]`: `U` decides the
+/// file ([`seal_target`]) before anything is read.
 pub fn cmd_aws_set(store: &Keystore, user: &str, check: bool, force: bool) -> Result<()> {
-    if !valid_user_name(user) {
-        return Err(CliError::Usage(format!("--user {user:?} is not an IAM user name ({USER_CHARS})")));
-    }
+    let target = seal_target(user)?;
     if check {
-        return run_check(store, user, force);
+        return run_check(store, target, force);
     }
     refuse_tty(std::io::stdin().is_terminal())?;
     let input = read_input(&mut std::io::stdin().lock()).map_err(|e| with_note(e, &unknown_key_note(user)))?;
-    let key = parse_input(&input, user).map_err(|e| e.into_cli(user))?;
+    let key = parse_input(&input, user, "seal").map_err(|e| e.into_cli(user, "stored"))?;
     drop(input);
-    let not_stored = |e: CliError| with_note(e, &not_stored_note(&key.user, &key.id));
+    let not_stored = |e: CliError| with_note(e, &cleanup_note(&key.user, &key.id, "stored"));
     let paths = Paths::resolve().map_err(|e| not_stored(e.into()))?;
     let name = key_name(&paths).map_err(not_stored)?;
-    let sealed = seal(store, &paths, &name, &key, force).map_err(not_stored)?;
+    let sealed = seal(store, &paths, &name, &key, target, force).map_err(not_stored)?;
     // The key is stored from here on: a failed audit write is a warning, not a
     // failure that would send the operator to delete a working key.
     let row = audit::AuditRow::new(
@@ -682,6 +772,7 @@ pub fn cmd_aws_set(store: &Keystore, user: &str, check: bool, force: bool) -> Re
             ("key_id_last4", key.id_tail().to_string()),
             ("key", name.clone()),
             ("rotated", sealed.backup.is_some().to_string()),
+            ("file", file_name(target, &paths)),
         ]),
     );
     if let Err(e) = audit::append(&paths.audit(), &row) {
@@ -695,9 +786,75 @@ pub fn cmd_aws_set(store: &Keystore, user: &str, check: bool, force: bool) -> Re
     // (one Touch ID to read the token); a failure there never fails the seal.
     // It records the hash of the text sealed here, whatever aws.env holds by
     // then (F2: a second `creds aws-set` may seal anew while the lines above
-    // are written).
-    crate::bridge::setup_token::after_aws_set(store, &paths, &name, &key.id, key.secret.expose(), &sealed.sha256, force);
+    // are written). The ops key is never part of combined.env.
+    if target == KeyFile::Runtime {
+        crate::bridge::setup_token::after_aws_set(store, &paths, &name, &key.id, key.secret.expose(), &sealed.sha256, force);
+    }
     Ok(())
+}
+
+/// One line on stdout for the recipe that reads it (`id <id>`, `arn <arn>`),
+/// written as it is, never through `scrub()` (the scrubber knows the id and
+/// would mask it), and only when stdout is not a terminal (D8: a person sees
+/// the full id nowhere but in a delete command). A write error is ignored: the
+/// exit status still says what happened.
+pub(crate) fn recipe_line(line: &str) {
+    let out = std::io::stdout();
+    let terminal = out.is_terminal();
+    recipe_line_to(&mut out.lock(), terminal, line);
+}
+
+/// [`recipe_line`] into `out`, which is a terminal when `terminal`: then nothing.
+fn recipe_line_to(out: &mut impl std::io::Write, terminal: bool, line: &str) {
+    if !terminal {
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+}
+
+/// `ai-env creds aws-verify [--user U]` (S8 operators): unseal `U`'s sealed
+/// key (one Touch ID), then `aws sts get-caller-identity` with that key alone
+/// until it answers ([`KeyWait::SEALED`]: 6 tries, 5 s apart, while IAM
+/// propagates a key just made), judged against the stack's account and the
+/// user's recorded ARN when this Mac knows them. stdout carries `id <id>`
+/// right after the unseal and `arn <arn>` on an answer (not on a terminal):
+/// exit 0 for `U`, 9 for another principal, the root, another account or
+/// another ARN, 5 when it never answered; an unseal keeps its own classes
+/// (absent or not sealed 5, cancelled 3, no keystore key 4).
+pub fn cmd_aws_verify(store: &Keystore, user: &str) -> Result<()> {
+    let file = verify_target(user)?;
+    let paths = Paths::resolve()?;
+    let key = crate::bridge::identity::unseal_key(store, &paths, file)?;
+    recipe_line(&format!("id {}", key.id()));
+    let exp = crate::bridge::identity::expected(&paths, None)?;
+    let label = format!("aws-verify: the sealed key ...{}", key.tail());
+    let user = file.user();
+    let wait = KeyWait::SEALED;
+    let (result, outcome) = match crate::bridge::identity::check_key(&key, user, &exp, wait, "the sealed key") {
+        Ok(v) => {
+            recipe_line(&format!("arn {}", v.arn));
+            voice::note(&format!("{label} answers as user/{user}"));
+            ("verified", Ok(()))
+        }
+        Err(KeyCheck::Mismatch(v, why)) => {
+            recipe_line(&format!("arn {}", v.arn));
+            let (result, text) = match why {
+                Mismatch::Root { .. } => ("root", format!("{label} is the account ROOT's: never seal it (delete it in the IAM console)")),
+                Mismatch::OtherPrincipal { arn } => ("other-principal", format!("{label} answers as {arn}, not user/{user}")),
+                Mismatch::OtherAccount { account, want, source, .. } => ("other-account", format!("{label} is {user} of account {account}, but the stack ({source}) is in account {want}")),
+                Mismatch::OtherArn { arn, want, source } => ("other-arn", format!("{label} answers as {arn}, but the stack's {user} is {want} ({source})")),
+            };
+            (result, Err(CliError::Policy(text)))
+        }
+        Err(KeyCheck::Refused(last) | KeyCheck::Failed(last)) => {
+            ("never-answered", Err(CliError::AuthUnavailable(format!("{label} never answered ({} tries, {} s apart; last: {last})", wait.tries, wait.step.as_secs()))))
+        }
+    };
+    let row = audit::AuditRow::new("creds_aws_verify", None, audit::detail(&[("user", user.to_string()), ("key_id_last4", key.tail().to_string()), ("result", result.to_string())]));
+    if let Err(e) = audit::append(&paths.audit(), &row) {
+        voice::warn(&format!("the audit row was not written: {e}"));
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -724,7 +881,7 @@ mod tests {
     }
 
     fn fault(json: &str) -> (Fault, String, Option<(String, String)>) {
-        let e = parse_input(json.as_bytes(), USER).expect_err("must be refused");
+        let e = parse_input(json.as_bytes(), USER, "seal").expect_err("must be refused");
         (e.fault, e.message, e.key)
     }
 
@@ -802,14 +959,96 @@ mod tests {
         assert_eq!(f, Fault::ForeignUser);
         assert!(message.contains("\"rust\"") && message.contains(&format!("\"{USER}\"")), "{message}");
         assert_eq!(key, Some(("rust".to_string(), i.clone())));
-        let e = parse_input(json("rust", &i, &s, "Active").as_bytes(), USER).unwrap_err().into_cli(USER);
+        let e = parse_input(json("rust", &i, &s, "Active").as_bytes(), USER, "seal").unwrap_err().into_cli(USER, "stored");
         assert_eq!(e.exit_code(), 9);
         let text = e.to_string();
         assert!(text.contains(&format!("aws iam delete-access-key --user-name rust --access-key-id {i} --region eu-central-1")), "{text}");
         assert!(text.contains("was NOT stored") && !text.contains(&s), "{text}");
-        let e = parse_input(b"{}", USER).unwrap_err().into_cli(USER);
+        let e = parse_input(b"{}", USER, "seal").unwrap_err().into_cli(USER, "stored");
         assert_eq!(e.exit_code(), 1);
         assert!(e.to_string().contains(&format!("aws iam list-access-keys --user-name {USER} --region eu-central-1")), "{e}");
+    }
+
+    /// S8 operators: the hand-over refuses another user's key with its own
+    /// verb, and its cleanup note says what was not done, naming the user the
+    /// key belongs to; the id stays whole in the delete command, where the
+    /// scrubber would mask it.
+    #[test]
+    fn cleanup_notes_name_the_owner_and_what_was_not_done() {
+        let (i, s) = (id("7V3K"), secret("mN4+"));
+        let e = parse_input(json("rust", &i, &s, "Active").as_bytes(), DEPLOYER_USER, "hand over").unwrap_err();
+        assert!(e.message.ends_with("not \"ai-env-deployer\": refusing to hand over another principal's key"), "{}", e.message);
+        let e = e.into_cli(DEPLOYER_USER, "handed over");
+        assert_eq!(e.exit_code(), 9);
+        let text = e.to_string();
+        // The note's runner is this process's marker's (tests/infra/creds.rs and handover.rs run each one).
+        let note = format!("the access key ...7V3K of IAM user rust was NOT handed over; if you just created it, delete it:\n  {}aws iam delete-access-key --user-name rust --access-key-id {i} --region eu-central-1", writer_runner());
+        assert!(text.ends_with(&note) && !text.contains(&s), "{text}");
+        assert_eq!(cleanup_note(OPS_USER, &i, "stored"), cleanup_note_as(writer_runner(), OPS_USER, &i, "stored"));
+        // D13: the delete command starts with the runner that can run it on this Mac (a bare aws has no credentials).
+        let stored = cleanup_note_as("ai-env as deployer -- ", OPS_USER, &i, "stored");
+        assert_eq!(stored, format!("the access key ...7V3K of IAM user ai-env-ops was NOT stored; if you just created it, delete it:\n  ai-env as deployer -- aws iam delete-access-key --user-name ai-env-ops --access-key-id {i} --region eu-central-1"));
+        assert!(!scrub(&stored).contains(&i), "printed whole although the scrubber masks such an id");
+        let root = cleanup_note_as("ai-env as root -- ", DEPLOYER_USER, &i, "handed over");
+        assert!(root.ends_with(&format!(":\n  ai-env as root -- aws iam delete-access-key --user-name ai-env-deployer --access-key-id {i} --region eu-central-1")), "{root}");
+        let unknown = unknown_key_note_as("ai-env as deployer -- ", OPS_USER);
+        assert_eq!(
+            unknown,
+            "no access key was stored; if aws iam create-access-key succeeded, find the new key and delete it:\n  ai-env as deployer -- aws iam list-access-keys --user-name ai-env-ops --region eu-central-1\n  ai-env as deployer -- aws iam delete-access-key --user-name ai-env-ops --access-key-id <id> --region eu-central-1"
+        );
+        assert_eq!(unknown_key_note(OPS_USER), unknown_key_note_as(writer_runner(), OPS_USER));
+        // The user name passes the scrubber.
+        assert!(!cleanup_note("token=abcdefgh1234", &i, "stored").contains("abcdefgh1234"));
+    }
+
+    /// D8: the `id` and `arn` lines of `creds deployer-key` and `creds
+    /// aws-verify` reach a pipe (the recipe that captures them) whole, never
+    /// through the scrubber, which masks such an id, and a terminal not at all:
+    /// a person sees the full id only in a delete command.
+    #[test]
+    fn recipe_lines_reach_a_pipe_whole_and_never_a_terminal() {
+        let i = id("6W2J");
+        let arn = "arn:aws:iam::123456789012:user/ai-env-ops";
+        for line in [format!("id {i}"), format!("arn {arn}")] {
+            let mut piped = Vec::new();
+            recipe_line_to(&mut piped, false, &line);
+            assert_eq!(String::from_utf8(piped).unwrap(), format!("{line}\n"));
+            let mut terminal = Vec::new();
+            recipe_line_to(&mut terminal, true, &line);
+            assert!(terminal.is_empty(), "{line} reached a terminal");
+        }
+        assert!(!scrub(&format!("id {i}")).contains(&i), "the scrubber would have masked the id");
+    }
+
+    /// `--user` decides the file before anything is read: the runtime and ops
+    /// keys have one each; the deployer's key is never stored (exit 9, with how
+    /// to find a key just created for it), any other user is a usage error.
+    /// aws-verify takes the same two users.
+    #[test]
+    fn seal_targets_follow_the_user_and_refuse_the_deployer() {
+        assert_eq!((seal_target(RUNTIME_USER).unwrap(), seal_target(OPS_USER).unwrap()), (KeyFile::Runtime, KeyFile::Ops));
+        let e = seal_target(DEPLOYER_USER).unwrap_err();
+        assert_eq!(e.exit_code(), 9);
+        let text = e.to_string();
+        let (first, rest) = text.split_once('\n').unwrap();
+        assert_eq!(
+            first,
+            format!("--user ai-env-deployer: the deployer's key is never stored on this Mac: it lives in Strongbox and is pasted per command (ai-env as deployer -- …); hand a new one over with: {}aws iam create-access-key --user-name ai-env-deployer --output json | ai-env creds deployer-key", writer_runner())
+        );
+        assert_eq!(rest, unknown_key_note(DEPLOYER_USER));
+        for other in ["rust", "ai-env-runtime2", "ai-env-deployer-2"] {
+            let e = seal_target(other).unwrap_err();
+            assert_eq!((e.exit_code(), e.to_string()), (2, format!("--user \"{other}\": aws-set seals ai-env-runtime (credentials/aws.env) or ai-env-ops (credentials/ops.env)")));
+        }
+        let e = seal_target("a b").unwrap_err();
+        assert!(e.exit_code() == 2 && e.to_string().contains("is not an IAM user name"), "{e}");
+        assert_eq!((verify_target(RUNTIME_USER).unwrap(), verify_target(OPS_USER).unwrap()), (KeyFile::Runtime, KeyFile::Ops));
+        let e = verify_target(DEPLOYER_USER).unwrap_err();
+        assert_eq!((e.exit_code(), e.to_string().as_str()), (9, "--user ai-env-deployer: its key is never sealed here: check it with ai-env as deployer -- true"));
+        let e = verify_target("rust").unwrap_err();
+        assert_eq!((e.exit_code(), e.to_string().as_str()), (2, "--user \"rust\": aws-verify checks ai-env-runtime (credentials/aws.env) or ai-env-ops (credentials/ops.env)"));
+        let paths = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        assert_eq!((file_name(KeyFile::Runtime, &paths), file_name(KeyFile::Ops, &paths)), ("aws.env".to_string(), "ops.env".to_string()));
     }
 
     #[test]
@@ -852,21 +1091,25 @@ mod tests {
 
     #[test]
     fn keys_verdict_counts_against_the_iam_maximum() {
+        const AS_D: &str = "ai-env as deployer -- ";
         let listed = |n: usize| {
             let rows: Vec<String> = (0..n).map(|k| format!("{{\"UserName\": \"{USER}\", \"AccessKeyId\": \"{}\", \"Status\": \"Active\"}}", id(&format!("000{k}")))).collect();
             format!("{{\"AccessKeyMetadata\": [{}]}}", rows.join(", "))
         };
-        assert!(keys_verdict(USER, &listed(0)).unwrap().contains("has 0 access key(s)"));
-        assert!(keys_verdict(USER, &listed(1)).unwrap().contains("has 1 access key(s)"));
-        let e = keys_verdict(USER, &listed(2)).unwrap_err();
+        assert!(keys_verdict(USER, &listed(0), AS_D).unwrap().contains("has 0 access key(s)"));
+        assert!(keys_verdict(USER, &listed(1), AS_D).unwrap().contains("has 1 access key(s)"));
+        let e = keys_verdict(USER, &listed(2), AS_D).unwrap_err();
         assert_eq!(e.exit_code(), 9);
         let text = e.to_string();
         assert!(text.contains("already has 2 access keys") && text.contains(&id("0000")) && text.contains(&id("0001")), "{text}");
-        assert!(text.contains("delete one first"), "{text}");
+        // D13: the delete command starts with the runner that can run it on this Mac (a bare aws has no credentials).
+        assert!(text.ends_with(&format!("the IAM maximum: delete one first (ai-env as deployer -- aws iam delete-access-key --user-name {USER} --access-key-id <id> --region eu-central-1)")), "{text}");
+        let root = keys_verdict(USER, &listed(2), "ai-env as root -- ").unwrap_err().to_string();
+        assert!(root.ends_with(&format!("delete one first (ai-env as root -- aws iam delete-access-key --user-name {USER} --access-key-id <id> --region eu-central-1)")), "{root}");
         let odd = "{\"AccessKeyMetadata\": [{\"AccessKeyId\": \"x\\u001b[31m\"}, {}]}";
-        let text = keys_verdict(USER, odd).unwrap_err().to_string();
+        let text = keys_verdict(USER, odd, AS_D).unwrap_err().to_string();
         assert!(text.contains("(unexpected id), (unexpected id)") && !text.contains('\u{1b}'), "{text}");
-        assert_eq!(keys_verdict(USER, "garbage").unwrap_err().exit_code(), 7);
+        assert_eq!(keys_verdict(USER, "garbage", AS_D).unwrap_err().exit_code(), 7);
     }
 
     #[test]

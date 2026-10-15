@@ -37,9 +37,11 @@ const STILL_ALLOWED: &str = "STILL ALLOWED on the proxy; `make proxy-stop` to fa
 const STATE_UNKNOWN: &str = "the proxy's state is unknown: `make proxy-stop` to fail closed";
 const SQUID_CONF: &str = "http_port 10.42.0.10:3128\n";
 const ALLOW: &str = "api.anthropic.com\nplatform.claude.com\nindex.crates.io\nstatic.crates.io\n";
-/// What a reload sends (its `--status` is a command of its own).
-const RELOAD_SCRIPT: &str = r#""commands":["/usr/local/sbin/ai-env-proxy-reload"],"executionTimeout":["1500"]"#;
-const STATUS_SCRIPT: &str = r#""commands":["/usr/local/sbin/ai-env-proxy-reload --status"],"executionTimeout":["400"]"#;
+/// What a reload sends (S8 operators): the reload document at its default version, applying (its `--status` is a
+/// command of its own); `--if-changed` sends the other mode.
+const RELOAD_SCRIPT: &str = "--document-name ai-env-proxy-reload --document-version $DEFAULT ";
+/// What a status run sends: the status document (`rpm -q squid`, then `ai-env-proxy-reload --status`), no parameters.
+const STATUS_SCRIPT: &str = "--document-name ai-env-proxy-status --document-version $DEFAULT ";
 const APPLIED: &str = "ai-env-proxy-reload: applied (reconfigured): allowed=4 extras=0 suspended=0\n";
 
 fn fixtures() -> PathBuf {
@@ -59,7 +61,8 @@ fn closed_stdout() -> Stdio {
 }
 
 fn bounded_with(mut c: Command, stdout: Stdio) -> Output {
-    let what = format!("{c:?}");
+    // The program and its arguments only: the command's environment carries a key (Eg::cmd), never Debug-formatted.
+    let what = std::iter::once(c.get_program()).chain(c.get_args()).map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
     let mut child = c.stdin(Stdio::null()).stdout(stdout).stderr(Stdio::piped()).spawn().unwrap_or_else(|e| panic!("{what}: {e}"));
     let (so, mut se) = (child.stdout.take(), child.stderr.take().unwrap());
     let out = std::thread::spawn(move || {
@@ -154,9 +157,16 @@ impl Eg {
         Paths::from_root_and_env(self.w.bridge(), None)
     }
 
+    /// `ai-env <args>` against this world's fakes, run as `ai-env as ops`
+    /// leaves it (S8 operators §11.2: the ops key and its marker), but for
+    /// `egress allow`, which only ai-env-deployer may run (O3): the deployer's
+    /// key and marker. A test that needs another identity sets it after this.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = self.w.cmd(args);
         c.env("PATH", &self.path).env("FAKE_AWS_LOG", &self.log).env("FAKE_AWS_ANSWERS", &self.answers).env("FAKE_AWS_SSM_DIR", &self.ssm).env("FAKE_AWS_PIN_ALL", "1");
+        use crate::aws_keys::{identity_env, DEPLOYER_TAIL, OPS_TAIL};
+        let identity = if args.starts_with(&["egress", "allow"]) { identity_env("deployer", DEPLOYER_TAIL) } else { identity_env("ops", OPS_TAIL) };
+        c.envs(identity);
         c
     }
 
@@ -388,7 +398,7 @@ fn status_all_green_checks_every_part_and_pins_every_call() {
     assert!(calls.iter().any(|l| l.starts_with(&format!("lambda-core get-network-connector --identifier {CONNECTOR} "))), "{calls:?}");
     let send: Vec<&String> = calls.iter().filter(|l| l.starts_with("ssm send-command")).collect();
     assert_eq!(send.len(), 1, "{calls:?}");
-    assert!(send[0].contains("--document-name AWS-RunShellScript") && send[0].contains(r#""commands":["rpm -q squid || true","/usr/local/sbin/ai-env-proxy-reload --status"]"#), "{}", send[0]);
+    assert!(send[0].contains(STATUS_SCRIPT) && send[0].contains(" --comment ai-env egress status --timeout-seconds 60 ") && !send[0].contains("--parameters"), "{}", send[0]);
     assert!(calls.iter().any(|l| l.starts_with("ssm get-parameters --names /ai-env/proxy/squid.conf /ai-env/proxy/allow /ai-env/proxy/extras /ai-env/proxy/suspended ")), "{calls:?}");
     assert!(!calls.iter().any(|l| l.contains("put-parameter") || l.contains("start-instances") || l.contains("stop-instances") || l.starts_with("route53resolver")), "status writes nothing; no DNS Firewall in mode none: {calls:?}");
     // --json: one document with every row.
@@ -574,7 +584,8 @@ fn status_in_firewall_mode_needs_a_closed_dns_firewall() {
 #[test]
 fn every_command_checks_the_operator_account_before_any_other_call() {
     let t = Eg::new();
-    t.answer("sts.get-caller-identity.json", &json!({"Account": "999999999999", "Arn": "arn:aws:iam::999999999999:user/rust"}));
+    // S8 operators: the operators' keys answer as their users, of another account than the connector's.
+    let elsewhere = "9001:ai-env-deployer@999999999999 9002:ai-env-ops@999999999999";
     for args in [
         &["egress", "status"][..],
         &["egress", "allow", "ai-env", "github.com"],
@@ -586,13 +597,137 @@ fn every_command_checks_the_operator_account_before_any_other_call() {
         &["proxy", "start"],
         &["proxy", "patch"],
     ] {
-        let o = t.run(args);
+        let o = t.run_env(args, &[("FAKE_AWS_KEY_USERS", elsewhere)]);
         assert_eq!(code(&o), 1, "{args:?}: {}", stderr(&o));
-        assert!(stderr(&o).contains("999999999999") && stderr(&o).contains("123456789012"), "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("the operator credentials are of account 999999999999, but") && stderr(&o).contains("is in account 123456789012: run it under ai-env as ops -- with that account's ops key"), "{args:?}: {}", stderr(&o));
         assert_eq!(t.ops(), ["sts get-caller-identity"], "{args:?}");
     }
     assert_eq!(t.param("extras"), EXTRAS_HEADER);
     assert!(t.w.audit().is_empty(), "{}", t.w.audit());
+}
+
+/// S8 operators (O3, §4.4): `egress allow`, adding or removing, is refused to
+/// ai-env-ops before any unseal or AWS call — under its marker, and with no
+/// marker at all (the resolver would unseal credentials/ops.env) — naming the
+/// exact command to run as the deployer; suspending stays ops' own.
+#[test]
+fn allow_is_refused_to_ai_env_ops_before_any_call() {
+    let t = Eg::new();
+    let ops: Vec<(String, String)> = crate::aws_keys::identity_env("ops", crate::aws_keys::OPS_TAIL);
+    let ops: Vec<(&str, &str)> = ops.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let none = [("AI_ENV_BRIDGE_AS", ""), ("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", "")];
+    for env in [&ops[..], &none[..]] {
+        // The variables' names only: the ops identity's values are a key.
+        let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        for (args, line) in [
+            (&["egress", "allow", "ai-env", "GitHub.com"][..], "ai-env: egress allow: /ai-env/proxy/extras widens what every vpc VM may reach and only ai-env-deployer writes it: run ai-env as deployer -- ai-env egress allow ai-env github.com (ai-env egress suspend github.com stops serving a host as ai-env-ops)"),
+            (&["egress", "allow", "ws-2", "example.com", "--remove"], "ai-env: egress allow --remove: /ai-env/proxy/extras widens what every vpc VM may reach and only ai-env-deployer writes it: run ai-env as deployer -- ai-env egress allow ws-2 example.com --remove (ai-env egress suspend example.com stops serving a host as ai-env-ops)"),
+        ] {
+            let o = t.run_env(args, env);
+            assert_eq!(code(&o), 9, "{args:?} {names:?}: {}", stderr(&o));
+            assert!(has_line(&o, line), "{args:?} {names:?}: {}", stderr(&o));
+            assert!(t.calls().is_empty(), "{args:?} {names:?}: {:?}", t.calls());
+        }
+    }
+    assert_eq!(t.param("extras"), EXTRAS_HEADER);
+    assert!(t.w.audit().is_empty(), "{}", t.w.audit());
+    // The deployer may; ops still suspends.
+    assert_eq!(code(&t.run(&["egress", "allow", "ai-env", "github.com"])), 0);
+    assert_eq!(t.param("extras"), format!("{EXTRAS_HEADER}github.com\tai-env\n"));
+    t.reload_proves("suspended", &format!("{SUSPENDED_HEADER}example.com\n"));
+    let o = t.run(&["egress", "suspend", "example.com"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+/// S8 operators §4.2: the operator's one sts call comes first and refuses a
+/// key that answers as the account root or as another user, a `root` marker
+/// whose credentials are not the root's, an `ambient` one whose are (D20),
+/// and a key AWS refuses — before any other call, and nothing is written.
+#[test]
+fn a_root_or_foreign_identity_is_refused_before_any_other_call() {
+    let t = Eg::new();
+    let root_key = "ai-env: egress status: the operator credentials are the account ROOT's: operator commands never run as root after the bootstrap (ai-env as ops --, ai-env as deployer --)";
+    // The ops runner's key is credentials/ops.env's (only ai-env as ops sets an ops: marker): re-sealed, never run
+    // again, which would unseal the same key (D23).
+    let foreign = "ai-env: egress status: AI_ENV_BRIDGE_AS says ai-env-ops, but its key answers as arn:aws:iam::123456789012:user/rust: re-seal credentials/ops.env, which ai-env as ops unseals, with ai-env as deployer -- make ops-key ROTATE=1";
+    let refused = "ai-env: egress status: AWS refused the operator key ...9002 (InvalidClientTokenId): re-seal credentials/ops.env, which ai-env as ops unseals, with ai-env as deployer -- make ops-key ROTATE=1";
+    let not_root = "ai-env: egress status: AI_ENV_BRIDGE_AS=root, but the aws CLI's credentials are arn:aws:iam::123456789012:user/rust, not the account root: unset it, or run the command under ai-env as root -- again";
+    let ambient_root = "ai-env: egress status: the aws CLI's credentials are the account ROOT under ai-env as ambient: operator commands run as ai-env as ops --, the bootstrap alone as ai-env as root --";
+    let root_marker = crate::aws_keys::marker_env("root");
+    let ambient_marker = crate::aws_keys::marker_env("ambient");
+    let marker = |m: &[(String, String)]| m[0].1.clone();
+    let (root_word, ambient_word) = (marker(&root_marker), marker(&ambient_marker));
+    for (env, code_want, text) in [
+        (vec![("FAKE_AWS_KEY_USERS", "9002:root")], 9, root_key),
+        (vec![("FAKE_AWS_KEY_USERS", "9002:rust")], 9, foreign),
+        (vec![("FAKE_AWS_KEY_USERS", "9001:ai-env-deployer")], 5, refused),
+        // The markers of the aws CLI's own chain: no key in the environment.
+        (vec![("AI_ENV_BRIDGE_AS", root_word.as_str()), ("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", ""), ("FAKE_AWS_CALLER", "rust")], 9, not_root),
+        (vec![("AI_ENV_BRIDGE_AS", ambient_word.as_str()), ("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", ""), ("FAKE_AWS_CALLER", "root")], 9, ambient_root),
+    ] {
+        for args in [&["egress", "status"][..], &["proxy", "start"], &["egress", "suspend", "example.com"]] {
+            let o = t.run_env(args, &env);
+            assert_eq!(code(&o), code_want, "{args:?} {env:?}: {}", stderr(&o));
+            let what = args[..2].join(" ");
+            assert!(has_line(&o, &text.replace("egress status", &what)), "{args:?} {env:?}: {}", stderr(&o));
+            assert_eq!(t.ops(), ["sts get-caller-identity"], "{args:?} {env:?}");
+        }
+    }
+    assert_eq!(t.param("suspended"), SUSPENDED_HEADER, "nothing written");
+    // The ambient chain under the marker that declares it: the account check, then the work, written, reloaded and
+    // the denial proved by the status document.
+    t.reload_proves("suspended", &format!("{SUSPENDED_HEADER}example.com\n"));
+    let o = t.run_env(&["egress", "suspend", "example.com"], &[("AI_ENV_BRIDGE_AS", ambient_word.as_str()), ("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", ""), ("FAKE_AWS_CALLER", "agent")]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let sent = ["ssm send-command", "ssm get-command-invocation"];
+    assert_eq!(t.ops(), [&["sts get-caller-identity", "ssm get-parameters", "ssm put-parameter", "ec2 describe-instances"][..], &sent, &sent].concat());
+    assert_eq!(t.param("suspended"), format!("{SUSPENDED_HEADER}example.com\n"));
+}
+
+/// S8 operators §7.4: a `state/infra.toml` that names other proxy documents
+/// than the ones this ai-env sends is refused by every command that sends
+/// one, `egress check` included (its network verification sends the status
+/// document), before the identity and any call (exit 1): under `ai-env as
+/// ops` and with no identity at all, where resolving it first would be exit
+/// 5 (and `egress allow`'s own refusal exit 9); no VM is started. Absent
+/// names pass (a reload right after a deploy), and `proxy stop` sends none.
+#[test]
+fn a_state_naming_other_proxy_documents_is_refused_before_the_identity() {
+    let t = Eg::new();
+    t.write_state(|s| {
+        s.proxy_reload_document = Some("ai-env-proxy-reload-v2".into());
+        s.proxy_patch_document = Some("ai-env-proxy-patch".into());
+    });
+    let state = t.w.bridge().join("state").join("infra.toml");
+    let line = format!(
+        "ai-env: {} names the proxy documents ai-env-proxy-reload-v2, -, ai-env-proxy-patch; this ai-env sends ai-env-proxy-reload, ai-env-proxy-status, ai-env-proxy-patch: update ai-env, or make infra-status WRITE=1",
+        state.display()
+    );
+    let none = [("AI_ENV_BRIDGE_AS", ""), ("AWS_ACCESS_KEY_ID", ""), ("AWS_SECRET_ACCESS_KEY", "")];
+    for (who, env) in [("ai-env as ops", &[][..]), ("no identity", &none[..])] {
+        for args in [&["egress", "status"][..], &["egress", "allow", "ai-env", "github.com"], &["egress", "suspend", "example.com"], &["egress", "reload"], &["proxy", "start"], &["proxy", "patch"], &["egress", "check"]] {
+            let o = t.run_env(args, env);
+            assert_eq!(code(&o), 1, "{args:?} ({who}): {}", stderr(&o));
+            assert!(has_line(&o, &line), "{args:?} ({who}): {}", stderr(&o));
+            assert!(t.calls().is_empty(), "{args:?} ({who}): {:?}", t.calls());
+        }
+    }
+    assert_eq!(t.w.runs(), 0, "no VM started");
+    // proxy stop sends none: it goes on to the identity (none: refused, exit 5) and its calls.
+    let o = t.run(&["proxy", "stop"]);
+    assert!(!has_line(&o, &line) && t.ops().first().map(String::as_str) == Some("sts get-caller-identity"), "{}: {:?}", stderr(&o), t.ops());
+    let o = t.run_env(&["proxy", "stop"], &none);
+    assert_eq!(code(&o), 5, "{}", stderr(&o));
+    assert!(stderr(&o).lines().any(|l| l.starts_with("ai-env: proxy stop: no AWS operator identity: ")) && t.calls().is_empty(), "{}: {:?}", stderr(&o), t.calls());
+    // The names this ai-env sends pass.
+    t.write_state(|s| {
+        s.proxy_reload_document = Some("ai-env-proxy-reload".into());
+        s.proxy_status_document = Some("ai-env-proxy-status".into());
+        s.proxy_patch_document = Some("ai-env-proxy-patch".into());
+    });
+    t.status_answer(" applied=yes");
+    let o = t.run(&["egress", "status"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
 }
 
 #[test]
@@ -648,7 +783,7 @@ fn allow_adds_normalised_hosts_and_says_what_the_other_lists_keep() {
     assert!(!fs::read_dir(&state).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".param.")), "the temp file is gone");
     use std::os::unix::fs::PermissionsExt as _;
     assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
-    assert!(calls[4].contains(RELOAD_SCRIPT) && calls[4].contains(&format!("--instance-ids {INSTANCE}")), "{}", calls[4]);
+    assert!(calls[4].contains(RELOAD_SCRIPT) && calls[4].contains(r#" --parameters {"mode":["apply"]} "#) && calls[4].contains(&format!("--instance-ids {INSTANCE}")), "{}", calls[4]);
     assert!(!stdout(&o).contains("the proxy denies"), "an add claims nothing about the proxy: {}", stdout(&o));
     let a = t.audit_rows("egress_allow");
     assert_eq!((a[0]["detail"]["slug"].as_str(), a[0]["detail"]["host"].as_str(), a[0]["detail"]["action"].as_str()), (Some("ai-env"), Some("github.com"), Some("add")));
@@ -673,7 +808,7 @@ fn allow_adds_normalised_hosts_and_says_what_the_other_lists_keep() {
     assert_eq!(t.param("extras"), EXTRAS_HEADER);
     assert_eq!(t.ops(), ["sts get-caller-identity", "ssm get-parameters", "ssm put-parameter", "ec2 describe-instances", "ssm send-command", "ssm get-command-invocation", "ssm send-command", "ssm get-command-invocation"]);
     let sends: Vec<String> = t.calls().into_iter().filter(|l| l.starts_with("ssm send-command")).collect();
-    assert!(sends[0].contains(RELOAD_SCRIPT) && sends[1].contains(STATUS_SCRIPT), "{sends:?}");
+    assert!(sends[0].contains(RELOAD_SCRIPT) && sends[0].contains(r#" --parameters {"mode":["apply"]} "#) && sends[1].contains(STATUS_SCRIPT) && !sends[1].contains("--parameters"), "{sends:?}");
     let out = stdout(&o);
     let (verified, claim) = (out.find("proxy: reloaded and verified").unwrap(), out.find("the proxy denies github.com now").unwrap());
     assert!(verified < claim, "{out}");
@@ -988,12 +1123,12 @@ fn reload_maps_the_script_exit_and_audits_the_result() {
     let o = t.run(&["egress", "reload"]);
     assert!(code(&o) == 0 && stdout(&o).contains(&format!("proxy {INSTANCE}: applied")), "{}\n{}", stdout(&o), stderr(&o));
     let send = t.calls().into_iter().find(|l| l.starts_with("ssm send-command")).unwrap();
-    assert!(send.contains(RELOAD_SCRIPT) && send.contains("--timeout-seconds 60 "), "{send}");
+    assert!(send.contains(RELOAD_SCRIPT) && send.contains(r#" --parameters {"mode":["apply"]} "#) && send.contains("--timeout-seconds 60 "), "{send}");
     t.reload_answer(0, "", "ai-env-proxy-reload: parameters unchanged since the last apply; nothing to do\n");
     let o = t.run(&["egress", "reload", "--if-changed"]);
     assert!(code(&o) == 0 && stdout(&o).contains("unchanged since the last apply"), "{}", stdout(&o));
     let send = t.calls().into_iter().find(|l| l.starts_with("ssm send-command")).unwrap();
-    assert!(send.contains(r#""commands":["/usr/local/sbin/ai-env-proxy-reload --if-changed"]"#), "{send}");
+    assert!(send.contains(RELOAD_SCRIPT) && send.contains(r#" --parameters {"mode":["if-changed"]} "#), "{send}");
     t.reload_answer(1, "", "ai-env-proxy-reload: refused; the running config is unchanged\n");
     let o = t.run(&["egress", "reload"]);
     assert!(code(&o) == 7 && stderr(&o).contains("the proxy kept its old config") && !has_line(&o, STATE_UNKNOWN), "{}", stderr(&o));
@@ -1148,7 +1283,7 @@ fn proxy_start_waits_for_running_then_ssm_then_squid_serving() {
             "ssm get-command-invocation"
         ]
     );
-    assert!(t.calls().iter().filter(|l| l.starts_with("ssm send-command")).all(|l| l.contains(r#""commands":["/usr/local/sbin/ai-env-proxy-reload --status"]"#)));
+    assert!(t.calls().iter().filter(|l| l.starts_with("ssm send-command")).all(|l| l.contains(STATUS_SCRIPT) && !l.contains("--parameters")), "{:?}", t.calls());
     assert!(stdout(&o).contains("running, SSM Online") && stdout(&o).contains("applied=yes"), "{}", stdout(&o));
     assert_eq!(t.audit_rows("proxy_start").len(), 1);
     // squid never serves (a refused boot reload keeps it stopped): bounded, exit 7.
@@ -1173,13 +1308,10 @@ fn proxy_patch_upgrades_then_restarts_squid_and_proves_it_serves() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     assert_eq!(t.ops(), ["sts get-caller-identity", "ec2 describe-instances", "ssm send-command", "ssm get-command-invocation", "ssm send-command", "ssm get-command-invocation"]);
     let sends: Vec<String> = t.calls().into_iter().filter(|l| l.starts_with("ssm send-command")).collect();
-    // The newest release's security updates (the AMI's locked release alone has none), the release and squid before and after, then the restart.
-    assert!(
-        sends[0].contains(r#""commands":["set -e","echo \"before: $(rpm -q system-release) $(rpm -q squid)\"","dnf -y upgrade --security --releasever=latest","echo \"after: $(rpm -q system-release) $(rpm -q squid)\"","systemctl restart squid"]"#)
-            && sends[0].contains(r#""executionTimeout":["1800"]"#),
-        "{}",
-        sends[0]
-    );
+    // The patch document: the newest release's security updates (the AMI's locked release alone has none), the
+    // release and squid before and after, then the restart (its runCommand, held to `cli::PATCH_SCRIPT` by a unit test).
+    // The patch document, no parameters (its runCommand is `cli::PATCH_SCRIPT`).
+    assert!(sends[0].contains("--document-name ai-env-proxy-patch --document-version $DEFAULT ") && sends[0].contains(" --comment ai-env proxy patch ") && !sends[0].contains("--parameters"), "{}", sends[0]);
     assert!(sends[1].contains(STATUS_SCRIPT), "{}", sends[1]);
     let out = stdout(&o);
     assert!(out.contains("before: system-release-2023.6.20241010") && out.contains("after:  system-release-2023.9.20251001") && !out.contains("unchanged") && out.contains("squid=active"), "{out}");
@@ -1203,4 +1335,89 @@ fn proxy_patch_upgrades_then_restarts_squid_and_proves_it_serves() {
     let o = t.run(&["proxy", "patch"]);
     assert!(code(&o) == 7 && stderr(&o).contains("`ai-env proxy start` first"), "{}", stderr(&o));
     assert!(!t.has_op("ssm send-command"));
+}
+
+/// S8 operators: whatever runs on the proxy is one of the stack's three SSM Command documents, sent by name at
+/// `$DEFAULT` with the delivery timeout, the reload with exactly one of its two modes and the others with no parameter:
+/// never `AWS-RunShellScript`, never a script or an execution timeout of the CLI's own. The fake aws refuses anything
+/// else as IAM and SSM would (its transitional pass for `AWS-RunShellScript` is gone), and an AccessDenied answer to
+/// a send names who may send the documents. `egress allow` runs as `ai-env as deployer` leaves it: only
+/// ai-env-deployer writes `/ai-env/proxy/extras` (contracts §4.4), whatever identity the harness gives the others.
+#[test]
+fn every_proxy_command_sends_a_fixed_document_never_a_shell_script() {
+    let t = Eg::new();
+    let deployer = crate::aws_keys::identity_env("deployer", crate::aws_keys::DEPLOYER_TAIL);
+    let deployer: Vec<(&str, &str)> = deployer.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut sends: Vec<String> = Vec::new();
+    let mut run = |args: &[&str], env: &[(&str, &str)]| {
+        let o = t.run_env(args, env);
+        assert_eq!(code(&o), 0, "{args:?}: {}\n{}", stdout(&o), stderr(&o));
+        sends.extend(t.calls().into_iter().filter(|l| l.starts_with("ssm send-command")));
+    };
+    t.status_answer(" applied=yes");
+    run(&["egress", "status"], &[]);
+    t.reload_answer(0, "", APPLIED);
+    run(&["egress", "reload"], &[]);
+    run(&["egress", "reload", "--if-changed"], &[]);
+    run(&["egress", "allow", "ai-env", "github.com"], &deployer);
+    t.reload_proves("extras", EXTRAS_HEADER);
+    run(&["egress", "allow", "ai-env", "github.com", "--remove"], &deployer);
+    t.reload_proves("suspended", &format!("{SUSPENDED_HEADER}example.com\n"));
+    run(&["egress", "suspend", "example.com"], &[]);
+    t.reload_proves("suspended", SUSPENDED_HEADER);
+    run(&["egress", "suspend", "example.com", "--restore"], &[]);
+    t.invocation("ssm.get-command-invocation.1.json", 0, "before: a\nafter: b\n", "");
+    t.status_answer(" applied=yes");
+    run(&["proxy", "patch"], &[]);
+    t.remove_answer("ssm.get-command-invocation.1.json");
+    t.instance_state("ec2.describe-instances.1.json", "stopped");
+    t.instance_state("ec2.describe-instances.2.json", "running");
+    run(&["proxy", "start"], &[]);
+    for f in ["ec2.describe-instances.1.json", "ec2.describe-instances.2.json"] {
+        t.remove_answer(f);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for s in &sends {
+        assert!(!s.contains("AWS-RunShellScript") && !s.contains("commands") && !s.contains("executionTimeout"), "{s}");
+        assert!(s.contains(&format!("--instance-ids {INSTANCE} ")) && s.contains(" --document-version $DEFAULT ") && s.contains(" --timeout-seconds 60 "), "{s}");
+        let doc = s.split_whitespace().skip_while(|w| *w != "--document-name").nth(1).unwrap_or_else(|| panic!("{s}"));
+        let params: Vec<&str> = s.split(" --parameters ").skip(1).map(|p| p.split_whitespace().next().unwrap()).collect();
+        match doc {
+            "ai-env-proxy-reload" => assert!(params == [r#"{"mode":["apply"]}"#] || params == [r#"{"mode":["if-changed"]}"#], "{s}"),
+            "ai-env-proxy-status" | "ai-env-proxy-patch" => assert!(params.is_empty(), "{s}"),
+            other => panic!("another document: {other}: {s}"),
+        }
+        seen.insert(format!("{doc} {}", params.first().copied().unwrap_or("-")));
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["ai-env-proxy-patch -", r#"ai-env-proxy-reload {"mode":["apply"]}"#, r#"ai-env-proxy-reload {"mode":["if-changed"]}"#, "ai-env-proxy-status -"],
+        "every document and both modes were sent"
+    );
+
+    // The fake refuses what ai-env never sends: another document (as IAM: AccessDenied), the reload without its
+    // parameter or with a script, a version other than $DEFAULT.
+    let ssm = ["ssm", "send-command", "--instance-ids", INSTANCE, "--region", "eu-central-1", "--endpoint-url", "https://ssm.eu-central-1.amazonaws.com", "--timeout-seconds", "60"];
+    let fake = |extra: &[&str]| {
+        let out = Command::new(t.w.root().join("bin").join("aws")).args(ssm).args(extra).env_clear().env("PATH", "/usr/bin:/bin").output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    for (extra, why) in [
+        (&["--document-name", "AWS-RunShellScript", "--parameters", "commands=true"][..], "(AccessDeniedException)"),
+        (&["--document-name", "ai-env-proxy-reload", "--document-version", "$DEFAULT"], "(InvalidParameters)"),
+        (&["--document-name", "ai-env-proxy-reload", "--document-version", "$DEFAULT", "--parameters", "commands=true"], "(InvalidParameters)"),
+        (&["--document-name", "ai-env-proxy-status", "--document-version", "$DEFAULT", "--parameters", r#"{"mode":["apply"]}"#], "(InvalidParameters)"),
+        (&["--document-name", "ai-env-proxy-patch", "--document-version", "1"], "(InvalidDocumentVersion)"),
+    ] {
+        let (rc, err) = fake(extra);
+        assert!(rc == Some(254) && err.contains(why), "{extra:?}: {rc:?} {err}");
+    }
+    assert!(fake(&["--document-name", "AWS-RunShellScript", "--parameters", "commands=true"]).1.contains("document/AWS-RunShellScript because no identity-based policy allows the ssm:SendCommand action"));
+
+    // An AccessDenied answer to the send: the error names who may send the proxy documents.
+    t.answer("ssm.send-command.rc", &json!(254));
+    fs::write(t.answers.join("ssm.send-command.stderr"), "\nAn error occurred (AccessDeniedException) when calling the SendCommand operation: User: arn:aws:iam::123456789012:user/ai-env-runtime is not authorized to perform: ssm:SendCommand on resource: arn:aws:ssm:eu-central-1:123456789012:document/ai-env-proxy-reload\n").unwrap();
+    let o = t.run(&["egress", "reload"]);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains("AccessDeniedException") && stderr(&o).contains(" (only ai-env-ops and ai-env-deployer may send the proxy documents: run it under ai-env as ops --)"), "{}", stderr(&o));
 }

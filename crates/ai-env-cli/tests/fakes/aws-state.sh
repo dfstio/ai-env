@@ -16,13 +16,20 @@
 #   FAKE_AWS_LIST_FAIL_FROM=N  the N-th list-access-keys call and every later
 #       one fail (Throttling, 254)
 #   iam delete-access-key --access-key-id K   removes K (NoSuchEntity: 254)
-#   sts get-caller-identity    with AWS_ACCESS_KEY_ID set: a key in $S/keys
-#       answers as user/FAKE_AWS_KEY_USER (default ai-env-runtime) once the
-#       first $S/sts-fails calls have failed (InvalidClientTokenId, 254, like
-#       a key IAM has not propagated); any other key fails the same way.
-#       Unset: the deploy identity user/rust. Account 123456789012. A session
+#   (S8) The keys of --user-name ai-env-ops and ai-env-deployer are the files
+#       $S/keys.ai-env-ops and $S/keys.ai-env-deployer, those of any other user
+#       (ai-env-runtime) $S/keys; every id comes from the one counter $S/next
+#   sts get-caller-identity    with AWS_ACCESS_KEY_ID set: a key in
+#       $S/keys.<user> answers as user/<user>, one in $S/keys as
+#       user/FAKE_AWS_KEY_USER (default ai-env-runtime), any other by its tail
+#       in FAKE_AWS_KEY_USERS (S8, as tests/fakes/aws.sh), each once the first
+#       $S/sts-fails calls have failed (InvalidClientTokenId, 254, like a key
+#       IAM has not propagated); an unknown key fails the same way. Unset:
+#       FAKE_AWS_CALLER (S8, as tests/fakes/aws.sh: default the deploy identity
+#       user/rust; USER@ACCOUNT, root, none). Account 123456789012. A session
 #       token next to the key (AWS_SESSION_TOKEN or AWS_SECURITY_TOKEN, e.g.
 #       leaked from the operator's shell) makes it fail like AWS does.
+#       --query Arn and --query Account print that field alone.
 #   lambda-microvms list-microvm-images      prints the name when $S/image/state
 #       exists
 #   lambda-microvms get-microvm-image        JSON of $S/image/{state,active,
@@ -31,7 +38,10 @@
 #   lambda-microvms list-microvm-image-versions   the lines "<version> <status>" of
 #       $S/image/versions as items (state SUCCESSFUL); no file: {"items": []}
 #   lambda-microvms list-microvms   the lines "<id> <image version> <state>" of
-#       $S/vms as items (JSON only: no --query)
+#       $S/vms as items (JSON); the one query it answers is ops.sh vm-guard's,
+#       --query "items[?state!='TERMINATED'].[microvmId,state,imageVersion]"
+#       --output text: "<id>\t<state>\t<version>" per VM not TERMINATED (any
+#       other --query: refused, exit 2)
 #   lambda-microvms get-microvm-image-version --image-version V   {"imageVersion": V, "codeArtifact":
 #       {"uri": <$S/image/uri>}} (no uri file: no codeArtifact)
 # S5 (the egress ops of infra/scripts/ops.sh and the s3-preflight rows P13-P16).
@@ -86,9 +96,15 @@
 #   FAKE_AWS_FAIL_OP="<service> <operation>"   that call fails (AccessDenied, 254)
 #   FAKE_AWS_NO_LAMBDA_CORE=1  lambda-core is an invalid choice (an aws CLI
 #       older than the service: the usage error, 252)
+#   (S8) AWS_PROFILE set with AWS_CONFIG_FILE=/dev/null: every call fails like
+#       the real CLI (the profile cannot be found, exit 255)
 # Environment:
 #   FAKE_AWS_LOG     when set, each call's argv is appended here, one line
 #   FAKE_AWS_STATE   the state directory (required)
+#   FAKE_AWS_KEY_USERS  space-separated TAIL:USER or TAIL:USER@ACCOUNT (S8, as
+#                    tests/fakes/aws.sh; default 9001:ai-env-deployer
+#                    9002:ai-env-ops 9003:ai-env-runtime)
+#   FAKE_AWS_CALLER  the caller without a key (S8, as tests/fakes/aws.sh)
 set -u
 if [ -n "${FAKE_AWS_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
@@ -158,10 +174,31 @@ touch "$S/keys"
 acct=123456789012
 key_id() { printf 'AKIAFAKE%012d' "$1"; }
 err() { printf '\nAn error occurred (%s) when calling the %s operation: %s\n' "$1" "$2" "$3" >&2; exit "${4:-254}"; }
+if [ -n "${AWS_PROFILE:-}" ] && [ "${AWS_CONFIG_FILE:-}" = /dev/null ]; then
+  printf '\nThe config profile (%s) could not be found\n' "$AWS_PROFILE" >&2
+  exit 255
+fi
 if [ -n "${FAKE_AWS_FAIL_OP:-}" ] && [ "${1:-} ${2:-}" = "$FAKE_AWS_FAIL_OP" ]; then
   err AccessDeniedException "${2:-}" "fake denial"
 fi
 unsupported_query() { echo "fake aws: unsupported --query for ${1:-} ${2:-}: $query" >&2; exit 2; }
+# keys_of <user>: the file of <user>'s access keys: ai-env-ops and ai-env-deployer have their own, any other user
+# (ai-env-runtime, or none named) shares $S/keys.
+keys_of() {
+  case "$1" in
+    ai-env-ops|ai-env-deployer) printf '%s/keys.%s' "$S" "$1" ;;
+    *) printf '%s/keys' "$S" ;;
+  esac
+}
+# key_user <tail>: FAKE_AWS_KEY_USERS' entry for a key id's last four characters ("USER" or "USER@ACCOUNT"),
+# else nothing and status 1, as in tests/fakes/aws.sh.
+key_user() {
+  ku=" ${FAKE_AWS_KEY_USERS:-9001:ai-env-deployer 9002:ai-env-ops 9003:ai-env-runtime} "
+  case "$ku" in
+    *" $1:"*) ku=${ku#*" $1:"}; printf '%s' "${ku%% *}"; return 0 ;;
+  esac
+  return 1
+}
 
 # ---- network connectors ($S/connectors/<name>) ----
 conn_id() {
@@ -226,52 +263,79 @@ case "${1:-} ${2:-}" in
     if [ -n "${FAKE_AWS_LIST_FAIL_FROM:-}" ] && [ "$calls" -ge "$FAKE_AWS_LIST_FAIL_FROM" ]; then
       err Throttling ListAccessKeys "Rate exceeded"
     fi
+    kf=$(keys_of "$user")
+    touch "$kf"
     case "$query" in
-      'AccessKeyMetadata[].AccessKeyId') paste -s -d '\t' "$S/keys" ;;
-      sort_by*) tail -1 "$S/keys" ;;
+      'AccessKeyMetadata[].AccessKeyId') paste -s -d '\t' "$kf" ;;
+      sort_by*) tail -1 "$kf" ;;
       *) echo "fake aws: unsupported list-access-keys query: $query" >&2; exit 2 ;;
     esac ;;
   "iam create-access-key")
     case "${FAKE_AWS_CREATE:-}" in
       fail) err ServiceFailure CreateAccessKey "the fake refuses to create a key" ;;
     esac
-    test "$(wc -l <"$S/keys" | tr -d ' ')" -lt 2 || err LimitExceeded CreateAccessKey "Cannot exceed quota for AccessKeysPerUser: 2" 254
+    kf=$(keys_of "$user")
+    touch "$kf"
+    test "$(wc -l <"$kf" | tr -d ' ')" -lt 2 || err LimitExceeded CreateAccessKey "Cannot exceed quota for AccessKeysPerUser: 2" 254
     n=$(cat "$S/next" 2>/dev/null || echo 1)
     if [ "${FAKE_AWS_CREATE:-}" = twice ]; then
-      key_id "$n" >>"$S/keys"
-      echo >>"$S/keys"
+      key_id "$n" >>"$kf"
+      echo >>"$kf"
       n=$((n + 1))
     fi
     echo $((n + 1)) >"$S/next"
     id=$(key_id "$n")
-    echo "$id" >>"$S/keys"
+    echo "$id" >>"$kf"
     test "${FAKE_AWS_CREATE:-}" != lost || exit 255
     secret=$(printf 'Fk9/%.0s' 1 2 3 4 5 6 7 8 9 10)
     printf '{\n    "AccessKey": {\n        "UserName": "%s",\n        "AccessKeyId": "%s",\n        "Status": "Active",\n        "SecretAccessKey": "%s",\n        "CreateDate": "2026-09-29T10:00:00+00:00"\n    }\n}\n' \
       "$user" "$id" "$secret" ;;
   "iam delete-access-key")
-    grep -qxF -- "$key" "$S/keys" || err NoSuchEntity DeleteAccessKey "The Access Key with id $key cannot be found."
-    grep -vxF -- "$key" "$S/keys" >"$S/keys.tmp" || true
-    mv "$S/keys.tmp" "$S/keys" ;;
+    kf=$(keys_of "$user")
+    touch "$kf"
+    grep -qxF -- "$key" "$kf" || err NoSuchEntity DeleteAccessKey "The Access Key with id $key cannot be found."
+    grep -vxF -- "$key" "$kf" >"$kf.tmp" || true
+    mv "$kf.tmp" "$kf" ;;
   "sts get-caller-identity")
-    who=rust
+    who=${FAKE_AWS_CALLER:-rust}
     if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
       if [ -n "${AWS_SESSION_TOKEN:-}${AWS_SECURITY_TOKEN:-}" ]; then
         err InvalidClientTokenId GetCallerIdentity "The security token included in the request is invalid."
       fi
-      grep -qxF -- "$AWS_ACCESS_KEY_ID" "$S/keys" || err InvalidClientTokenId GetCallerIdentity "The security token included in the request is invalid."
+      # A user's own key file, then $S/keys, then the key's tail.
+      who=
+      for f in "$S"/keys.*; do
+        case "$f" in *.tmp) continue ;; esac
+        if [ -f "$f" ] && grep -qxF -- "$AWS_ACCESS_KEY_ID" "$f"; then who=${f##*/keys.}; break; fi
+      done
+      if [ -z "$who" ] && grep -qxF -- "$AWS_ACCESS_KEY_ID" "$S/keys"; then who=${FAKE_AWS_KEY_USER:-ai-env-runtime}; fi
+      if [ -z "$who" ]; then
+        ktail=${AWS_ACCESS_KEY_ID#"${AWS_ACCESS_KEY_ID%????}"}
+        who=$(key_user "$ktail") || err InvalidClientTokenId GetCallerIdentity "The security token included in the request is invalid."
+      fi
       fails=$(cat "$S/sts-fails" 2>/dev/null || echo 0)
       if [ "$fails" -gt 0 ]; then
         echo $((fails - 1)) >"$S/sts-fails"
         err InvalidClientTokenId GetCallerIdentity "The security token included in the request is invalid."
       fi
-      who=${FAKE_AWS_KEY_USER:-ai-env-runtime}
+    elif [ "$who" = none ]; then
+      echo 'Unable to locate credentials. You can configure credentials by running "aws configure".' >&2
+      exit 253
     fi
-    arn="arn:aws:iam::$acct:user/$who"
+    account=$acct
+    case "$who" in
+      *@*) account=${who#*@}; who=${who%%@*} ;;
+    esac
+    uid=AIDAFAKEFAKEFAKEFAKE
+    arn="arn:aws:iam::$account:user/$who"
+    if [ "$who" = root ]; then
+      uid=$account
+      arn="arn:aws:iam::$account:root"
+    fi
     case "$query" in
       Arn) echo "$arn" ;;
-      Account) echo "$acct" ;;
-      *) printf '{\n    "UserId": "AIDAFAKEFAKEFAKEFAKE",\n    "Account": "%s",\n    "Arn": "%s"\n}\n' "$acct" "$arn" ;;
+      Account) echo "$account" ;;
+      *) printf '{\n    "UserId": "%s",\n    "Account": "%s",\n    "Arn": "%s"\n}\n' "$uid" "$account" "$arn" ;;
     esac ;;
   "lambda-microvms list-microvm-images")
     if [ -f "$S/image/state" ]; then echo "$name"; fi ;;
@@ -310,6 +374,15 @@ case "${1:-} ${2:-}" in
     fi
     printf ']}\n' ;;
   "lambda-microvms list-microvms")
+    if [ "$query" = "items[?state!='TERMINATED'].[microvmId,state,imageVersion]" ]; then
+      if [ -f "$S/vms" ]; then
+        while read -r id v st; do
+          [ -n "$id" ] && [ "$st" != TERMINATED ] || continue
+          printf '%s\t%s\t%s\n' "$id" "$st" "$v"
+        done < "$S/vms"
+      fi
+      exit 0
+    fi
     test -z "$query" || unsupported_query "$@"
     printf '{"items": ['
     sep=

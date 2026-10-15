@@ -1,13 +1,20 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
-.PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance clean \
+.PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-egress-run test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance acceptance-run clean \
         claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
 
 SHELL        := /bin/bash
-# The switches that delete, rotate, write, pick a version, skip a gate or widen a live run (YES, KEEP, VERSION, ROTATE,
-# WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES, SYSTEMD, CRED) count only when given on the make command line (`make image-prune YES=1`;
-# a sub-make inherits them): the same name exported in the environment is ignored. $(call cmdline,NAME) is the value, or empty.
+# The switches that delete, rotate, write, pick a version, skip a gate, widen a live run or pick an identity (YES, KEEP,
+# VERSION, ROTATE, WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES, SYSTEMD, CRED, REFRESH,
+# BREAKGLASS) count only when given on the make command line (`make image-prune YES=1`; a sub-make inherits them, one
+# under `ai-env as` too): the same name exported in the environment is ignored. $(call cmdline,NAME) is the value, or empty.
 cmdline       = $(if $(filter command line,$(origin $(1))),$($(1)))
+# The single-letter switches of this make run: MAKEFLAGS' first word and its -x words, as GNU make 3.81 and 4.x write
+# them (a variable assignment, a long option, and an option with an argument (-j -l -O -I) hold none). acceptance, and
+# every tiered target and its X-run (NOT_UNDER_I_OR_P, infra/infra.mk), refuse -i and -p on them; TIER leaves its
+# runner out in a dry run (-n, -q, -t: MAKE_DRY). ops.sh's make_switch reads claude-update's the same way.
+MAKE_SWITCHES = $(foreach w,$(firstword $(MAKEFLAGS)),$(if $(or $(findstring =,$(w)),$(filter --% -j% -l% -O% -I%,$(w))),,$(w))) $(filter-out --% -j% -l% -O% -I%,$(filter -%,$(MAKEFLAGS)))
+MAKE_DRY      = $(strip $(findstring n,$(MAKE_SWITCHES))$(findstring q,$(MAKE_SWITCHES))$(findstring t,$(MAKE_SWITCHES)))
 STACK        ?= dev
 TOOLCHAIN    ?= 1.98.1
 # ai-env-age declares rust-version = "1.88"; keep in sync with crates/ai-env-age/Cargo.toml.
@@ -77,7 +84,7 @@ build: ## Build ai-env (+ ai-env-claude) in all four feature sets: default, none
 	$(CARGO) build -p $(PKG) --no-default-features
 	$(CARGO) build -p $(PKG) --no-default-features --features shim
 	$(CARGO) build -p $(PKG) --no-default-features --features bridge
-	@test -x target/debug/ai-env && test -x target/debug/ai-env-claude && echo "build: ok (both bins)"
+	@d=$${CARGO_TARGET_DIR:-target}; test -x "$$d/debug/ai-env" && test -x "$$d/debug/ai-env-claude" && echo "build: ok (both bins)"
 
 check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; explicit --bin ai-env-claude is refused without bridge
 	CARGO_TARGET_DIR=target/matrix/shim $(CARGO) build -p $(PKG) --no-default-features --features shim
@@ -115,14 +122,18 @@ test: ## Unit + integration tests in all four feature sets
 # list to every AI_ENV_BRIDGE_LAB_* name the code and infra/scripts read.
 LAB_KNOBS    := AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_SHELL AI_ENV_BRIDGE_LAB_ASSUME_TTY \
                 AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS AI_ENV_BRIDGE_LAB_TRANSCRIPT AI_ENV_BRIDGE_LAB_EXIT \
-                AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS
+                AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS AI_ENV_BRIDGE_LAB_OSASCRIPT
 LAB_UNSET    := env $(addprefix -u ,$(LAB_KNOBS))
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
-# cargo hides for passing tests; one thread keeps each test's lines together.
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command: 10 beside the test process's one, 11 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension, one more; live_wrapper_smoke is skipped: make s8-smoke runs it)
+# cargo hides for passing tests; one thread keeps each test's lines together. test-aws may run under a runner (its
+# help: the suspension's Touch IDs are then the runner's), and test-aws-readonly as ai-env as ops: their tests are
+# built first without any key in their environment (D18: a dependency's build script or proc macro never sees it), as
+# test-egress's are, and so is the probes' operator CLI; the run then finds them built and keeps the key.
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command: 10 beside the test process's one, 11 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension and its restore, two more (the ops key's, one per egress suspend; none when the run is under ai-env as ops or as deployer); live_wrapper_smoke is skipped: make s8-smoke runs it)
+	$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture$(if $(filter 1,$(call cmdline,CRED)), --skip live_wrapper_smoke)
-	@$(if $(filter 1,$(call cmdline,PROBES)),rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
+	@$(if $(filter 1,$(call cmdline,PROBES)),$(AI_ENV_BUILD) || exit $$?; rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
 
 test-claude: ## T7.2 (live, this Mac): the sealed setup-token drives the real claude: a stream-json session with a tool call, --resume, the Remote Control refusal, --bare not logged in (AI_ENV_CLAUDE_TESTS=1; one Touch ID; real model requests)
@@ -149,6 +160,7 @@ doc-test: ## The README's and SKILL.md's sh doc-test blocks in their dry forms (
 	$(CARGO) test -p $(PKG) --features bridge --test readme
 
 test-aws-readonly: ## Part A live checks, read-only (this identity, eu-central-1): TLS to the MicroVM proxy, managed images, ListMicrovms, GetMicrovm of an unknown id
+	$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored readonly_ --test-threads=1 --nocapture
 
 s4-smoke: ## T4.1 gate: three `ai-env vm smoke --max-duration 900 --json` passes (live, one Touch ID each); records appended to target/s4/smoke.jsonl
@@ -196,10 +208,24 @@ s7-smoke: ## T7.4 gate: three `ai-env vm smoke --egress vpc --exec --with-creden
 # The live tests may allow github.com for workspace ai-env-test (live_egress_extra_and_removal): on every exit of the
 # recipe (success, failure, Ctrl-C) the entry is removed again, a no-op when it is absent, so a killed test never leaves
 # github.com allowed for every vpc VM. INT, TERM and HUP are trapped too: bash 3.2 kills itself without running the
-# EXIT trap when its foreground child dies of an untrapped SIGINT. A removal that fails fails the target.
-test-egress: ## S5 T5.2-T5.4: the live egress tests (#[ignore]d; AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1; a vpc VM, the proxy, Touch ID), measurements shown; every exit removes the test's github.com entry; a test that skips its proof fails the target
+# EXIT trap when its foreground child dies of an untrapped SIGINT. A removal that fails fails the target. S8 operators:
+# egress allow writes the extras parameter, which only ai-env-deployer may, so the tests run under the deployer's key
+# (infra/infra.mk's TIER); the tests and the binary they run are compiled first, outside the runner, without any key
+# in their environment (D18: a dependency's build script never sees it), and the run under it finds them built.
+# test-egress-run checks the same builds again, still without the key (a no-op after the wrapper's), so one typed by
+# hand under a runner compiles nothing with the key either, the removal's operator CLI included.
+test-egress: ## (deployer: asks once for its key, from Strongbox; the VMs' Touch IDs) S5 T5.2-T5.4: the live egress tests (#[ignore]d; AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1; a vpc VM, the proxy, Touch ID), measurements shown; every exit removes the test's github.com entry; a test that skips its proof fails the target
+	$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run
+	@$(call NOT_UNDER_I_OR_P,test-egress)
+	@$(call TIER,deployer,test-egress) $(MAKE) --no-print-directory test-egress-run
+
+test-egress-run:
+	@$(IDENTITY) deployer test-egress
+	@$(call NOT_UNDER_I_OR_P,test-egress)
+	$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run
+	@$(AI_ENV_BUILD)
 	@log=$$(mktemp "$${TMPDIR:-/tmp}/ai-env-test-egress.XXXXXX") || exit 1; \
-	  trap 'rm -f "$$log"; echo "test-egress: removing the test allowlist entry (ai-env egress allow ai-env-test github.com --remove)"; $(LAB_UNSET) $(AI_ENV) egress allow ai-env-test github.com --remove || { echo "test-egress: the removal FAILED: github.com may still be allowed for every vpc VM: run ai-env egress allow ai-env-test github.com --remove"; exit 1; }' EXIT; \
+	  trap 'rm -f "$$log"; echo "test-egress: removing the test allowlist entry (ai-env egress allow ai-env-test github.com --remove)"; $(LAB_UNSET) $(AI_ENV) egress allow ai-env-test github.com --remove || { echo "test-egress: the removal FAILED: github.com may still be allowed for every vpc VM: run ai-env as deployer -- ai-env egress allow ai-env-test github.com --remove"; exit 1; }' EXIT; \
 	  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
 	  set -o pipefail; \
 	  $(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_EGRESS_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored live_egress_ --test-threads=1 --nocapture 2>&1 | tee "$$log" || exit $$?; \
@@ -216,14 +242,16 @@ perf-wrapper: ## T1.2 overhead: ai-env-claude (release) vs a bare exec of the fa
 	AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test wrapper -- --ignored overhead --nocapture --test-threads=1
 	$(if $(filter 1,$(call cmdline,PREWARM)),AI_ENV_PERF_TESTS=1 $(CARGO) test --release -p $(PKG) --features bridge --test prewarm -- --ignored overhead --nocapture --test-threads=1)
 
+# The build never sees an operator key (D18): part B0 runs make install in the account root's terminal, its key there.
 install: ## cargo install both bins (ai-env + ai-env-claude) into $(INSTALL_ROOT)/bin with the committed Cargo.lock; asserts one version
-	$(CARGO) install --path crates/$(PKG) --locked --root "$(INSTALL_ROOT)"
+	$(NO_KEY) $(CARGO) install --path crates/$(PKG) --locked --root "$(INSTALL_ROOT)"
 	@a=$$("$(INSTALL_ROOT)/bin/ai-env" --version); b=$$("$(INSTALL_ROOT)/bin/ai-env-claude" --version); echo "$$a / $$b"; \
 	  test "$${a##* }" = "$${b##* }" || { echo "install: version skew between the two bins"; exit 1; }
 	@case ":$$PATH:" in *":$(INSTALL_ROOT)/bin:"*) ;; *) echo "note: $(INSTALL_ROOT)/bin is not on PATH";; esac
 
 # --lambda-dir: cargo-lambda otherwise writes under the cargo target directory (CARGO_TARGET_DIR when set), and the cp
 # below would take a stale bootstrap; the old one is removed first, so a build that writes nothing fails at the cp.
+# The cross-build runs without any operator key or marker (D18), whoever calls it.
 vm-build: ## Cross-build the VM shim binary with cargo-lambda (--arm64, shim feature only) -> image/ai-env; assert glibc <= $(GLIBC_MAX) and no getentropy
 	@set -eu; cl="$(CARGO_LAMBDA)"; \
 	  ver() { "$$1" lambda --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }; \
@@ -238,7 +266,7 @@ vm-build: ## Cross-build the VM shim binary with cargo-lambda (--arm64, shim fea
 	  rustup +$(TOOLCHAIN) target list --installed | grep -qx '$(TARGET)' || { echo "missing target: rustup target add $(TARGET) --toolchain $(TOOLCHAIN)"; exit 1; }; \
 	  test -x $(LLVM_BIN)/llvm-nm -a -x $(LLVM_BIN)/llvm-objdump || { echo "vm-build: $(LLVM_BIN)/llvm-nm or llvm-objdump missing (brew install llvm, or set LLVM_BIN)"; exit 1; }; \
 	  rm -f target/lambda/ai-env/bootstrap; \
-	  ulimit -n 10240; RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p $(PKG) --bin ai-env --no-default-features --features shim
+	  ulimit -n 10240; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p $(PKG) --bin ai-env --no-default-features --features shim
 	mkdir -p image
 	cp target/lambda/ai-env/bootstrap image/ai-env
 	@file image/ai-env | grep -q 'ELF 64-bit.*aarch64' || { file image/ai-env; echo "vm-build: not an aarch64 ELF"; exit 1; }
@@ -365,16 +393,18 @@ image-stage-scan: ## Stage $(IMAGE_DIR) per its MANIFEST (unlisted files and sym
 	  $(AI_ENV) infra scan "$$stage" --profile image; \
 	  mv "$$stage" "$$final"; echo "image-stage-scan: scanned clean, published as $$final"
 
+# The image's build needs no AWS: its sub-makes and the CLI's version read (a cargo run) never see an operator key or
+# the runner's marker (D18), whoever calls it (deploy's wrapper, test-docker, a make typed under a runner).
 image-zip: ## vm-build, stage + scan, then a deterministic $(IMAGE_ZIP) and $(IMAGE_JSON) (sha256, S3 key, versions)
-	$(MAKE) vm-build
-	$(MAKE) image-stage-scan
+	$(NO_KEY) $(MAKE) vm-build
+	$(NO_KEY) $(MAKE) image-stage-scan
 	@set -euo pipefail; stage="$(STAGE)"; mkdir -p "$(IMAGE_OUT)"; \
 	  zip_abs="$$(cd "$(IMAGE_OUT)" && pwd)/$$(basename "$(IMAGE_ZIP)")"; rm -f "$$zip_abs"; \
 	  find "$$stage" -exec env TZ=UTC touch -h -t 198001010000 {} +; \
 	  (cd "$$stage" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort | TZ=UTC zip -X -q "$$zip_abs" -@); \
 	  sha=$$(shasum -a 256 "$$zip_abs" | cut -d' ' -f1); \
 	  claude=$$(sed -n 's/^CLAUDE_VERSION=//p' "$$stage/claude.lock"); \
-	  shim=$$($(AI_ENV) --version | awk '{print $$NF}'); \
+	  shim=$$($(NO_KEY) $(AI_ENV) --version | awk '{print $$NF}'); \
 	  printf '{"zip":"%s","sha256":"%s","key":"ai-env/image-%s.zip","claudeVersion":"%s","shimVersion":"%s"}\n' "$(IMAGE_ZIP)" "$$sha" "$${sha:0:16}" "$$claude" "$$shim" > "$(IMAGE_JSON)"; \
 	  ls -l "$$zip_abs"; cat "$(IMAGE_JSON)"
 
@@ -390,17 +420,21 @@ image-build-local: ## docker build the staged context (as the platform would) in
 image-run-local: ## Run $(LOCAL_IMAGE) with its ports on 127.0.0.1:18080 (app), :19000 (hooks), :19418 (code)
 	docker run --rm -it --platform linux/arm64 --name ai-env-agent-local -p 127.0.0.1:18080:8080 -p 127.0.0.1:19000:9000 -p 127.0.0.1:19418:9418 $(LOCAL_IMAGE)
 
+# test-docker needs no AWS: its every step runs without an operator key or the runner's marker (D18), also as the first
+# goal of `ai-env as deployer -- make test-docker deploy` or in the root's terminal (B0.3), so neither its builds nor
+# Docker nor its tests ever see one.
 test-docker: ## T3.1: image-zip + image-build-local, then the opt-in Docker tests (L1 base image + shim, L2 local image, and S6 T6.7: the real `vm exec` on L2 through the fake endpoint); stamps the zip for deploy
-	$(MAKE) image-zip
-	$(MAKE) image-build-local
-	AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
+	$(NO_KEY) $(MAKE) image-zip
+	$(NO_KEY) $(MAKE) image-build-local
+	$(NO_KEY) AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
 	  $(CARGO) test -p $(PKG) --no-default-features --features shim --test shim_docker -- --ignored --test-threads=1
-	AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
+	$(NO_KEY) AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
 	  $(CARGO) test -p $(PKG) --test docker_exec -- --ignored --test-threads=1
 	@sha=$$(shasum -a 256 "$(IMAGE_ZIP)" | cut -d' ' -f1); echo "$$sha" > "$(DOCKER_STAMP)"; echo "test-docker: ok, stamped $$sha"
 
-check-base-image: ## T3.5: the pinned managed base image (baseImage in $(IMAGE_CONFIG)) is AVAILABLE
+check-base-image: ## (ops: one Touch ID, none under ai-env as) T3.5: the pinned managed base image (baseImage in $(IMAGE_CONFIG)) is AVAILABLE
 	@$(BASE_CHECK) || { echo "check-base-image: $(BASE_MISSING)"; exit 1; }
+	@$(AI_ENV_BUILD)
 	$(AI_ENV) infra base-image --name $(BASE_NAME) --version $(BASE_VERSION)
 
 # P13-P16 (S5, read-only, both phases): the aws CLI's lambda-core (connector-wait and the probe use it), VPC Block
@@ -409,7 +443,12 @@ check-base-image: ## T3.5: the pinned managed base image (baseImage in $(IMAGE_C
 # IGW traffic leaves), room for the egress VPC under the VPC quota, and whether the service-linked role the
 # connector's first create makes exists (recorded only). Under
 # pipefail no row pipes a tool into `grep -q`: grep stops at the first match and the writer's SIGPIPE would fail it.
-s3-preflight: ## S3/S5 preconditions P1-P16 (PHASE=a: build + read-only checks; PHASE=b: also the deploy ones); one row each, exit 1 on any [NO ]
+# P8 (S8 operators): PHASE=b admits only the stack's deployer, or the account root for the bootstrap or with BREAKGLASS=1
+# on the command line (ops.sh identity deployer: its one line is the row; a break-glass row is [-  ], loud but no
+# refusal); PHASE=a only says who this shell's own credentials are (the agent's, in its own account). The operator CLI
+# P9-P11 run is built first, without any key (D18: the preflight runs under ai-env as, deploy's or typed).
+s3-preflight: ## S3/S5 preconditions P1-P16 (PHASE=a: build + read-only checks; PHASE=b: also the deploy ones, P8 the deploy identity: make deploy runs it as the deployer; alone: ai-env as deployer -- make s3-preflight PHASE=b); one row each, exit 1 on any [NO ]
+	@$(AI_ENV_BUILD)
 	@set -uo pipefail; phase="$(or $(PHASE),a)"; bad=0; \
 	  row() { printf '%s %s\n' "$$1" "$$2"; [ "$$1" = "[NO ]" ] && bad=1; true; }; \
 	  if out=$$($(SUBMAKE) -s --no-print-directory vm-build-pick 2>&1); then row "[ok ]" "P1 cargo-lambda: $$out"; else row "[NO ]" "P1 cargo-lambda: $$out"; fi; \
@@ -434,7 +473,11 @@ s3-preflight: ## S3/S5 preconditions P1-P16 (PHASE=a: build + read-only checks; 
 	  if [ "$$phase" = b ]; then \
 	    if stacks=$$(cd infra && pulumi stack ls --json 2>/dev/null) && grep -q '"name": *"$(STACK)"' <<<"$$stacks"; then row "[ok ]" "P6 pulumi stack $(STACK) ($$(pulumi whoami -v 2>/dev/null | sed -n 's/^Backend URL: *//p'))"; else row "[NO ]" "P6 pulumi stack $(STACK) missing: cd infra && pulumi stack init $(STACK)"; fi; fi; \
 	  if pulumi plugin ls --json 2>/dev/null | node -e 'const p=JSON.parse(require("fs").readFileSync(0,"utf8"));const has=(n,v)=>p.some(x=>x.name===n&&x.kind==="resource"&&x.version===v);process.exit(has("aws","7.10.0")&&has("aws-native","1.79.0")?0:1)'; then row "[ok ]" "P7 pulumi plugins aws 7.10.0, aws-native 1.79.0"; else row "[NO ]" "P7 pulumi plugin install resource aws 7.10.0; pulumi plugin install resource aws-native 1.79.0"; fi; \
-	  if arn=$$(aws sts get-caller-identity --region $(REGION) --query Arn --output text 2>/dev/null); then row "[ok ]" "P8 deploy identity $${arn##*:}"; else row "[NO ]" "P8 no AWS credentials for the deploy identity"; fi; \
+	  if [ "$$phase" = b ]; then \
+	    if out=$$($(IDENTITY) deployer 2>&1); then case "$$out" in BREAK-GLASS:*) row "[-  ]" "P8 $$out";; *) row "[ok ]" "P8 deploy identity $$out";; esac; \
+	    else row "[NO ]" "P8 deploy identity $$out"; fi; \
+	  elif arn=$$(aws sts get-caller-identity --region $(REGION) --query Arn --output text 2>/dev/null); then row "[ok ]" "P8 identity $${arn##*:} (PHASE=a reads only; PHASE=b admits only the stack's deployer)"; \
+	  else row "[NO ]" "P8 no AWS credentials (PHASE=a: this shell's own, the agent's; on this Mac: ai-env as ops -- make s3-preflight)"; fi; \
 	  if [ "$$phase" = b ]; then \
 	    if out=$$($(AI_ENV) creds aws-set --check 2>&1); then row "[ok ]" "P9 runtime-key preconditions"; else row "[-  ]" "P9 runtime-key preconditions not met yet (needed by make runtime-key, not by deploy)"; fi; fi; \
 	  if out=$$($(AI_ENV) infra pin --check-bundle --lock image/claude.lock 2>&1); then row "[ok ]" "P10 $$(echo "$$out" | tail -1)"; else row "[NO ]" "P10 $$(echo "$$out" | tail -1)"; fi; \
@@ -480,21 +523,26 @@ vm-build-pick:
 	  if [ -z "$$cl" ]; then for c in $$(which -a cargo-lambda 2>/dev/null) "$$HOME/.cargo/bin/cargo-lambda"; do if [ -x "$$c" ] && ok "$$c"; then cl="$$c"; break; fi; done; fi; \
 	  if [ -n "$$cl" ] && ok "$$cl"; then echo "$$cl $$(ver "$$cl")"; else echo "none >= $(CARGO_LAMBDA_MIN) (cargo install cargo-lambda --locked --version $(CARGO_LAMBDA_MIN))"; exit 1; fi
 
-gates: ## Run the G1–G8 pre-code gates via `ai-env gates` (writes plans/gates.md); GATES_ARGS='--only G1,G3' re-measures a subset without writing
+# gates runs the tree's ai-env (cargo run, whatever AI_ENV says), built first without any key (D18: under ai-env as
+# ops, the run's compile would otherwise see the key).
+gates: ## (ops: one Touch ID, none under ai-env as; G7 simulates the deployer) Run the G1–G8 pre-code gates via `ai-env gates` (writes plans/gates.md); GATES_ARGS='--only G1,G3' re-measures a subset without writing
+	@$(NO_KEY) $(CARGO) build -q -p $(PKG) --bin ai-env
 	$(CARGO) run -q -p $(PKG) --bin ai-env -- gates $(GATES_ARGS)
 
 # S8 acceptance (plans/v6-microvm-bridge.md §6, the S8 subset), live on this Mac: the pair `make install` put in
 # ACCEPT_BIN (a relative one is taken from this directory), as Cursor runs it, against this Mac's bridge root. Each
-# step is one recipe line, so each negative is its own one-liner: its shell drops the lab knobs and the wrapper's own
-# switches (the kill switch, the mode, the VM pin, the mirror root), works in a directory of its own under ACCEPT_DIR,
-# removes it on every exit (ACCEPT_DIR too once empty, target/s8 too when the run made it) and stops the target with
-# one "acceptance: STEP: ..." line. The fixture repositories are built at run time with no user
-# or system git config (no hook, no signing), the tripwire's value with printf. The two Touch IDs come last (vm
-# smoke, vm list). Under make -i a failed step would be ignored, the next ones would run (the Touch IDs among them)
-# and the last line would say ok: the first line is a $(error) that make expands before any step runs, -i or not (the
-# options are MAKEFLAGS' first word and its -x words, as GNU make 3.81 writes them; under -k a failed line still ends
-# the recipe). The VM's own negatives (a 9418 token used against 8080, curl without the proxy from a VM shell, ai-env
-# vm list inside the VM) are part B's.
+# step is one recipe line of acceptance-run, so each negative is its own one-liner: its shell drops the lab knobs and
+# the wrapper's own switches (the kill switch, the mode, the VM pin, the mirror root), works in a directory of its own
+# under ACCEPT_DIR, removes it on every exit (ACCEPT_DIR too once empty, target/s8 too when the run made it) and stops
+# the target with one "acceptance: STEP: ..." line. The fixture repositories are built at run time with no user
+# or system git config (no hook, no signing), the tripwire's value with printf. S8 operators: the steps run as ai-env-ops
+# (infra/infra.mk's TIER: credentials/ops.env's one Touch ID first, so doctor's AWS rows run); then the two Touch IDs
+# of the runtime key come last (vm smoke, vm list). Under make -i a failed step would be ignored, the next ones would
+# run (the Touch IDs among them) and the last line would say ok, and under make -p acceptance-run's make, the runner's,
+# would print the ops key in its data base: the wrapper's first line is a $(error) that make expands before its runner
+# or any step runs, -i or not (on MAKE_SWITCHES; under -k a failed line still ends the recipe), with infra.mk's -p
+# refusal after it. The VM's own negatives (a 9418 token used against 8080, curl without the proxy from a VM shell,
+# ai-env vm list inside the VM) are part B's.
 ACCEPT_BIN   ?= $(INSTALL_ROOT)/bin
 ACCEPT_DIR   := target/s8/acceptance
 # A Cursor session's stream-json argv (the stand-in claude only records it).
@@ -513,8 +561,12 @@ ACCEPT_SH     = set -uo pipefail; unset $(LAB_KNOBS) AI_ENV_BRIDGE_LOCAL AI_ENV_
                 repo() { git_ init -q -b main "$$1" && git_ -C "$$1" add -A && git_ -C "$$1" commit -q -m fixture; }; \
                 standin() { printf '\043!/bin/sh\necho "$$$$ $$*" > "%s/ran"\nexit 0\n' "$$1" > "$$1/claude" && chmod 755 "$$1/claude"; };
 
-acceptance: ## S8 acceptance, live (v6 §6, the S8 subset; part B, after make install: the installed pair, or ACCEPT_BIN=DIR): [workspaces].roots must hold target/s8, checked first; doctor exits 0 in eu-central-1, ai-env and ai-env-claude are one version, creds status; then the negatives, each its own line: (a) a remote-mode session outside the roots execs the stand-in claude (census route local, reason outside_roots), (b) an AKIA-shaped value in a tracked file and (c) a committed bypassPermissions each make box seed --dry-run exit 9 naming it, (d) no egress connector: the remote wrapper refuses at the precheck, exit 9 (no Touch ID, no unseal row; it asks for vpc egress whatever [egress].require says), (e) AI_ENV_BRIDGE_LOCAL=1 execs the stand-in with no census row, (f) AWS_REGION=eu-west-3 leaves eu-central-1, (g) ai-env alone: doctor [NO ] exit 1, wrapper install exit 5; last vm smoke --max-duration 900, then vm list holds none of its VM: the two Touch IDs, nothing before needs one; a VM's own negatives (a 9418 token on 8080, curl without the proxy, ai-env vm list in the VM) are part B's; target/s8/acceptance removed on every exit (target/s8 too when the run made it); refused under make -i
-	@$(if $(findstring i,$(foreach w,$(firstword $(MAKEFLAGS)),$(if $(or $(findstring =,$(w)),$(filter --%,$(w))),,$(w))) $(filter-out --%,$(filter -%,$(MAKEFLAGS)))),$(error acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it))
+acceptance: ## (ops: one Touch ID first, then the smoke's two) S8 acceptance, live (v6 §6, the S8 subset; part B, after make install: the installed pair, or ACCEPT_BIN=DIR): [workspaces].roots must hold target/s8, checked first; doctor exits 0 in eu-central-1 (its AWS rows as ai-env-ops), ai-env and ai-env-claude are one version, creds status; then the negatives, each its own line: (a) a remote-mode session outside the roots execs the stand-in claude (census route local, reason outside_roots), (b) an AKIA-shaped value in a tracked file and (c) a committed bypassPermissions each make box seed --dry-run exit 9 naming it, (d) no egress connector: the remote wrapper refuses at the precheck, exit 9 (no Touch ID, no unseal row; it asks for vpc egress whatever [egress].require says), (e) AI_ENV_BRIDGE_LOCAL=1 execs the stand-in with no census row, (f) AWS_REGION=eu-west-3 leaves eu-central-1, (g) ai-env alone: doctor [NO ] exit 1, wrapper install exit 5; last vm smoke --max-duration 900, then vm list holds none of its VM: the runtime key's two Touch IDs, nothing between the ops key's and them needs one; a VM's own negatives (a 9418 token on 8080, curl without the proxy, ai-env vm list in the VM) are part B's; target/s8/acceptance removed on every exit (target/s8 too when the run made it); refused under make -i or -p
+	@$(if $(findstring i,$(MAKE_SWITCHES)),$(error acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it))$(call NOT_UNDER_P,acceptance)
+	@$(call TIER,ops,acceptance) $(MAKE) --no-print-directory acceptance-run
+
+acceptance-run:
+	@$(if $(findstring i,$(MAKE_SWITCHES)),$(error acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it))$(call NOT_UNDER_P,acceptance)
 	@$(call ACCEPT_SH,roots) test -x "$$ai" && test -x "$$wrap" || fail "no ai-env and ai-env-claude in $(ACCEPT_BIN): make install first (or ACCEPT_BIN=DIR)"; \
 	  printf 'acceptance fixture\n' > "$$a/README.md"; repo "$$a" > /dev/null || fail "git could not make the fixture repository $$a"; \
 	  out=$$("$$ai" box seed "$$a" --dry-run 2>&1); rc=$$?; \

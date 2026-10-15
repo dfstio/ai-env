@@ -2,9 +2,17 @@
 //! function of already-collected inputs so it is unit-testable without the
 //! subprocesses that `rows` runs (5 s timeout each; 15 s for aws). Doctor
 //! never calls Pulumi: the stack's view comes from `state/infra.toml`.
+//!
+//! S8 operators: doctor never unseals anything (neither the runtime key nor
+//! `credentials/ops.env`) and never resolves an operator: its AWS rows run
+//! only under an identity `ai-env as` declared (`ai-env as ops -- ai-env
+//! doctor`, one Touch ID), as that identity; without one it makes a single
+//! plain `sts get-caller-identity`, only to warn when the shell's own
+//! credentials are the account root's.
 use crate::age_cmd::{effective_path, find_in_path};
 use crate::bridge::census::read_rows;
-use crate::bridge::awscli::aws_run;
+use crate::bridge::awscli::{aws_cmd_as, program_as};
+use crate::bridge::identity::{declared, parse_caller, verify_operator, KeyNotes, Operator, Verified, DEPLOYER_USER};
 use crate::bridge::config::{env_region_warning, is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, CredsCfg, EgressCfg, Paths, VmCfg, WrapperMode, REGION, TRUE_ACCEPTS_NOTHING};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
 use crate::bridge::egress::{credential_precheck, EgressVerified};
@@ -142,18 +150,40 @@ fn error_line(stderr: &str) -> &str {
     stderr.trim().lines().rev().find(|l| !l.is_empty() && !l.starts_with(char::is_whitespace) && !l.starts_with("Traceback ")).map_or(first, str::trim)
 }
 
-/// The command a probe runs: `program args…` with `CLAUDE_CODE_OAUTH_TOKEN`
-/// removed from the child's environment (probed tools have no business
-/// seeing it).
-fn probe_cmd(program: &str, args: &[&str]) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.args(args).env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+/// Remove from `cmd`'s environment what a probed tool has no business
+/// seeing: the variables the age children lose (`CHILD_ENV_REMOVED`: the
+/// OAuth token, the API key, an AWS key, a session token) and the `ai-env
+/// as` marker. Under `ai-env as ops -- ai-env doctor` the operator key is
+/// for the AWS rows alone, never for rustup, zig or claude.
+fn without_credentials(cmd: &mut Command) -> &mut Command {
+    for name in crate::age_cmd::CHILD_ENV_REMOVED.iter().chain(&[crate::commands::RUNNER_MARKER]) {
+        cmd.env_remove(name);
+    }
     cmd
 }
 
-/// Probe `program args…` with no stdin and without the OAuth token.
+/// The command a probe runs: `program args…` without any credential of this
+/// process ([`without_credentials`]).
+fn probe_cmd(program: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new(program);
+    without_credentials(cmd.args(args));
+    cmd
+}
+
+/// Probe `program args…` with no stdin and without any credential of this
+/// process (the OAuth token, an AWS key, the marker).
 pub fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
     run_capture_cmd(probe_cmd(program, args), None, timeout)
+}
+
+/// Doctor's one plain `aws sts get-caller-identity` when no identity is
+/// declared (§8.2): the shell's own credential chain as it is (an exported
+/// key included: the row warns when it is the account root's), only the
+/// OAuth token removed.
+fn ambient_sts_cmd() -> Command {
+    let mut cmd = Command::new("aws");
+    cmd.args(["sts", "get-caller-identity", "--region", REGION, "--output", "json"]).env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    cmd
 }
 
 // ---- version parsing -----------------------------------------------------------
@@ -236,28 +266,145 @@ pub fn row_cross_tools(cargo_lambda: &[(PathBuf, Option<String>)], zig_out: Opti
     }
 }
 
-/// `(row, credentials_unavailable)`.
+/// What a row says when its AWS call needs the operator identity doctor was not given.
+pub const NO_OPERATOR_ROW: &str = "no operator identity: ai-env as ops -- ai-env doctor";
+
+/// The operator identity `ai-env as` declared (`declared`: `None` without a
+/// marker, `Err` its §2.5 refusal) and what the row's one sts call answered
+/// as it (`checked`): `(row, auth_unavailable)`. A refused key is the only
+/// failure that sets `auth_unavailable` (exit 5).
 #[must_use]
-pub fn row_aws_identity(sts: Option<Result<&str, &str>>) -> (DoctorLine, bool) {
+pub fn row_operator_identity(declared: Option<&std::result::Result<Operator, String>>, checked: Option<&crate::errors::Result<Verified>>) -> (DoctorLine, bool) {
+    let op = match declared {
+        None => return (DoctorLine::row(Tag::Skip, "operator identity: none declared (doctor never unseals credentials/ops.env)  <- ai-env as ops -- ai-env doctor (one Touch ID)"), false),
+        Some(Err(e)) => return (DoctorLine::row(Tag::No, format!("operator identity: {e}")), false),
+        Some(Ok(op)) => op,
+    };
+    let v = match checked {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return (DoctorLine::row(Tag::No, format!("operator identity: {e}")), e.exit_code() == 5),
+        None => return (DoctorLine::row(Tag::No, "operator identity: not checked"), false),
+    };
+    let line = match op {
+        Operator::Runner { role, tail } => DoctorLine::row(Tag::Ok, format!("operator identity {} (ai-env as {}, key ...{tail})", v.arn, role.word())),
+        Operator::Sealed { key } => DoctorLine::row(Tag::Ok, format!("operator identity {} (credentials/ops.env, key ...{})", v.arn, key.tail())),
+        Operator::Ambient { root: true } => DoctorLine::row(Tag::Warn, "operator identity is the account ROOT (ai-env as root: the bootstrap and break-glass only)  <- ai-env as ops -- ai-env doctor"),
+        Operator::Ambient { root: false } => DoctorLine::row(Tag::Ok, format!("operator identity {} (ai-env as ambient: the aws CLI's own credentials, never the root)", v.arn)),
+    };
+    (line, false)
+}
+
+/// No identity declared: one plain `aws sts get-caller-identity` (`sts`:
+/// `None` without an aws CLI), only to warn when the shell's own credentials
+/// are the account root's; operator commands never use them.
+#[must_use]
+pub fn row_ambient_identity(sts: Option<Result<&str, &str>>) -> DoctorLine {
+    let not_used = |e: &str| DoctorLine::row(Tag::Skip, format!("ambient aws CLI identity: {e} (not used by operator commands)"));
     match sts {
-        None => (DoctorLine::row(Tag::Skip, "aws cli not found (bridge commands need it)"), false),
-        Some(Err(msg)) => {
-            let lower = msg.to_ascii_lowercase();
-            let creds = lower.contains("credential") || lower.contains("expiredtoken") || lower.contains("invalidclienttokenid") || lower.contains("token");
-            if creds {
-                (DoctorLine::row(Tag::No, format!("aws credentials unavailable: {msg}")), true)
-            } else {
-                (DoctorLine::row(Tag::No, format!("aws identity: {msg}")), false)
-            }
+        None => DoctorLine::row(Tag::Skip, "aws cli not found (bridge commands need it)"),
+        Some(Err(e)) if e.to_ascii_lowercase().contains("unable to locate credentials") => {
+            DoctorLine::row(Tag::Ok, "no ambient aws CLI credentials (operator commands use ai-env as … or credentials/ops.env)")
         }
-        Some(Ok(json)) => {
-            let arn = serde_json::from_str::<serde_json::Value>(json)
-                .ok()
-                .and_then(|v| v.get("Arn").and_then(|a| a.as_str()).map(str::to_string))
-                .unwrap_or_else(|| "unknown principal".to_string());
-            (DoctorLine::row(Tag::Ok, format!("aws identity {arn}")), false)
-        }
+        Some(Err(e)) => not_used(e),
+        Some(Ok(json)) => match parse_caller(json) {
+            Ok(v) if v.is_root() => DoctorLine::row(
+                Tag::Warn,
+                "the ambient aws CLI credentials are the account ROOT: operator commands never use them; delete root's access key  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy",
+            ),
+            Ok(v) => DoctorLine::row(Tag::Skip, format!("ambient aws CLI identity {} (not used by operator commands)", v.arn)),
+            Err(e) => not_used(&e),
+        },
     }
+}
+
+/// `credentials/ops.env`, the ai-env-ops key, from the file and the notes
+/// sealed with it (`notes`: unauthenticated, display only; no Touch ID).
+#[must_use]
+pub fn row_ops_key(state: &AwsEnvState, path: &Path, notes: &KeyNotes) -> DoctorLine {
+    match state {
+        AwsEnvState::Sealed => {
+            let user = notes.user.as_deref().unwrap_or("an unrecorded user");
+            let tail = notes.key_id_last4.as_deref().map_or_else(|| "(key id not recorded)".to_string(), |t| format!("...{t}"));
+            let day = notes.sealed_day().unwrap_or_else(|| "on an unrecorded day".to_string());
+            DoctorLine::row(Tag::Ok, format!("ops key sealed ({}): {user} {tail}, sealed {day} (recorded at sealing, not authenticated)", path.display()))
+        }
+        AwsEnvState::Absent => DoctorLine::row(Tag::Skip, format!("ops key absent ({})  <- ai-env as deployer -- make ops-key (after the bootstrap: make operator-keys)", path.display())),
+        AwsEnvState::NotSealed(why) => DoctorLine::row(Tag::No, format!("ops key NOT sealed: {} {why}  <- move it away, then ai-env as deployer -- make ops-key ROTATE=1", path.display())),
+    }
+}
+
+/// The ops key row for the file at `path`, as `rows` builds it (its notes read without a Touch ID).
+#[must_use]
+pub fn ops_key(path: &Path) -> DoctorLine {
+    let state = aws_env_state(path);
+    let notes = match state {
+        AwsEnvState::Sealed => crate::bridge::registry::read_regular_file(path).ok().flatten().map(|text| KeyNotes::of(&text)).unwrap_or_default(),
+        _ => KeyNotes::default(),
+    };
+    row_ops_key(&state, path, &notes)
+}
+
+/// The deployer `state/infra.toml` records and, under an identity, its keys
+/// (`keys`: the `iam list-access-keys --user-name ai-env-deployer` output;
+/// `None` when not made). Its key lives in Strongbox only: one key is the
+/// norm, none or two need a hand.
+#[must_use]
+pub fn row_deployer(state: &Result<Option<InfraState>, BridgeError>, keys: Option<Result<&str, &str>>) -> DoctorLine {
+    let recorded = match state {
+        Ok(s) => s.as_ref().is_some_and(|s| s.deployer_user_arn.is_some() || s.deployer_user_name.is_some()),
+        Err(e) => return DoctorLine::row(Tag::Skip, format!("deployer: not checked (state/infra.toml unreadable: {e})  <- {INFRA_STATUS_HINT}")),
+    };
+    if !recorded {
+        return DoctorLine::row(Tag::Skip, format!("deployer: none recorded in state/infra.toml  <- the bootstrap deploy, then {INFRA_STATUS_HINT}"));
+    }
+    let who = format!("deployer user/{DEPLOYER_USER}");
+    let json = match keys {
+        None => return DoctorLine::row(Tag::Ok, format!("{who} (stack output; its key is in Strongbox only)")),
+        Some(Err(e)) if e.contains("NoSuchEntity") => return DoctorLine::row(Tag::No, format!("{who} does not exist, though state/infra.toml names it  <- {INFRA_STATUS_HINT}")),
+        Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("deployer: iam list-access-keys failed: {e}")),
+        Some(Ok(json)) => json,
+    };
+    let count = serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.get("AccessKeyMetadata").and_then(|k| k.as_array()).map(Vec::len));
+    match count {
+        Some(0) => DoctorLine::row(Tag::No, format!("{who} has no access key  <- ai-env as root -- make operator-keys")),
+        Some(1) => DoctorLine::row(Tag::Ok, format!("{who}: 1 access key (in Strongbox only)")),
+        Some(n) => DoctorLine::row(
+            Tag::Warn,
+            format!("{who} has {n} access keys (one left from a rotation?)  <- delete the one not in Strongbox: ai-env as deployer -- aws iam list-access-keys --user-name {DEPLOYER_USER} --region {REGION}"),
+        ),
+        None => DoctorLine::row(Tag::Warn, "deployer: iam list-access-keys failed: no AccessKeyMetadata in its output"),
+    }
+}
+
+/// `aws iam list-access-keys` of the deployer (the deployer row's call).
+fn deployer_keys_args() -> [&'static str; 8] {
+    ["iam", "list-access-keys", "--user-name", DEPLOYER_USER, "--region", REGION, "--output", "json"]
+}
+
+/// The account root's access keys (`summary`: the `iam get-account-summary`
+/// output; `None` without an identity): any, active or deactivated, is a
+/// warning until it is deleted.
+#[must_use]
+pub fn row_root_access_keys(summary: Option<Result<&str, &str>>) -> DoctorLine {
+    let not_checked = |why: &str| DoctorLine::row(Tag::Skip, format!("the account root's access keys: not checked ({why})"));
+    let json = match summary {
+        None => return not_checked(NO_OPERATOR_ROW),
+        Some(Err(e)) => return not_checked(e),
+        Some(Ok(json)) => json,
+    };
+    match serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.get("SummaryMap")?.get("AccountAccessKeysPresent")?.as_u64()) {
+        Some(0) => DoctorLine::row(Tag::Ok, "the account root has no access key"),
+        Some(n) => DoctorLine::row(
+            Tag::Warn,
+            format!("the account root has an access key (AccountAccessKeysPresent={n}, active or deactivated)  <- delete it once ai-env-deployer works (IAM console, Security credentials)"),
+        ),
+        None => not_checked("no SummaryMap.AccountAccessKeysPresent in the get-account-summary output"),
+    }
+}
+
+/// `aws iam get-account-summary` (the root access keys row's call).
+fn account_summary_args() -> [&'static str; 6] {
+    ["iam", "get-account-summary", "--region", REGION, "--output", "json"]
 }
 
 /// The region is pinned in code; an `AWS_REGION`/profile value that differs
@@ -267,36 +414,6 @@ pub fn row_region(env_warning: Option<&str>) -> DoctorLine {
     match env_warning {
         None => DoctorLine::row(Tag::Ok, format!("region {REGION} (pinned in code)")),
         Some(w) => DoctorLine::row(Tag::Warn, format!("region {REGION} (pinned in code)  <- {w}")),
-    }
-}
-
-/// `None`: not attempted (no identity); `Some(Err)`: the call itself failed.
-#[must_use]
-pub fn row_iam_simulate(sim: Option<Result<&str, &str>>) -> DoctorLine {
-    let json = match sim {
-        None => return DoctorLine::row(Tag::Skip, "iam simulate not run (no aws identity)"),
-        Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("iam simulate failed: {e}")),
-        Some(Ok(json)) => json,
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return DoctorLine::row(Tag::Warn, "iam simulate: unparseable output");
-    };
-    let mut denied = Vec::new();
-    let mut allowed = Vec::new();
-    for r in v.get("EvaluationResults").and_then(|r| r.as_array()).into_iter().flatten() {
-        let action = r.get("EvalActionName").and_then(|a| a.as_str()).unwrap_or("?").to_string();
-        if r.get("EvalDecision").and_then(|d| d.as_str()) == Some("allowed") {
-            allowed.push(action);
-        } else {
-            denied.push(action);
-        }
-    }
-    if denied.is_empty() && !allowed.is_empty() {
-        DoctorLine::row(Tag::Ok, format!("{} allowed (dedicated runtime principal possible)", allowed.join(", ")))
-    } else if !denied.is_empty() {
-        DoctorLine::row(Tag::Skip, format!("iam simulate: {} denied — named-profile fallback", denied.join(", ")))
-    } else {
-        DoctorLine::row(Tag::Skip, "iam simulate: no results")
     }
 }
 
@@ -326,13 +443,18 @@ pub fn row_keystore_key(exists: bool, key: &str) -> DoctorLine {
 /// CLI is not reported as a failed login check.
 const CLAUDE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `claude auth status --json` of `claude` without the token, the API key
-/// and the config-dir variables (the default login is the one asked about),
-/// within [`CLAUDE_AUTH_TIMEOUT`].
-fn claude_auth_status(claude: &Path) -> Result<String, String> {
+/// `claude auth status --json` of `claude` without the token, the API key,
+/// an AWS key, the marker ([`without_credentials`]) and the config-dir
+/// variable (the default login is the one asked about).
+fn claude_auth_cmd(claude: &Path) -> Command {
     let mut cmd = Command::new(claude);
-    cmd.args(["auth", "status", "--json"]).env_remove("CLAUDE_CODE_OAUTH_TOKEN").env_remove("ANTHROPIC_API_KEY").env_remove("CLAUDE_CONFIG_DIR");
-    run_capture_cmd(cmd, None, CLAUDE_AUTH_TIMEOUT)
+    without_credentials(cmd.args(["auth", "status", "--json"])).env_remove("CLAUDE_CONFIG_DIR");
+    cmd
+}
+
+/// [`claude_auth_cmd`] within [`CLAUDE_AUTH_TIMEOUT`].
+fn claude_auth_status(claude: &Path) -> Result<String, String> {
+    run_capture_cmd(claude_auth_cmd(claude), None, CLAUDE_AUTH_TIMEOUT)
 }
 
 /// `loggedIn` of a `claude auth status --json` answer; nothing else of it is read.
@@ -607,7 +729,7 @@ pub fn row_review_files(tripwires: &Path, tripwires_exist: bool, policy: &Path, 
 
 /// The pinned managed base image version, from the
 /// `list-managed-microvm-image-versions` call: `None` when it was not made
-/// (no AWS identity, `[-  ]`); `Some(Err)` when the call itself failed (a
+/// (no operator identity, `[-  ]`); `Some(Err)` when the call itself failed (a
 /// timeout, throttling, AccessDenied, an aws CLI without `lambda-microvms`),
 /// which says nothing about the version (`[!! ] not checked`); otherwise
 /// [`base_image_verdict`] on the listing: AVAILABLE, or `[NO ]` naming the
@@ -616,7 +738,7 @@ pub fn row_review_files(tripwires: &Path, tripwires_exist: bool, policy: &Path, 
 pub fn row_base_image(listing: Option<Result<&str, &str>>) -> DoctorLine {
     let pinned = format!("base image {BASE_IMAGE_NAME} version {BASE_IMAGE_VERSION}");
     match listing {
-        None => DoctorLine::row(Tag::Skip, format!("{pinned} not checked (no AWS identity)")),
+        None => DoctorLine::row(Tag::Skip, format!("{pinned} not checked ({NO_OPERATOR_ROW})")),
         Some(Err(e)) => DoctorLine::row(Tag::Warn, format!("{pinned} not checked: {e}")),
         Some(Ok(json)) => match base_image_verdict(json, BASE_IMAGE_VERSION) {
             Ok(v) => DoctorLine::row(Tag::Ok, format!("{pinned}: {v}")),
@@ -627,17 +749,9 @@ pub fn row_base_image(listing: Option<Result<&str, &str>>) -> DoctorLine {
     }
 }
 
-/// `arn:aws:iam::<account>:root`: the account root user, which
-/// `simulate-principal-policy` refuses (`InvalidInput`).
-#[must_use]
-pub fn is_root_arn(arn: &str) -> bool {
-    arn.strip_prefix("arn:aws:iam::").and_then(|r| r.split_once(':')).is_some_and(|(acct, rest)| acct.len() == 12 && acct.bytes().all(|c| c.is_ascii_digit()) && rest == "root")
-}
-
-/// `aws iam simulate-principal-policy` for `arn` (the doctor's IAM row):
-/// the region is pinned like every aws call, although IAM is global.
-fn iam_simulate_args(arn: &str) -> [&str; 11] {
-    ["iam", "simulate-principal-policy", "--region", REGION, "--policy-source-arn", arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "--output", "json"]
+/// `aws lambda-microvms list-managed-microvm-image-versions` of the pinned base image (the operator's identity).
+fn base_image_args(identifier: &str) -> [&str; 8] {
+    ["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", identifier, "--region", REGION, "--output", "json"]
 }
 
 // ---- S4 rows ------------------------------------------------------------------------
@@ -676,7 +790,7 @@ fn gib(mib: u64) -> String {
 
 /// The MicroVM memory quota against what `[vm]` may run at once
 /// (`max_concurrent × memory_mib`). `q` is the output of [`quota_args`]:
-/// `None` when not run (no aws identity, `[-  ]`); `Some(Err)` when the call
+/// `None` when not run (no operator identity, `[-  ]`); `Some(Err)` when the call
 /// failed (`[!! ]` with the reason: no verdict); otherwise the quota's
 /// `Quota.Value` in Gigabytes: `[ok ]` when `value × 1024 ≥ max_concurrent ×
 /// memory_mib`, else `[!! ]` (the platform refuses the run that crosses it
@@ -685,7 +799,7 @@ fn gib(mib: u64) -> String {
 pub fn row_microvm_quota(q: Option<Result<&str, &str>>, max_concurrent: u32, memory_mib: u32) -> DoctorLine {
     let name = format!("microvm memory quota {MICROVM_MEMORY_QUOTA_CODE}");
     let json = match q {
-        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked (no aws identity)")),
+        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked ({NO_OPERATOR_ROW})")),
         Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("{name} not checked: {e}")),
         Some(Ok(json)) => json,
     };
@@ -1076,7 +1190,7 @@ pub fn is_instance_id(id: &str) -> bool {
 }
 
 /// Whether [`rows`] makes the proxy row's one call, and for which instance:
-/// only with an aws identity (`identity`, as for every other doctor call)
+/// only with an operator identity (`identity`, as for every other doctor call)
 /// and a recorded `proxy_instance_id` that is an instance id
 /// ([`is_instance_id`]); `None`: no call.
 #[must_use]
@@ -1088,15 +1202,15 @@ pub fn proxy_call(identity: bool, state: Option<&InfraState>) -> Option<&str> {
 /// The proxy address the VMs are told (shared with `ai-env egress env`).
 pub use crate::bridge::egress::effective_proxy_ip;
 
-/// `aws ec2 <these>` through [`aws_run`] (region, pinned endpoint, no
-/// pager, no OAuth token): the one operator call of the proxy row.
+/// `aws ec2 <these>` through [`aws_cmd_as`] (region, pinned endpoint, no
+/// pager, no OAuth token, the declared identity): the one operator call of the proxy row.
 fn proxy_describe_args(id: &str) -> [&str; 3] {
     ["describe-instances", "--instance-ids", id]
 }
 
 /// The egress proxy (S5), from `state/infra.toml`'s `proxy_instance_id` (as
 /// [`read_infra_state`] returned it) and one `ec2 describe-instances` of it
-/// (`described`: `None` when not made — no aws identity, [`proxy_call`]).
+/// (`described`: `None` when not made — no operator identity, [`proxy_call`]).
 /// No id recorded is `[-  ]` (an unreadable file: its error named), an id
 /// that is not one `[!! ]` without a call. Running is `[ok ]` with its
 /// private IP (`[!! ]` when that is not the address the VMs are told,
@@ -1120,7 +1234,7 @@ pub fn row_proxy(configured_ip: Option<&str>, state: &Result<Option<InfraState>,
     }
     let name = format!("egress proxy {id}");
     let json = match described {
-        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked (no aws identity)")),
+        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked ({NO_OPERATOR_ROW})")),
         Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("{name} not checked: {e}")),
         Some(Ok(json)) => json,
     };
@@ -1280,35 +1394,46 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     lines.push(row_cross_tools(&cargo_lambda, run_capture("zig", &["version"], t).ok().as_deref()));
 
     let aws_present = find_in_path("aws", &effective_path()).is_some();
-    let sts = if aws_present {
-        Some(run_capture("aws", &["sts", "get-caller-identity", "--region", REGION, "--output", "json"], Duration::from_secs(15)))
-    } else {
-        None
+    // S8 operators: the identity `ai-env as` declared, from the marker alone (doctor never unseals and never
+    // resolves an operator); verified by one sts call as that identity. Without one, a plain sts call only warns
+    // when the shell's own credentials are the root's.
+    let declared = declared();
+    let checked = match &declared {
+        Some(Ok(op)) => Some(verify_operator(op)),
+        _ => None,
     };
-    let (row, auth_unavailable) = row_aws_identity(sts.as_ref().map(|r| r.as_deref().map_err(String::as_str)));
+    let (row, auth_unavailable) = row_operator_identity(declared.as_ref(), checked.as_ref());
     lines.push(row);
-    lines.push(row_region(env_region_warning().as_deref()));
-    let arn = sts.as_ref().and_then(|r| r.as_ref().ok()).and_then(|json| {
-        serde_json::from_str::<serde_json::Value>(json).ok().and_then(|v| v.get("Arn").and_then(|a| a.as_str()).map(str::to_string))
-    });
-    if arn.as_deref().is_some_and(is_root_arn) {
-        lines.push(DoctorLine::row(Tag::Skip, "iam simulate: not possible for the account root user (use an IAM user or SSO role for day-to-day work)"));
-    } else {
-        let sim = arn.as_ref().map(|arn| run_capture("aws", &iam_simulate_args(arn), Duration::from_secs(15)));
-        lines.push(row_iam_simulate(sim.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    if declared.is_none() {
+        let sts = aws_present.then(|| run_capture_cmd(ambient_sts_cmd(), None, Duration::from_secs(15)));
+        lines.push(row_ambient_identity(sts.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
     }
-    let base = arn.as_ref().map(|_| {
-        let id = format!("arn:aws:lambda:{REGION}:aws:microvm-image:{BASE_IMAGE_NAME}");
-        run_capture("aws", &["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", &id, "--region", REGION, "--output", "json"], Duration::from_secs(15))
-    });
+    lines.push(row_region(env_region_warning().as_deref()));
+    // The identity the AWS rows below run as: a declared one that answered as it must.
+    let op = match (&declared, &checked) {
+        (Some(Ok(op)), Some(Ok(_))) => Some(op),
+        _ => None,
+    };
+    let call = |args: &[&str]| op.map(|op| run_capture_cmd(program_as(args, op), None, Duration::from_secs(15)));
+    let paths = Paths::resolve();
+    if let Ok(paths) = &paths {
+        lines.push(ops_key(&paths.ops_env()));
+        let state = read_infra_state(paths);
+        let recorded = state.as_ref().is_ok_and(|s| s.as_ref().is_some_and(|s| s.deployer_user_arn.is_some() || s.deployer_user_name.is_some()));
+        let keys = if recorded { call(&deployer_keys_args()) } else { None };
+        lines.push(row_deployer(&state, keys.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    }
+    let summary = call(&account_summary_args());
+    lines.push(row_root_access_keys(summary.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    let base_id = format!("arn:aws:lambda:{REGION}:aws:microvm-image:{BASE_IMAGE_NAME}");
+    let base = call(&base_image_args(&base_id));
     lines.push(row_base_image(base.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
 
-    let paths = Paths::resolve();
     let loaded = paths.as_ref().ok().map(BridgeConfig::load);
     // The operator's identity, like every aws call here (doctor never unseals
     // the runtime key); only for a parsed `[vm]` the quota could cover.
     let parsed = matches!(loaded, Some(Ok(Some(_))));
-    let quota = arn.as_ref().filter(|_| parsed).map(|_| run_capture("aws", &quota_args(), Duration::from_secs(15)));
+    let quota = if parsed { call(&quota_args()) } else { None };
     let census_path = match &paths {
         Ok(paths) => {
             let loaded = loaded.as_ref().expect("loaded with the paths");
@@ -1340,7 +1465,7 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state, &dns_path, &verified, unix_now()));
             // S5: the egress row reads only the state file; the proxy row
             // adds one operator call, for a recorded proxy and an identity.
-            let described = proxy_call(arn.is_some(), recorded).map(|id| aws_run("ec2", &proxy_describe_args(id), None, Duration::from_secs(15)));
+            let described = op.and_then(|op| proxy_call(true, recorded).map(|id| aws_cmd_as("ec2", &proxy_describe_args(id), op).and_then(|cmd| run_capture_cmd(cmd, None, Duration::from_secs(15)))));
             lines.push(row_proxy(cfg.aws.proxy_private_ip.as_deref(), &state, described.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
             let vms = list_rows(paths);
             lines.push(match &vms {
@@ -1454,15 +1579,14 @@ mod tests {
         }
     }
 
+    /// S8 operators: the IAM calls of the deployer and root-keys rows, and the
+    /// base image's, pin the region like every aws call (IAM is global).
     #[test]
-    fn the_doctor_iam_call_pins_the_region() {
-        assert!(is_root_arn("arn:aws:iam::123456789012:root"));
-        assert!(!is_root_arn("arn:aws:iam::123456789012:user/root"));
-        assert!(!is_root_arn("arn:aws:sts::123456789012:assumed-role/x/y"));
-        let args = iam_simulate_args("arn:aws:iam::123456789012:user/example");
-        assert!(args.windows(2).any(|w| w == ["--region", "eu-central-1"]), "{args:?}");
-        assert_eq!(&args[..2], ["iam", "simulate-principal-policy"]);
-        assert!(args.windows(2).any(|w| w == ["--policy-source-arn", "arn:aws:iam::123456789012:user/example"]), "{args:?}");
+    fn the_doctor_iam_calls_pin_the_region() {
+        assert_eq!(deployer_keys_args(), ["iam", "list-access-keys", "--user-name", "ai-env-deployer", "--region", "eu-central-1", "--output", "json"]);
+        assert_eq!(account_summary_args(), ["iam", "get-account-summary", "--region", "eu-central-1", "--output", "json"]);
+        let base = base_image_args("arn:aws:lambda:eu-central-1:aws:microvm-image:al2023-1");
+        assert!(base.windows(2).any(|w| w == ["--region", "eu-central-1"]) && base[..2] == ["lambda-microvms", "list-managed-microvm-image-versions"], "{base:?}");
     }
 
     #[test]
@@ -1573,7 +1697,7 @@ mod tests {
     fn row_microvm_quota_without_a_verdict() {
         let (tag, t) = text(&row_microvm_quota(None, 3, 2048));
         assert_eq!(tag, Tag::Skip);
-        assert_eq!(t, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)");
+        assert_eq!(t, "microvm memory quota L-CD1C0CC4 not checked (no operator identity: ai-env as ops -- ai-env doctor)");
         let call = "An error occurred (AccessDeniedException) when calling the GetServiceQuota operation: User is not authorized";
         let row = row_microvm_quota(Some(Err(call)), 3, 2048);
         assert_eq!(text(&row), (Tag::Warn, format!("microvm memory quota L-CD1C0CC4 not checked: {call}")));
@@ -1712,7 +1836,7 @@ mod tests {
         assert!(got[6].0 == Tag::Skip && got[6].1.contains("no active image version recorded"), "without a recorded version there is nothing to judge: {got:?}");
         assert_eq!(got[7], text(&row_credential_vm_role(&cfg.aws)));
         let got = settings(&Ok(Some(cfg.clone())), None, &Ok(None), &Ok(None));
-        assert_eq!(got[2], (Tag::Skip, "microvm memory quota L-CD1C0CC4 not checked (no aws identity)".to_string()));
+        assert_eq!(got[2], (Tag::Skip, "microvm memory quota L-CD1C0CC4 not checked (no operator identity: ai-env as ops -- ai-env doctor)".to_string()));
         assert_eq!(got[4].0, Tag::Skip, "no dns-path row: {got:?}");
         assert!(got[6].0 == Tag::Skip && got[6].1.contains("no state recorded"), "without state/infra.toml the gate row is skipped: {got:?}");
         // A configured connector with an ACTIVE recorded state: the row is [ok ].
@@ -2007,7 +2131,7 @@ mod tests {
     fn the_proxy_call_needs_an_identity_and_a_valid_recorded_id() {
         let s = active_state();
         assert_eq!(proxy_call(true, Some(&s)), Some(PROXY_ID));
-        assert_eq!(proxy_call(false, Some(&s)), None, "no aws identity: no call");
+        assert_eq!(proxy_call(false, Some(&s)), None, "no operator identity: no call");
         assert_eq!(proxy_call(true, None), None, "no state: no call");
         for none in [None, Some(String::new())] {
             assert_eq!(proxy_call(true, Some(&InfraState { proxy_instance_id: none.clone(), ..s.clone() })), None, "{none:?}");
@@ -2037,7 +2161,7 @@ mod tests {
             assert!(tag == Tag::Warn && t.contains(&format!("proxy_instance_id {bad:?} in state/infra.toml is not an instance id; not checked")), "{bad}: {t}");
         }
         let s = ok(s);
-        assert_eq!(text(&row_proxy(None, &s, None)), (Tag::Skip, "egress proxy i-0123456789abcdef0 not checked (no aws identity)".to_string()));
+        assert_eq!(text(&row_proxy(None, &s, None)), (Tag::Skip, "egress proxy i-0123456789abcdef0 not checked (no operator identity: ai-env as ops -- ai-env doctor)".to_string()));
         // A failed call names the error: no verdict, doctor exit 0.
         let call = "aws ec2 describe-instances: An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: You are not authorized to perform this operation.";
         let row = row_proxy(None, &s, Some(Err(call)));
@@ -2333,6 +2457,28 @@ mod tests {
         assert_eq!(cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), vec!["-c", "true"]);
     }
 
+    /// S8 operators: under `ai-env as ops -- ai-env doctor` the operator key
+    /// and its marker are for the AWS rows alone: every probed tool (rustup,
+    /// cargo-lambda, zig, `claude --version`, `claude auth status`,
+    /// ai-env-claude) loses them with the OAuth token, the API key and a
+    /// session token; the one plain sts call of a run without an identity
+    /// keeps the shell's own chain (an exported root key is what it warns of).
+    #[test]
+    fn probes_never_inherit_an_aws_key_or_the_runner_marker() {
+        let removed = |cmd: &Command| cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let want = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AI_ENV_BRIDGE_AS"];
+        for (what, cmd) in [("a probe", probe_cmd("rustup", &["run", EXPECTED_TOOLCHAIN, "rustc", "--version"])), ("claude auth status", claude_auth_cmd(Path::new("/x/claude")))] {
+            let gone = removed(&cmd);
+            for name in want {
+                assert!(gone.iter().any(|g| g == name), "{what} inherits {name}: {gone:?}");
+            }
+        }
+        assert!(removed(&claude_auth_cmd(Path::new("/x/claude"))).iter().any(|g| g == "CLAUDE_CONFIG_DIR"), "the default login is the one asked about");
+        let sts = ambient_sts_cmd();
+        assert_eq!(removed(&sts), ["CLAUDE_CODE_OAUTH_TOKEN"], "the ambient chain as it is");
+        assert_eq!(sts.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), ["sts", "get-caller-identity", "--region", "eu-central-1", "--output", "json"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn capture_bounds_the_wait_for_pipes_held_by_a_grandchild() {
@@ -2367,15 +2513,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_identity_and_region_rows() {
-        let (r, u) = row_aws_identity(None);
-        assert_eq!((text(&r).0, u), (Tag::Skip, false));
-        let (r, u) = row_aws_identity(Some(Err("Unable to locate credentials. You can configure credentials by running \"aws configure\".")));
-        assert_eq!((text(&r).0, u), (Tag::No, true));
-        let (r, u) = row_aws_identity(Some(Ok("{\"Arn\":\"arn:aws:iam::123456789012:user/example\"}")));
-        let (tag, t) = text(&r);
-        assert_eq!((tag, u), (Tag::Ok, false));
-        assert!(t.contains("user/example"), "{t}");
+    fn region_rows() {
         let (tag, t) = text(&row_region(None));
         assert_eq!(tag, Tag::Ok);
         assert!(t.contains("eu-central-1 (pinned in code)"), "{t}");
@@ -2384,19 +2522,120 @@ mod tests {
         assert!(t.contains("eu-west-3 ignored"), "{t}");
     }
 
+    fn verified(arn: &str) -> crate::errors::Result<Verified> {
+        Ok(parse_caller(&format!("{{\"Account\": \"123456789012\", \"Arn\": \"{arn}\"}}")).unwrap())
+    }
+
+    /// S8 operators §8.2: the operator identity row, from the marker alone and
+    /// the row's one sts call; a refused key is the only exit-5 case, and with
+    /// no marker doctor names `ai-env as ops -- ai-env doctor` (it never unseals).
     #[test]
-    fn iam_rows() {
-        let allowed = "{\"EvaluationResults\":[{\"EvalActionName\":\"iam:CreateUser\",\"EvalDecision\":\"allowed\"},{\"EvalActionName\":\"iam:CreateAccessKey\",\"EvalDecision\":\"allowed\"}]}";
-        assert_eq!(text(&row_iam_simulate(Some(Ok(allowed)))).0, Tag::Ok);
-        let denied = "{\"EvaluationResults\":[{\"EvalActionName\":\"iam:CreateUser\",\"EvalDecision\":\"implicitDeny\"}]}";
-        let (tag, t) = text(&row_iam_simulate(Some(Ok(denied))));
-        assert_eq!(tag, Tag::Skip);
-        assert!(t.contains("named-profile fallback"), "{t}");
-        assert_eq!(text(&row_iam_simulate(None)).0, Tag::Skip);
-        let (tag, t) = text(&row_iam_simulate(Some(Err("An error occurred (AccessDenied) when calling the SimulatePrincipalPolicy operation"))));
+    fn operator_identity_rows() {
+        use crate::bridge::identity::Role;
+        use crate::errors::CliError;
+        let ops = Ok(Operator::Runner { role: Role::Ops, tail: "9002".into() });
+        let ops_arn = "arn:aws:iam::123456789012:user/ai-env-ops";
+        let (row, auth) = row_operator_identity(Some(&ops), Some(&verified(ops_arn)));
+        assert_eq!((text(&row), auth), ((Tag::Ok, format!("operator identity {ops_arn} (ai-env as ops, key ...9002)")), false));
+        let root = Ok(Operator::Ambient { root: true });
+        let (row, _) = row_operator_identity(Some(&root), Some(&verified("arn:aws:iam::123456789012:root")));
+        assert_eq!(text(&row), (Tag::Warn, "operator identity is the account ROOT (ai-env as root: the bootstrap and break-glass only)  <- ai-env as ops -- ai-env doctor".into()));
+        let ambient = Ok(Operator::Ambient { root: false });
+        let (row, _) = row_operator_identity(Some(&ambient), Some(&verified("arn:aws:iam::123456789012:user/agent")));
+        assert_eq!(text(&row), (Tag::Ok, "operator identity arn:aws:iam::123456789012:user/agent (ai-env as ambient: the aws CLI's own credentials, never the root)".into()));
+        // A declared identity that fails: [NO ] with its text; only a refused key is exit 5.
+        let refused_text = "AWS refused the operator key ...9002 (InvalidClientTokenId): re-seal credentials/ops.env, which ai-env as ops unseals, with ai-env as deployer -- make ops-key ROTATE=1";
+        let refused = Err(CliError::AuthUnavailable(refused_text.into()));
+        let (row, auth) = row_operator_identity(Some(&ops), Some(&refused));
+        assert_eq!((text(&row), auth), ((Tag::No, format!("operator identity: {refused_text}")), true));
+        let other = Err(CliError::Policy("AI_ENV_BRIDGE_AS=root, but the aws CLI's credentials are arn:aws:iam::123456789012:user/rust, not the account root: unset it, or run the command under ai-env as root -- again".into()));
+        let (row, auth) = row_operator_identity(Some(&root), Some(&other));
+        assert!(text(&row).0 == Tag::No && text(&row).1.starts_with("operator identity: AI_ENV_BRIDGE_AS=root, but") && !auth, "{:?}", text(&row));
+        let bad: std::result::Result<Operator, String> = Err("AI_ENV_BRIDGE_AS=x is not one ai-env sets (deployer:XXXX, ops:XXXX, root or ambient): unset it".into());
+        let (row, auth) = row_operator_identity(Some(&bad), None);
+        assert_eq!((text(&row), auth), ((Tag::No, "operator identity: AI_ENV_BRIDGE_AS=x is not one ai-env sets (deployer:XXXX, ops:XXXX, root or ambient): unset it".into()), false));
+        let (row, auth) = row_operator_identity(None, None);
+        assert_eq!((text(&row), auth), ((Tag::Skip, "operator identity: none declared (doctor never unseals credentials/ops.env)  <- ai-env as ops -- ai-env doctor (one Touch ID)".into()), false));
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+    }
+
+    /// With no identity declared, the shell's own credentials are only looked
+    /// at to warn when they are the root's, naming the runners instead.
+    #[test]
+    fn ambient_root_row_names_ai_env_as_ops() {
+        let (tag, t) = text(&row_ambient_identity(Some(Ok("{\"Account\": \"123456789012\", \"Arn\": \"arn:aws:iam::123456789012:root\"}"))));
         assert_eq!(tag, Tag::Warn);
-        assert!(t.starts_with("iam simulate failed: An error occurred (AccessDenied)"), "{t}");
-        assert_eq!(text(&row_iam_simulate(Some(Ok("not json")))).0, Tag::Warn);
+        assert_eq!(t, "the ambient aws CLI credentials are the account ROOT: operator commands never use them; delete root's access key  <- ai-env as ops -- … for operator commands, ai-env as deployer -- … to deploy");
+        let row = row_ambient_identity(Some(Ok("{\"Account\": \"123456789012\", \"Arn\": \"arn:aws:iam::123456789012:user/agent\"}")));
+        assert_eq!(text(&row), (Tag::Skip, "ambient aws CLI identity arn:aws:iam::123456789012:user/agent (not used by operator commands)".into()));
+        let row = row_ambient_identity(Some(Err("Unable to locate credentials. You can configure credentials by running \"aws configure\".")));
+        assert_eq!(text(&row), (Tag::Ok, "no ambient aws CLI credentials (operator commands use ai-env as … or credentials/ops.env)".into()));
+        let row = row_ambient_identity(Some(Err("An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: expired")));
+        assert_eq!(text(&row), (Tag::Skip, "ambient aws CLI identity: An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: expired (not used by operator commands)".into()));
+        assert_eq!(text(&row_ambient_identity(None)), (Tag::Skip, "aws cli not found (bridge commands need it)".into()));
+        assert!(text(&row_ambient_identity(Some(Ok("not json")))).1.starts_with("ambient aws CLI identity: unreadable answer"));
+    }
+
+    /// The ops key row reads the file and its sealing notes only (no Touch
+    /// ID), as `creds status` does, showing the UTC day of the sealing.
+    #[test]
+    fn row_ops_key_follows_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("ops.env");
+        assert_eq!(
+            text(&ops_key(&p)),
+            (Tag::Skip, format!("ops key absent ({})  <- ai-env as deployer -- make ops-key (after the bootstrap: make operator-keys)", p.display()))
+        );
+        let notes = KeyNotes::pairs(crate::bridge::identity::OPS_USER, "9002", 1_789_804_800);
+        let notes: Vec<(&str, &str)> = notes.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        std::fs::write(&p, crate::container::write_annotated(b"age-encryption.org/v1\n-> x\n--- y\n", &notes).unwrap()).unwrap();
+        assert_eq!(text(&ops_key(&p)), (Tag::Ok, format!("ops key sealed ({}): ai-env-ops ...9002, sealed 2026-09-19 (recorded at sealing, not authenticated)", p.display())));
+        std::fs::write(&p, crate::container::write(b"age-encryption.org/v1\n-> x\n--- y\n")).unwrap();
+        let (tag, t) = text(&ops_key(&p));
+        assert!(tag == Tag::Ok && t.ends_with("an unrecorded user (key id not recorded), sealed on an unrecorded day (recorded at sealing, not authenticated)"), "{t}");
+        let plain = format!("{}{}", "placeholder-", "value");
+        std::fs::write(&p, format!("AWS_ACCESS_KEY_ID=x\nAWS_SECRET_ACCESS_KEY={plain}\n")).unwrap();
+        let (tag, t) = text(&ops_key(&p));
+        assert_eq!(tag, Tag::No);
+        assert!(t.starts_with("ops key NOT sealed: ") && t.ends_with("is not an ai-env container (plaintext?)  <- move it away, then ai-env as deployer -- make ops-key ROTATE=1") && !t.contains(&plain), "{t}");
+    }
+
+    /// The deployer the state records, with its key count under an identity:
+    /// one key is the norm, none or two need a hand, a missing user is stale state.
+    #[test]
+    fn row_deployer_counts_its_keys() {
+        let with = ok(InfraState { deployer_user_arn: Some("arn:aws:iam::123456789012:user/ai-env-deployer".into()), ..active_state() });
+        let keys = |n: usize| serde_json::json!({"AccessKeyMetadata": (0..n).map(|i| serde_json::json!({"UserName": "ai-env-deployer", "Status": "Active", "N": i})).collect::<Vec<_>>()}).to_string();
+        assert_eq!(text(&row_deployer(&with, None)), (Tag::Ok, "deployer user/ai-env-deployer (stack output; its key is in Strongbox only)".into()));
+        assert_eq!(text(&row_deployer(&with, Some(Ok(&keys(1))))), (Tag::Ok, "deployer user/ai-env-deployer: 1 access key (in Strongbox only)".into()));
+        assert_eq!(text(&row_deployer(&with, Some(Ok(&keys(0))))), (Tag::No, "deployer user/ai-env-deployer has no access key  <- ai-env as root -- make operator-keys".into()));
+        assert_eq!(
+            text(&row_deployer(&with, Some(Ok(&keys(2))))),
+            (Tag::Warn, "deployer user/ai-env-deployer has 2 access keys (one left from a rotation?)  <- delete the one not in Strongbox: ai-env as deployer -- aws iam list-access-keys --user-name ai-env-deployer --region eu-central-1".into())
+        );
+        let gone = "An error occurred (NoSuchEntity) when calling the ListAccessKeys operation: The user with name ai-env-deployer cannot be found.";
+        assert_eq!(text(&row_deployer(&with, Some(Err(gone)))), (Tag::No, "deployer user/ai-env-deployer does not exist, though state/infra.toml names it  <- make infra-status WRITE=1".into()));
+        assert_eq!(text(&row_deployer(&with, Some(Err("aws: timed out after 15s")))), (Tag::Warn, "deployer: iam list-access-keys failed: aws: timed out after 15s".into()));
+        assert_eq!(text(&row_deployer(&ok(active_state()), None)), (Tag::Skip, "deployer: none recorded in state/infra.toml  <- the bootstrap deploy, then make infra-status WRITE=1".into()));
+        assert_eq!(text(&row_deployer(&Ok(None), None)).0, Tag::Skip);
+        assert!(text(&row_deployer(&unreadable(), None)).1.starts_with("deployer: not checked (state/infra.toml unreadable: "));
+        assert_eq!(crate::commands::doctor_exit_code(&[row_deployer(&with, Some(Ok(&keys(2))))], false), 0, "a warning, not a failure");
+    }
+
+    /// The account root's access keys, from `get-account-summary` under an
+    /// identity: any key, deactivated too, warns until it is deleted.
+    #[test]
+    fn row_root_access_keys_counts_and_failures() {
+        let summary = |n: u64| format!("{{\"SummaryMap\": {{\"AccountAccessKeysPresent\": {n}, \"AccountMFAEnabled\": 1, \"Users\": 3}}}}");
+        assert_eq!(text(&row_root_access_keys(Some(Ok(&summary(0))))), (Tag::Ok, "the account root has no access key".into()));
+        assert_eq!(
+            text(&row_root_access_keys(Some(Ok(&summary(1))))),
+            (Tag::Warn, "the account root has an access key (AccountAccessKeysPresent=1, active or deactivated)  <- delete it once ai-env-deployer works (IAM console, Security credentials)".into())
+        );
+        assert!(text(&row_root_access_keys(Some(Ok(&summary(2))))).1.contains("AccountAccessKeysPresent=2"));
+        assert_eq!(text(&row_root_access_keys(Some(Err("AccessDenied")))), (Tag::Skip, "the account root's access keys: not checked (AccessDenied)".into()));
+        assert_eq!(text(&row_root_access_keys(None)), (Tag::Skip, "the account root's access keys: not checked (no operator identity: ai-env as ops -- ai-env doctor)".into()));
+        assert_eq!(text(&row_root_access_keys(Some(Ok("{}")))).0, Tag::Skip);
     }
 
     #[test]

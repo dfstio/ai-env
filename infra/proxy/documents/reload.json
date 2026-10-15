@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "2.2",
+  "description": "ai-env egress proxy: ai-env-proxy-reload (apply the SSM parameters; if-changed: only when they changed since the last apply)",
+  "parameters": {
+    "mode": {
+      "type": "String",
+      "description": "apply or if-changed",
+      "allowedValues": ["apply", "if-changed"],
+      "default": "apply"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "reload",
+      "inputs": {
+        "timeoutSeconds": "1500",
+        "runCommand": [
+          "case '{{ mode }}' in",
+          "  apply) exec /usr/local/sbin/ai-env-proxy-reload ;;",
+          "  if-changed) exec /usr/local/sbin/ai-env-proxy-reload --if-changed ;;",
+          "  *) echo 'ai-env-proxy-reload: unknown mode; nothing changed' >&2; exit 1 ;;",
+          "esac"
+        ]
+      }
+    }
+  ]
+}

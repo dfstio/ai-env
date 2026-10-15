@@ -2614,9 +2614,12 @@ impl Drop for ApiHostSuspended {
 /// mid-session (`egress suspend`, lifted on every path), a turn ends by the
 /// CLI's own retries within the budget, as an error result while the session
 /// lives on (nothing was refused: never exit 5 or `credential_rejected`).
-/// With AI_ENV_AWS_SLOW=1 too (about four minutes; one Touch ID).
+/// With AI_ENV_AWS_SLOW=1 too (about four minutes; three Touch IDs: the
+/// chat's, then the ops key's for the suspension and again for its restore,
+/// each `egress suspend` its own process; under `ai-env as ops` or
+/// `ai-env as deployer` the chat's alone).
 #[test]
-#[ignore = "live, about four minutes, denies api.anthropic.com on the proxy meanwhile (one Touch ID): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws CRED=1 SLOW=1"]
+#[ignore = "live, about four minutes, denies api.anthropic.com on the proxy meanwhile (three Touch IDs: the chat's, the ops key's for the suspension and for its restore; the chat's alone under ai-env as ops or as deployer): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws CRED=1 SLOW=1"]
 fn live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget() {
     const TEST: &str = "live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget";
     if !cred_live() {

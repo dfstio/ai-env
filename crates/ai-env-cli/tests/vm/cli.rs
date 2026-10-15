@@ -69,6 +69,7 @@ impl World {
             .env("AI_ENV_DIR", self.root().join("keys"))
             .env_remove("AI_ENV_BRIDGE_CONFIG")
             .env_remove("AI_ENV_BRIDGE_TRACE")
+            .env_remove("AI_ENV_BRIDGE_AS")
             .env_remove("RUST_LOG")
             .stdin(Stdio::null());
         for (k, _) in std::env::vars_os() {

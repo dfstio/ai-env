@@ -23,7 +23,13 @@
 //! than the pinned one, a `connectorArn` that is not a customer network
 //! connector in it and a `proxyPrivateIp` outside RFC 1918 are refused
 //! before anything is read live or written, and the stack is read without
-//! `--show-secrets` (no passphrase needed, none printed).
+//! `--show-secrets` (no passphrase needed, none printed). S8 operators: an
+//! operator user's output must be that user of the stack's account, a proxy
+//! document's the name this ai-env sends ([`check_identities`]); the live
+//! reads run as the operator identity (`bridge::identity`: `ai-env as …`,
+//! else `credentials/ops.env`), and without one (or with one refused) they
+//! are skipped and recorded as failed, never made on the shell's own
+//! credentials; a dismissed Touch ID cancels the command (exit 3).
 //!
 //! `base-image` is the preflight for the pinned managed base image version
 //! (AVAILABLE or exit 1); `versions-diff` compares two
@@ -31,9 +37,11 @@
 //! the `image-version-delete` probe: whether the update handler, which holds
 //! `lambda:DeleteMicrovmImageVersion`, removed any earlier version.
 use crate::bridge::audit::{self, AuditRow};
-use crate::bridge::awscli::{arn_account, aws_json};
+use crate::bridge::awscli::{arn_account, aws_json, operator_capture};
 use crate::bridge::config::{is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, Paths, REGION};
 use crate::bridge::doctor::run_capture_cmd;
+use crate::bridge::egress::{PATCH_DOCUMENT, RELOAD_DOCUMENT, STATUS_DOCUMENT};
+use crate::bridge::identity::{self, DEPLOYER_USER, OPS_USER};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::logging::open_log_file;
 use crate::bridge::probes::{append_row, Expectation, ProbeRow};
@@ -154,6 +162,30 @@ pub struct StackOutputs {
     pub squid_conf_sha256: Option<String>,
     #[serde(default, deserialize_with = "scalar")]
     pub allow_sha256: Option<String>,
+    // S8 operators (infra/index.ts): the operator users, the stack's policies they hold and the proxy's SSM
+    // documents, names and ARNs only. A stack without `deployerUserName` has no deployer yet (the bootstrap).
+    #[serde(default, deserialize_with = "scalar")]
+    pub deployer_user_name: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub deployer_user_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub ops_user_name: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub ops_user_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub deployer_policy_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub ops_policy_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub deploy_egress_policy_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub deploy_dns_policy_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_reload_document: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_status_document: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_patch_document: Option<String>,
 }
 
 /// What to do when the outputs lack the two keys every successful deploy
@@ -218,6 +250,29 @@ pub fn check_egress(o: &StackOutputs) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The S8 operators pins, applied with [`check_egress`] before anything is
+/// read live or written: a `deployerUserArn` or `opsUserArn` must be
+/// `arn:aws:iam::<the stack's account>:user/ai-env-deployer` (or
+/// `ai-env-ops`), the stack's account being `accountId`'s, else `imageArn`'s;
+/// a proxy document output must be the name this ai-env sends. Absent
+/// outputs pass (a stack before the bootstrap).
+pub fn check_identities(o: &StackOutputs) -> std::result::Result<(), String> {
+    let account = o.account_id.as_deref().or_else(|| arn_account(&o.image_arn)).unwrap_or_default();
+    for (key, arn, user) in [("deployerUserArn", o.deployer_user_arn.as_deref(), DEPLOYER_USER), ("opsUserArn", o.ops_user_arn.as_deref(), OPS_USER)] {
+        let want = format!("arn:aws:iam::{account}:user/{user}");
+        if let Some(arn) = arn.filter(|arn| *arn != want) {
+            return Err(format!("stack output {key} {arn:?} is not {want} (the stack's account, the user's name); nothing written"));
+        }
+    }
+    let documents = [("proxyReloadDocument", o.proxy_reload_document.as_deref(), RELOAD_DOCUMENT), ("proxyStatusDocument", o.proxy_status_document.as_deref(), STATUS_DOCUMENT), ("proxyPatchDocument", o.proxy_patch_document.as_deref(), PATCH_DOCUMENT)];
+    for (key, name, want) in documents {
+        if let Some(name) = name.filter(|name| *name != want) {
+            return Err(format!("stack output {key} {name:?} is not {want}, the document this ai-env sends: update ai-env; nothing written"));
+        }
+    }
+    Ok(())
+}
+
 /// The `[aws]` entries the outputs supply, in the order they are written
 /// (§8): `region`, `image_arn`, then `execution_role_arn`,
 /// `egress_connector_arn` (`connectorArn`), `proxy_private_ip`
@@ -255,17 +310,17 @@ pub fn parse_live_image(json: &str) -> std::result::Result<LiveImage, String> {
 }
 
 /// `aws lambda-microvms get-microvm-image` of `arn`: read-only, pinned to
-/// [`REGION`], no pager, without the OAuth token.
-fn live_image_cmd(arn: &str) -> Command {
-    let mut cmd = Command::new("aws");
-    cmd.args(["lambda-microvms", "get-microvm-image", "--image-identifier", arn, "--region", REGION, "--output", "json"]).env_remove("CLAUDE_CODE_OAUTH_TOKEN").env("AWS_PAGER", "");
-    cmd
+/// [`REGION`] (`awscli::operator_program`: no pager, without the OAuth
+/// token, as the operator identity).
+fn live_image_args(arn: &str) -> [&str; 8] {
+    ["lambda-microvms", "get-microvm-image", "--image-identifier", arn, "--region", REGION, "--output", "json"]
 }
 
 /// The live image state of `arn`; `Err` names why it could not be read
-/// (the aws error's first line, a timeout, a missing CLI, a bad response).
+/// (the aws error's first line, a timeout, a missing CLI, a bad response, no
+/// operator identity).
 pub(crate) fn read_live_image(arn: &str) -> std::result::Result<LiveImage, String> {
-    run_capture_cmd(live_image_cmd(arn), None, CALL_TIMEOUT).and_then(|json| parse_live_image(&json))
+    operator_capture(&live_image_args(arn), CALL_TIMEOUT).and_then(|json| parse_live_image(&json))
 }
 
 /// One version of `aws lambda-microvms list-microvm-image-versions` (the
@@ -296,12 +351,11 @@ pub fn parse_live_image_versions(json: &str) -> std::result::Result<Vec<LiveImag
 }
 
 /// The live versions of `arn` (`aws lambda-microvms
-/// list-microvm-image-versions`, read-only, pinned to [`REGION`], no pager,
-/// without the OAuth token, as [`read_live_image`]).
+/// list-microvm-image-versions`, read-only, pinned to [`REGION`], as the
+/// operator, as [`read_live_image`]).
 pub(crate) fn read_live_image_versions(arn: &str) -> std::result::Result<Vec<LiveImageVersion>, String> {
-    let mut cmd = Command::new("aws");
-    cmd.args(["lambda-microvms", "list-microvm-image-versions", "--image-identifier", arn, "--region", REGION, "--output", "json"]).env_remove("CLAUDE_CODE_OAUTH_TOKEN").env("AWS_PAGER", "");
-    run_capture_cmd(cmd, None, CALL_TIMEOUT).and_then(|json| parse_live_image_versions(&json))
+    let args = ["lambda-microvms", "list-microvm-image-versions", "--image-identifier", arn, "--region", REGION, "--output", "json"];
+    operator_capture(&args, CALL_TIMEOUT).and_then(|json| parse_live_image_versions(&json))
 }
 
 /// The six `[aws]` keys `status` may write (the ones the outputs can
@@ -476,6 +530,29 @@ pub struct InfraState {
     pub squid_conf_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_sha256: Option<String>,
+    // S8 operators: the operator users, their policies and the proxy's SSM documents (the outputs above).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer_user_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer_user_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops_user_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops_user_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer_policy_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops_policy_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy_egress_policy_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy_dns_policy_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_reload_document: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_status_document: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_patch_document: Option<String>,
     /// The connector's Id, from the live read (the echo gate accepts the Id
     /// form only when `connector_arn` equals `[aws].egress_connector_arn`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -532,6 +609,17 @@ impl InfraState {
             parameter_prefix: o.parameter_prefix.clone(),
             squid_conf_sha256: o.squid_conf_sha256.clone(),
             allow_sha256: o.allow_sha256.clone(),
+            deployer_user_name: o.deployer_user_name.clone(),
+            deployer_user_arn: o.deployer_user_arn.clone(),
+            ops_user_name: o.ops_user_name.clone(),
+            ops_user_arn: o.ops_user_arn.clone(),
+            deployer_policy_arn: o.deployer_policy_arn.clone(),
+            ops_policy_arn: o.ops_policy_arn.clone(),
+            deploy_egress_policy_arn: o.deploy_egress_policy_arn.clone(),
+            deploy_dns_policy_arn: o.deploy_dns_policy_arn.clone(),
+            proxy_reload_document: o.proxy_reload_document.clone(),
+            proxy_status_document: o.proxy_status_document.clone(),
+            proxy_patch_document: o.proxy_patch_document.clone(),
             connector_id: None,
             connector_state: None,
             connector_state_source: None,
@@ -1190,6 +1278,7 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
     let outputs = parse_outputs(&json).map_err(|e| CliError::Aws(format!("stack {stack}: {e}")))?;
     check_region(&outputs).map_err(CliError::Aws)?;
     check_egress(&outputs).map_err(CliError::Aws)?;
+    check_identities(&outputs).map_err(CliError::Aws)?;
     let entries = aws_entries(&outputs);
 
     let paths = Paths::resolve()?;
@@ -1221,8 +1310,28 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
     let changed: Vec<&str> = entries.iter().filter(|(k, v)| current.get(*k) != Some(v)).map(|(k, _)| *k).collect();
 
     // The live reads (after every refusal above): the image fields of the
-    // outputs are those of the last successful `pulumi up`.
-    let live = read_live_image(&outputs.image_arn);
+    // outputs are those of the last successful `pulumi up`. S8 operators: they
+    // run as the operator identity, resolved first (one Touch ID without a
+    // runner); without one, or with one refused, they are recorded as failed,
+    // never a reason not to write. A dismissed Touch ID is the operator's
+    // cancel, as in every operator command: nothing is written (exit 3).
+    let operator = match identity::operator() {
+        Ok(_) => Ok(()),
+        Err(CliError::Cancelled) => return Err(CliError::Cancelled),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &operator {
+        if matches!(e, CliError::AuthUnavailable(m) if m == identity::NO_OPERATOR) {
+            crate::bridge::voice::note("no AWS operator identity: the live reads are skipped (ai-env as ops -- make infra-status)");
+        } else {
+            crate::bridge::voice::note(&format!("the live reads are skipped: {e}"));
+        }
+    }
+    let operator = operator.map_err(|e| e.to_string());
+    let live = match &operator {
+        Ok(()) => read_live_image(&outputs.image_arn),
+        Err(e) => Err(e.clone()),
+    };
     let now = rfc3339_utc(unix_now());
     let mut state = InfraState::from_outputs(&outputs, stack, now.clone());
     let live_note = match &live {
@@ -1233,7 +1342,10 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
     // S5: the connector's Id and state exist only live (the outputs carry
     // neither); a failed read is recorded, never a reason not to write.
     let connector_note = outputs.connector_arn.as_deref().map(|arn| {
-        let live = read_live_connector(arn);
+        let live = match &operator {
+            Ok(()) => read_live_connector(arn),
+            Err(e) => Err(e.clone()),
+        };
         let note = match &live {
             Ok(l) => format!("{} {} (live get-network-connector){}", l.arn, l.state, l.id_refused.as_deref().map(|w| format!("; Id not recorded: {w}")).unwrap_or_default()),
             Err(e) => format!("{arn}, state unknown: the live get-network-connector failed: {e}"),
@@ -1322,13 +1434,16 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
 
 // ---- base image --------------------------------------------------------------------------
 
-/// `aws lambda-microvms list-managed-microvm-image-versions` for the managed
-/// base image `name`, pinned to [`REGION`] (the CLI default is elsewhere).
-fn base_image_cmd(name: &str) -> Command {
-    let mut cmd = Command::new("aws");
-    cmd.args(["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", &format!("arn:aws:lambda:{REGION}:aws:microvm-image:{name}"), "--region", REGION, "--output", "json"])
-        .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
-    cmd
+/// The managed base image `name`'s ARN in [`REGION`].
+fn base_image_identifier(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:aws:microvm-image:{name}")
+}
+
+/// `aws lambda-microvms list-managed-microvm-image-versions` of the managed
+/// base image `identifier`, pinned to [`REGION`] (the CLI default is
+/// elsewhere), as the operator identity.
+fn base_image_args(identifier: &str) -> [&str; 8] {
+    ["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", identifier, "--region", REGION, "--output", "json"]
 }
 
 /// The `items` of a list-versions response (a bare array is accepted too;
@@ -1393,7 +1508,12 @@ pub fn cmd_base_image(name: &str, version: &str, json_in: Option<&Path>) -> Resu
     }
     let json = match json_in {
         Some(p) => read_input(p)?,
-        None => run_capture_cmd(base_image_cmd(name), None, CALL_TIMEOUT).map_err(|e| CliError::Aws(format!("list-managed-microvm-image-versions {name}: {e}")))?,
+        None => {
+            // S8 operators: as the operator identity, resolved first; its refusals keep their class.
+            identity::operator().map_err(|e| identity::labelled("infra base-image", e))?;
+            let identifier = base_image_identifier(name);
+            operator_capture(&base_image_args(&identifier), CALL_TIMEOUT).map_err(|e| CliError::Aws(format!("list-managed-microvm-image-versions {name}: {e}")))?
+        }
     };
     match base_image_verdict(&json, version) {
         Ok(line) => {
@@ -1817,6 +1937,64 @@ mod tests {
         assert!(read_infra_state(&paths).is_err());
     }
 
+    /// S8 operators: the eleven operator outputs land in the state field of
+    /// their name, each its own (distinct values catch a swapped pair), and
+    /// survive the file; an S5 stack's outputs leave them absent, as does an
+    /// empty value.
+    #[test]
+    fn the_operator_outputs_map_to_their_state_fields() {
+        let outputs = [
+            ("deployerUserName", "ai-env-deployer"),
+            ("deployerUserArn", "arn:aws:iam::123456789012:user/ai-env-deployer"),
+            ("opsUserName", "ai-env-ops"),
+            ("opsUserArn", "arn:aws:iam::123456789012:user/ai-env-ops"),
+            ("deployerPolicyArn", "arn:aws:iam::123456789012:policy/ai-env-deployer"),
+            ("opsPolicyArn", "arn:aws:iam::123456789012:policy/ai-env-ops"),
+            ("deployEgressPolicyArn", "arn:aws:iam::123456789012:policy/ai-env-deploy-egress"),
+            ("deployDnsPolicyArn", "arn:aws:iam::123456789012:policy/ai-env-deploy-dns"),
+            ("proxyReloadDocument", "ai-env-proxy-reload"),
+            ("proxyStatusDocument", "ai-env-proxy-status"),
+            ("proxyPatchDocument", "ai-env-proxy-patch"),
+        ];
+        let mut j = outputs_json();
+        for (k, v) in outputs {
+            j[k] = serde_json::json!(v);
+        }
+        let o = parse_outputs(&j.to_string()).unwrap();
+        let s = InfraState::from_outputs(&o, "dev", "2026-10-14T10:00:00Z".into());
+        let fields = |s: &InfraState| {
+            [
+                ("deployer_user_name", s.deployer_user_name.clone()),
+                ("deployer_user_arn", s.deployer_user_arn.clone()),
+                ("ops_user_name", s.ops_user_name.clone()),
+                ("ops_user_arn", s.ops_user_arn.clone()),
+                ("deployer_policy_arn", s.deployer_policy_arn.clone()),
+                ("ops_policy_arn", s.ops_policy_arn.clone()),
+                ("deploy_egress_policy_arn", s.deploy_egress_policy_arn.clone()),
+                ("deploy_dns_policy_arn", s.deploy_dns_policy_arn.clone()),
+                ("proxy_reload_document", s.proxy_reload_document.clone()),
+                ("proxy_status_document", s.proxy_status_document.clone()),
+                ("proxy_patch_document", s.proxy_patch_document.clone()),
+            ]
+        };
+        for ((output, value), (field, got)) in outputs.iter().zip(fields(&s)) {
+            assert_eq!(got.as_deref(), Some(*value), "{output} -> {field}");
+        }
+        let text = s.render().unwrap();
+        for ((_, value), (field, _)) in outputs.iter().zip(fields(&s)) {
+            assert!(text.contains(&format!("\n{field} = \"{value}\"\n")), "{field} in state/infra.toml: {text}");
+        }
+        assert_eq!(toml::from_str::<InfraState>(&text).unwrap(), s, "the file reads back as written");
+        // An S5 stack exports none of them: none is written.
+        let s5 = InfraState::from_outputs(&parse_outputs(&outputs_json().to_string()).unwrap(), "dev", "2026-10-14T10:00:00Z".into());
+        assert!(fields(&s5).iter().all(|(_, v)| v.is_none()), "{s5:?}");
+        let text = s5.render().unwrap();
+        assert!(fields(&s5).iter().all(|(f, _)| !text.contains(f)), "{text}");
+        // An empty output reads as absent, as every other.
+        j["deployerUserName"] = serde_json::json!("");
+        assert_eq!(parse_outputs(&j.to_string()).unwrap().deployer_user_name, None);
+    }
+
     #[test]
     fn the_live_image_state_overlays_the_outputs_and_names_its_source() {
         let live = parse_live_image(&serde_json::json!({"imageArn": ARN, "imageName": "ai-env-agent", "state": "UPDATED", "latestActiveImageVersion": 3, "latestFailedImageVersion": null, "extra": {"x": [1]}}).to_string()).unwrap();
@@ -1944,6 +2122,41 @@ mod tests {
             check_egress(&with("proxyPrivateIp", good)).unwrap();
         }
         check_egress(&parse_outputs(&outputs_json().to_string()).unwrap()).unwrap();
+    }
+
+    /// S8 operators: an operator user output must be that user of the
+    /// stack's account (`accountId`, else the image's), a document output
+    /// the name this ai-env sends; absent outputs pass (before the bootstrap).
+    #[test]
+    fn check_identities_refuses_another_accounts_user_and_another_document() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut j = s5_outputs_json();
+            for (k, v) in pairs {
+                j[*k] = serde_json::json!(v);
+            }
+            parse_outputs(&j.to_string()).unwrap()
+        };
+        let users = [("deployerUserArn", "arn:aws:iam::123456789012:user/ai-env-deployer"), ("opsUserArn", "arn:aws:iam::123456789012:user/ai-env-ops")];
+        let documents = [("proxyReloadDocument", "ai-env-proxy-reload"), ("proxyStatusDocument", "ai-env-proxy-status"), ("proxyPatchDocument", "ai-env-proxy-patch")];
+        check_identities(&with(&[])).unwrap();
+        check_identities(&with(&[users.as_slice(), documents.as_slice()].concat())).unwrap();
+        for (key, bad, want) in [
+            ("deployerUserArn", "arn:aws:iam::999999999999:user/ai-env-deployer", "arn:aws:iam::123456789012:user/ai-env-deployer"),
+            ("deployerUserArn", "arn:aws:iam::123456789012:user/ai-env-ops", "arn:aws:iam::123456789012:user/ai-env-deployer"),
+            ("opsUserArn", "arn:aws:iam::123456789012:user/team/ai-env-ops", "arn:aws:iam::123456789012:user/ai-env-ops"),
+            ("opsUserArn", "arn:aws:iam::123456789012:root", "arn:aws:iam::123456789012:user/ai-env-ops"),
+        ] {
+            assert_eq!(check_identities(&with(&[(key, bad)])).unwrap_err(), format!("stack output {key} {bad:?} is not {want} (the stack's account, the user's name); nothing written"));
+        }
+        let e = check_identities(&with(&[("proxyStatusDocument", "AWS-RunShellScript")])).unwrap_err();
+        assert_eq!(e, "stack output proxyStatusDocument \"AWS-RunShellScript\" is not ai-env-proxy-status, the document this ai-env sends: update ai-env; nothing written");
+        // Without accountId the image's account is the stack's.
+        let mut j = s5_outputs_json();
+        j.as_object_mut().unwrap().remove("accountId");
+        j["opsUserArn"] = serde_json::json!("arn:aws:iam::123456789012:user/ai-env-ops");
+        check_identities(&parse_outputs(&j.to_string()).unwrap()).unwrap();
+        j["imageArn"] = serde_json::json!("arn:aws:lambda:eu-central-1:999999999999:microvm-image:ai-env-agent");
+        assert!(check_identities(&parse_outputs(&j.to_string()).unwrap()).unwrap_err().contains("is not arn:aws:iam::999999999999:user/ai-env-ops"));
     }
 
     fn golden_connector() -> serde_json::Value {
@@ -2103,9 +2316,9 @@ mod tests {
         let p = pulumi_outputs_cmd("dev", Path::new("infra"));
         assert_eq!(args(&p), ["stack", "output", "--json", "--stack", "dev", "--cwd", "infra"]);
         assert!(!args(&p).iter().any(|a| a.contains("secret")));
-        let a = base_image_cmd("al2023-1");
+        let a = crate::bridge::awscli::program_cmd(&base_image_args(&base_image_identifier("al2023-1")));
         assert_eq!(args(&a), ["lambda-microvms", "list-managed-microvm-image-versions", "--image-identifier", "arn:aws:lambda:eu-central-1:aws:microvm-image:al2023-1", "--region", "eu-central-1", "--output", "json"]);
-        let l = live_image_cmd(ARN);
+        let l = crate::bridge::awscli::program_cmd(&live_image_args(ARN));
         assert_eq!(args(&l), ["lambda-microvms", "get-microvm-image", "--image-identifier", ARN, "--region", "eu-central-1", "--output", "json"]);
         assert!(l.get_envs().any(|(k, v)| k == "CLAUDE_CODE_OAUTH_TOKEN" && v.is_none()), "no OAuth token for aws");
         let c = crate::bridge::awscli::aws_cmd("lambda-core", &live_connector_args(CONNECTOR)).unwrap();

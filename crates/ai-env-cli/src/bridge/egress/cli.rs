@@ -8,7 +8,9 @@
 //! Every command but `egress env` loads `bridge.toml` (the S5 keys
 //! validated) and `state/infra.toml`, then checks, before its first other
 //! aws call, that the CLI's credentials belong to the account of
-//! `[aws].egress_connector_arn` (exit 1 otherwise). No Touch ID, no SDK.
+//! `[aws].egress_connector_arn` (exit 1 otherwise). No SDK. The operator is
+//! `bridge::identity`'s: the key of the `ai-env as` runner, else the sealed
+//! ops key (one Touch ID per process), never the shell's own AWS settings.
 //!
 //! - `egress status`: one row per check (ok | DRIFT | unknown) of the
 //!   connector, its ENIs, the VM subnet's effective route table and network
@@ -40,7 +42,7 @@
 //! - A proxy id that is terminated or unknown to EC2 (the stack replaces the
 //!   instance on any user-data change) means `state/infra.toml` is stale:
 //!   every command says so and names `make infra-status WRITE=1`.
-use super::ops::{self, arr, text, Invocation, Param, Wait, PATCH_EXEC_S, RELOAD, RELOAD_EXEC_S, STATUS_EXEC_S};
+use super::ops::{self, arr, text, Invocation, Param, ProxyDoc, Wait};
 use super::{
     effective_hosts, fits_parameter, is_aws_service_host, is_valid_slug, normalize_connector, normalize_host, param_name, parse_extras, parse_hosts, parse_reload_status, proxy_env, render_extras, render_suspended, value_sha256, Extra,
     PARAMETER_PREFIX, PARAMS, PARAM_MAX_BYTES, PROXY_PORT, RESOLVERS,
@@ -56,6 +58,8 @@ use crate::cli::{EgressCmd, ProxyCmd};
 use crate::errors::{CliError, Result};
 use crate::outln;
 use crate::store::Keystore;
+use super::{PATCH_DOCUMENT, RELOAD_DOCUMENT, STATUS_DOCUMENT};
+use crate::bridge::identity::{self, labelled, Operator, Role};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -159,9 +163,19 @@ impl Ctx {
         }
     }
 
-    /// The operator-account check, before any other aws call (exit 1).
+    /// The proxy documents `state/infra.toml` names are the ones this ai-env
+    /// sends ([`check_documents_of`]), before the identity is resolved.
+    fn check_documents(&self) -> Result<()> {
+        check_documents_of(&self.paths, &self.state)
+    }
+
+    /// The operator identity (S8 operators: the runner's key, else
+    /// `credentials/ops.env` and its one Touch ID, else exit 5), then its
+    /// account check, before any other aws call: the identity's refusals keep
+    /// their class, another account is exit 1.
     fn operator(&self, what: &str) -> Result<()> {
-        require_operator_account(&self.connector).map(|_| ()).map_err(|e| CliError::Msg(format!("{what}: {e}")))
+        identity::operator().map_err(|e| labelled(what, e))?;
+        require_operator_account(&self.connector).map(|_| ()).map_err(|e| labelled(what, e))
     }
 
     fn wait(&self, w: Wait) -> Wait {
@@ -172,6 +186,49 @@ impl Ctx {
     fn state_dir(&self) -> PathBuf {
         self.paths.egress_lock().parent().map_or_else(|| self.paths.root.join("state"), std::path::Path::to_path_buf)
     }
+}
+
+/// The proxy documents (S8 operators): when `state` (`state/infra.toml` at
+/// `paths`) names any of the three, each one named must be the document this
+/// ai-env sends, else exit 1 naming both sets (an absent one shows as `-`);
+/// absent names pass (a post-deploy reload runs before the state is
+/// refreshed). Document names never come from `bridge.toml`.
+pub(crate) fn check_documents_of(paths: &Paths, state: &InfraState) -> Result<()> {
+    let named = [state.proxy_reload_document.as_deref(), state.proxy_status_document.as_deref(), state.proxy_patch_document.as_deref()];
+    let sent = [RELOAD_DOCUMENT, STATUS_DOCUMENT, PATCH_DOCUMENT];
+    if named.iter().zip(sent).all(|(name, want)| name.is_none_or(|n| n == want)) {
+        return Ok(());
+    }
+    let shown: Vec<&str> = named.iter().map(|n| n.unwrap_or("-")).collect();
+    Err(CliError::Msg(format!(
+        "{} names the proxy documents {}; this ai-env sends {}: update ai-env, or make infra-status WRITE=1",
+        paths.infra_state().display(),
+        shown.join(", "),
+        sent.join(", ")
+    )))
+}
+
+/// Whether `egress allow` (add or `--remove`) is refused before any unseal or
+/// AWS call (S8 operators, O3): `extras` widens what every vpc VM may reach
+/// and only ai-env-deployer writes it, so no marker (the resolver would pick
+/// `credentials/ops.env`) or a valid `ops:` marker is refused; the deployer,
+/// root and ambient markers pass (IAM decides for them), and a marker the
+/// resolver refuses is left to its own refusal.
+fn allow_refused(declared: Option<&std::result::Result<Operator, String>>) -> bool {
+    match declared {
+        None => true,
+        Some(Ok(op)) => op.role() == Some(Role::Ops),
+        Some(Err(_)) => false,
+    }
+}
+
+/// The text of [`allow_refused`] (exit 9): the command to run instead, as is.
+fn allow_refusal(slug: &str, host: &str, remove: bool) -> String {
+    let (what, flag) = if remove { ("egress allow --remove", " --remove") } else { ("egress allow", "") };
+    format!(
+        "{what}: {} widens what every vpc VM may reach and only ai-env-deployer writes it: run ai-env as deployer -- ai-env egress allow {slug} {host}{flag} (ai-env egress suspend {host} stops serving a host as ai-env-ops)",
+        param_name("extras")
+    )
 }
 
 /// `prefix` followed by 8 or 17 lowercase hex digits (`i-0123456789abcdef0`).
@@ -332,8 +389,9 @@ fn fail_closed_line(reload: &Reload, still_allowed: bool) {
     }
 }
 
-/// `ai-env-proxy-reload [--if-changed]` on the proxy through SSM when the
-/// instance runs (its `--status` is a command of its own: [`status_line`]).
+/// `ai-env-proxy-reload [--if-changed]` on the proxy through SSM (the
+/// reload document, `ProxyDoc::Reload`) when the instance runs (its
+/// `--status` is a command of its own: [`status_line`]).
 /// `deny`: the change must stop a host being served, so a `stopping` proxy
 /// (still serving) is a failure, not a stop.
 fn reload_proxy(ctx: &Ctx, instance: &str, if_changed: bool, comment: &str, deny: bool) -> Reload {
@@ -348,8 +406,7 @@ fn reload_proxy(ctx: &Ctx, instance: &str, if_changed: bool, comment: &str, deny
         "stopping" if !deny => return Reload::Stopped(state),
         other => return Reload::Failed(format!("the proxy {instance} is {other}: not reloaded (`ai-env egress reload` once it runs or has stopped)")),
     }
-    let cmd = format!("{RELOAD}{}", if if_changed { " --if-changed" } else { "" });
-    let inv = match ops::run_shell(instance, &[&cmd], comment, RELOAD_EXEC_S, ctx.wait(Wait::RELOAD)) {
+    let inv = match ops::run_document(instance, ProxyDoc::Reload { if_changed }, comment, ctx.wait(Wait::RELOAD)) {
         Ok(inv) => inv,
         Err(e) => return Reload::Failed(e),
     };
@@ -588,8 +645,12 @@ fn allow(slug: &str, host: &str, remove: bool) -> Result<()> {
     }
     let ctx = Ctx::load()?;
     ctx.check_prefix()?;
+    ctx.check_documents()?;
     let instance = ctx.instance()?;
     let what = if remove { "egress allow --remove" } else { "egress allow" };
+    if allow_refused(identity::declared().as_ref()) {
+        return Err(CliError::Policy(allow_refusal(slug, &host, remove)));
+    }
     ctx.operator(what)?;
     locked(&ctx.paths, || {
         let l = read_lists(what)?;
@@ -627,6 +688,7 @@ fn suspend(host: &str, restore: bool) -> Result<()> {
     let host = normalize_host(host).map_err(|e| CliError::Usage(format!("egress suspend: {e}")))?;
     let ctx = Ctx::load()?;
     ctx.check_prefix()?;
+    ctx.check_documents()?;
     let instance = ctx.instance()?;
     let what = if restore { "egress suspend --restore" } else { "egress suspend" };
     ctx.operator(what)?;
@@ -652,6 +714,7 @@ fn suspend(host: &str, restore: bool) -> Result<()> {
 
 fn reload(if_changed: bool) -> Result<()> {
     let ctx = Ctx::load()?;
+    ctx.check_documents()?;
     let instance = ctx.instance()?;
     ctx.operator("egress reload")?;
     locked(&ctx.paths, || {
@@ -783,10 +846,12 @@ fn wait_online(instance: &str, wait: Wait) -> std::result::Result<(), String> {
 /// A `--status` line and its pairs.
 type StatusLine = (String, BTreeMap<String, String>);
 
-/// One `ai-env-proxy-reload --status` run: its line and pairs, `None` when
-/// it printed none (it could not fetch the parameters).
+/// One run of the status document (`rpm -q squid`, then
+/// `ai-env-proxy-reload --status`): the `--status` line (the last `squid=`
+/// line) and its pairs, `None` when it printed none (it could not fetch the
+/// parameters).
 fn status_line(ctx: &Ctx, instance: &str, comment: &str) -> std::result::Result<Option<StatusLine>, String> {
-    let inv = ops::run_shell(instance, &[&format!("{RELOAD} --status")], comment, STATUS_EXEC_S, ctx.wait(Wait::STATUS))?;
+    let inv = ops::run_document(instance, ProxyDoc::Status, comment, ctx.wait(Wait::STATUS))?;
     let Some(line) = split_status_output(&inv.stdout).1 else { return Ok(None) };
     let pairs = parse_reload_status(line)?;
     Ok(Some((line.to_string(), pairs)))
@@ -821,6 +886,7 @@ fn wait_serving(ctx: &Ctx, instance: &str, wait: Wait) -> std::result::Result<St
 
 fn proxy_start() -> Result<()> {
     let ctx = Ctx::load()?;
+    ctx.check_documents()?;
     let instance = ctx.instance()?;
     ctx.operator("proxy start")?;
     live_proxy("proxy start", instance)?;
@@ -840,8 +906,9 @@ fn proxy_start() -> Result<()> {
 /// AMI), so `--security` alone sees no newer package: `--releasever=latest`
 /// takes the security updates of the newest release. The release package
 /// and squid are printed before and after; squid restarts only when the
-/// upgrade succeeded.
-const PATCH_SCRIPT: [&str; 5] = [
+/// upgrade succeeded. S8 operators: `infra/proxy/documents/patch.json`'s
+/// `runCommand` is exactly these lines (`the_proxy_documents_are_what_the_cli_sends`).
+pub const PATCH_SCRIPT: [&str; 5] = [
     "set -e",
     r#"echo "before: $(rpm -q system-release) $(rpm -q squid)""#,
     "dnf -y upgrade --security --releasever=latest",
@@ -851,6 +918,7 @@ const PATCH_SCRIPT: [&str; 5] = [
 
 fn proxy_patch() -> Result<()> {
     let ctx = Ctx::load()?;
+    ctx.check_documents()?;
     let instance = ctx.instance()?;
     ctx.operator("proxy patch")?;
     let state = live_proxy("proxy patch", instance)?;
@@ -858,7 +926,7 @@ fn proxy_patch() -> Result<()> {
         return Err(CliError::Aws(format!("proxy patch: the proxy {instance} is {state}: `ai-env proxy start` first")));
     }
     note(&format!("patching {instance} through SSM: dnf -y upgrade --security --releasever=latest, then systemctl restart squid"));
-    let inv: Invocation = ops::run_shell(instance, &PATCH_SCRIPT, "ai-env proxy patch", PATCH_EXEC_S, ctx.wait(Wait::PATCH)).map_err(aws("proxy patch"))?;
+    let inv: Invocation = ops::run_document(instance, ProxyDoc::Patch, "ai-env proxy patch", ctx.wait(Wait::PATCH)).map_err(aws("proxy patch"))?;
     let ok = inv.succeeded();
     audit(&ctx.paths, "proxy_patch", &[("instance", instance.to_string()), ("result", if ok { "ok".to_string() } else { format!("{} exit {}", inv.status, inv.code) })]);
     let marked = |m: &str| inv.stdout.lines().map(str::trim).find_map(|l| l.strip_prefix(m)).map(str::to_string);
@@ -1633,6 +1701,7 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
     let instance = ctx.instance()?;
     let dns_mode = ctx.need("dns_mode", &ctx.state.dns_mode, "")?;
     ctx.check_prefix()?;
+    ctx.check_documents()?;
     // The stack's proxy address: the VM SG and the VM subnet's NACL name it.
     let proxy_addr = ctx.need("proxy_private_ip", &ctx.state.proxy_private_ip, "")?;
     if !is_rfc1918(proxy_addr) {
@@ -1737,7 +1806,7 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
             }
         };
         if online {
-            match ops::run_shell(instance, &["rpm -q squid || true", &format!("{RELOAD} --status")], "ai-env egress status", STATUS_EXEC_S, ctx.wait(Wait::STATUS)) {
+            match ops::run_document(instance, ProxyDoc::Status, "ai-env egress status", ctx.wait(Wait::STATUS)) {
                 Ok(inv) => {
                     let (rpm, line) = split_status_output(&inv.stdout);
                     r.push("squid-rpm", judge_rpm(rpm));
@@ -2202,12 +2271,16 @@ mod tests {
         assert!(l.effective_with("extras", "github.com\n").is_err());
     }
 
+    /// S8 operators: `proxy patch` sends the patch document, whose
+    /// `runCommand` is `PATCH_SCRIPT` (`the_proxy_documents_are_what_the_cli_sends`
+    /// holds infra/proxy/documents/patch.json to it), with no parameter.
     #[test]
     fn the_patch_takes_the_newest_release_and_shows_before_and_after() {
         assert!(PATCH_SCRIPT.contains(&"dnf -y upgrade --security --releasever=latest"));
         let at = |s: &str| PATCH_SCRIPT.iter().position(|c| c.contains(s)).unwrap();
         assert!(PATCH_SCRIPT[0] == "set -e" && at("before:") < at("dnf -y") && at("dnf -y") < at("after:") && at("after:") < at("systemctl restart squid"));
         assert!(PATCH_SCRIPT[at("before:")].contains("rpm -q system-release") && PATCH_SCRIPT[at("after:")].contains("rpm -q squid"));
+        assert_eq!((ProxyDoc::Patch.name(), ProxyDoc::Patch.parameters(), ProxyDoc::Patch.exec_s()), (super::super::PATCH_DOCUMENT, None, ops::PATCH_EXEC_S));
     }
 
     #[test]
@@ -2237,5 +2310,50 @@ mod tests {
         assert_eq!(proxy_ip(&set, Some(&state)), "192.168.1.5");
         let public = InfraState { proxy_private_ip: Some("8.8.8.8".into()), ..InfraState::default() };
         assert_eq!(proxy_ip(&cfg, Some(&public)), PROXY_IP, "never a public address");
+    }
+
+    /// S8 operators: the proxy documents the state names must be the three
+    /// this ai-env sends; an absent name passes (a reload right after a
+    /// deploy, before the state is refreshed) and shows as `-`.
+    #[test]
+    fn the_state_must_name_the_documents_this_ai_env_sends() {
+        let paths = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        let named = |r: Option<&str>, s: Option<&str>, p: Option<&str>| InfraState {
+            proxy_reload_document: r.map(str::to_string),
+            proxy_status_document: s.map(str::to_string),
+            proxy_patch_document: p.map(str::to_string),
+            ..InfraState::default()
+        };
+        for ok in [named(None, None, None), named(Some(RELOAD_DOCUMENT), Some(STATUS_DOCUMENT), Some(PATCH_DOCUMENT)), named(Some(RELOAD_DOCUMENT), None, None), named(None, None, Some(PATCH_DOCUMENT))] {
+            check_documents_of(&paths, &ok).unwrap();
+        }
+        let e = check_documents_of(&paths, &named(Some("ai-env-proxy-reload-v2"), None, Some(PATCH_DOCUMENT))).unwrap_err();
+        assert_eq!(
+            (e.exit_code(), e.to_string()),
+            (1, "/r/state/infra.toml names the proxy documents ai-env-proxy-reload-v2, -, ai-env-proxy-patch; this ai-env sends ai-env-proxy-reload, ai-env-proxy-status, ai-env-proxy-patch: update ai-env, or make infra-status WRITE=1".to_string())
+        );
+        assert!(check_documents_of(&paths, &named(None, Some("AWS-RunShellScript"), None)).is_err());
+    }
+
+    /// S8 operators (O3): `egress allow` is refused to ai-env-ops (its marker,
+    /// or none: the resolver would unseal ops.env) before any unseal or call,
+    /// naming the exact command to run as the deployer; the deployer, root
+    /// and ambient pass, and a marker the resolver refuses keeps its own text.
+    #[test]
+    fn allow_is_refused_to_ai_env_ops_from_the_marker_alone() {
+        let runner = |role| Ok(Operator::Runner { role, tail: "9002".into() });
+        assert!(allow_refused(None), "no marker: the resolver would pick credentials/ops.env");
+        assert!(allow_refused(Some(&runner(Role::Ops))));
+        for passes in [runner(Role::Deployer), Ok(Operator::Ambient { root: true }), Ok(Operator::Ambient { root: false }), Err("AI_ENV_BRIDGE_AS=x is not one ai-env sets".to_string())] {
+            assert!(!allow_refused(Some(&passes)), "{passes:?}");
+        }
+        assert_eq!(
+            allow_refusal("ai-env", "github.com", false),
+            "egress allow: /ai-env/proxy/extras widens what every vpc VM may reach and only ai-env-deployer writes it: run ai-env as deployer -- ai-env egress allow ai-env github.com (ai-env egress suspend github.com stops serving a host as ai-env-ops)"
+        );
+        assert_eq!(
+            allow_refusal("ws.2", "example.com", true),
+            "egress allow --remove: /ai-env/proxy/extras widens what every vpc VM may reach and only ai-env-deployer writes it: run ai-env as deployer -- ai-env egress allow ws.2 example.com --remove (ai-env egress suspend example.com stops serving a host as ai-env-ops)"
+        );
     }
 }

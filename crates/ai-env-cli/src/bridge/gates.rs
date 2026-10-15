@@ -2,10 +2,23 @@
 //! are re-measured on every run; G3 re-inspects the last `make vm-build`
 //! output (it never rebuilds it); G6 checks the plugin and leaves the preview
 //! to a hand record. Manual rows (G4 without a token, G5, G6, G8) and skipped
-//! rows keep whatever the existing `plans/gates.md` records, unless that text
-//! is the tool's own placeholder. GO requires G1–G5 ✓ on a full run;
-//! `--only` never evaluates go/no-go and never writes the file.
+//! rows but G7's keep whatever the existing `plans/gates.md` records (a
+//! skipped row only a record of its own gate, the same id and name), unless
+//! that text is the tool's own placeholder; a skipped G7 (no state or no
+//! identity to simulate as) always shows why. GO requires G1–G5 ✓ on a full
+//! run; `--only` never evaluates go/no-go and never writes the file.
+//!
+//! S8 operators: G2 and G7 run as the operator identity (`bridge::identity`:
+//! `ai-env as …`, else `credentials/ops.env`, one Touch ID), resolved once
+//! before G1 when either runs. G7 is "IAM of the operator identities": eight
+//! `simulate-principal-policy` calls of the stack's users from
+//! `state/infra.toml`, never of the caller, and no sts call of its own, so
+//! its verdict does not depend on who runs it.
+use crate::bridge::awscli::{arn_account, operator_capture};
+use crate::bridge::config::REGION;
 use crate::bridge::doctor::{capture, run_capture};
+use crate::bridge::egress::PARAMETER_PREFIX;
+use crate::bridge::infra::{read_infra_state, InfraState};
 use crate::commands::json_string;
 use crate::errors::{CliError, Result};
 use crate::outln;
@@ -208,13 +221,18 @@ fn g1(repo_root: &Path) -> GateResult {
     )
 }
 
-fn g2() -> GateResult {
+/// G2 as the operator identity (`operator`: its resolution, `Err` the
+/// labelled refusal); the `aws --version` probe stays plain.
+fn g2(operator: Option<&std::result::Result<(), String>>) -> GateResult {
     let t = Duration::from_secs(30);
     if run_capture("aws", &["--version"], Duration::from_secs(5)).is_err() {
         return gate("G2", "region + API", "aws lambda-microvms list-managed-microvm-images", "al2023-1 listed / eu-west-3 403", "aws cli not found".into(), GateStatus::Skipped);
     }
-    let central = run_capture("aws", &["lambda-microvms", "list-managed-microvm-images", "--region", "eu-central-1", "--output", "json"], t);
-    let west = run_capture("aws", &["lambda-microvms", "list-managed-microvm-images", "--region", "eu-west-3", "--output", "json"], t);
+    if let Some(Err(e)) = operator {
+        return gate("G2", "region + API", "aws lambda-microvms list-managed-microvm-images --region eu-central-1 | --region eu-west-3", "al2023-1 listed / 403", e.clone(), GateStatus::Fail);
+    }
+    let central = operator_capture(&["lambda-microvms", "list-managed-microvm-images", "--region", "eu-central-1", "--output", "json"], t);
+    let west = operator_capture(&["lambda-microvms", "list-managed-microvm-images", "--region", "eu-west-3", "--output", "json"], t);
     let central_ok = central.as_ref().is_ok_and(|j| j.contains("al2023-1"));
     let west_403 = west.as_ref().is_err_and(|e| e.contains("403") || e.contains("AccessDenied"));
     let obs = format!(
@@ -395,33 +413,172 @@ fn g6() -> GateResult {
     }
 }
 
-fn g7() -> GateResult {
-    let cmd = "aws iam simulate-principal-policy … iam:CreateUser iam:CreateAccessKey budgets:ModifyBudget";
-    let expected = "recorded either way (denied ⇒ named-profile fallback)";
-    let arn = run_capture("aws", &["sts", "get-caller-identity", "--region", crate::bridge::config::REGION, "--query", "Arn", "--output", "text"], Duration::from_secs(20));
-    let Ok(arn) = arn else {
-        return gate("G7", "IAM for the runtime principal", cmd, expected, format!("no identity: {}", arn.err().unwrap_or_default()), GateStatus::Skipped);
-    };
-    let sim = run_capture(
-        "aws",
-        &["iam", "simulate-principal-policy", "--region", crate::bridge::config::REGION, "--policy-source-arn", &arn, "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "budgets:ModifyBudget", "--output", "json"],
-        Duration::from_secs(30),
-    );
-    match sim {
-        Ok(json) => {
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
-            let mut parts = Vec::new();
-            let mut all_allowed = true;
-            for r in v.get("EvaluationResults").and_then(|r| r.as_array()).into_iter().flatten() {
-                let a = r.get("EvalActionName").and_then(|x| x.as_str()).unwrap_or("?");
-                let d = r.get("EvalDecision").and_then(|x| x.as_str()).unwrap_or("?");
-                all_allowed &= d == "allowed";
-                parts.push(format!("{a}={d}"));
-            }
-            gate("G7", "IAM for the runtime principal", cmd, expected, format!("{arn}: {}", parts.join(", ")), if all_allowed { GateStatus::Pass } else { GateStatus::Manual })
-        }
-        Err(e) => gate("G7", "IAM for the runtime principal", cmd, expected, e, GateStatus::Manual),
+// ---- G7: IAM of the operator identities (S8 operators §8.1) --------------------------------
+
+const G7_NAME: &str = "IAM of the operator identities";
+const G7_COMMAND: &str = "aws iam simulate-principal-policy (8 calls): user/ai-env-deployer's 4 pairs, user/ai-env-ops' 20 deploy actions";
+const G7_EXPECTED: &str = "the deployer's 4 pairs allowed; ops' 20 pairs denied";
+/// The stack's budget when the state names none (infra/budget.ts's name).
+const DEFAULT_BUDGET: &str = "ai-env-monthly";
+
+/// One `simulate-principal-policy` call: a principal's actions on resources,
+/// every pair wanted allowed (the deployer's) or denied (ops').
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sim {
+    pub principal: String,
+    pub actions: &'static [&'static str],
+    pub resources: Vec<String>,
+    pub allowed: bool,
+}
+
+/// `arn:aws:iam::<12 digits>:user/<path/>name`.
+fn is_user_arn(arn: &str) -> bool {
+    arn.strip_prefix("arn:aws:iam::").and_then(|r| r.split_once(":user/")).is_some_and(|(acct, name)| acct.len() == 12 && acct.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() && !name.ends_with('/'))
+}
+
+/// G7's eight calls (§8.1) from `state/infra.toml`; `Err` says what the
+/// state lacks, or that its deployer is no IAM user (G7 is then skipped).
+pub fn g7_plan(s: &InfraState) -> std::result::Result<Vec<Sim>, String> {
+    let some = |v: &Option<String>| v.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    let image = Some(s.image_arn.trim().to_string()).filter(|a| !a.is_empty());
+    let fields = [("deployer_user_arn", some(&s.deployer_user_arn)), ("ops_user_arn", some(&s.ops_user_arn)), ("runtime_user_arn", some(&s.runtime_user_arn)), ("image_arn", image)];
+    let lacking: Vec<&str> = fields.iter().filter(|(_, v)| v.is_none()).map(|(name, _)| *name).collect();
+    if !lacking.is_empty() {
+        return Err(format!("state/infra.toml lacks {}  <- make infra-status WRITE=1 after the bootstrap", lacking.join(", ")));
     }
+    let [deployer, ops, runtime, image] = fields.map(|(_, v)| v.unwrap_or_default());
+    if !is_user_arn(&deployer) {
+        return Err(format!("deployer_user_arn {deployer:?} in state/infra.toml is not an IAM user ARN  <- make infra-status WRITE=1"));
+    }
+    let account = some(&s.account_id).or_else(|| arn_account(&deployer).map(str::to_string)).unwrap_or_default();
+    let budget = some(&s.budget_name).unwrap_or_else(|| DEFAULT_BUDGET.to_string());
+    let prefix = some(&s.parameter_prefix).unwrap_or_else(|| PARAMETER_PREFIX.to_string());
+    let parameter = |name: &str| format!("arn:aws:ssm:{REGION}:{account}:parameter{prefix}/{name}");
+    let sim = |principal: &str, actions: &'static [&'static str], resources: Vec<String>, allowed: bool| Sim { principal: principal.to_string(), actions, resources, allowed };
+    Ok(vec![
+        sim(&deployer, &["iam:CreateUser", "iam:CreateAccessKey"], vec![runtime.clone()], true),
+        sim(&deployer, &["iam:CreateAccessKey"], vec![ops.clone()], true),
+        sim(&deployer, &["budgets:ModifyBudget"], vec![format!("arn:aws:budgets::{account}:budget/{budget}")], true),
+        sim(&ops, &["cloudformation:CreateResource", "cloudformation:UpdateResource", "cloudformation:DeleteResource", "lambda:CreateMicrovmImage"], vec!["*".to_string()], false),
+        sim(&ops, &["iam:CreateAccessKey", "iam:PutUserPolicy", "iam:AttachUserPolicy"], vec![deployer.clone(), ops.clone(), runtime], false),
+        sim(&ops, &["lambda:UpdateMicrovmImage", "lambda:UpdateMicrovmImageVersion", "lambda:DeleteMicrovmImageVersion"], vec![image], false),
+        sim(&ops, &["ssm:PutParameter"], vec![parameter("extras"), parameter("allow"), parameter("squid.conf")], false),
+        sim(&ops, &["ssm:SendCommand"], vec![format!("arn:aws:ssm:{REGION}::document/AWS-RunShellScript")], false),
+    ])
+}
+
+/// The argv of one G7 call (after `aws`).
+pub fn sim_args(s: &Sim) -> Vec<&str> {
+    let mut args = vec!["iam", "simulate-principal-policy", "--region", REGION, "--policy-source-arn", s.principal.as_str(), "--action-names"];
+    args.extend(s.actions.iter().copied());
+    args.push("--resource-arns");
+    args.extend(s.resources.iter().map(String::as_str));
+    args.extend(["--output", "json"]);
+    args
+}
+
+/// `(action, resource, decision)` of every pair a `simulate-principal-policy`
+/// answer holds, flat (`EvalActionName`, `EvalResourceName`, `EvalDecision`)
+/// or nested (`ResourceSpecificResults` of `EvalResourceName` and
+/// `EvalResourceDecision`).
+pub fn sim_decisions(json: &str) -> std::result::Result<Vec<(String, String, String)>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("unreadable simulate-principal-policy answer: {e}"))?;
+    let results = v.get("EvaluationResults").and_then(|r| r.as_array()).ok_or("unreadable simulate-principal-policy answer: no EvaluationResults")?;
+    let text = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let mut out = Vec::new();
+    for r in results {
+        let action = text(r, "EvalActionName");
+        match r.get("ResourceSpecificResults").and_then(|x| x.as_array()).filter(|x| !x.is_empty()) {
+            Some(nested) => out.extend(nested.iter().map(|n| (action.clone(), text(n, "EvalResourceName"), text(n, "EvalResourceDecision")))),
+            None => out.push((action, text(r, "EvalResourceName"), text(r, "EvalDecision"))),
+        }
+    }
+    Ok(out)
+}
+
+/// A resource as G7 shows it: the ARN's part after its fifth colon (`*` as it is).
+fn shown_resource(arn: &str) -> &str {
+    arn.splitn(6, ':').nth(5).unwrap_or(arn)
+}
+
+/// G7's verdict on its calls' answers (one per [`Sim`], in order): ✓ when
+/// every requested pair is answered, every positive `allowed` and every
+/// negative `implicitDeny` or `explicitDeny`; ? otherwise (a positive denied,
+/// a negative allowed, a missing pair, an unreadable answer, a failed call).
+pub fn g7_verdict(plan: &[Sim], answers: &[std::result::Result<String, String>]) -> (GateStatus, String) {
+    let (mut deployer_pairs, mut errors) = (Vec::new(), Vec::new());
+    let (mut denied, mut negatives) = (0usize, 0usize);
+    let mut failing: Vec<(String, String)> = Vec::new();
+    let (mut deployer, mut ops) = (String::new(), String::new());
+    let mut pass = true;
+    for (sim, answer) in plan.iter().zip(answers) {
+        let decisions = match answer.as_deref().map_err(String::clone).and_then(sim_decisions) {
+            Ok(d) => d,
+            Err(e) => {
+                if !errors.contains(&e) {
+                    errors.push(e);
+                }
+                Vec::new()
+            }
+        };
+        let who = shown_resource(&sim.principal).to_string();
+        if sim.allowed { deployer.clone_from(&who) } else { ops.clone_from(&who) }
+        for action in sim.actions {
+            for resource in &sim.resources {
+                let decision = decisions.iter().find(|(a, r, _)| a == action && r == resource).map(|(_, _, d)| d.as_str());
+                let pair = format!("{action}@{}", shown_resource(resource));
+                if sim.allowed {
+                    pass &= decision == Some("allowed");
+                    deployer_pairs.push(format!("{pair}={}", decision.unwrap_or("missing")));
+                } else {
+                    negatives += 1;
+                    match decision {
+                        Some("implicitDeny" | "explicitDeny") => denied += 1,
+                        Some(other) => failing.push((other.to_string(), pair)),
+                        None => failing.push(("missing".to_string(), pair)),
+                    }
+                }
+            }
+        }
+    }
+    pass &= denied == negatives && errors.is_empty() && answers.len() == plan.len();
+    let mut observed = format!("deployer {deployer}: {}; ops {ops}: {denied}/{negatives} deploy actions denied", deployer_pairs.join(", "));
+    let mut kinds: Vec<&str> = Vec::new();
+    for (kind, _) in &failing {
+        if !kinds.contains(&kind.as_str()) {
+            kinds.push(kind);
+        }
+    }
+    for kind in kinds {
+        let pairs: Vec<&str> = failing.iter().filter(|(k, _)| k == kind).map(|(_, p)| p.as_str()).collect();
+        observed.push_str(&format!("; {kind}: {}", pairs.join(", ")));
+    }
+    for e in errors {
+        observed.push_str(&format!("; {e}"));
+    }
+    (if pass { GateStatus::Pass } else { GateStatus::Manual }, observed)
+}
+
+/// G7: the deployer's four pairs allowed and ops' twenty denied, simulated
+/// for the stack's users of `state/infra.toml` as the operator identity
+/// (`operator`: its resolution, `Err` the labelled refusal, which skips it).
+fn g7(operator: Option<&std::result::Result<(), String>>) -> GateResult {
+    let skipped = |why: String| gate("G7", G7_NAME, G7_COMMAND, G7_EXPECTED, why, GateStatus::Skipped);
+    if let Some(Err(e)) = operator {
+        return skipped(e.clone());
+    }
+    // A missing state lacks every field G7 needs.
+    let state = match crate::bridge::config::Paths::resolve().map_err(|e| e.to_string()).and_then(|paths| read_infra_state(&paths).map_err(|e| e.to_string())) {
+        Ok(state) => state.unwrap_or_default(),
+        Err(e) => return skipped(format!("state/infra.toml unreadable: {e}  <- make infra-status WRITE=1")),
+    };
+    let plan = match g7_plan(&state) {
+        Ok(plan) => plan,
+        Err(why) => return skipped(why),
+    };
+    let answers: Vec<std::result::Result<String, String>> = plan.iter().map(|s| operator_capture(&sim_args(s), Duration::from_secs(30))).collect();
+    let (status, observed) = g7_verdict(&plan, &answers);
+    gate("G7", G7_NAME, G7_COMMAND, G7_EXPECTED, observed, status)
 }
 
 fn g8() -> GateResult {
@@ -435,17 +592,24 @@ fn g8() -> GateResult {
     )
 }
 
-/// Run every gate (or only the listed ids). The boolean reports that AWS
-/// credentials were unavailable (exit 5 semantics).
+/// Does this run measure G2 or G7, the gates that need the operator identity?
+fn needs_operator(only: &[String]) -> bool {
+    only.is_empty() || only.iter().any(|o| o.eq_ignore_ascii_case("G2") || o.eq_ignore_ascii_case("G7"))
+}
+
+/// Run every gate (or only the listed ids); `operator` is the identity's
+/// resolution when G2 or G7 runs (`Err`: the labelled refusal). The boolean
+/// reports that AWS credentials or an operator identity were unavailable
+/// (exit 5 semantics).
 #[must_use]
-pub fn run_all(repo_root: &Path, only: &[String]) -> (Vec<GateResult>, bool) {
+pub fn run_all(repo_root: &Path, only: &[String], operator: Option<&std::result::Result<(), String>>) -> (Vec<GateResult>, bool) {
     let wanted = |id: &str| only.is_empty() || only.iter().any(|o| o.eq_ignore_ascii_case(id));
     let mut rows = Vec::new();
     if wanted("G1") {
         rows.push(g1(repo_root));
     }
     if wanted("G2") {
-        rows.push(g2());
+        rows.push(g2(operator));
     }
     if wanted("G3") {
         rows.push(g3(repo_root));
@@ -460,12 +624,15 @@ pub fn run_all(repo_root: &Path, only: &[String]) -> (Vec<GateResult>, bool) {
         rows.push(g6());
     }
     if wanted("G7") {
-        rows.push(g7());
+        rows.push(g7(operator));
     }
     if wanted("G8") {
         rows.push(g8());
     }
-    let creds_unavailable = rows.iter().any(|r| r.observed.to_ascii_lowercase().contains("unable to locate credentials"));
+    let creds_unavailable = rows.iter().any(|r| {
+        let observed = r.observed.to_ascii_lowercase();
+        observed.contains("unable to locate credentials") || observed.contains("no aws operator identity")
+    });
     (rows, creds_unavailable)
 }
 
@@ -474,23 +641,32 @@ pub fn run_all(repo_root: &Path, only: &[String]) -> (Vec<GateResult>, bool) {
 /// run — a Manual G7 (an action denied) is the measurement, not a placeholder.
 const HAND_RECORDED: [&str; 4] = ["G4", "G5", "G6", "G8"];
 
-/// Hand-recorded gates that came back Manual, and any gate that came back
-/// Skipped (the tool or binary to measure it is missing), take the observed
-/// text, status and date recorded in the existing table — unless that record
-/// is just the tool's own placeholder (empty, `…`, or exactly what this run
-/// would write), in which case nobody recorded anything yet. A row whose
-/// status was set to ✓/✗ by hand counts as recorded even with the placeholder
-/// text. Measured rows always take the fresh measurement.
+/// Gates whose Skipped row is itself the verdict: G7 is skipped when the
+/// state or the operator identity it simulates as is missing or refused,
+/// never a tool, and an older ✓ would claim a simulation this run never made
+/// (§8.1: the reason is shown).
+const SKIPPED_IS_MEASURED: [&str; 1] = ["G7"];
+
+/// Hand-recorded gates that came back Manual, and any gate but G7 that came
+/// back Skipped (the tool or binary to measure it is missing), take the
+/// observed text, status and date recorded in the existing table — unless
+/// that record is just the tool's own placeholder (empty, `…`, or exactly
+/// what this run would write), in which case nobody recorded anything yet. A
+/// row whose status was set to ✓/✗ by hand counts as recorded even with the
+/// placeholder text. A skipped gate takes only a record of the same gate, its
+/// id and name: a row of another name under that id measured something else.
+/// Measured rows, G7's skipped one included, always take the fresh result.
 #[must_use]
 pub fn merge_manual(mut fresh: Vec<GateResult>, existing_md: Option<&str>) -> Vec<GateResult> {
     let Some(md) = existing_md else {
         return fresh;
     };
     let existing = parse(md);
+    let names: std::collections::BTreeMap<String, String> = table(md).into_iter().map(|r| (r.0, r.1)).collect();
     for row in &mut fresh {
         let mergeable = match row.status {
             GateStatus::Manual => HAND_RECORDED.contains(&row.id),
-            GateStatus::Skipped => true,
+            GateStatus::Skipped => !SKIPPED_IS_MEASURED.contains(&row.id) && names.get(row.id).is_some_and(|name| name == row.name),
             GateStatus::Pass | GateStatus::Fail => false,
         };
         if !mergeable {
@@ -513,7 +689,13 @@ pub fn merge_manual(mut fresh: Vec<GateResult>, existing_md: Option<&str>) -> Ve
 /// `id → (observed, status, date)` from a rendered table.
 #[must_use]
 pub fn parse(md: &str) -> std::collections::BTreeMap<String, (String, GateStatus, String)> {
-    let mut out = std::collections::BTreeMap::new();
+    table(md).into_iter().map(|(id, _, observed, status, date)| (id, (observed, status, date))).collect()
+}
+
+/// The rows of a rendered table, in order: `(id, name, observed, status,
+/// date)`, the name being the Gate cell after the id.
+fn table(md: &str) -> Vec<(String, String, String, GateStatus, String)> {
+    let mut out = Vec::new();
     for line in md.lines() {
         if !line.starts_with("| G") {
             continue;
@@ -525,10 +707,11 @@ pub fn parse(md: &str) -> std::collections::BTreeMap<String, (String, GateStatus
             continue;
         }
         let id = cells[1].split_whitespace().next().unwrap_or("").to_string();
+        let name = cells[1][id.len()..].trim().to_string();
         let Some(status) = GateStatus::from_glyph(&cells[5]) else {
             continue;
         };
-        out.insert(id, (cells[4].clone(), status, cells[6].clone()));
+        out.push((id, name, cells[4].clone(), status, cells[6].clone()));
     }
     out
 }
@@ -645,6 +828,16 @@ pub fn exit_code(rows: &[GateResult], creds_unavailable: bool) -> i32 {
     }
 }
 
+/// The exit of a run whose operator identity was `refused` (labelled): the
+/// higher of the rows' [`exit_code`] and the refusal's class, so a marker or
+/// principal the resolver refuses is exit 9 and a missing keystore key exit
+/// 4, as from every other operator command, where G2 and G7 only show it
+/// (and `--only G7`, which never blocks, would exit 0).
+#[must_use]
+pub fn exit_with(exit: i32, refused: Option<&CliError>) -> i32 {
+    refused.map_or(exit, |e| exit.max(e.exit_code()))
+}
+
 /// GO means every blocking gate is present and none blocks: a subset run can
 /// exit 0 without being a GO.
 #[must_use]
@@ -685,12 +878,24 @@ pub fn main(json: bool, out: Option<PathBuf>, only: Vec<String>) -> Result<()> {
         return Err(CliError::Usage(format!("unknown gate id(s) {}; known: {}", unknown.join(", "), KNOWN.join(", "))));
     }
     let partial = !only.is_empty();
+    // S8 operators: the operator identity first, once (its Touch ID before any gate runs); a dismissed dialog
+    // cancels the run, any other refusal is shown by G2 and G7 and keeps its class for the exit.
+    let operator = needs_operator(&only).then(|| crate::bridge::identity::operator().map(|_| ()).map_err(|e| crate::bridge::identity::labelled("gates", e)));
+    if let Some(Err(CliError::Cancelled)) = &operator {
+        return Err(CliError::Cancelled);
+    }
+    let shown = operator.as_ref().map(|r| match r {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    });
+    let refused = operator.and_then(std::result::Result::err);
     let root = repo_root();
     let path = out.unwrap_or_else(|| root.join("plans").join("gates.md"));
     let existing = std::fs::read_to_string(&path).ok();
-    let (fresh, creds_unavailable) = run_all(&root, &only);
+    let (fresh, creds_unavailable) = run_all(&root, &only, shown.as_ref());
     let rows = merge_manual(fresh, existing.as_deref());
-    let exit = exit_code(&rows, creds_unavailable);
+    let rows_exit = exit_code(&rows, creds_unavailable);
+    let exit = exit_with(rows_exit, refused.as_ref());
     if !partial {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -709,6 +914,10 @@ pub fn main(json: bool, out: Option<PathBuf>, only: Vec<String>) -> Result<()> {
         } else {
             outln!("{}: {}", if go(&rows, exit) { "GO" } else { "NO-GO" }, path.display());
         }
+    }
+    if let Some(e) = refused.filter(|_| exit > rows_exit) {
+        // The identity's refusal raised the exit: its own text and class.
+        return Err(e);
     }
     match exit {
         0 => Ok(()),
@@ -813,18 +1022,19 @@ mod tests {
         assert_eq!(render(&merged, None), md, "and written back as it was");
     }
 
-    /// A skipped G7 (no identity) keeps its last record, as any skipped gate
-    /// does, but no account id in it: a record an older ai-env wrote unmasked
-    /// is masked on the way out. The tool's own skipped text, escaped in the
+    /// A skipped gate keeps its last record, but no account id in it: a
+    /// record an older ai-env wrote unmasked is masked on the way out (here
+    /// G3's, the binary gone). The tool's own skipped text, escaped in the
     /// file, is still its placeholder: today's row, not the old one.
     #[test]
-    fn a_skipped_g7_keeps_its_last_record_masked() {
-        let unmasked = render(&[row("G7", GateStatus::Manual, "x")], None).replace("| x |", "| arn:aws:iam::123456789012:root: iam:CreateUser=implicitDeny |");
-        let skipped = row("G7", GateStatus::Skipped, "no identity: aws: [ERROR]: <ExpiredToken>");
+    fn a_kept_record_is_masked_and_the_tools_own_text_is_no_record() {
+        let pulled = "docker: pulled 123456789012.dkr.ecr.eu-central-1.amazonaws.com/base; ai-env 0.1.0";
+        let unmasked = render(&[row("G3", GateStatus::Manual, "x")], None).replace("| x |", &format!("| {pulled} |"));
+        let skipped = row("G3", GateStatus::Skipped, "image/ai-env missing — run: make vm-build (<repo>/image/ai-env)");
         let merged = merge_manual(vec![skipped.clone()], Some(&unmasked));
-        assert_eq!((merged[0].observed.as_str(), merged[0].status), ("arn:aws:iam::123456789012:root: iam:CreateUser=implicitDeny", GateStatus::Manual), "the last record");
+        assert_eq!((merged[0].observed.as_str(), merged[0].status), (pulled, GateStatus::Manual), "the last record");
         let md = render(&merged, None);
-        assert!(md.contains("| arn:aws:iam::&lt;acct&gt;:root: iam:CreateUser=implicitDeny |") && !md.contains("123456789012"), "{md}");
+        assert!(md.contains("| docker: pulled &lt;acct&gt;.dkr.ecr.eu-central-1.amazonaws.com/base; ai-env 0.1.0 |") && !md.contains("123456789012"), "{md}");
         let mut today = skipped.clone();
         today.date = "2026-10-12".into();
         let merged = merge_manual(vec![today], Some(&render(&[skipped], None)));
@@ -904,6 +1114,60 @@ mod tests {
         assert!(!go(&g8_only, exit_code(&g8_only, false)));
     }
 
+    /// S8 operators: a refused operator identity keeps its class, as from
+    /// every other operator command (a marker or principal the resolver
+    /// refuses 9, a missing keystore key 4), where the rows alone would give
+    /// 0 (G7 never blocks) or 1; the rows' own exit stands when it is higher
+    /// or there is no refusal.
+    #[test]
+    fn a_refused_identity_keeps_its_class_in_the_exit() {
+        let policy = CliError::Policy("gates: AI_ENV_BRIDGE_AS=root, but …".into());
+        assert_eq!(exit_with(0, Some(&policy)), 9, "--only G7: skipped, yet refused");
+        assert_eq!(exit_with(1, Some(&policy)), 9, "a full run: G2 ✗ from the same refusal");
+        assert_eq!(exit_with(1, Some(&CliError::NoKey("gates: key".into()))), 4);
+        assert_eq!(exit_with(5, Some(&CliError::AuthUnavailable("gates: no AWS operator identity: …".into()))), 5);
+        assert_eq!(exit_with(1, Some(&CliError::Msg("gates: aws sts get-caller-identity: …".into()))), 1);
+        assert_eq!((exit_with(0, None), exit_with(1, None), exit_with(5, None)), (0, 1, 5));
+        let all: Vec<GateResult> = BLOCKING.iter().map(|id| row(id, GateStatus::Pass, "ok")).collect();
+        assert!(!go(&all, exit_with(0, Some(&policy))), "never a GO under a refused identity");
+    }
+
+    /// A skipped gate takes the last record of its own gate only: a row of
+    /// another name under its id measured something else, so the skipped
+    /// text, status and date stand; a record of the same gate is still kept.
+    #[test]
+    fn a_skipped_gate_never_takes_the_record_of_another_gate_under_its_id() {
+        let skipped = GateResult { name: "cross build on AL2023 arm64", date: "2026-10-14".into(), ..row("G3", GateStatus::Skipped, "image/ai-env missing — run: make vm-build") };
+        let other = GateResult { name: "an earlier gate under that id", ..row("G3", GateStatus::Pass, "measured something else") };
+        let merged = merge_manual(vec![skipped.clone()], Some(&render(&[other], None)));
+        assert_eq!(merged, std::slice::from_ref(&skipped), "the fresh skipped row, as measured");
+        let recorded = GateResult { observed: "ELF aarch64; max GLIBC_2.30; getentropy refs 0".into(), status: GateStatus::Pass, date: "2026-10-13".into(), ..skipped.clone() };
+        let merged = merge_manual(vec![skipped], Some(&render(std::slice::from_ref(&recorded), None)));
+        assert_eq!((merged[0].observed.as_str(), merged[0].status, merged[0].date.as_str()), (recorded.observed.as_str(), GateStatus::Pass, "2026-10-13"), "its own last record");
+    }
+
+    /// A skipped G7 never takes a record, not even its own: it is skipped
+    /// when the state or the identity to simulate as is missing or refused,
+    /// never a tool, and an older ✓ would claim a simulation this run never
+    /// made (§8.1: the row shows why). Nor does G7's row of before S8
+    /// operators (another name, the caller simulated) count.
+    #[test]
+    fn a_skipped_g7_shows_why_over_any_record() {
+        let mut skipped = gate("G7", G7_NAME, G7_COMMAND, G7_EXPECTED, "state/infra.toml lacks deployer_user_arn, ops_user_arn  <- make infra-status WRITE=1 after the bootstrap".into(), GateStatus::Skipped);
+        skipped.date = "2026-10-14".into();
+        let old = GateResult {
+            name: "IAM for the runtime principal",
+            ..row("G7", GateStatus::Manual, "aws: [ERROR]: An error occurred (InvalidInput) when calling the SimulatePrincipalPolicy operation: Invalid ARN provided in the request: `arn:aws:iam::<acct>:root`")
+        };
+        let recorded = GateResult { observed: "deployer user/ai-env-deployer: …; ops user/ai-env-ops: 20/20 deploy actions denied".into(), status: GateStatus::Pass, date: "2026-10-13".into(), ..skipped.clone() };
+        let hand = GateResult { observed: "simulated by hand in the console".into(), status: GateStatus::Pass, ..recorded.clone() };
+        for file in [render(&[old], None), render(std::slice::from_ref(&recorded), None), render(&[hand], None)] {
+            assert_eq!(merge_manual(vec![skipped.clone()], Some(&file)), std::slice::from_ref(&skipped), "the fresh skipped row:\n{file}");
+        }
+        let names: Vec<(String, String)> = table(&render(&[recorded], None)).into_iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(names, [("G7".to_string(), G7_NAME.to_string())], "its own record, which it still never takes");
+    }
+
     #[test]
     fn json_shape() {
         let s = to_json(&[row("G1", GateStatus::Pass, "ok")], 0, true);
@@ -960,5 +1224,120 @@ mod tests {
         for st in [GateStatus::Pass, GateStatus::Fail, GateStatus::Manual, GateStatus::Skipped] {
             assert_eq!(GateStatus::from_glyph(st.glyph()), Some(st));
         }
+    }
+
+    const STACK: &str = "123456789012";
+
+    fn user(name: &str) -> String {
+        format!("arn:aws:iam::{STACK}:user/{name}")
+    }
+
+    /// The operator fields of `state/infra.toml` after the bootstrap.
+    fn operator_state() -> InfraState {
+        InfraState {
+            account_id: Some(STACK.into()),
+            image_arn: format!("arn:aws:lambda:eu-central-1:{STACK}:microvm-image:ai-env-agent"),
+            deployer_user_arn: Some(user("ai-env-deployer")),
+            ops_user_arn: Some(user("ai-env-ops")),
+            runtime_user_arn: Some(user("ai-env-runtime")),
+            ..InfraState::default()
+        }
+    }
+
+    /// An answer to `s` in the flat shape (one result per action and
+    /// resource) or the nested one (`ResourceSpecificResults`), each pair's
+    /// decision from `decide`.
+    fn answer(s: &Sim, nested: bool, decide: &dyn Fn(&str, &str) -> &'static str) -> String {
+        let results: Vec<serde_json::Value> = if nested {
+            s.actions
+                .iter()
+                .map(|a| {
+                    let per: Vec<serde_json::Value> = s.resources.iter().map(|r| serde_json::json!({"EvalResourceName": r, "EvalResourceDecision": decide(a, r)})).collect();
+                    serde_json::json!({"EvalActionName": a, "EvalResourceName": "*", "EvalDecision": "implicitDeny", "ResourceSpecificResults": per})
+                })
+                .collect()
+        } else {
+            s.actions.iter().flat_map(|a| s.resources.iter().map(move |r| serde_json::json!({"EvalActionName": a, "EvalResourceName": r, "EvalDecision": decide(a, r), "MatchedStatements": []}))).collect()
+        };
+        serde_json::json!({"EvaluationResults": results}).to_string()
+    }
+
+    /// S8 operators §8.1: eight calls, the deployer's four pairs on their own
+    /// resources and ops' twenty deploy actions, from the stack's users (never
+    /// the caller's ARN), the account and names from the state.
+    #[test]
+    fn g7_plan_simulates_the_deployer_per_resource_and_the_ops_negatives() {
+        let plan = g7_plan(&operator_state()).unwrap();
+        assert_eq!(plan.len(), 8);
+        let pairs = |allowed: bool| plan.iter().filter(|s| s.allowed == allowed).map(|s| s.actions.len() * s.resources.len()).sum::<usize>();
+        assert_eq!((pairs(true), pairs(false)), (4, 20));
+        assert!(plan[..3].iter().all(|s| s.allowed && s.principal == user("ai-env-deployer")), "{plan:?}");
+        assert!(plan[3..].iter().all(|s| !s.allowed && s.principal == user("ai-env-ops")), "{plan:?}");
+        assert_eq!(
+            sim_args(&plan[0]),
+            ["iam", "simulate-principal-policy", "--region", "eu-central-1", "--policy-source-arn", &user("ai-env-deployer"), "--action-names", "iam:CreateUser", "iam:CreateAccessKey", "--resource-arns", &user("ai-env-runtime"), "--output", "json"]
+        );
+        assert_eq!(plan[1].resources, [user("ai-env-ops")]);
+        assert_eq!(plan[2].resources, [format!("arn:aws:budgets::{STACK}:budget/ai-env-monthly")]);
+        assert_eq!(plan[3].resources, ["*"]);
+        assert_eq!(plan[4].resources, [user("ai-env-deployer"), user("ai-env-ops"), user("ai-env-runtime")]);
+        assert_eq!(plan[5].resources, [operator_state().image_arn]);
+        let param = |p: &str| format!("arn:aws:ssm:eu-central-1:{STACK}:parameter/ai-env/proxy/{p}");
+        assert_eq!(plan[6].resources, [param("extras"), param("allow"), param("squid.conf")]);
+        assert_eq!(plan[7].resources, ["arn:aws:ssm:eu-central-1::document/AWS-RunShellScript"]);
+        // The budget and the prefix the state records; the account of the deployer's ARN without account_id.
+        let named = InfraState { account_id: None, budget_name: Some("b2".into()), parameter_prefix: Some("/x/proxy".into()), ..operator_state() };
+        let plan = g7_plan(&named).unwrap();
+        assert_eq!(plan[2].resources, [format!("arn:aws:budgets::{STACK}:budget/b2")]);
+        assert_eq!(plan[6].resources[0], format!("arn:aws:ssm:eu-central-1:{STACK}:parameter/x/proxy/extras"));
+        // What the state lacks skips G7, named; a deployer that is no IAM user too.
+        let e = g7_plan(&InfraState { ops_user_arn: None, image_arn: String::new(), ..operator_state() }).unwrap_err();
+        assert_eq!(e, "state/infra.toml lacks ops_user_arn, image_arn  <- make infra-status WRITE=1 after the bootstrap");
+        let e = g7_plan(&InfraState::default()).unwrap_err();
+        assert!(e.starts_with("state/infra.toml lacks deployer_user_arn, ops_user_arn, runtime_user_arn, image_arn"), "{e}");
+        for bad in [format!("arn:aws:iam::{STACK}:root"), format!("arn:aws:sts::{STACK}:assumed-role/a/b"), format!("arn:aws:iam::{STACK}:user/")] {
+            let e = g7_plan(&InfraState { deployer_user_arn: Some(bad.clone()), ..operator_state() }).unwrap_err();
+            assert!(e.contains("is not an IAM user ARN"), "{bad}: {e}");
+        }
+    }
+
+    /// ✓ needs every pair answered, the four positives allowed and the twenty
+    /// negatives denied, in either answer shape; anything else is ?, naming
+    /// the pairs that fail.
+    #[test]
+    fn g7_verdict_reads_both_answer_shapes_and_needs_every_pair() {
+        let plan = g7_plan(&operator_state()).unwrap();
+        // The deployer's actions overlap ops' (iam:CreateAccessKey): a decision is the call's, never the action's.
+        let by_call = |nested: bool| -> Vec<std::result::Result<String, String>> { plan.iter().map(|s| Ok(answer(s, nested, &|_, _| if s.allowed { "allowed" } else { "implicitDeny" }))).collect() };
+        let want = "deployer user/ai-env-deployer: iam:CreateUser@user/ai-env-runtime=allowed, iam:CreateAccessKey@user/ai-env-runtime=allowed, iam:CreateAccessKey@user/ai-env-ops=allowed, budgets:ModifyBudget@budget/ai-env-monthly=allowed; ops user/ai-env-ops: 20/20 deploy actions denied";
+        for nested in [false, true] {
+            assert_eq!(g7_verdict(&plan, &by_call(nested)), (GateStatus::Pass, want.to_string()), "nested {nested}");
+        }
+        // An explicit deny is a deny.
+        let explicit: Vec<std::result::Result<String, String>> = plan.iter().map(|s| Ok(answer(s, false, &|_, _| if s.allowed { "allowed" } else { "explicitDeny" }))).collect();
+        assert_eq!(g7_verdict(&plan, &explicit).0, GateStatus::Pass);
+        // Ops may put the extras parameter: ?, the pair named.
+        let mut leaky = by_call(false);
+        leaky[6] = Ok(answer(&plan[6], false, &|_, r| if r.ends_with("/extras") { "allowed" } else { "implicitDeny" }));
+        let (status, observed) = g7_verdict(&plan, &leaky);
+        assert_eq!(status, GateStatus::Manual);
+        assert!(observed.ends_with("ops user/ai-env-ops: 19/20 deploy actions denied; allowed: ssm:PutParameter@parameter/ai-env/proxy/extras"), "{observed}");
+        // A positive denied, and an answer missing a pair.
+        let mut denied = by_call(false);
+        denied[2] = Ok(answer(&plan[2], false, &|_, _| "implicitDeny"));
+        denied[7] = Ok("{\"EvaluationResults\": []}".to_string());
+        let (status, observed) = g7_verdict(&plan, &denied);
+        assert_eq!(status, GateStatus::Manual);
+        assert!(observed.contains("budgets:ModifyBudget@budget/ai-env-monthly=implicitDeny") && observed.contains("19/20 deploy actions denied; missing: ssm:SendCommand@document/AWS-RunShellScript"), "{observed}");
+        // A failed call or an unreadable answer: ?, its error named, its pairs missing.
+        let mut failed = by_call(false);
+        failed[0] = Err("An error occurred (AccessDenied) when calling the SimulatePrincipalPolicy operation: denied".into());
+        failed[3] = Ok("not json".into());
+        let (status, observed) = g7_verdict(&plan, &failed);
+        assert_eq!(status, GateStatus::Manual);
+        assert!(observed.contains("iam:CreateUser@user/ai-env-runtime=missing") && observed.contains("16/20 deploy actions denied; missing: cloudformation:CreateResource@*"), "{observed}");
+        assert!(observed.contains("; An error occurred (AccessDenied)") && observed.contains("; unreadable simulate-principal-policy answer"), "{observed}");
+        // In gates.md the account ids are masked (cell).
+        assert!(!cell(&format!("{observed} {}", user("x"))).contains(STACK));
     }
 }
