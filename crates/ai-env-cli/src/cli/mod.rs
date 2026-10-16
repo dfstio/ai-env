@@ -174,7 +174,7 @@ pub enum Cmd {
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
     },
-    /// Cursor wrapper: install the claudeProcessWrapper setting, inspect the invocation census, promote a session's approved settings
+    /// Cursor wrapper: install or uninstall the claudeProcessWrapper setting, show its status, inspect the invocation census, promote a session's approved settings
     #[cfg(feature = "bridge")]
     Wrapper {
         #[command(subcommand)]
@@ -915,8 +915,8 @@ mod creds_cmd_tests {
     }
 }
 
-/// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands, and
-/// S8's settings sync.
+/// `ai-env wrapper …` (feature `bridge`): the two S1 operator commands, S8's
+/// settings sync, and the setting's status and uninstall.
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum WrapperCmd {
@@ -932,6 +932,12 @@ pub enum WrapperCmd {
         /// Also set [wrapper].mode in bridge.toml (backup first): remote runs Cursor's chats under the roots in a MicroVM, passthrough on this Mac
         #[arg(long, value_enum, value_name = "MODE")]
         mode: Option<WrapperModeArg>,
+    },
+    /// Take claudeCode.claudeProcessWrapper out of Cursor's settings: what Cursor starts afterwards is its bundled claude (dry run unless --write; backs up settings.json; initialPermissionMode and bridge.toml stay)
+    Uninstall {
+        /// Edit settings.json (default: a dry run that shows what would be removed)
+        #[arg(long)]
+        write: bool,
     },
     /// Promote the permission rules a session approved in its VMs into the image's settings (dry run unless --write; never a broad allow, a repo-scan finding or defaultMode)
     SettingsSync {
@@ -964,6 +970,12 @@ pub enum WrapperCmd {
         /// expectation, a gap included; the rows are written first)
         #[arg(long)]
         record_probes: bool,
+    },
+    /// Show whether Cursor's claudeProcessWrapper is set, which ai-env-claude it runs, the effective wrapper mode and roots, whether bridge.toml passes a remote session's start checks, and which extension Cursor last ran (read-only: no AWS, no Touch ID)
+    Status {
+        /// Machine-readable output (doctor --json's shape)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1152,8 +1164,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Wrapper { cmd } => match cmd {
             WrapperCmd::Install { write, permission_mode, mode: None } => crate::bridge::wrapper::install(write, permission_mode),
             WrapperCmd::Install { write, permission_mode, mode: Some(mode) } => crate::bridge::wrapper::install_mode(write, permission_mode, mode.mode()),
+            WrapperCmd::Uninstall { write } => crate::bridge::wrapper::uninstall(write),
             WrapperCmd::Census { last, json, record_probes } => crate::bridge::wrapper::census(last, json, record_probes),
             WrapperCmd::SettingsSync { session, rule, all_safe, write, image_dir } => crate::bridge::wrapper::settings_sync(&session, &rule, all_safe, write, image_dir.as_deref()),
+            WrapperCmd::Status { json } => crate::bridge::wrapper_status::status(json),
         },
         #[cfg(feature = "bridge")]
         Cmd::Session { cmd } => match cmd {
@@ -1271,12 +1285,17 @@ mod tests {
         assert_eq!((session.as_str(), rule, image_dir), ("u", vec!["Bash(git status)".to_string(), "Read".to_string()], Some(std::path::PathBuf::from("/i"))));
         let Cmd::Wrapper { cmd: WrapperCmd::Install { mode: Some(WrapperModeArg::Remote), write: true, .. } } = cmd(&["wrapper", "install", "--write", "--mode", "remote"]) else { panic!("wrapper install --mode") };
         let Cmd::Wrapper { cmd: WrapperCmd::Install { mode: None, .. } } = cmd(&["wrapper", "install"]) else { panic!("wrapper install") };
+        let Cmd::Wrapper { cmd: WrapperCmd::Uninstall { write: true } } = cmd(&["wrapper", "uninstall", "--write"]) else { panic!("wrapper uninstall --write") };
+        let Cmd::Wrapper { cmd: WrapperCmd::Uninstall { write: false } } = cmd(&["wrapper", "uninstall"]) else { panic!("wrapper uninstall") };
         assert_eq!(WrapperModeArg::Passthrough.mode().name(), "passthrough");
         assert_eq!(WrapperModeArg::Remote.mode().name(), "remote");
         for bad in [
             &["box", "seed", "--max-mib", "0"][..],
             &["box", "fetch", "--max-mib", "1025"],
             &["wrapper", "install", "--mode", "local-child"],
+            // uninstall leaves bridge.toml and initialPermissionMode alone: no --mode, no --permission-mode.
+            &["wrapper", "uninstall", "--mode", "remote"],
+            &["wrapper", "uninstall", "--permission-mode", "plan"],
             &["vm", "warm", "/w", "--dry-run", "--prewarm"],
             &["vm", "warm", "--dry-run"],
             &["session", "drop-transport"],
@@ -1355,6 +1374,19 @@ mod tests {
         assert!(about("egress").ends_with("; allow as ai-env-deployer)"), "{}", about("egress"));
         let doctor = about("doctor");
         assert!(doctor.ends_with("(exit 1 when any row is [NO ], 5 when AWS refuses the key of the identity ai-env as declared)") && !doctor.contains("credentials are unavailable"), "{doctor}");
+    }
+
+    /// `wrapper status` parses with and without `--json`, takes nothing else
+    /// (it writes nothing: no `--write`), and its help says it is read-only.
+    #[test]
+    fn wrapper_status_parses_with_its_json_flag() {
+        let Cmd::Wrapper { cmd: WrapperCmd::Status { json: false } } = cmd(&["wrapper", "status"]) else { panic!("wrapper status") };
+        let Cmd::Wrapper { cmd: WrapperCmd::Status { json: true } } = cmd(&["wrapper", "status", "--json"]) else { panic!("wrapper status --json") };
+        for bad in [&["wrapper", "status", "--write"][..], &["wrapper", "status", "--mode", "remote"], &["wrapper", "status", "now"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let help = long_help("wrapper", "status");
+        assert!(help.contains("(read-only: no AWS, no Touch ID)") && help.contains("--json"), "{help}");
     }
 }
 

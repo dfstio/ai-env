@@ -58,21 +58,18 @@ impl Ctx {
         Ok(Ctx { paths: paths.clone(), cfg: cfg.clone(), knobs })
     }
 
-    /// The `vm` checks of `cfg` ([`Ctx::load`]'s) and the lab knobs, announced when active.
+    /// The `vm` checks of `cfg` ([`Ctx::load`]'s, [`config_checks`]) and the lab knobs, announced when active.
     fn checked(paths: &Paths, cfg: &BridgeConfig) -> Result<VmKnobs> {
-        cfg.vm.validate()?;
-        cfg.aws.validate_egress()?;
-        cfg.egress.validate()?;
-        if cfg.egress.names_no_resolver() {
-            // Reported, never refused: S5's first form still parses, and only the credential gate depends on it.
-            let newest = crate::bridge::egress::newest_dns_path(paths);
-            let fix = crate::bridge::egress::pin_suggestion(newest.as_ref().ok().and_then(Option::as_deref));
-            // Without the rows the suggestion can only be the placeholder: say why.
-            let unread = newest.err().map(|e| format!(" (the dns-path rows cannot be read: {e})")).unwrap_or_default();
-            crate::bridge::voice::warn(&format!("{TRUE_ACCEPTS_NOTHING}; only no-dns passes the credential gate: in {}: {fix}{unread}", paths.config.display()));
-        }
-        CredentialsSource::parse(&cfg.aws.credentials)?;
-        cfg.transport.validate()?;
+        config_checks(cfg, || {
+            if cfg.egress.names_no_resolver() {
+                // Reported, never refused: S5's first form still parses, and only the credential gate depends on it.
+                let newest = crate::bridge::egress::newest_dns_path(paths);
+                let fix = crate::bridge::egress::pin_suggestion(newest.as_ref().ok().and_then(Option::as_deref));
+                // Without the rows the suggestion can only be the placeholder: say why.
+                let unread = newest.err().map(|e| format!(" (the dns-path rows cannot be read: {e})")).unwrap_or_default();
+                crate::bridge::voice::warn(&format!("{TRUE_ACCEPTS_NOTHING}; only no-dns passes the credential gate: in {}: {fix}{unread}", paths.config.display()));
+            }
+        })?;
         let knobs = vm_knobs();
         knobs.agent_addr().map_err(CliError::Usage)?;
         announce(&knobs);
@@ -107,6 +104,23 @@ impl Ctx {
     pub(crate) fn backoff(&self) -> health::Backoff {
         health::Backoff::HEALTH.scaled(self.knobs.backoff_ms)
     }
+}
+
+/// The checks of `cfg` that [`Ctx::checked`] runs before a `vm`/`lab` command
+/// or a remote session (S8 P0, after `[wrapper]` and `[seed]`) does anything,
+/// in its order: `[vm]`'s ranges, the S5 egress keys of `[aws]`, `[egress]`,
+/// `[aws].credentials`, `[transport]`; the first that fails is the error
+/// (exit 1 naming the key). Pure: nothing is read or printed here, and
+/// `egress_checked` runs once the egress keys pass, before the rest (where
+/// `Ctx::checked` reports the legacy `accept_platform_dns = true`; `ai-env
+/// wrapper status` gives nothing).
+pub(crate) fn config_checks(cfg: &BridgeConfig, egress_checked: impl FnOnce()) -> std::result::Result<(), BridgeError> {
+    cfg.vm.validate()?;
+    cfg.aws.validate_egress()?;
+    cfg.egress.validate()?;
+    egress_checked();
+    CredentialsSource::parse(&cfg.aws.credentials)?;
+    cfg.transport.validate()
 }
 
 fn announce(knobs: &VmKnobs) {

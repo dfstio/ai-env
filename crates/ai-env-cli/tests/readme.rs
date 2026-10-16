@@ -156,8 +156,10 @@ impl DryForm {
 /// nor age. Not listed on purpose: `vm status` and `vm health` (they
 /// rewrite the VM's row), `vm terminate`, `vm exec`, `egress check` (no dry
 /// form).
-const DRY_FORMS: [DryForm; 14] = [
+const DRY_FORMS: [DryForm; 16] = [
     DryForm::new(&["wrapper", "install"], Dry::Drop("--write"), &[0], &["dry run"], 0, Api::None, false),
+    DryForm::new(&["wrapper", "uninstall"], Dry::Drop("--write"), &[0], &["nothing to remove", "dry run"], 0, Api::None, false),
+    DryForm::new(&["wrapper", "status"], Dry::AsIs, &[0], &["claudeCode.claudeProcessWrapper"], 0, Api::None, false),
     DryForm::new(&["wrapper", "settings-sync"], Dry::Drop("--write"), &[0], &[], 0, Api::None, false),
     DryForm::new(&["vm", "gc"], Dry::Drop("--yes"), &[0], &[], 1, Api::Reads, false),
     DryForm::new(&["creds", "forget"], Dry::Drop("--yes"), &[0], &[], 0, Api::None, false),

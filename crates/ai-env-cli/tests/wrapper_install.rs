@@ -1,4 +1,4 @@
-//! `ai-env wrapper install` and `ai-env wrapper census` — compiled only with
+//! `ai-env wrapper install`, `uninstall` and `census` — compiled only with
 //! `bridge`. Every command runs with the child's `HOME` and
 //! `AI_ENV_BRIDGE_DIR` under a tempdir, so Cursor's real `settings.json`
 //! (`~/Library/Application Support/Cursor/User`) and the developer's
@@ -256,6 +256,18 @@ fn wrapper_help_lists_install_and_census() {
     let stdout = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
     assert!(stdout.contains("install") && stdout.contains("census") && stdout.contains("settings-sync"), "{stdout}");
+    assert!(stdout.lines().any(|l| l.trim_start().starts_with("uninstall ")), "{stdout}");
+    // A subcommand line: the about text's "show its status" would satisfy a bare contains.
+    assert!(stdout.lines().any(|l| l.trim_start().starts_with("status ")), "{stdout}");
+    let out = Home::new().run(&["status", "--help"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert!(stdout.contains("--json") && !stdout.contains("--write"), "{stdout}");
+    // uninstall leaves bridge.toml and initialPermissionMode alone: --write is its one flag.
+    let out = Home::new().run(&["uninstall", "--help"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert!(stdout.contains("--write") && !stdout.contains("--mode") && !stdout.contains("--permission-mode"), "{stdout}");
     let out = Home::new().run(&["install", "--help"]);
     let stdout = text(&out.stdout);
     assert!(stdout.contains("--write") && stdout.contains("--permission-mode <M>"), "{stdout}");
@@ -291,9 +303,19 @@ fn install_dry_run_writes_nothing_and_prints_the_snippet() {
     assert_eq!(parse_settings(&snip).unwrap()[WRAPPER_SETTING], w, "the snippet is valid JSON");
     assert!(stdout.contains("re-run with --write"), "{stdout}");
     assert!(!stdout.contains("backup:") && !stdout.contains("wrote:"), "{stdout}");
-    for line in ["disableLoginPrompt is left alone (set it only once S8 runs Cursor's sessions in MicroVMs", "Manual mode", "--permission-mode default", "Reload the Cursor window", "Cursor still updates the extension", "CLAUDE_CONFIG_DIR", "AI_ENV_BRIDGE_LOCAL=1"] {
+    for line in [
+        "disableLoginPrompt is left alone (set it only once S8 runs Cursor's sessions in MicroVMs",
+        "Manual mode",
+        "--permission-mode default",
+        "Cursor reads this setting each time it starts a process: chats it starts from now on use it; a chat already running keeps its process until it ends",
+        "Cursor still updates the extension",
+        "CLAUDE_CONFIG_DIR",
+        "AI_ENV_BRIDGE_LOCAL=1",
+    ] {
         assert!(stdout.contains(line), "{line}: {stdout}");
     }
+    // G1: no advice to reload (a reload restarts the open chats through the wrapper).
+    assert!(!stdout.contains("Reload the Cursor window"), "{stdout}");
     assert_target_warning(&stderr);
     assert!(!home.settings_path().exists() && !home.settings_dir().exists(), "a dry run creates nothing");
     assert!(!home.bridge_dir().exists(), "a dry run touches no bridge state");
@@ -474,6 +496,581 @@ fn install_refuses_a_symlinked_settings_file() {
     assert!(std::fs::symlink_metadata(home.settings_path()).unwrap().file_type().is_symlink(), "the link is untouched");
     assert!(home.backups().is_empty(), "no backup of a refused edit");
     assert!(!home.settings_dir().join(".settings.json.tmp").exists());
+}
+
+// ---- wrapper uninstall ------------------------------------------------------------
+
+/// The line `uninstall` prints when it refuses to edit the file.
+fn remove_by_hand(home: &Home) -> String {
+    format!("remove {} from {} by hand\n", json_str(WRAPPER_SETTING), home.settings_path().display())
+}
+
+/// `uninstall` without `--write`: no settings file is nothing to remove and
+/// creates nothing (`--write` neither); a set key prints `-> unset` with the
+/// mode left alone, what Cursor would do after `--write` (never as done: the
+/// key is still set, so a reload still restarts the open chats through the
+/// wrapper) and the undo, and the file stays byte for byte, no backup.
+#[test]
+fn uninstall_dry_run_writes_nothing() {
+    let home = Home::new();
+    for args in [&["uninstall"][..], &["uninstall", "--write"]] {
+        let out = home.run(args);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stdout}{stderr}");
+        assert_eq!(stdout, format!("settings: {} (absent)\n  {WRAPPER_SETTING}: unset (nothing to remove)\n", home.settings_path().display()), "{args:?}");
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+    }
+    assert!(!home.settings_dir().exists() && !home.bridge_dir().exists(), "nothing created");
+
+    let w = sibling();
+    let w = w.to_str().unwrap();
+    let src = format!("{{\n  \"editor.tabSize\": 2,\n  {}: {},\n  {}: \"default\"\n}}\n", json_str(WRAPPER_SETTING), json_str(w), json_str(PERMISSION_SETTING));
+    home.write_settings(&src);
+    let out = home.run(&["uninstall"]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stderr.is_empty(), "no sibling looked for, no warning: {stderr}");
+    let settings = format!("settings: {}", home.settings_path().display());
+    let unset = format!("  {WRAPPER_SETTING}: {w:?} -> unset");
+    let mode = format!("  {PERMISSION_SETTING}: \"default\" (left alone)");
+    let spawn = format!("With --write, Cursor reads {WRAPPER_SETTING} at every spawn: what it starts from then on (a new chat, a reopened or restored one, its config probe) runs its bundled claude on this Mac: no ai-env-claude, no census, no MicroVM, no Touch ID.");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            settings.as_str(),
+            unset.as_str(),
+            mode.as_str(),
+            "dry run: nothing written; re-run with --write",
+            "",
+            spawn.as_str(),
+            "A chat already running keeps the process it started with; after the write, a window reload restarts the restored chats without the wrapper.",
+            "bridge.toml is left alone ([wrapper] mode unset: passthrough): ai-env wrapper install --write brings the wrapper back, in that mode, for what Cursor starts after it.",
+            "undo: ai-env wrapper install --write",
+        ]
+    );
+    assert!(!stdout.contains("from now on"), "nothing changed yet: {stdout}");
+    assert_eq!(home.settings_text(), src, "a dry run writes nothing");
+    assert!(home.backups().is_empty());
+    assert!(!home.bridge_dir().exists());
+}
+
+/// `uninstall --write` after `install --write --permission-mode manual`:
+/// the backup is the installed text byte for byte, with the file's mode;
+/// the file is that text without the wrapper's line (the mode, comments and
+/// trailing comma kept); no temp file is left, no bridge state touched, and
+/// the undo carries the mode. Again: nothing to remove, no backup.
+#[test]
+fn uninstall_write_backs_up_and_removes_only_the_wrapper_key() {
+    let home = Home::new();
+    let src = "{\n  // Cursor settings\n  \"claudeCode.preferredLocation\": \"panel\", /* keep */\n  \"editor.tabSize\": 2, // two\n  \"list\": [1, 2, ],\n}\n";
+    home.write_settings(src);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(home.settings_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let out = home.run(&["install", "--write", "--permission-mode", "manual"]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
+    let installed = home.settings_text();
+    let earlier = home.backups();
+
+    let out = home.run(&["uninstall", "--write"]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let backups: Vec<PathBuf> = home.backups().into_iter().filter(|b| !earlier.contains(b)).collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), installed, "the backup is the installed text, byte for byte");
+    let want = format!("{}  {}: \"manual\",\n}}\n", &src[..src.len() - 2], json_str(PERMISSION_SETTING));
+    assert_eq!(home.settings_text(), want, "only the wrapper's line goes");
+    for want in [
+        format!("  {PERMISSION_SETTING}: \"manual\" (left alone)"),
+        format!("backup: {}", backups[0].display()),
+        format!("wrote: {}", home.settings_path().display()),
+        // Written: what Cursor starts from now on, in the present tense.
+        format!("Cursor reads {WRAPPER_SETTING} at every spawn: what it starts from now on (a new chat, a reopened or restored one, its config probe) runs its bundled claude on this Mac: no ai-env-claude, no census, no MicroVM, no Touch ID."),
+        "A chat already running keeps the process it started with; a window reload restarts the restored chats without the wrapper.".to_string(),
+        "undo: ai-env wrapper install --write --permission-mode manual".to_string(),
+    ] {
+        assert!(stdout.lines().any(|l| l == want), "{want}: {stdout}");
+    }
+    assert!(!stdout.contains("note:") && !stdout.contains("dry run") && !stdout.contains("With --write") && !stdout.contains("after the write"), "{stdout}");
+    #[cfg(unix)]
+    {
+        assert_eq!(mode_of(&home.settings_path()), 0o644, "the file keeps its mode");
+        assert_eq!(mode_of(&backups[0]), 0o644, "the backup carries it");
+        assert!(!home.settings_dir().join(".settings.json.tmp").exists(), "no temp file left behind");
+    }
+    assert!(!home.bridge_dir().exists(), "uninstall touches no bridge state");
+
+    let out = home.run(&["uninstall", "--write"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert_eq!(stdout, format!("settings: {}\n  {WRAPPER_SETTING}: unset (nothing to remove)\n", home.settings_path().display()));
+    assert_eq!(home.settings_text(), want);
+    assert_eq!(home.backups().len(), earlier.len() + 1, "no backup when there is nothing to remove");
+}
+
+/// U4: install, uninstall, install gives back the installed bytes (the
+/// wrapper's key back just before the mode, not at the end), three
+/// backups in all.
+#[test]
+fn install_uninstall_install_gives_back_the_same_bytes() {
+    for src in ["{\n    \"editor.tabSize\": 2,\n    \"zebra\": \"last\"\n}\n", "{\n  // Cursor settings\n  \"list\": [1, 2, ],\n}\n"] {
+        let home = Home::new();
+        home.write_settings(src);
+        let mut texts = Vec::new();
+        for args in [&["install", "--write"][..], &["uninstall", "--write"], &["install", "--write"]] {
+            let out = home.run(args);
+            assert_eq!(out.status.code(), Some(0), "{args:?}: {}{}", text(&out.stdout), text(&out.stderr));
+            texts.push(home.settings_text());
+        }
+        assert_eq!(texts[2], texts[0], "{src:?}");
+        let removed = parse_settings(&texts[1]).unwrap();
+        assert!(removed.get(WRAPPER_SETTING).is_none() && removed[PERMISSION_SETTING] == "default", "{}", texts[1]);
+        assert_eq!(home.backups().len(), 3, "{:?}", home.backups());
+    }
+}
+
+/// `install --write` over the two values it writes changes nothing: no
+/// backup and no write, so settings.json keeps its bytes and its mtime
+/// (`ai-env wrapper status` weighs the census against the file's last
+/// change: a rewrite would leave it claiming nothing until Cursor's next
+/// spawn), and it says so, as the dry run does. `--mode` then writes
+/// bridge.toml alone when only its mode changes.
+#[test]
+fn install_over_the_same_values_writes_nothing() {
+    let home = Home::new();
+    home.write_settings("{\n  \"editor.tabSize\": 2\n}\n");
+    let out = home.run(&["install", "--write"]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
+    let installed = home.settings_text();
+    assert_eq!(home.backups().len(), 1);
+    // Dated back, as for a wrapper set long ago.
+    let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_788_000_000);
+    std::fs::File::options().write(true).open(home.settings_path()).unwrap().set_modified(long_ago).unwrap();
+    let mtime = || std::fs::metadata(home.settings_path()).unwrap().modified().unwrap();
+    let w = sibling();
+    let w = w.to_str().unwrap();
+    for args in [&["install", "--write"][..], &["install"]] {
+        let out = home.run(args);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stdout}{}", text(&out.stderr));
+        for want in [format!("  {WRAPPER_SETTING}: {w:?} (unchanged)"), format!("  {PERMISSION_SETTING}: \"default\" (unchanged)"), "settings: nothing to write".to_string()] {
+            assert!(stdout.lines().any(|l| l == want), "{args:?} {want}: {stdout}");
+        }
+        assert!(!stdout.contains("backup:") && !stdout.contains("wrote:") && !stdout.contains("dry run"), "{args:?}: {stdout}");
+        assert_eq!((home.settings_text(), mtime(), home.backups().len()), (installed.clone(), long_ago, 1), "{args:?}: neither written nor backed up");
+    }
+    // --mode over the same two keys: bridge.toml is written, settings.json is not.
+    std::fs::create_dir_all(home.bridge_dir()).unwrap();
+    std::fs::write(home.bridge_toml(), "[workspaces]\nroots = [\"/w\"]\n").unwrap();
+    let out = home.run(&["install", "--write", "--mode", "remote"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert!(stdout.lines().any(|l| l == "settings: nothing to write") && stdout.lines().any(|l| l == format!("wrote: {}", home.bridge_toml().display())), "{stdout}");
+    assert_eq!(std::fs::read_to_string(home.bridge_toml()).unwrap(), "[workspaces]\nroots = [\"/w\"]\n\n[wrapper]\nmode = \"remote\"\n");
+    assert_eq!((home.settings_text(), mtime(), home.backups().len()), (installed, long_ago, 1), "settings.json untouched");
+}
+
+/// A symlinked or unparseable settings file is exit 1, naming the key to
+/// remove by hand: nothing written, no backup.
+#[cfg(unix)]
+#[test]
+fn uninstall_refuses_a_symlink_or_an_unparseable_file() {
+    let home = Home::new();
+    let set = format!("{{{}: \"/x/ai-env-claude\"}}\n", json_str(WRAPPER_SETTING));
+    let real = home.path().join("elsewhere").join("settings.json");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, &set).unwrap();
+    std::fs::create_dir_all(home.settings_dir()).unwrap();
+    std::os::unix::fs::symlink(&real, home.settings_path()).unwrap();
+    let out = home.run(&["uninstall", "--write"]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(stderr.starts_with("ai-env: ") && stderr.contains("is a symlink"), "{stderr}");
+    assert_eq!(stdout, remove_by_hand(&home));
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), set, "the target is untouched");
+    assert!(std::fs::symlink_metadata(home.settings_path()).unwrap().file_type().is_symlink(), "the link is untouched");
+
+    std::fs::remove_file(home.settings_path()).unwrap();
+    let broken = format!("{{\n  {}: \"/x/ai-env-claude\"\n  \"a\": 1\n}}\n", json_str(WRAPPER_SETTING));
+    home.write_settings(&broken);
+    for args in [&["uninstall"][..], &["uninstall", "--write"]] {
+        let out = home.run(args);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stdout}{stderr}");
+        assert!(stderr.starts_with(&format!("ai-env: cannot parse {}", home.settings_path().display())), "{stderr}");
+        assert_eq!(stdout, remove_by_hand(&home));
+        assert_eq!(home.settings_text(), broken);
+    }
+    assert!(home.backups().is_empty(), "no backup of a refused edit");
+    assert!(!home.settings_dir().join(".settings.json.tmp").exists());
+}
+
+/// `uninstall` needs no `ai-env-claude` (it still works once `cargo clean`
+/// broke Cursor's wrapper): ai-env alone in a directory, nothing on PATH.
+#[cfg(unix)]
+#[test]
+fn uninstall_needs_no_ai_env_claude() {
+    let alone = tempfile::tempdir().unwrap();
+    let copy = alone.path().join("ai-env");
+    std::fs::copy(ai_env(), &copy).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = Home::new();
+    let src = format!("{{\n  \"a\": 1,\n  {}: {},\n  {}: \"default\"\n}}\n", json_str(WRAPPER_SETTING), json_str(sibling().to_str().unwrap()), json_str(PERMISSION_SETTING));
+    home.write_settings(&src);
+    let mut cmd = home.command(copy.to_str().unwrap(), &["uninstall", "--write"]);
+    cmd.env("PATH", "/nonexistent");
+    let out = bounded::run_within(cmd, None, LIMIT, "the copied ai-env");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(home.settings_text(), format!("{{\n  \"a\": 1,\n  {}: \"default\"\n}}\n", json_str(PERMISSION_SETTING)));
+    assert_eq!(home.backups().len(), 1);
+}
+
+/// A wrapper that is no `ai-env-claude` is removed all the same, with a
+/// note (the backup keeps it), and so is every top-level copy of the key,
+/// with a note; a mode the undo cannot carry is named.
+#[test]
+fn uninstall_notes_a_foreign_wrapper_and_duplicates() {
+    let home = Home::new();
+    let foreign = format!("{{\n  {}: \"/opt/other/claude-wrapper\"\n}}\n", json_str(WRAPPER_SETTING));
+    home.write_settings(&foreign);
+    let out = home.run(&["uninstall", "--write"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    for want in [
+        format!("  {WRAPPER_SETTING}: \"/opt/other/claude-wrapper\" -> unset"),
+        format!("  {PERMISSION_SETTING}: unset (left alone)"),
+        "note: \"/opt/other/claude-wrapper\" is not an ai-env-claude; removed all the same (the backup keeps it)".to_string(),
+        "undo: ai-env wrapper install --write".to_string(),
+        format!("note: install sets {PERMISSION_SETTING} to \"default\" (now unset)"),
+    ] {
+        assert!(stdout.lines().any(|l| l == want), "{want}: {stdout}");
+    }
+    assert!(!stdout.contains("times"), "{stdout}");
+    assert_eq!(home.settings_text(), "{\n}\n");
+    assert_eq!(std::fs::read_to_string(&home.backups()[0]).unwrap(), foreign, "the backup keeps it");
+
+    let home = Home::new();
+    let twice = format!("{{\n  {w}: \"/old/ai-env-claude\",\n  \"a\": 1,\n  {w}: \"/new/ai-env-claude\"\n}}\n", w = json_str(WRAPPER_SETTING));
+    home.write_settings(&twice);
+    let out = home.run(&["uninstall", "--write"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    for want in [format!("  {WRAPPER_SETTING}: \"/new/ai-env-claude\" -> unset"), format!("note: {WRAPPER_SETTING} was set 2 times; every one is removed")] {
+        assert!(stdout.lines().any(|l| l == want), "{want}: {stdout}");
+    }
+    assert!(!stdout.contains("is not an ai-env-claude"), "{stdout}");
+    assert_eq!(home.settings_text(), "{\n  \"a\": 1\n}\n");
+}
+
+/// The bridge.toml line names the mode the wrapper comes back in, as
+/// ai-env-claude reads the file: a value it cannot read, or one that names
+/// no mode, is remote, and then, as in a remote file that does not load, a
+/// chat under the roots fails closed (a note says so: with a root, or roots
+/// it cannot read; with none no chat goes remote, and no note); so it does
+/// when a remote file with a root fails another check of the session's
+/// start (no `[aws]`, a name the session's environment may not hold), the
+/// note naming that exit code. The undo carries `--permission-mode` when
+/// install would pick another mode than today's
+/// (`[wrapper].initial_permission_mode`), or would refuse bridge.toml's: run
+/// dry, install takes it and writes today's mode whenever it accepts that.
+/// bridge.toml is never written.
+#[test]
+fn uninstall_reads_bridge_toml_as_the_wrapper_and_install_do() {
+    let left_alone = |mode: &str| format!("bridge.toml is left alone ({mode}): ai-env wrapper install --write brings the wrapper back, in that mode, for what Cursor starts after it.");
+    let closed_with = |code: i32| format!("note: with the wrapper back, every Cursor chat under bridge.toml's roots (every chat, when they cannot be read) exits {code} naming the error until bridge.toml is fixed (ai-env wrapper status shows it)");
+    let closed = closed_with(1);
+    let undo = "undo: ai-env wrapper install --write".to_string();
+    let with_flag = |m: &str| format!("{undo} --permission-mode {m}");
+    let refused = |was: &str| format!("note: install refuses bridge.toml's [wrapper].initial_permission_mode = \"bogus\": the undo sets {PERMISSION_SETTING} to \"default\" (now {was})");
+    let (remote, unreadable) = (left_alone("[wrapper] mode = \"remote\""), left_alone("[wrapper] mode unreadable: remote"));
+    let plan = "[wrapper]\nmode = \"remote\"\ninitial_permission_mode = \"plan\"\n";
+    let bogus = "[wrapper]\nmode = \"remote\"\ninitial_permission_mode = \"bogus\"\n";
+    // A root, and the [aws] a remote session's run plan needs (the documentation account's made-up ARNs).
+    let rooted = "[wrapper]\nmode = \"remote\"\n[workspaces]\nroots = [\"/w\"]\n";
+    let aws = "[aws]\nimage_arn = \"arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env\"\negress_connector_arn = \"arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress\"\n";
+    let (planned, refusing) = (format!("{rooted}{aws}"), format!("[wrapper]\nmode = \"remote\"\nenv_extra = [\"NODE_OPTIONS\"]\n[workspaces]\nroots = [\"/w\"]\n{aws}"));
+    // (bridge.toml, today's mode, the report from the bridge.toml line on, the mode the undo writes)
+    let cases = [
+        // The plan's form; the undo weighs today's mode against bridge.toml's, not "default".
+        (plan, Some("plan"), vec![remote.clone(), undo.clone()], "plan"),
+        (plan, Some("default"), vec![remote.clone(), with_flag("default")], "default"),
+        (plan, None, vec![remote.clone(), undo.clone(), format!("note: install sets {PERMISSION_SETTING} to \"plan\" (now unset)")], "plan"),
+        ("[wrapper]\nmode = \"passthrough\"\n", Some("default"), vec![left_alone("[wrapper] mode = \"passthrough\""), undo.clone()], "default"),
+        // Not TOML (its roots unreadable: every chat counts as under them), no string, no mode: remote, as the
+        // wrapper takes them; with a root, a chat under it fails closed.
+        ("[wrapper]\nmode = \"remote\"\n[workspaces\nroots = [\"/w\"]\n", Some("default"), vec![unreadable.clone(), closed.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = 1\n[workspaces]\nroots = [\"/w\"]\n", Some("default"), vec![unreadable.clone(), closed.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"bogus\"\n[workspaces]\nroots = [\"/w\"]\n", Some("default"), vec![left_alone("[wrapper] mode = \"bogus\": remote"), closed.clone(), undo.clone()], "default"),
+        // With no root, no chat goes remote: none fails closed, no note.
+        ("[wrapper]\nmode = 1\n", Some("default"), vec![unreadable.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"bogus\"\n", Some("default"), vec![left_alone("[wrapper] mode = \"bogus\": remote"), undo.clone()], "default"),
+        // A file that does not load: remote fails closed under its roots, passthrough runs on this Mac.
+        ("[wrapper]\nmode = \"remote\"\nnope = 1\n[workspaces]\nroots = [\"/w\"]\n", Some("default"), vec![remote.clone(), closed.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"remote\"\nnope = 1\n", Some("default"), vec![remote.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"passthrough\"\nnope = 1\n", Some("default"), vec![left_alone("[wrapper] mode = \"passthrough\""), undo.clone()], "default"),
+        // An initial_permission_mode install refuses: the undo names one it takes.
+        (bogus, None, vec![remote.clone(), with_flag("default"), refused("unset")], "default"),
+        (bogus, Some("bogus"), vec![remote.clone(), with_flag("default"), refused("\"bogus\"")], "default"),
+        (bogus, Some("plan"), vec![remote.clone(), with_flag("plan")], "plan"),
+        // With a root, the other checks of a remote session's start: no [aws] (exit 1), a name P0 refuses (exit 9), none.
+        (rooted, Some("default"), vec![remote.clone(), closed.clone(), undo.clone()], "default"),
+        (refusing.as_str(), Some("default"), vec![remote.clone(), closed_with(9), undo.clone()], "default"),
+        (planned.as_str(), Some("default"), vec![remote.clone(), undo.clone()], "default"),
+    ];
+    let home = Home::new();
+    std::fs::create_dir_all(home.bridge_dir()).unwrap();
+    let settings = |now: Option<&str>| {
+        let mode = now.map_or_else(String::new, |m| format!(",\n  {}: {}", json_str(PERMISSION_SETTING), json_str(m)));
+        format!("{{\n  {}: \"/x/ai-env-claude\"{mode}\n}}\n", json_str(WRAPPER_SETTING))
+    };
+    // From the bridge.toml line to the end.
+    let tail = |stdout: &str| -> Vec<String> { stdout.lines().skip_while(|l| !l.starts_with("bridge.toml is left alone")).map(str::to_string).collect() };
+    for (toml, now, want, after) in cases {
+        std::fs::write(home.bridge_toml(), toml).unwrap();
+        home.write_settings(&settings(now));
+        let out = home.run(&["uninstall"]);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{toml:?} {now:?}: {stdout}{stderr}");
+        assert!(stderr.is_empty(), "{toml:?} {now:?}: {stderr}");
+        assert_eq!(tail(&stdout), want, "{toml:?} {now:?}");
+        let undo_args: Vec<&str> = want.iter().find_map(|l| l.strip_prefix("undo: ai-env wrapper ")).unwrap().split(' ').filter(|a| *a != "--write").collect();
+        let out = home.run(&undo_args);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{toml:?} {undo_args:?}: {stdout}{}", text(&out.stderr));
+        assert!(stdout.contains(&snippet(sibling().to_str().unwrap(), after)), "{toml:?} {undo_args:?}: {stdout}");
+        assert_eq!(std::fs::read_to_string(home.bridge_toml()).unwrap(), toml);
+    }
+    // Why the flag: install without it refuses bridge.toml's value.
+    std::fs::write(home.bridge_toml(), bogus).unwrap();
+    let out = home.run(&["install"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+
+    // --write edits settings.json only: bridge.toml byte for byte, no backup of it.
+    std::fs::write(home.bridge_toml(), plan).unwrap();
+    home.write_settings(&settings(Some("plan")));
+    let out = home.run(&["uninstall", "--write"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert_eq!(tail(&stdout), [remote.clone(), undo.clone()]);
+    assert_eq!(home.settings_text(), format!("{{\n  {}: \"plan\"\n}}\n", json_str(PERMISSION_SETTING)));
+    assert_eq!(std::fs::read_to_string(home.bridge_toml()).unwrap(), plan);
+    assert!(home.bridge_backups().is_empty(), "{:?}", home.bridge_backups());
+
+    // A bridge.toml that cannot be read is remote to the wrapper too (root reads through the mode: skipped).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(home.bridge_toml(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        home.write_settings(&settings(Some("default")));
+        let readable = std::fs::read(home.bridge_toml()).is_ok();
+        let out = home.run(&["uninstall"]);
+        std::fs::set_permissions(home.bridge_toml(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+        if readable {
+            eprintln!("root reads a mode-000 file: skipped");
+        } else {
+            assert_eq!(tail(&stdout), [unreadable, closed, undo]);
+        }
+    }
+}
+
+/// Cursor's `claudeCode.environmentVariables`, which the extension hands to
+/// every process it starts (the wrapper too, once install brings it back),
+/// weigh in the bridge.toml line as `ai-env wrapper status` weighs them: the
+/// kill switch (exactly `1`) runs every chat on this Mac whatever the mode;
+/// an `AI_ENV_BRIDGE_MODE` that names a mode wins over bridge.toml's, the
+/// fail-closed note following it (remote over a `[wrapper] mode` the
+/// wrapper does not know still fails closed: the session's start refuses
+/// the key; with no root no chat goes remote, and no note), and one that
+/// names none is ignored; a
+/// bridge root or bridge.toml other than this command's is named (scrubbed)
+/// and its mode never claimed. Read from a list or an object, the last
+/// entry winning. No other variable shows, by name or by value, and nothing
+/// reaches stderr (a value that names no mode is never handed to the
+/// wrapper's own reading, which would say so there).
+#[test]
+fn uninstall_weighs_cursors_variables_as_status_does() {
+    use ai_env_cli::bridge::wrapper_status::ENV_SETTING;
+    let home = Home::new();
+    std::fs::create_dir_all(home.bridge_dir()).unwrap();
+    // Built at run time: no secret-shaped literal in the source.
+    let secret_name = format!("{}_{}", "PLANTED", "API_KEY");
+    let secret_value = format!("pv-{}", "q".repeat(40));
+    let token = format!("{}oat01-{}", "sk-ant-", "Z".repeat(30));
+    let in_cursor = format!("Cursor's {ENV_SETTING}");
+    let back = "ai-env wrapper install --write brings the wrapper back";
+    let left_alone = |mode: &str, how: &str| format!("bridge.toml is left alone ({mode}): {back}, {how}, for what Cursor starts after it.");
+    let over = |m: &str| format!("in {m} mode, which AI_ENV_BRIDGE_MODE in {in_cursor} sets over bridge.toml's");
+    let kill = format!("bridge.toml is left alone: {back}, but the kill switch (AI_ENV_BRIDGE_LOCAL=1 in {in_cursor}) still runs every chat on this Mac.");
+    let closed = "note: with the wrapper back, every Cursor chat under bridge.toml's roots (every chat, when they cannot be read) exits 1 naming the error until bridge.toml is fixed (ai-env wrapper status shows it)".to_string();
+    let undo = "undo: ai-env wrapper install --write".to_string();
+    let elsewhere = home.path().join("elsewhere");
+    let dir = |v: &str| format!("AI_ENV_BRIDGE_DIR={v:?}");
+    let another = |vars: &str, how: &str| format!("bridge.toml is left alone, but the wrapper reads another bridge root ({vars} in {in_cursor}): {back}, {how}, for what Cursor starts after it (ai-env wrapper status shows the variables).");
+    let (remote, broken_remote) = ("[wrapper]\nmode = \"remote\"\n", "[wrapper]\nmode = \"remote\"\nnope = 1\n");
+    let (passthrough, broken_passthrough) = ("[wrapper]\nmode = \"passthrough\"\n", "[wrapper]\nmode = \"passthrough\"\nnope = 1\n");
+    // The same two files that do not load, with a root to route on.
+    let (rooted_remote, rooted_passthrough) = (format!("{broken_remote}[workspaces]\nroots = [\"/w\"]\n"), format!("{broken_passthrough}[workspaces]\nroots = [\"/w\"]\n"));
+    let var = |name: &str, value: serde_json::Value| serde_json::json!({ "name": name, "value": value });
+    // (bridge.toml, Cursor's variables, the lines from the bridge.toml line on)
+    let cases: Vec<(&str, serde_json::Value, Vec<String>)> = vec![
+        // (a) The kill switch, as a list entry or an object's number: over remote, over a file that fails closed.
+        (remote, serde_json::json!([var("AI_ENV_BRIDGE_LOCAL", "1".into())]), vec![kill.clone(), undo.clone()]),
+        ("[wrapper]\nmode = \"remotely\"\n", serde_json::json!({ "AI_ENV_BRIDGE_LOCAL": 1, "AI_ENV_BRIDGE_MODE": "remote" }), vec![kill.clone(), undo.clone()]),
+        // Anything but exactly 1 is no kill switch; the last entry of a name wins.
+        (remote, serde_json::json!([var("AI_ENV_BRIDGE_LOCAL", "true".into())]), vec![left_alone("[wrapper] mode = \"remote\"", "in that mode"), undo.clone()]),
+        (remote, serde_json::json!([var("AI_ENV_BRIDGE_LOCAL", "1".into()), var("AI_ENV_BRIDGE_LOCAL", "0".into())]), vec![left_alone("[wrapper] mode = \"remote\"", "in that mode"), undo.clone()]),
+        // (b) A mode named wins over bridge.toml's, and the note follows the mode the chats get.
+        (passthrough, serde_json::json!([var("AI_ENV_BRIDGE_MODE", "remote".into())]), vec![left_alone("[wrapper] mode = \"passthrough\"", &over("remote")), undo.clone()]),
+        (remote, serde_json::json!({ "AI_ENV_BRIDGE_MODE": "passthrough" }), vec![left_alone("[wrapper] mode = \"remote\"", &over("passthrough")), undo.clone()]),
+        (rooted_passthrough.as_str(), serde_json::json!([var("AI_ENV_BRIDGE_MODE", "remote".into())]), vec![left_alone("[wrapper] mode = \"passthrough\"", &over("remote")), closed.clone(), undo.clone()]),
+        // With no root no chat goes remote: no note.
+        (broken_passthrough, serde_json::json!([var("AI_ENV_BRIDGE_MODE", "remote".into())]), vec![left_alone("[wrapper] mode = \"passthrough\"", &over("remote")), undo.clone()]),
+        (broken_remote, serde_json::json!([var("AI_ENV_BRIDGE_MODE", "passthrough".into())]), vec![left_alone("[wrapper] mode = \"remote\"", &over("passthrough")), undo.clone()]),
+        ("[wrapper]\nmode = \"bogus\"\n", serde_json::json!([var("AI_ENV_BRIDGE_MODE", "local-child".into())]), vec![left_alone("[wrapper] mode = \"bogus\": remote", &over("local-child")), undo.clone()]),
+        // Remote named over a mode bridge.toml does not name: the session's start still refuses the key.
+        ("[wrapper]\nmode = \"remotely\"\n[workspaces]\nroots = [\"/w\"]\n", serde_json::json!([var("AI_ENV_BRIDGE_MODE", "remote".into())]), vec![left_alone("[wrapper] mode = \"remotely\": remote", &over("remote")), closed.clone(), undo.clone()]),
+        // One that names no mode is ignored, its value never shown.
+        (rooted_remote.as_str(), serde_json::json!([var("AI_ENV_BRIDGE_MODE", token.clone().into())]), vec![left_alone("[wrapper] mode = \"remote\"", "in that mode"), closed.clone(), undo.clone()]),
+        (broken_remote, serde_json::json!([var("AI_ENV_BRIDGE_MODE", token.clone().into())]), vec![left_alone("[wrapper] mode = \"remote\"", "in that mode"), undo.clone()]),
+        // (c) Another bridge root or bridge.toml: named, scrubbed and capped, its mode never claimed, no note.
+        (
+            broken_remote,
+            serde_json::json!([var("AI_ENV_BRIDGE_DIR", format!("{}/{token}", elsewhere.display()).into())]),
+            vec![another(&dir(&format!("{}/sk-ant-[redacted:len={}]", elsewhere.display(), token.len())), "in the mode the bridge.toml there names"), undo.clone()],
+        ),
+        (
+            remote,
+            serde_json::json!({ "AI_ENV_BRIDGE_CONFIG": elsewhere.join("bridge.toml"), "AI_ENV_BRIDGE_DIR": elsewhere, "AI_ENV_BRIDGE_MODE": "passthrough" }),
+            vec![
+                another(&format!("{} and AI_ENV_BRIDGE_CONFIG={:?}", dir(&elsewhere.display().to_string()), elsewhere.join("bridge.toml").display().to_string()), &format!("in passthrough mode (AI_ENV_BRIDGE_MODE in {in_cursor})")),
+                undo.clone(),
+            ],
+        ),
+        // This command's own root and bridge.toml are no other.
+        (remote, serde_json::json!({ "AI_ENV_BRIDGE_DIR": home.bridge_dir(), "AI_ENV_BRIDGE_CONFIG": home.bridge_toml() }), vec![left_alone("[wrapper] mode = \"remote\"", "in that mode"), undo.clone()]),
+    ];
+    let tail = |stdout: &str| -> Vec<String> { stdout.lines().skip_while(|l| !l.starts_with("bridge.toml is left alone")).map(str::to_string).collect() };
+    for (toml, mut vars, want) in cases {
+        std::fs::write(home.bridge_toml(), toml).unwrap();
+        // The planted variable comes first: never shown, and never the one that wins.
+        match &mut vars {
+            serde_json::Value::Array(list) => list.insert(0, var(&secret_name, secret_value.clone().into())),
+            serde_json::Value::Object(names) => {
+                names.insert(secret_name.clone(), secret_value.clone().into());
+            }
+            _ => unreachable!(),
+        }
+        let settings = serde_json::json!({ WRAPPER_SETTING: "/x/ai-env-claude", PERMISSION_SETTING: "default", ENV_SETTING: vars });
+        home.write_settings(&settings.to_string());
+        let out = home.run(&["uninstall"]);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{settings}: {stdout}{stderr}");
+        assert!(stderr.is_empty(), "{settings}: {stderr}");
+        assert_eq!(tail(&stdout), want, "{settings}");
+        for never in [&secret_name, &secret_value, &token] {
+            assert!(!stdout.contains(never.as_str()), "{never} shown: {stdout}");
+        }
+        assert_eq!(std::fs::read_to_string(home.bridge_toml()).unwrap(), toml);
+    }
+    // --write says the same, and edits settings.json only: the variables stay.
+    let settings = serde_json::json!({ WRAPPER_SETTING: "/x/ai-env-claude", PERMISSION_SETTING: "default", ENV_SETTING: [var("AI_ENV_BRIDGE_LOCAL", "1".into())] });
+    home.write_settings(&settings.to_string());
+    let out = home.run(&["uninstall", "--write"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert_eq!(tail(&stdout), [kill, undo]);
+    assert_eq!(parse_settings(&home.settings_text()).unwrap(), serde_json::json!({ PERMISSION_SETTING: "default", ENV_SETTING: [var("AI_ENV_BRIDGE_LOCAL", "1".into())] }));
+}
+
+/// A `[wrapper] mode` that looks like a token (built at run time) never
+/// shows raw in uninstall's bridge.toml line, the file loading or not, nor
+/// in `install --mode`'s line on the value it replaces: scrubbed and capped
+/// at 64 characters, as `ai-env wrapper status` shows it.
+#[test]
+fn uninstall_never_prints_a_secret_looking_mode() {
+    let home = Home::new();
+    std::fs::create_dir_all(home.bridge_dir()).unwrap();
+    let token = format!("{}oat01-{}", "sk-ant-", "Q".repeat(40));
+    let masked = format!("\"sk-ant-[redacted:len={}]\"", token.len());
+    let long = "m".repeat(100);
+    home.write_settings(&format!("{{\n  {}: \"/x/ai-env-claude\",\n  {}: \"default\"\n}}\n", json_str(WRAPPER_SETTING), json_str(PERMISSION_SETTING)));
+    let line = |shown: &str| format!("bridge.toml is left alone ([wrapper] mode = {shown}: remote): ai-env wrapper install --write brings the wrapper back, in that mode, for what Cursor starts after it.");
+    for (toml, shown) in [
+        (format!("[wrapper]\nmode = \"{token}\"\n[workspaces]\nroots = [\"/w\"]\n"), masked.clone()),
+        (format!("[wrapper]\nmode = \"{token}\"\nnope = 1\n[workspaces]\nroots = [\"/w\"]\n"), masked.clone()),
+        (format!("[wrapper]\nmode = \"{long}\"\n"), format!("{:?}", "m".repeat(64))),
+    ] {
+        std::fs::write(home.bridge_toml(), &toml).unwrap();
+        let out = home.run(&["uninstall"]);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{toml:?}: {stdout}{stderr}");
+        assert!(stderr.is_empty(), "{toml:?}: {stderr}");
+        assert!(stdout.lines().any(|l| l == line(&shown)), "{toml:?}: {stdout}");
+        assert!(!stdout.contains(&token) && !stdout.contains("QQQQ") && !stdout.contains(&long), "{toml:?}: {stdout}");
+    }
+    // install --mode names the value it replaces the same way (a dry run: neither file written).
+    let toml = format!("[wrapper]\nmode = \"{token}\"\n[workspaces]\nroots = [\"/w\"]\n");
+    std::fs::write(home.bridge_toml(), &toml).unwrap();
+    let before = home.settings_text();
+    let out = home.run(&["install", "--mode", "remote"]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.lines().any(|l| l == format!("  [wrapper] mode: {masked} -> \"remote\"")), "{stdout}");
+    assert!(!format!("{stdout}{stderr}").contains("QQQQ"), "{stdout}{stderr}");
+    assert_eq!((home.settings_text(), std::fs::read_to_string(home.bridge_toml()).unwrap()), (before, toml));
+}
+
+/// bridge.toml's other values these commands name never show raw either
+/// (a token built at run time): an `[wrapper].initial_permission_mode`
+/// install refuses, in uninstall's note on the undo and in install's own
+/// refusal (exit 2), scrubbed and capped; and the error of a bridge.toml the
+/// `--mode` splice refuses (exit 1), its first line only (the rest quotes
+/// the file), scrubbed. Neither file is written.
+#[test]
+fn install_and_uninstall_never_print_a_secret_looking_bridge_toml_value() {
+    let home = Home::new();
+    std::fs::create_dir_all(home.bridge_dir()).unwrap();
+    let token = format!("{}oat01-{}", "sk-ant-", "Q".repeat(40));
+    let masked = format!("\"sk-ant-[redacted:len={}]\"", token.len());
+    let settings = format!("{{\n  {}: \"/x/ai-env-claude\"\n}}\n", json_str(WRAPPER_SETTING));
+    home.write_settings(&settings);
+    let never = |what: &str, out: &Output| {
+        let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(!all.contains(&token) && !all.contains("QQQQ"), "{what}: {all}");
+    };
+    std::fs::write(home.bridge_toml(), format!("[wrapper]\nmode = \"passthrough\"\ninitial_permission_mode = \"{token}\"\n")).unwrap();
+    let out = home.run(&["uninstall"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    for want in ["undo: ai-env wrapper install --write --permission-mode default".to_string(), format!("note: install refuses bridge.toml's [wrapper].initial_permission_mode = {masked}: the undo sets {PERMISSION_SETTING} to \"default\" (now unset)")] {
+        assert!(stdout.lines().any(|l| l == want), "{want}: {stdout}");
+    }
+    never("uninstall", &out);
+    let out = home.run(&["install"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let refusal = format!("ai-env: permission mode {masked} is not one of default, manual, acceptEdits, plan, bypassPermissions");
+    assert!(text(&out.stderr).lines().any(|l| l == refusal), "{}", text(&out.stderr));
+    never("install", &out);
+    // The splice's own check of the result: a value on its error's first line, a key in the snippet after it.
+    let path = home.bridge_toml().display().to_string();
+    for (toml, first) in [
+        (format!("[aws]\nregion = \"{token}\"\n"), format!("the result is not a valid bridge.toml: config: [aws].region = {masked} but the MicroVM bridge is pinned to eu-central-1 (eu-west-3 is not supported)")),
+        (format!("[wrapper]\n{token} = 1\n"), "the result is not a valid bridge.toml: config: bridge.toml: TOML parse error at line 2, column 1".to_string()),
+    ] {
+        std::fs::write(home.bridge_toml(), &toml).unwrap();
+        let out = home.run(&["install", "--write", "--mode", "remote"]);
+        assert_eq!(out.status.code(), Some(1), "{toml:?}: {}", text(&out.stderr));
+        assert_eq!(text(&out.stderr), format!("ai-env: {path}: {first}; set [wrapper] mode = \"remote\" by hand\n"), "{toml:?}");
+        never(&toml, &out);
+        assert_eq!((home.settings_text(), std::fs::read_to_string(home.bridge_toml()).unwrap()), (settings.clone(), toml), "nothing written");
+    }
 }
 
 // ---- wrapper census ---------------------------------------------------------------
@@ -932,6 +1529,7 @@ fn install_mode_dry_run_writes_neither_file_and_says_so() {
         assert!(stdout.lines().any(|l| l == want), "{want}: {stdout}");
     }
     assert!(stdout.contains("Remote mode: a Cursor chat (stream-json) under [workspaces].roots runs in the workspace's MicroVM") && !stdout.contains("roots is empty"), "{stdout}");
+    assert!(stdout.contains("Chats started from now on use the new mode; a window reload moves the chats already open, and restarts them.") && !stdout.contains("Reload the Cursor window"), "{stdout}");
     assert_eq!(std::fs::read_to_string(home.bridge_toml()).unwrap(), BRIDGE_TOML);
     assert!(home.bridge_backups().is_empty() && !home.settings_path().exists());
 }
@@ -966,6 +1564,7 @@ fn install_mode_write_backs_up_bridge_toml_and_switches_back() {
     let stdout = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
     assert!(stdout.contains("  [wrapper] mode: \"remote\" -> \"passthrough\"") && stdout.contains("Passthrough mode: every Cursor chat runs on this Mac"), "{stdout}");
+    assert!(stdout.contains("Chats started from now on use the new mode; a window reload moves the chats already open, and restarts them.") && !stdout.contains("Reload the Cursor window"), "{stdout}");
     assert_eq!(std::fs::read_to_string(home.bridge_toml()).unwrap(), remote.replace("mode = \"remote\"", "mode = \"passthrough\""));
     let out = home.run(&["install", "--write", "--mode", "passthrough"]);
     let stdout = text(&out.stdout);

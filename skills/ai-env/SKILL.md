@@ -90,7 +90,10 @@ ai-env vm list                     # the VMs that run or are suspended
 Review with git (`git log --oneline BRANCH..box/BRANCH`) and merge by hand; never push a
 `box/*` ref. `ai-env vm terminate ID` ends a VM (the next chat seeds a fresh one).
 `AI_ENV_BRIDGE_LOCAL=1` in Cursor's `claudeCode.environmentVariables` runs every chat on the
-Mac again.
+Mac again. `ai-env wrapper status` is read-only (no AWS, no Touch ID) and shows whether Cursor's
+wrapper is set and where the chats Cursor starts next will run (it cannot see a chat already
+running). `ai-env wrapper uninstall` and `ai-env wrapper install`
+change where every later Cursor chat runs: they are the user's to run, never yours.
 
 **Exits Cursor shows** as `Claude Code process exited with code N`, the last stderr line
 (`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed (nothing started;

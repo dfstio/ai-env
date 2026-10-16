@@ -56,3 +56,4 @@ pub mod vm;
 pub mod voice;
 pub mod workspace;
 pub mod wrapper;
+pub mod wrapper_status;

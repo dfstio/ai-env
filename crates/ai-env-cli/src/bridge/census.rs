@@ -312,6 +312,43 @@ pub fn read_rows(path: &Path, last: Option<usize>) -> Result<Vec<serde_json::Val
     Ok(rows)
 }
 
+/// The parseable rows of the census's last `chunks` × [`MAX_ROW_BYTES`]
+/// bytes (oldest first), for a reader that must not read the whole file (the
+/// census is never rotated): it seeks back that far, plus one byte that says
+/// whether a line starts there, and reads no further than the length it saw
+/// first. A line the window cuts is dropped, so every row is whole, and the
+/// last `chunks` rows are always among them (no row is longer than
+/// [`MAX_ROW_BYTES`]). A missing file is an empty census; unparseable lines,
+/// a partial last line among them, are skipped. Opened as the writer guards
+/// its file (`logging::open_log_file`: `O_NOFOLLOW`, then a regular file on
+/// the descriptor), and `O_NONBLOCK`: a symlink, a FIFO or any other
+/// non-regular file is an error naming the path, never followed or waited on.
+pub fn read_tail(path: &Path, chunks: usize) -> Result<Vec<serde_json::Value>, BridgeError> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path);
+    let mut file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(BridgeError::Config(format!("{} is a symlink; refusing to read it", path.display()))),
+        Err(e) => return Err(BridgeError::Io(e)),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(BridgeError::Config(format!("{} is not a regular file", path.display())));
+    }
+    let len = meta.len();
+    let window = u64::try_from(chunks).unwrap_or(u64::MAX).saturating_mul(MAX_ROW_BYTES as u64);
+    let start = len.saturating_sub(window.saturating_add(1));
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    file.take(len - start).read_to_end(&mut buf)?;
+    // From the start of the file every line is whole; else the first one is
+    // whole only when the byte before the window ends a line.
+    let whole = if start == 0 { &buf[..] } else { buf.iter().position(|b| *b == b'\n').map_or(&[][..], |i| &buf[i + 1..]) };
+    Ok(whole.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice(l).ok()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +606,105 @@ mod tests {
         assert!(record(&path, &row_with_note(&"n".repeat(MAX_ROW_BYTES))).is_err());
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists(), "the 0700 dir is not created either");
+    }
+
+    /// One census line of exactly `bytes` bytes, its newline included: a
+    /// row whose note pads it out.
+    fn line_of(n: usize, bytes: usize) -> String {
+        let head = format!("{{\"v\":1,\"n\":{n},\"note\":\"");
+        format!("{head}{}\"}}\n", "x".repeat(bytes - head.len() - 3))
+    }
+
+    fn numbers(rows: &[serde_json::Value]) -> Vec<u64> {
+        rows.iter().map(|r| r["n"].as_u64().unwrap()).collect()
+    }
+
+    /// The tail spans several chunks: the rows of the last `chunks` × 64 KiB
+    /// come back whole and in order, a row the window cuts is dropped, a row
+    /// before it never shows (the file is not read from its start), and a
+    /// census shorter than the window comes back whole.
+    #[test]
+    fn read_tail_reads_the_last_chunks_only_and_keeps_whole_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("census.jsonl");
+        assert_eq!(read_tail(&path, 4).unwrap(), Vec::<serde_json::Value>::new(), "a missing file is an empty census");
+        // Row 0, then 20 KiB rows: 2 × 64 KiB hold six of them and part of a seventh.
+        let mut text = line_of(0, 100);
+        for n in 1..=12 {
+            text.push_str(&line_of(n, 20 * 1024));
+        }
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(numbers(&read_tail(&path, 2).unwrap()), (7..=12).collect::<Vec<_>>(), "row 6 is cut by the window");
+        assert_eq!(numbers(&read_tail(&path, 1).unwrap()), (10..=12).collect::<Vec<_>>());
+        assert_eq!(numbers(&read_tail(&path, 4).unwrap()), (0..=12).collect::<Vec<_>>(), "the whole census fits in four chunks");
+        assert_eq!(read_tail(&path, 0).unwrap(), Vec::<serde_json::Value>::new());
+        // A window that starts exactly on a line keeps it: the byte before is its predecessor's newline.
+        let exact = root.path().join("exact.jsonl");
+        std::fs::write(&exact, format!("{}{}{}", line_of(0, 100), line_of(1, MAX_ROW_BYTES / 2), line_of(2, MAX_ROW_BYTES / 2))).unwrap();
+        assert_eq!(numbers(&read_tail(&exact, 1).unwrap()), vec![1, 2]);
+    }
+
+    /// A partial last line (a row still being written, or a torn one) is
+    /// skipped; an unterminated line that parses is a whole row.
+    #[test]
+    fn read_tail_skips_a_partial_last_line() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("census.jsonl");
+        std::fs::write(&path, format!("{}{}{{\"v\":1,\"n\":3,\"no", line_of(1, 200), line_of(2, 200))).unwrap();
+        assert_eq!(numbers(&read_tail(&path, 1).unwrap()), vec![1, 2]);
+        std::fs::write(&path, format!("{}{{\"v\":1,\"n\":3}}", line_of(1, 200))).unwrap();
+        assert_eq!(numbers(&read_tail(&path, 1).unwrap()), vec![1, 3]);
+    }
+
+    /// The tail is opened as the writer guards the file: a symlink in its
+    /// place is refused, never followed; a FIFO or a directory is no regular
+    /// file, refused at once (the FIFO's open never waits for a writer). Each
+    /// error names the path.
+    #[cfg(unix)]
+    #[test]
+    fn read_tail_refuses_a_symlink_a_fifo_or_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real.jsonl");
+        std::fs::write(&real, line_of(1, 200)).unwrap();
+        assert_eq!(numbers(&read_tail(&real, 1).unwrap()), vec![1]);
+        let link = root.path().join("census.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_tail(&link, 1).unwrap_err().to_string(), format!("config: {} is a symlink; refusing to read it", link.display()));
+        let fifo = root.path().join("fifo.jsonl");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // On a thread with a deadline: without O_NONBLOCK the open would wait for a writer forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = fifo.clone();
+        std::thread::spawn(move || tx.send(read_tail(&at, 1).map_err(|e| e.to_string())).unwrap());
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("opening a FIFO must not block");
+        assert_eq!(got, Err(format!("config: {} is not a regular file", fifo.display())));
+        assert_eq!(read_tail(root.path(), 1).unwrap_err().to_string(), format!("config: {} is not a regular file", root.path().display()));
+    }
+
+    /// A row of exactly [`MAX_ROW_BYTES`] (the largest `record` writes) is
+    /// whole in a one-chunk tail, and the row before it is not read.
+    #[test]
+    fn read_tail_keeps_a_64_kib_row() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("census.jsonl");
+        let big = line_of(2, MAX_ROW_BYTES);
+        assert_eq!(big.len(), MAX_ROW_BYTES);
+        std::fs::write(&path, format!("{}{big}", line_of(1, 300))).unwrap();
+        let rows = read_tail(&path, 1).unwrap();
+        assert_eq!(numbers(&rows), vec![2]);
+        assert_eq!(rows[0]["note"].as_str().map(str::len), Some(MAX_ROW_BYTES - "{\"v\":1,\"n\":2,\"note\":\"\"}\n".len()));
+        assert_eq!(numbers(&read_tail(&path, 2).unwrap()), vec![1, 2]);
+        // Its own census row: record writes it, the tail reads it back.
+        let real = root.path().join("logs").join("census.jsonl");
+        let mut row = row_with_note("");
+        let pad = MAX_ROW_BYTES - serde_json::to_vec(&row).unwrap().len() - 1;
+        row.note = Some("n".repeat(pad));
+        record(&real, &row_with_note("before")).unwrap();
+        record(&real, &row).unwrap();
+        let back = read_tail(&real, 1).unwrap();
+        assert_eq!(back.len(), 1, "the row before the 64 KiB one is outside the window");
+        assert_eq!(serde_json::from_value::<CensusRow>(back[0].clone()).unwrap(), row);
     }
 }

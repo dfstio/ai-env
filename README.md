@@ -139,6 +139,11 @@ ai-env gates  [--json] [--only G1,G3] [--out FILE]        # MicroVM bridge pre-c
 ai-env wrapper install [--write] [--permission-mode M] [--mode passthrough|remote]   # point Cursor's claudeProcessWrapper at the sibling
                                                           #   ai-env-claude; --mode also sets [wrapper].mode in bridge.toml (S8)
                                                           #   (dry run unless --write; backs up settings.json, and bridge.toml with --mode; bridge feature)
+ai-env wrapper status [--json]                            # is Cursor's wrapper set, which ai-env-claude, the effective mode and
+                                                          #   roots, a remote session's start checks, the extension Cursor last ran
+                                                          #   (read-only: no AWS, no Touch ID; exit 1 on a [NO ] row)
+ai-env wrapper uninstall [--write]                        # take claudeProcessWrapper out of Cursor's settings (dry run unless
+                                                          #   --write; backs up settings.json; initialPermissionMode and bridge.toml stay)
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env wrapper settings-sync UUID [--rule R]… [--all-safe] [--write] [--image-dir DIR]   # a remote chat's approved rules → the image (S8)
 ai-env session list [--json] | show UUID [--json] [--settings-diff] | forget UUID | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8)
@@ -206,7 +211,16 @@ Identities).
 (the absolute path of the `ai-env-claude` next to `ai-env`) and `claudeCode.initialPermissionMode`
 (default `default`, i.e. the mode Cursor labels Manual; with a wrapper configured the extension
 always passes `--permission-mode` explicitly). It backs up `settings.json` first, keeps comments
-and key order, and prints the exact snippet when it cannot write. Reload the window afterwards.
+and key order, prints the exact snippet when it cannot write, and writes nothing when both keys
+already hold their values (`settings: nothing to write`). Cursor reads the setting each time
+it starts a process: the chats it starts afterwards use the wrapper, and a chat already open keeps
+its process until that ends (a window reload restarts the open chats through the wrapper).
+`ai-env wrapper status` shows whether the setting is there, which `ai-env-claude` it names, the
+effective mode and the extension version Cursor last ran, without AWS or Touch ID;
+`ai-env wrapper uninstall --write` takes the setting out again (backup first;
+`initialPermissionMode` and bridge.toml stay), and the `undo:` line it prints puts it back
+(`ai-env wrapper install --write`, plus `--permission-mode` when install would otherwise change
+`initialPermissionMode`).
 Every invocation the wrapper handles — chat sessions, config probes, `auth status --json`,
 `plugin list --json`, `mcp add` … — execs the bundled binary locally and appends one redacted
 JSON line to `~/.config/ai-env/bridge/logs/census.jsonl` (environment variable NAMES, a short
@@ -793,8 +807,10 @@ targets drop it, and release builds compile it out.
 prompts and interrupts happen in the workspace's VM, as the agent (uid 1000), behind the egress
 allowlist, logged in with the sealed setup-token (S7). Cursor still starts `ai-env-claude` from
 `claudeCode.claudeProcessWrapper`. For a stream-json session whose working directory is under
-`[workspaces].roots` (a chat, and Cursor's config probe, login probe and prompt-suggestion queries
-alike), the wrapper picks the workspace's VM, seeds the workspace into it at the identical absolute path
+`[workspaces].roots` (a chat and Cursor's config probe alike, and any other session Cursor starts
+there: the sign-in it runs when you log in with no chat open, and the prompt-suggestion
+queries it runs only with `CLAUDE_PROACTIVE_SUGGESTIONS=true` in its own environment), the wrapper
+picks the workspace's VM, seeds the workspace into it at the identical absolute path
 (the image's agent is `/Users/mike`, as on the Mac), starts claude there with `--session-mirror` and
 relays its stream; the `initialize` answer carries the wrapper's own pid. Everything else
 (`auth status`, `mcp add` and every other subcommand, `--version`, a session outside the roots) execs
@@ -813,14 +829,17 @@ When Cursor closes a chat the wrapper exits within 1.5 s: claude in the VM gets 
 point Cursor at a build under `target/`: `cargo clean` would break it). Then, from the installed
 `ai-env`, `ai-env wrapper install --write --mode remote` sets Cursor's wrapper as S1 does and
 `[wrapper] mode = "remote"` in bridge.toml, backing both files up first; without `--write` it prints
-what it would change. Reload the Cursor window. `[workspaces].roots` (and each `[[workspace]] path`)
-decides which workspaces go remote: keep it narrow while you try it out. `ai-env doctor` shows the mode,
+what it would change. The chats Cursor starts from then on run remote; a window reload moves the
+chats already open (it restarts them). `ai-env wrapper status` shows the result. `[workspaces].roots`
+(and each `[[workspace]] path`) decides which workspaces go remote: keep it narrow while you try it
+out. `ai-env doctor` shows the mode,
 whether the image new VMs run serves the workspace routes (`workspace_v1`: an image older than S8 needs
 `make deploy`) and the `[seed]` caps; `ai-env creds status` shows the sealed setup-token and whether
 `combined.env` is current.
 
 ```sh doc-test
 ai-env wrapper install --write --mode remote   # Cursor's wrapper setting and [wrapper] mode = "remote" (backups first)
+ai-env wrapper status                          # the setting, the effective mode and roots, the extension Cursor last ran
 ai-env doctor                                  # the mode, the image's workspace_v1, the [seed] caps
 ai-env creds status                            # the sealed setup-token and combined.env, without a Touch ID
 ```
@@ -840,14 +859,41 @@ bridge.toml. VMs already running stay until they suspend, reach their wall or ar
 }
 ```
 
+**No wrapper at all.** `ai-env wrapper uninstall --write` takes `claudeCode.claudeProcessWrapper` out
+of Cursor's settings (backup first; `initialPermissionMode`, `environmentVariables` and bridge.toml
+stay; without `--write` it shows what it would remove), and the `undo:` line it prints puts it back:
+`ai-env wrapper install --write`, with `--permission-mode` when install would otherwise set
+`initialPermissionMode` to another value. The chats Cursor starts after that run in the mode bridge.toml
+names, unless Cursor's `environmentVariables` override it (uninstall says so). Cursor reads the
+setting each time it starts a process and never restarts a running chat for a settings change, so a
+chat keeps the binary it started with. That keeps one chat on this Mac while remote mode serves the
+others: take the setting out before a window reload (a restored chat starts its process as soon as it
+is restored, before any message), let that chat answer once, then put the setting back without
+reloading, and start the chats meant for a MicroVM with New Conversation (the blank chat Cursor
+preloaded at the reload is local too). Taking the setting out or putting it back makes every open
+Claude view start `auth status --json` and a config probe about 1.5 s later: once the setting is back,
+each config probe under the roots asks for a Touch ID, and `auth status`, which runs on this Mac, may
+start the prewarm (one more). A local chat goes remote whenever Cursor starts a process for it again:
+a window reload, a Cursor or extension-host restart, Reload Claude, closing and reopening its tab,
+opening it in a second window, a rewind or fork (a new session), or its process ending (the next
+action that needs one starts it again).
+`ai-env wrapper status` shows where the chats Cursor starts next will run: the setting and the
+`ai-env-claude` it names, the kill switch and `AI_ENV_BRIDGE_MODE` in Cursor's list, the effective
+mode, the roots, whether bridge.toml passes the checks a remote session runs at its start, and the
+extension version Cursor last ran (from the census, which only the wrapper writes: after a change to
+Cursor's settings.json it names none until Cursor has started a process through the wrapper). It cannot
+see a chat that is already running.
+
 ```sh doc-test
 ai-env wrapper install --write --mode passthrough   # every chat on this Mac again
+ai-env wrapper uninstall --write                    # no wrapper at all: Cursor runs its bundled claude (backup first)
 ```
 
 **A Touch ID per session (D1).** Every remote wrapper process unseals the runtime key itself: one Touch
-ID each for the chat, Cursor's config probe and login probe, each prompt-suggestion query, and the
-prewarm below. With a current `combined.env` that one prompt also opens the setup-token for a VM that
-does not hold it yet (without one, that is a second prompt). Nothing keeps a key between processes
+ID each for the chat, Cursor's config probe and the prewarm below, and for any other session Cursor
+starts under the roots (the sign-in, prompt-suggestion queries when enabled). With a current
+`combined.env` that one prompt also opens the setup-token for a VM that does not hold it yet (without
+one, that is a second prompt). Nothing keeps a key between processes
 (S15's daemon is the later fix), so a Cursor reload costs two to four prompts, shown one at a time. The
 countdown goes to the wrapper's stderr, and the dialog must be answered within Cursor's 60 s
 `initialize` window less 11 s. A dismissed dialog exits 3, with the line

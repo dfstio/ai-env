@@ -932,9 +932,10 @@ pub fn doctor_lines(store: &Keystore, file: &Path) -> Result<Vec<DoctorLine>> {
     Ok(lines)
 }
 
-/// Print rows in the historical text format.
-pub fn print_doctor(lines: &[DoctorLine]) -> Result<()> {
-    outln!("ai-env doctor");
+/// Print rows in the historical text format under `heading`
+/// ([`doctor_report_under`]).
+pub fn print_doctor(heading: &str, lines: &[DoctorLine]) -> Result<()> {
+    outln!("{heading}");
     for line in lines {
         match line {
             DoctorLine::Row { tag, text } => outln!("  {} {text}", tag.bracket()),
@@ -981,11 +982,17 @@ pub fn doctor_exit_code(lines: &[DoctorLine], auth_unavailable: bool) -> i32 {
 /// Emit the report (text or JSON) — every row is printed before a non-zero
 /// exit — and turn the exit policy into a result.
 pub fn doctor_report(lines: &[DoctorLine], json: bool, auth_unavailable: bool) -> Result<()> {
+    doctor_report_under("ai-env doctor", lines, json, auth_unavailable)
+}
+
+/// [`doctor_report`] with the text form under `heading` (`ai-env wrapper
+/// status` reports doctor's rows too).
+pub fn doctor_report_under(heading: &str, lines: &[DoctorLine], json: bool, auth_unavailable: bool) -> Result<()> {
     let exit = doctor_exit_code(lines, auth_unavailable);
     if json {
         outln!("{}", doctor_json(lines, exit));
     } else {
-        print_doctor(lines)?;
+        print_doctor(heading, lines)?;
     }
     match exit {
         0 => Ok(()),

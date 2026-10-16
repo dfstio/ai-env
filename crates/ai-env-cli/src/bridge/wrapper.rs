@@ -12,14 +12,27 @@
 //! rules a session's VM added into the image's `claude/settings.json` and
 //! the settings policy, scanned before and after (T8.7, [`settings_sync`],
 //! [`splice_rules`]).
+//!
+//! `uninstall` takes the wrapper key out again ([`remove_settings`], the
+//! splice's inverse, verified the same way), so what Cursor starts
+//! afterwards is its bundled claude. `install` then splices the key in as
+//! any missing key ([`splice_settings`], U4): on its own line just before
+//! `initialPermissionMode` when that key starts its own line, else just
+//! before the final `}`. Given the same two values, a key that sat as
+//! install writes it (on its own line just before `initialPermissionMode`,
+//! with that line's indent and line ending) comes back byte for byte; from
+//! anywhere else it comes back where the splice puts it, the settings the
+//! same.
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::census::read_rows;
 use crate::bridge::config::{BridgeConfig, Paths, WrapperMode};
-use crate::bridge::doctor::{cursor_settings_path, parse_settings, run_capture, version_token, PERMISSION_SETTING, WRAPPER_SETTING};
+use crate::bridge::doctor::{cursor_settings_path, parse_settings, run_capture, strip_jsonc, version_token, PERMISSION_SETTING, WRAPPER_SETTING};
 use crate::bridge::probes::{append_row, init_wrapper_verdict, Expectation};
 use crate::bridge::sibling::{exists_exec, require_sibling, INSTALL_HINT};
+use crate::bridge::wrapper_status::{shown_mode, CursorEnv};
 use crate::errors::{CliError, Result};
 use crate::store::write_atomic;
+use crate::wire::redact::scrub;
 use crate::wire::time::{rfc3339_utc, unix_now};
 use crate::{bail, outln};
 use std::io::Write;
@@ -378,16 +391,28 @@ fn top_level(tokens: &[Token]) -> std::result::Result<TopLevel, String> {
 }
 
 /// Replace the value of the depth-1 string key `key` in place, or insert
-/// `"key": "value"` before the final `}` with the detected indent.
-fn upsert(text: &str, key: &str, value: &str) -> std::result::Result<String, String> {
+/// `"key": "value"`: on its own line just before the member `anchor` when
+/// that starts its own line (its indent and its line's ending; U4), else
+/// before the final `}` with the detected indent.
+fn upsert(text: &str, key: &str, value: &str, anchor: Option<&str>) -> std::result::Result<String, String> {
     let tokens = tokenize(text)?;
     let top = top_level(&tokens)?;
     let literal = serde_json::to_string(value).map_err(|e| e.to_string())?;
-    let existing = top.members.iter().find(|m| serde_json::from_str::<String>(&text[m.key_start..m.key_end]).is_ok_and(|k| k == key));
-    if let Some(m) = existing {
+    let member = |name: &str| top.members.iter().find(|m| serde_json::from_str::<String>(&text[m.key_start..m.key_end]).is_ok_and(|k| k == name)).copied();
+    if let Some(m) = member(key) {
         return Ok(format!("{}{literal}{}", &text[..m.value_start], &text[m.value_end..]));
     }
     let key_literal = serde_json::to_string(key).map_err(|e| e.to_string())?;
+    if let Some(m) = anchor.and_then(member) {
+        let line_start = text[..m.key_start].rfind('\n').map_or(0, |i| i + 1);
+        let indent = &text[line_start..m.key_start];
+        if indent.bytes().all(|c| c == b' ' || c == b'\t') {
+            // The anchor line's own ending (the LF lines install adds to a CRLF file stay LF), else the one before it.
+            let ending = text[m.key_start..].find('\n').map_or(line_start, |i| m.key_start + i + 1);
+            let eol = if text[..ending].ends_with("\r\n") { "\r\n" } else { "\n" };
+            return Ok(format!("{}{indent}{key_literal}: {literal},{eol}{}", &text[..line_start], &text[line_start..]));
+        }
+    }
     let indent = detect_indent(text);
     let close = top.close;
     // Everything before `}`, with a comma appended to the previous member
@@ -409,29 +434,102 @@ fn upsert(text: &str, key: &str, value: &str) -> std::result::Result<String, Str
 }
 
 /// A JSONC-safe top-level upsert of string-valued keys: each existing key's
-/// value is replaced in place, each missing key is inserted before the final
-/// `}` (a comma is added to the previous member when needed; `{}`, `{\n}`, a
-/// trailing comma and a missing final newline are handled), and nothing
-/// outside the touched values changes — comments and order included. Then
-/// the result is verified: `parse_settings(new)` must equal
+/// value is replaced in place, each missing key is inserted just before the
+/// first later entry the file already holds when that starts its own line
+/// (U4: with the same values, `uninstall` then `install` gives back the same
+/// bytes when the wrapper key sat on its own line just before
+/// `initialPermissionMode`, the layout install writes; else the same
+/// settings), else before
+/// the final `}` (a comma is added to the previous member when needed; `{}`,
+/// `{\n}`, a trailing comma and a missing final newline are handled), and
+/// nothing outside the touched values changes — comments and order
+/// included. Then the result is verified: `parse_settings(new)` must equal
 /// `parse_settings(text)` with `entries` applied, else `Err` and the caller
 /// writes nothing.
 pub fn splice_settings(text: &str, entries: &[(&str, &str)]) -> std::result::Result<String, String> {
     let old = parse_settings(text).map_err(|e| format!("cannot parse the settings: {e}"))?;
-    let mut expected = old;
+    let mut expected = old.clone();
     let obj = expected.as_object_mut().ok_or_else(|| "the top-level value is not an object".to_string())?;
     for (key, value) in entries {
         obj.insert((*key).to_string(), serde_json::Value::String((*value).to_string()));
     }
     let mut out = text.to_string();
-    for (key, value) in entries {
-        out = upsert(&out, key, value)?;
+    for (i, (key, value)) in entries.iter().enumerate() {
+        let anchor = entries[i + 1..].iter().map(|(k, _)| *k).find(|k| old.get(*k).is_some());
+        out = upsert(&out, key, value, anchor)?;
     }
     let got = parse_settings(&out).map_err(|e| format!("splice verification failed: the result does not parse: {e}"))?;
     if got != expected {
         return Err("splice verification failed: the result is not the old settings plus the new keys".to_string());
     }
     Ok(out)
+}
+
+/// Take the first depth-1 member named `key` (escaped keys match) out of
+/// `text`: the member and one comma, its own or, for the last member, the
+/// one before it (only that comma byte: a comment after it stays). A member
+/// alone on its line(s) goes with them, line ending included; one ending a
+/// line behind something else takes the blanks before it. Comments outside
+/// the member stay, ones inside it go with it. `None`: no such member.
+fn remove_first(text: &str, key: &str) -> std::result::Result<Option<String>, String> {
+    let tokens = tokenize(text)?;
+    top_level(&tokens)?;
+    let obj = object_at(&tokens, 0)?;
+    let named = |i: usize| serde_json::from_str::<String>(&text[tokens[i].start..tokens[i].end]).is_ok_and(|k| k == key);
+    let Some(j) = obj.members.iter().position(|&(k, _, _)| named(k)) else {
+        return Ok(None);
+    };
+    let (k, _, last) = obj.members[j];
+    let (b, blank) = (text.as_bytes(), |c: u8| c == b' ' || c == b'\t');
+    let (key_at, value_end) = (tokens[k].start, tokens[last].end);
+    let comma = (tokens[last + 1].tok == Tok::Comma).then_some(tokens[last + 1]);
+    let before = (comma.is_none() && j > 0).then_some(tokens[k - 1]);
+    let own_end = comma.map_or(value_end, |c| c.end);
+    let ws_end = own_end + b[own_end..].iter().take_while(|&&c| blank(c)).count();
+    let line_end = match &b[ws_end..] {
+        [b'\n', ..] => Some(ws_end + 1),
+        [b'\r', b'\n', ..] => Some(ws_end + 2),
+        _ => None,
+    };
+    let line_start = text[..key_at].rfind('\n').map_or(0, |i| i + 1);
+    let lead = key_at - b[line_start..key_at].iter().rev().take_while(|&&c| blank(c)).count();
+    let (from, to) = match (line_end, before) {
+        (Some(end), _) if lead == line_start => (line_start, end),
+        // `"a": 1, "k": "v"` on one line: the comma before goes with it.
+        (_, Some(c)) if b[c.end..key_at].iter().all(|&x| blank(x)) => (c.start, value_end),
+        (Some(_), _) => (lead, ws_end),
+        _ => (key_at, ws_end),
+    };
+    let head = match before {
+        Some(c) if c.start < from => format!("{}{}", &text[..c.start], &text[c.end..from]),
+        _ => text[..from].to_string(),
+    };
+    Ok(Some(format!("{head}{}", &text[to..])))
+}
+
+/// [`splice_settings`]' inverse, for `uninstall`: every depth-1 member
+/// named in `keys` taken out, duplicates too ([`remove_first`] until none is
+/// left), with how many went. Then verified: `parse_settings(new)` must
+/// equal `parse_settings(text)` without `keys`, else `Err` and the caller
+/// writes nothing.
+pub fn remove_settings(text: &str, keys: &[&str]) -> std::result::Result<(String, usize), String> {
+    let mut expected = parse_settings(text).map_err(|e| format!("cannot parse the settings: {e}"))?;
+    let obj = expected.as_object_mut().ok_or_else(|| "the top-level value is not an object".to_string())?;
+    for key in keys {
+        obj.remove(*key);
+    }
+    let (mut out, mut removed) = (text.to_string(), 0);
+    for key in keys {
+        while let Some(next) = remove_first(&out, key)? {
+            out = next;
+            removed += 1;
+        }
+    }
+    let got = parse_settings(&out).map_err(|e| format!("removal verification failed: the result does not parse: {e}"))?;
+    if got != expected {
+        return Err("removal verification failed: the result is not the old settings without the keys".to_string());
+    }
+    Ok((out, removed))
 }
 
 /// An object's members as token indices (`object_at`): each member's key,
@@ -605,15 +703,74 @@ fn configured_mode(text: &str) -> Option<String> {
     table.get("wrapper")?.get("mode")?.as_str().map(str::to_string)
 }
 
+/// The permission mode `install` writes without `--permission-mode`:
+/// `[wrapper].initial_permission_mode` from bridge.toml, else `default`.
+fn configured_permission_mode() -> String {
+    Paths::resolve().ok().and_then(|p| BridgeConfig::load(&p).ok().flatten()).map_or_else(|| "default".to_string(), |c| c.wrapper.initial_permission_mode)
+}
+
+/// `uninstall`'s line on the mode the wrapper comes back in, and the exit
+/// code every chat under the roots then fails closed with (`None`: it does
+/// not), both as `ai-env wrapper status` weighs them
+/// (`wrapper_status::row_effective_mode`): Cursor's variables (`env`, read
+/// from the settings `uninstall` edits, as the extension hands them to every
+/// spawn) first. The kill switch runs every chat on this Mac, whatever the
+/// mode. A bridge root or bridge.toml other than this command's
+/// (`AI_ENV_BRIDGE_DIR`, `AI_ENV_BRIDGE_CONFIG`) leaves the mode to a file
+/// this command does not read: named, never claimed. Else bridge.toml's
+/// `[wrapper] mode` as the wrapper reads it (`route::load_for_wrapper`,
+/// `route::effective_mode_loaded`): the value as written (scrubbed and
+/// capped as status shows it, `wrapper_status::shown_mode`), with the mode
+/// it is taken as unless that is its own name (`unset: passthrough`,
+/// `unreadable: remote`, `"x": remote`), under an `AI_ENV_BRIDGE_MODE` that
+/// names a mode, which wins. In remote mode it fails closed as
+/// `wrapper_status::fails_closed` says (a file that does not load or names
+/// no mode, or fails a check of a remote session's start, with a root to
+/// route on or roots it cannot read: without one no session goes remote);
+/// never under the kill switch or another bridge root. No other variable's
+/// name or value is ever printed.
+fn wrapper_mode_report(env: &CursorEnv) -> (String, Option<i32>) {
+    use crate::bridge::route::{effective_mode_loaded, load_for_wrapper, MODE_ENV};
+    use crate::bridge::wrapper_status::{fails_closed, ENV_SETTING, LOCAL_ENV};
+    let back = "ai-env wrapper install --write brings the wrapper back";
+    if env.local == Some(true) {
+        return (format!("bridge.toml is left alone: {back}, but the kill switch ({LOCAL_ENV}=1 in Cursor's {ENV_SETTING}) still runs every chat on this Mac."), None);
+    }
+    let loaded = load_for_wrapper();
+    let elsewhere = env.elsewhere(loaded.paths.as_ref());
+    let named = env.named_mode();
+    if !elsewhere.is_empty() {
+        let how = named.map_or_else(|| "in the mode the bridge.toml there names".to_string(), |m| format!("in {m} mode ({MODE_ENV} in Cursor's {ENV_SETTING})"));
+        return (format!("bridge.toml is left alone, but the wrapper reads another bridge root ({} in Cursor's {ENV_SETTING}): {back}, {how}, for what Cursor starts after it (ai-env wrapper status shows the variables).", elsewhere.join(" and ")), None);
+    }
+    // The file's own mode for the report; the one the chats get, the variable's when it names one, for the rest.
+    let file = effective_mode_loaded(None, &loaded).0;
+    let mode = effective_mode_loaded(named, &loaded).0;
+    let written = match &loaded.broken {
+        Some(broken) => broken.mode.clone(),
+        None => Some(loaded.paths.as_ref().and_then(|p| std::fs::read_to_string(&p.config).ok()).and_then(|t| configured_mode(&t))),
+    };
+    let report = match &written {
+        Some(Some(w)) if w == file.name() => format!("[wrapper] mode = {}", shown_mode(w)),
+        Some(Some(w)) => format!("[wrapper] mode = {}: {}", shown_mode(w), file.name()),
+        Some(None) => format!("[wrapper] mode unset: {}", file.name()),
+        None => format!("[wrapper] mode unreadable: {}", file.name()),
+    };
+    let how = named.map_or_else(|| "in that mode".to_string(), |m| format!("in {m} mode, which {MODE_ENV} in Cursor's {ENV_SETTING} sets over bridge.toml's"));
+    (format!("bridge.toml is left alone ({report}): {back}, {how}, for what Cursor starts after it."), fails_closed(mode, &loaded).map(|c| c.code()))
+}
+
 /// `ai-env wrapper install … --mode M` (S8, L1): [`install`] (Cursor's two
 /// keys), and `[wrapper] mode = "M"` spliced into bridge.toml
 /// (`infra::splice_toml_table`: comments, order and every other table kept;
 /// the result must parse as a bridge.toml), backup first. The splice is
-/// checked before anything is written; without `--write` neither file is
-/// written and the dry run says so. No bridge.toml: passthrough is already
-/// the default, and remote mode needs one (`[workspaces].roots`, `[aws]`):
-/// refused naming `make infra-status WRITE=1`. `AI_ENV_BRIDGE_MODE` still
-/// overrides the key (tests), and `AI_ENV_BRIDGE_LOCAL=1` stays the kill switch.
+/// checked before anything is written (a refusal names the first line of
+/// its error, scrubbed: the rest quotes the file); without `--write`
+/// neither file is written and the dry run says so. No bridge.toml:
+/// passthrough is already the default, and remote mode needs one
+/// (`[workspaces].roots`, `[aws]`): refused naming `make infra-status
+/// WRITE=1`. `AI_ENV_BRIDGE_MODE` still overrides the key (tests), and
+/// `AI_ENV_BRIDGE_LOCAL=1` stays the kill switch.
 pub fn install_mode(write: bool, permission_mode: Option<String>, mode: WrapperMode) -> Result<()> {
     let paths = Paths::resolve()?;
     let path = paths.config.clone();
@@ -631,7 +788,9 @@ pub fn install_mode(write: bool, permission_mode: Option<String>, mode: WrapperM
     let planned = match &meta {
         Some(m) => {
             let old_text = std::fs::read_to_string(&path).map_err(|e| CliError::Msg(format!("cannot read {}: {e}", path.display())))?;
-            let new_text = crate::bridge::infra::splice_toml_table(&old_text, "wrapper", &[("mode", want.to_string())]).map_err(|e| CliError::Msg(format!("{}: {e}; set [wrapper] mode = {want:?} by hand", path.display())))?;
+            // The refusal's first line, scrubbed: a bridge.toml error quotes the file (a snippet, a value).
+            let new_text = crate::bridge::infra::splice_toml_table(&old_text, "wrapper", &[("mode", want.to_string())])
+                .map_err(|e| CliError::Msg(format!("{}: {}; set [wrapper] mode = {want:?} by hand", path.display(), scrub(e.lines().next().unwrap_or_default()))))?;
             Some((m.clone(), stamp(Some(m)), old_text, new_text))
         }
         None => None,
@@ -645,7 +804,7 @@ pub fn install_mode(write: bool, permission_mode: Option<String>, mode: WrapperM
     outln!("bridge.toml: {}", path.display());
     match configured_mode(&old_text) {
         Some(c) if c == want => outln!("  [wrapper] mode: {c:?} (unchanged)"),
-        Some(c) => outln!("  [wrapper] mode: {c:?} -> {want:?}"),
+        Some(c) => outln!("  [wrapper] mode: {} -> {want:?}", shown_mode(&c)),
         None => outln!("  [wrapper] mode: unset (passthrough) -> {want:?}"),
     }
     if new_text == old_text {
@@ -664,9 +823,9 @@ pub fn install_mode(write: bool, permission_mode: Option<String>, mode: WrapperM
             if cfg.roots().is_empty() {
                 outln!("note: [workspaces].roots is empty: no chat runs in a MicroVM until a root is set");
             }
-            outln!("Remote mode: a Cursor chat (stream-json) under [workspaces].roots runs in the workspace's MicroVM (a Touch ID per chat process); everything else runs on this Mac. Reload the Cursor window; ai-env wrapper install --write --mode passthrough switches back.");
+            outln!("Remote mode: a Cursor chat (stream-json) under [workspaces].roots runs in the workspace's MicroVM (a Touch ID per chat process); everything else runs on this Mac. Chats started from now on use the new mode; a window reload moves the chats already open, and restarts them. ai-env wrapper install --write --mode passthrough switches back.");
         }
-        WrapperMode::Passthrough => outln!("Passthrough mode: every Cursor chat runs on this Mac (the wrapper execs the bundled claude). Reload the Cursor window."),
+        WrapperMode::Passthrough => outln!("Passthrough mode: every Cursor chat runs on this Mac (the wrapper execs the bundled claude). Chats started from now on use the new mode; a window reload moves the chats already open, and restarts them."),
     }
     Ok(())
 }
@@ -952,7 +1111,10 @@ pub fn settings_sync(session: &str, rules: &[String], all_safe: bool, write: boo
 /// `ai-env wrapper install [--write] [--permission-mode M]` (plan §7): find
 /// and check the sibling wrapper, pick the permission mode, splice the two
 /// keys into Cursor's `settings.json` (dry run unless `write`; a backup and
-/// a size/mtime re-check guard the write) and print the guidance block.
+/// a size/mtime re-check guard the write; nothing is written when both keys
+/// hold their values already) and print the guidance block. A permission
+/// mode it refuses is named scrubbed and capped, as it may come from
+/// bridge.toml.
 pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     // 1. The sibling: absolute, not canonicalised (`<dir of ai-env>/ai-env-claude`).
     let (sibling, note) = require_sibling("ai-env-claude")?;
@@ -985,15 +1147,9 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
         bail!("version skew: ai-env {mine}, ai-env-claude {theirs}  <- {INSTALL_HINT}");
     }
     // 4. The permission mode: the flag, else `[wrapper].initial_permission_mode`, else `default`.
-    let mode = match permission_mode {
-        Some(m) => m,
-        None => Paths::resolve()
-            .ok()
-            .and_then(|p| BridgeConfig::load(&p).ok().flatten())
-            .map_or_else(|| "default".to_string(), |c| c.wrapper.initial_permission_mode),
-    };
+    let mode = permission_mode.unwrap_or_else(configured_permission_mode);
     if !PERMISSION_MODES.contains(&mode.as_str()) {
-        return Err(CliError::Usage(format!("permission mode {mode:?} is not one of {}", PERMISSION_MODES.join(", "))));
+        return Err(CliError::Usage(format!("permission mode {} is not one of {}", shown_mode(&mode), PERMISSION_MODES.join(", "))));
     }
     // 5. The settings file: a symlink is refused, a missing file is `{}`.
     let path = cursor_settings_path();
@@ -1049,7 +1205,11 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     }
     outln!("snippet:");
     outln!("{snippet}");
-    if write {
+    if new_text == old_text {
+        // Both keys hold their values already: no backup, no write, so the file keeps its mtime
+        // (`ai-env wrapper status` weighs the census against its last change).
+        outln!("settings: nothing to write");
+    } else if write {
         match commit_settings(&path, meta.as_ref(), before, &old_text, &new_text)? {
             Some(bak) => outln!("backup: {}", bak.display()),
             None => outln!("backup: none (no settings.json before)"),
@@ -1062,9 +1222,123 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     outln!();
     outln!("claudeCode.disableLoginPrompt is left alone (set it only once S8 runs Cursor's sessions in MicroVMs with the delivered credential).");
     outln!("Wrapped setups start in Manual mode: the extension now passes --permission-mode {mode} on every spawn (choose with --permission-mode).");
-    outln!("Reload the Cursor window for the setting to take effect.");
+    outln!("Cursor reads this setting each time it starts a process: chats it starts from now on use it; a chat already running keeps its process until it ends (a window reload restarts open chats through the wrapper).");
     outln!("With a wrapper set the extension stops following CLAUDE_CONFIG_DIR changes. Cursor still updates the extension and its bundled claude (turn off Auto Update for the Claude Code extension to keep a version); make claude-update brings the image to it.");
     outln!("AI_ENV_BRIDGE_LOCAL=1 is the kill switch: the wrapper execs the bundled binary directly, without a census.");
+    Ok(())
+}
+
+/// A settings value as the reports show it: a string quoted, anything else
+/// as its JSON.
+fn shown(v: &serde_json::Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), |s| format!("{s:?}"))
+}
+
+/// `ai-env wrapper uninstall [--write]`: take `claudeCode.claudeProcessWrapper`
+/// out of Cursor's `settings.json`, every top-level copy ([`remove_settings`]),
+/// so what Cursor starts afterwards is its bundled claude. A dry run unless
+/// `write`; the backup and the size/mtime re-check are `install`'s
+/// ([`commit_settings`]). `initialPermissionMode`, bridge.toml, the census and
+/// both binaries stay, and nothing here needs `ai-env-claude`, Touch ID or
+/// AWS. A missing or empty file, or no wrapper key, is nothing to remove
+/// (exit 0, no backup); a symlink or a file that does not parse is exit 1,
+/// nothing written. Prints what Cursor does once the key is out (after a
+/// dry run, what it would do after `--write`: until then a reload still
+/// restarts the open chats through the wrapper), the mode the wrapper comes
+/// back in as it reads bridge.toml under Cursor's variables, with a note
+/// when every chat under the roots then fails closed
+/// ([`wrapper_mode_report`]), and the `install` that undoes it (with
+/// `--permission-mode` when the file's `initialPermissionMode` is not the
+/// one `install` would pick, or `install` would refuse bridge.toml's).
+pub fn uninstall(write: bool) -> Result<()> {
+    let path = cursor_settings_path();
+    let by_hand = format!("remove {} from {} by hand", json_str(WRAPPER_SETTING), path.display());
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            outln!("{by_hand}");
+            bail!("{} is a symlink — refusing to edit it", path.display());
+        }
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            outln!("settings: {} (absent)", path.display());
+            outln!("  {WRAPPER_SETTING}: unset (nothing to remove)");
+            return Ok(());
+        }
+        Err(e) => bail!("cannot stat {}: {e}", path.display()),
+    };
+    let before = stamp(Some(&meta));
+    let old_text = std::fs::read_to_string(&path).map_err(|e| CliError::Msg(format!("cannot read {}: {e}", path.display())))?;
+    let old = match parse_settings(&old_text) {
+        Ok(v) => Some(v),
+        Err(_) if strip_jsonc(&old_text).trim().is_empty() => None,
+        Err(e) => {
+            outln!("{by_hand}");
+            bail!("cannot parse {}: {e}", path.display());
+        }
+    };
+    let Some(wrapper) = old.as_ref().and_then(|v| v.get(WRAPPER_SETTING)) else {
+        outln!("settings: {}", path.display());
+        outln!("  {WRAPPER_SETTING}: unset (nothing to remove)");
+        return Ok(());
+    };
+    let (new_text, removed) = match remove_settings(&old_text, &[WRAPPER_SETTING]) {
+        Ok(r) => r,
+        Err(e) => {
+            outln!("{by_hand}");
+            bail!("{}: {e}", path.display());
+        }
+    };
+    let permission = old.as_ref().and_then(|v| v.get(PERMISSION_SETTING));
+    let was = permission.map_or_else(|| "unset".to_string(), shown);
+    outln!("settings: {}", path.display());
+    outln!("  {WRAPPER_SETTING}: {} -> unset", shown(wrapper));
+    outln!("  {PERMISSION_SETTING}: {was} (left alone)");
+    if removed > 1 {
+        outln!("note: {WRAPPER_SETTING} was set {removed} times; every one is removed");
+    }
+    if wrapper.as_str().and_then(|w| Path::new(w).file_name()).is_none_or(|n| n != "ai-env-claude") {
+        outln!("note: {} is not an ai-env-claude; removed all the same (the backup keeps it)", shown(wrapper));
+    }
+    if write {
+        if let Some(bak) = commit_settings(&path, Some(&meta), before, &old_text, &new_text)? {
+            outln!("backup: {}", bak.display());
+        }
+        outln!("wrote: {}", path.display());
+    } else {
+        outln!("dry run: nothing written; re-run with --write");
+    }
+    outln!();
+    let spawned = "(a new chat, a reopened or restored one, its config probe) runs its bundled claude on this Mac: no ai-env-claude, no census, no MicroVM, no Touch ID.";
+    if write {
+        outln!("Cursor reads {WRAPPER_SETTING} at every spawn: what it starts from now on {spawned}");
+        outln!("A chat already running keeps the process it started with; a window reload restarts the restored chats without the wrapper.");
+    } else {
+        // Nothing changed yet: a reload now still restarts the open chats through the wrapper.
+        outln!("With --write, Cursor reads {WRAPPER_SETTING} at every spawn: what it starts from then on {spawned}");
+        outln!("A chat already running keeps the process it started with; after the write, a window reload restarts the restored chats without the wrapper.");
+    }
+    // Cursor's variables, as the extension hands them to every process it starts, the wrapper back too.
+    let (report, closed) = wrapper_mode_report(&old.as_ref().map(CursorEnv::of).unwrap_or_default());
+    outln!("{report}");
+    if let Some(code) = closed {
+        outln!("note: with the wrapper back, every Cursor chat under bridge.toml's roots (every chat, when they cannot be read) exits {code} naming the error until bridge.toml is fixed (ai-env wrapper status shows it)");
+    }
+    // `install` rewrites initialPermissionMode too: the flag keeps today's when install would
+    // pick another, and stands in for a bridge.toml value install refuses (exit 2).
+    let picked = configured_permission_mode();
+    let now = permission.and_then(|m| m.as_str()).filter(|m| PERMISSION_MODES.contains(m));
+    match (now, PERMISSION_MODES.contains(&picked.as_str())) {
+        (Some(m), true) if m == picked => outln!("undo: ai-env wrapper install --write"),
+        (Some(m), _) => outln!("undo: ai-env wrapper install --write --permission-mode {m}"),
+        (None, true) => {
+            outln!("undo: ai-env wrapper install --write");
+            outln!("note: install sets {PERMISSION_SETTING} to {picked:?} (now {was})");
+        }
+        (None, false) => {
+            outln!("undo: ai-env wrapper install --write --permission-mode default");
+            outln!("note: install refuses bridge.toml's [wrapper].initial_permission_mode = {}: the undo sets {PERMISSION_SETTING} to \"default\" (now {was})", shown_mode(&picked));
+        }
+    }
     Ok(())
 }
 
@@ -1296,6 +1570,127 @@ mod tests {
         assert!(top_level(&tokenize("[1]").unwrap()).unwrap_err().contains("not an object"));
         assert!(tokenize("{\"a\": \"unterminated}").is_err());
         assert!(tokenize("{ /* open").is_err());
+    }
+
+    /// `uninstall`'s removal: the member and one comma (the last member's
+    /// from before it, only the comma byte), its whole lines when it is
+    /// alone on them; comments outside it, the trailing-comma style,
+    /// indents, tabs and CRLF stay.
+    #[test]
+    fn remove_takes_the_member_and_one_comma() {
+        for (src, want) in [
+            // Four-space indent, between two members.
+            ("{\n    \"a\": 1,\n    \"k\": \"v\",\n    \"z\": 2\n}\n", "{\n    \"a\": 1,\n    \"z\": 2\n}\n"),
+            // The last member, no trailing comma: the comma before it goes.
+            ("{\n  \"a\": 1,\n  \"k\": \"v\"\n}\n", "{\n  \"a\": 1\n}\n"),
+            // CRLF with tabs, last and first.
+            ("{\r\n\t\"a\": 1,\r\n\t\"k\": \"v\"\r\n}\r\n", "{\r\n\t\"a\": 1\r\n}\r\n"),
+            ("{\r\n\t\"k\": \"v\",\r\n\t\"a\": 1\r\n}\r\n", "{\r\n\t\"a\": 1\r\n}\r\n"),
+            // A comment after the previous comma stays: only the comma goes.
+            ("{\n  \"a\": 1, // one\n  \"k\": \"v\"\n}\n", "{\n  \"a\": 1 // one\n}\n"),
+            // A trailing comma stays trailing.
+            ("{\n  \"a\": 1,\n  \"k\": \"v\",\n}\n", "{\n  \"a\": 1,\n}\n"),
+            // A comment line before the member, a comment after its comma: both stay.
+            ("{\n  \"a\": 1,\n  // mine\n  \"k\": \"v\",\n  \"z\": 2\n}\n", "{\n  \"a\": 1,\n  // mine\n  \"z\": 2\n}\n"),
+            ("{\n  \"k\": \"v\", // why\n  \"z\": 2\n}\n", "{\n  // why\n  \"z\": 2\n}\n"),
+            // A comment inside the member goes with it.
+            ("{\n  \"k\": /* old */ \"v\",\n  \"z\": 2\n}\n", "{\n  \"z\": 2\n}\n"),
+            // The only member.
+            ("{\"k\": \"v\"}", "{}"),
+            ("{ \"k\": \"v\" }", "{ }"),
+            ("{\n  \"k\": \"v\"\n}\n", "{\n}\n"),
+            ("{\n  \"k\": \"v\",\n}\n", "{\n}\n"),
+            // One line: first, middle, last, compact.
+            ("{\"k\": \"v\", \"a\": 1}", "{\"a\": 1}"),
+            ("{\"a\": 1, \"k\": \"v\", \"z\": 2}", "{\"a\": 1, \"z\": 2}"),
+            ("{ \"a\": 1, \"k\": \"v\" }", "{ \"a\": 1 }"),
+            ("{\"a\":1,\"k\":\"v\"}", "{\"a\":1}"),
+            // Behind another member on its line: the blanks before it go too.
+            ("{\n  \"a\": 1, \"k\": \"v\",\n  \"z\": 2\n}\n", "{\n  \"a\": 1,\n  \"z\": 2\n}\n"),
+            ("{\n  \"a\": 1, \"k\": \"v\"\n}\n", "{\n  \"a\": 1\n}\n"),
+            // An object value over several lines: every one of them.
+            ("{\n  \"k\": {\n    \"nested\": [1,\n      2]\n  },\n  \"z\": 2\n}\n", "{\n  \"z\": 2\n}\n"),
+        ] {
+            assert_eq!(remove_settings(src, &["k"]), Ok((want.to_string(), 1)), "{src:?}");
+        }
+    }
+
+    /// Every top-level copy goes (serde and Cursor read the last one), an
+    /// escaped key matches, the key nested, in a string or in a comment
+    /// never does, and what does not parse is refused as the splice refuses it.
+    #[test]
+    fn remove_takes_every_copy_and_nothing_else() {
+        let twice = "{\n  \"k\": \"v\",\n  \"a\": 1,\n  \"k\": \"w\"\n}\n";
+        assert_eq!(remove_settings(twice, &["k"]), Ok(("{\n  \"a\": 1\n}\n".to_string(), 2)));
+        let escaped = "{\"claudeCode\\u002eclaudeProcessWrapper\": \"/x/ai-env-claude\", \"a\": 1}";
+        assert_eq!(remove_settings(escaped, &[WRAPPER_SETTING]), Ok(("{\"a\": 1}".to_string(), 1)));
+        // splice_is_not_confused_by_the_key_inside_strings_comments_or_nested_objects' source.
+        let src = "{\n  // \"claudeCode.claudeProcessWrapper\": \"in a comment\"\n  \"note\": \"\\\"claudeCode.claudeProcessWrapper\\\": in a string\",\n  \"nested\": { \"claudeCode.claudeProcessWrapper\": \"depth 2\" },\n  /* \"claudeCode.claudeProcessWrapper\": \"in a block\" */\n  \"list\": [\"claudeCode.claudeProcessWrapper\"]\n}\n";
+        assert_eq!(remove_settings(src, &[WRAPPER_SETTING]), Ok((src.to_string(), 0)));
+        assert_eq!(remove_settings("{}\n", &[WRAPPER_SETTING]), Ok(("{}\n".to_string(), 0)));
+        for (text, why) in [
+            ("{\"a\": }", "cannot parse the settings"),
+            ("", "cannot parse the settings"),
+            ("{\"a\": 1} {}", "cannot parse the settings"),
+            ("[1, 2]", "the top-level value is not an object"),
+            // Parses once the comment is stripped, but its tokens are no member list.
+            ("{\"k\": tru/**/e}", "expected ',' or '}'"),
+        ] {
+            let e = remove_settings(text, &["k"]).unwrap_err();
+            assert!(e.contains(why), "{text:?}: {e}");
+        }
+    }
+
+    /// U4: `uninstall` then `install` gives back the same bytes when the
+    /// wrapper key sat on its own line just before `initialPermissionMode`,
+    /// as install writes it. With the key gone, the splice puts it back just
+    /// before `initialPermissionMode` when that starts its own line (its
+    /// indent and its line's ending), else before the final `}` as before; a
+    /// key that sat anywhere else comes back there, the settings the same.
+    #[test]
+    fn remove_then_splice_gives_back_the_same_bytes() {
+        let wrapper = "/x/ai-env-claude";
+        for (src, mode) in [
+            // The two splices above: plain JSON, JSONC with a trailing comma.
+            ("{\n    \"editor.tabSize\": 2,\n    \"nested\": {\"k\": [1, 2]},\n    \"z\": \"last\",\n    \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n    \"claudeCode.initialPermissionMode\": \"default\"\n}\n", "default"),
+            ("{\n  // Cursor settings\n  \"editor.tabSize\": 2, /* block */\n  \"url\": \"http://x/y\", // a line comment with \"quotes\"\n  \"list\": [1, 2, ],\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"manual\",\n}\n", "manual"),
+            // A member after the mode; the wrapper first, no final newline; CRLF with tabs.
+            ("{\n  \"a\": 1,\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"plan\",\n  \"z\": 2\n}\n", "plan"),
+            ("{\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"default\",\n  \"a\": 1\n}", "default"),
+            ("{\r\n\t\"a\": 1,\r\n\t\"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\r\n\t\"claudeCode.initialPermissionMode\": \"default\"\r\n}\r\n", "default"),
+        ] {
+            let (removed, n) = remove_settings(src, &[WRAPPER_SETTING]).unwrap();
+            assert_eq!(n, 1, "{src:?}");
+            assert_eq!(splice_settings(&removed, &[(WRAPPER_SETTING, wrapper), (PERMISSION_SETTING, mode)]).unwrap(), src, "{removed:?}");
+        }
+        // install's own lines in a CRLF file end in LF: the key comes back with the mode line's ending.
+        for src in ["{\r\n  \"a\": 1\r\n}\r\n", "{\r\n\t\"a\": 1,\r\n}", "{}\r\n"] {
+            let entries = [(WRAPPER_SETTING, wrapper), (PERMISSION_SETTING, "default")];
+            let installed = splice_settings(src, &entries).unwrap();
+            let (removed, _) = remove_settings(&installed, &[WRAPPER_SETTING]).unwrap();
+            assert_eq!(splice_settings(&removed, &entries).unwrap(), installed, "{src:?}");
+        }
+        // The mode not on a line of its own: before the final `}`, as before.
+        let (removed, _) = remove_settings("{\"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\", \"claudeCode.initialPermissionMode\": \"default\"}", &[WRAPPER_SETTING]).unwrap();
+        assert_eq!(removed, "{\"claudeCode.initialPermissionMode\": \"default\"}");
+        assert_eq!(splice_settings(&removed, &[(WRAPPER_SETTING, wrapper), (PERMISSION_SETTING, "default")]).unwrap(), "{\"claudeCode.initialPermissionMode\": \"default\",\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\"\n}");
+        // Another layout (the key last, after the mode, as the install before U4 left a file whose mode
+        // was set; the key with a comment after it): the key comes back before the mode, not where it was.
+        for (src, back) in [
+            (
+                "{\n  \"editor.tabSize\": 2,\n  \"claudeCode.initialPermissionMode\": \"default\",\n  \"window.zoomLevel\": 1,\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\"\n}\n",
+                "{\n  \"editor.tabSize\": 2,\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"default\",\n  \"window.zoomLevel\": 1\n}\n",
+            ),
+            (
+                "{\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\", // ai-env\n  \"claudeCode.initialPermissionMode\": \"default\"\n}\n",
+                "{\n  // ai-env\n  \"claudeCode.claudeProcessWrapper\": \"/x/ai-env-claude\",\n  \"claudeCode.initialPermissionMode\": \"default\"\n}\n",
+            ),
+        ] {
+            let (removed, _) = remove_settings(src, &[WRAPPER_SETTING]).unwrap();
+            let again = splice_settings(&removed, &[(WRAPPER_SETTING, wrapper), (PERMISSION_SETTING, "default")]).unwrap();
+            assert_eq!(again, back, "{src:?}");
+            assert_eq!(parse_settings(&again).unwrap(), parse_settings(src).unwrap(), "the same settings: {src:?}");
+        }
     }
 
     /// S8 T8.7: rules spliced into `permissions.<kind>` in the document's

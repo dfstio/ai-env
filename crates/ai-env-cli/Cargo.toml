@@ -59,6 +59,11 @@ path = "tests/wrapper_install.rs"
 required-features = ["bridge"]
 
 [[test]]
+name = "wrapper_status"
+path = "tests/wrapper_status.rs"
+required-features = ["bridge"]
+
+[[test]]
 name = "hoststate"
 path = "tests/hoststate.rs"
 required-features = ["bridge"]
