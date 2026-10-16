@@ -152,9 +152,10 @@ fn error_line(stderr: &str) -> &str {
 
 /// Remove from `cmd`'s environment what a probed tool has no business
 /// seeing: the variables the age children lose (`CHILD_ENV_REMOVED`: the
-/// OAuth token, the API key, an AWS key, a session token) and the `ai-env
-/// as` marker. Under `ai-env as ops -- ai-env doctor` the operator key is
-/// for the AWS rows alone, never for rustup, zig or claude.
+/// OAuth token, the API key, an AWS key, a session token, the stack's
+/// passphrase) and the `ai-env as` marker. Under `ai-env as ops -- ai-env
+/// doctor` the operator key is for the AWS rows alone, never for rustup, zig
+/// or claude.
 fn without_credentials(cmd: &mut Command) -> &mut Command {
     for name in crate::age_cmd::CHILD_ENV_REMOVED.iter().chain(&[crate::commands::RUNNER_MARKER]) {
         cmd.env_remove(name);

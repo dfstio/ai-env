@@ -38,9 +38,10 @@ infra="$root/infra"
 
 test -x "$infra/node_modules/.bin/tsc" || { echo "check-policies: $infra/node_modules missing: make infra-install" >&2; exit 1; }
 rm -rf "$out"
-# Compile only the printer and the pure policies module (no Pulumi at run time), never with an operator key in the
-# environment (D18: `make deploy` runs this under ai-env as deployer); the aws and node calls below keep it.
-(cd "$infra" && env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS \
+# Compile only the printer and the pure policies module (no Pulumi at run time), never with an operator key or the
+# stack's passphrase in the environment (D18: `make deploy` runs this under ai-env as deployer, and A39's unseal); the
+# aws and node calls below keep the key.
+(cd "$infra" && env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE \
     node_modules/.bin/tsc --strict --target es2022 --module commonjs --moduleResolution node --types node \
     --rootDir . --outDir "$out" scripts/print-policies.ts)
 

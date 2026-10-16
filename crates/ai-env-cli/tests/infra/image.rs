@@ -425,8 +425,9 @@ const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_
 /// step, and ops.sh's need_ai_env): `--version`, with no marker and no lab knob in its environment.
 const BUILT: &str = "--version [AI_ENV=unset]";
 
-/// `$(NO_KEY)` as the recipes run it (D18): the four variables no compile may see.
-const NO_KEY: &str = "env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS";
+/// `$(NO_KEY)` as the recipes run it (D18): the six variables no compile may see (the key, its secret, a session
+/// token, the marker, and the stack's passphrase either way, A39).
+const NO_KEY: &str = "env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE";
 
 #[test]
 fn make_n_of_the_part_b_targets_executes_nothing() {
@@ -446,7 +447,9 @@ fn make_n_of_the_part_b_targets_executes_nothing() {
     for want in ["pulumi up --stack dev", "creds aws-set --check", "pulumi destroy --stack dev", "infra pin --manifest", "--expect-version \"2.1.283\""] {
         assert!(text.contains(want), "{want} missing from the dry run: {text}");
     }
-    let rk = text.lines().skip_while(|l| !l.ends_with("creds aws-set --check")).take_while(|l| !l.contains("pulumi destroy")).collect::<Vec<_>>().join("\n");
+    // runtime-key's lines alone, up to destroy's CONFIRM check: the whole dry run names `encrypt -k` (its first line,
+    // deploy's passphrase check).
+    let rk = text.lines().skip_while(|l| !l.ends_with("creds aws-set --check")).take_while(|l| !l.contains("= \"destroy-dev\"")).collect::<Vec<_>>().join("\n");
     assert!(!rk.is_empty() && !rk.contains(" -k "), "runtime-key names no keystore key (ai-env run picks the container's): {rk}");
 }
 
@@ -1414,10 +1417,11 @@ fn ops5(t: &Path, bin: &Path, args: &[&str]) -> Command {
 /// A copy of the repo's make files under `<tmp>/w`, for the recipes that
 /// write relative to the tree (deploy, s5-smoke) or must not find a file:
 /// the Makefile, infra/infra.mk, the parameter files (egress-config.json
-/// only when `egress_config`), ops.sh and image/Dockerfile.
+/// only when `egress_config`), ops.sh, pass-exec.sh (TIER's guard after the
+/// passphrase's unseal) and image/Dockerfile.
 fn planted_repo(tmp: &Path, egress_config: bool) -> PathBuf {
     let w = tmp.join("w");
-    let mut files = vec!["Makefile", "infra/infra.mk", "infra/image-config.json", "infra/scripts/ops.sh", "image/Dockerfile"];
+    let mut files = vec!["Makefile", "infra/infra.mk", "infra/image-config.json", "infra/scripts/ops.sh", "infra/scripts/pass-exec.sh", "image/Dockerfile"];
     if egress_config {
         files.push("infra/egress-config.json");
     }
@@ -1435,6 +1439,21 @@ fn make_in(tmp: &Path, bin: &Path, w: &Path, args: &[&str]) -> Command {
     isolate(&mut cmd, tmp).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
     cmd.args(["-s", "--no-print-directory", "-C"]).arg(w).args(args);
     cmd
+}
+
+/// Where make and ops.sh look for the stack's sealed passphrase by default (A39: PULUMI_SEALED), under `home`, the
+/// HOME of the run ([`isolate`] sets it to the test's temp dir).
+fn sealed_path(home: &Path) -> PathBuf {
+    home.join(".config/ai-env/pulumi.env")
+}
+
+/// The stack's passphrase sealed at `file` as the stand-in reads it (tests/fakes/ai-env.sh `run -f`): `kind` "" seals
+/// the fake stack's passphrase (aws_keys::passphrase(), which the fake pulumi accepts), "empty" the README's first line
+/// before `ai-env edit` set its value, "none" no PULUMI_CONFIG_PASSPHRASE at all. No file holds the value itself.
+fn seal_passphrase(file: &Path, kind: &str) -> PathBuf {
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, if kind.is_empty() { "FAKE-SEALED-PASSPHRASE\n".to_string() } else { format!("FAKE-SEALED-PASSPHRASE {kind}\n") }).unwrap();
+    file.to_path_buf()
 }
 
 /// A network connector of the stateful aws: `states` its get answers in turn (the last one sticks).
@@ -2753,7 +2772,9 @@ fn the_destroy_checklist_names_the_egress_leftovers() {
 /// is built in the same run); the account holds the image (active version
 /// 2), the stack's connector, the running proxy and a vpc VM row, and
 /// state/infra.toml is current. `pulumi up` (FAKE_PULUMI_ON_UP) makes image
-/// version 3 and a connector that is PENDING once more.
+/// version 3 and a connector that is PENDING once more. The stack's
+/// passphrase is sealed where make looks for it (A39), so the deploy unseals
+/// it (the stand-in's one Touch ID) before the deployer's paste.
 struct DeployTree {
     t: tempfile::TempDir,
     w: PathBuf,
@@ -2781,6 +2802,7 @@ impl DeployTree {
         std::fs::write(t.path().join("fresh"), arm64_elf("fresh bootstrap")).unwrap();
         // The stack's deployer exists (S8 operators): make deploy runs as it.
         write_outputs(t.path(), &with_operators(outputs()));
+        seal_passphrase(&sealed_path(t.path()), "");
         write_infra_state(t.path(), &bin, &outputs());
         set_image(t.path(), "UPDATED", "2", "", "2026-09-29T10:00:00.123000+00:00");
         seed_connector(t.path(), CONNECTOR, "ACTIVE");
@@ -2799,6 +2821,11 @@ impl DeployTree {
 
     /// `make <target>` (deploy, deploy-policies) in the tree, the plan `p` its preview's.
     fn run(&self, target: &str, p: &Value, envs: &[(&str, &str)]) -> Output {
+        self.run_with(target, &[], p, envs)
+    }
+
+    /// [`DeployTree::run`] with `args` added to make's command line.
+    fn run_with(&self, target: &str, args: &[&str], p: &Value, envs: &[(&str, &str)]) -> Output {
         let t = self.t.path();
         std::fs::write(t.join("plan.json"), p.to_string()).unwrap();
         let mut cmd = make_in(t, &self.bin, &self.w, &[target]);
@@ -2807,6 +2834,7 @@ impl DeployTree {
             .arg(format!("CARGO_LAMBDA={}", self.bin.join("cargo-lambda").display()))
             .arg(format!("LLVM_BIN={}", t.join("llvm").display()))
             .args(["EXPECT_BUILD_FAILURE=1", "CONNECTOR_WAIT_POLL=1", "CONNECTOR_WAIT_TIMEOUT=10", "IMAGE_WAIT_POLL=1", "IMAGE_WAIT_TIMEOUT=10"])
+            .args(args)
             .env("FAKE_CL_BOOTSTRAP", t.join("fresh"))
             .env("FAKE_DOCKER_VERSION", "29.8.0 arm64")
             .env("FAKE_DOCKER_FREE_KB", "50125004")
@@ -2882,21 +2910,31 @@ fn deploy_runs_the_plan_gate_first_and_the_egress_steps_last() {
     }
     assert_eq!(c.iter().filter(|l| l.starts_with("pulumi preview")).count(), 1, "one preview: {c:#?}");
     assert!(!c.iter().any(|l| l.contains("FORBIDDEN")), "{c:#?}");
-    // S8 operators: the zip was built before the runner, which asked once; everything after it ran as the deployer.
-    let runner = format!("as deployer -- {} --no-print-directory deploy-run [AI_ENV=unset]", make_path());
+    // S8 operators: the zip was built before the runner, which asked once; everything after it ran as the deployer. A39:
+    // the stack's passphrase, unsealed (the stand-in's `run -f` of the sealed file) right before the runner, is in the
+    // runner's environment and X-run's, never a build's.
+    let runner = format!("as deployer -- {} --no-print-directory deploy-run [AI_ENV=unset] [PASS]", make_path());
     assert_eq!(c.iter().filter(|l| l.starts_with("as ")).cloned().collect::<Vec<_>>(), ["as --check deployer [AI_ENV=unset]".to_string(), runner.clone()], "one runner: {c:#?}");
     let r = at(&c, &runner);
+    let sealed = sealed_path(d.t.path());
+    let unsealed = format!("run -f {} -- /bin/bash infra/scripts/pass-exec.sh deploy {} {} as deployer -- {} --no-print-directory deploy-run [AI_ENV=unset]", sealed.display(), sealed.display(), d.bin.join("ai-env-stand-in").display(), make_path());
+    assert_eq!(c[r - 1], unsealed, "the passphrase's unseal right before the runner: {c:#?}");
     assert!(at(&c, "infra scan ") < r, "the zip's scan before the runner: {c:#?}");
     assert_eq!(c.iter().filter(|l| l.starts_with("infra scan ")).count(), 1, "the zip is built once, in the wrapper; deploy-run never builds it again: {c:#?}");
     let asked = at(&c, "as --check deployer");
     assert!(c[asked - 1] == BUILT && c[..asked].iter().filter(|l| *l == BUILT).count() == 2, "the zip's version read, then TIER's keyless build of the CLI (D18), before it asks: {c:#?}");
     for (i, l) in c.iter().enumerate().filter(|(_, l)| l.contains("[AI_ENV=") && !l.starts_with("as ")) {
-        if l.starts_with("--version ") {
-            // The zip's version read and every keyless build (TIER's, s3-preflight's, ops.sh post-deploy's).
-            assert!(!l.contains("[AS="), "a build or version read under the marker: {l}: {c:#?}");
+        if l.starts_with("--version ") || l.starts_with("infra scan ") {
+            // The zip's scan and version read, and every keyless build (TIER's, s3-preflight's, ops.sh post-deploy's).
+            assert!(!l.contains("[AS=") && !l.contains("[PASS]"), "a build or version read under the marker or the passphrase: {l}: {c:#?}");
             continue;
         }
-        assert_eq!(l.ends_with(" [AS=deployer:9001]"), i > r, "the stand-in's calls after the runner, and only those, as the deployer: {l}: {c:#?}");
+        assert_eq!(l.contains(" [AS=deployer:9001]"), i > r, "the stand-in's calls after the runner, and only those, as the deployer: {l}: {c:#?}");
+        assert_eq!(l.ends_with(" [PASS]"), i > r, "the stand-in's calls after the runner, and only those, under the passphrase: {l}: {c:#?}");
+    }
+    assert!(c[..r - 1].iter().all(|l| !l.contains("[PASS]")), "nothing before the unseal holds the passphrase: {c:#?}");
+    for pulumi in ["pulumi preview --json --show-sames --show-reads --non-interactive --stack dev [PASS]", "pulumi up --stack dev [PASS]"] {
+        assert!(c.iter().any(|l| l == pulumi), "{pulumi}: {c:#?}");
     }
     assert!(text.contains("deploy: identity user/ai-env-deployer (the deployer of stack dev)") && text.contains("[ok ] P8 deploy identity user/ai-env-deployer (the deployer of stack dev)"), "{text}");
     let lines = [
@@ -2961,7 +2999,7 @@ fn deploy_runs_the_reload_and_the_warnings_on_every_exit_after_pulumi_up_and_fai
     let out = d.deploy(&deploy_plan(&[]), &[("FAKE_AIENV_STATUS_RC", "1"), ("FAKE_AIENV_DRIFT", "sg-proxy")]);
     let text = all(&out);
     assert!(!out.status.success() && text.contains("deploy: DRIFT: ai-env egress status found drift in sg-proxy") && text.contains("new image version"), "{text}");
-    assert_eq!(calls(d.t.path()).last().map(String::as_str), Some("egress status [AI_ENV=unset] [AS=deployer:9001]"), "the drift check is the last step, as the deployer");
+    assert_eq!(calls(d.t.path()).last().map(String::as_str), Some("egress status [AI_ENV=unset] [AS=deployer:9001] [PASS]"), "the drift check is the last step, as the deployer");
     let d = DeployTree::new(CHECK_PLAN_FAKE);
     let out = d.deploy(&deploy_plan(&[]), &[("FAKE_AIENV_STATUS_RC", "7")]);
     assert!(out.status.success() && all(&out).contains("deploy: warning: ai-env egress status exit 7"), "{}", all(&out));
@@ -3012,13 +3050,27 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
     let out = d.deploy(&failed, &[("FAKE_PULUMI_PREVIEW_RC", "255")]);
     let text = all(&out);
     assert!(!out.status.success() && text.contains("deploy: pulumi preview --json failed (exit 255): nothing deployed") && text.contains("the program threw: egress guard refused something"), "{text}");
-    // The two routes to the stack's passphrase: the exported file, or the sealed one under ai-env run -f.
-    assert!(
-        text.contains("nothing deployed (a passphrase stack needs PULUMI_CONFIG_PASSPHRASE_FILE: --non-interactive cannot prompt, or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"))"),
-        "{text}"
+    // A39: the failure names where the passphrase comes from and how a wrong or empty sealed one is set again.
+    let edit = format!(
+        "nothing deployed (Pulumi's error above; its incorrect passphrase: the value in effect is wrong or empty, the sealed one set with ai-env edit {}, which make deploy unseals unless PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE is set (README \"Identities\"))",
+        sealed_path(d.t.path()).display()
     );
+    assert!(text.contains(&edit), "{text}");
     let c = calls(d.t.path());
     assert!(!c.iter().any(|l| l.starts_with("check-plan") || l.starts_with("pulumi up")), "{c:#?}");
+
+    // A wrong passphrase in the environment (nothing is unsealed then): Pulumi's own error at the plan check, the same
+    // text after it; nothing checked or deployed.
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let wrong = super::aws_keys::passphrase().to_lowercase();
+    let out = d.deploy(&deploy_plan(&[]), &[("PULUMI_CONFIG_PASSPHRASE", &wrong)]);
+    let text = all(&out);
+    assert!(!out.status.success() && text.contains("error: getting stack configuration: get stack secrets manager: incorrect passphrase"), "{text}");
+    assert!(text.contains("deploy: pulumi preview --json failed (exit 1): nothing deployed (Pulumi's error above; its incorrect passphrase: the value in effect is wrong or empty"), "{text}");
+    assert!(text.contains(&format!("the sealed one set with ai-env edit {}, which make deploy unseals", sealed_path(d.t.path()).display())), "{text}");
+    let c = calls(d.t.path());
+    assert!(!c.iter().any(|l| l.starts_with("run ") || l.starts_with("check-plan") || l.starts_with("pulumi up")), "set: nothing unsealed, nothing deployed: {c:#?}");
+    assert!(!text.contains(&wrong) && c.iter().all(|l| !l.contains(&wrong)), "the value is never shown");
 }
 
 /// `make claude-update` (ops.sh claude-update): it follows the installed Cursor bundle, does only what is not current
@@ -3037,6 +3089,14 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
 /// covers the tier it asks nothing; a cancelled runner changes nothing after it. A deploy due before the bootstrap (no
 /// deployer exported, so no deployer key) is the account root's: refused before anything runs, naming what to run
 /// instead (the pin and make test-docker when due, then make deploy as the account root).
+/// A39: a deploy due with the passphrase not set as Pulumi takes it (neither variable, or an empty
+/// PULUMI_CONFIG_PASSPHRASE, which Pulumi takes before the file) unseals the sealed file (PULUMI_SEALED, by default
+/// under HOME): one `ai-env run -f` after pin and test-docker and before the runner's ask (the Touch ID before the
+/// paste), the only hop under a runner that covers the deployer, whose identity is checked before anything runs; an
+/// empty sealed value stops before the paste, saying what the pass before the unseal left; no file refuses before
+/// anything runs; nothing to deploy unseals nothing. Only the make deploy step ever holds the passphrase, and the
+/// deployer's runner that carries it there: no read of ops.sh's own (the bundle, the outputs, the checks), and neither
+/// pin, test-docker, the status, the proxy, the check nor git.
 #[test]
 fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
     const TTY: (&str, &str) = ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1");
@@ -3074,6 +3134,12 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         NoDeployerStamped,
         /// The lock tracked by git and changed (a fake git, which logs whether a key reached it).
         LockTracked,
+        /// The stack's passphrase sealed where ops.sh looks by default (A39).
+        Sealed,
+        /// The README's first line without `ai-env edit`: the sealed passphrase empty.
+        SealedEmpty,
+        /// The passphrase sealed in `sealed.env` of the working directory (PULUMI_SEALED names it).
+        SealedElsewhere,
     }
     struct Case<'a> {
         what: &'a str,
@@ -3089,6 +3155,8 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         runner: Option<&'a str>,
         /// The marker of a runner the whole run is under (`deployer`, `ops`), whose key the stand-in's tails give.
         under: Option<&'a str>,
+        /// The run unseals the sealed passphrase (A39: one `ai-env run -f`, after pin and test-docker, before the ask).
+        unsealed: bool,
     }
     let full = vec![TTY, PASS];
     let c = |what, bundle, locked, deployed, envs: Vec<(&'static str, &'static str)>, world, code, steps: Vec<&'static str>, wants: Vec<&'static str>| {
@@ -3100,7 +3168,7 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         } else {
             None
         };
-        Case { what, bundle, locked, deployed, envs, world, code, steps, wants, runner, under: None }
+        Case { what, bundle, locked, deployed, envs, world, code, steps, wants, runner, under: None, unsealed: false }
     };
     let mut cases: Vec<Case> = vec![
         c("up to date", "2.1.287", "2.1.287", "2.1.287", vec![], World::Plain, 0, vec![status, check], vec!["claude-update: 2.1.287 is pinned and deployed: nothing to build or deploy", "claude-update [2/3] new VMs start the deployed image version", "claude-update: new VMs start image version 3.0, the deployed one, built from ai-env/image-0123456789abcdef.zip", "done: new VMs start image version 3.0 with Claude Code 2.1.287", "claude-update: this run needs ai-env as ops (the status and the egress check): asking once, before the first step that needs AWS", "claude-update: identity user/ai-env-ops (the operator of stack dev)"]),
@@ -3111,8 +3179,9 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
         c("a failed check", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![status, check], vec!["STOPPED at step 3/3 (ai-env egress check --if-needed: exit 3)"]),
         c("a rollback", "2.1.287", "2.1.287", "2.1.287", vec![], World::Rollback, 1, vec![status], vec!["new VMs start image version 3.0, not the deployed 4.0 (a rollback with make image-deactivate or image-activate?)", "make image-activate VERSION=4.0", "STOPPED at step 2/3"]),
         c("no terminal", "2.1.288", "2.1.287", "2.1.287", vec![PASS], World::Plain, 1, vec![], vec!["claude-update: needs a terminal"]),
-        // Both routes to the passphrase: the exported file, or the sealed one under ai-env run -f (README "Identities").
-        c("no passphrase", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Plain, 1, vec![], vec!["claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the dev stack's passphrase: make deploy's preview runs --non-interactive), or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"): nothing changed"]),
+        // Neither passphrase variable set and nothing sealed to unseal (A39): refused before anything runs, naming the
+        // README's two lines and the export (the path, under the test's HOME, is checked below).
+        c("no passphrase", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Plain, 1, vec![], vec!["claude-update: a deploy is due, and the dev stack's passphrase is in neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none), and there is no sealed ", "/.config/ai-env/pulumi.env to unseal (make deploy's preview runs --non-interactive): seal it once (README \"Identities\"): printf 'PULUMI_CONFIG_PASSPHRASE=\\n' | ai-env encrypt -k ai-env-bridge - > \"", "/.config/ai-env/pulumi.env\"; or export PULUMI_CONFIG_PASSPHRASE_FILE (a file holding it): nothing changed"]),
         c("Docker down", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DOCKER_RC", "1")], World::Plain, 1, vec![], vec!["claude-update: Docker does not answer (docker info)"]),
         c("make -k", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -k")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
         c("a variable is no flag", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
@@ -3199,19 +3268,53 @@ fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
     }
     // The lock tracked and changed: said at the end, git run without the key and without an fsmonitor (D17).
     cases.push(c("a lock to commit", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::LockTracked, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: image/claude.lock changed: review and commit it"]));
+    // A39: the stack's passphrase sealed, neither variable set. A deploy due unseals it once, after pin and test-docker
+    // and before the deployer's ask (each said on stderr first); the pass under it asks for the runner as before. An
+    // empty sealed value stops before the ask, saying what the pass before the unseal left; a dismissed Touch ID is
+    // ai-env run's exit, nothing after it. An empty PULUMI_CONFIG_PASSPHRASE beside its file is no passphrase (Pulumi
+    // takes the empty one first): unsealed too.
+    let unsealing = "claude-update: a deploy is due: the dev stack's passphrase: ai-env run -f ";
+    let then_asks = "(one Touch ID), then ai-env as deployer: asking once each, before the first step that needs AWS";
+    let empty = "/.config/ai-env/pulumi.env, but it sets neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none: set it with ai-env edit \"";
+    let empty_left = "\", README \"Identities\"): stopped before the first step that needs AWS: nothing deployed: the pass before the unseal pinned image/claude.lock to 2.1.288 and passed make test-docker (kept: make claude-update again resumes)";
+    // (what, the environment, the world, the exit, the steps, the wants)
+    type Sealed<'a> = (&'a str, Vec<(&'a str, &'a str)>, World, i32, Vec<&'a str>, Vec<&'a str>);
+    let sealed_cases: [Sealed; 5] = [
+        ("the passphrase sealed", vec![TTY], World::Sealed, 0, vec![PIN288, test, deploy, status, proxy, check], vec![unsealing, then_asks, "claude-update: this run needs ai-env as deployer (a deploy is due): asking once", "claude-update [1/5] make deploy"]),
+        ("an empty passphrase beside its file", vec![TTY, ("PULUMI_CONFIG_PASSPHRASE", ""), PASS], World::Sealed, 0, vec![PIN288, test, deploy, status, proxy, check], vec![unsealing, then_asks, "claude-update [1/5] make deploy"]),
+        ("the sealed passphrase empty", vec![TTY], World::SealedEmpty, 1, vec![PIN288, test], vec![unsealing, "claude-update: this run is under ai-env run -f ", empty, empty_left, "!claude-update: Cursor bundle", "!this run needs ai-env as"]),
+        ("a cancelled unseal", vec![TTY, ("FAKE_AIENV_RUN", "cancel")], World::Sealed, 3, vec![PIN288, test], vec![unsealing, "ai-env: cancelled", "!claude-update: Cursor bundle", "!this run needs ai-env as"]),
+        ("PULUMI_SEALED names the file", vec![TTY, ("PULUMI_SEALED", "sealed.env")], World::SealedElsewhere, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: a deploy is due: the dev stack's passphrase: ai-env run -f sealed.env (one Touch ID), then ai-env as deployer"]),
+    ];
+    for (what, envs, world, code, steps, wants) in sealed_cases {
+        let mut case = c(what, "2.1.288", "2.1.287", "2.1.287", envs, world, code, steps, wants);
+        case.unsealed = true;
+        if code != 0 {
+            case.runner = None;
+        }
+        cases.push(case);
+    }
+    // Under the deployer's runner the unseal is the only hop; with nothing to deploy nothing is unsealed.
+    let mut case = c("the passphrase sealed under the deployer's runner", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Sealed, 0, vec![PIN288, test, deploy, status, proxy, check], vec![unsealing, "(one Touch ID), before the first step that needs AWS", "!then ai-env as", "!this run needs ai-env as"]);
+    case.runner = None;
+    case.under = Some("deployer");
+    case.unsealed = true;
+    cases.push(case);
+    cases.push(c("nothing to deploy, a sealed file", "2.1.287", "2.1.287", "2.1.287", vec![], World::Sealed, 0, vec![status, check], vec!["is pinned and deployed", "!the dev stack's passphrase"]));
     for case in cases {
         let what = case.what;
         let tmp = tempfile::tempdir().unwrap();
         let t = tmp.path();
         let bin = s5_bin(t);
-        // The steps' make: each call logged with the marker and whether a credential (the key, its secret or a
-        // session token) is in its environment (never a value); claude-pin writes the lock and test-docker the zip,
-        // its image.json and its stamp, as the real ones do; a deploy moves the stack outputs' claudeVersion to the
-        // version it deployed (FAKE_DEPLOYS).
+        // The steps' make: each call logged with the marker, whether a credential (the key, its secret or a session
+        // token) and whether the stack's passphrase is in its environment (never a value); claude-pin writes the lock
+        // and test-docker the zip, its image.json and its stamp, as the real ones do; a deploy moves the stack outputs'
+        // claudeVersion to the version it deployed (FAKE_DEPLOYS).
         script(
             &bin.join("make"),
             r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
-printf 'make %s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+p=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}
+printf 'make %s%s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" "${p:+ [PASS]}" >> "$FAKE_AIENV_LOG"
 case " $* " in *" ${FAKE_MAKE_FAIL:-none} "*) exit 2 ;; esac
 case " $* " in
   *" claude-pin "*) for a in "$@"; do case "$a" in CLAUDE_VERSION=*) printf 'CLAUDE_VERSION=%s\nCLAUDE_PLATFORM=linux-arm64\n' "${a#CLAUDE_VERSION=}" > "$LOCK" ;; esac; done ;;
@@ -3233,12 +3336,25 @@ exit 0"#,
         o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
         write_outputs(t, &if matches!(case.world, World::NoDeployer | World::NoDeployerStamped) { o } else { with_operators(o) });
         if case.world == World::LockTracked {
-            // git: each call logged with the marker and whether a credential reached it (never a value); the lock is
-            // tracked (ls-files) and changed (diff --quiet exits 1).
+            // git: each call logged with the marker and whether a credential or the stack's passphrase reached it (never
+            // a value); the lock is tracked (ls-files) and changed (diff --quiet exits 1).
             script(
                 &bin.join("git"),
-                "k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}\nprintf 'git %s%s%s\\n' \"$*\" \"${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}\" \"${k:+ [KEY]}\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" diff \"*) exit 1 ;; esac\nexit 0",
+                "k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}\np=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}\nprintf 'git %s%s%s%s\\n' \"$*\" \"${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}\" \"${k:+ [KEY]}\" \"${p:+ [PASS]}\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" diff \"*) exit 1 ;; esac\nexit 0",
             );
+        }
+        // A39: the stack's passphrase sealed, as the stand-in's `ai-env run -f` reads it.
+        match case.world {
+            World::Sealed => {
+                seal_passphrase(&sealed_path(t), "");
+            }
+            World::SealedEmpty => {
+                seal_passphrase(&sealed_path(t), "empty");
+            }
+            World::SealedElsewhere => {
+                seal_passphrase(&t.join("sealed.env"), "");
+            }
+            _ => {}
         }
         std::fs::create_dir_all(t.join("aws/image")).unwrap();
         std::fs::write(t.join("aws/image/state"), "UPDATED").unwrap();
@@ -3330,7 +3446,10 @@ exit 0"#,
             }
             None => assert_eq!(asked, Vec::<&String>::new(), "{what}: no runner"),
         }
-        // pin and test-docker never see a key; every other step runs as the identity of the run.
+        // pin and test-docker never see a key; every other step runs as the identity of the run. A39: only the deploy
+        // step holds the stack's passphrase (pin and test-docker without any key or it, the steps after the deploy, the
+        // check and git without it), and the deployer's runner that carries it there: no read of ops.sh's own either
+        // (the stand-in's bundle, checks and builds, pulumi's stack outputs).
         let marker_of = match (case.under, case.runner) {
             (_, Some("deployer")) | (Some("deployer"), None) => "deployer:9001",
             _ => "ops:9002",
@@ -3339,8 +3458,33 @@ exit 0"#,
             let keyless = l.contains(" claude-pin ") || l.contains(" test-docker");
             assert_eq!(!l.contains(" [KEY]") && !l.contains(" [AS="), keyless, "{what}: {l}");
             if !keyless {
-                assert!(l.ends_with(&format!(" [AS={marker_of}] [KEY]")), "{what}: {l}");
+                assert!(l.contains(&format!(" [AS={marker_of}] [KEY]")), "{what}: {l}");
             }
+            assert_eq!(l.ends_with(" [PASS]"), l.starts_with(&format!("{deploy} ")), "{what}: {l}");
+        }
+        let held: Vec<&String> = c.iter().filter(|l| l.contains("[PASS]")).collect();
+        assert!(held.iter().all(|l| l.starts_with(&format!("{deploy} ")) || l.starts_with("as deployer -- ")), "{what}: only the deploy step and its runner hold the passphrase: {held:#?}");
+        // One unseal of the sealed passphrase when the run needs it: after pin and test-docker, before the ask; nothing
+        // before it holds the passphrase, and its value is never shown.
+        let unseals: Vec<&String> = c.iter().filter(|l| l.starts_with("run -f ")).collect();
+        if case.unsealed {
+            let file = if case.world == World::SealedElsewhere { "sealed.env".to_string() } else { sealed_path(t).display().to_string() };
+            assert_eq!(unseals.len(), 1, "{what}: one unseal: {c:#?}");
+            assert!(unseals[0].starts_with(&format!("run -f {file} -- env AI_ENV_CLI={} /bin/bash ", bin.join("ai-env-stand-in").display())) && unseals[0].contains("/infra/scripts/ops.sh claude-update [AI_ENV=unset]"), "{what}: {}", unseals[0]);
+            let u = at(&c, "run -f ");
+            let before = case.steps.iter().take_while(|s| s.starts_with("make --no-print-directory claude-pin") || **s == test).count();
+            assert_eq!(c[..u].iter().filter(|l| l.starts_with("make ")).count(), before, "{what}: pin and test-docker before the unseal, nothing else: {c:#?}");
+            assert!(c[..u].iter().all(|l| !l.contains("[PASS]")), "{what}: nothing before the unseal holds the passphrase: {c:#?}");
+            if case.runner.is_some() {
+                assert!(u < at(&c, "as deployer -- "), "{what}: the Touch ID before the paste: {c:#?}");
+            }
+        } else {
+            assert_eq!(unseals, Vec::<&String>::new(), "{what}: nothing unsealed");
+        }
+        let passphrase = super::aws_keys::passphrase();
+        assert!(!text.contains(&passphrase) && c.iter().all(|l| !l.contains(&passphrase)), "{what}: the passphrase's value shown");
+        if what == "no passphrase" {
+            assert!(text.contains(&format!("there is no sealed {} to unseal", sealed_path(t).display())), "{what}: the refusal names the default file: {text}");
         }
         if case.code == 0 || case.steps.iter().any(|s| s.starts_with("make --no-print-directory infra-status") || *s == deploy) {
             assert_eq!(text.matches("claude-update: Cursor bundle ").count(), 1, "{what}: the summary once, under the runner: {text}");
@@ -3390,15 +3534,16 @@ exit 0"#,
     // A deploy is due under the account root's runner (it covers the deployer): once the stack has its deployer the
     // deployer tier refuses the root, and an exported BREAKGLASS=1 is set aside (claude-update is never break-glass:
     // make deploy BREAKGLASS=1, then the steps by hand). Nothing ran, not even pin or test-docker; nothing was asked.
+    // A39: whether the passphrase is exported or only sealed (then the unseal is the only hop, after the identity).
     script(&bin.join("docker"), "exit 0");
-    for envs in [&[][..], &[("BREAKGLASS", "1")][..]] {
+    seal_passphrase(&sealed_path(t), "");
+    for envs in [&[PASS][..], &[PASS, ("BREAKGLASS", "1")][..], &[][..], &[("BREAKGLASS", "1")][..]] {
         std::fs::remove_file(t.join("calls.log")).ok();
         let out = ops5(t, &bin, &["claude-update"])
             .current_dir(t)
             .env("LOCK", "image/claude.lock")
             .env("FAKE_AIENV_BUNDLE", "2.1.288")
             .env("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")
-            .env("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")
             .envs(super::aws_keys::marker_env("root").iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .env("FAKE_AWS_CALLER", "root")
             .envs(envs.iter().copied())
@@ -3406,10 +3551,10 @@ exit 0"#,
         let text = all(&out);
         assert_eq!(out.status.code(), Some(1), "{envs:?}: {text}");
         assert!(text.contains("claude-update: the identity of this run is refused: root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line: nothing changed"), "{envs:?}: {text}");
-        assert!(!text.contains("BREAK-GLASS"), "{envs:?}: {text}");
+        assert!(!text.contains("BREAK-GLASS") && !text.contains("stack's passphrase"), "{envs:?}: {text}");
         assert!(
-            !calls(t).iter().any(|l| l.starts_with("make ") || l.starts_with("egress check") || (l.starts_with("as ") && !l.starts_with("as --check "))),
-            "{envs:?}: nothing ran, nothing asked: {:?}",
+            !calls(t).iter().any(|l| l.starts_with("make ") || l.starts_with("egress check") || l.starts_with("run -f ") || (l.starts_with("as ") && !l.starts_with("as --check "))),
+            "{envs:?}: nothing ran, nothing asked, nothing unsealed: {:?}",
             calls(t)
         );
     }
@@ -3484,30 +3629,33 @@ fn marker_of(tier: &str) -> &'static str {
 
 /// A `$(MAKE)` (and a `cargo`) that only log, into FAKE_AIENV_LOG: `make <argv>`, then ` [AS=<marker>]` and ` [KEY]`
 /// when the runner's marker or a credential (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN) is in its
-/// environment (never a value).
+/// environment, then ` [PASS]` when the stack's passphrase is (either variable, even empty; A39): never a value.
 const LOGGED_MAKE: &str = r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
-printf '%s %s%s%s\n' "$(basename "$0" | sed 's/^fake-//')" "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+p=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}
+printf '%s %s%s%s%s\n' "$(basename "$0" | sed 's/^fake-//')" "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" "${p:+ [PASS]}" >> "$FAKE_AIENV_LOG"
 exit "${FAKE_MAKE_RC:-0}""#;
 
 /// A `cargo` whose `run ... -- ARGS` is the stand-in's `ARGS` (the Makefile's default AI_ENV is `cargo run`): every
-/// call logged first, as [`LOGGED_MAKE`] logs (`cargo <argv>`, ` [AS=<marker>]`, ` [KEY]`), so a test sees whether a
-/// compile (`cargo run` builds the tree when it changed) ever had a credential or the marker in its environment; a
-/// `build` or `test` passes.
+/// call logged first, as [`LOGGED_MAKE`] logs (`cargo <argv>`, ` [AS=<marker>]`, ` [KEY]`, ` [PASS]`), so a test sees
+/// whether a compile (`cargo run` builds the tree when it changed) ever had a credential, the marker or the stack's
+/// passphrase in its environment; a `build` or `test` passes.
 const CARGO_RUN: &str = r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
-printf 'cargo %s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" >> "$FAKE_AIENV_LOG"
+p=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}
+printf 'cargo %s%s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" "${p:+ [PASS]}" >> "$FAKE_AIENV_LOG"
 case " $* " in *" run "*" -- "*) ;; *) exit 0 ;; esac
 while [ "$1" != -- ]; do shift; done
 shift
 exec "$(dirname "$0")/ai-env-stand-in" "$@""#;
 
-/// A tier world: the S5 fakes (the stateful aws, pulumi, the stand-in, node), a logging `fake-make` and `cargo`, and
-/// the outputs of a stack that has its deployer.
+/// A tier world: the S5 fakes (the stateful aws, pulumi, the stand-in, node), a logging `fake-make` and `cargo`, the
+/// outputs of a stack that has its deployer, and the stack's passphrase sealed where make looks for it (A39).
 fn tier_world(t: &Path) -> PathBuf {
     let bin = s5_bin(t);
     script(&bin.join("fake-make"), LOGGED_MAKE);
     script(&bin.join("cargo"), LOGGED_MAKE);
     bin_with(t, &[("logged.sh", "sleep")]);
     write_outputs(t, &with_operators(outputs()));
+    seal_passphrase(&sealed_path(t), "");
     bin
 }
 
@@ -3529,7 +3677,9 @@ fn pairs(v: &[(String, String)]) -> Vec<(&str, &str)> {
 /// Each tiered target, run for real with its prechecks met: exactly one runner, `ai-env as <tier> -- $(MAKE)
 /// --no-print-directory X-run`, after `ai-env as --check <tier>` (and the root's, for the root tier), its X-run then
 /// under that identity's key and marker; the deployer's wrappers that build the image zip (and test-egress, its tests)
-/// build first, with no key and no marker.
+/// build first, with no key and no marker. A39: with the stack's passphrase sealed and not set, the four that run pulumi
+/// preview, up or destroy of the real stack, and only they, unseal it once, right before the runner (said once on
+/// stderr), so the runner and X-run hold it; no other target ever does.
 #[test]
 fn every_tiered_target_runs_exactly_one_runner_line() {
     let cases = tiered_runs();
@@ -3554,8 +3704,23 @@ fn every_tiered_target_runs_exactly_one_runner_line() {
         assert!(out.status.success(), "{what}: {text}");
         let c = calls(tmp.path());
         let fake_make = bin.join("fake-make");
+        let passed = ["preview", "deploy", "deploy-policies", "destroy"].contains(target);
+        let pass = if passed { " [PASS]" } else { "" };
         let runners: Vec<&String> = c.iter().filter(|l| l.starts_with("as ") && !l.starts_with("as --check ")).collect();
-        assert_eq!(runners, [&format!("as {tier} -- {} --no-print-directory {target}-run [AI_ENV=unset]", fake_make.display())], "{what}: exactly one runner: {c:#?}");
+        assert_eq!(runners, [&format!("as {tier} -- {} --no-print-directory {target}-run [AI_ENV=unset]{pass}", fake_make.display())], "{what}: exactly one runner: {c:#?}");
+        let unseals: Vec<&String> = c.iter().filter(|l| l.starts_with("run -f ")).collect();
+        let note = format!("{target}: the dev stack's passphrase: ai-env run -f {} (one Touch ID)", sealed_path(tmp.path()).display());
+        if passed {
+            let sealed = sealed_path(tmp.path()).display().to_string();
+            let unseal = format!("run -f {sealed} -- /bin/bash infra/scripts/pass-exec.sh {target} {sealed} {} as {tier} -- {} --no-print-directory {target}-run [AI_ENV=unset]", bin.join("ai-env-stand-in").display(), fake_make.display());
+            assert_eq!(unseals, [&unseal], "{what}: one unseal: {c:#?}");
+            let (u, r) = (at(&c, "run -f "), c.iter().position(|l| l == runners[0]).unwrap());
+            assert!(at(&c, "as --check ") < u && u + 1 == r, "{what}: the unseal after the check, right before the runner: {c:#?}");
+            assert_eq!(stderr(out).matches(&note).count(), 1, "{what}: said once: {text}");
+        } else {
+            assert_eq!(unseals, Vec::<&String>::new(), "{what}: nothing unsealed: {c:#?}");
+            assert!(!text.contains("stack's passphrase"), "{what}: {text}");
+        }
         let checks: Vec<&String> = c.iter().filter(|l| l.starts_with("as --check ")).collect();
         let want_checks: &[&str] = match (*tier, *target) {
             ("root", "destroy") => &["as --check root [AI_ENV=unset]"],
@@ -3566,7 +3731,7 @@ fn every_tiered_target_runs_exactly_one_runner_line() {
         assert_eq!(checks, want_checks, "{what}: {c:#?}");
         let makes: Vec<&String> = c.iter().filter(|l| l.starts_with("make ") || l.starts_with("cargo ")).collect();
         let key = if *tier == "root" { "" } else { " [KEY]" };
-        let run = format!("make --no-print-directory {target}-run [AS={}]{key}", marker_of(tier));
+        let run = format!("make --no-print-directory {target}-run [AS={}]{key}{pass}", marker_of(tier));
         let built: Vec<String> = match *target {
             "deploy" | "preview" | "deploy-policies" => vec!["make --no-print-directory image-zip".to_string()],
             "test-egress" => vec!["cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run".to_string()],
@@ -3590,19 +3755,33 @@ fn every_tiered_target_runs_exactly_one_runner_line() {
 /// `make -n` (and --dry-run, --just-print, -s -n, an outer make's MAKEFLAGS=n, -t and -q) of every tiered target
 /// asks nothing and runs nothing: no runner, no tool, not even ops.sh's read of the outputs; the -n forms print the
 /// runner (`: <ai-env> as <tier> --;`, the root's under BREAKGLASS=1) and X-run's recipe. In a copy of the make files,
-/// which none of the forms changes.
+/// which none of the forms changes. A39: with the stack's passphrase sealed and not set, the four targets that would
+/// unseal it show the unseal before the runner (`: <ai-env> run -f "<file>" -- <ai-env> as <tier> --;`) and unseal
+/// nothing. It is shown exactly where TIER would unseal: never with the passphrase set as Pulumi takes it (its file
+/// exported, or the passphrase itself, whose value is never shown), but with an empty one beside its file (Pulumi takes
+/// the empty one first); never without a sealed file at PULUMI_SEALED (none there, or a directory); HOME's file for a
+/// command line's `~/`.
 #[test]
 fn make_n_and_the_other_dry_forms_never_run_the_runner_or_a_tool() {
-    type Form = (&'static str, &'static [&'static str], &'static [(&'static str, &'static str)]);
-    let forms: [Form; 7] = [
-        ("-n", &["-n"], &[]),
-        ("--dry-run", &["--dry-run"], &[]),
-        ("--just-print", &["--just-print"], &[]),
-        ("-s -n", &["-s", "-n"], &[]),
-        ("an outer make's n", &[], &[("MAKEFLAGS", "n")]),
-        ("-t", &["-t"], &[]),
-        ("-q", &["-q"], &[]),
+    let passphrase = super::aws_keys::passphrase();
+    // (what, make's own switches and variables, the environment)
+    type Form<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, &'a str)>);
+    let forms: Vec<Form> = vec![
+        ("-n", vec!["-n"], vec![]),
+        ("--dry-run", vec!["--dry-run"], vec![]),
+        ("--just-print", vec!["--just-print"], vec![]),
+        ("-s -n", vec!["-s", "-n"], vec![]),
+        ("an outer make's n", vec![], vec![("MAKEFLAGS", "n")]),
+        ("-t", vec!["-t"], vec![]),
+        ("-q", vec!["-q"], vec![]),
+        ("-n, the passphrase's file exported", vec!["-n"], vec![("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")]),
+        ("-n, the passphrase exported", vec!["-n"], vec![("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str())]),
+        ("-n, an empty passphrase beside its file", vec!["-n"], vec![("PULUMI_CONFIG_PASSPHRASE", ""), ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")]),
+        ("-n, no sealed file there", vec!["-n"], vec![("PULUMI_SEALED", "/nonexistent/pulumi.env")]),
+        ("-n, PULUMI_SEALED a directory", vec!["-n"], vec![("PULUMI_SEALED", "/")]),
+        ("-n, PULUMI_SEALED=~/… on the command line", vec!["-n", "PULUMI_SEALED=~/.config/ai-env/pulumi.env"], vec![]),
     ];
+    let (forms, passphrase) = (&forms, passphrase.as_str());
     let cases = tiered_runs();
     std::thread::scope(|s| {
         for (target, tier, args) in &cases {
@@ -3614,6 +3793,8 @@ fn make_n_and_the_other_dry_forms_never_run_the_runner_or_a_tool() {
                 let bin = bin_with(t, &fakes);
                 let stand_in = bin.join("ai-env-stand-in");
                 let dry_tier = if args.contains(&"BREAKGLASS=1") { "root" } else { *tier };
+                let sealed = seal_passphrase(&sealed_path(t), "");
+                let passed = ["preview", "deploy", "deploy-policies", "destroy"].contains(target);
                 for (form, flags, envs) in forms {
                     let what = format!("{form} {target} {}", args.join(" "));
                     let out = make_in(t, &bin, &w, flags)
@@ -3624,14 +3805,24 @@ fn make_n_and_the_other_dry_forms_never_run_the_runner_or_a_tool() {
                         .env("FAKE_AIENV_LOG", t.join("runner.log"))
                         .envs(envs.iter().copied())
                         .bounded();
+                    assert!(!all(&out).contains(passphrase), "{what}: the passphrase shown");
                     assert_eq!(read(&t.join("tools.log")), "", "{what}: a tool ran: {}", all(&out));
                     assert_eq!(read(&t.join("runner.log")), "", "{what}: the runner ran: {}", all(&out));
-                    if !matches!(form, "-t" | "-q") {
+                    if !matches!(*form, "-t" | "-q") {
                         assert!(out.status.success(), "{what}: {}", all(&out));
                         let text = stdout(&out);
-                        let runner = format!(": {} as {dry_tier} --; {} --no-print-directory {target}-run\n", stand_in.display(), make_path());
+                        // Pulumi's order: PULUMI_CONFIG_PASSPHRASE when it is there at all (empty is none), else its file.
+                        let var = |k: &str| envs.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+                        let set = match var("PULUMI_CONFIG_PASSPHRASE") {
+                            Some(v) => !v.is_empty(),
+                            None => var("PULUMI_CONFIG_PASSPHRASE_FILE").is_some_and(|v| !v.is_empty()),
+                        };
+                        let there = var("PULUMI_SEALED").is_none();
+                        let unseal = if passed && !set && there { format!("{} run -f \"{}\" -- ", stand_in.display(), sealed.display()) } else { String::new() };
+                        let runner = format!(": {unseal}{} as {dry_tier} --; {} --no-print-directory {target}-run\n", stand_in.display(), make_path());
                         assert_eq!(text.matches(&runner).count(), 1, "{what}: the runner shown once: {text}");
                         assert!(!text.contains(" as --check "), "{what}: {text}");
+                        assert_eq!(text.contains(" run -f \""), !unseal.is_empty(), "{what}: the unseal shown where it would happen: {text}");
                     }
                 }
                 assert!(!w.join("target").exists(), "{target}: a dry form made {}", w.join("target").display());
@@ -3663,7 +3854,8 @@ fn breakglass_counts_only_on_the_make_command_line() {
     assert!(calls(t).contains(&"make --no-print-directory deployer-key-run [AS=deployer:9001] [KEY]".to_string()), "{:#?}", calls(t));
 
     // X-run's identity line, under the root's runner: the command line's BREAKGLASS=1 admits the root (and the preview
-    // runs); the environment's is set aside (the root is refused before anything runs).
+    // runs, the stack's passphrase exported in that terminal: an X-run typed by hand never unseals it); the
+    // environment's is set aside (the root is refused before anything runs).
     // (the make arguments, the environment, admitted)
     type Run<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], bool);
     let cases: [Run; 2] = [(&["preview-run", "BREAKGLASS=1"], &[], true), (&["preview-run"], &[("BREAKGLASS", "1")], false)];
@@ -3674,7 +3866,7 @@ fn breakglass_counts_only_on_the_make_command_line() {
         let plan = t.join("plan.txt");
         std::fs::write(&plan, "a preview\n").unwrap();
         let mut envs = envs.to_vec();
-        envs.extend([("FAKE_AWS_CALLER", "root"), ("AI_ENV_BRIDGE_AS", "root"), ("FAKE_PULUMI_PREVIEW", plan.to_str().unwrap())]);
+        envs.extend([("FAKE_AWS_CALLER", "root"), ("AI_ENV_BRIDGE_AS", "root"), ("FAKE_PULUMI_PREVIEW", plan.to_str().unwrap()), ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")]);
         let out = tier_make(t, &bin, args, false, &envs);
         let text = all(&out);
         assert_eq!(out.status.success(), ok, "{args:?} {envs:?}: {text}");
@@ -4007,7 +4199,8 @@ fn destroy_is_the_account_roots_with_breakglass_only() {
     assert!(!c.iter().any(|l| l.starts_with("pulumi destroy") || l.starts_with("lambda-core ") || l.starts_with("lambda-microvms ")), "nothing after the identity line: {c:#?}");
     std::fs::remove_file(t.join("calls.log")).unwrap();
 
-    // The real thing, as the root: the identity, vm-guard, pulumi destroy (its own confirmation), the checklist.
+    // The real thing, as the root: the identity, vm-guard, pulumi destroy (its own confirmation), the checklist. A39: the
+    // stack's sealed passphrase unsealed first (pulumi destroy needs it), then the root's runner.
     let out = tier_make(t, &bin, &["destroy", "CONFIRM=destroy-dev", "BREAKGLASS=1"], false, &[("FAKE_AWS_CALLER", "root"), ("FAKE_PULUMI_ALLOW", "destroy")]);
     let text = all(&out);
     assert!(out.status.success(), "{text}");
@@ -4017,8 +4210,11 @@ fn destroy_is_the_account_roots_with_breakglass_only() {
         last = said[last..].find(want).unwrap_or_else(|| panic!("{want} missing or out of order: {text}")) + last;
     }
     let c = calls(t);
-    assert!(c.contains(&format!("as root -- {} --no-print-directory destroy-run [AI_ENV=unset]", make_path())), "{c:#?}");
-    assert!(c.contains(&"pulumi destroy --stack dev".to_string()) && !c.iter().any(|l| l.contains("FORBIDDEN")), "no --yes: {c:#?}");
+    let runner = format!("as root -- {} --no-print-directory destroy-run [AI_ENV=unset] [PASS]", make_path());
+    assert!(c.contains(&runner), "{c:#?}");
+    let sealed = sealed_path(t).display().to_string();
+    assert_eq!(c[at(&c, &runner) - 1], format!("run -f {sealed} -- /bin/bash infra/scripts/pass-exec.sh destroy {sealed} {} as root -- {} --no-print-directory destroy-run [AI_ENV=unset]", bin.join("ai-env-stand-in").display(), make_path()), "{c:#?}");
+    assert!(c.contains(&"pulumi destroy --stack dev [PASS]".to_string()) && !c.iter().any(|l| l.contains("FORBIDDEN")), "no --yes: {c:#?}");
 }
 
 /// deploy-policies: the zip first (no key), then as the deployer the identity, deploy's gates (s3-preflight PHASE=b,
@@ -4047,7 +4243,8 @@ fn deploy_policies_updates_the_five_stack_policies_only_and_preview_refreshes_on
     assert!(out.status.success(), "{text}");
     let c = calls(d.t.path());
     let up: Vec<&String> = c.iter().filter(|l| l.starts_with("pulumi up")).collect();
-    assert_eq!(up, [&format!("pulumi up --stack dev {}", urns.join(" "))], "the five policies and nothing else: {c:#?}");
+    // Under the stack's passphrase, unsealed before the runner (A39).
+    assert_eq!(up, [&format!("pulumi up --stack dev {} [PASS]", urns.join(" "))], "the five policies and nothing else: {c:#?}");
     let order = ["infra scan ", "as --check deployer", "as deployer -- ", "sts get-caller-identity", "check-policies eu-central-1", "pulumi preview --json --show-sames --show-reads --non-interactive --stack dev", "check-plan --mode none", "pulumi up --stack dev --target "];
     let mut last = 0;
     for want in order {
@@ -4197,10 +4394,41 @@ fn make_help_lists_the_new_targets_and_every_make_line_is_a_sub_make_or_a_tier_l
         let before = wrapper[at_tier.saturating_sub(1)];
         assert!(at_tier > 0 && (before == refusal || (*target == "acceptance" && before.starts_with(acceptance_refusal) && before.ends_with(acceptance_p))), "{target}: the make -i and -p refusal right before the runner: {wrapper:#?}");
     }
-    // D18: the wrappers' compiles carry $(NO_KEY), first, and NO_KEY unsets all four (the key, its secret, a session
-    // token, the marker); so does the keyless build of the operator CLI, and ops.sh's NO_KEY_ENV.
+    // D18: the wrappers' compiles carry $(NO_KEY), first, and NO_KEY unsets all six (the key, its secret, a session
+    // token, the marker, and the stack's passphrase either way: A39); so does the keyless build of the operator CLI, and
+    // ops.sh's NO_KEY_ENV. A39: deploy and deploy-policies, whose plan check cannot prompt, check the passphrase first,
+    // before the build (preview and destroy keep Pulumi's prompt); exactly the four targets that run pulumi preview, up
+    // or destroy of the real stack unseal it, and no other wrapper checks it.
     for target in ["deploy", "preview", "deploy-policies"] {
-        assert_eq!(recipe(target)[0], "$(NO_KEY) $(MAKE) --no-print-directory image-zip", "{target}: the zip built first, without a key");
+        let zip = usize::from(target != "preview");
+        assert_eq!(recipe(target)[zip], "$(NO_KEY) $(MAKE) --no-print-directory image-zip", "{target}: the zip built first, without a key");
+    }
+    for target in ["deploy", "deploy-policies"] {
+        assert_eq!(recipe(target)[0], format!("@$(call PASS_CHECK,{target})"), "{target}: the passphrase checked first");
+    }
+    let checks: Vec<&str> = mk.lines().filter(|l| l.contains("$(call PASS_CHECK,")).collect();
+    assert_eq!(checks, ["\t@$(call PASS_CHECK,deploy)", "\t@$(call PASS_CHECK,deploy-policies)"], "no other wrapper checks the passphrase");
+    // A39 (D17): the passphrase is never expanded into a command line (a recipe shell's argv, make -n's output, a log):
+    // the make files and the scripts name the two variables only to test whether one is set (the shell's `${NAME:+x}`
+    // and `${NAME+x}`, `$${…}` in make), to unset them, in $(origin) and in text; never make's $(NAME), ${NAME} or
+    // $(value NAME), nor the shell's $NAME or another ${NAME…}.
+    let mut scripts: Vec<PathBuf> = std::fs::read_dir(Path::new(REPO).join("infra/scripts")).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "sh")).collect();
+    scripts.sort();
+    let sources = std::iter::once(("Makefile and infra/infra.mk".to_string(), mk.clone(), true)).chain(scripts.iter().map(|p| (p.display().to_string(), read(p), false)));
+    for (file, text, make) in sources {
+        for line in text.lines() {
+            for (at, _) in line.match_indices("PULUMI_CONFIG_PASSPHRASE") {
+                let before = &line[..at];
+                let name = if line[at..].starts_with("PULUMI_CONFIG_PASSPHRASE_FILE") { "PULUMI_CONFIG_PASSPHRASE_FILE" } else { "PULUMI_CONFIG_PASSPHRASE" };
+                let tested = [":+x}", "+x}"].iter().any(|t| line[at + name.len()..].starts_with(t));
+                let only_named = if before.ends_with('{') {
+                    tested && before.ends_with(if make { "$${" } else { "${" })
+                } else {
+                    !before.ends_with('$') && !(make && (before.ends_with("$(") || before.ends_with("$(value ")))
+                };
+                assert!(only_named, "{file}: the passphrase expanded, not only tested: {line}");
+            }
+        }
     }
     // D2: the live tests a runner may run build their tests without the key first (the run keeps it), test-aws's probes
     // their CLI too; test-docker, which needs no AWS, drops it from every step, and so do the image's build (image-zip,
@@ -4236,9 +4464,21 @@ fn make_help_lists_the_new_targets_and_every_make_line_is_a_sub_make_or_a_tier_l
     let vars = make_vars(t.path(), &[]);
     assert_eq!(vars["NO_KEY"], NO_KEY);
     assert_eq!(vars["AI_ENV_BUILD"], "$(NO_KEY) $(LAB_UNSET) $(AI_ENV) --version >/dev/null");
-    assert!(vars["TIER_SH"].starts_with("tier() { t=$$1; x=$$2; shift 2; $(AI_ENV_BUILD) || return $$?; "), "TIER builds first: {}", vars["TIER_SH"]);
+    assert!(vars["TIER_SH"].starts_with("tier() { t=$$1; x=$$2; shift 2; $(AI_ENV_BUILD) || return $$?; $(PASS_SH) "), "TIER builds first, then decides the unseal: {}", vars["TIER_SH"]);
+    assert_eq!(vars["PASS_TARGETS"], "preview deploy deploy-policies destroy", "the targets whose X-run runs pulumi preview, up or destroy");
     let ops = read(&Path::new(REPO).join("infra/scripts/ops.sh"));
     assert!(ops.contains(&format!("\nNO_KEY_ENV=({NO_KEY})\n")), "ops.sh's NO_KEY_ENV is $(NO_KEY)");
+    // A39: claude-update's steps after its deploy (status, proxy, check) run under NO_PASS_ENV, the passphrase's two
+    // names, besides the export -n that keeps it from every step but the deploy: either alone keeps it from them.
+    assert!(ops.contains("\nNO_PASS_ENV=(env -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE)\n"), "ops.sh's NO_PASS_ENV unsets the passphrase's two names");
+    for step in ["status)", "proxy)", "check)"] {
+        let line = ops.lines().map(str::trim_start).find(|l| l.starts_with(step) && l.contains(" update_step ")).unwrap_or_else(|| panic!("ops.sh: no claude-update {step} step"));
+        assert!(line.contains(" \"${NO_PASS_ENV[@]}\" "), "claude-update's {step} step runs under NO_PASS_ENV: {line}");
+    }
+    // The two tsc compiles inside deploy-run (the plan check's and check-policies') run under the same six.
+    for script in ["check-plan.sh", "check-policies.sh"] {
+        assert!(read(&Path::new(REPO).join("infra/scripts").join(script)).contains(&format!("(cd \"$infra\" && {NO_KEY} \\\n")), "{script}: its tsc under $(NO_KEY)'s six");
+    }
 }
 
 /// D18, nested (contracts §9.3): a make typed under `ai-env as` (`ai-env as deployer -- make preview deploy`,
@@ -4271,10 +4511,19 @@ fn a_make_under_a_runner_compiles_nothing_with_the_key() {
     ];
     // (the make arguments, the environment, a logging MAKE, the `cargo` and `make` calls in order; <bin> the fakes)
     type Case = (Vec<&'static str>, Vec<(String, String)>, bool, Vec<String>);
+    // A39: the tier world seals the stack's passphrase, not set here, so deploy, preview and deploy-policies unseal it
+    // under the covering runner (`ai-env run -f`, then X-run at once), after every compile; <t> the HOME of the run.
+    let unseal = |x: &str| cli(&format!("run -f <t>/.config/ai-env/pulumi.env -- /bin/bash infra/scripts/pass-exec.sh {x} <t>/.config/ai-env/pulumi.env <bin>/fake-make --no-print-directory {x}-run")) + d;
     let mut cases: Vec<Case> = ["deploy", "preview", "deploy-policies"]
         .into_iter()
-        .map(|x| (vec![x], deployer.clone(), true, vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory {x}-run{d}")]))
+        .map(|x| (vec![x], deployer.clone(), true, vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, unseal(x), format!("make --no-print-directory {x}-run{d} [PASS]")]))
         .collect();
+    // A make typed under `ai-env run -f` of the sealed passphrase and the runner (README "Identities"): nothing unsealed
+    // again; the zip and the build without the passphrase, the check and X-run with it.
+    let passphrase = super::aws_keys::passphrase();
+    let under_pass = [deployer.clone(), vec![(s("PULUMI_CONFIG_PASSPHRASE"), passphrase.clone())]].concat();
+    let passed_deploy = vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d + " [PASS]", format!("make --no-print-directory deploy-run{d} [PASS]")];
+    cases.push((vec!["deploy"], under_pass.clone(), true, passed_deploy.clone()));
     cases.extend([
         (vec!["test-egress"], deployer.clone(), true, vec![s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory test-egress-run{d}")]),
         (vec!["runtime-key"], deployer.clone(), true, vec![build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory runtime-key-run{d}")]),
@@ -4325,8 +4574,10 @@ fn a_make_under_a_runner_compiles_nothing_with_the_key() {
             vec!["test-docker", "deploy"],
             deployer.clone(),
             true,
-            [docker, vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory deploy-run{d}")]].concat(),
+            [docker.clone(), vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, unseal("deploy"), format!("make --no-print-directory deploy-run{d} [PASS]")]].concat(),
         ),
+        // The same under the passphrase too: test-docker's steps never carry it either.
+        (vec!["test-docker", "deploy"], under_pass, true, [docker, passed_deploy].concat()),
     ]);
     let runs: Vec<(tempfile::TempDir, PathBuf, Output)> = std::thread::scope(|sc| {
         let handles: Vec<_> = cases
@@ -4356,11 +4607,12 @@ fn a_make_under_a_runner_compiles_nothing_with_the_key() {
     });
     for ((args, _, _, want), (tmp, bin, out)) in cases.iter().zip(&runs) {
         let what = args.join(" ");
-        let c: Vec<String> = calls(tmp.path()).into_iter().filter(|l| l.starts_with("cargo ") || l.starts_with("make ")).map(|l| l.replace(&bin.display().to_string(), "<bin>")).collect();
-        assert_eq!(&c, want, "{what}: the compiles first, with no key, no secret, no session token and no marker: {}", all(out));
+        let c: Vec<String> = calls(tmp.path()).into_iter().filter(|l| l.starts_with("cargo ") || l.starts_with("make ")).map(|l| l.replace(&bin.display().to_string(), "<bin>").replace(&tmp.path().display().to_string(), "<t>")).collect();
+        assert_eq!(&c, want, "{what}: the compiles first, with no key, no secret, no session token, no marker and no passphrase: {}", all(out));
         if what != "s3-preflight PHASE=b" {
             assert!(out.status.success(), "{what}: {}", all(out));
         }
+        assert!(!all(out).contains(&passphrase) && !read(&tmp.path().join("calls.log")).contains(&passphrase), "{what}: the passphrase's value shown");
     }
 
     // ops.sh's own calls of the CLI (key-issue, post-deploy, connector-probe, claude-update: need_ai_env): the CLI
@@ -4424,22 +4676,24 @@ fn make_i_is_refused_by_every_tiered_target_and_its_run_before_anything_runs() {
 /// so would every make nested under it (D1). Every tiered target refuses -p as it refuses -i, before its build, its
 /// runner or anything else runs, however make got it (the switch, beside -n or -s, an outer make's MAKEFLAGS), and so
 /// does its X-run typed by hand. The real make runs X-run here: a runner that started would leave the stand-in's key
-/// in the data base. (A make typed under a runner holds the key itself, and prints it under -p whatever its makefile
-/// says: never -p there.)
+/// in the data base, and an unseal the stack's passphrase (A39: the tier world seals it; the refusal comes before the
+/// unseal). (A make typed under a runner holds the key itself, and prints it under -p whatever its makefile says: never
+/// -p there.)
 #[test]
 fn make_p_is_refused_by_every_tiered_target_and_its_run_before_any_key_is_there_to_print() {
-    // The stand-in runner's secret and its two key ids (tests/fakes/ai-env.sh).
+    // The stand-in runner's secret and its two key ids (tests/fakes/ai-env.sh), and the passphrase its unseal would set.
     let secret = "Dm7/".repeat(10);
     let ids = [super::aws_keys::key_id(super::aws_keys::DEPLOYER_TAIL), super::aws_keys::key_id(super::aws_keys::OPS_TAIL)];
+    let passphrase = super::aws_keys::passphrase();
     let cases = tiered_runs();
     std::thread::scope(|sc| {
         for (target, _, args) in &cases {
-            let (target, secret, ids): (&str, &str, &[String; 2]) = (target, &secret, &ids);
+            let (target, secret, ids, passphrase): (&str, &str, &[String; 2], &str) = (target, &secret, &ids, &passphrase);
             sc.spawn(move || {
                 let tmp = tempfile::tempdir().unwrap();
                 let t = tmp.path();
                 let bin = tier_world(t);
-                let refusal = format!("*** {target}: not under make -p (it prints every variable when it ends, the environment's too: under the runner, the operator key and its secret): run make {target} without it.");
+                let refusal = format!("*** {target}: not under make -p (it prints every variable when it ends, the environment's too: under the runner, the operator key and its secret, and the stack's passphrase once unsealed): run make {target} without it.");
                 let run = format!("{target}-run");
                 // (what, the goal, make's own flags, the environment)
                 type Form<'a> = (&'a str, &'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
@@ -4456,6 +4710,7 @@ fn make_p_is_refused_by_every_tiered_target_and_its_run_before_any_key_is_there_
                     let out = tier_make(t, &bin, &argv, false, envs);
                     let text = all(&out);
                     assert!(!text.contains(secret) && ids.iter().all(|id| !text.contains(id.as_str())), "{target} {what}: a key in make's data base");
+                    assert!(!text.contains(passphrase), "{target} {what}: the passphrase in make's data base");
                     assert_eq!(out.status.code(), Some(2), "{target} {what}: {}", stderr(&out));
                     assert!(stderr(&out).contains(&refusal), "{target} {what}: {}", stderr(&out));
                     assert_eq!(calls(t), Vec::<String>::new(), "{target} {what}: something ran: {}", stderr(&out));
@@ -4468,7 +4723,7 @@ fn make_p_is_refused_by_every_tiered_target_and_its_run_before_any_key_is_there_
 /// AI_ENV_PASTE_STDIN=1 (a test session's leftover) never reaches a runner: the make targets' operator CLI is a debug
 /// build (cargo run), whose `ai-env as deployer` would read the key from a stdin that is not a terminal (D11). TIER's
 /// two runner calls drop it (its keyless build, which reads no paste, shows it reached make), and so does ops.sh for
-/// every command, claude-update's runner among them.
+/// every command, claude-update's runner among them. A39: so does the passphrase's unseal, and the runner under it.
 #[test]
 fn the_debug_paste_knob_never_reaches_a_runner() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4481,6 +4736,18 @@ fn the_debug_paste_knob_never_reaches_a_runner() {
     let runner: Vec<&String> = c.iter().filter(|l| l.starts_with("as ")).collect();
     assert_eq!(runner.len(), 2, "{c:#?}");
     assert!(runner.iter().all(|l| !l.contains("[PASTE")), "the knob reached the runner: {runner:#?}");
+
+    // preview unseals the sealed passphrase before its runner: neither has the knob.
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let out = tier_make(t, &bin, &["preview"], true, &[("AI_ENV_PASTE_STDIN", "1")]);
+    assert!(out.status.success(), "{}", all(&out));
+    let c = calls(t);
+    assert_eq!(c.iter().filter(|l| l.starts_with("--version ")).collect::<Vec<_>>(), ["--version [AI_ENV=unset] [PASTE=1]"], "the knob reached make: {c:#?}");
+    let runner: Vec<&String> = c.iter().filter(|l| l.starts_with("run -f ") || l.starts_with("as ")).collect();
+    assert!(runner.len() == 3 && runner[1].starts_with("run -f ") && runner[2].starts_with("as deployer -- "), "the check, the unseal, the runner: {c:#?}");
+    assert!(runner.iter().all(|l| !l.contains("[PASTE")), "the knob reached the unseal or the runner: {runner:#?}");
 
     // claude-update, nothing to deploy: every call of the operator CLI, its runner's included, is without it.
     let tmp = tempfile::tempdir().unwrap();
@@ -4515,6 +4782,356 @@ fn claude_update_refuses_breakglass_on_its_command_line_before_anything_runs() {
     let out = tier_make(t, &bin, &["claude-update"], false, &[("BREAKGLASS", "1")]);
     let text = all(&out);
     assert!(!text.contains("never break-glass") && text.contains("claude-update: cannot read the Cursor bundle's version"), "{text}");
+}
+
+// ---- A39: the stack's sealed passphrase, unsealed by make (plans/s8-operators-contracts.md A39) ----
+
+/// make deploy in a terminal that holds neither passphrase variable unseals the stack's sealed passphrase itself: one
+/// `ai-env run -f` of make's default file (under HOME), said on stderr first, after the zip's build (its scan and
+/// version read) and TIER's keyless build, after `as --check` and the stack-deployer read, and right before the
+/// deployer's runner: the Touch ID before the paste. Nothing before it holds the passphrase; the runner, X-run and
+/// Pulumi's preview and up do. Its value is never in the output, a fake's log or a file of the tree. A dismissed Touch
+/// ID, or a file that is no container (still plaintext), stops it there: no paste, nothing of X-run; a sealed value
+/// left empty (or none) stops right after the unseal (pass-exec.sh), before the paste, naming ai-env edit; a cancelled
+/// paste stops after the unseal.
+#[test]
+fn deploy_unseals_the_stack_passphrase_once_after_the_build_and_before_the_paste() {
+    let passphrase = super::aws_keys::passphrase();
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let sealed = sealed_path(d.t.path()).display().to_string();
+    let out = d.deploy(&deploy_plan(&[]), &[]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    let c = calls(d.t.path());
+    let x_run = format!("{} --no-print-directory deploy-run", make_path());
+    let unsealed = format!("run -f {sealed} -- /bin/bash infra/scripts/pass-exec.sh deploy {sealed} {} as deployer -- {x_run} [AI_ENV=unset]", d.bin.join("ai-env-stand-in").display());
+    assert_eq!(c.iter().filter(|l| l.starts_with("run ")).collect::<Vec<_>>(), [&unsealed], "one unseal: {c:#?}");
+    let u = at(&c, &unsealed);
+    assert_eq!(c[u + 1], format!("as deployer -- {x_run} [AI_ENV=unset] [PASS]"), "the runner (its paste) right after the unseal (its Touch ID): {c:#?}");
+    let (scan, checked, outputs_read) = (at(&c, "infra scan "), at(&c, "as --check deployer"), at(&c, "pulumi stack output --json"));
+    assert!(scan < checked && checked < outputs_read && outputs_read < u, "after the zip's build, the check and the stack-deployer read: {c:#?}");
+    assert_eq!(c[..u].iter().filter(|l| *l == BUILT).count(), 2, "the zip's version read and TIER's keyless build before it: {c:#?}");
+    assert!(c[..u].iter().all(|l| !l.contains("[PASS]")), "nothing before the unseal holds the passphrase: {c:#?}");
+    for pulumi in ["pulumi preview --json --show-sames --show-reads --non-interactive --stack dev [PASS]", "pulumi up --stack dev [PASS]"] {
+        assert!(c.iter().any(|l| l == pulumi), "{pulumi}: {c:#?}");
+    }
+    let note = format!("deploy: the dev stack's passphrase: ai-env run -f {sealed} (one Touch ID)");
+    assert_eq!(stderr(&out).matches(&note).count(), 1, "said once: {text}");
+    // The value nowhere: the output, the fakes' logs, any file of the tree.
+    assert!(!text.contains(&passphrase), "the passphrase in the output");
+    for log in ["calls.log", "tools.log"] {
+        assert!(!read(&d.t.path().join(log)).contains(&passphrase), "the passphrase in {log}");
+    }
+    for f in d.files() {
+        assert!(!String::from_utf8_lossy(&std::fs::read(&f).unwrap()).contains(&passphrase), "{} holds the passphrase", f.display());
+    }
+
+    // A dismissed Touch ID: ai-env run's own exit, nothing after it (no paste, nothing of X-run).
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.deploy(&deploy_plan(&[]), &[("FAKE_AIENV_RUN", "cancel")]);
+    let text = all(&out);
+    let c = calls(d.t.path());
+    assert!(!out.status.success() && text.contains("ai-env: cancelled") && text.contains("make: *** [deploy] Error 3"), "{text}");
+    assert!(c.last().is_some_and(|l| l.starts_with("run -f ")) && !c.iter().any(|l| l.starts_with("as deployer -- ") || l.starts_with("check-policies")), "nothing after the unseal: {c:#?}");
+
+    // A file that is no container (the README's first line, never encrypted): ai-env run's plaintext refusal, exit 6.
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    std::fs::write(sealed_path(d.t.path()), "PULUMI_CONFIG_PASSPHRASE=\n").unwrap();
+    let out = d.deploy(&deploy_plan(&[]), &[]);
+    let text = all(&out);
+    let c = calls(d.t.path());
+    let plaintext = format!("ai-env: {} is not an ai-env encrypted file (no AI_ENV=1 marker) — is it still plaintext?", sealed_path(d.t.path()).display());
+    assert!(!out.status.success() && text.contains(&plaintext) && text.contains("make: *** [deploy] Error 6"), "{text}");
+    assert!(c.last().is_some_and(|l| l.starts_with("run -f ")) && !c.iter().any(|l| l.starts_with("as deployer -- ")), "no paste: {c:#?}");
+
+    // The sealed value empty (the README's first line without ai-env edit), or none: stopped right after the Touch ID,
+    // before the paste, naming ai-env edit.
+    for kind in ["empty", "none"] {
+        let d = DeployTree::new(CHECK_PLAN_FAKE);
+        let sealed = seal_passphrase(&sealed_path(d.t.path()), kind).display().to_string();
+        let out = d.deploy(&deploy_plan(&[]), &[]);
+        let text = all(&out);
+        let c = calls(d.t.path());
+        let stopped = format!("deploy: the passphrase sealed in {sealed} is empty, or not there (PULUMI_CONFIG_PASSPHRASE= has no value until ai-env edit sets one): set it with ai-env edit \"{sealed}\" (README \"Identities\"), then make deploy again: nothing ran against the stack");
+        assert!(!out.status.success() && text.contains(&stopped) && text.contains("make: *** [deploy] Error 1"), "{kind}: {text}");
+        assert!(c.last().is_some_and(|l| l.starts_with("run -f ")) && !c.iter().any(|l| l.starts_with("as deployer -- ")), "{kind}: no paste: {c:#?}");
+    }
+
+    // A cancelled paste after the unseal: the unseal, the paste, then nothing.
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.deploy(&deploy_plan(&[]), &[("FAKE_AIENV_AS", "cancel")]);
+    let text = all(&out);
+    let c = calls(d.t.path());
+    assert!(!out.status.success() && text.contains("ai-env: as deployer: nothing was pasted: cancelled, nothing was run"), "{text}");
+    assert!(c.len() >= 2 && c[c.len() - 2].starts_with("run -f ") && c[c.len() - 1].starts_with("as deployer -- "), "the unseal, the paste, then nothing: {c:#?}");
+}
+
+/// pass-exec.sh, TIER's guard between the unseal and the runner (A39), decides as Pulumi takes the passphrase: CMD runs
+/// under a PULUMI_CONFIG_PASSPHRASE that is set and not empty, or, with none set at all, under a
+/// PULUMI_CONFIG_PASSPHRASE_FILE that is (a sealed file may hold either); an empty PULUMI_CONFIG_PASSPHRASE stops it
+/// whatever the file (Pulumi takes the empty one first), and so does neither: exit 1 before CMD, naming ai-env edit of
+/// the sealed file, never a value. Fewer than three arguments: usage, exit 2.
+#[test]
+fn pass_exec_runs_its_command_only_under_a_passphrase_pulumi_takes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let passphrase = super::aws_keys::passphrase();
+    let ran = t.join("ran");
+    let pass_exec = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new("/bin/bash");
+        isolate(&mut cmd, t).env("PATH", "/usr/bin:/bin");
+        cmd.arg(Path::new(REPO).join("infra/scripts/pass-exec.sh")).args(args).envs(envs.iter().copied()).bounded()
+    };
+    let stopped = "deploy: the passphrase sealed in /sealed/pulumi.env is empty, or not there (PULUMI_CONFIG_PASSPHRASE= has no value until ai-env edit sets one): set it with ai-env edit \"/sealed/pulumi.env\" (README \"Identities\"), then make deploy again: nothing ran against the stack\n";
+    // (what, the environment, CMD runs)
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, bool);
+    let cases: [Case; 7] = [
+        ("the passphrase", vec![("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str())], true),
+        ("the passphrase beside its file", vec![("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str()), ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")], true),
+        ("its file alone (a sealed PULUMI_CONFIG_PASSPHRASE_FILE)", vec![("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")], true),
+        ("an empty passphrase (the README's first line before ai-env edit)", vec![("PULUMI_CONFIG_PASSPHRASE", "")], false),
+        ("an empty passphrase beside its file", vec![("PULUMI_CONFIG_PASSPHRASE", ""), ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")], false),
+        ("an empty file", vec![("PULUMI_CONFIG_PASSPHRASE_FILE", "")], false),
+        ("neither", vec![], false),
+    ];
+    for (what, envs, runs) in cases {
+        std::fs::remove_file(&ran).ok();
+        let out = pass_exec(&["deploy", "/sealed/pulumi.env", "touch", ran.to_str().unwrap()], &envs);
+        let text = all(&out).replace(&passphrase, "<the passphrase>");
+        assert!(!text.contains("<the passphrase>"), "{what}: the value shown");
+        assert_eq!((out.status.code(), ran.exists(), stderr(&out).as_str()), (Some(if runs { 0 } else { 1 }), runs, if runs { "" } else { stopped }), "{what}: {text}");
+    }
+    let out = pass_exec(&["deploy", "/sealed/pulumi.env"], &[("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str())]);
+    assert_eq!((out.status.code(), stderr(&out).as_str()), (Some(2), "usage: pass-exec.sh LABEL FILE CMD...\n"), "usage");
+}
+
+/// Without a sealed passphrase and with the passphrase not set as Pulumi takes it (neither variable, an empty one, or
+/// an empty PULUMI_CONFIG_PASSPHRASE beside its file: Pulumi takes the empty one first), deploy and deploy-policies,
+/// whose plan check runs `pulumi preview --non-interactive` and cannot prompt, refuse as their first line, before the
+/// build and anything else, naming the file make looks for, the README's two setup lines and the export.
+/// PULUMI_SEALED, on the command line or exported, names another file, a leading `~/` HOME's (zsh passes it on as it
+/// is): refused the same way while it is absent, or a directory (which TIER would not unseal either), unsealed once it
+/// is there. preview and destroy go on to Pulumi, which asks on the terminal (the fake, which has none, says the
+/// passphrase must be set).
+#[test]
+fn the_passphrase_targets_refuse_without_a_sealed_file_before_anything_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    std::fs::remove_file(sealed_path(t)).unwrap();
+    let refusal = |x: &str, f: &Path| {
+        let f = f.display();
+        format!("{x}: the dev stack's passphrase: neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE is set (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none), and there is no sealed {f} to unseal (the plan check runs pulumi preview --non-interactive): seal it once (README \"Identities\"): printf 'PULUMI_CONFIG_PASSPHRASE=\\n' | ai-env encrypt -k ai-env-bridge - > \"{f}\", then ai-env edit \"{f}\"; or export PULUMI_CONFIG_PASSPHRASE_FILE (a file holding it): nothing ran")
+    };
+    let other = t.join("other.env");
+    let on_line = format!("PULUMI_SEALED={}", other.display());
+    let dir = t.join("sealed.d");
+    std::fs::create_dir_all(&dir).unwrap();
+    // (the make arguments, the environment, the file the refusal names)
+    type Refused<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>, PathBuf);
+    for x in ["deploy", "deploy-policies"] {
+        let cases: [Refused; 7] = [
+            (vec![x], vec![], sealed_path(t)),
+            (vec![x], vec![("PULUMI_CONFIG_PASSPHRASE", "")], sealed_path(t)),
+            (vec![x], vec![("PULUMI_CONFIG_PASSPHRASE", ""), ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")], sealed_path(t)),
+            (vec![x, on_line.as_str()], vec![], other.clone()),
+            (vec![x], vec![("PULUMI_SEALED", other.to_str().unwrap())], other.clone()),
+            (vec![x, "PULUMI_SEALED=~/other.env"], vec![], other.clone()),
+            (vec![x], vec![("PULUMI_SEALED", dir.to_str().unwrap())], dir.clone()),
+        ];
+        for (args, envs, file) in cases {
+            std::fs::remove_file(t.join("calls.log")).ok();
+            let out = tier_make(t, &bin, &args, true, &envs);
+            let text = all(&out);
+            assert_eq!(out.status.code(), Some(2), "{args:?} {envs:?}: {text}");
+            assert!(stdout(&out).contains(&refusal(x, &file)) && stderr(&out).contains(&format!("[{x}] Error 1")), "{args:?} {envs:?}: {text}");
+            assert_eq!(calls(t), Vec::<String>::new(), "{args:?} {envs:?}: something ran");
+        }
+    }
+    // PULUMI_SEALED's file, once there, is the one unsealed (from the command line and from the environment alike), and
+    // the one make -n shows.
+    seal_passphrase(&other, "");
+    for (args, envs) in [(vec!["deploy", on_line.as_str()], vec![]), (vec!["deploy"], vec![("PULUMI_SEALED", other.to_str().unwrap())]), (vec!["deploy", "PULUMI_SEALED=~/other.env"], vec![])] {
+        std::fs::remove_file(t.join("calls.log")).ok();
+        let out = tier_make(t, &bin, &args, true, &envs);
+        assert!(out.status.success(), "{args:?} {envs:?}: {}", all(&out));
+        let c = calls(t);
+        let unseal = format!("run -f {} -- /bin/bash infra/scripts/pass-exec.sh deploy {} ", other.display(), other.display());
+        assert!(c.iter().filter(|l| l.starts_with("run -f ")).count() == 1 && c.iter().any(|l| l.starts_with(&unseal)), "{args:?} {envs:?}: {c:#?}");
+        assert!(c.contains(&"make --no-print-directory deploy-run [AS=deployer:9001] [KEY] [PASS]".to_string()), "{args:?} {envs:?}: {c:#?}");
+        let dry = tier_make(t, &bin, &[&["-n"][..], &args[..]].concat(), false, &envs);
+        assert!(stdout(&dry).contains(&format!(" run -f \"{}\" -- ", other.display())), "{args:?} {envs:?}: make -n shows that unseal: {}", all(&dry));
+    }
+
+    // preview and destroy keep Pulumi's own prompt: nothing unsealed, Pulumi asked (here with no terminal to ask on).
+    let must = "error: getting stack configuration: get stack secrets manager: passphrase must be set with PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE environment variables";
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    std::fs::remove_file(sealed_path(d.t.path())).unwrap();
+    let out = d.run("preview", &deploy_plan(&[]), &[]);
+    let text = all(&out);
+    let c = calls(d.t.path());
+    assert!(!out.status.success() && text.contains(must), "{text}");
+    assert!(c.contains(&"pulumi preview --diff --stack dev".to_string()) && !c.iter().any(|l| l.starts_with("run -f ")), "{c:#?}");
+    seed_connector(t, CONNECTOR, "ACTIVE");
+    std::fs::remove_file(t.join("calls.log")).ok();
+    let out = tier_make(t, &bin, &["destroy", "CONFIRM=destroy-dev", "BREAKGLASS=1"], false, &[("FAKE_AWS_CALLER", "root"), ("FAKE_PULUMI_ALLOW", "destroy")]);
+    let text = all(&out);
+    let c = calls(t);
+    assert!(!out.status.success() && text.contains(must), "{text}");
+    assert!(c.contains(&"pulumi destroy --stack dev".to_string()) && !c.iter().any(|l| l.starts_with("run -f ")), "{c:#?}");
+}
+
+/// A passphrase already in the environment is never unsealed again: its file or the variable itself exported (a make
+/// typed under `ai-env run -f`), or a make nested in a run that holds it; nothing is asked for it and nothing said, the
+/// runner and X-run run under it, the zip and the build never. Under the deployer's runner as well, X-run runs at
+/// once. The same without any sealed file: deploy's first line (PASS_CHECK) lets a passphrase that is set through. An
+/// X-run typed by hand never unseals, the sealed file there or not: without the passphrase its plan check fails, naming
+/// where it comes from. An empty PULUMI_CONFIG_PASSPHRASE beside its file is none, as Pulumi takes them (the empty one
+/// first): unsealed.
+#[test]
+fn a_passphrase_already_in_the_environment_is_never_unsealed_again() {
+    let passphrase = super::aws_keys::passphrase();
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    // (what, the environment, under the deployer's runner)
+    type Set<'a> = (&'a str, Vec<(&'a str, &'a str)>, bool);
+    let cases: [Set; 3] = [
+        ("the file exported", vec![("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")], false),
+        ("the passphrase exported", vec![("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str())], false),
+        ("the passphrase under the deployer's runner", [pairs(&deployer), vec![("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str())]].concat(), true),
+    ];
+    for (what, envs, under) in cases {
+        for sealed in [true, false] {
+            let what = if sealed { what.to_string() } else { format!("{what}, no sealed file") };
+            let tmp = tempfile::tempdir().unwrap();
+            let t = tmp.path();
+            let bin = tier_world(t);
+            if !sealed {
+                std::fs::remove_file(sealed_path(t)).unwrap();
+            }
+            let out = tier_make(t, &bin, &["deploy"], true, &envs);
+            let text = all(&out);
+            assert!(out.status.success(), "{what}: {text}");
+            let c = calls(t);
+            assert!(!c.iter().any(|l| l.starts_with("run -f ")) && !text.contains("stack's passphrase"), "{what}: nothing unsealed, nothing said: {c:#?}");
+            let runner = format!("as deployer -- {} --no-print-directory deploy-run [AI_ENV=unset] [PASS]", bin.join("fake-make").display());
+            assert_eq!(c.contains(&runner), !under, "{what}: the runner under the passphrase, unless one covers the tier: {c:#?}");
+            assert!(c.contains(&"make --no-print-directory deploy-run [AS=deployer:9001] [KEY] [PASS]".to_string()), "{what}: X-run under it: {c:#?}");
+            assert!(c.contains(&"make --no-print-directory image-zip".to_string()) && c.iter().filter(|l| l.starts_with("--version ")).all(|l| !l.contains("[PASS]")), "{what}: the zip and the build without it: {c:#?}");
+            assert!(!text.contains(&passphrase) && c.iter().all(|l| !l.contains(&passphrase)), "{what}: the value shown");
+        }
+    }
+    // An empty PULUMI_CONFIG_PASSPHRASE beside its file: Pulumi would take the empty one, so the sealed one is unsealed.
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let out = tier_make(t, &bin, &["deploy"], true, &[("PULUMI_CONFIG_PASSPHRASE", ""), ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")]);
+    assert!(out.status.success(), "{}", all(&out));
+    let c = calls(t);
+    let unseal = format!("run -f {} -- /bin/bash infra/scripts/pass-exec.sh deploy ", sealed_path(t).display());
+    assert!(c.iter().filter(|l| l.starts_with("run -f ")).count() == 1 && c.iter().any(|l| l.starts_with(&unseal)), "an empty passphrase beside its file: unsealed: {c:#?}");
+    assert!(c.contains(&"make --no-print-directory deploy-run [AS=deployer:9001] [KEY] [PASS]".to_string()), "{c:#?}");
+    // deploy-run typed by hand under the deployer's runner never unseals: its plan check fails without the passphrase.
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.run("deploy-run", &deploy_plan(&[]), &pairs(&deployer));
+    let text = all(&out);
+    let c = calls(d.t.path());
+    assert!(!out.status.success() && text.contains("passphrase must be set with PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE"), "{text}");
+    assert!(text.contains("which make deploy unseals unless PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE is set"), "{text}");
+    assert!(!c.iter().any(|l| l.starts_with("run -f ") || l.starts_with("as ") || l.starts_with("pulumi up")), "never unsealed, nothing deployed: {c:#?}");
+}
+
+/// BREAKGLASS=1 typed under a runner (A39, TIER's root tier): under `ai-env as root`, which covers the root tier, the
+/// four passphrase targets unseal the stack's passphrase right after `ai-env as --check root`, then run X-run at once as
+/// the root, under it, with no second runner; under another runner's marker `ai-env as root` refuses before it asks
+/// anything (it starts only from a terminal of its own), so nothing is unsealed for that refusal: no Touch ID spent.
+#[test]
+fn breakglass_under_a_runner_unseals_only_where_the_root_runs() {
+    let root = super::aws_keys::marker_env("root");
+    let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
+    for target in ["deploy", "preview", "deploy-policies", "destroy"] {
+        let argv: Vec<&str> = if target == "destroy" { vec![target, "CONFIRM=destroy-dev", "BREAKGLASS=1"] } else { vec![target, "BREAKGLASS=1"] };
+        let zip: Vec<String> = if target == "destroy" { vec![] } else { vec!["make --no-print-directory image-zip".to_string()] };
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bin = tier_world(t);
+        let fake_make = bin.join("fake-make");
+        let out = tier_make(t, &bin, &argv, true, &pairs(&root));
+        assert!(out.status.success(), "{target}, under the root's runner: {}", all(&out));
+        let sealed = sealed_path(t).display().to_string();
+        let ran = [
+            BUILT.to_string(),
+            "as --check root [AI_ENV=unset] [AS=root]".to_string(),
+            format!("run -f {sealed} -- /bin/bash infra/scripts/pass-exec.sh {target} {sealed} {} --no-print-directory {target}-run [AI_ENV=unset] [AS=root]", fake_make.display()),
+            format!("make --no-print-directory {target}-run [AS=root] [PASS]"),
+        ];
+        assert_eq!(calls(t), [zip.clone(), ran.to_vec()].concat(), "{target}, under the root's runner: the unseal, then X-run at once: {}", all(&out));
+
+        std::fs::remove_file(t.join("calls.log")).ok();
+        let out = tier_make(t, &bin, &argv, true, &pairs(&deployer));
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(2), "{target}, under the deployer's runner: {text}");
+        assert!(text.contains("ai-env: as root: already inside ai-env as deployer (AI_ENV_BRIDGE_AS): start it from a terminal of its own") && !text.contains("stack's passphrase"), "{target}: {text}");
+        let refused = [
+            BUILT.to_string(),
+            "as --check root [AI_ENV=unset] [AS=deployer:9001]".to_string(),
+            format!("as root -- {} --no-print-directory {target}-run [AI_ENV=unset] [AS=deployer:9001]", fake_make.display()),
+        ];
+        assert_eq!(calls(t), [zip, refused.to_vec()].concat(), "{target}, under the deployer's runner: refused, nothing unsealed: {text}");
+    }
+}
+
+/// A39 (D17): the stack's passphrase never reaches a command line make writes, whether make deploy unseals it or finds
+/// it exported (as a make nested under claude-update's unseal does): no recipe shell's argv (make runs each recipe line
+/// as `$(SHELL) -c LINE`, every sub-make's too, here through a logger of its arguments), and no output, while X-run's
+/// Pulumi calls hold it.
+#[test]
+fn the_stack_passphrase_never_reaches_a_recipe_line() {
+    let passphrase = super::aws_keys::passphrase();
+    for (what, envs) in [("unsealed", vec![]), ("exported", vec![("PULUMI_CONFIG_PASSPHRASE", passphrase.as_str())])] {
+        let d = DeployTree::new(CHECK_PLAN_FAKE);
+        let argv = d.t.path().join("argv.log");
+        let sh = d.t.path().join("argv-sh");
+        script(&sh, &format!("printf '%s\\n' \"$*\" >> '{}'\nexec /bin/bash \"$@\"", argv.display()));
+        let shell = format!("SHELL={}", sh.display());
+        let out = d.run_with("deploy", &[shell.as_str()], &deploy_plan(&[]), &envs);
+        let text = all(&out).replace(&passphrase, "<the passphrase>");
+        assert!(out.status.success(), "{what}: {text}");
+        let shells = read(&argv);
+        assert!(shells.contains("pulumi preview --json") && shells.contains("pulumi up --stack dev"), "{what}: deploy's recipe lines through the logger: {} lines", shells.lines().count());
+        assert!(!shells.contains(&passphrase), "{what}: the passphrase in a recipe shell's argv");
+        assert!(!text.contains("<the passphrase>"), "{what}: the passphrase in make's output");
+        let c = calls(d.t.path());
+        assert!(c.iter().all(|l| !l.contains(&passphrase)), "{what}: the passphrase in a fake's log");
+        assert!(c.contains(&"pulumi up --stack dev [PASS]".to_string()), "{what}: X-run's Pulumi holds it: {c:#?}");
+    }
+}
+
+/// The passphrase itself on the make command line is refused before anything runs, whatever the goal: MAKEFLAGS would
+/// hand it to every child of make, the builds among them. The refusal never shows the value. (make -p prints the
+/// command line's variables whatever a makefile says: README says never so.) So is its file there: a sub-make started
+/// under NO_KEY's `env -u` exports its command line's variables again, to the builds too (exported, NO_KEY keeps it
+/// from them).
+#[test]
+fn the_passphrase_on_the_make_command_line_is_refused_before_anything_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let bin = tier_world(t);
+    let passphrase = super::aws_keys::passphrase();
+    let arg = format!("PULUMI_CONFIG_PASSPHRASE={passphrase}");
+    for goal in ["deploy", "preview", "image-status", "help"] {
+        std::fs::remove_file(t.join("calls.log")).ok();
+        let out = tier_make(t, &bin, &[goal, arg.as_str()], true, &[]);
+        let text = all(&out).replace(&passphrase, "<the passphrase>");
+        assert_eq!(out.status.code(), Some(2), "{goal}: {text}");
+        assert!(text.contains("PULUMI_CONFIG_PASSPHRASE on the make command line: MAKEFLAGS would hand it to every child of make, the builds among them: drop it; the targets that need the passphrase unseal "), "{goal}: {text}");
+        assert!(!text.contains("<the passphrase>"), "{goal}: the value shown: {text}");
+        assert_eq!(calls(t), Vec::<String>::new(), "{goal}: something ran");
+        let out = tier_make(t, &bin, &[goal, "PULUMI_CONFIG_PASSPHRASE_FILE=/dev/null"], true, &[]);
+        let text = all(&out);
+        assert_eq!(out.status.code(), Some(2), "{goal}: {text}");
+        assert!(text.contains("PULUMI_CONFIG_PASSPHRASE_FILE on the make command line: MAKEFLAGS would hand it to every child of make, the builds among them, past NO_KEY: export it instead, or drop it and let the targets that need the passphrase unseal "), "{goal}: {text}");
+        assert_eq!(calls(t), Vec::<String>::new(), "{goal}: something ran");
+    }
 }
 
 /// The key targets through make, as Mike types them (contracts §9.8): TIER asks for the deployer (the stand-in's

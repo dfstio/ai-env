@@ -59,7 +59,10 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
 /// this process's environment, and a decrypt (age-plugin-se and its Touch ID
 /// dialog with it) may wait a minute; neither tool has any use for a
 /// credential, and a same-uid reader of their environment would find it.
-pub const CHILD_ENV_REMOVED: [&str; 5] = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"];
+/// The stack's Pulumi passphrase too (A39): whatever runs under `ai-env run
+/// -f` of its sealed file (make's deploy targets) holds it, and an `ai-env`
+/// started there may still decrypt (`ai-env as ops`, a VM's runtime key).
+pub const CHILD_ENV_REMOVED: [&str; 7] = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PULUMI_CONFIG_PASSPHRASE", "PULUMI_CONFIG_PASSPHRASE_FILE"];
 
 /// `program` (age or age-keygen) as every call here starts it: PATH with
 /// Homebrew's bin, so age finds its plugin, and none of [`CHILD_ENV_REMOVED`].
@@ -695,6 +698,8 @@ mod tests {
             assert_eq!(envs.len(), CHILD_ENV_REMOVED.len() + 1, "{what}: nothing else is changed");
         }
         assert!(version_cmd(&tool.age).get_args().eq(["--version"]), "the probe asks the version only");
+        // A39: the stack's passphrase, which make's deploy targets unseal into their run, is one of them, either way.
+        assert!(["PULUMI_CONFIG_PASSPHRASE", "PULUMI_CONFIG_PASSPHRASE_FILE"].iter().all(|n| CHILD_ENV_REMOVED.contains(n)), "{CHILD_ENV_REMOVED:?}");
     }
 
     /// Set only in the environment of the call-site test's child half: the
@@ -742,8 +747,9 @@ mod tests {
             std::fs::write(bin.join(name), text).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // The dummies the child's environment holds, built here: a setup-token, an API key, a runtime key and a session token.
-        let dummies = [format!("sk-ant-oat01-{}F28a", "Cs7_".repeat(20)), format!("sk-ant-api03-{}F28b", "Cs7_".repeat(20)), format!("AKIA{}", "F28C".repeat(4)), format!("{}f28d", "Cs7+".repeat(9)), format!("session-{}F28e", "Cs7x".repeat(16))];
+        // The dummies the child's environment holds, built here: a setup-token, an API key, a runtime key, a session
+        // token, and the stack's passphrase and a passphrase file's path.
+        let dummies = [format!("sk-ant-oat01-{}F28a", "Cs7_".repeat(20)), format!("sk-ant-api03-{}F28b", "Cs7_".repeat(20)), format!("AKIA{}", "F28C".repeat(4)), format!("{}f28d", "Cs7+".repeat(9)), format!("session-{}F28e", "Cs7x".repeat(16)), format!("{}f28f", "Cs7/".repeat(8)), format!("/nonexistent/passphrase-{}f28g", "Cs7x".repeat(4))];
         let name = format!("{}::no_call_that_starts_age_or_age_keygen_hands_it_a_credential", module_path!().split_once("::").map_or("", |(_, m)| m));
         let (out_path, err_path) = (d.path().join("child.out"), d.path().join("child.err"));
         let mut cmd = Command::new(std::env::current_exe().unwrap());

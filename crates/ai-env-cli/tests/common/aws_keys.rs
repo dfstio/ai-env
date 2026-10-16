@@ -1,5 +1,6 @@
 //! S8 operators: AWS key shapes built at run time (no credential-shaped
-//! literal anywhere in the sources) and the environment `ai-env as` leaves
+//! literal anywhere in the sources), the stack's Pulumi passphrase likewise
+//! (A39), and the environment `ai-env as` leaves
 //! (plans/s8-operators-contracts.md §11.1). A fake key id is `AKIA`, `FAKE`
 //! and twelve digits, as tests/fakes/aws.sh, aws-state.sh and ai-env.sh build
 //! it; its last four characters are its tail, which `FAKE_AWS_KEY_USERS` maps
@@ -17,6 +18,9 @@ pub const RUNTIME_TAIL: &str = "9003";
 /// The secret of [`identity_env`], the one tests/fakes/ai-env.sh's runner
 /// builds too.
 const SECRET_BLOCK: &str = "Dm7/";
+
+/// The block of [`passphrase`].
+const PASSPHRASE_BLOCK: &str = "Pf3+";
 
 /// `AKIA`, `FAKE`, eight zeros and `tail` (four of 0-9 A-Z): the shape tests/fakes/aws.sh builds.
 pub fn key_id(tail: &str) -> String {
@@ -45,6 +49,14 @@ pub fn identity_env(role: &str, tail: &str) -> Vec<(String, String)> {
         ("AWS_ACCESS_KEY_ID".to_string(), key_id(tail)),
         ("AWS_SECRET_ACCESS_KEY".to_string(), secret(SECRET_BLOCK)),
     ]
+}
+
+/// The fake stack's Pulumi passphrase (A39), built at run time so no fixture
+/// holds it: what tests/fakes/ai-env.sh's `run -f` of a
+/// `FAKE-SEALED-PASSPHRASE` file puts in PULUMI_CONFIG_PASSPHRASE, and the one
+/// value tests/fakes/pulumi.sh accepts (both build it the same way).
+pub fn passphrase() -> String {
+    PASSPHRASE_BLOCK.repeat(8)
 }
 
 /// What `ai-env as root|ambient` leaves: the marker only.

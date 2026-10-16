@@ -57,13 +57,23 @@
 #                                   names unset, the 7 pins set, a 40-character
 #                                   secret) with the marker deployer:9001 or
 #                                   ops:9002
-#   run -f FILE [-k NAME] -- CMD    one decrypt (one Touch ID prompt): a -k
+#   run -f FILE [-k NAME] -- CMD    one decrypt (one Touch ID prompt), checked
+#                                   in the real binary's order: FILE unreadable
+#                                   (exit 1), its first line no FAKE-SEALED one
+#                                   (ai-env's plaintext refusal, exit 6), a -k
 #                                   naming another key than FAKE_AIENV_KEY
-#                                   fails like ai-env's strict choice (exit 4);
-#                                   then CMD runs with the sealed id as
-#                                   AWS_ACCESS_KEY_ID and a dummy secret, and
-#                                   without AI_ENV_BRIDGE_AS (S8: ai-env run
-#                                   drops it)
+#                                   (ai-env's strict choice, exit 4), then
+#                                   FAKE_AIENV_RUN. `FAKE-SEALED <id>`: CMD runs
+#                                   with the sealed id as AWS_ACCESS_KEY_ID and
+#                                   a dummy secret, and without AI_ENV_BRIDGE_AS
+#                                   (S8: ai-env run drops it for a key).
+#                                   `FAKE-SEALED-PASSPHRASE` (A39, the stack's
+#                                   sealed passphrase, plain variables): CMD
+#                                   runs with PULUMI_CONFIG_PASSPHRASE the fake
+#                                   stack's (tests/common/aws_keys.rs'
+#                                   passphrase(), built here as there), the
+#                                   marker and any key kept; `… empty` sets it
+#                                   empty, `… none` sets nothing
 #   vm smoke ...                    prints FAKE_AIENV_SMOKE (one JSON record)
 #                                   on stdout, exit FAKE_AIENV_SMOKE_RC (0)
 #   egress reload ...               one line, exit FAKE_AIENV_RELOAD_RC (0)
@@ -94,7 +104,9 @@
 #                    (plus " [LAB=<names>]" when any AI_ENV_BRIDGE_LAB_* knob
 #                    reached it, then " [AS=<marker>]" when AI_ENV_BRIDGE_AS
 #                    is set, then " [PASTE=<value>]" when the debug builds'
-#                    paste knob AI_ENV_PASTE_STDIN reached it)
+#                    paste knob AI_ENV_PASTE_STDIN reached it, then " [PASS]"
+#                    when PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE
+#                    is set, even empty: never a value)
 #   FAKE_AIENV_KEY   the keystore key the container is sealed to
 #                    (default ai-env-bridge)
 #   FAKE_AIENV_SEAL  early: aws-set exits 1 before reading stdin; fail: after
@@ -120,8 +132,9 @@ if [ -n "${FAKE_AIENV_PEEK:-}" ] && [ "${1:-} ${2:-} ${3:-}" = "lab run connecto
   peeked="$FAKE_AIENV_PEEK/connectors/$c/peeked"
 fi
 lab=$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | sort | tr '\n' ' ')
+pass=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}
 if [ -n "${FAKE_AIENV_LOG:-}" ]; then
-  printf '%s [AI_ENV=%s]%s%s%s%s\n' "$*" "${AI_ENV-unset}" "$peek" "${lab:+ [LAB=${lab% }]}" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${AI_ENV_PASTE_STDIN:+ [PASTE=$AI_ENV_PASTE_STDIN]}" >> "$FAKE_AIENV_LOG"
+  printf '%s [AI_ENV=%s]%s%s%s%s%s\n' "$*" "${AI_ENV-unset}" "$peek" "${lab:+ [LAB=${lab% }]}" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${AI_ENV_PASTE_STDIN:+ [PASTE=$AI_ENV_PASTE_STDIN]}" "${pass:+ [PASS]}" >> "$FAKE_AIENV_LOG"
 fi
 
 # ---- S8: the runner's marker and the key checks (plans/s8-operators-contracts.md §2, §3, §5.2, §6) ----
@@ -591,7 +604,7 @@ if [ "${1:-}" = as ]; then
 fi
 if [ "${1:-}" = run ]; then
   shift
-  file=
+  file=.env
   key=
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -602,6 +615,15 @@ if [ "${1:-}" = run ]; then
     esac
     shift
   done
+  if [ ! -r "$file" ] || [ -d "$file" ]; then
+    echo "ai-env: cannot read $file: No such file or directory (os error 2)" >&2
+    exit 1
+  fi
+  sealed=$(sed -n 1p "$file")
+  case "$sealed" in
+    "FAKE-SEALED "?*|FAKE-SEALED-PASSPHRASE|"FAKE-SEALED-PASSPHRASE empty"|"FAKE-SEALED-PASSPHRASE none") ;;
+    *) echo "ai-env: $file is not an ai-env encrypted file (no AI_ENV=1 marker) — is it still plaintext?" >&2; exit 6 ;;
+  esac
   if [ -n "$key" ] && [ "$key" != "${FAKE_AIENV_KEY:-ai-env-bridge}" ]; then
     echo "ai-env: key \"$key\" does not exist" >&2
     exit 4
@@ -610,13 +632,23 @@ if [ "${1:-}" = run ]; then
     echo "ai-env: cancelled" >&2
     exit 3
   fi
-  id=$(sed -n 's/^FAKE-SEALED //p' "$file" 2>/dev/null)
-  test -n "$id" || { echo "ai-env: $file: not an ai-env container" >&2; exit 6; }
-  AWS_ACCESS_KEY_ID=$id
-  AWS_SECRET_ACCESS_KEY=$(printf 'Dm7/%.0s' 1 2 3 4 5 6 7 8 9 10)
-  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-  unset AI_ENV_BRIDGE_AS
-  exec "$@"
+  case "$sealed" in
+    FAKE-SEALED-PASSPHRASE*)
+      # Plain variables: ai-env run keeps the runner's marker and key (it drops the marker only for a container that sets
+      # AWS_ACCESS_KEY_ID). The value is built here, as tests/common/aws_keys.rs builds it, and never logged.
+      case "$sealed" in
+        *" empty") PULUMI_CONFIG_PASSPHRASE= ;;
+        *" none") ;;
+        *) PULUMI_CONFIG_PASSPHRASE=$(printf 'Pf3+%.0s' 1 2 3 4 5 6 7 8) ;;
+      esac
+      case "$sealed" in *" none") ;; *) export PULUMI_CONFIG_PASSPHRASE ;; esac ;;
+    *)
+      AWS_ACCESS_KEY_ID=${sealed#FAKE-SEALED }
+      AWS_SECRET_ACCESS_KEY=$(printf 'Dm7/%.0s' 1 2 3 4 5 6 7 8 9 10)
+      export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+      unset AI_ENV_BRIDGE_AS ;;
+  esac
+  run_cmd "$@"
 fi
 echo "fake ai-env: $*"
 exit 0

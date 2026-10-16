@@ -318,16 +318,18 @@ make s3-preflight PHASE=a      # build-side preconditions, one row each; P11 run
 make check-policies preview-scratch   # IAM Access Analyzer + a throwaway-backend Pulumi preview (read-only; this shell's own
                                #   credentials, an agent's; on this Mac: ai-env as ops -- make check-policies, and
                                #   ai-env as deployer -- make preview-scratch, whose program reads the AMI parameter)
-make deploy                    # (deployer: one paste, after the zip is built; the bootstrap as the account root)
-                               #   Pulumi up of infra/ in eu-central-1, then waits for the image build
+make deploy                    # (deployer: one paste, after the zip is built and the stack's passphrase, one Touch ID unless
+                               #   set; the bootstrap as the account root) Pulumi up of infra/ in eu-central-1, then waits for
+                               #   the image build
 make infra-status WRITE=1      # (ops: one Touch ID) stack outputs (+ the image's live state) → bridge.toml [aws] (comments kept)
                                #   + state/infra.toml
 make runtime-key               # (deployer: one paste) seal a key of the ai-env-runtime user under the bridge keystore key,
                                #   rebuild combined.env (one Touch ID when a setup-token is sealed), then verify it (one
                                #   Touch ID); ROTATE=1 replaces it
-make claude-update             # (at a terminal; asks once: the deployer's key when it deploys, else ops' Touch ID) follow the
-                               #   Cursor extension's Claude Code: claude-pin, test-docker, deploy, infra-status WRITE=1, proxy-start,
-                               #   egress check --if-needed (only what is not current; rerun resumes)
+make claude-update             # (at a terminal; asks once: when it deploys the passphrase's Touch ID unless set, then the
+                               #   deployer's key; else ops' Touch ID) follow the Cursor extension's Claude Code: claude-pin,
+                               #   test-docker, deploy, infra-status WRITE=1, proxy-start, egress check --if-needed (only what
+                               #   is not current; rerun resumes)
 ```
 
 `make claude-update` reads the version of the installed Cursor bundle (`ai-env infra pin
@@ -340,22 +342,28 @@ version (a rollback with `make image-deactivate`/`image-activate` stops it, and 
 and runs `ai-env egress check --if-needed`, which starts no VM once the version new VMs run has a
 pass bound to its build and to the connector's live facts. It never runs under `make -i`, `-k` or
 `-p`, nor with `BREAKGLASS=1` on its command line (break-glass is `make deploy BREAKGLASS=1`, then
-the steps by hand). Otherwise it checks the preconditions first (a terminal, the Pulumi passphrase
-in the environment, Docker, and a stack that exports its deployer: before the bootstrap there is no
+the steps by hand). Otherwise it checks the preconditions first (a terminal, the stack's Pulumi
+passphrase in the environment or its sealed file to unseal, "The stack's passphrase" under
+Identities, Docker, and a stack that exports its deployer: before the bootstrap there is no
 deployer key, and that deploy is the account root's, "The bootstrap" under Identities), then pins,
 runs `make test-docker` (unless it already passed for the current zip), `make deploy` (the plan
 gate, then Pulumi's own confirmation),
 `make infra-status WRITE=1`, the same active-version check, `make proxy-start` (the check needs
 squid serving) and the egress check for the new image version (its VM costs the runtime key's Touch
 ID). It asks once for the AWS identity the run needs, after the steps that need none (the pin and
-`make test-docker` run without any key) and before the first that does: the deployer's key (one
-paste) when a deploy is due, else ops' Touch ID, announced on stderr as
-`claude-update: this run needs ai-env as deployer (a deploy is due): asking once, …`. Every later
-step runs under that identity, which must be one of the stack's (`claude-update: identity …`; a
-refusal there, after the pin and `make test-docker` ran, says what they left: the new lock and the
-stamp stay, and a rerun goes on from them), and
-under `ai-env as deployer -- make claude-update` it asks for nothing more. The first failure stops
-it naming the step; running it again resumes (once it has started a deploy, a marker in
+`make test-docker` run without any key or the passphrase) and before the first that does: the
+deployer's key (one paste) when a deploy is due, else ops' Touch ID, announced on stderr as
+`claude-update: this run needs ai-env as deployer (a deploy is due): asking once, …`. A deploy
+needs the stack's passphrase too: when it is not set ("The stack's passphrase" under Identities), it
+unseals the sealed file first, one Touch ID before the paste (`claude-update: a deploy is due: the
+dev stack's passphrase: ai-env run -f … (one Touch ID), then ai-env as deployer: asking once each,
+…`), and stops there, before the paste, when the sealed value is empty; only its `make deploy` gets
+the passphrase, none of its other steps or its own reads. Every later step runs under that
+identity, which must be one of the stack's (`claude-update: identity …`; a refusal there, after the
+pin and `make test-docker` ran, says what they left: the new lock and the stamp stay, and a rerun
+goes on from them), and under `ai-env as deployer -- make claude-update` it asks for nothing more
+but that Touch ID (that runner's identity checked first, before anything runs). The first failure
+stops it naming the step; running it again resumes (once it has started a deploy, a marker in
 `target/image` makes the rerun finish every remaining step, `make proxy-start` included). Near the
 image-version quota it lists old versions to deactivate, never one a VM still runs. It cannot run
 unattended (the paste or Touch ID, Pulumi's confirmation and the check's Touch ID are the point);
@@ -532,9 +540,9 @@ still get created).
 make test-proxy                # squid on AL2023 in Docker: the allowlist, rebinding, reload, rollback (+ real systemd); no AWS
 make preview-scratch [EGRESS_MODE=firewall] [NEGATIVE=…]   # read-only Pulumi preview + the plan check and its negatives
                                #   (this shell's own credentials, an agent's account)
-make deploy                    # (deployer: one paste) plan check + replacement guard, pulumi up, connector-wait, proxy reload,
-                               #   egress status (its preview runs --non-interactive: export PULUMI_CONFIG_PASSPHRASE_FILE
-                               #   for a passphrase stack, or run it under ai-env run -f with the sealed passphrase: Identities)
+make deploy                    # (the stack's passphrase: one Touch ID unless set; then the deployer: one paste) plan check +
+                               #   replacement guard, pulumi up, connector-wait, proxy reload, egress status (its preview runs
+                               #   --non-interactive: it unseals the sealed passphrase, and refuses without one: Identities)
 make infra-status WRITE=1      # (ops: one Touch ID) adds egress_connector_arn and proxy_private_ip to bridge.toml [aws]
 make s5-smoke                  # three `vm smoke --egress vpc --json` passes (the runtime key's Touch ID each); the echo must be
                                #   exactly the connector
@@ -1214,7 +1222,8 @@ key sits in the environment of its process tree, where the user's other processe
 is gone when the command ends. Never run a shell or another long-lived program under
 `ai-env as deployer` or `ai-env as ops` (such as `ai-env as deployer -- zsh`): the key would stay in
 its environment, and in everything started from it, until it exits. Put several goals in one make
-run instead.
+run instead. The same holds for the stack's passphrase under
+`ai-env run -f "$HOME/.config/ai-env/pulumi.env"` (below).
 
 **Nothing falls back to the shell's own AWS settings.** Every `aws` call of an operator command (the
 egress and proxy commands, `infra status` and `infra base-image`, `gates`, `creds aws-set --check`,
@@ -1244,7 +1253,11 @@ user.
   `--refresh`), `deploy-policies`, `runtime-key`, `ops-key`, `deployer-key`, `image-activate`,
   `image-deactivate`, `image-prune YES=1`, `image-delete`, `connector-probe`, `connector-delete` and
   `test-egress`; several goals share one paste under
-  `ai-env as deployer -- make preview REFRESH=1 deploy`. These targets never compile with the key:
+  `ai-env as deployer -- make preview REFRESH=1 deploy`. `deploy`, `preview` and `deploy-policies`
+  (and the root's `destroy`) also need the stack's passphrase: when it is not set they unseal it
+  after the build and before their runner asks (the deployer's paste; `ai-env as root` asks for
+  nothing), one Touch ID per goal (below). These targets never compile with the key or the
+  passphrase:
   the tiered ones build first without it, `make test-docker` builds, runs Docker and tests without
   it (`image-zip` and `vm-build` build without it whoever calls them), `make install` builds
   without it, and `make test-aws` and `make test-aws-readonly` build their tests without it before
@@ -1259,7 +1272,8 @@ user.
   asks again under `ai-env as ops --` or `ai-env as deployer --`;
 - `ai-env egress allow` needs the deployer (`ai-env as deployer -- ai-env egress allow SLUG HOST`),
   `ai-env egress check` costs the ops key's Touch ID and then the runtime key's for its VM, and
-  `make claude-update` asks once for the identity the run needs (S3, above);
+  `make claude-update` asks once for the identity the run needs (S3, above), and when it deploys
+  unseals the stack's passphrase first (its Touch ID before the paste);
 - `ai-env doctor` asks for nothing, and its one AWS call is a plain sts call that warns when the
   shell's own credentials are the account root's; `ai-env as ops -- ai-env doctor` (one Touch ID)
   adds the rows that call AWS: the operator identity (checked with sts), the deployer's key count
@@ -1267,23 +1281,19 @@ user.
   the proxy, the base image and the quota. The ops key row (from its file's notes: the user, the
   last four characters and the day it was sealed) and the deployer row show either way, and
   `ai-env creds status` shows the ops key and the deployer without a Touch ID;
-- `make -n TARGET` (and `-q`, `-t`) asks for nothing: it shows the runner it would call, then the
-  recipe. Every tiered target refuses `make -i` (a refused identity would be ignored) and `make -p`
-  (`-n` beside it or not: make prints every variable when it ends, and the make under the runner
-  would print the key), before its build or its runner; `make claude-update` refuses both too. A make
-  typed under `ai-env as` holds the key itself and prints it under `-p` whatever the target, so never
-  `-p` there. `make -j` is not for tiered targets (two runners would ask at once);
+- `make -n TARGET` (and `-q`, `-t`) asks for nothing: it shows the unseal (when it would happen) and
+  the runner it would call, then the recipe. Every tiered target refuses `make -i` (a refused
+  identity would be ignored) and `make -p` (`-n` beside it or not: make prints every variable when it
+  ends, and the make under the runner would print the key, and the passphrase once unsealed), before
+  its build, its unseal or its runner; `make claude-update` refuses both too. A make typed under
+  `ai-env as` (or `ai-env run -f` with the passphrase) holds the key (or the passphrase) itself and
+  prints it under `-p` whatever the target, so never `-p` there. `make -j` is not for tiered targets
+  (two runners would ask at once);
 - `vm`, `box` and the wrapper's sessions are unchanged: the runtime key's Touch ID.
 
-**The stack's passphrase in a clean terminal.** `make deploy` (and `make claude-update` when it
-deploys) runs Pulumi's preview `--non-interactive`, so a passphrase stack needs
-`PULUMI_CONFIG_PASSPHRASE_FILE` or `PULUMI_CONFIG_PASSPHRASE` in its environment. In a terminal that
-exports neither, `make deploy` stops at its plan check, before anything is deployed (after the zip
-build, the paste and the preflight: `pulumi preview --json failed …: nothing deployed`), and
-`make claude-update` before its first step
-(`claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first …`); both name the two routes. Instead
-of exporting one in every terminal, seal the passphrase once into an ai-env container under the
-bridge keystore key (`[creds].key`, `ai-env-bridge` by default), then set its value in
+**The stack's passphrase.** Pulumi needs the dev stack's passphrase for `pulumi preview`, `up` and
+`destroy` (reading the stack's outputs needs none). Seal it once per Mac into an ai-env container
+under the bridge keystore key (`[creds].key`, `ai-env-bridge` by default), then set its value in
 `ai-env edit`:
 
 ```sh
@@ -1295,27 +1305,53 @@ In the editor: Enter on its line, the passphrase inside single quotes (taken lit
 `Ctrl+S`, `Ctrl+C`. If you paste it (from Strongbox, say), copy it with Handoff and any clipboard
 history off, as for the keys, and clear the clipboard after the paste (`pbcopy </dev/null`). The
 first line writes a new container over any earlier one: to change the value later, run only the
-second. Then run the deploy under `ai-env run -f`, which hands the passphrase to that one command's
-process tree: one Touch ID for the passphrase, one paste for the deployer's key:
+second. The file opens only on this Mac (its keystore key); a new Mac seals its own.
+
+From then on the targets that need it unseal it themselves (`ai-env run -f` of that file, one
+Touch ID) when it is not set as Pulumi takes it (`PULUMI_CONFIG_PASSPHRASE` first, even empty, and
+an empty one counts as none; else `PULUMI_CONFIG_PASSPHRASE_FILE`): `make preview`, `make deploy`,
+`make deploy-policies` and `make destroy` after their build and before their runner asks (the
+deployer's paste; `ai-env as root` asks for nothing), saying so first
+(`deploy: the dev stack's passphrase: ai-env run -f … (one Touch ID)`), and `make claude-update`
+when it deploys. Only that run holds it: nothing compiles with it, no test or Docker step sees it,
+and of `make claude-update` only its `make deploy` gets it, none of its other steps or its own
+reads. `PULUMI_SEALED=FILE` (on the make command line, or exported) names another file, a leading
+`~/` the home directory's (zsh passes `PULUMI_SEALED=~/…` on to make as it is). An exported
+`PULUMI_CONFIG_PASSPHRASE_FILE` works as before, and with the passphrase set nothing is unsealed
+(nor in a make nested in such a run). Without the file, `make deploy`, `make deploy-policies` and
+`make claude-update` (when it deploys) refuse before anything runs, naming the two lines above:
+their plan check runs Pulumi's preview `--non-interactive`, which cannot prompt; `make preview`
+and `make destroy` keep Pulumi's own prompt. A sealed value left empty (the first line without
+`ai-env edit`) stops the run right after the Touch ID, before the runner; a wrong one fails at the
+plan check with Pulumi's `incorrect passphrase`, nothing deployed: set it again with `ai-env edit`.
+Never put the passphrase, or its file, on the make command line: make refuses both there
+(`MAKEFLAGS` would hand them to every child, the builds included; exported, they stay out of the
+builds), and `make -p` would print them. Each a command of its own: pasted together, the later
+lines could reach the deployer's key prompts.
 
 ```sh
-ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- ai-env as deployer -- make deploy
+make deploy
 ```
 
-`make claude-update` takes the same wrapper (it then asks for its identity as usual), and so does
-`make preview`, each a command of its own: pasted together, the later lines could reach the
-deployer's key prompts.
-
 ```sh
-ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- make claude-update
+make claude-update
 ```
 
 ```sh
-ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- ai-env as deployer -- make preview
+make preview
+```
+
+Several goals that need the passphrase unseal once each, as each asks for the deployer's key; under
+this wrapper they take one Touch ID and one paste in all:
+
+```sh
+ai-env run -f "$HOME/.config/ai-env/pulumi.env" -- ai-env as deployer -- make preview REFRESH=1 deploy
 ```
 
 **When the deployer lacks a right.** A deploy that stops on `AccessDenied` names the action. Add it to
-`infra/policies.ts`, then run `ai-env as deployer -- make deploy-policies deploy` (one paste): the
+`infra/policies.ts`, then run `ai-env as deployer -- make deploy-policies deploy` (one paste, and
+the passphrase's Touch ID per goal; or one in all under the `ai-env run -f` wrapper of "The stack's
+passphrase", above): the
 deploy's gates, a `pulumi up` of the five stack policies alone, then the deploy. While the stack's
 plan holds one of the five documents unknown, as it does whenever the proxy is to be replaced
 (ai-env-ops' document names the instance), deploy-policies refuses before `pulumi up` (exit 1,
@@ -1340,9 +1376,10 @@ deployer, the deployer-tier targets run under `ai-env as root` (said on stderr) 
 paste. Between `make install` and the bootstrap deploy the egress commands fail: the new ai-env
 sends proxy documents the stack does not have yet. One command at a time:
 
-1. `make test-docker deploy`: Pulumi creates the two new users, their two policies, six attachments
-   and the three proxy documents, replaces the three deploy policies once (their descriptions
-   changed; part B0 first checks that nothing holds them) and updates the image.
+1. `make test-docker deploy` (the stack's passphrase: one Touch ID, unless set): Pulumi creates the
+   two new users, their two policies, six attachments and the three proxy documents, replaces the
+   three deploy policies once (their descriptions changed; part B0 first checks that nothing holds
+   them) and updates the image.
 2. `make operator-keys` (the account root, once; a rerun resumes): the deployer's first key goes onto
    its Strongbox entry through the clipboard, is pasted back and verified, then ai-env-ops' key is
    sealed into `credentials/ops.env` and verified (one Touch ID). Before it, on this first
@@ -1352,8 +1389,8 @@ sends proxy documents the stack does not have yet. One command at a time:
    (System Settings, General, AirDrop & Handoff) and check again.
 3. Close the root's terminal, then in a new one: `make infra-status WRITE=1`, then the checks:
    `make gates` shows G7 ✓, and `ai-env as deployer -- make preview REFRESH=1 deploy` is the
-   deployer's first run (one paste, no changes; under `ai-env run -f` with the sealed passphrase,
-   above).
+   deployer's first run (one paste, no changes, and the passphrase's Touch ID per goal; or one in
+   all under the `ai-env run -f` wrapper of "The stack's passphrase", above).
 4. Root's access key: ai-env never needs it again (only break-glass would), so deleting it is
    optional. Delete it when nothing else uses it (IAM console as root, with MFA: Security
    credentials, Access keys); `ai-env as ops -- ai-env doctor` then shows
@@ -1381,7 +1418,8 @@ over, verifies it, and deletes the old one last:
   stack's Pulumi state (the local backend and `infra/Pulumi.dev.yaml`, from the old one) and
   `state/infra.toml` (copied too, or written by `make infra-status WRITE=1`, which writes it without
   an operator identity): `ops.sh identity` refuses while the stack's outputs cannot be read, and
-  `ai-env as deployer` takes the stack's account from that file;
+  `ai-env as deployer` takes the stack's account from that file. The new Mac also seals the stack's
+  passphrase itself (the two lines of "The stack's passphrase"): the old Mac's file opens only there;
 - `make runtime-key ROTATE=1` (`credentials/aws.env`; `combined.env` is rebuilt, as before);
 - `make deployer-key ROTATE=1`: the new key goes onto the Strongbox entry as with
   `make operator-keys`, and the old key it deletes last is the one the run was started with, so run
@@ -1411,7 +1449,8 @@ read -rs 'AWS_ACCESS_KEY_ID?root access key id: '; echo; read -rs 'AWS_SECRET_AC
 Then run the one command needed, with `BREAKGLASS=1` on the make command line (exported, it is
 ignored): for a lost Strongbox entry `make deployer-key ROTATE=1 BREAKGLASS=1`, when self-management
 broke `make deploy BREAKGLASS=1`, for teardown `make destroy CONFIRM=destroy-dev BREAKGLASS=1`. The
-target runs under `ai-env as root`, says so on stderr, and P8 shows `[-  ] P8 BREAK-GLASS: …`.
+target runs under `ai-env as root`, says so on stderr, and P8 shows `[-  ] P8 BREAK-GLASS: …`; a
+deploy or a destroy unseals the stack's passphrase first, as without it (one Touch ID, unless set).
 Destroy is the account root's alone, since it deletes the operator users themselves; its checklist
 adds the two users, every `ai-env-*` policy, `credentials/ops.env` and the Strongbox entry, and ends
 with root's key (item 15: unset, this terminal closed, the key deleted when nothing else uses it).

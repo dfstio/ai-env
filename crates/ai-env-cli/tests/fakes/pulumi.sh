@@ -3,7 +3,16 @@
 # ops.sh post-deploy and connector-status, s3-preflight P6/P7): never touches a
 # backend or AWS. Copied into a temp bin dir as `pulumi`. --show-secrets and
 # --yes are refused everywhere (exit 3, logged as FORBIDDEN): the Makefile and
-# ops.sh never pass them (D17).
+# ops.sh never pass them (D17). preview, up, destroy and refresh first build
+# the stack's secrets manager, as Pulumi 3.268 does for a passphrase stack
+# (A39): PULUMI_CONFIG_PASSPHRASE wins when it is set, even empty, and must be
+# the fake stack's (tests/common/aws_keys.rs' passphrase(), built here as
+# there), else "error: getting stack configuration: get stack secrets
+# manager: incorrect passphrase", exit 1; else a PULUMI_CONFIG_PASSPHRASE_FILE
+# that is set and not empty is taken; else, without a terminal (the tests
+# never have one), "… passphrase must be set with PULUMI_CONFIG_PASSPHRASE or
+# PULUMI_CONFIG_PASSPHRASE_FILE environment variables", exit 1 (both
+# Pulumi's generic error).
 #   pulumi preview ...          prints the file FAKE_PULUMI_PREVIEW (a plan the
 #                               test wrote) and exits FAKE_PULUMI_PREVIEW_RC
 #                               (default 0); unset: refused
@@ -27,10 +36,14 @@
 #                               refused (exit 1) unless FAKE_PULUMI_ALLOW lists
 #                               its first word; then exit 0
 # Environment:
-#   FAKE_PULUMI_LOG   when set, each call is appended here as "pulumi <argv>"
+#   FAKE_PULUMI_LOG   when set, each call is appended here as "pulumi <argv>",
+#                     then " [PASS]" when PULUMI_CONFIG_PASSPHRASE or
+#                     PULUMI_CONFIG_PASSPHRASE_FILE is set, even empty (never
+#                     a value)
 set -u
+pass=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}
 if [ -n "${FAKE_PULUMI_LOG:-}" ]; then
-  printf 'pulumi %s\n' "$*" >> "$FAKE_PULUMI_LOG"
+  printf 'pulumi %s%s\n' "$*" "${pass:+ [PASS]}" >> "$FAKE_PULUMI_LOG"
 fi
 for a in "$@"; do
   case "$a" in
@@ -48,6 +61,21 @@ allowed() {
   esac
   return 1
 }
+# needs_passphrase: the stack's secrets manager, built before anything else (above); the value is compared, never shown.
+needs_passphrase() {
+  if [ -n "${PULUMI_CONFIG_PASSPHRASE+x}" ]; then
+    if [ "$PULUMI_CONFIG_PASSPHRASE" != "$(printf 'Pf3+%.0s' 1 2 3 4 5 6 7 8)" ]; then
+      echo "error: getting stack configuration: get stack secrets manager: incorrect passphrase" >&2
+      exit 1
+    fi
+  elif [ -z "${PULUMI_CONFIG_PASSPHRASE_FILE:-}" ]; then
+    echo "error: getting stack configuration: get stack secrets manager: passphrase must be set with PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE environment variables" >&2
+    exit 1
+  fi
+}
+case "${1:-}" in
+  preview|up|destroy|refresh) needs_passphrase ;;
+esac
 case "${1:-} ${2:-}" in
   "preview "*)
     test -n "${FAKE_PULUMI_PREVIEW:-}" || { echo "fake pulumi: preview refused (FAKE_PULUMI_PREVIEW is not set)" >&2; exit 1; }

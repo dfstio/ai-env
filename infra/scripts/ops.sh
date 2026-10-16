@@ -22,9 +22,10 @@
 # Env (set by infra/infra.mk): REGION, IMAGE_NAME, IMAGE_OUT, STACK, IMAGE_WAIT_TIMEOUT, IMAGE_WAIT_POLL,
 # VERSIONS_WARN, VERSIONS_QUOTA, CONNECTOR_WAIT_TIMEOUT, CONNECTOR_WAIT_POLL; AI_ENV_CLI (connector-probe,
 # post-deploy, key-issue and claude-update only: the make target's $(AI_ENV), split on blanks and not passed on to any
-# child); LOCK and CLAUDE_RELEASES (claude-update only); BREAKGLASS (identity only: 1 when given on the make command
-# line) and ROTATE (key-issue only, the same); AI_ENV_BRIDGE_AS, the marker `ai-env as` sets, read by identity, and by
-# the printed recovery commands, which start with the runner of the identity that must run them (as_writer).
+# child); LOCK, CLAUDE_RELEASES and PULUMI_SEALED (claude-update only; the last the stack's sealed passphrase, default
+# $HOME/.config/ai-env/pulumi.env); BREAKGLASS (identity only: 1 when given on the make command line) and ROTATE
+# (key-issue only, the same); AI_ENV_BRIDGE_AS, the marker `ai-env as` sets, read by identity, and by the printed
+# recovery commands, which start with the runner of the identity that must run them (as_writer).
 # AI_ENV_PASTE_STDIN, the debug builds' paste knob (a test session's leftover), is dropped for every command.
 set -euo pipefail
 # The aws CLI pages its output through less on a terminal (measured 1 Oct 2026: `make image-status` stopped in the
@@ -408,13 +409,27 @@ need_connector() {
     test -n "$connector" || { echo "ops.sh: no connectorName in $infra/egress-config.json" >&2; exit 1; }
 }
 
-# The four variables a compile or a test must never see (D18): an operator key and the runner's marker.
-NO_KEY_ENV=(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS)
+# The six variables a compile or a test must never see (D18): an operator key, the runner's marker and the stack's
+# passphrase (A39); NO_PASS_ENV, the passphrase alone (claude-update's status, proxy and check, besides its export -n).
+NO_KEY_ENV=(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE)
+NO_PASS_ENV=(env -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE)
 
-# need_ai_env: the ai-env command words of AI_ENV_CLI in the array ai_env, built first without any key or marker in
-# its environment (D18): `<ai-env> --version`, which with the make targets' default (cargo run) compiles the tree when
-# it changed, so no later call compiles under the key `ai-env as` put in this process's environment (key-issue,
-# post-deploy, connector-probe and claude-update run under it).
+# pass_set: the stack's passphrase is set as Pulumi takes it (A39): PULUMI_CONFIG_PASSPHRASE when it is set at all, even
+# empty (an empty one is none), else a PULUMI_CONFIG_PASSPHRASE_FILE that is not empty. Only tested, never expanded
+# (infra.mk's PASS_SET_SH and pass-exec.sh test the same).
+pass_set() { [ -n "${PULUMI_CONFIG_PASSPHRASE:+x}" ] || { [ -z "${PULUMI_CONFIG_PASSPHRASE+x}" ] && [ -n "${PULUMI_CONFIG_PASSPHRASE_FILE:+x}" ]; }; }
+
+# with_pass CMD...: CMD with the stack's passphrase exported again, in a subshell of its own (cmd_claude_update keeps it
+# unexported, A39): claude-update's make deploy, the one step that needs it.
+with_pass() (
+    export PULUMI_CONFIG_PASSPHRASE PULUMI_CONFIG_PASSPHRASE_FILE
+    exec "$@"
+)
+
+# need_ai_env: the ai-env command words of AI_ENV_CLI in the array ai_env, built first without any key, marker or
+# passphrase in its environment (D18): `<ai-env> --version`, which with the make targets' default (cargo run) compiles
+# the tree when it changed, so no later call compiles under the key `ai-env as` put in this process's environment
+# (key-issue, post-deploy, connector-probe and claude-update run under it), or the passphrase an unseal put there.
 need_ai_env() {
     local st
     test -n "$ai_env_line" || { echo "ops.sh: AI_ENV_CLI is empty (the make target passes \$(AI_ENV))" >&2; exit 1; }
@@ -1141,43 +1156,56 @@ make_switch() (
 #      nothing): a run after a deploy whose check failed or was cancelled finishes it. When the marker
 #      $IMAGE_OUT/claude-update.pending names B (a deploy this command started, "B <proxy state before>", removed once
 #      a run is done), `make proxy-start` too, and the end notes of a deploy, the proxy's with the state that run found;
-#   3. else, after the preconditions (a terminal for Pulumi's confirmation and the Touch ID; the Pulumi passphrase in
-#      the environment, as make deploy's preview runs --non-interactive; Docker answering; and, outside a runner that
-#      covers the deployer, a stack that exports its deployer: before the bootstrap there is no deployer key to ask
-#      for, and that deploy is the account root's, so the refusal names the pin and make test-docker when they are due,
-#      then make deploy as the root), so that nothing changes when they fail: `make claude-pin
+#   3. else, after the preconditions (a terminal for Pulumi's confirmation and the Touch ID; the stack's passphrase in
+#      the environment, or its sealed file PULUMI_SEALED to unseal (A39), as make deploy's preview runs
+#      --non-interactive; Docker answering; and, outside a runner that covers the deployer, a stack that exports its
+#      deployer: before the bootstrap there is no deployer key to ask for, and that deploy is the account root's, so
+#      the refusal names the pin and make test-docker when they are due, then make deploy as the root), so that nothing
+#      changes when they fail: `make claude-pin
 #      CLAUDE_VERSION=B` (when L != B), `make test-docker` (skipped when it already passed for the current zip of B:
 #      make deploy rebuilds the zip, and its P12 refuses one that differs), then the runner and the AWS identity of the
 #      run (below), the marker, `make deploy EXPECT_BUILD_FAILURE=` (Pulumi asks before it changes anything; the T3.4
 #      switch never reaches it), `make infra-status WRITE=1`, the live active version check, `make proxy-start` (the
 #      check needs squid serving; it also waits for a stopped proxy's boot), `ai-env egress check --if-needed`.
 # Never under make -i, -k or -p, whichever step is due (refused first: -i and -k would go on past a failed preflight or
-# test, and under -p every make the steps run would print its environment, the runner's key among them).
+# test, and under -p every make the steps run would print its environment, the runner's key and the stack's passphrase
+# among them).
 # S8 operators: the identity. The decision above reads local files only; the run then needs one AWS identity, asked
 # once: the deployer when a deploy is due, else ops (contracts §9.10). The steps that need no AWS (make claude-pin: curl
-# and gpg; make test-docker: cargo, the image build, Docker) run first, outside the runner and without any key in
-# their environment (D18); then this script runs itself again under `ai-env as <tier>` (one paste, or one Touch ID),
-# which decides again: the lock and test-docker's stamp are current by then, so that pass never repeats them. In the
-# pass under the runner (or a run started under a covering one, where pin and test-docker come after it), the version
-# summary, then `ops.sh identity <tier>` (an operator of the stack's account, not the account root but the bootstrap's;
-# never break-glass, an exported BREAKGLASS set aside, and make claude-update refuses one on its command line), its
-# line said, then every step that needs AWS; a nested make deploy meets infra.mk's TIER under the deployer's marker and
-# runs at once (its zip rebuilt without the key). An identity refused there, after the pass before the runner pinned or
-# ran make test-docker, says so ("nothing deployed": the new lock and the stamp stay, and a rerun goes on from them);
-# else nothing changed.
+# and gpg; make test-docker: cargo, the image build, Docker) run first, outside the runner and without any key or the
+# stack's passphrase in their environment (D18); then this script runs itself again under `ai-env as <tier>` (one
+# paste, or one Touch ID), which decides again: the lock and test-docker's stamp are current by then, so that pass never
+# repeats them. A39: when a deploy is due and the stack's passphrase is not set as Pulumi takes it (pass_set), it first
+# runs itself again under `ai-env run -f PULUMI_SEALED` (one Touch ID, before the paste; under a covering runner the
+# only hop, that runner's identity checked first, before pin and test-docker: refused, nothing ran), and that pass
+# stops before the paste when the sealed value is empty or missing, saying what the pass before it left. Every pass
+# keeps the passphrase in its own shell, unexported: only the make deploy step gets it (with_pass), and the deployer's
+# runner that carries it there; no read of this script and no other step (status, proxy and check run under
+# NO_PASS_ENV too). In the pass under the runner (or a run started under a covering one, where pin and test-docker come
+# after it; when that run unseals, before the unseal), the version summary, then `ops.sh identity <tier>` (an operator
+# of the stack's account, not the account root but the bootstrap's; never break-glass, an exported BREAKGLASS set aside,
+# and make claude-update refuses one on its command line), its line said, then every step that needs AWS; a nested make
+# deploy meets infra.mk's TIER under the deployer's marker and runs at once (its zip rebuilt without the key). An
+# identity refused there, after the pass before the runner (or the unseal) pinned or ran make test-docker, says so
+# ("nothing deployed": the new lock and the stamp stay, and a rerun goes on from them); else nothing changed.
 # The first failure stops it naming the step; make claude-update again resumes (every step is idempotent). The lock
 # changes in the tree: Mike reviews and commits it (git, asked whether it changed, runs without the key or an
 # fsmonitor).
-# Env (infra.mk): AI_ENV_CLI, LOCK, CLAUDE_RELEASES, CLAUDE_GPG_FPR; AI_ENV_BRIDGE_LAB_ASSUME_TTY=1 (the tests only:
-# LAB_UNSET clears it on every make run) skips the terminal check. CLAUDE_UPDATE_REEXEC: this script's own, from the
-# pass that asked for the runner to the pass under it (the same process id, `exec` all the way: an exported leftover
-# never matches), so a runner that did not take is never asked for again.
+# Env (infra.mk): AI_ENV_CLI, LOCK, CLAUDE_RELEASES, CLAUDE_GPG_FPR, PULUMI_SEALED; AI_ENV_BRIDGE_LAB_ASSUME_TTY=1 (the
+# tests only: LAB_UNSET clears it on every make run) skips the terminal check. CLAUDE_UPDATE_REEXEC: this script's own,
+# `<pid> <pinned> <tested> <unsealed> <ran-as>`, from a pass that runs itself again to the pass under it (the same
+# process id, `exec` all the way: an exported leftover never matches), so neither the unseal nor a runner that did not
+# take is asked for again.
 cmd_claude_update() {
     local lock=${LOCK:?} releases=${CLAUDE_RELEASES:-} bundle locked deployed active latest="" outputs steps s n=0 total st proxy proxy_before="" pinned=0 tested=0 deploying=0 marker
-    local pending="$out/claude-update.pending" decided="" stale_marker=0 read_proxy=0 tier why line handed="" h_pin="" h_test="" left todo=""
+    local pending="$out/claude-update.pending" decided="" stale_marker=0 read_proxy=0 tier why line h_pin="" h_test="" h_pass="" h_as="" left todo=""
+    local sealed=${PULUMI_SEALED:-$HOME/.config/ai-env/pulumi.env} unseal=0 covered then_as=""
+    # The stack's passphrase stays in this shell, unexported (A39): only make deploy gets it (with_pass), and the
+    # deployer's runner that carries it there; the tests below read whether it is set, never a value.
+    export -n PULUMI_CONFIG_PASSPHRASE PULUMI_CONFIG_PASSPHRASE_FILE
     need_ai_env
     if make_switch ik; then echo "claude-update: not under make -i or -k (a failing preflight or test must stop the deploy): run make claude-update without them"; exit 2; fi
-    if make_switch p; then echo "claude-update: not under make -p (it prints every variable at the end of every make it reaches, the environment's too: under the runner this run asks for, the operator key and its secret): run make claude-update without it"; exit 2; fi
+    if make_switch p; then echo "claude-update: not under make -p (it prints every variable at the end of every make it reaches, the environment's too: under the runner this run asks for, the operator key and its secret, and the stack's passphrase once unsealed): run make claude-update without it"; exit 2; fi
     bundle=$("${ai_env[@]}" infra pin --bundle-version) || { st=$?; echo "claude-update: cannot read the Cursor bundle's version (ai-env infra pin --bundle-version: exit $st, above; exit 1 when no bundle is installed): nothing changed"; exit 1; }
     is_version "$bundle" || { echo "claude-update: ai-env infra pin --bundle-version printed \"$bundle\", not a version: nothing changed"; exit 1; }
     locked=$(sed -n 's/^CLAUDE_VERSION=//p' "$lock" 2>/dev/null | head -1 || true)
@@ -1207,8 +1235,14 @@ cmd_claude_update() {
             echo "claude-update: needs a terminal (make deploy asks Pulumi's confirmation, the egress check one Touch ID: not from a pipe, cron or launchd): nothing changed"
             exit 1
         fi
-        test -n "${PULUMI_CONFIG_PASSPHRASE:-}${PULUMI_CONFIG_PASSPHRASE_FILE:-}" \
-            || { echo "claude-update: export PULUMI_CONFIG_PASSPHRASE_FILE first (the file holding the $stack stack's passphrase: make deploy's preview runs --non-interactive), or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"): nothing changed"; exit 1; }
+        # The stack's passphrase (A39): set (pass_set), or its sealed file, unsealed before the paste.
+        if ! pass_set; then
+            if [ ! -f "$sealed" ]; then
+                printf '%s\n' "claude-update: a deploy is due, and the $stack stack's passphrase is in neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none), and there is no sealed $sealed to unseal (make deploy's preview runs --non-interactive): seal it once (README \"Identities\"): printf 'PULUMI_CONFIG_PASSPHRASE=\n' | ai-env encrypt -k ai-env-bridge - > \"$sealed\", then ai-env edit \"$sealed\"; or export PULUMI_CONFIG_PASSPHRASE_FILE (a file holding it): nothing changed"
+                exit 1
+            fi
+            unseal=1
+        fi
         docker info >/dev/null 2>&1 || { echo "claude-update: Docker does not answer (docker info), and make test-docker needs it: start Docker, then make claude-update: nothing changed"; exit 1; }
         steps="deploy status active proxy check"
         deploying=1
@@ -1225,10 +1259,21 @@ cmd_claude_update() {
     total=$(wc -w <<<"$steps" | tr -d ' ')
     tier=ops
     case " $steps " in *" deploy "*) tier=deployer ;; esac
-    if ! "${ai_env[@]}" as --check "$tier" >/dev/null 2>&1; then
-        # Not under a runner that covers the tier: the steps that need no AWS first, then the runner, once.
-        handed=${CLAUDE_UPDATE_REEXEC:-}
-        if [ "${handed%% *}" = "$$" ]; then
+    # What the pass before this one did (pinned, tested), and how it handed over: under the unseal, under the runner.
+    case "${CLAUDE_UPDATE_REEXEC:-}" in "$$ "*) read -r _ h_pin h_test h_pass h_as <<<"$CLAUDE_UPDATE_REEXEC" ;; esac
+    unset CLAUDE_UPDATE_REEXEC
+    if [ "$h_pin" = 1 ]; then pinned=1; fi
+    if [ "$h_test" = 1 ]; then tested=1; fi
+    covered=1
+    "${ai_env[@]}" as --check "$tier" >/dev/null 2>&1 || covered=0
+    if [ "$unseal" = 1 ] || [ "$covered" = 0 ]; then
+        # The passphrase to unseal, or no runner that covers the tier: the steps that need no AWS first, then the unseal
+        # (its Touch ID), then the runner (its paste or Touch ID), each once, this script running itself again under it.
+        if [ "$unseal" = 1 ] && [ "$h_pass" = 1 ]; then
+            echo "claude-update: this run is under ai-env run -f $sealed, but it sets neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none: set it with ai-env edit \"$sealed\", README \"Identities\"): stopped before the first step that needs AWS: $(claude_update_left)"
+            exit 1
+        fi
+        if [ "$covered" = 0 ] && [ "$h_as" = 1 ]; then
             echo "claude-update: this run is under ai-env as $tier, but ai-env as --check $tier still fails: stopped before the first step that needs AWS"
             exit 1
         fi
@@ -1236,7 +1281,7 @@ cmd_claude_update() {
         # account root's (make deploy runs it as the root; a run under ai-env as root covers the tier and comes not here).
         # The refusal names what to run instead, from the steps decided above: the pin and make test-docker when due
         # (neither needs AWS), then make deploy as the account root.
-        if [ "$tier" = deployer ] && [ -z "$(printf '%s' "$outputs" | jsq 'j.deployerUserName' 2>/dev/null)" ]; then
+        if [ "$covered" = 0 ] && [ "$tier" = deployer ] && [ -z "$(printf '%s' "$outputs" | jsq 'j.deployerUserName' 2>/dev/null)" ]; then
             echo "claude-update: a deploy is due, but stack $stack exports no deployer yet, so there is no deployer key to ask for: that deploy is the bootstrap, the account root's (README \"The bootstrap\"): nothing changed"
             for s in $steps; do
                 case "$s" in
@@ -1248,22 +1293,34 @@ cmd_claude_update() {
             echo "claude-update: run instead: ${todo:+${todo}then }make deploy as the account root (the bootstrap)"
             exit 1
         fi
+        # Under a runner that covers the tier the unseal is the only hop, and that runner's identity is checked first, as
+        # a run that unseals nothing checks it before any step: refused, nothing ran (no pin, no test, no Touch ID). The
+        # pass under the unseal checks it again, and says it.
+        if [ "$covered" = 1 ] && ! line=$(BREAKGLASS= cmd_identity "$tier"); then
+            echo "claude-update: the identity of this run is refused: $line: $(claude_update_left)"
+            exit 1
+        fi
         for s in $steps; do
             case "$s" in pin | test) ;; *) break ;; esac
             n=$((n + 1))
             claude_update_step "$s"
         done
+        if [ "$unseal" = 1 ]; then
+            if [ "$covered" = 0 ]; then then_as=", then ai-env as $tier: asking once each"; fi
+            echo "claude-update: a deploy is due: the $stack stack's passphrase: ai-env run -f $sealed (one Touch ID)$then_as, before the first step that needs AWS" >&2
+            CLAUDE_UPDATE_REEXEC="$$ $pinned $tested 1 ${h_as:-0}"
+            export CLAUDE_UPDATE_REEXEC
+            exec "${ai_env[@]}" run -f "$sealed" -- env AI_ENV_CLI="$ai_env_line" "$BASH" "${BASH_SOURCE[0]}" claude-update
+        fi
         case "$tier" in deployer) why="a deploy is due" ;; *) why="the status and the egress check" ;; esac
         echo "claude-update: this run needs ai-env as $tier ($why): asking once, before the first step that needs AWS" >&2
-        CLAUDE_UPDATE_REEXEC="$$ $pinned $tested"
+        CLAUDE_UPDATE_REEXEC="$$ $pinned $tested ${h_pass:-0} 1"
         export CLAUDE_UPDATE_REEXEC
+        # The deploy's passphrase goes with the deployer's runner to the pass under it (which keeps it unexported too).
+        if [ "$tier" = deployer ]; then export PULUMI_CONFIG_PASSPHRASE PULUMI_CONFIG_PASSPHRASE_FILE; fi
         exec "${ai_env[@]}" as "$tier" -- env AI_ENV_CLI="$ai_env_line" "$BASH" "${BASH_SOURCE[0]}" claude-update
     fi
-    # Under the runner: what the pass before it did (pinned, tested), the summary, the identity, then every step.
-    case "${CLAUDE_UPDATE_REEXEC:-}" in "$$ "*) read -r h_pin h_test <<<"${CLAUDE_UPDATE_REEXEC#* }" ;; esac
-    if [ "$h_pin" = 1 ]; then pinned=1; fi
-    if [ "$h_test" = 1 ]; then tested=1; fi
-    unset CLAUDE_UPDATE_REEXEC
+    # Under the runner (and the passphrase, when a deploy is due): the summary, the identity, then every step.
     if [ -n "$releases" ]; then
         latest=$(curl --proto '=https' --tlsv1.2 -fsS -m 10 "$releases/latest" 2>/dev/null | head -c 64 | tr -d '[:space:]' || true)
         is_version "$latest" || latest=""
@@ -1283,13 +1340,7 @@ cmd_claude_update() {
     # aside, as make's IDENTITY sets aside any but the command line's. The admitted line is said too (the bootstrap's
     # root among them). Refused, it says what the pass before the runner left: its pin and stamp stay current.
     if ! line=$(BREAKGLASS= cmd_identity "$tier"); then
-        if [ "$pinned" = 1 ]; then
-            left="nothing deployed: the pass before the runner pinned $lock to $bundle and passed make test-docker (kept: make claude-update again resumes)"
-        elif [ "$tested" = 1 ]; then
-            left="nothing deployed: the pass before the runner passed make test-docker (kept: make claude-update again resumes)"
-        else
-            left="nothing changed"
-        fi
+        left=$(claude_update_left)
         echo "claude-update: the identity of this run is refused: $line: $left"
         exit 1
     fi
@@ -1332,9 +1383,25 @@ cmd_claude_update() {
     fi
 }
 
+# claude_update_left: what the pass before this one left, for a refusal after the runner or, with no runner asked yet
+# (h_as), after the unseal (cmd_claude_update's locals pinned, tested, lock, bundle, h_as): its pin and test-docker's
+# stamp stay, and a rerun goes on from them.
+claude_update_left() {
+    local before="the pass before the unseal"
+    if [ "$h_as" = 1 ]; then before="the pass before the runner"; fi
+    if [ "$pinned" = 1 ]; then
+        echo "nothing deployed: $before pinned $lock to $bundle and passed make test-docker (kept: make claude-update again resumes)"
+    elif [ "$tested" = 1 ]; then
+        echo "nothing deployed: $before passed make test-docker (kept: make claude-update again resumes)"
+    else
+        echo "nothing changed"
+    fi
+}
+
 # claude_update_step <step>: step n of cmd_claude_update's total (its locals: n, total, bundle, pending, proxy_before,
-# pinned, tested). pin and test need no AWS: they run without any key in their environment (D18), as the first pass
-# does.
+# pinned, tested). pin and test need no AWS: they run without any key or the stack's passphrase in their environment
+# (D18), as the first pass does; only make deploy gets the passphrase (with_pass: A39, for its preview and pulumi up),
+# and the steps after it run without it (NO_PASS_ENV, besides cmd_claude_update's export -n).
 claude_update_step() {
     case "$1" in
     pin)
@@ -1353,12 +1420,12 @@ claude_update_step() {
         mkdir -p "$out" && printf '%s %s\n' "$bundle" "${proxy_before:-unknown}" >"$pending"
         # EXPECT_BUILD_FAILURE= : the T3.4 switch typed on claude-update's command line must not reach the
         # deploy (it would skip P12, which the test-docker skip relies on).
-        update_step "$n/$total" "make deploy" make --no-print-directory deploy EXPECT_BUILD_FAILURE=
+        update_step "$n/$total" "make deploy" with_pass make --no-print-directory deploy EXPECT_BUILD_FAILURE=
         ;;
-    status) update_step "$n/$total" "make infra-status WRITE=1" make --no-print-directory infra-status WRITE=1 ;;
+    status) update_step "$n/$total" "make infra-status WRITE=1" "${NO_PASS_ENV[@]}" make --no-print-directory infra-status WRITE=1 ;;
     active) update_step "$n/$total" "new VMs start the deployed image version" active_is_deployed ;;
-    proxy) update_step "$n/$total" "make proxy-start (squid serving the deployed parameters)" make --no-print-directory proxy-start ;;
-    check) update_step "$n/$total" "ai-env egress check --if-needed" "${ai_env[@]}" egress check --if-needed ;;
+    proxy) update_step "$n/$total" "make proxy-start (squid serving the deployed parameters)" "${NO_PASS_ENV[@]}" make --no-print-directory proxy-start ;;
+    check) update_step "$n/$total" "ai-env egress check --if-needed" "${NO_PASS_ENV[@]}" "${ai_env[@]}" egress check --if-needed ;;
     esac
 }
 

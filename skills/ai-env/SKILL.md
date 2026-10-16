@@ -117,6 +117,10 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   `credentials/*.env` or anything under `~/.aws`. Never run `ai-env creds deployer-key`,
   `ai-env creds aws-set` or `ai-env creds aws-verify` for the user's keys, and never copy an `id`
   or `arn` line, or the key id in a printed `aws iam delete-access-key` command, into notes or plans.
+- Never read `~/.config/ai-env/pulumi.env`, the stack's sealed Pulumi passphrase, nor unseal it
+  (`ai-env run -f` of it, `ai-env show` or `ai-env edit`): the deploy targets unseal it themselves,
+  with the user's Touch ID, in the user's terminal. Never put a passphrase on a command line or in
+  a file.
 - Never start a deployer-tier target (`make deploy`, `make preview`, `make runtime-key`,
   `make ops-key`, `make deployer-key`, `make image-activate`, …), `ai-env as deployer …`,
   `ai-env egress allow` or `make claude-update` yourself: give the user the exact command to run in a

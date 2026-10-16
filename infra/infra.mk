@@ -15,11 +15,14 @@
 #     (BREAKGLASS=1 only); the bootstrap deploy itself, and BREAKGLASS=1 on the command line for any deployer target;
 #   no tier: infra-status, allowlist-reload, proxy-stop, proxy-start, proxy-patch (and gates, check-base-image) are one
 #     ai-env command each, which resolves its identity itself (credentials/ops.env, one Touch ID; none under a runner),
-#     and claude-update, whose ops.sh asks once for ops, or the deployer when a deploy is due.
+#     and claude-update, whose ops.sh asks once for ops, or the deployer when a deploy is due (after the stack's
+#     passphrase, below).
 # Nothing falls back to this shell's own AWS settings: `ai-env as` clears them for its command.
 # Every aws call carries --region $(REGION), and the lambda-core, ec2 and logs ones the pinned --endpoint-url; nothing
-# here runs `pulumi login`, sets the dev stack's passphrase or uses --yes / --show-secrets (D17; `ai-env proxy stop
-# --yes` is the operator CLI's own switch). The image lifecycle and egress logic lives in infra/scripts/ops.sh (bash 3.2).
+# here runs `pulumi login` or uses --yes / --show-secrets (D17; `ai-env proxy stop --yes` is the operator CLI's own
+# switch), and nothing writes, prints or passes the dev stack's passphrase as an argument: the targets that need it
+# unseal its sealed file through `ai-env run -f` (A39, which amends D17; PASS_TARGETS below). The image lifecycle and
+# egress logic lives in infra/scripts/ops.sh (bash 3.2).
 .PHONY: infra-install infra-typecheck check-policies preview-scratch preview deploy deploy-policies image-wait image-status image-versions image-builds image-deactivate image-activate image-prune image-delete logs infra-status runtime-key ops-key deployer-key operator-keys destroy \
         connector-status connector-wait connector-probe connector-delete egress-logs allowlist-reload proxy-stop proxy-start proxy-patch claude-update \
         preview-run deploy-run deploy-policies-run image-wait-run image-status-run image-versions-run image-builds-run image-deactivate-run image-activate-run image-prune-run image-delete-run logs-run \
@@ -28,6 +31,24 @@
 INFRA              := infra
 # The program reads image.json and resolves the paths inside it from the repo root, also from a scratch copy.
 PULUMI_ENV          = IMAGE_JSON="$(abspath $(IMAGE_JSON))" AI_ENV_REPO_ROOT="$(CURDIR)"
+# The stack's passphrase, sealed once per Mac (README "Identities"): PULUMI_SEALED=FILE, on the command line or from the
+# environment, names another file (PULUMI_ENV above is the program's own), a leading ~/ HOME's (zsh hands make the
+# command line's `PULUMI_SEALED=~/f` as it is), so that TIER, its dry form and ops.sh look at one file. PASS_TARGETS
+# (A39): the tiered targets whose X-run runs pulumi preview, up or destroy of the real stack, the only ones that unseal
+# it (TIER below).
+PULUMI_SEALED      := $(or $(PULUMI_SEALED),$(HOME)/.config/ai-env/pulumi.env)
+override PULUMI_SEALED := $(if $(filter ~/%,$(PULUMI_SEALED)),$(HOME)/$(PULUMI_SEALED:~/%=%),$(PULUMI_SEALED))
+PASS_TARGETS       := preview deploy deploy-policies destroy
+# The passphrase itself, or its file, on the make command line would sit in MAKEFLAGS, which hands it to every child of
+# every make run, the builds among them (a sub-make started under NO_KEY exports its command line's variables again):
+# refused before anything runs (exported, NO_KEY keeps either from the builds; make -p still prints the command line:
+# never with it).
+ifeq ($(origin PULUMI_CONFIG_PASSPHRASE),command line)
+$(error PULUMI_CONFIG_PASSPHRASE on the make command line: MAKEFLAGS would hand it to every child of make, the builds among them: drop it; the targets that need the passphrase unseal $(PULUMI_SEALED) themselves (README "Identities"))
+endif
+ifeq ($(origin PULUMI_CONFIG_PASSPHRASE_FILE),command line)
+$(error PULUMI_CONFIG_PASSPHRASE_FILE on the make command line: MAKEFLAGS would hand it to every child of make, the builds among them, past NO_KEY: export it instead, or drop it and let the targets that need the passphrase unseal $(PULUMI_SEALED) (README "Identities"))
+endif
 # D19: the log group comes from the one image parameter file.
 LOG_GROUP          := $(shell sed -n 's/.*"logGroup": *"\([^"]*\)".*/\1/p' $(IMAGE_CONFIG))
 RUNTIME_USER       := ai-env-runtime
@@ -48,29 +69,43 @@ OPS_USER           := ai-env-ops
 # (-n, -q, -t: MAKE_DRY) the runner is only shown: the line names $(MAKE), which GNU make runs even then, and the
 # sub-make inherits the switch, so `make -n X` prints X-run's recipe and asks for nothing (make -p is refused, -n or
 # not: NOT_UNDER_I_OR_P); every other line naming $(MAKE) is a sub-make. Compile steps
-# never see an operator key (D18: the key reaches every child, a dependency's build script included): they come first,
-# in the wrapper, under $(NO_KEY), which a make nested under a runner needs too; and TIER itself first builds the
-# operator CLI the same way ($(AI_ENV_BUILD)), before its `ai-env as --check`, which under a runner holds the key.
-# make -j is not for tiered targets (two runners would ask at once); several goals under one ask: ai-env as deployer
-# -- make A B C.
-NO_KEY             := env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS
-# The operator CLI built without any key or marker in its environment (D18): `$(AI_ENV) --version`, which with the
-# default AI_ENV (cargo run) compiles the tree when it changed, its proc macros and any build script that reruns
-# seeing only this environment. TIER runs it first, and so does every target or ops.sh command that calls $(AI_ENV)
-# and may run under a runner (the one-command operator targets, s3-preflight, ops.sh's need_ai_env, and the X-runs that
-# call it before any of those: one typed by hand under a runner builds too), so a make nested under `ai-env as`, or
-# typed under it, finds the binary built and never compiles with the key.
+# never see an operator key or the stack's passphrase (D18: either reaches every child, a dependency's build script
+# included): they come first, in the wrapper, under $(NO_KEY), which a make nested under a runner (or under the unseal)
+# needs too; and TIER itself first builds the operator CLI the same way ($(AI_ENV_BUILD)), before its `ai-env as
+# --check`, which under a runner holds the key. make -j is not for tiered targets (two runners would ask at once);
+# several goals under one ask: ai-env as deployer -- make A B C.
+# A39, the stack's passphrase: for the PASS_TARGETS, which run pulumi preview, up or destroy of the real stack in X-run
+# (nothing else needs it: reading the stack outputs has needed none since Pulumi 3.252), TIER unseals the sealed
+# $(PULUMI_SEALED) when the passphrase is not set as Pulumi takes it (PULUMI_CONFIG_PASSPHRASE first, even empty, and
+# an empty one is none; else PULUMI_CONFIG_PASSPHRASE_FILE) and that file exists: after the build, its Touch ID before
+# the runner's ask (`ai-env run -f F -- pass-exec.sh X F ai-env as T -- X-run`, or under a covering runner `ai-env run
+# -f F -- pass-exec.sh X F X-run`), said on stderr first; pass-exec.sh stops an empty sealed value before the runner.
+# Once set (exported, a nested make, a make under `ai-env run -f`), nothing is unsealed again; several such goals unseal
+# once each, as each asks its runner, or once for all under `ai-env run -f F -- ai-env as deployer -- make A B C`. The
+# root's runner under another runner's marker refuses before it asks anything (`ai-env as root` starts only from a
+# terminal of its own): nothing is unsealed for that refusal. Without the file deploy and deploy-policies refuse first
+# (PASS_CHECK: their plan check cannot prompt), and preview and destroy keep Pulumi's own prompt. The dry form shows
+# the unseal exactly where it would happen: make runs TIER's own test of the two variables and the file ($(shell): a
+# test only, no value expanded).
+NO_KEY             := env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AI_ENV_BRIDGE_AS -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE
+# The operator CLI built without any key, marker or passphrase in its environment (D18): `$(AI_ENV) --version`, which
+# with the default AI_ENV (cargo run) compiles the tree when it changed, its proc macros and any build script that
+# reruns seeing only this environment. TIER runs it first, and so does every target or ops.sh command that calls
+# $(AI_ENV) and may run under a runner (the one-command operator targets, s3-preflight, ops.sh's need_ai_env, and the
+# X-runs that call it before any of those: one typed by hand under a runner builds too), so a make nested under `ai-env
+# as`, or typed under it, finds the binary built and never compiles with the key.
 AI_ENV_BUILD        = $(NO_KEY) $(LAB_UNSET) $(AI_ENV) --version >/dev/null
 # make -i ignores a failed line and runs the next: a refused identity (ops.sh identity), a missing CONFIRM or
 # BREAKGLASS would be ignored and the step it guards run anyway, as the account root or this shell's own credentials
 # too. make -p prints its data base when it ends, every variable with its value, the environment's too, and MAKEFLAGS
 # hands the -p to every sub-make: X-run's under the runner, and every make nested in it, would print the operator key
-# and its secret. Every tiered target refuses both in its wrapper, before its build and its runner, and again in its
-# X-run (typed by hand), as acceptance does: a $(error) on MAKE_SWITCHES, which make expands with the whole recipe
-# before any of its lines runs, wherever the line stands (otherwise the line is empty); -p under -n too, as -i. -k is
-# no such risk: a failed line still ends the recipe. (A make typed under a runner holds the key itself and prints it
-# under -p whatever this file says: the refusal stops its steps, never its own data base.)
-NOT_UNDER_P         = $(if $(findstring p,$(MAKE_SWITCHES)),$(error $(1): not under make -p (it prints every variable when it ends, the environment's too: under the runner, the operator key and its secret): run make $(1) without it))
+# and its secret, and the stack's passphrase once unsealed (A39). Every tiered target refuses both in its wrapper,
+# before its build, its unseal and its runner, and again in its X-run (typed by hand), as acceptance does: a $(error)
+# on MAKE_SWITCHES, which make expands with the whole recipe before any of its lines runs, wherever the line stands
+# (otherwise the line is empty); -p under -n too, as -i. -k is no such risk: a failed line still ends the recipe. (A
+# make typed under a runner, or under `ai-env run -f` with the passphrase, holds it itself and prints it under -p
+# whatever this file says: the refusal stops its steps, never its own data base.)
+NOT_UNDER_P         = $(if $(findstring p,$(MAKE_SWITCHES)),$(error $(1): not under make -p (it prints every variable when it ends, the environment's too: under the runner, the operator key and its secret, and the stack's passphrase once unsealed): run make $(1) without it))
 NOT_UNDER_I_OR_P    = $(if $(findstring i,$(MAKE_SWITCHES)),$(error $(1): not under make -i (a refused identity, or a missing CONFIRM or BREAKGLASS, would be ignored and the steps after it run): run make $(1) without it))$(call NOT_UNDER_P,$(1))
 BREAKGLASS_ON       = $(filter 1,$(call cmdline,BREAKGLASS))
 # The runner's environment: no lab knob (A7: a debug `ai-env` reads them, AI_ENV_BRIDGE_LAB_OSASCRIPT among them)
@@ -78,15 +113,31 @@ BREAKGLASS_ON       = $(filter 1,$(call cmdline,BREAKGLASS))
 # key from a stdin that is not a terminal (a pipe into make, an IDE's task runner) instead of /dev/tty; X-run inherits
 # it.
 RUNNER_ENV          = $(LAB_UNSET) -u AI_ENV_PASTE_STDIN
-TIER_SH             = tier() { t=$$1; x=$$2; shift 2; $(AI_ENV_BUILD) || return $$?; \
+# A39 (above). PASS_SET_SH: the stack's passphrase is set as Pulumi takes it: PULUMI_CONFIG_PASSPHRASE when it is set
+# at all, even empty (an empty one is none), else a PULUMI_CONFIG_PASSPHRASE_FILE that is not empty (only tested, never
+# expanded; pass-exec.sh and ops.sh's pass_set test the same). PASS_CHECK, the first line of deploy and deploy-policies
+# (their plan check cannot prompt): refused before the build when it is not set and there is no sealed file to unseal.
+# PASS_SH, TIER's: u=unseal for a PASS_TARGET when it is not set and the sealed file exists, and `unseal CMD...`, which
+# says so on stderr, then runs CMD under the passphrase through pass-exec.sh's guard, the lab and paste knobs dropped as
+# for the runner. PASS_DRY: the dry form's unseal, where PASS_SH's own test would set u (make runs it: $(shell)).
+PASS_SET_SH         = { [ -n "$${PULUMI_CONFIG_PASSPHRASE:+x}" ] || { [ -z "$${PULUMI_CONFIG_PASSPHRASE+x}" ] && [ -n "$${PULUMI_CONFIG_PASSPHRASE_FILE:+x}" ]; }; }
+PASS_CHECK          = $(PASS_SET_SH) || test -f "$(PULUMI_SEALED)" || { printf '%s\n' "$(1): the $(STACK) stack's passphrase: neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE is set (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none), and there is no sealed $(PULUMI_SEALED) to unseal (the plan check runs pulumi preview --non-interactive): seal it once (README \"Identities\"): printf 'PULUMI_CONFIG_PASSPHRASE=\n' | ai-env encrypt -k ai-env-bridge - > \"$(PULUMI_SEALED)\", then ai-env edit \"$(PULUMI_SEALED)\"; or export PULUMI_CONFIG_PASSPHRASE_FILE (a file holding it): nothing ran"; exit 1; }
+PASS_SH             = u=; case " $(PASS_TARGETS) " in *" $$x "*) $(PASS_SET_SH) || test ! -f "$(PULUMI_SEALED)" || u=unseal ;; esac; \
+                        unseal() { echo "$$x: the $(STACK) stack's passphrase: ai-env run -f $(PULUMI_SEALED) (one Touch ID)" >&2; \
+                          $(RUNNER_ENV) $(AI_ENV) run -f "$(PULUMI_SEALED)" -- $(SHELL) $(INFRA)/scripts/pass-exec.sh "$$x" "$(PULUMI_SEALED)" "$$@"; };
+PASS_DRY            = $(if $(filter $(1),$(PASS_TARGETS)),$(if $(shell $(PASS_SET_SH) || test ! -f "$(PULUMI_SEALED)" || echo y),$(AI_ENV) run -f "$(PULUMI_SEALED)" -- ))
+# Nothing to unseal (u empty): the shell's unquoted $u vanishes, and the last line is the runner as it was. The root's
+# runner under another runner's marker (the root's own covers it) refuses at once: nothing unsealed for it.
+TIER_SH             = tier() { t=$$1; x=$$2; shift 2; $(AI_ENV_BUILD) || return $$?; $(PASS_SH) \
                         if [ -n "$(BREAKGLASS_ON)" ]; then \
                           echo "$$x: BREAKGLASS=1 on the make command line: ai-env as root (the account root's own credentials; README \"Break-glass\")" >&2; t=root; \
-                        elif $(RUNNER_ENV) $(AI_ENV) as --check "$$t" >/dev/null 2>&1; then "$$@"; return; \
+                        elif $(RUNNER_ENV) $(AI_ENV) as --check "$$t" >/dev/null 2>&1; then $$u "$$@"; return; \
                         elif [ "$$t" = deployer ] && d=$$($(OPS) stack-deployer) && [ -z "$$d" ]; then \
                           echo "$$x: stack $(STACK) exports no deployer yet: the bootstrap, as the account root (ai-env as root)" >&2; t=root; fi; \
-                        if [ "$$t" = root ] && $(RUNNER_ENV) $(AI_ENV) as --check root >/dev/null 2>&1; then "$$@"; return; fi; \
-                        $(RUNNER_ENV) $(AI_ENV) as "$$t" -- "$$@"; };
-TIER                = $(if $(MAKE_DRY),: $(AI_ENV) as $(if $(BREAKGLASS_ON),root,$(1)) --;,$(TIER_SH) tier $(1) $(2))
+                        if [ "$$t" = root ] && $(RUNNER_ENV) $(AI_ENV) as --check root >/dev/null 2>&1; then $$u "$$@"; return; fi; \
+                        if [ "$$t" = root ] && [ -n "$${AI_ENV_BRIDGE_AS:-}" ]; then u=; fi; \
+                        if [ -n "$$u" ]; then unseal $(AI_ENV) as "$$t" -- "$$@"; else $(RUNNER_ENV) $(AI_ENV) as "$$t" -- "$$@"; fi; };
+TIER                = $(if $(MAKE_DRY),: $(call PASS_DRY,$(2))$(AI_ENV) as $(if $(BREAKGLASS_ON),root,$(1)) --;,$(TIER_SH) tier $(1) $(2))
 # ops.sh identity TIER [LABEL]: one line, exit 0 (admitted; a loud break-glass line starts "BREAK-GLASS:") or 1.
 IDENTITY            = BREAKGLASS='$(BREAKGLASS_ON)' $(OPS) identity
 # ops.sh key-issue LABEL USER sealed|handover [first]: an access key whose secret never crosses a recipe (D23).
@@ -134,10 +185,11 @@ IMAGE_WAIT_SH       = ( $(OPS) wait; st=$$?; \
 # deploy's gate before anything is recorded or changed, shared with deploy-policies ($(1) the target, $(2) plan-gate's
 # options): ONE `pulumi preview --json` of the real stack, held in a shell variable (never written or echoed: it carries
 # the account id), on stdin to ops.sh plan-gate (the plan check and the replacement guard; for deploy-policies also its
-# five documents known in that plan, D18); any refusal stops it.
+# five documents known in that plan, D18); any refusal stops it. Its failure names the passphrase's routes (A39): a
+# wrong or empty value is Pulumi's "incorrect passphrase" here, after the paste.
 PLAN_GATE           = echo "cd $(INFRA) && pulumi preview --json --stack $(STACK): the plan check and the replacement guard"; \
                         plan=$$(cd $(INFRA) && $(PULUMI_ENV) pulumi preview --json --show-sames --show-reads --non-interactive --stack $(STACK)) \
-                          || { st=$$?; printf '%s' "$$plan" | $(OPS) plan-errors; echo "$(1): pulumi preview --json failed (exit $$st): nothing deployed (a passphrase stack needs PULUMI_CONFIG_PASSPHRASE_FILE: --non-interactive cannot prompt, or run it under ai-env run -f <your sealed passphrase file> (README \"Identities\"))"; exit 1; }; \
+                          || { st=$$?; printf '%s' "$$plan" | $(OPS) plan-errors; echo "$(1): pulumi preview --json failed (exit $$st): nothing deployed (Pulumi's error above; its incorrect passphrase: the value in effect is wrong or empty, the sealed one set with ai-env edit $(PULUMI_SEALED), which make $(1) unseals unless PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE is set (README \"Identities\"))"; exit 1; }; \
                         printf '%s' "$$plan" | $(OPS) plan-gate$(if $(2), $(2))
 # deploy-policies' targets: the stack's five managed policies (infra/policies.ts), the only resources it updates.
 STACK_POLICIES     := ai-env-deploy ai-env-deploy-egress ai-env-deploy-dns ai-env-deployer ai-env-ops
@@ -160,10 +212,12 @@ check-policies: ## S3 T3.6, S5: Access Analyzer on every IAM document; simulate-
 preview-scratch: ## S3 T3.2/T3.5, S5, S8 operators: pulumi preview of a scratch copy (throwaway backend, stack, passphrase) + the plan check, the existing-stack copies (the bootstrap passes, the tampered ones are refused); NEGATIVE=no-logging|no-logging-cast|region|vm-sg-open|private-route|nacl-open|dns-support-on-in-none-mode|stray-rule|stray-type|late-transform|early-transform|dns-firewall-qtype|miswired|iam-widen|owned-param-reset|identity-widen|document-widen; EGRESS_MODE=none|firewall
 	@$(PULUMI_ENV) REGION=$(REGION) SCRATCH="$(SCRATCH)" NEGATIVE="$(NEGATIVE)" EGRESS_MODE="$(EGRESS_MODE)" $(SHELL) $(INFRA)/scripts/preview-scratch.sh
 
-# The deployer's targets that build the image zip build it first, in the wrapper, without any key in its environment
-# (D18: cargo-lambda's build scripts, the stage's scan); the key is pasted after the build, and X-run does not build
-# it again.
-preview: ## (deployer: asks once for its key, from Strongbox) S3 part B: image-zip, then pulumi preview --diff of the real stack $(STACK); REFRESH=1 (command line only) adds --refresh (every resource read as the deployer)
+# The deployer's targets that build the image zip build it first, in the wrapper, without any key or the stack's
+# passphrase in its environment (D18: cargo-lambda's build scripts, the stage's scan); the passphrase is unsealed and
+# then the key pasted after the build (A39, TIER), and X-run does not build it again. Without the sealed passphrase,
+# preview keeps Pulumi's own prompt for it (a terminal); deploy and deploy-policies, whose plan check cannot prompt,
+# refuse first (PASS_CHECK).
+preview: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set) S3 part B: image-zip, then pulumi preview --diff of the real stack $(STACK); REFRESH=1 (command line only) adds --refresh (every resource read as the deployer)
 	$(NO_KEY) $(MAKE) --no-print-directory image-zip
 	@$(call NOT_UNDER_I_OR_P,preview)
 	@$(call TIER,deployer,preview) $(MAKE) --no-print-directory preview-run
@@ -185,14 +239,16 @@ preview-run:
 # of every IAM document), then the plan gate (PLAN_GATE: the plan check, scripts/check-plan.sh, the final word on the
 # inventory and the egress spec, and the replacement guard: nothing the connector's ENIs pin is replaced, and the VPC's
 # Amazon DNS is not turned on, while a connector exists); either refusal stops the deploy before `pulumi up`. The
-# preview is --non-interactive (its stdout is captured, so it could not prompt): a passphrase stack needs
-# PULUMI_CONFIG_PASSPHRASE_FILE in the environment, or PULUMI_CONFIG_PASSPHRASE from a sealed file under `ai-env run -f`
-# (README "Identities"). Once `pulumi up` has started, ops.sh post-deploy runs on every
+# preview is --non-interactive (its stdout is captured, so it could not prompt): the stack's passphrase comes from the
+# environment, PULUMI_CONFIG_PASSPHRASE_FILE or PULUMI_CONFIG_PASSPHRASE exported, else TIER's unseal of the sealed
+# file (A39); with neither and no file, PASS_CHECK refuses before the zip is built. Once `pulumi up` has started,
+# ops.sh post-deploy runs on every
 # exit: after image-wait and connector-wait succeeded the whole of it (egress reload --if-changed when the proxy runs,
 # the vpc VM warning, the egress-check line on a new image version, egress status as the out-of-band drift check:
 # `pulumi up` does not refresh; drift fails the deploy at the end), after any failure the reload and the warnings
 # (`--after-failure`: Pulumi may already have written a proxy parameter); the exit status is the first failure's.
-deploy: ## (deployer: asks once for its key, from Strongbox, after the zip is built; the bootstrap, and BREAKGLASS=1 on the command line: as the account root, README "Break-glass") S3/S5 part B: image-zip, s3-preflight PHASE=b, check-policies, plan check + replacement guard (pulumi preview --json), pre-deploy snapshots, pulumi up $(STACK) (interactive confirmation), image-wait, connector-wait, egress reload/status; EXPECT_BUILD_FAILURE=1 skips P12 (T3.4)
+deploy: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set; the bootstrap, and BREAKGLASS=1 on the command line: as the account root, README "Break-glass") S3/S5 part B: image-zip, s3-preflight PHASE=b, check-policies, plan check + replacement guard (pulumi preview --json), pre-deploy snapshots, pulumi up $(STACK) (interactive confirmation), image-wait, connector-wait, egress reload/status; EXPECT_BUILD_FAILURE=1 skips P12 (T3.4)
+	@$(call PASS_CHECK,deploy)
 	$(NO_KEY) $(MAKE) --no-print-directory image-zip
 	@$(call NOT_UNDER_I_OR_P,deploy)
 	@$(call TIER,deployer,deploy) $(MAKE) --no-print-directory deploy-run
@@ -218,7 +274,8 @@ deploy-run:
 # create or delete a policy. IAM takes some seconds to apply a new version. The gate also wants the five documents
 # known in its plan: one the plan check accepts unknown (a resource it names, the proxy instance, created or replaced)
 # would be rendered anew by the targeted up from the old resource and applied uncompared; make deploy takes it whole.
-deploy-policies: ## (deployer: asks once for its key, from Strongbox, after the zip is built) S8 operators: image-zip, s3-preflight PHASE=b, check-policies, the plan check, then pulumi up of the five stack policies only (--target each; interactive confirmation); then wait about 15 s for IAM and make deploy
+deploy-policies: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set) S8 operators: image-zip, s3-preflight PHASE=b, check-policies, the plan check, then pulumi up of the five stack policies only (--target each; interactive confirmation); then wait about 15 s for IAM and make deploy
+	@$(call PASS_CHECK,deploy-policies)
 	$(NO_KEY) $(MAKE) --no-print-directory image-zip
 	@$(call NOT_UNDER_I_OR_P,deploy-policies)
 	@$(call TIER,deployer,deploy-policies) $(MAKE) --no-print-directory deploy-policies-run
@@ -237,13 +294,17 @@ deploy-policies-run:
 # make deploy is the ordinary one: the plan gate, then Pulumi's own confirmation. S8 operators: no TIER here: ops.sh
 # decides from local reads whether a deploy is due, runs the steps that need no AWS (make claude-pin, make
 # test-docker) without any key, then asks once for the identity the rest needs (ai-env as ops, or ai-env as deployer
-# when a deploy is due) and runs every later step under it. Never break-glass: BREAKGLASS=1 on its command line would
+# when a deploy is due) and runs every later step under it. A deploy needs the stack's passphrase (A39): when it is not
+# set as Pulumi takes it (ops.sh's pass_set, as PASS_SET_SH), ops.sh unseals PULUMI_SEALED with `ai-env run -f` (one
+# Touch ID) before the deployer's paste, and refuses before anything runs when there is no such file; only its make
+# deploy gets the passphrase (ops.sh keeps it unexported). Never break-glass: BREAKGLASS=1 on its command line would
 # reach the nested make deploy through MAKEFLAGS (TIER then asks for ai-env as root under the deployer's runner, which
-# refuses it after the paste), so it is refused first, before ops.sh runs; exported, it counts for nothing, as anywhere.
+# refuses it after the paste), so it is refused first, before ops.sh runs; exported, it counts for nothing, as
+# anywhere.
 CLAUDE_UPDATE_GLASS  = test -z "$(BREAKGLASS_ON)" || { echo "claude-update: never break-glass (BREAKGLASS=1 is on the make command line): as the account root, run make deploy BREAKGLASS=1, then the remaining steps by hand (README \"Break-glass\"): nothing changed"; exit 2; }
-claude-update: ## (ops, or the deployer when a deploy is due: asked once, before the first step that needs AWS) S3/S5 part B (interactive: the identity, Pulumi's confirmation, the egress check's Touch ID): follow the Cursor extension's Claude Code: make claude-pin (its version), make test-docker, make deploy, make infra-status WRITE=1, make proxy-start, ai-env egress check --if-needed; when already pinned and deployed only the status and the check; run again to resume after a failure
+claude-update: ## (ops, or the deployer when a deploy is due: asked once, before the first step that needs AWS, a deploy's after the stack's passphrase: one Touch ID unless set) S3/S5 part B (interactive: the identity, Pulumi's confirmation, the egress check's Touch ID): follow the Cursor extension's Claude Code: make claude-pin (its version), make test-docker, make deploy, make infra-status WRITE=1, make proxy-start, ai-env egress check --if-needed; when already pinned and deployed only the status and the check; run again to resume after a failure
 	@$(CLAUDE_UPDATE_GLASS)
-	@$(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' LOCK='$(IMAGE_DIR)/claude.lock' CLAUDE_RELEASES='$(CLAUDE_RELEASES)' CLAUDE_GPG_FPR='$(CLAUDE_GPG_FPR)' $(OPS) claude-update
+	@$(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' LOCK='$(IMAGE_DIR)/claude.lock' CLAUDE_RELEASES='$(CLAUDE_RELEASES)' CLAUDE_GPG_FPR='$(CLAUDE_GPG_FPR)' PULUMI_SEALED='$(PULUMI_SEALED)' $(OPS) claude-update
 
 # D29: the wait decides from the versions against the pre-deploy snapshot; the post-deploy snapshot and
 # versions-diff run even after a failed build (T3.4 records both).
@@ -395,10 +456,12 @@ operator-keys-run:
 # destroy deletes the operator users themselves (forceDestroy) and the policies the deployer holds: as the deployer it
 # would lose its rights half-way, so the account root runs it, BREAKGLASS=1 only (L8); destroy-run's identity line, the
 # break-glass tier, admits the account root under its runner with it and nobody else, so destroy-run typed by hand
-# under the deployer's runner (which the wrapper's root tier would refuse) never reaches pulumi destroy either.
+# under the deployer's runner (which the wrapper's root tier would refuse) never reaches pulumi destroy either. pulumi
+# destroy needs the stack's passphrase: TIER unseals it (A39) when it is not set and the sealed file exists, else
+# Pulumi asks for it on the terminal.
 DESTROY_CONFIRM      = test "$(call cmdline,CONFIRM)" = "destroy-$(STACK)" || { echo "destroy: removes the image and its versions, roles, the deployer, ops and runtime users and their keys, the stack's policies, bucket, log group and budget, the egress VPC, proxy and connector of stack $(STACK); set CONFIRM=destroy-$(STACK) on the command line"; exit 1; }
 DESTROY_BREAKGLASS   = test -n "$(BREAKGLASS_ON)" || { echo "destroy: it deletes the operator users themselves: as the account root only: make destroy CONFIRM=destroy-$(STACK) BREAKGLASS=1 (README \"Break-glass\")"; exit 1; }
-destroy: ## (root, BREAKGLASS=1 only: the account root's own credentials; README "Break-glass") S3 part B: pulumi destroy of $(STACK) (CONFIRM=destroy-$(STACK) BREAKGLASS=1; refuses while a VM of the image is not TERMINATED or a connector other than the stack's exists), then the post-destroy checklist
+destroy: ## (root, BREAKGLASS=1 only: the account root's own credentials, after the stack's passphrase: one Touch ID unless set; README "Break-glass") S3 part B: pulumi destroy of $(STACK) (CONFIRM=destroy-$(STACK) BREAKGLASS=1; refuses while a VM of the image is not TERMINATED or a connector other than the stack's exists), then the post-destroy checklist
 	@$(DESTROY_CONFIRM)
 	@$(DESTROY_BREAKGLASS)
 	@$(call NOT_UNDER_I_OR_P,destroy)

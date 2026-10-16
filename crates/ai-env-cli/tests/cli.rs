@@ -959,9 +959,9 @@ fn doctor_json_shape_matches_process_exit() {
 /// identity's paste, the plugin's keygen, age-keygen for the new recovery
 /// identity and -y on its paste-back, age for the self-test and the sweep).
 /// A wrapper in front of each fake logs which of `CHILD_ENV_REMOVED`'s names
-/// it was given, never a value: ai-env had all five, with stand-in values,
-/// and no tool got one (the plugin's keygen got all five before it was
-/// started as every age-family tool is, `age_cmd::tool_cmd`).
+/// it was given, never a value: ai-env had all of them, with stand-in
+/// values, and no tool got one (the plugin's keygen got them all before it
+/// was started as every age-family tool is, `age_cmd::tool_cmd`).
 #[test]
 fn ceremony_tools_never_inherit_a_credential() {
     use std::os::unix::fs::PermissionsExt as _;
