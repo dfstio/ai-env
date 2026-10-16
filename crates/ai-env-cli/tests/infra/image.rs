@@ -1251,13 +1251,18 @@ fn vm_build_copies_the_bootstrap_it_built_whatever_the_cargo_target_dir() {
         .arg(format!("CARGO_LAMBDA={}", bin.join("cargo-lambda").display()))
         .arg(format!("LLVM_BIN={}", t.path().join("llvm").display()))
         .env("CARGO_TARGET_DIR", t.path().join("elsewhere"))
+        // A make under `cargo run` (claude-update's passes, logs/test34.txt): cargo hands its child CARGO, a program's
+        // path; make must not export its own CARGO (`cargo +1.98.1`) under that name to cargo-lambda.
+        .env("CARGO", "/usr/bin/true")
         .env("FAKE_CL_BOOTSTRAP", t.path().join("fresh"))
         .env("FAKE_CL_LOG", t.path().join("cl.log"))
         .bounded();
     let all = all(&out);
     assert!(out.status.success(), "{all}");
     assert_eq!(std::fs::read(w.join("image/ai-env")).unwrap(), arm64_elf("fresh bootstrap"), "image/ai-env is this build's: {all}");
-    assert!(lines_of(&t.path().join("cl.log")).iter().any(|l| l.contains("build") && l.contains("--lambda-dir target/lambda")), "{all}");
+    let cl = lines_of(&t.path().join("cl.log"));
+    assert!(cl.iter().any(|l| l.contains("build") && l.contains("--lambda-dir target/lambda")), "{all}");
+    assert!(!cl.iter().any(|l| l.ends_with(" [CARGO]")), "no recipe gets CARGO (unexport): {cl:?}");
     assert!(!t.path().join("elsewhere/lambda").exists(), "{all}");
 }
 

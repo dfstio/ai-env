@@ -32,6 +32,12 @@ LLVM_BIN     ?= /opt/homebrew/opt/llvm/bin
 # The image's base container: the FROM line of image/Dockerfile is the single source (digest-pinned).
 BASE_IMAGE   := $(shell sed -n 's/^FROM[[:space:]]*//p' image/Dockerfile | head -1)
 CARGO        := cargo +$(TOOLCHAIN)
+# A make started under `cargo run` (claude-update's passes re-exec through $(AI_ENV), `cargo run` by default) inherits
+# CARGO, the path cargo gives its children, and make exports a variable that came from the environment with this
+# file's value: every recipe would get CARGO=`cargo +1.98.1`, which cargo-lambda runs as a program for its `cargo
+# metadata` (cargo_metadata reads CARGO first), and none is called that (vm-build: "failed to start `cargo metadata`:
+# No such file or directory", logs/test34.txt). Recipes use $(CARGO); their children find cargo on PATH.
+unexport CARGO
 # Where `make install` puts the two bins (cargo install --root); same default as cargo's own.
 INSTALL_ROOT ?= $(or $(CARGO_INSTALL_ROOT),$(CARGO_HOME),$(HOME)/.cargo)
 # Only these files may touch the TLS/WS dialing API (grep guard in `lint`).
