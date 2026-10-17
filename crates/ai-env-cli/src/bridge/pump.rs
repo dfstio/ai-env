@@ -3781,7 +3781,7 @@ mod tests {
             }
 
             async fn started(&self) {
-                self.send(ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 4000 + self.gen, claude_version: Some("2.1.296".into()) })).await;
+                self.send(ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 4000 + self.gen, claude_version: Some(crate::bridge::authwatch::AUTH_TIMERS.claude.into()) })).await;
             }
 
             async fn exit(&self, code: i32) {

@@ -116,8 +116,9 @@
 /// all fail (S8's pump).
 pub const RETRY_LIMIT: u32 = 3;
 /// The CLI's own auth timers, as the `oauth-t1` row measured them (S7 B11,
-/// 11 Oct 2026; `plans/s7-measurements.md`), keyed to the claude version
-/// they name (`claude`, 2.1.296): a new one is measured again with
+/// 11 Oct 2026, claude 2.1.296; again S8 part B, 17 Oct 2026, claude
+/// 2.1.302: `plans/s8-measurements.md`), keyed to the claude version they
+/// name (`claude`, 2.1.302): a new one is measured again with
 /// `ai-env lab run oauth-t1` before they are trusted for it. S8's wrapper
 /// and S12's refresh relay read them: S8 is to compare `claude` with the
 /// version of the CLI it runs, a different version being unmeasured until
@@ -136,16 +137,26 @@ pub const RETRY_LIMIT: u32 = 3;
 /// 0 outside a remote session; the host's answer awaited 30 s). The 60 s
 /// wait in a remote session and `CLAUDE_CODE_AUTH_FAIL_EXIT_MS` (600 s by
 /// those bytes, past the probe's bound) stay unmeasured: ai-env's CLI is
-/// never a remote child.
-pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.296", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
+/// never a remote child. Claude 2.1.302 (Cursor's bundle, the same runs)
+/// gave the same timers: the ask 0.95-1.16 s after the spawn; with no answer
+/// the turn failed 30.0 s after the ask and no exit came before the 150 s
+/// bound; a null answer failed it 1.1 s after the ask, and 1.0 s after its
+/// stdin closed the CLI exited 1; the 401 wait of 5000 moved the ask to
+/// 5.96 s and the null answer's failed turn to 5.0 s after it; a valid
+/// answer brought the reply 2.3 s after the ask, and exit 0.
+pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
 /// How long a turn whose model requests all fail without a refusal (an
 /// egress that blocks api.anthropic.com, an outage) may take before the CLI
-/// gives up by itself, keyed to [`AUTH_TIMERS`]'s claude like the timers: S7
-/// B10 (11 Oct 2026, claude 2.1.296) measured 179 s of the CLI's own retries
+/// gives up by itself, measured on [`AUTH_FAIL_BUDGET_CLAUDE`]: S7 B10
+/// (11 Oct 2026, claude 2.1.296) measured 179 s of the CLI's own retries
 /// against the proxy's 403s, then a result with `is_error` and exit 1 (never
 /// 5: nothing was refused). S8's tests and part B judge a blocked turn
 /// against it (plan L8); the wrapper does not enforce it.
 pub const AUTH_FAIL_BUDGET_MS: u64 = 200_000;
+/// The claude [`AUTH_FAIL_BUDGET_MS`] was measured on (S7 B10). Unlike
+/// [`AUTH_TIMERS`], it was not measured again for 2.1.302 (S8 part B ran no
+/// blocked turn on it).
+pub const AUTH_FAIL_BUDGET_CLAUDE: &str = "2.1.296";
 /// Longest line inspected; a longer one is passed over, its head aside.
 pub const LINE_MAX: usize = 64 * 1024;
 /// What is kept of a line passed over: its first bytes, which tell a model
@@ -1085,11 +1096,12 @@ mod tests {
         }
     }
 
-    /// AUTH_TIMERS is what `oauth-t1` measured (S7 B11, claude 2.1.296): a
-    /// changed value comes from a new measurement, for the version it names.
+    /// AUTH_TIMERS is what `oauth-t1` measured (S7 B11 on claude 2.1.296, S8
+    /// part B on 2.1.302): a changed value comes from a new measurement, for
+    /// the version it names.
     #[test]
     fn auth_timers_are_what_oauth_t1_measured() {
-        assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.296", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
+        assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
     }
 
     /// AUTH_FAIL_BUDGET_MS covers what S7 B10 measured on the same claude
@@ -1099,7 +1111,7 @@ mod tests {
         const B10_MS: u64 = 179_000;
         assert_eq!(AUTH_FAIL_BUDGET_MS, 200_000);
         const { assert!(AUTH_FAIL_BUDGET_MS > B10_MS && AUTH_FAIL_BUDGET_MS - B10_MS <= 30_000, "a margin over B10, not a different measurement") };
-        assert_eq!(AUTH_TIMERS.claude, "2.1.296", "keyed to the version B10 ran");
+        assert_eq!(AUTH_FAIL_BUDGET_CLAUDE, "2.1.296", "keyed to the version B10 ran");
     }
 
     proptest::proptest! {

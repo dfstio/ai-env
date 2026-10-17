@@ -1384,7 +1384,7 @@ mod tests {
             let first = if self.fail {
                 ChildEvent::SpawnFailed(SpawnFailure::from_failure(StartStep::Workspace, &Failure::Finding { finding: "untracked .env rule env-file-plaintext".into() }, Some("microvm-1".into())))
             } else {
-                ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 4000 + gen, claude_version: Some("2.1.296".into()) })
+                ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 4000 + gen, claude_version: Some(AUTH_TIMERS.claude.into()) })
             };
             ev_tx.try_send(first).map_err(|e| std::io::Error::other(e.to_string()))?;
             self.far.push((in_rx, sig_rx));

@@ -334,7 +334,7 @@ fn the_rig_routes_each_port_to_its_listener_behind_the_check() {
     let health = rig.send(&vm, &Req::get("/health", 8080, &app));
     assert_eq!(health.status, 200, "{}", health.text());
     let h = health.json();
-    assert_eq!((h["microvm_id"].as_str(), h["run_hook_seen"].as_bool(), h["claude_version"].as_str()), (Some(vm.as_str()), Some(true), Some("2.1.296")), "{h}");
+    assert_eq!((h["microvm_id"].as_str(), h["run_hook_seen"].as_bool(), h["claude_version"].as_str()), (Some(vm.as_str()), Some(true), Some("2.1.302")), "{h}");
     let hooks: Vec<(&str, u16)> = rig.endpoint.hooks().iter().map(|k| (k.name, k.status)).collect();
     assert_eq!(hooks, [("run", 200)], "the endpoint ran the VM on the shim at its first request");
     assert_eq!(rig.send(&vm, &Req::get("/health", 9418, &code)).status, 401, "the code listener: every path behind the bearer");
