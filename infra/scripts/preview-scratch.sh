@@ -12,14 +12,16 @@
 #
 # The normal run must succeed, then the plan check (scripts/check-plan.sh, the same one `make deploy` runs; always
 # the repo's copy, never the edited scratch copy) must accept the --json plan: exactly the stack inventory per type
-# and name (67 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, and S8 operators' 13, the users
+# and name (75 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, S8 operators' 13, the users
 # ai-env-deployer and ai-env-ops, the policies ai-env-deployer and ai-env-ops, the six user policy attachments and
-# the proxy's three SSM documents; EGRESS_MODE=firewall previews the copy with dnsMode firewall: 72), the pinned
+# the proxy's three SSM documents, and S9's 8, the transcripts bucket with its six settings and the S3 gateway
+# endpoint; EGRESS_MODE=firewall previews the copy with dnsMode firewall: 80), the pinned
 # providers, every egress input and reference, every IAM document (for the caller's account, read once from `aws sts
 # get-caller-identity` into a shell variable), who holds which policy, the documents' content (the files) and no
-# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 25 outputs `ai-env infra
-# status` reads (S5's 14 egress outputs, S8 operators' 11) are checked in the text preview, squidConfSha256 and
-# allowSha256 against the SHA-256 of the planned parameter values. Then the same plan, rewritten in memory into the
+# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 30 outputs `ai-env infra
+# status` reads (S5's 14 egress outputs, S8 operators' 11, S9's 5) are checked in the text preview, squidConfSha256 and
+# allowSha256 against the SHA-256 of the planned parameter values, s3EndpointPolicySha256 against the canonical hash of
+# the planned endpoint policy. Then the same plan, rewritten in memory into the
 # shape `pulumi preview --json` gives for the stack once it exists (every step same, or the VM subnet, VM security
 # group and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must
 # pass too, also as the deploy that adds the operator role's Deny to it (its create step, everything else same) and
@@ -88,6 +90,15 @@
 #                    {{ssm:…}} reference in the status document's script (spec, guard, plan); a second step in the
 #                    patch document (spec, guard, plan); the documents shared with every account (guard, plan); the
 #                    status document's script edited (guard, plan)
+#   endpoint-on-vm-table
+#                    S9: the S3 gateway endpoint on the VM route table (the VMs would reach S3 past squid): plan (the
+#                    route tables' ids are unknown in a preview, so the guard cannot compare them)
+#   endpoint-policy-widen
+#                    S9: the endpoint's policy widened from our bucket's v1/* to the whole bucket: guard, plan
+#   bucket-policy-no-vpce
+#                    S9: the bucket policy built without the S3 gateway endpoint (another endpoint's id in its
+#                    aws:SourceVpce conditions): guard (a known document while the endpoint's id is not), plan (not
+#                    built from the endpoint, by URN; not policies.ts's document)
 #
 # Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, IMAGE_JSON (absolute), SCRATCH, NEGATIVE, EGRESS_MODE.
 set -euo pipefail
@@ -99,7 +110,7 @@ negative=${NEGATIVE:-}
 mode=${EGRESS_MODE:-}
 real_image_json=${IMAGE_JSON:?}
 
-negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset identity-widen document-widen"
+negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset identity-widen document-widen endpoint-on-vm-table endpoint-policy-widen bucket-policy-no-vpce"
 case " $negatives " in *" $negative "*) ;; *) test -z "$negative" || { echo "preview-scratch: unknown NEGATIVE=$negative ($negatives)" >&2; exit 2; } ;; esac
 case "$mode" in "" | none | firewall) ;; *) echo "preview-scratch: unknown EGRESS_MODE=$mode (none, firewall)" >&2; exit 2 ;; esac
 if [ "$mode" = firewall ] && [ -n "$negative" ]; then echo "preview-scratch: EGRESS_MODE=firewall is a positive preview; run the negatives without it" >&2; exit 2; fi
@@ -183,7 +194,7 @@ json_plan() {
 }
 # Disable a layer in the scratch copy, so the next one alone must refuse (the spec layer: both asserts of index.ts).
 no_spec() {
-    edit_file index.ts '/scratch:assert$/s/assertEgressSpec(egress);/void assertEgressSpec;/' \
+    edit_file index.ts '/scratch:assert$/s/assertEgressSpec(egress, allowText);/void assertEgressSpec;/' \
         '/scratch:assert-documents$/s/assertProxyDocuments(documents);/void assertProxyDocuments;/'
     grep -qF 'void assertEgressSpec; // scratch:assert' index.ts || fail "the scratch:assert marker no longer disables assertEgressSpec"
     grep -qF 'void assertProxyDocuments; // scratch:assert-documents' index.ts || fail "the scratch:assert-documents marker no longer disables assertProxyDocuments"
@@ -265,7 +276,7 @@ for (const s of plan.steps) {
         : t === "aws-native:lambda:NetworkConnector" ? `arn:aws:lambda:${pol.REGION}:${acct}:network-connector:nc-${k.toString(16).padStart(17, "0")}`
         : t === "aws:s3/bucket:Bucket" ? i.bucket
         : t === "aws:ec2/subnet:Subnet" ? hex("subnet") : t === "aws:ec2/securityGroup:SecurityGroup" ? hex("sg") : t === "aws:ec2/vpc:Vpc" ? hex("vpc")
-        : t === "aws:ec2/instance:Instance" ? hex("i")
+        : t === "aws:ec2/instance:Instance" ? hex("i") : t === "aws:ec2/vpcEndpoint:VpcEndpoint" ? hex("vpce")
         : t.startsWith("pulumi:providers:") ? `00000000-0000-4000-8000-${k.toString(16).padStart(12, "0")}` : hex("id"));
 }
 const byName = (t, nm) => plan.steps.find((s) => type(s) === t && name(s) === nm);
@@ -274,19 +285,24 @@ const proxySubnet = ids.get(byName("aws:ec2/subnet:Subnet", "ai-env-egress-proxy
 const vmSg = ids.get(byName("aws:ec2/securityGroup:SecurityGroup", cfg.vmSecurityGroupName).urn);
 const proxySg = ids.get(byName("aws:ec2/securityGroup:SecurityGroup", cfg.proxySecurityGroupName).urn);
 const updated = new Set([byName("aws:ec2/subnet:Subnet", "ai-env-egress-vms").urn, byName("aws:ec2/securityGroup:SecurityGroup", cfg.vmSecurityGroupName).urn, byName("aws:ec2/vpc:Vpc", "ai-env-egress").urn]);
-const bucket = ids.get(plan.steps.find((s) => type(s) === "aws:s3/bucket:Bucket").urn);
+const bucket = ids.get(byName("aws:s3/bucket:Bucket", pol.BUCKET_PREFIX).urn);
+// S9: the id of the S3 gateway endpoint, which the policy of the transcripts bucket names.
+const s3EndpointId = ids.get(byName("aws:ec2/vpcEndpoint:VpcEndpoint", spec.NET.s3Endpoint).urn);
 // The connector ARN (the runtime policy, S7 D5) and the proxy instance id (the ops policy, S8 operators).
 const connectorArn = ids.get(byName("aws-native:lambda:NetworkConnector", cfg.connectorName).urn);
 const proxyInstanceId = ids.get(byName("aws:ec2/instance:Instance", "ai-env-egress-proxy").urn);
 const names = (subnet) => ({ accountId: acct, region: pol.REGION, bucket, imageName: img.imageName, logGroup: img.logGroup,
-    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg, connectorArn, proxyInstanceId } });
+    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg, connectorArn, proxyInstanceId },
+    transcriptsBucket: pol.transcriptsBucketName(acct), s3EndpointId });
 const docs = (subnet) => new Map(pol.allPolicies(names(subnet)).map((d) => [d.name, JSON.stringify(d.document)]));
 const good = docs(vmSubnet), bad = docs(proxySubnet);
 // Which document each IAM input is (print-policies names).
 const doc = { "aws:iam/role:Role": { "ai-env-image-build": "build-trust", "ai-env-vm-exec": "execution-trust", [cfg.proxyRoleName]: "proxy-trust", [cfg.operatorRoleName]: "operator-trust" },
     "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy", [cfg.operatorRoleName]: "operator" },
     "aws:iam/userPolicy:UserPolicy": { MacRuntimePolicy: "runtime" },
-    "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns", "ai-env-deployer": "deployer", "ai-env-ops": "ops" } };
+    "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns", "ai-env-deployer": "deployer", "ai-env-ops": "ops" },
+    // S9: the two resource policies (their `policy` input, as for a role policy).
+    "aws:ec2/vpcEndpoint:VpcEndpoint": { [spec.NET.s3Endpoint]: "s3-endpoint" }, "aws:s3/bucketPolicy:BucketPolicy": { [pol.TRANSCRIPTS_RESOURCE]: "transcripts-bucket" } };
 // The tampered documents: [which document, the edit of its parsed JSON].
 const statement = (d, sid) => d.Statement.find((x) => x.Sid === sid);
 const edits = {
@@ -445,9 +461,20 @@ case "$negative" in
     for k in connectorArn connectorName proxyPrivateIp proxyInstanceId egressVpcId vmSubnetId vmEgressSecurityGroupId proxySecurityGroupId \
         operatorRoleArn egressLogGroup dnsMode parameterPrefix squidConfSha256 allowSha256 \
         deployerUserName deployerUserArn opsUserName opsUserArn deployerPolicyArn opsPolicyArn deployEgressPolicyArn deployDnsPolicyArn \
-        proxyReloadDocument proxyStatusDocument proxyPatchDocument; do
+        proxyReloadDocument proxyStatusDocument proxyPatchDocument \
+        transcriptsBucket s3EndpointId s3EndpointPolicySha256 transcriptsBucketPolicySha256 proxyRouteTableId; do
         grep -qE "^ +$k +: " <<<"$outputs" || fail "the preview plans no stack output $k"
     done
+    # S9: the endpoint policy's canonical hash (known in a preview: the policy is built from the account) is the planned
+    # policy's, as policies.ts computes it (the compiled copy plan_check left).
+    got=$(sed -n 's/^ *s3EndpointPolicySha256 *: "\([0-9a-f]\{64\}\)"$/\1/p' <<<"$outputs")
+    want=$(node -e '
+const pol = require(process.argv[1] + "/policies.js");
+const plan = JSON.parse(require("fs").readFileSync(0, "utf-8"));
+const s = plan.steps.find((x) => x.newState && x.newState.type === "aws:ec2/vpcEndpoint:VpcEndpoint");
+process.stdout.write(s ? pol.canonicalPolicySha256(s.newState.inputs.policy) : "");
+' "$scratch/plan-check" <<<"$plan")
+    test -n "$got" && test "$got" = "$want" || fail "output s3EndpointPolicySha256 (${got:-none}) is not the canonical hash of the planned S3 endpoint policy (${want:-none})"
     for p in squid.conf allow; do
         k=$([ "$p" = allow ] && echo allowSha256 || echo squidConfSha256)
         got=$(sed -n "s/^ *$k *: \"\([0-9a-f]\{64\}\)\"\$/\1/p" <<<"$outputs")
@@ -513,7 +540,7 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
             echo "existing stack, $v: $diag"
         done
     done
-    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 25 egress and operator outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-one tampered copies were refused)"
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 30 egress, operator and transcript store outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-one tampered copies were refused)"
     ;;
 no-logging)
     edit '/scratch:logging/d'
@@ -894,5 +921,35 @@ fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n");
     no_guard
     expect_plan_refusal "aws:ssm/document:Document ai-env-proxy-status: content is not infra/proxy/documents/status.json"
     echo "$label: ok (spec, guard and plan each refused a free-form document parameter, an {{ssm:…}} reference and a second step; guard and plan each refused a shared document and an edited script)"
+    ;;
+endpoint-on-vm-table)
+    # S9: the S3 gateway endpoint on the VM route table: the VMs would reach S3 past squid. In a preview the route
+    # tables' ids are unknown, so only the plan check (by URN) can see it.
+    edit_file egress.ts '/scratch:endpoint-table/s|routeTableIds: \[proxyRoutes.table.id\]|routeTableIds: [vmRoutes.table.id]|'
+    grep -qF 'routeTableIds: [vmRoutes.table.id], // scratch:endpoint-table' egress.ts || fail "the scratch:endpoint-table marker no longer puts the S3 endpoint on the VM route table"
+    expect_plan_refusal "aws:ec2/vpcEndpoint:VpcEndpoint ai-env-s3: routeTableIds depends on aws:ec2/routeTable:RouteTable::ai-env-egress-vms, expected aws:ec2/routeTable:RouteTable::ai-env-egress-proxy"
+    echo "$label: ok (the plan check refused the S3 gateway endpoint on the VM route table)"
+    ;;
+endpoint-policy-widen)
+    # S9: the endpoint's policy widened from our bucket's v1/* to the whole bucket (the endpoint would admit the runtime
+    # user's writes outside v1/): the guard compares it whole with policies.ts for the account, then the plan check.
+    edit_file egress.ts '/scratch:endpoint-policy/s|policy: s3EndpointPolicyJson,|policy: s3EndpointPolicyJson.apply((p) => p.split("/v1/*").join("/*")),|'
+    grep -qF 'policy: s3EndpointPolicyJson.apply((p) => p.split("/v1/*").join("/*")), // scratch:endpoint-policy' egress.ts || fail "the scratch:endpoint-policy marker no longer widens the S3 endpoint's policy"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/vpcEndpoint:VpcEndpoint ai-env-s3: policy is not policies.ts's document for the stack"
+    no_guard
+    expect_plan_refusal "aws:ec2/vpcEndpoint:VpcEndpoint ai-env-s3: policy is not policies.ts s3EndpointPolicy(); a statement differs"
+    echo "$label: ok (guard and plan each refused a widened S3 endpoint policy)"
+    ;;
+bucket-policy-no-vpce)
+    # S9: the bucket policy built without the S3 gateway endpoint (another endpoint's id in its aws:SourceVpce
+    # conditions): reads and the VM's writes no longer bound to our endpoint. The guard sees a known document while the
+    # endpoint's id is not; the plan check sees it built from no endpoint (by URN), and not policies.ts's document.
+    edit_file transcripts.ts '/scratch:bucket-policy/s|pulumi.all(\[accountId, endpointId\])|pulumi.all([accountId, pulumi.output("vpce-00000000000000000")])|'
+    grep -qF 'pulumi.all([accountId, pulumi.output("vpce-00000000000000000")])' transcripts.ts || fail "the scratch:bucket-policy marker no longer builds the bucket policy without the S3 endpoint"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:s3/bucketPolicy:BucketPolicy ai-env-transcripts: policy is known while the S3 gateway endpoint's id is not"
+    no_guard
+    expect_plan_refusal "aws:s3/bucketPolicy:BucketPolicy ai-env-transcripts: policy does not depend on aws:ec2/vpcEndpoint:VpcEndpoint::ai-env-s3" \
+        "aws:s3/bucketPolicy:BucketPolicy ai-env-transcripts: policy is not policies.ts transcriptsBucketPolicy()"
+    echo "$label: ok (guard and plan each refused a bucket policy not bound to the S3 gateway endpoint)"
     ;;
 esac

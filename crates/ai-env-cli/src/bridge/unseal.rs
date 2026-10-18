@@ -223,9 +223,11 @@ impl UnsealJob {
 }
 
 /// Kills one job's decrypt group when dropped while armed ([`UnsealJob::wait_or`]).
-/// The kill returns once the group ended on its TERM and the decrypt's waiter
-/// reaped it (`AgeKill::kill_group`), so a drop on a runtime's thread (S8: the
-/// pump drops a pending remote start on its only one) holds it tens of ms.
+/// The kill returns once its TERM is sent within a Tokio runtime's context
+/// (the pump's runtime thread included: S8, the pump drops a pending remote
+/// start on its only one), the rest of the ladder on a thread the process
+/// joins before it exits (`AgeKill::kill_group`, S9 F7), so a drop there
+/// costs only the TERM.
 struct CloseOnDrop(Option<Arc<AgeKill>>);
 
 impl CloseOnDrop {

@@ -10,9 +10,13 @@
 //! S8's app-port routes (`wire::workspace`), each run by the agent's helper
 //! (`asagent`) and served only by a shim that has one (it then names
 //! `CAP_WORKSPACE_V1`; without one they answer 404, as an older shim's do):
-//! `GET /transcript?rel=` (a `TranscriptStat`), `PUT /transcript?rel=` (the
-//! file, `Content-Length` required, at most `TRANSCRIPT_MAX`; one at a time)
-//! and `GET /settings?path=` (a `SettingsCapture`).
+//! `GET /transcript?rel=` (a `TranscriptStat`) and `GET /settings?path=` (a
+//! `SettingsCapture`). S9's transfer routes (`shim::s3xfer`: push, pull,
+//! view, tail) are mounted beside them, and `CAP_TRANSCRIPT_S3_V1` named,
+//! once `s3xfer::SERVED` holds; the code port's git routes name
+//! `CAP_GIT_HTTP_V1` once `gitcgi::SERVED` holds. S8's `PUT /transcript`
+//! (the Mac's mirror sent up at a resume) went at the S3 cut-over: a chat's
+//! transcript reaches the VM from S3 (`POST /transcript/pull`).
 use crate::shim::agent::AgentRegistry;
 use crate::shim::asagent::{self, AgentCmd, WorkspaceSlot};
 use crate::shim::hooks::HookSource;
@@ -20,12 +24,13 @@ use crate::shim::peer::AgentGuard;
 use crate::shim::spawn::{SpawnManager, SpawnOpts};
 use crate::shim::state::RunState;
 use crate::shim::sys::{ClockMode, RealSys, SysOps};
-use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
-use crate::wire::workspace::{budget, refusal, transcript_rel_check, vm_path_check, PathQuery, RelQuery, SettingsCapture, TranscriptReply, TranscriptStat, WsRefusal, SETTINGS_ROUTE, TRANSCRIPT_MAX, TRANSCRIPT_ROUTE};
+use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
+use crate::wire::workspace::{budget, refusal, vm_path_check, PathQuery, SettingsCapture, TranscriptStat, WsRefusal, SETTINGS_ROUTE, TRANSCRIPT_ROUTE};
+use crate::wire::workspace::{TRANSCRIPT_PULL_ROUTE, TRANSCRIPT_PUSH_ROUTE, TRANSCRIPT_TAIL_ROUTE, TRANSCRIPT_VIEW_ROUTE};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,10 +88,22 @@ pub struct ShimOpts {
     pub helper: Option<PathBuf>,
     /// The git the helper runs (hidden `--git`, default [`GIT_DEFAULT`]).
     pub git: PathBuf,
+    /// The curl the transcript transfers run (S9; hidden `--curl`, default [`CURL_DEFAULT`]).
+    pub curl: PathBuf,
+    /// Who curl runs as when the shim is root ([`NET_UID`], [`NET_GID`]:
+    /// `ai-env-net`; the shim's own uid otherwise, the native tests).
+    pub net_uid: u32,
+    pub net_gid: u32,
 }
 
 /// The image's git, the helper's unless `--git` names another.
 pub const GIT_DEFAULT: &str = "/usr/bin/git";
+/// The image's curl, the transfers' unless `--curl` names another (S9).
+pub const CURL_DEFAULT: &str = "/usr/bin/curl";
+/// The image's `ai-env-net` user (uid and gid 999): curl runs as it, so the
+/// agent (uid 1000) can read none of its descriptors, the presigned URL's.
+pub const NET_UID: u32 = 999;
+pub const NET_GID: u32 = 999;
 
 impl Default for ShimOpts {
     fn default() -> Self {
@@ -102,6 +119,9 @@ impl Default for ShimOpts {
             window_bytes: STDOUT_WINDOW_BYTES,
             helper: None,
             git: PathBuf::from(GIT_DEFAULT),
+            curl: PathBuf::from(CURL_DEFAULT),
+            net_uid: NET_UID,
+            net_gid: NET_GID,
         }
     }
 }
@@ -146,6 +166,8 @@ pub struct ShimState {
     /// The VM's one workspace (S8): the last seed's record, the lock of seed,
     /// code-out and snapshot.
     pub workspace: WorkspaceSlot,
+    /// The transcript store's transfers (S9): the runs under way, the tails waiting for a hook.
+    pub transfers: crate::shim::s3xfer::Transfers,
 }
 
 impl ShimState {
@@ -191,6 +213,7 @@ impl ShimState {
             last_clock: Mutex::new(None),
             ports: OnceLock::new(),
             workspace: WorkspaceSlot::default(),
+            transfers: crate::shim::s3xfer::Transfers::default(),
         }
     }
 
@@ -235,12 +258,22 @@ impl ShimState {
         self.opts.helper.is_some()
     }
 
-    /// What this shim can do beyond wire v1's core: `hello_ok.caps` and `/health`'s.
+    /// What this shim can do beyond wire v1's core: `hello_ok.caps` and
+    /// `/health`'s, in this order: `credential_cache`; then, with a helper,
+    /// `workspace_v1`, `git_http_v1` once the git routes are built
+    /// (`gitcgi::SERVED`) and `transcript_s3_v1` once the transfers are
+    /// (`s3xfer::SERVED`, S9): a route is mounted exactly when its cap is named.
     #[must_use]
     pub fn caps(&self) -> Vec<String> {
         let mut caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
         if self.serves_workspace() {
             caps.push(CAP_WORKSPACE_V1.to_string());
+            if crate::shim::gitcgi::SERVED {
+                caps.push(CAP_GIT_HTTP_V1.to_string());
+            }
+            if crate::shim::s3xfer::SERVED {
+                caps.push(CAP_TRANSCRIPT_S3_V1.to_string());
+            }
         }
         caps
     }
@@ -400,8 +433,17 @@ pub fn router(state: Arc<ShimState>) -> Router {
         .route("/agent", any(crate::shim::agent::upgrade));
     if state.serves_workspace() {
         routes = routes
-            .route(TRANSCRIPT_ROUTE, get(get_transcript).put(put_transcript).fallback(method_not_allowed))
+            .route(TRANSCRIPT_ROUTE, get(get_transcript).fallback(method_not_allowed))
             .route(SETTINGS_ROUTE, get(get_settings).fallback(method_not_allowed));
+    }
+    // S9: the transcript store's transfers, as their cap is named (`caps`).
+    if state.serves_workspace() && crate::shim::s3xfer::SERVED {
+        use crate::shim::s3xfer;
+        routes = routes
+            .route(TRANSCRIPT_PUSH_ROUTE, post(s3xfer::push).fallback(method_not_allowed))
+            .route(TRANSCRIPT_PULL_ROUTE, post(s3xfer::pull).fallback(method_not_allowed))
+            .route(TRANSCRIPT_VIEW_ROUTE, get(s3xfer::view).fallback(method_not_allowed))
+            .route(TRANSCRIPT_TAIL_ROUTE, post(s3xfer::tail).fallback(method_not_allowed));
     }
     // The last layer runs first: the guard, then the bearer.
     routes
@@ -414,63 +456,54 @@ pub fn router(state: Arc<ShimState>) -> Router {
 // ---- S8: the transcript and settings routes -------------------------------------------------
 
 /// The agent's projects directory, where its claude keeps its transcripts
-/// (`CLAUDE_CONFIG_DIR` is `<home>/.claude`: `spawn`).
-fn projects(state: &ShimState) -> std::path::PathBuf {
+/// (`CLAUDE_CONFIG_DIR` is `<home>/.claude`: `spawn`); S9's transfers
+/// (`s3xfer`) run their helper ops in it too.
+pub(crate) fn projects(state: &ShimState) -> std::path::PathBuf {
     state.opts.home.join(".claude").join("projects")
 }
 
-/// `GET /transcript?rel=`: the VM's copy, as the agent's projects directory holds it.
+/// `GET /transcript?rel=`: the VM's copy, as the agent's projects directory
+/// holds it. S9's extended stat (`?rel=&from=&fp=&subtree=`, a
+/// `wire::workspace::StatQuery`): with `from`, the delta's sha256, the
+/// fingerprints and the inode instead of the whole file's sha256; with
+/// `subtree`, the session's files, which the helper answers in the payload
+/// form (`s3xfer::run_payload`; past its caps 413 `too_large`). Without them,
+/// S8's stat.
 async fn get_transcript(State(state): State<Arc<ShimState>>, req: Request) -> axum::response::Response {
     let (op, started) = ("transcript-stat", Instant::now());
-    let q: RelQuery = match crate::shim::code::query(&req) {
+    let q: crate::wire::workspace::StatQuery = match crate::shim::code::query(&req) {
         Ok(q) => q,
         Err(r) => return asagent::refuse(op, started, &r),
     };
-    if let Err(e) = transcript_rel_check(&q.rel) {
-        return asagent::refuse(op, started, &WsRefusal::new(refusal::BAD_REQUEST, &format!("the transcript's rel {e}")));
+    if let Err(e) = q.check() {
+        let message = if e.starts_with("the ") { e } else { format!("the stat query {e}") };
+        return asagent::refuse(op, started, &WsRefusal::new(refusal::BAD_REQUEST, &message));
     }
     if state.is_draining() {
         return asagent::refuse(op, started, &asagent::AgentProcError::Draining.refusal(op));
     }
-    let cmd = AgentCmd { op, args: vec![asagent::flag("projects", projects(&state)), asagent::flag("rel", &q.rel)], budget: budget::TRANSCRIPT, stdin: false, during_stop: false };
+    let mut args = vec![asagent::flag("projects", projects(&state)), asagent::flag("rel", &q.rel)];
+    if let Some(from) = q.from {
+        args.push(asagent::flag("from", from.to_string()));
+    }
+    if let Some(fp) = &q.fp {
+        args.push(asagent::flag("fp", fp));
+    }
+    if q.subtree {
+        args.push("--subtree".into());
+    }
+    let cmd = AgentCmd { op, args, budget: budget::TRANSCRIPT, stdin: false, during_stop: false };
+    if q.subtree {
+        return match crate::shim::s3xfer::run_payload::<TranscriptStat>(&state, cmd).await {
+            Ok(stat) => {
+                asagent::log(op, 200, None, started);
+                asagent::answered(200, &stat)
+            }
+            Err(r) => asagent::refuse(op, started, &r),
+        };
+    }
     let out = asagent::run_op::<TranscriptStat>(&state, cmd, None).await;
     asagent::respond(op, started, out, |_| 200)
-}
-
-/// `PUT /transcript?rel=`: the file (`Content-Length` required, at most
-/// `TRANSCRIPT_MAX`), streamed to the helper, which writes it as the agent;
-/// under the transcripts' own lock, as a task of its own
-/// (`asagent::detached`: a client gone meanwhile never kills the helper
-/// before it removed its temp file).
-async fn put_transcript(State(state): State<Arc<ShimState>>, req: Request) -> axum::response::Response {
-    let (op, started) = ("transcript-put", Instant::now());
-    let q: RelQuery = match crate::shim::code::query(&req) {
-        Ok(q) => q,
-        Err(r) => return crate::shim::code::refuse_draining(op, started, req, &r).await,
-    };
-    if let Err(e) = transcript_rel_check(&q.rel) {
-        return crate::shim::code::refuse_draining(op, started, req, &WsRefusal::new(refusal::BAD_REQUEST, &format!("the transcript's rel {e}"))).await;
-    }
-    let len = match crate::shim::code::content_length(&req, TRANSCRIPT_MAX) {
-        Ok(len) => len,
-        Err(stop) => {
-            crate::shim::peer::drain(req).await;
-            return stop.respond(op, started);
-        }
-    };
-    if state.is_draining() {
-        return crate::shim::code::refuse_draining(op, started, req, &asagent::AgentProcError::Draining.refusal(op)).await;
-    }
-    asagent::detached(op, started, async move {
-        let Ok(_one) = tokio::time::timeout(state.workspace.busy_wait(), state.workspace.transcripts.lock()).await else {
-            return crate::shim::code::refuse_after_body(op, started, req, len, &asagent::busy(op, "another transcript upload is being written", state.workspace.busy_wait())).await;
-        };
-        let args = vec![asagent::flag("projects", projects(&state)), asagent::flag("rel", &q.rel), asagent::flag("len", len.to_string())];
-        let cmd = AgentCmd { op, args, budget: budget::TRANSCRIPT + asagent::transfer(len), stdin: true, during_stop: false };
-        let out = asagent::run_with_body::<TranscriptReply>(&state, cmd, req.into_body()).await;
-        asagent::respond(op, started, out, |r| r.outcome.status())
-    })
-    .await
 }
 
 /// `GET /settings?path=`: the VM claude's settings for the workspace (T8.7).

@@ -486,7 +486,8 @@ impl AgeTool {
 /// dialog appears that nobody waits for.
 #[derive(Debug, Default)]
 pub struct AgeKill {
-    state: std::sync::Mutex<Option<std::process::Child>>,
+    /// Shared with a SIGKILL step [`Self::kill_group`] hands to a thread of its own.
+    state: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
     cancelled: std::sync::atomic::AtomicBool,
 }
 
@@ -554,45 +555,101 @@ impl AgeKill {
     /// reaped it after the TERM (asked every [`REAP_POLL`]): a group that ends
     /// on its TERM costs the caller tens of ms, never the whole wait (S8: the
     /// remote session drops a pending unseal on the pump's only runtime
-    /// thread). Safe to call more than once, and from any thread.
+    /// thread). S9 (F7): called within a Tokio runtime's context (a runtime
+    /// thread, or the blocking pool's, where `UnsealJob::wait_or`'s deadline
+    /// runs) it returns once the TERM is sent, the rest of the ladder (that
+    /// wait, the SIGKILL) on a thread of its own that the process joins
+    /// before it exits ([`join_kills`]), so a group that ignores its TERM no
+    /// longer holds the runtime 500 ms; a caller outside any runtime
+    /// (local-scratch's `await_unseal`, a plain thread) still returns once
+    /// the ladder is over. Safe to call more than once, and from any thread.
     pub fn kill_group(&self) {
         // First, so a child adopted after this point is killed by `adopt` itself.
         self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         #[cfg(unix)]
         {
-            if !self.signal_group(libc::SIGTERM) {
+            if !signal_group(&self.state, libc::SIGTERM) {
                 return;
             }
-            // Reaped: the SIGKILL below finds no child, as it always did once the waiter had reaped it.
             let until = std::time::Instant::now() + KILL_AFTER_TERM;
-            while self.running() && std::time::Instant::now() < until {
-                std::thread::sleep(REAP_POLL);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let state = std::sync::Arc::clone(&self.state);
+                if let Ok(step) = std::thread::Builder::new().name("age kill".into()).spawn(move || kill_after_term(&state, until)) {
+                    keep_kill(step);
+                    return;
+                }
             }
-            self.signal_group(libc::SIGKILL);
+            kill_after_term(&self.state, until);
         }
-    }
-
-    /// Send `sig` to the unreaped child's process group (its pid, as
-    /// `process_group(0)` made it the leader) WITH THE LOCK HELD, so it cannot be
-    /// reaped — and its pid recycled — between the lookup and the signal. Even a
-    /// leader that has exited keeps the group id reserved while it is a zombie,
-    /// so the plugin it leaves behind is still reached. `false` when there is no
-    /// unreaped child.
-    #[cfg(unix)]
-    fn signal_group(&self, sig: i32) -> bool {
-        let slot = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(pgid) = slot.as_ref().map(|c| i32::try_from(c.id()).unwrap_or(0)).filter(|p| *p > 0) else {
-            return false;
-        };
-        // SAFETY: a plain libc call on our own child's group, which cannot be reaped while we hold the lock.
-        unsafe { libc::killpg(pgid, sig) };
-        true
     }
 
     /// Is a decrypt running right now (for tests and the countdown)?
     #[must_use]
     pub fn running(&self) -> bool {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
+    }
+}
+
+/// [`AgeKill::kill_group`]'s ladder past its TERM: until the waiter reaped
+/// the child (asked every [`REAP_POLL`]) or `until`, then the SIGKILL, which
+/// finds no child once it was reaped, as it always did.
+#[cfg(unix)]
+fn kill_after_term(state: &std::sync::Mutex<Option<std::process::Child>>, until: std::time::Instant) {
+    while state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() && std::time::Instant::now() < until {
+        std::thread::sleep(REAP_POLL);
+    }
+    signal_group(state, libc::SIGKILL);
+}
+
+/// Send `sig` to the unreaped child's process group (its pid, as
+/// `process_group(0)` made it the leader) WITH THE LOCK HELD, so it cannot be
+/// reaped — and its pid recycled — between the lookup and the signal. Even a
+/// leader that has exited keeps the group id reserved while it is a zombie,
+/// so the plugin it leaves behind is still reached. `false` when there is no
+/// unreaped child.
+#[cfg(unix)]
+fn signal_group(state: &std::sync::Mutex<Option<std::process::Child>>, sig: i32) -> bool {
+    let slot = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(pgid) = slot.as_ref().map(|c| i32::try_from(c.id()).unwrap_or(0)).filter(|p| *p > 0) else {
+        return false;
+    };
+    // SAFETY: a plain libc call on our own child's group, which cannot be reaped while we hold the lock.
+    unsafe { libc::killpg(pgid, sig) };
+    true
+}
+
+/// The SIGKILL steps [`AgeKill::kill_group`] handed to a thread of their own,
+/// until the process joins them ([`join_kills`]).
+#[cfg(unix)]
+static KILLS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
+
+/// Keep `step`, a SIGKILL step's thread, for [`join_kills`], which the first
+/// one kept registers to run at the process's exit (`atexit`: a return from
+/// `main` and `process::exit` alike, the wrapper's included).
+#[cfg(unix)]
+fn keep_kill(step: std::thread::JoinHandle<()>) {
+    static AT_EXIT: std::sync::Once = std::sync::Once::new();
+    AT_EXIT.call_once(|| {
+        // SAFETY: a plain libc call registering an `extern "C" fn()` that cannot unwind.
+        unsafe { libc::atexit(join_kills_at_exit) };
+    });
+    KILLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(step);
+}
+
+#[cfg(unix)]
+extern "C" fn join_kills_at_exit() {
+    join_kills();
+}
+
+/// Join every SIGKILL step [`AgeKill::kill_group`] handed to a thread of its
+/// own, each over within [`KILL_AFTER_TERM`] of its TERM: run at the
+/// process's exit, so no decrypt group that ignored its TERM outlives the
+/// process that asked for its dialog.
+#[cfg(unix)]
+pub fn join_kills() {
+    let steps = std::mem::take(&mut *KILLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    for step in steps {
+        let _ = step.join();
     }
 }
 
@@ -816,5 +873,46 @@ mod tests {
         assert!(tool.decrypt_with_identity_string(&line, &sealed).unwrap_or_else(|e| panic!("decrypt_with_identity_string: {e}")).as_slice() == plain);
         let (secret, recipient) = tool.keygen_x25519().unwrap_or_else(|e| panic!("keygen_x25519: {e}"));
         assert_eq!(tool.identity_to_recipient(&secret).unwrap_or_else(|e| panic!("identity_to_recipient: {e}")), recipient);
+    }
+
+    /// S9 (F7): on an async runtime's thread `kill_group` returns once its
+    /// TERM is sent, even to a group that ignores it (a shell that traps it
+    /// away, its `sleep` too): the SIGKILL comes at the bound from a thread
+    /// of its own, which `join_kills` (the process's exit) waits for, and the
+    /// decrypt's waiter then reaps the child the KILL ended.
+    #[cfg(unix)]
+    #[test]
+    fn kill_group_on_a_runtime_thread_hands_its_kill_to_a_thread_the_exit_joins() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::time::{Duration, Instant};
+        let kill = std::sync::Arc::new(AgeKill::new());
+        let mut child = Command::new("/bin/sh").args(["-c", "trap '' TERM; echo ready; while :; do sleep 1; done"]).process_group(0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n", "the shell ignores TERM from here");
+        kill.adopt(child);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::sync::Arc::clone(&kill);
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter.wait());
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // Before the TERM: the step returns no earlier than its bound, which starts after the TERM.
+        let term = Instant::now();
+        let held = rt.block_on(async {
+            let t = Instant::now();
+            kill.kill_group();
+            t.elapsed()
+        });
+        assert!(held < Duration::from_millis(200), "kill_group held the runtime's thread {held:?}");
+        let t = Instant::now();
+        join_kills();
+        let (joined, since_term) = (t.elapsed(), term.elapsed());
+        assert!(since_term >= KILL_AFTER_TERM, "join_kills waited for the SIGKILL step, at its bound: {since_term:?} after the TERM");
+        assert!(joined < Duration::from_secs(3), "join_kills: {joined:?}");
+        let status = rx.recv_timeout(Duration::from_secs(3)).expect("reaped once the KILL came").expect("the waiter");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert!(!kill.running());
     }
 }

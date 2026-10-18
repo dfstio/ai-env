@@ -10,14 +10,23 @@
 //! acts on each verdict (re-mint, wait, retry, ask GetMicrovm) is
 //! `exchange`. The wire's types and its refusal codes are
 //! `wire::workspace`'s; a URL with a query is `vm::health::endpoint_url_query`.
+//!
+//! S9 (frozen in S9 phase 0): the transcript store's five routes join
+//! [`DataPlane`] as default methods that fail closed (an implementation that
+//! serves them overrides them; `HttpsEndpoint`'s are G4's), each exchange
+//! names the capability a 404 means the VM lacks (`Exchange.cap`,
+//! [`verdict_cap`]), and [`HttpsEndpoint`] sends a raw body with extra
+//! headers (`send_with`, `Payload::Bytes`) for git smart-HTTP's client
+//! (`gitsmart::GitHttp`, G2's).
 use crate::bridge::agent::AgentTarget;
 use crate::bridge::api::AuthToken;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::workspace::KeptReason;
 use crate::wire::frame::CAP_WORKSPACE_V1;
 use crate::wire::workspace::{
-    known_refusal, refusal, CodeoutManifest, CodeoutRequest, SeedQuery, SeedReply, SeedState, SettingsCapture, TranscriptReply, TranscriptStat, WsRefusal,
+    known_refusal, refusal, CodeoutManifest, CodeoutRequest, SeedQuery, SeedReply, SeedState, SettingsCapture, TranscriptStat, WsRefusal,
 };
+use crate::wire::workspace::{StatQuery, TranscriptPull, TranscriptPullReply, TranscriptPush, TranscriptPushReply, TranscriptTail, ViewQuery};
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
@@ -128,11 +137,47 @@ pub trait DataPlane: Send + Sync {
     /// `GET /transcript?rel=` (8080).
     fn transcript_stat(&self, target: &AgentTarget, token: &AuthToken, rel: &str) -> impl Future<Output = Result<DpReply<TranscriptStat>, BridgeError>> + Send;
 
-    /// `PUT /transcript?rel=` (8080) with the file `body`, `len` bytes, streamed.
-    fn put_transcript(&self, target: &AgentTarget, token: &AuthToken, rel: &str, body: &Path, len: u64) -> impl Future<Output = Result<DpReply<TranscriptReply>, BridgeError>> + Send;
-
     /// `GET /settings?path=` (8080).
     fn get_settings(&self, target: &AgentTarget, token: &AuthToken, path: &str) -> impl Future<Output = Result<DpReply<SettingsCapture>, BridgeError>> + Send;
+
+    // S9: the transcript store's routes, each `cap` transcript_s3_v1. The
+    // defaults fail closed (`Config`, exit 1): a data plane that serves one
+    // overrides it.
+
+    /// `GET /transcript?rel=&from=&fp=&subtree=` (8080), `cap` transcript_s3_v1.
+    fn transcript_stat_from(&self, target: &AgentTarget, token: &AuthToken, q: &StatQuery) -> impl Future<Output = Result<DpReply<TranscriptStat>, BridgeError>> + Send {
+        let _ = (target, token, q);
+        async { Err(unserved("GET /transcript")) }
+    }
+
+    /// `POST /transcript/push` (8080).
+    fn transcript_push(&self, target: &AgentTarget, token: &AuthToken, req: &TranscriptPush) -> impl Future<Output = Result<DpReply<TranscriptPushReply>, BridgeError>> + Send {
+        let _ = (target, token, req);
+        async { Err(unserved("POST /transcript/push")) }
+    }
+
+    /// `POST /transcript/pull` (8080): 200 and 201 both carry the reply.
+    fn transcript_pull(&self, target: &AgentTarget, token: &AuthToken, req: &TranscriptPull) -> impl Future<Output = Result<DpReply<TranscriptPullReply>, BridgeError>> + Send {
+        let _ = (target, token, req);
+        async { Err(unserved("POST /transcript/pull")) }
+    }
+
+    /// `GET /transcript/view?rel=&n=` (8080).
+    fn transcript_view(&self, target: &AgentTarget, token: &AuthToken, q: &ViewQuery) -> impl Future<Output = Result<DpReply<crate::wire::view::TranscriptViewReply>, BridgeError>> + Send {
+        let _ = (target, token, q);
+        async { Err(unserved("GET /transcript/view")) }
+    }
+
+    /// `POST /transcript/tail` (8080): 204.
+    fn transcript_tail(&self, target: &AgentTarget, token: &AuthToken, req: &TranscriptTail) -> impl Future<Output = Result<DpReply<()>, BridgeError>> + Send {
+        let _ = (target, token, req);
+        async { Err(unserved("POST /transcript/tail")) }
+    }
+}
+
+/// What a data plane answers for a route it does not serve (S9's defaults).
+fn unserved(route: &str) -> BridgeError {
+    BridgeError::Config(format!("{route}: this data plane does not serve it (S9)"))
 }
 
 /// What the caller does with one answer (plan §10).
@@ -146,11 +191,6 @@ pub enum Verdict {
     /// 409 `dirty` or `diverged`: the VM keeps its state (D3), not an error;
     /// `state` is the VM's as the refusal carried it.
     Kept { reason: KeptReason, state: Option<SeedState> },
-    /// 409 `vm_longer` (`PUT /transcript`): the VM's copy is longer than the
-    /// Mac's and wins (plan §8), not an error: the resume goes on with it
-    /// (`workspace::TranscriptOutcome::VmLonger`); `size` is the VM copy's,
-    /// as the refusal carried it.
-    VmLonger { size: Option<u64> },
     /// 409 `changed`: the tip moved between `GET /seed` and the write: read
     /// the state once more and decide again; a second `changed` is `error` (exit 9).
     Reread { error: BridgeError },
@@ -185,17 +225,24 @@ fn code_and_message<T>(reply: &DpReply<T>, route: &str) -> (&'static str, String
 /// How one answer of `route` (`"PUT /seed"`, …) on `port` is acted on
 /// (plan §10): 401/403 re-mint once, then exit 7; 404 is an image without
 /// [`CAP_WORKSPACE_V1`] (`NoCapability`, exit 7); 409 `dirty` and `diverged`
-/// keep the VM's state, `vm_longer` is the VM's transcript winning (§8),
-/// `changed` re-reads once, `busy` retries for 30 s, any other code is
+/// keep the VM's state, `changed` re-reads once, `busy` retries for 30 s, any other code is
 /// `WorkspaceRefused` (exit 9); 400, and 411 (no `Content-Length`), are
 /// `WorkspaceRefused { bad_request }` (the VM refused what the Mac had
 /// checked: a version skew, exit 9); 413 is `WorkspaceRefused { too_large }`
 /// (9); 422, 500 and 504 are `WorkspaceFailed` (1) with the refusal's code
 /// (else `bad_pack`, `git_failed`, `timeout`); 429 waits `Retry-After`, then
 /// exit 7; 502 and 503 (the shim's `draining` too) ask GetMicrovm (gone: 8),
-/// then exit 7; any other status is `Http` (7). Pure: no I/O.
+/// then exit 7; any other status is `Http` (7). Pure: no I/O. Its 404 names
+/// `workspace_v1` ([`verdict_cap`] names another capability).
 #[must_use]
 pub fn verdict<T>(route: &str, port: u16, reply: &DpReply<T>) -> Verdict {
+    verdict_cap(route, port, CAP_WORKSPACE_V1, reply)
+}
+
+/// [`verdict`]'s table with a 404 naming `cap` (S9): the capability the
+/// route's VM lacks, `NoCapability` (exit 7, `make deploy`).
+#[must_use]
+pub fn verdict_cap<T>(route: &str, port: u16, cap: &'static str, reply: &DpReply<T>) -> Verdict {
     let status = reply.status;
     let (code, message) = code_and_message(reply, route);
     let refused = |fallback: &'static str| BridgeError::WorkspaceRefused { code: if code == "unknown" { fallback } else { code }, message: message.clone() };
@@ -204,11 +251,10 @@ pub fn verdict<T>(route: &str, port: u16, reply: &DpReply<T>) -> Verdict {
         200 | 201 | 204 => Verdict::Done,
         400 | 411 => Verdict::Fail(refused(refusal::BAD_REQUEST)),
         401 | 403 => Verdict::Remint { error: BridgeError::TokenRejected { port, status, proxy_error: reply.proxy_error.clone() } },
-        404 => Verdict::Fail(BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, message: format!("{route} answered 404") }),
+        404 => Verdict::Fail(BridgeError::NoCapability { cap, message: format!("{route} answered 404") }),
         409 => match code {
             refusal::DIRTY => Verdict::Kept { reason: KeptReason::Dirty, state: reply.refusal.as_ref().and_then(|r| r.state.clone()) },
             refusal::DIVERGED => Verdict::Kept { reason: KeptReason::Diverged, state: reply.refusal.as_ref().and_then(|r| r.state.clone()) },
-            refusal::VM_LONGER => Verdict::VmLonger { size: reply.refusal.as_ref().and_then(|r| r.size) },
             refusal::CHANGED => Verdict::Reread { error: refused(refusal::CHANGED) },
             refusal::BUSY => Verdict::Busy { error: BridgeError::Busy(message) },
             _ => Verdict::Fail(refused("conflict")),
@@ -233,6 +279,8 @@ pub(crate) struct Exchange<'a, A, T> {
     pub tokens: &'a T,
     pub vm_id: &'a str,
     pub port: u16,
+    /// The capability a 404 means the VM lacks (`workspace_v1`, S9's `git_http_v1` or `transcript_s3_v1`).
+    pub cap: &'static str,
     pub route: &'static str,
     pub deadline: Option<tokio::time::Instant>,
     /// A transport failure (connect, reset) is tried once more: only for a
@@ -247,8 +295,8 @@ pub(crate) struct Exchange<'a, A, T> {
 /// [`BUSY_RETRY`], a 502 or 503 asks GetMicrovm (a VM that is gone is exit
 /// 8, else the answer's error, exit 7); a transport failure of an
 /// idempotent request is tried once more. The answer and its verdict come
-/// back for [`Verdict::Done`], [`Verdict::Kept`], [`Verdict::VmLonger`] and
-/// [`Verdict::Reread`]; every other verdict is its error. Past the
+/// back for [`Verdict::Done`], [`Verdict::Kept`] and [`Verdict::Reread`];
+/// every other verdict is its error. Past the
 /// deadline nothing more is sent: `WorkspaceFailed { too_slow_for_init }`.
 pub(crate) async fn exchange<A, T, R, F, Fut>(x: &Exchange<'_, A, T>, mut send: F) -> Result<(DpReply<R>, Verdict), BridgeError>
 where
@@ -282,8 +330,8 @@ where
             }
             Err(e) => return Err(e),
         };
-        match verdict(x.route, x.port, &reply) {
-            v @ (Verdict::Done | Verdict::Kept { .. } | Verdict::VmLonger { .. } | Verdict::Reread { .. }) => return Ok((reply, v)),
+        match verdict_cap(x.route, x.port, x.cap, &reply) {
+            v @ (Verdict::Done | Verdict::Kept { .. } | Verdict::Reread { .. }) => return Ok((reply, v)),
             Verdict::Remint { error } => {
                 if reminted {
                     return Err(error);
@@ -296,7 +344,7 @@ where
                     return Err(error);
                 }
                 throttled = true;
-                pause(x.deadline, Duration::from_secs(retry_after_s.unwrap_or(1).max(1))).await.map_err(|()| error)?;
+                pause(x.deadline, throttle_wait(retry_after_s)).await.map_err(|()| error)?;
             }
             Verdict::Busy { error } => {
                 let since = *busy_since.get_or_insert_with(tokio::time::Instant::now);
@@ -317,9 +365,21 @@ where
     }
 }
 
-/// Sleep `d`, or `Err` when that would pass `deadline`.
+/// The longest a 429's `Retry-After` is waited (a longer one is cut to it).
+pub const THROTTLE_WAIT_MAX: Duration = Duration::from_secs(30);
+
+/// How long a 429 is waited before the request goes once more: its
+/// `Retry-After` (else a second), at least a second and at most
+/// [`THROTTLE_WAIT_MAX`]: the VM's number would otherwise hold the caller,
+/// and the locks it holds (the fetch lock, a manifest's), for as long as it
+/// says.
+fn throttle_wait(retry_after_s: Option<u64>) -> Duration {
+    Duration::from_secs(retry_after_s.unwrap_or(1).clamp(1, THROTTLE_WAIT_MAX.as_secs()))
+}
+
+/// Sleep `d`, or `Err` when that would pass `deadline` (or no instant is `d` away).
 async fn pause(deadline: Option<tokio::time::Instant>, d: Duration) -> Result<(), ()> {
-    let until = tokio::time::Instant::now() + d;
+    let Some(until) = tokio::time::Instant::now().checked_add(d) else { return Err(()) };
     if deadline.is_some_and(|dl| until > dl) {
         return Err(());
     }
@@ -335,12 +395,15 @@ async fn pause(deadline: Option<tokio::time::Instant>, d: Duration) -> Result<()
 /// records their expiry, `vm::token::mint`), by port; one with less than
 /// [`REMINT_BELOW`] left is minted again. A 9418 token lasts
 /// [`TOKEN_MINUTES_SEED`] for a seed (`seeding`), every other
-/// [`TOKEN_MINUTES`].
+/// [`TOKEN_MINUTES`]. S9: [`MintingTokens::unrecorded`] mints without the
+/// row's expiry, for a dry run.
 pub struct MintingTokens<P> {
     api: P,
     paths: crate::bridge::config::Paths,
     vm_id: String,
     code_minutes: u16,
+    /// Each mint's expiry recorded in the VM's row (`vm::token::mint`); not for a dry run.
+    record: bool,
     cache: std::sync::Mutex<std::collections::BTreeMap<u16, AuthToken>>,
 }
 
@@ -350,15 +413,81 @@ where
     P::Target: crate::bridge::api::MicrovmApi + Sized,
 {
     /// The tokens of `vm_id`; `seeding`: its 9418 tokens outlast a first seed.
+    /// S9: `AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES` (debug builds; the live
+    /// re-mint test) sets every 9418 token's minutes instead ([`code_minutes`]).
     #[must_use]
     pub fn new(api: P, paths: &crate::bridge::config::Paths, vm_id: &str, seeding: bool) -> MintingTokens<P> {
-        MintingTokens { api, paths: paths.clone(), vm_id: vm_id.to_string(), code_minutes: if seeding { TOKEN_MINUTES_SEED } else { TOKEN_MINUTES }, cache: std::sync::Mutex::new(std::collections::BTreeMap::new()) }
+        let code_minutes = code_minutes(crate::bridge::lab::vm_knobs().code_token_minutes(), seeding);
+        MintingTokens { api, paths: paths.clone(), vm_id: vm_id.to_string(), code_minutes, record: true, cache: std::sync::Mutex::new(std::collections::BTreeMap::new()) }
+    }
+
+    /// These tokens minted without their expiry in the VM's row
+    /// (`vm::token::mint_unrecorded`, S9): what `box fetch --dry-run` mints
+    /// with, which changes nothing on the Mac.
+    #[must_use]
+    pub fn unrecorded(self) -> MintingTokens<P> {
+        MintingTokens { record: false, ..self }
     }
 
     fn cached(&self, port: u16) -> Option<AuthToken> {
         let now = crate::wire::time::unix_now();
         let cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.get(&port).filter(|t| t.expires_at_unix > now.saturating_add(REMINT_BELOW.as_secs())).cloned()
+    }
+}
+
+/// A 9418 token's minutes: the lab knob's when set (`VmKnobs::code_token_minutes`:
+/// 1 to 15, debug builds only, the fake API not needed: the live re-mint
+/// test's short tokens), else [`TOKEN_MINUTES_SEED`] for a seed and
+/// [`TOKEN_MINUTES`] for the rest.
+fn code_minutes(knob: Option<u16>, seeding: bool) -> u16 {
+    knob.unwrap_or(if seeding { TOKEN_MINUTES_SEED } else { TOKEN_MINUTES })
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod g8_tests {
+    use super::*;
+    use crate::bridge::api::{Call, FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, FAKE_IMAGE_ARN};
+
+    /// S9: the knob's minutes win for every 9418 token, a seed's too; without
+    /// it a seed's last 15 minutes and the rest 5. The knob's own range (1 to
+    /// 15, else none) is `VmKnobs::code_token_minutes`'.
+    #[test]
+    fn the_code_token_knob_sets_every_9418_tokens_minutes() {
+        assert_eq!((code_minutes(None, true), code_minutes(None, false)), (TOKEN_MINUTES_SEED, TOKEN_MINUTES));
+        assert_eq!((code_minutes(Some(2), true), code_minutes(Some(2), false)), (2, 2));
+        let knobs = |m: u16| crate::bridge::lab::VmKnobs { code_token_minutes: Some(m), ..crate::bridge::lab::VmKnobs::default() };
+        assert_eq!((knobs(0).code_token_minutes(), knobs(1).code_token_minutes(), knobs(15).code_token_minutes(), knobs(16).code_token_minutes()), (None, Some(1), Some(15), None));
+        assert_eq!(code_minutes(knobs(16).code_token_minutes(), false), TOKEN_MINUTES, "out of range: the default");
+    }
+
+    /// The minutes reach the mint: an 8080 token stays 5 minutes whatever a
+    /// 9418 one lasts (the knob is the 9418 tokens' alone).
+    #[tokio::test]
+    async fn a_code_token_is_minted_for_its_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::bridge::config::Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let api = FakeMicrovmApi::new();
+        let spec = RunSpec {
+            image_arn: FAKE_IMAGE_ARN.into(),
+            image_version: "1.0".into(),
+            execution_role_arn: None,
+            ingress_connectors: vec![],
+            egress_connectors: vec![],
+            idle: IdleSpec { max_idle_s: 300, suspended_s: 900, auto_resume: true },
+            max_duration_s: 900,
+            run_hook_payload: "{}".into(),
+            client_token: "01926f2e-0000-7000-8000-0000000000c8".into(),
+        };
+        let id = api.run(&spec).await.unwrap().id;
+        api.advance_all();
+        let mut tokens = MintingTokens::new(&api, &paths, &id, false);
+        tokens.code_minutes = code_minutes(Some(2), false);
+        tokens.token(crate::wire::workspace::CODE_PORT).await.unwrap();
+        tokens.token(crate::wire::workspace::APP_PORT).await.unwrap();
+        let minted: Vec<(u16, u16)> = api.calls().iter().filter_map(|c| if let Call::Token { port, minutes, .. } = c { Some((*port, *minutes)) } else { None }).collect();
+        assert_eq!(minted, [(9418, 2), (8080, TOKEN_MINUTES)], "the 9418 token for its 2 minutes, the 8080 one for its 5");
     }
 }
 
@@ -372,7 +501,11 @@ where
             return Ok(t);
         }
         let minutes = if port == crate::wire::workspace::CODE_PORT { self.code_minutes } else { TOKEN_MINUTES };
-        let token = crate::bridge::vm::token::mint(&*self.api, &self.paths, &self.vm_id, port, minutes).await?;
+        let token = if self.record {
+            crate::bridge::vm::token::mint(&*self.api, &self.paths, &self.vm_id, port, minutes).await?
+        } else {
+            crate::bridge::vm::token::mint_unrecorded(&*self.api, &self.vm_id, port, minutes).await?
+        };
         self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(port, token.clone());
         Ok(token)
     }
@@ -456,6 +589,13 @@ impl HttpsEndpoint {
     /// session bearer, within `timeout`: its response once its head came;
     /// a redirect is refused, never followed.
     async fn send(&self, method: reqwest::Method, target: &AgentTarget, token: &AuthToken, url: reqwest::Url, timeout: Duration, payload: Payload) -> Result<reqwest::Response, BridgeError> {
+        self.send_with(method, target, token, url, timeout, payload, &[]).await
+    }
+
+    /// [`Self::send`] with `extra` headers besides its own (S9: git
+    /// smart-HTTP's `Git-Protocol` and `Accept`; never a sensitive one).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_with(&self, method: reqwest::Method, target: &AgentTarget, token: &AuthToken, url: reqwest::Url, timeout: Duration, payload: Payload, extra: &[(&'static str, String)]) -> Result<reqwest::Response, BridgeError> {
         use crate::bridge::vm::health::{bearer_header, redirect_refusal_for, transport_error_for};
         let host = url.host_str().unwrap_or_default().to_string();
         let shown = url.as_str().to_string();
@@ -463,10 +603,14 @@ impl HttpsEndpoint {
         let mut auth = reqwest::header::HeaderValue::from_str(value.expose()).map_err(|_| BridgeError::Sdk { op: "workspace", message: "the endpoint token is not a valid header value".into() })?;
         auth.set_sensitive(true);
         let mut req = self.client(token.port, &host)?.request(method.clone(), url).header("x-aws-proxy-auth", auth).header("x-aws-proxy-port", token.port.to_string()).header(reqwest::header::AUTHORIZATION, bearer_header(&target.session_token)?).timeout(timeout);
+        for (name, value) in extra {
+            req = req.header(*name, value.as_str());
+        }
         match payload {
             Payload::None => {}
             Payload::File(body, len) => req = req.header(reqwest::header::CONTENT_LENGTH, len).body(body),
             Payload::Json(json) => req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(json),
+            Payload::Bytes { content_type, body } => req = req.header(reqwest::header::CONTENT_TYPE, content_type).header(reqwest::header::CONTENT_LENGTH, body.len()).body(body),
         }
         let resp = req.send().await.map_err(|e| transport_error_for(method.as_str(), "workspace", &shown, &e))?;
         if resp.url().as_str() != shown {
@@ -518,6 +662,9 @@ enum Payload {
     File(reqwest::Body, u64),
     /// A JSON document.
     Json(Vec<u8>),
+    /// S9: bytes of a given type, with their `Content-Length` (a git upload-pack request; G2 sends it).
+    #[allow(dead_code)]
+    Bytes { content_type: &'static str, body: Vec<u8> },
 }
 
 /// `path`'s first `len` bytes as a request body, read in [`CHUNK`]s (never buffered whole).
@@ -574,8 +721,20 @@ async fn refusal_of<R>(mut resp: reqwest::Response, method: &str, url: &str) -> 
     let status = resp.status().as_u16();
     let (proxy_error, retry_after_s) = (proxy_error_of(resp.headers()), retry_after_of(resp.headers()));
     let (bytes, _) = read_capped(&mut resp, MAX_JSON, method, url).await?;
-    let refusal = serde_json::from_slice::<WsRefusal>(&bytes).ok().map(|r| WsRefusal { state: r.state, size: r.size, ..WsRefusal::new(&r.code, &r.message) });
+    let refusal = serde_json::from_slice::<WsRefusal>(&bytes).ok().map(|r| WsRefusal { code: refusal_code(&r.code), state: r.state, size: r.size, ..WsRefusal::new("", &r.message) });
     Ok(DpReply { refusal, proxy_error, retry_after_s, ..DpReply::status(status) })
+}
+
+/// A refusal's code as the VM sent it, kept when it is a code word (1 to 64
+/// bytes of `[a-z0-9_]`: a newer shim's code shows as itself), else
+/// `unknown`: it is echoed in errors, and the VM's bytes never reach the
+/// terminal unchecked (an escape sequence, a key id, a megabyte).
+fn refusal_code(c: &str) -> String {
+    if (1..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+        c.to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 impl DataPlane for HttpsEndpoint {
@@ -646,13 +805,6 @@ impl DataPlane for HttpsEndpoint {
         reply_of(resp, &[200], "GET", &shown).await
     }
 
-    async fn put_transcript(&self, target: &AgentTarget, token: &AuthToken, rel: &str, body: &Path, len: u64) -> Result<DpReply<TranscriptReply>, BridgeError> {
-        let url = self.url(target, crate::wire::workspace::TRANSCRIPT_ROUTE, &crate::wire::workspace::RelQuery { rel: rel.to_string() }.pairs())?;
-        let shown = url.as_str().to_string();
-        let resp = self.send(reqwest::Method::PUT, target, token, url, request_timeout(len, crate::wire::workspace::budget::TRANSCRIPT), Payload::File(file_body(body, len).await?, len)).await?;
-        reply_of(resp, &[200, 201], "PUT", &shown).await
-    }
-
     async fn get_settings(&self, target: &AgentTarget, token: &AuthToken, path: &str) -> Result<DpReply<SettingsCapture>, BridgeError> {
         let url = self.url(target, crate::wire::workspace::SETTINGS_ROUTE, &crate::wire::workspace::PathQuery { path: path.to_string() }.pairs())?;
         let shown = url.as_str().to_string();
@@ -662,6 +814,173 @@ impl DataPlane for HttpsEndpoint {
             c.check().map_err(|e| BridgeError::Protocol(format!("GET {shown}: the capture {e}")))?;
         }
         Ok(reply)
+    }
+
+    // S9's transcript routes (G4 builds them: JSON bodies through `send`'s `Payload::Json`, budgets
+    // `request_timeout(len, budget::…)`, `reply_of(resp, &[200], …)`, `&[200, 201]` for the pull, 204 for the tail).
+
+    // Each request is checked first (the VM refuses what its `check` refuses: a version skew, never sent), its URLs
+    // travel in the JSON body only (behind the bearer, never in the query or a log line), and its wait is
+    // `request_timeout` over what may cross and the shim's own budget.
+
+    async fn transcript_stat_from(&self, target: &AgentTarget, token: &AuthToken, q: &StatQuery) -> Result<DpReply<TranscriptStat>, BridgeError> {
+        q.check().map_err(|e| BridgeError::Config(format!("GET /transcript: the query {e}")))?;
+        let url = self.url(target, crate::wire::workspace::TRANSCRIPT_ROUTE, &q.pairs())?;
+        let shown = url.as_str().to_string();
+        let hashed = if q.subtree { crate::wire::workspace::SUBTREE_BYTES_MAX } else { 0 };
+        let resp = self.send(reqwest::Method::GET, target, token, url, request_timeout(hashed, crate::wire::workspace::budget::TRANSCRIPT), Payload::None).await?;
+        reply_of(resp, &[200], "GET", &shown).await
+    }
+
+    async fn transcript_push(&self, target: &AgentTarget, token: &AuthToken, req: &TranscriptPush) -> Result<DpReply<TranscriptPushReply>, BridgeError> {
+        req.check().map_err(|e| BridgeError::Config(format!("POST /transcript/push: the request {e}")))?;
+        let none: [(&str, &str); 0] = [];
+        let url = self.url(target, crate::wire::workspace::TRANSCRIPT_PUSH_ROUTE, &none)?;
+        let json = serde_json::to_vec(req).map_err(|e| BridgeError::Config(format!("POST /transcript/push: {e}")))?;
+        if json.len() > crate::wire::workspace::TRANSFER_REQUEST_MAX {
+            return Err(BridgeError::Config(format!("POST /transcript/push: a {}-byte request (at most {})", json.len(), crate::wire::workspace::TRANSFER_REQUEST_MAX)));
+        }
+        let shown = url.as_str().to_string();
+        let timeout = request_timeout(req.len, crate::wire::workspace::budget::TRANSCRIPT_PUSH);
+        let resp = self.send(reqwest::Method::POST, target, token, url, timeout, Payload::Json(json)).await?;
+        reply_of(resp, &[200], "POST", &shown).await
+    }
+
+    async fn transcript_pull(&self, target: &AgentTarget, token: &AuthToken, req: &TranscriptPull) -> Result<DpReply<TranscriptPullReply>, BridgeError> {
+        req.check().map_err(|e| BridgeError::Config(format!("POST /transcript/pull: the request {e}")))?;
+        let none: [(&str, &str); 0] = [];
+        let url = self.url(target, crate::wire::workspace::TRANSCRIPT_PULL_ROUTE, &none)?;
+        let json = serde_json::to_vec(req).map_err(|e| BridgeError::Config(format!("POST /transcript/pull: {e}")))?;
+        if json.len() > crate::wire::workspace::TRANSFER_REQUEST_MAX {
+            return Err(BridgeError::Config(format!("POST /transcript/pull: a {}-byte request (at most {})", json.len(), crate::wire::workspace::TRANSFER_REQUEST_MAX)));
+        }
+        let shown = url.as_str().to_string();
+        let bytes = req.parts.iter().map(|p| p.len).sum::<u64>();
+        let timeout = request_timeout(bytes, crate::wire::workspace::budget::TRANSCRIPT_PULL);
+        let resp = self.send(reqwest::Method::POST, target, token, url, timeout, Payload::Json(json)).await?;
+        reply_of(resp, &[200, 201], "POST", &shown).await
+    }
+
+    async fn transcript_view(&self, target: &AgentTarget, token: &AuthToken, q: &ViewQuery) -> Result<DpReply<crate::wire::view::TranscriptViewReply>, BridgeError> {
+        q.check().map_err(|e| BridgeError::Config(format!("GET /transcript/view: the query {e}")))?;
+        let url = self.url(target, crate::wire::workspace::TRANSCRIPT_VIEW_ROUTE, &q.pairs())?;
+        let shown = url.as_str().to_string();
+        let resp = self.send(reqwest::Method::GET, target, token, url, request_timeout(crate::wire::workspace::JSON_PAYLOAD_MAX as u64, crate::wire::workspace::budget::TRANSCRIPT_VIEW), Payload::None).await?;
+        reply_of(resp, &[200], "GET", &shown).await
+    }
+
+    async fn transcript_tail(&self, target: &AgentTarget, token: &AuthToken, req: &TranscriptTail) -> Result<DpReply<()>, BridgeError> {
+        req.check().map_err(|e| BridgeError::Config(format!("POST /transcript/tail: the request {e}")))?;
+        let none: [(&str, &str); 0] = [];
+        let url = self.url(target, crate::wire::workspace::TRANSCRIPT_TAIL_ROUTE, &none)?;
+        let json = serde_json::to_vec(req).map_err(|e| BridgeError::Config(format!("POST /transcript/tail: {e}")))?;
+        if json.len() > crate::wire::workspace::TRANSFER_REQUEST_MAX {
+            return Err(BridgeError::Config(format!("POST /transcript/tail: a {}-byte request (at most {})", json.len(), crate::wire::workspace::TRANSFER_REQUEST_MAX)));
+        }
+        let shown = url.as_str().to_string();
+        let resp = self.send(reqwest::Method::POST, target, token, url, request_timeout(0, crate::wire::workspace::budget::TRANSCRIPT), Payload::Json(json)).await?;
+        if resp.status().as_u16() == 204 {
+            return Ok(DpReply { proxy_error: crate::bridge::vm::health::proxy_error_of(resp.headers()), ..DpReply::status(204) });
+        }
+        refusal_of(resp, "POST", &shown).await
+    }
+}
+
+/// Git smart-HTTP v2 on the code port (S9 §2.1): through `send_with`, with
+/// `Git-Protocol: version=2` and `Accept` (the advertisement's type for the
+/// `GET`, the result's for the `POST`, whose one v2 command goes as
+/// `Payload::Bytes` of the request's type with its `Content-Length`); never
+/// a `Content-Encoding` nor an `Accept-Encoding`. A status other than 200
+/// comes back as a [`DpReply`] with its refusal (`refusal_of`), which
+/// `exchange` decides on; a 200's body is read to its end, never past its
+/// cap (more: `too_large`, exit 9), and one cut short is `Endpoint`.
+impl crate::bridge::gitsmart::GitHttp for HttpsEndpoint {
+    async fn info_refs(&self, target: &AgentTarget, token: &AuthToken) -> Result<DpReply<Vec<u8>>, BridgeError> {
+        use crate::bridge::gitsmart::{ADVERT_MAX, INFO_REFS};
+        use crate::wire::workspace::{budget, GIT_ADVERTISEMENT_TYPE, GIT_INFO_REFS_ROUTE, GIT_PROTOCOL_V2, GIT_UPLOAD_PACK_QUERY};
+        // `service=git-upload-pack`, its one pair.
+        let query: Vec<(&str, &str)> = GIT_UPLOAD_PACK_QUERY.split_once('=').into_iter().collect();
+        let url = self.url(target, GIT_INFO_REFS_ROUTE, &query)?;
+        let shown = url.as_str().to_string();
+        let extra = [("Git-Protocol", GIT_PROTOCOL_V2.to_string()), ("Accept", GIT_ADVERTISEMENT_TYPE.to_string())];
+        let mut resp = self.send_with(reqwest::Method::GET, target, token, url, request_timeout(ADVERT_MAX, budget::GIT_ADVERTISE), Payload::None, &extra).await?;
+        if resp.status().as_u16() != 200 {
+            return refusal_of(resp, "GET", &shown).await;
+        }
+        let (proxy_error, retry_after_s) = (crate::bridge::vm::health::proxy_error_of(resp.headers()), crate::bridge::vm::health::retry_after_of(resp.headers()));
+        let (body, over) = read_capped(&mut resp, usize::try_from(ADVERT_MAX).unwrap_or(usize::MAX), "GET", &shown).await?;
+        if over {
+            return Err(BridgeError::WorkspaceRefused { code: refusal::TOO_LARGE, message: format!("{INFO_REFS}: the advertisement is over {}", crate::bridge::workspace::snapshot::human_bytes(ADVERT_MAX)) });
+        }
+        Ok(DpReply { proxy_error, retry_after_s, ..DpReply::ok(200, body) })
+    }
+
+    async fn upload_pack<W: std::io::Write + Send>(&self, target: &AgentTarget, token: &AuthToken, body: &[u8], sink: &mut W, cap: u64) -> Result<DpReply<u64>, BridgeError> {
+        use crate::bridge::gitsmart::UPLOAD_PACK;
+        use crate::wire::workspace::{budget, GIT_PROTOCOL_V2, GIT_UPLOAD_PACK_REQUEST_TYPE, GIT_UPLOAD_PACK_RESULT_TYPE, GIT_UPLOAD_PACK_ROUTE};
+        let none: [(&str, &str); 0] = [];
+        let url = self.url(target, GIT_UPLOAD_PACK_ROUTE, &none)?;
+        let shown = url.as_str().to_string();
+        let extra = [("Git-Protocol", GIT_PROTOCOL_V2.to_string()), ("Accept", GIT_UPLOAD_PACK_RESULT_TYPE.to_string())];
+        let timeout = request_timeout(cap.saturating_add(body.len() as u64), budget::GIT_UPLOAD_PACK);
+        let payload = Payload::Bytes { content_type: GIT_UPLOAD_PACK_REQUEST_TYPE, body: body.to_vec() };
+        let mut resp = self.send_with(reqwest::Method::POST, target, token, url, timeout, payload, &extra).await?;
+        if resp.status().as_u16() != 200 {
+            return refusal_of(resp, "POST", &shown).await;
+        }
+        let (proxy_error, retry_after_s) = (crate::bridge::vm::health::proxy_error_of(resp.headers()), crate::bridge::vm::health::retry_after_of(resp.headers()));
+        let mut written = 0u64;
+        while let Some(chunk) = resp.chunk().await.map_err(|e| crate::bridge::vm::health::transport_error_for("POST", "workspace", &shown, &e))? {
+            written = written.saturating_add(chunk.len() as u64);
+            if written > cap {
+                return Err(BridgeError::WorkspaceRefused { code: refusal::TOO_LARGE, message: format!("{UPLOAD_PACK}: the answer is over {}", crate::bridge::workspace::snapshot::human_bytes(cap)) });
+            }
+            sink.write_all(&chunk)?;
+        }
+        Ok(DpReply { proxy_error, retry_after_s, ..DpReply::ok(200, written) })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod g2_tests {
+    use super::*;
+    use crate::bridge::api::{Call, FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, FAKE_IMAGE_ARN};
+
+    /// S9: tokens made `unrecorded` mint as the others do (once per port, a
+    /// 9418 one for 5 minutes), and the VM's row, which a recorded mint
+    /// writes, stays byte for byte as it was.
+    #[tokio::test]
+    async fn unrecorded_tokens_leave_the_vms_row_as_it_was() {
+        use crate::bridge::vm::registry::{read_row, write_row, RowStatus, VmRow};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::bridge::config::Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let api = FakeMicrovmApi::new();
+        let spec = RunSpec {
+            image_arn: FAKE_IMAGE_ARN.into(),
+            image_version: "1.0".into(),
+            execution_role_arn: None,
+            ingress_connectors: vec![],
+            egress_connectors: vec![],
+            idle: IdleSpec { max_idle_s: 300, suspended_s: 900, auto_resume: true },
+            max_duration_s: 900,
+            run_hook_payload: "{}".into(),
+            client_token: "01926f2e-0000-7000-8000-0000000000c2".into(),
+        };
+        let id = api.run(&spec).await.unwrap().id;
+        api.advance_all();
+        write_row(&paths, &VmRow { id: id.clone(), status: RowStatus::Running, client_token: spec.client_token.clone(), ..VmRow::default() }).unwrap();
+        let file = paths.vms().join(format!("{id}.toml"));
+        let before = std::fs::read(&file).unwrap();
+        let dry = MintingTokens::new(&api, &paths, &id, false).unrecorded();
+        dry.token(9418).await.unwrap();
+        dry.token(9418).await.unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before, "nothing recorded");
+        let minted = |api: &FakeMicrovmApi| api.calls().iter().filter(|c| matches!(c, Call::Token { port: 9418, minutes: 5, .. })).count();
+        assert_eq!(minted(&api), 1, "minted once, then kept in memory");
+        MintingTokens::new(&api, &paths, &id, false).token(9418).await.unwrap();
+        assert!(read_row(&paths, &id).unwrap().unwrap().token_expiries.contains_key("9418"), "the plain tokens still record");
+        assert_eq!(minted(&api), 2);
     }
 }
 
@@ -715,10 +1034,6 @@ impl DataPlane for Unreached {
     }
 
     async fn transcript_stat(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<TranscriptStat>, BridgeError> {
-        Err(BridgeError::Endpoint("unreached".into()))
-    }
-
-    async fn put_transcript(&self, _: &AgentTarget, _: &AuthToken, _: &str, _: &Path, _: u64) -> Result<DpReply<TranscriptReply>, BridgeError> {
         Err(BridgeError::Endpoint("unreached".into()))
     }
 
@@ -786,18 +1101,14 @@ mod tests {
             assert_eq!(exit_code, 9, "{code}");
             assert!(text.starts_with(&format!("workspace refused ({code}): PUT /seed: the shim's words")), "{text}");
         }
-        // Plan §8: a longer VM transcript wins, and the resume goes on with it.
-        let longer = DpReply::<TranscriptReply>::refused(WsRefusal::new(refusal::VM_LONGER, "the VM's copy is longer").with_size(4096));
-        assert!(matches!(verdict("PUT /transcript", 8080, &longer), Verdict::VmLonger { size: Some(4096) }));
-        assert!(matches!(verdict("PUT /transcript", 8080, &refused(refusal::VM_LONGER)), Verdict::VmLonger { size: None }));
         assert_eq!(fail_code(verdict("PUT /seed", 9418, &refused(refusal::BAD_REQUEST))), (9, "workspace refused (bad_request): PUT /seed: the shim's words".to_string()));
         // A body without Content-Length is the wire's 411 `bad_request`; a body over its cap 413 `too_large`.
         for (s, word) in [(411, refusal::BAD_REQUEST), (413, refusal::TOO_LARGE)] {
-            let (exit_code, text) = fail_code(verdict("PUT /transcript", 8080, &DpReply::<TranscriptReply>::status(s)));
+            let (exit_code, text) = fail_code(verdict("PUT /seed", 9418, &DpReply::<SeedReply>::status(s)));
             assert_eq!(exit_code, 9);
-            assert!(text.starts_with(&format!("workspace refused ({word}): PUT /transcript answered HTTP {s}")), "{text}");
+            assert!(text.starts_with(&format!("workspace refused ({word}): PUT /seed answered HTTP {s}")), "{text}");
         }
-        let missing = DpReply::<TranscriptReply> { refusal: Some(WsRefusal::new(refusal::BAD_REQUEST, "Content-Length required")), ..DpReply::status(411) };
+        let missing = DpReply::<SeedReply> { refusal: Some(WsRefusal::new(refusal::BAD_REQUEST, "Content-Length required")), ..DpReply::status(411) };
         assert_eq!(fail_code(verdict("PUT /seed", 9418, &missing)), (9, "workspace refused (bad_request): PUT /seed: Content-Length required".to_string()));
         for (code, s) in [(refusal::BAD_PACK, 422), (refusal::MISSING_PREREQUISITES, 422), (refusal::BAD_REFS, 422), (refusal::GIT_FAILED, 500), (refusal::TIMEOUT, 504)] {
             let (exit_code, text) = fail_code(verdict("PUT /seed", 9418, &refused(code)));
@@ -844,6 +1155,53 @@ mod tests {
         let conflict = DpReply::<SeedReply> { refusal: Some(WsRefusal::new("from_the_future", "x")), ..DpReply::status(409) };
         let (exit_code, text) = fail_code(verdict("PUT /seed", 9418, &conflict));
         assert!(exit_code == 9 && text.starts_with("workspace refused (conflict)"), "{text}");
+    }
+
+    /// S9 phase 4 (F1): what a refusal's body carries reaches no error text
+    /// raw: a code that is no code word (a key id, an escape, a megabyte) is
+    /// `unknown`, the message is one scrubbed line, and an `Http` error's
+    /// body is scrubbed as it prints; a well-formed code this build does not
+    /// know still shows.
+    #[tokio::test]
+    async fn a_refusals_code_and_text_never_carry_the_vms_bytes() {
+        let key_id = format!("{}{}", "AKIA", "R".repeat(16));
+        let body = |code: &str| serde_json::json!({"code": code, "message": format!("saw {key_id} \u{1b}[31m")}).to_string();
+        for status in [503u16, 418, 500, 409] {
+            for code in [format!("{key_id}\u{1b}[2J"), "x".repeat(1 << 20)] {
+                let resp = reqwest::Response::from(http::Response::builder().status(status).body(body(&code)).unwrap());
+                let reply: DpReply<SeedReply> = refusal_of(resp, "GET", "/workspace.git/info/refs").await.unwrap();
+                assert_eq!(reply.refusal.as_ref().map(|r| r.code.as_str()), Some("unknown"), "{status}");
+                let error = match verdict_cap("GET /workspace.git/info/refs", 9418, CAP_WORKSPACE_V1, &reply) {
+                    Verdict::CheckVm { error } | Verdict::Fail(error) => error,
+                    other => panic!("{status}: {other:?}"),
+                };
+                let text = error.to_string();
+                assert!(!text.contains(&key_id) && !text.contains('\u{1b}') && text.len() < 2048, "{status}: {text}");
+            }
+        }
+        let resp = reqwest::Response::from(http::Response::builder().status(500).body(body("from_the_future")).unwrap());
+        let reply: DpReply<SeedReply> = refusal_of(resp, "GET", "/x").await.unwrap();
+        let (_, text) = fail_code(verdict("PUT /seed", 9418, &reply));
+        assert!(text.contains("(from_the_future)") && !text.contains(&key_id), "{text}");
+        let shown = BridgeError::Http { status: 418, body: format!("saw {key_id}") }.to_string();
+        assert!(shown.starts_with("endpoint HTTP 418: saw ") && !shown.contains(&key_id), "{shown}");
+        assert_eq!((refusal_code("too_large"), refusal_code(""), refusal_code("Bad"), refusal_code(&"a".repeat(65))), ("too_large".into(), "unknown".into(), "unknown".into(), "unknown".into()));
+    }
+
+    /// S9 phase 4 (F2): a `Retry-After` past [`THROTTLE_WAIT_MAX`] is waited
+    /// that long at most (none or 0: a second); `pause` refuses a wait no
+    /// instant is that far away, with a deadline or none (`u64::MAX` once
+    /// panicked adding to an instant, before the deadline was looked at).
+    #[tokio::test]
+    async fn a_huge_retry_after_waits_the_cap_and_never_panics() {
+        assert_eq!([throttle_wait(None), throttle_wait(Some(0)), throttle_wait(Some(7)), throttle_wait(Some(31)), throttle_wait(Some(u64::MAX))], [Duration::from_secs(1), Duration::from_secs(1), Duration::from_secs(7), THROTTLE_WAIT_MAX, THROTTLE_WAIT_MAX]);
+        assert_eq!(THROTTLE_WAIT_MAX, Duration::from_secs(30));
+        let far = Some(tokio::time::Instant::now() + Duration::from_secs(3600));
+        for deadline in [None, far] {
+            assert_eq!(pause(deadline, Duration::from_secs(u64::MAX)).await, Err(()), "{deadline:?}");
+        }
+        assert_eq!(pause(Some(tokio::time::Instant::now()), Duration::from_secs(1)).await, Err(()), "past the deadline");
+        assert_eq!(pause(far, Duration::from_millis(1)).await, Ok(()));
     }
 
     #[test]
@@ -912,7 +1270,7 @@ mod tests {
         let (api, id) = running().await;
         let paths = crate::bridge::config::Paths::from_root_and_env("/nonexistent/bridge".into(), None);
         let tokens = MintingTokens::new(&api, &paths, &id, false);
-        let x = Exchange { api: &api, tokens: &tokens, vm_id: &id, port: 9418, route: "GET /seed", deadline: None, idempotent: true };
+        let x = Exchange { api: &api, tokens: &tokens, vm_id: &id, port: 9418, cap: CAP_WORKSPACE_V1, route: "GET /seed", deadline: None, idempotent: true };
         let xr = &x;
         let run = |script: Vec<Result<DpReply<SeedState>, BridgeError>>| {
             let script = Mutex::new(std::collections::VecDeque::from(script));
@@ -950,8 +1308,40 @@ mod tests {
         let e = r.unwrap_err();
         assert!(matches!(e, BridgeError::Terminated(_)), "{e:?}");
         assert_eq!(CliError::from(e).exit_code(), 8);
-        let late = Exchange { api: &api, tokens: &tokens, vm_id: &id, port: 9418, route: "GET /seed", deadline: Some(tokio::time::Instant::now()), idempotent: true };
+        let late = Exchange { api: &api, tokens: &tokens, vm_id: &id, port: 9418, cap: CAP_WORKSPACE_V1, route: "GET /seed", deadline: Some(tokio::time::Instant::now()), idempotent: true };
         let e = exchange(&late, |_t| async { Ok::<DpReply<SeedState>, BridgeError>(DpReply::status(200)) }).await.unwrap_err();
         assert!(matches!(&e, BridgeError::WorkspaceFailed { code: c, .. } if *c == crate::bridge::workspace::code::TOO_SLOW_FOR_INIT), "{e:?}");
+    }
+
+    /// S9: a 404 names the capability the route needs (`verdict` stays
+    /// `workspace_v1`'s, its text byte for byte); every other status maps as
+    /// before; a data plane that does not serve a transcript route fails
+    /// closed; the shim's JSON payload is this client's own cap.
+    #[tokio::test]
+    async fn a_404_names_the_routes_cap_and_unserved_routes_fail_closed() {
+        use crate::wire::frame::{CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1};
+        let (_, old) = fail_code(verdict("GET /seed", 9418, &DpReply::<SeedState>::status(404)));
+        let (_, same) = fail_code(verdict_cap("GET /seed", 9418, CAP_WORKSPACE_V1, &DpReply::<SeedState>::status(404)));
+        assert_eq!(old, same);
+        assert!(old.contains("older than S8"), "{old}");
+        for (cap, route) in [(CAP_GIT_HTTP_V1, "GET /workspace.git/info/refs"), (CAP_TRANSCRIPT_S3_V1, "POST /transcript/push")] {
+            match verdict_cap(route, 8080, cap, &DpReply::<SeedState>::status(404)) {
+                Verdict::Fail(e @ BridgeError::NoCapability { .. }) => {
+                    let text = e.to_string();
+                    assert!(text.contains(cap) && text.contains("older than S9") && text.contains(&format!("{route} answered 404")), "{text}");
+                    assert_eq!(exit(e), 7);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(matches!(verdict_cap(route, 8080, cap, &DpReply::<SeedState>::status(403)), Verdict::Remint { .. }));
+            assert!(matches!(verdict_cap(route, 8080, cap, &DpReply::<SeedState>::status(200)), Verdict::Done));
+        }
+        let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: crate::wire::redact::Secret::new("t".into()), vpc: true, shell: false };
+        let token = AuthToken { headers: std::collections::BTreeMap::new(), port: 8080, expires_at_unix: 0 };
+        let q = ViewQuery { rel: "s/u.jsonl".into(), n: 10 };
+        let e = Unreached.transcript_view(&target, &token, &q).await.unwrap_err();
+        assert!(matches!(&e, BridgeError::Config(m) if m == "GET /transcript/view: this data plane does not serve it (S9)"), "{e:?}");
+        assert_eq!(exit(e), 1);
+        assert_eq!(MAX_JSON, crate::wire::workspace::JSON_PAYLOAD_MAX, "the helper's payload fits the client's read");
     }
 }

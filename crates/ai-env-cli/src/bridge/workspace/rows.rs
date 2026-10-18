@@ -51,6 +51,9 @@ pub struct WsRow {
     pub last_fetch_at: Option<u64>,
     pub last_fetch_vm: Option<String>,
     pub last_wip: Option<String>,
+    /// S9: when (unix seconds) `box fetch` said that the workspace's
+    /// repository has no ai-env pre-push hook: it says so once.
+    pub hook_noted_at: Option<u64>,
     /// `refs/remotes/box/*` and `refs/remotes/box-quarantine/*` as the last
     /// fetch left them, to their commits (a snapshot past the cap gone).
     pub fetched: BTreeMap<String, String>,

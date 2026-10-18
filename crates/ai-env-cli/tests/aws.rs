@@ -724,6 +724,8 @@ async fn live_vm_token_expiry() {
 
 use ai_env_cli::bridge::egress::check::{self, Judgement, Markers, Verdict};
 use ai_env_cli::bridge::egress::{ConnectorAlias, ExpectedEcho};
+use ai_env_cli::bridge::lab::VmKnobs;
+use ai_env_cli::bridge::s3::S3Target;
 use ai_env_cli::bridge::transport::ShellAuth;
 use ai_env_cli::bridge::vm::client::SdkMicrovmApi;
 use ai_env_cli::bridge::vm::health::{read_health, Backoff};
@@ -762,7 +764,8 @@ struct Shelled {
 }
 
 /// The VM booted (its /health answers), then the named cases through the
-/// platform shell.
+/// platform shell, in one frame (`check::render_cases`: never a case that asks
+/// the transcripts bucket — the full check, [`shell_check`], runs those).
 async fn shell_cases(api: &SdkMicrovmApi, ep: &HttpsEndpoint, live: &Live, id: &str, names: &[&str]) -> Shelled {
     read_health(api, ep, &live.paths, id, Backoff::HEALTH).await.unwrap_or_else(|e| panic!("/health of {id}: {}", no_account(&e.to_string())));
     let nonce = check::new_nonce();
@@ -774,8 +777,31 @@ async fn shell_cases(api: &SdkMicrovmApi, ep: &HttpsEndpoint, live: &Live, id: &
     Shelled { markers, nonce, started_s, ended_s }
 }
 
-fn all_cases() -> Vec<&'static str> {
-    check::CASES.iter().map(|c| c.name).collect()
+/// The VM booted (its /health answers), then every case of `ai-env egress
+/// check` through the platform shell, as the command runs them: the script for
+/// the transcripts bucket state/infra.toml records (after the S9 deploy and
+/// `make infra-status WRITE=1`), the presigned URLs it reads typed only once
+/// it asks (`check::run_check_script`).
+async fn shell_check(api: &SdkMicrovmApi, ep: &HttpsEndpoint, live: &Live, id: &str) -> Shelled {
+    read_health(api, ep, &live.paths, id, Backoff::HEALTH).await.unwrap_or_else(|e| panic!("/health of {id}: {}", no_account(&e.to_string())));
+    let bucket = S3Target::resolve(&live.paths, &VmKnobs::default()).unwrap_or_else(|e| panic!("the transcripts bucket: {}", no_account(&e.to_string())));
+    let nonce = check::new_nonce();
+    let script = check::render_script_with(&nonce, &check::proxy_ip(&live.cfg, &live.paths), &check::S3Probe::of(&bucket));
+    let started_s = ai_env_cli::wire::time::unix_now();
+    let out = check::run_check_script(api, id, &script, &nonce, Some(&bucket), check::script_budget(check::CASES.len()), ShellAuth::Header)
+        .await
+        .unwrap_or_else(|e| panic!("the scripted shell on {id}: {}", no_account(&e.to_string())));
+    let ended_s = ai_env_cli::wire::time::unix_now();
+    let markers = check::parse_markers(&out, &nonce).unwrap_or_else(|e| panic!("the transcript of {id}: {e}"));
+    Shelled { markers, nonce, started_s, ended_s }
+}
+
+/// What the S3 cases are judged by besides their markers, as the command
+/// gathers it before the script runs: whether the VM runs with an execution
+/// role (its plan's, or its echo of one), and the Mac's anonymous GET of the
+/// front object.
+async fn live_s3_facts(plan: &RunPlan, vm: &ai_env_cli::bridge::api::VmInfo) -> check::S3Facts {
+    check::S3Facts { has_role: plan.execution_role_arn.is_some() || vm.execution_role_arn.is_some(), front: check::front_object().await }
 }
 
 /// The hosts `check::judge_with` records, not judges: those of `check::ALLOWLISTABLE` on the
@@ -802,9 +828,11 @@ fn live_egress_direct_closed() {
         let guard = VmGuard::new(&live);
         let api = connect(&live.creds).await;
         let ep = HttpsEndpoint::new().unwrap();
-        let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
-        let m = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers;
-        let j = check::judge_with(&m, &live_allowlisted());
+        let plan = egress_plan(&live);
+        let (_, vm, _) = start(&api, &ep, &live, &guard, &plan).await;
+        let s3 = live_s3_facts(&plan, &vm).await;
+        let m = shell_check(&api, &ep, &live, &vm.id).await.markers;
+        let j = check::judge_with(&m, &live_allowlisted(), &s3);
         show("live_egress_direct_closed", &vm.id, &j);
         assert!(j.finished, "the script did not finish");
         // Direct egress (name, IPv4 on 443 and 80, IPv6), every DNS path and the proxy's other ports closed (nothing
@@ -826,10 +854,12 @@ fn live_egress_proxy_allowlist() {
         let guard = VmGuard::new(&live);
         let api = connect(&live.creds).await;
         let ep = HttpsEndpoint::new().unwrap();
-        let (_, vm, _) = start(&api, &ep, &live, &guard, &egress_plan(&live)).await;
-        let run = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await;
+        let plan = egress_plan(&live);
+        let (_, vm, _) = start(&api, &ep, &live, &guard, &plan).await;
+        let s3 = live_s3_facts(&plan, &vm).await;
+        let run = shell_check(&api, &ep, &live, &vm.id).await;
         let skip = live_allowlisted();
-        let j = check::judge_with(&run.markers, &skip);
+        let j = check::judge_with(&run.markers, &skip, &s3);
         show("live_egress_proxy_allowlist", &vm.id, &j);
         // allowed (first and last) → 401 in a tunnel; denied (the nonce host), an IP literal, CONNECT :8443,
         // github.com → the proxy's CONNECT 403; plain http :8080 → squid's 403 — but github.com is recorded, not
@@ -985,8 +1015,9 @@ fn live_egress_after_resume() {
         let alias = ConnectorAlias::load(&live.paths, &plan.egress_connectors[0]);
         assert!(expected.matches(&after.egress, alias.as_ref()), "after resume {} echoes {:?}", vm.id, after.egress);
         // And egress is as closed, and the allowlist as open, as before the suspend.
-        let m = shell_cases(&api, &ep, &live, &vm.id, &all_cases()).await.markers;
-        let j = check::judge_with(&m, &live_allowlisted());
+        let s3 = live_s3_facts(&plan, &after).await;
+        let m = shell_check(&api, &ep, &live, &vm.id).await.markers;
+        let j = check::judge_with(&m, &live_allowlisted(), &s3);
         show("live_egress_after_resume", &vm.id, &j);
         assert!(j.passed(), "{:?}", j.failures());
     });
@@ -1608,6 +1639,12 @@ fn cred_world() -> Live {
 /// SIGTERM (it closes a Touch ID dialog and detaches on its own), then
 /// SIGKILL 5 s later, and the test fails, so its `VmGuard` acts.
 fn ai_env_live(live: &Live, args: &[&str]) -> std::process::Output {
+    ai_env_live_within(live, args, CRED_COMMAND_LIMIT)
+}
+
+/// [`ai_env_live`] bounded by `limit` in place of [`CRED_COMMAND_LIMIT`] (S9:
+/// a 1 GiB chat's stage, with the restore of `--warm`, and its sync).
+fn ai_env_live_within(live: &Live, args: &[&str], limit: Duration) -> std::process::Output {
     use std::io::Read;
     fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
@@ -1639,7 +1676,7 @@ fn ai_env_live(live: &Live, args: &[&str]) -> std::process::Output {
         if asked.is_none() && CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
             asked = Some(Instant::now());
         }
-        let due = started.elapsed() > CRED_COMMAND_LIMIT || asked.is_some_and(|t| t.elapsed() > Duration::from_secs(10));
+        let due = started.elapsed() > limit || asked.is_some_and(|t| t.elapsed() > Duration::from_secs(10));
         match termed {
             None if due => {
                 // SAFETY: kill(2) on our own child, which try_wait just saw running (not reaped).
@@ -1658,7 +1695,7 @@ fn ai_env_live(live: &Live, args: &[&str]) -> std::process::Output {
     eprintln!("ai-env {what}: exit {:?} in {} ms\n{}", out.status.code(), started.elapsed().as_millis(), no_account(&scrub(&String::from_utf8_lossy(&out.stderr))));
     let sig = CRED_SIGNAL.load(Ordering::SeqCst);
     assert_eq!(sig, 0, "interrupted during ai-env {what}: the guard terminates the test's VMs");
-    assert!(termed.is_none(), "ai-env {what} ran past {CRED_COMMAND_LIMIT:?} and was stopped");
+    assert!(termed.is_none(), "ai-env {what} ran past {limit:?} and was stopped");
     out
 }
 
@@ -1806,16 +1843,18 @@ async fn live_credential_never_enters_an_internet_vm() {
 // (made anew by each test), which a configured root must hold: else the test
 // fails, listing the roots. Each test runs in its own temporary bridge root
 // (the credential world's copies) with `[vm] max_duration_s = 900`, so every VM
-// its sessions start lives at most 15 minutes and has its row there, and
-// `migrate_before_wall_s = 300`, so a later chat reuses (or resumes) it for its
-// first ten minutes (at the default 1200 s a 900 s VM is never reused):
+// its sessions (or commands) start lives at most 15 minutes (S9's 1 GiB round
+// trip sets about 120) and has its row there, and `migrate_before_wall_s =
+// 300`, so a later chat reuses (or resumes) it for its first ten minutes (at
+// the default 1200 s a 900 s VM is never reused):
 // `SessionVms` terminates them all on every path the test unwinds through and,
 // unless the test already failed, asserts each is gone. The sessions make real
 // model requests with the operator's token. Touch IDs: one for the test
 // process's runtime key (`LIVE_CREDS`, when a test reads the service itself),
 // then one per wrapper process (D1) and one per `ai-env vm` or `box` command,
-// with a current combined.env. The Mac's mirror of each fixture's transcripts
-// goes where Cursor's would (`~/.claude/projects/<the fixture's slug>/`).
+// with a current combined.env. Each fixture's chat keeps its transcript in S3
+// (S9) and its view where Cursor's file would be
+// (`~/.claude/projects/<the fixture's slug>/`).
 // `live_wrapper_smoke` is `make s8-smoke`'s body; the API-host test needs
 // AI_ENV_AWS_SLOW=1 as well (about four minutes).
 
@@ -1853,8 +1892,8 @@ const LIVE_EXIT_LIMIT: Duration = Duration::from_secs(10);
 /// [`cred_world`] for a wrapper test: `[vm] max_duration_s = 900` and
 /// `migrate_before_wall_s = 300` (`reuse_candidate` takes a VM only with
 /// more wall left than that: at the default 1200 none of these would ever be
-/// reused), and `vm`'s other `[vm]` keys, written into the temporary root's
-/// bridge.toml.
+/// reused), and `vm`'s `[vm]` keys (set last: they win over those two),
+/// written into the temporary root's bridge.toml.
 fn wrapper_world(vm: &[(&str, toml::Value)]) -> Live {
     let mut live = cred_world();
     let mut doc: toml::Table = toml::from_str(&std::fs::read_to_string(&live.paths.config).unwrap()).expect("the copied bridge.toml");
@@ -1935,8 +1974,9 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// The VMs a wrapper test's sessions made, all with their rows in its temporary root: on drop every row's VM is
-/// terminated (on its own runtime and thread) and, unless the test already failed, each is asserted gone.
+/// The VMs a wrapper test's sessions and commands made (`session stage --warm` warms one), all with their rows in its
+/// temporary root: on drop every row's VM is terminated (on its own runtime and thread) and, unless the test already
+/// failed, each is asserted gone; when it failed, what is left is said.
 struct SessionVms {
     creds: RuntimeCreds,
     paths: Paths,
@@ -1982,8 +2022,14 @@ impl Drop for SessionVms {
         for line in said {
             let _ = writeln!(std::io::stderr(), "{line}");
         }
-        if !left.is_empty() && !std::thread::panicking() {
-            panic!("the test's VMs are not all gone: {}", left.join("; "));
+        if !left.is_empty() {
+            let left = format!("the test's VMs are not all gone: {}", left.join("; "));
+            // A test that failed already is told, never panicked again.
+            if std::thread::panicking() {
+                let _ = writeln!(std::io::stderr(), "guard: {left}");
+            } else {
+                panic!("{left}");
+            }
         }
     }
 }
@@ -2093,12 +2139,18 @@ impl Chat {
 
     /// `initialize`, answered within Cursor's window: how long it took.
     fn initialize(&mut self) -> Duration {
+        self.initialize_within(LIVE_INIT_LIMIT)
+    }
+
+    /// [`Chat::initialize`] answered within `limit` (S9: the reopen of a 1 GiB
+    /// chat, which claude may parse whole before it answers).
+    fn initialize_within(&mut self, limit: Duration) -> Duration {
         let t = Instant::now();
         self.send(&serde_json::json!({"type": "control_request", "request_id": "live-init", "request": {"subtype": "initialize"}}));
         loop {
-            let Some(v) = self.next(t + LIVE_INIT_LIMIT) else {
+            let Some(v) = self.next(t + limit) else {
                 let test = self.test;
-                panic!("{test}: no answer to initialize within {LIVE_INIT_LIMIT:?}; the wrapper's stderr: {}", self.stderr_now());
+                panic!("{test}: no answer to initialize within {limit:?}; the wrapper's stderr: {}", self.stderr_now());
             };
             if v["type"] == "control_response" && v["response"]["request_id"] == "live-init" {
                 assert_eq!(v["response"]["subtype"], "success", "{}: initialize answered {v}", self.test);
@@ -2110,13 +2162,19 @@ impl Chat {
     /// One user message and its turn, to its `result`: every `can_use_tool` request is allowed as asked, any other
     /// request of claude's answered with an error.
     fn turn(&mut self, text: &str) -> LiveTurn {
+        self.turn_within(text, LIVE_TURN_LIMIT)
+    }
+
+    /// [`Chat::turn`] answered within `limit` (S9: the first turn of a
+    /// reopened 1 GiB chat, which claude may parse whole first).
+    fn turn_within(&mut self, text: &str, limit: Duration) -> LiveTurn {
         let t = Instant::now();
         self.send(&serde_json::json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null, "session_id": "", "uuid": uuid::Uuid::now_v7().to_string()}));
         let mut turn = LiveTurn::default();
         loop {
-            let Some(v) = self.next(t + LIVE_TURN_LIMIT) else {
+            let Some(v) = self.next(t + limit) else {
                 let test = self.test;
-                panic!("{test}: no result within {LIVE_TURN_LIMIT:?} (tools used: {:?}, asked for: {:?}); the wrapper's stderr: {}", turn.used, turn.asked, self.stderr_now());
+                panic!("{test}: no result within {limit:?} (tools used: {:?}, asked for: {:?}); the wrapper's stderr: {}", turn.used, turn.asked, self.stderr_now());
             };
             match v["type"].as_str() {
                 Some("control_request") => {
@@ -2386,8 +2444,9 @@ fn live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip() {
 
 /// T8.5 live: a word told in a chat is recalled after its VM was terminated:
 /// the reopened chat (`--resume` of its session) starts a new VM, its
-/// transcript is put there before the spawn (`transcript:uploaded`, audited),
-/// and the conversation goes on. Three Touch IDs: two chats and the terminate.
+/// transcript is restored there from S3 before the spawn
+/// (`transcript:restored`, a `transcript_pull` audit row written), and the
+/// conversation goes on. Three Touch IDs: two chats and the terminate.
 #[test]
 #[ignore = "live, starts two MicroVMs and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
 fn live_wrapper_resume_into_a_new_vm_continues_the_conversation() {
@@ -2419,54 +2478,10 @@ fn live_wrapper_resume_into_a_new_vm_continues_the_conversation() {
     assert_eq!(second.session.as_deref(), Some(session.as_str()), "{TEST}: the same session id");
     let vm2 = note_part(&row, "vm").expect("the second VM");
     assert_ne!(vm2, vm1, "{TEST}: a new VM");
-    assert_eq!((note_part(&row, "vm_how").as_deref(), note_part(&row, "transcript").as_deref()), (Some("started"), Some("uploaded")), "{TEST}");
-    assert!(!live_audit(&live, "transcript_put").is_empty(), "{TEST}: the upload is audited");
+    assert_eq!((note_part(&row, "vm_how").as_deref(), note_part(&row, "transcript").as_deref()), (Some("started"), Some("restored")), "{TEST}");
+    assert!(live_audit(&live, "transcript_pull").iter().any(|r| r["detail"]["outcome"] == "written" && r["detail"]["vm"] == vm2.as_str()), "{TEST}: the pull into the new VM is audited");
     let (a, b) = (first.output(), second.output());
     sweep_live(&live, &[&a, &b, &terminate], &[]);
-}
-
-/// The VM's copy of a transcript wins: after a chat (its VM kept running), a
-/// shorter upload of that session's transcript (`PUT /transcript`, as a resume
-/// would send a Mac copy behind the VM's) is 409 `vm_longer` naming the VM's
-/// size, and the VM's copy stays as it was. Two Touch IDs: the chat and the
-/// test process's runtime key.
-#[tokio::test]
-#[ignore = "live, starts a MicroVM and asks the model (two Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
-async fn live_wrapper_shorter_transcript_upload_is_409() {
-    use ai_env_cli::bridge::dataplane::{DataPlane, HttpsEndpoint as DataEndpoint, MintingTokens, TokenSource};
-    const TEST: &str = "live_wrapper_shorter_transcript_upload_is_409";
-    if !cred_live() {
-        return;
-    }
-    let _signals = Interrupts::catch();
-    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
-    let _vms = SessionVms::new(&live);
-    let ws = s8_fixture(&live, "live-wrapper-transcript");
-    // The chat's waits block this test's one thread: nothing else runs on its runtime meanwhile.
-    let mut chat = Chat::open(TEST, &live, &ws, &[]);
-    chat.initialize();
-    chat.turn("Reply with exactly OK");
-    let (code, close) = chat.close();
-    let row = assert_closed_well(TEST, &live, &chat, code, close);
-    let (vm, session) = (note_part(&row, "vm").expect("the chat's VM"), chat.session.clone().expect("the chat's session id"));
-    let rel = ai_env_cli::bridge::registry::read(&live.paths, &session).unwrap().and_then(|r| r.transcript_rel).expect("the session's transcript_rel");
-    let api = connect(&live.creds).await;
-    let vm_row = vm_rows::read_row(&live.paths, &vm).unwrap().expect("the VM's row");
-    let target = AgentTarget::from_row(&vm_row).unwrap();
-    let dp = DataEndpoint::new(&ai_env_cli::bridge::lab::VmKnobs::default()).unwrap();
-    let tokens = MintingTokens::new(&api, &live.paths, &vm, false);
-    let token = tokens.token(ai_env_cli::wire::workspace::APP_PORT).await.unwrap_or_else(|e| panic!("{TEST}: a Port(8080) token: {}", no_account(&e.to_string())));
-    let before = dp.transcript_stat(&target, &token, &rel).await.unwrap().body.expect("the VM's stat");
-    assert!(before.present && before.size > 1, "{TEST}: the VM holds the session's transcript: {before:?}");
-    let shorter = live.paths.root.join("shorter.jsonl");
-    std::fs::write(&shorter, vec![b'\n'; usize::try_from(before.size - 1).unwrap()]).unwrap();
-    let put = dp.put_transcript(&target, &token, &rel, &shorter, before.size - 1).await.unwrap();
-    let refusal = put.refusal.clone().unwrap_or_else(|| panic!("{TEST}: HTTP {} without a refusal", put.status));
-    assert_eq!((put.status, refusal.code.as_str(), refusal.size), (409, "vm_longer", Some(before.size)), "{TEST}: {refusal:?}");
-    let after = dp.transcript_stat(&target, &token, &rel).await.unwrap().body.expect("the VM's stat");
-    assert_eq!((after.size, after.sha256.clone()), (before.size, before.sha256.clone()), "{TEST}: the VM's copy stays");
-    let out = chat.output();
-    sweep_live(&live, &[&out], &[]);
 }
 
 /// A secret in the workspace is caught before anything leaves the Mac: an
@@ -2650,6 +2665,790 @@ fn live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget() {
     assert_ne!(code, Some(5), "{TEST}: nothing was refused");
     assert_ne!(note_part(&row, "end").as_deref(), Some("credential_rejected"), "{TEST}");
     assert!(close.as_millis() <= u128::from(CLOSE_BUDGET_MS), "{TEST}: the close took {} ms", close.as_millis());
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
+}
+
+// ---- S9: smart-HTTP, review, the push path and the S3 store, live (part B: B3 to B6) --------
+//
+// S9 wave 2 (G8). The smart-HTTP tests (`make test-aws`: AI_ENV_AWS_TESTS=1)
+// run the real CLI in a temporary bridge root holding what a vpc VM's run and
+// gate read ([`s9_world`]): `vm run --egress vpc --workspace` on a fixture
+// under this checkout's `target/s8/` (a configured root must hold it, as for
+// S8's), `box seed`, commits made in the VM as the agent (`vm exec`), then
+// `box fetch` either way and `box review` (no AWS call, no Touch ID). One
+// Touch ID per `ai-env vm` or `box` command that reaches AWS, and the test
+// process's own once when it reads the service itself (`LIVE_CREDS`).
+// `SessionVms` ends every VM whose row is in the temporary root. The re-mint
+// after expiry needs AI_ENV_AWS_SLOW=1 and, in the test process's own
+// environment, AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES (`make test-aws SLOW=1`
+// sets 2): its 9418 tokens are minted in process, by `MintingTokens`.
+// The S3 store's tests (`make test-aws S3=1`: AI_ENV_S3_TESTS=1) are chats
+// of the real `ai-env-claude` in remote mode on S8's rig (`wrapper_world`,
+// `Chat`; the setup-token sealed), on an image and a Mac past S9's cut-over:
+// a chat's turns land in S3 and the Mac keeps the view; a reopen in a new VM
+// restores from S3; a 1 GiB chat begun on the Mac is staged with `--warm`
+// (restored into the VM its reopen takes) and round-trips (its rates printed,
+// and claude's memory with it open); the Mac cannot read the VM's objects,
+// nor write one.
+// Each purges its chat's objects at its end (`session forget --purge`, one
+// Touch ID more: `PurgeTranscripts`).
+
+use ai_env_cli::bridge::dataplane::{HttpsEndpoint as DataEndpoint, MintingTokens, TokenSource};
+use ai_env_cli::bridge::gitsmart::Client as SmartHttp;
+use ai_env_cli::wire::workspace::{ObjectFormat, APP_PORT as S9_APP_PORT, CODE_PORT as S9_CODE_PORT};
+
+/// Whether the S3 store's live tests run: [`live`], and AI_ENV_S3_TESTS=1 (`make test-aws S3=1`).
+fn s3_live() -> bool {
+    if !live() {
+        return false;
+    }
+    if std::env::var("AI_ENV_S3_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_S3_TESTS=1 too (make test-aws S3=1) for the S3 store's chats");
+    false
+}
+
+/// [`live_world`] with what a vpc VM's run and gate read (the egress
+/// records and the dns-path rows, as [`cred_world`] copies them; no
+/// setup-token) and `[vm] max_duration_s = 900`.
+fn s9_world() -> Live {
+    let mut live = live_world();
+    let real = Paths::resolve().expect("the real bridge root");
+    for (from, to) in [(real.egress_verified(), live.paths.egress_verified()), (real.probes(), live.paths.probes())] {
+        if from.exists() {
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+    let mut doc: toml::Table = toml::from_str(&std::fs::read_to_string(&live.paths.config).unwrap()).expect("the copied bridge.toml");
+    let table = doc.entry("vm").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    table.as_table_mut().expect("[vm] is a table").insert("max_duration_s".into(), toml::Value::Integer(900));
+    std::fs::write(&live.paths.config, toml::to_string(&doc).unwrap()).unwrap();
+    live.cfg = BridgeConfig::load(&live.paths).unwrap().expect("bridge.toml");
+    live
+}
+
+/// A git command line as the agent's own, for a commit made in the VM: the fixture's author, no signing.
+const VM_GIT: &str = "git -c user.name=ai-env-live -c user.email=live@ai-env.invalid -c commit.gpgsign=false";
+
+/// The fixture `ws`'s vpc VM (`vm run --workspace`), seeded (`box seed`): its id. Two Touch IDs.
+fn s9_seeded_vm(test: &str, live: &Live, ws: &str) -> String {
+    let run = ai_env_live(live, &["vm", "run", "--egress", "vpc", "--workspace", ws, "--json"]);
+    assert_eq!(run.status.code(), Some(0), "{test}: vm run");
+    let v: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap_or_else(|e| panic!("{test}: vm run --json: {e}"));
+    let id = v["id"].as_str().unwrap_or_else(|| panic!("{test}: no id in {v}")).to_string();
+    let (code, seeded, _) = box_json(test, live, &["seed", ws]);
+    assert_eq!((code, seeded["outcome"].as_str(), seeded["vm"].as_str()), (Some(0), Some("seeded"), Some(id.as_str())), "{test}: {seeded}");
+    id
+}
+
+/// `sh -c <script>` in the VM `vm` at `path`, as the agent (`vm exec`, one Touch ID): its stdout trimmed, after exit 0.
+fn vm_sh(test: &str, live: &Live, vm: &str, path: &str, script: &str) -> (String, std::process::Output) {
+    let out = ai_env_live(live, &["vm", "exec", vm, "--cwd", path, "--", "sh", "-c", script]);
+    assert_eq!(out.status.code(), Some(0), "{test}: vm exec: {}", String::from_utf8_lossy(&out.stdout));
+    (String::from_utf8_lossy(&out.stdout).trim().to_string(), out)
+}
+
+/// `ai-env box <args> --json` in the test's root: its exit and its JSON document.
+fn box_json(test: &str, live: &Live, args: &[&str]) -> (Option<i32>, serde_json::Value, std::process::Output) {
+    let mut all = vec!["box"];
+    all.extend_from_slice(args);
+    all.push("--json");
+    let out = ai_env_live(live, &all);
+    let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{test}: box {args:?} --json ({e}): {}", String::from_utf8_lossy(&out.stdout)));
+    (out.status.code(), v, out)
+}
+
+/// A fetch's `report.<key>` (`promoted`, `quarantined`): full ref name to commit.
+fn report_refs(v: &serde_json::Value, key: &str) -> BTreeMap<String, String> {
+    v["report"][key].as_object().map(|m| m.iter().filter_map(|(r, id)| id.as_str().map(|id| (r.clone(), id.to_string()))).collect()).unwrap_or_default()
+}
+
+/// T9.2 live (B3): smart-HTTP promotes what `/codeout` promotes. In a seeded
+/// vpc VM the agent commits on `main` and on a branch of its own; `box fetch`
+/// (`/codeout`) promotes both heads at the VM's tips; with those refs deleted
+/// on the Mac, `box fetch --smart-http` promotes exactly the same map; the
+/// audit names each fetch's way. Five Touch IDs: vm run, box seed, vm exec,
+/// the two fetches.
+#[test]
+#[ignore = "live, starts a vpc MicroVM (five Touch IDs: vm run, box seed, vm exec, two box fetch): AI_ENV_AWS_TESTS=1 make test-aws"]
+fn live_box_fetch_smart_http_matches_codeout() {
+    const TEST: &str = "live_box_fetch_smart_http_matches_codeout";
+    if !live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s9_world();
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s9-smart-http");
+    let path = ws.display().to_string();
+    let vm = s9_seeded_vm(TEST, &live, &path);
+    let script = format!(
+        "git checkout -q -b feature && printf 'a feature\\n' > feature.txt && git add feature.txt && {VM_GIT} commit -q -m 'a feature' && git checkout -q main && printf 'on main\\n' > main.txt && git add main.txt && {VM_GIT} commit -q -m 'on main' && git for-each-ref --format='%(refname) %(objectname)' refs/heads"
+    );
+    let (heads, exec) = vm_sh(TEST, &live, &vm, &path, &script);
+    let heads: BTreeMap<String, String> = heads.lines().filter_map(|l| l.split_once(' ')).map(|(r, id)| (r.replacen("refs/heads/", "refs/remotes/box/", 1), id.to_string())).collect();
+    assert_eq!(heads.len(), 2, "{TEST}: main and feature in the VM: {heads:?}");
+    let (code, codeout, a) = box_json(TEST, &live, &["fetch", &path]);
+    assert_eq!((code, codeout["via"].as_str()), (Some(0), Some("codeout")), "{TEST}: {codeout}");
+    let promoted = report_refs(&codeout, "promoted");
+    for (r, id) in &heads {
+        assert_eq!(promoted.get(r), Some(id), "{TEST}: /codeout promoted {r} at the VM's tip: {codeout}");
+    }
+    for r in promoted.keys() {
+        fixture_git(&ws, &["update-ref", "-d", r]);
+    }
+    let (code, smart, b) = box_json(TEST, &live, &["fetch", &path, "--smart-http"]);
+    assert_eq!((code, smart["via"].as_str()), (Some(0), Some("smart-http")), "{TEST}: {smart}");
+    assert_eq!(report_refs(&smart, "promoted"), promoted, "{TEST}: smart-HTTP promotes what /codeout promoted");
+    let vias: Vec<String> = live_audit(&live, "codeout_fetch").iter().filter_map(|r| r["detail"]["via"].as_str().map(str::to_string)).collect();
+    assert_eq!(vias, ["codeout", "smart-http"], "{TEST}: each fetch audited with its way");
+    eprintln!("{TEST}: both ways promoted {} refs: {:?}", promoted.len(), promoted.keys().collect::<Vec<_>>());
+    sweep_live(&live, &[&exec, &a, &b], &[]);
+}
+
+/// Hands out, for whatever port is asked, a `Port(8080)` token minted for
+/// the VM and labelled with the asked port: on 9418, the token of the wrong
+/// port. Counts its mints and forgets.
+struct WrongPortTokens<'a> {
+    api: &'a SdkMicrovmApi,
+    vm: String,
+    minted: std::sync::atomic::AtomicU32,
+    forgot: std::sync::atomic::AtomicU32,
+}
+
+impl TokenSource for WrongPortTokens<'_> {
+    async fn token(&self, port: u16) -> Result<AuthToken, BridgeError> {
+        self.minted.fetch_add(1, Ordering::SeqCst);
+        let t = self.api.create_auth_token(&self.vm, 5, S9_APP_PORT).await?;
+        Ok(AuthToken { port, ..t })
+    }
+
+    fn forget(&self, _port: u16) {
+        self.forgot.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// T9.2 live (B3): a token of the wrong port on the code port is refused by
+/// the endpoint twice: smart-HTTP's advertisement sends with an 8080 token
+/// on 9418, is refused (403, `x-aws-proxy-error: UNAUTHORIZED`, as S4
+/// measured a wrong-port token), forgets it, mints once more, is refused
+/// again, and stops: `TokenRejected` on 9418, exit 7. One Touch ID (the test
+/// process's runtime key).
+#[tokio::test]
+#[ignore = "live, starts a MicroVM (one Touch ID): AI_ENV_AWS_TESTS=1 make test-aws"]
+async fn live_smart_http_wrong_port_token_403_twice() {
+    if !live() {
+        return;
+    }
+    let live = live_world();
+    let guard = VmGuard::new(&live);
+    let api = connect(&live.creds).await;
+    let ep = HttpsEndpoint::new().unwrap();
+    let (_, vm, _) = start(&api, &ep, &live, &guard, &test_plan(&live, None)).await;
+    read_health(&api, &ep, &live.paths, &vm.id, Backoff::HEALTH).await.unwrap();
+    let row = vm_rows::read_row(&live.paths, &vm.id).unwrap().expect("the VM's row");
+    let target = AgentTarget::from_row(&row).unwrap();
+    let tokens = WrongPortTokens { api: &api, vm: vm.id.clone(), minted: std::sync::atomic::AtomicU32::new(0), forgot: std::sync::atomic::AtomicU32::new(0) };
+    let dp = DataEndpoint::new(&VmKnobs::default()).unwrap();
+    let client = SmartHttp { api: &api, tokens: &tokens, git: &dp, target: &target };
+    let e = client.advertise(ObjectFormat::Sha1).await.expect_err("a token of the wrong port never passes");
+    eprintln!("live_smart_http_wrong_port_token_403_twice: {}", no_account(&e.to_string()));
+    assert!(matches!(&e, BridgeError::TokenRejected { port: S9_CODE_PORT, status: 403, proxy_error: Some(p) } if p == "UNAUTHORIZED"), "{}", no_account(&e.to_string()));
+    assert_eq!((tokens.minted.load(Ordering::SeqCst), tokens.forgot.load(Ordering::SeqCst)), (2, 1), "refused, forgotten, minted once more, refused again");
+    assert_eq!(CliError::from(e).exit_code(), 7);
+}
+
+/// T9.2 live (B3, SLOW): a 9418 token that expired is minted again, and
+/// smart-HTTP goes on. With the code-token knob (2 minutes under `make
+/// test-aws SLOW=1`), a seeded VM's advertisement is asked through
+/// `MintingTokens`, which records each mint's expiry in the VM's row; past
+/// that expiry the next advertisement mints a new token (the row's 9418
+/// expiry moves on) and is answered. Three Touch IDs: vm run, box seed, the
+/// test process's runtime key.
+#[tokio::test]
+#[ignore = "live, about four minutes, starts a vpc MicroVM (three Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2 (make test-aws SLOW=1)"]
+async fn live_smart_http_remints_after_expiry() {
+    const TEST: &str = "live_smart_http_remints_after_expiry";
+    if !live() {
+        return;
+    }
+    if std::env::var("AI_ENV_AWS_SLOW").as_deref() != Ok("1") {
+        eprintln!("skipped: set AI_ENV_AWS_SLOW=1 (make test-aws SLOW=1) for the re-mint after a code token's expiry");
+        return;
+    }
+    let Some(minutes) = ai_env_cli::bridge::lab::vm_knobs().code_token_minutes().filter(|m| *m <= 3) else {
+        panic!("{TEST}: set AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES to 1, 2 or 3 in the test's environment (make test-aws SLOW=1 sets 2)");
+    };
+    let _signals = Interrupts::catch();
+    let live = s9_world();
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s9-remint");
+    let path = ws.display().to_string();
+    let vm = s9_seeded_vm(TEST, &live, &path);
+    let api = connect(&live.creds).await;
+    let row = vm_rows::read_row(&live.paths, &vm).unwrap().expect("the VM's row");
+    let target = AgentTarget::from_row(&row).unwrap();
+    let dp = DataEndpoint::new(&VmKnobs::default()).unwrap();
+    let tokens = MintingTokens::new(&api, &live.paths, &vm, false);
+    let client = SmartHttp { api: &api, tokens: &tokens, git: &dp, target: &target };
+    let expiry = || vm_rows::read_row(&live.paths, &vm).unwrap().and_then(|r| r.token_expiries.get("9418").copied()).unwrap_or_else(|| panic!("{TEST}: no 9418 token's expiry in the row"));
+    let first = client.advertise(ObjectFormat::Sha1).await.unwrap_or_else(|e| panic!("{TEST}: {}", no_account(&e.to_string())));
+    let (minted, now) = (expiry(), ai_env_cli::wire::time::unix_now());
+    assert!(minted <= now + u64::from(minutes) * 60 + 5, "{TEST}: the 9418 token lasts the knob's {minutes} minutes: it expires at {minted}, now {now}");
+    tokio::time::sleep(Duration::from_secs(minted.saturating_sub(now) + 15)).await;
+    assert!(ai_env_cli::wire::time::unix_now() > minted, "{TEST}: the first token has expired");
+    let second = client.advertise(ObjectFormat::Sha1).await.unwrap_or_else(|e| panic!("{TEST}: after the expiry: {}", no_account(&e.to_string())));
+    let again = expiry();
+    eprintln!("{TEST}: a {minutes}-minute 9418 token expired at {minted}; the next advertisement minted one to {again}");
+    assert!(again > minted, "{TEST}: a new token was minted once the first expired");
+    assert_eq!(first, second, "{TEST}: the same advertisement");
+}
+
+/// `ai-env box review <rev> --repo <ws> --json` (no AWS call, no Touch ID): its exit and JSON.
+fn review(test: &str, live: &Live, ws: &str, rev: &str) -> (Option<i32>, serde_json::Value, std::process::Output) {
+    box_json(test, live, &["review", rev, "--repo", ws])
+}
+
+/// T9.3 live (B4): the review loop, and no tag leaks. In a seeded vpc VM
+/// the agent commits and tags; `box fetch --smart-http` brings the commit
+/// and never the tag, and `box review` passes it. A commit holding an
+/// access-key shape (built here) comes in quarantined (exit 9), and `box
+/// review` of it exits 9 naming the file and line, never the value. The
+/// agent drops that commit and commits clean: the next fetch moves
+/// `box/main` there, and its review passes. No `refs/tags/*` ever came to
+/// the Mac; nothing was pushed anywhere. Nine Touch IDs: the test process's
+/// runtime key, vm run, box seed, three vm exec, three box fetch (the reviews
+/// take none).
+#[test]
+#[ignore = "live, starts a vpc MicroVM (nine Touch IDs: the test process's runtime key, vm run, box seed, three vm exec, three box fetch): AI_ENV_AWS_TESTS=1 make test-aws"]
+fn live_review_loop_and_tag_leak() {
+    const TEST: &str = "live_review_loop_and_tag_leak";
+    if !live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s9_world();
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s9-review");
+    let path = ws.display().to_string();
+    let vm = s9_seeded_vm(TEST, &live, &path);
+    let mut outs = Vec::new();
+    let (clean, o) = vm_sh(TEST, &live, &vm, &path, &format!("printf 'clean\\n' > clean.txt && git add clean.txt && {VM_GIT} commit -q -m 'a clean change' && git tag v-leak && git rev-parse HEAD"));
+    outs.push(o);
+    let (code, fetched, o) = box_json(TEST, &live, &["fetch", &path, "--smart-http"]);
+    outs.push(o);
+    assert_eq!((code, report_refs(&fetched, "promoted").get("refs/remotes/box/main")), (Some(0), Some(&clean)), "{TEST}: {fetched}");
+    let (code, reviewed, o) = review(TEST, &live, &path, "refs/remotes/box/main");
+    outs.push(o);
+    assert_eq!((code, reviewed["verdict"].as_str()), (Some(0), Some("pass")), "{TEST}: {reviewed}");
+    // A key shape, built here: the fetch quarantines it, the review names where it is.
+    let key = format!("{}{}", "AKIA", "Q7ZT".repeat(4));
+    let (planted, o) = vm_sh(TEST, &live, &vm, &path, &format!("printf 'aws_access_key_id = %s\\n' {key} > leak.txt && git add leak.txt && {VM_GIT} commit -q -m 'a planted key' && git rev-parse HEAD"));
+    outs.push(o);
+    let (code, fetched, o) = box_json(TEST, &live, &["fetch", &path, "--smart-http"]);
+    outs.push(o);
+    assert_eq!((code, report_refs(&fetched, "quarantined").get("refs/remotes/box-quarantine/main")), (Some(9), Some(&planted)), "{TEST}: {fetched}");
+    let (code, reviewed, o) = review(TEST, &live, &path, "refs/remotes/box-quarantine/main");
+    outs.push(o);
+    assert_eq!((code, reviewed["verdict"].as_str()), (Some(9), Some("findings")), "{TEST}: {reviewed}");
+    let findings = reviewed["findings"].as_array().cloned().unwrap_or_default();
+    assert!(findings.iter().any(|f| f["path"] == "leak.txt" && f["line"] == 1 && f["commit"] == planted.as_str()), "{TEST}: the finding names leak.txt:1 in the planted commit: {reviewed}");
+    // The loop: the agent drops the commit and commits clean.
+    let (fixed, o) = vm_sh(TEST, &live, &vm, &path, &format!("git reset -q --hard HEAD~1 && printf 'fixed\\n' > fixed.txt && git add fixed.txt && {VM_GIT} commit -q -m 'without the key' && git rev-parse HEAD"));
+    outs.push(o);
+    let (code, fetched, o) = box_json(TEST, &live, &["fetch", &path, "--smart-http"]);
+    outs.push(o);
+    assert_eq!((code, report_refs(&fetched, "promoted").get("refs/remotes/box/main")), (Some(0), Some(&fixed)), "{TEST}: {fetched}");
+    let (code, reviewed, o) = review(TEST, &live, &path, "refs/remotes/box/main");
+    outs.push(o);
+    assert_eq!((code, reviewed["verdict"].as_str()), (Some(0), Some("pass")), "{TEST}: the fixed range passes: {reviewed}");
+    assert_eq!(fixture_git(&ws, &["for-each-ref", "refs/tags", "refs/remotes/box/tags", "refs/remotes/box-quarantine/tags"]), "", "{TEST}: the VM's tag never reached the Mac");
+    assert_eq!(fixture_git(&ws, &["remote"]), "", "{TEST}: the fixture has no remote: nothing could be pushed");
+    sweep_live(&live, &outs.iter().collect::<Vec<_>>(), &[key.as_str()]);
+}
+
+/// T9.4 live (B5): the VM has no push path. In a seeded vpc VM, as the
+/// agent: `git push` finds no destination; there is no `~/.ssh`,
+/// `~/.config/gh` or `~/.git-credentials`; git's user is `claude-agent`
+/// (the image's); and github.com is refused at the egress proxy (its
+/// CONNECT answered 403). Four Touch IDs: the test process's runtime key,
+/// vm run, box seed, vm exec.
+#[test]
+#[ignore = "live, starts a vpc MicroVM (four Touch IDs: the test process's runtime key, vm run, box seed, vm exec): AI_ENV_AWS_TESTS=1 make test-aws"]
+fn live_vm_has_no_push_path() {
+    const TEST: &str = "live_vm_has_no_push_path";
+    if !live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s9_world();
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s9-no-push");
+    let path = ws.display().to_string();
+    let vm = s9_seeded_vm(TEST, &live, &path);
+    let script = "git push 2>&1; echo \"push=$?\"; for p in \"$HOME/.ssh\" \"$HOME/.config/gh\" \"$HOME/.git-credentials\"; do if [ -e \"$p\" ]; then echo \"present=$p\"; fi; done; \
+                  echo \"user=$(git config user.name)\"; echo \"github=$(curl -s -o /dev/null --max-time 20 -w '%{http_connect} %{http_code}' https://github.com/)\"";
+    let (said, out) = vm_sh(TEST, &live, &vm, &path, script);
+    eprintln!("{TEST}:\n{said}");
+    assert!(said.contains("No configured push destination"), "{TEST}: git push: {said}");
+    assert!(said.lines().any(|l| l.starts_with("push=") && l != "push=0"), "{TEST}: the push failed: {said}");
+    assert!(!said.lines().any(|l| l.starts_with("present=")), "{TEST}: a credential store in the VM: {said}");
+    assert!(said.lines().any(|l| l == "user=claude-agent"), "{TEST}: git's user: {said}");
+    assert!(said.lines().any(|l| l.starts_with("github=403 ")), "{TEST}: github.com refused at the proxy: {said}");
+    sweep_live(&live, &[&out], &[]);
+}
+
+/// The Mac's projects directory, where Cursor's chats and a remote chat's view live.
+fn mac_projects() -> std::path::PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".claude"), std::path::PathBuf::from).join("projects")
+}
+
+/// The manifest the Mac keeps of `session`'s transcript in S3 (`state/transcripts/<sid>/manifest.toml`).
+fn s3_manifest(test: &str, live: &Live, session: &str) -> toml::Table {
+    let path = live.paths.transcript_manifest(session);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{test}: {}: {e}", path.display()));
+    toml::from_str(&text).unwrap_or_else(|e| panic!("{test}: {}: {e}", path.display()))
+}
+
+/// The manifest's parts: (key, version id) each.
+fn manifest_parts(m: &toml::Table) -> Vec<(String, Option<String>)> {
+    m.get("parts").and_then(toml::Value::as_array).map(|parts| parts.iter().filter_map(|p| Some((p.get("key")?.as_str()?.to_string(), p.get("version_id").and_then(toml::Value::as_str).map(str::to_string)))).collect()).unwrap_or_default()
+}
+
+/// A request of the Mac to the transcripts bucket with its own runtime key
+/// (outside the gateway endpoint): `method` on `key` (`version` when
+/// given), `headers` signed besides the owner's: S3's status and `<Code>`.
+async fn mac_s3(api: &SdkMicrovmApi, target: &ai_env_cli::bridge::s3::S3Target, method: ai_env_cli::bridge::s3::S3Method, key: &str, version: Option<&str>, headers: Vec<(String, String)>, body: Vec<u8>) -> (u16, Option<String>) {
+    use ai_env_cli::bridge::s3::{presign, S3Method, S3Sign};
+    let query = version.map(|v| vec![("versionId".to_string(), v.to_string())]).unwrap_or_default();
+    let req = presign::request(method, target, Some(key.to_string()), query, headers, ai_env_cli::wire::s3::PRESIGN_EXPIRY);
+    let url = api.presign(&req).await.unwrap_or_else(|e| panic!("presign: {}", no_account(&e.to_string())));
+    let verb = if method == S3Method::Put { reqwest::Method::PUT } else { reqwest::Method::GET };
+    let mut rb = tls::reqwest_client().unwrap().request(verb, url.expose());
+    for (name, value) in &req.headers {
+        rb = rb.header(name.as_str(), value.as_str());
+    }
+    // Never reqwest's Display or Debug of a send failure: either holds the presigned URL (its signature, the
+    // runtime key's id, the bucket), which `--nocapture` would print. The URL goes at its source, the rest is scrubbed.
+    let resp = rb.body(body).send().await.unwrap_or_else(|e| panic!("the request to S3: {}", no_account(&scrub(&e.without_url().to_string()))));
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    (status, ai_env_cli::bridge::s3::client::error_code(&text))
+}
+
+/// The bucket of the test's root (`state/infra.toml`'s, copied).
+fn s3_target(live: &Live) -> ai_env_cli::bridge::s3::S3Target {
+    ai_env_cli::bridge::s3::S3Target::resolve(&live.paths, &VmKnobs::default()).unwrap_or_else(|e| panic!("the transcripts bucket: {e} (run make infra-status WRITE=1 after the S9 deploy)"))
+}
+
+/// The S3 transcripts of a test's chats, purged when the test ends, passed or
+/// failed: `session forget <sid> --purge` in the test's root (one Touch ID
+/// each) for every session it keeps transcript state of
+/// (`state/transcripts/<sid>/`). That deletes the objects under
+/// `v1/<sid>/`, which only the temporary root's manifests name (no later
+/// `session gc --remote` would find them), and the view. Made after
+/// [`SessionVms`] and before the chats: it runs once they closed, before
+/// their VMs are terminated. Interrupted, or when a purge fails, the prefix
+/// to delete by hand is printed.
+struct PurgeTranscripts<'a>(&'a Live);
+
+impl Drop for PurgeTranscripts<'_> {
+    fn drop(&mut self) {
+        let live = self.0;
+        let mut sessions: Vec<String> = std::fs::read_dir(live.paths.transcripts()).map(|dir| dir.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| ai_env_cli::bridge::registry::is_uuid(n)).collect()).unwrap_or_default();
+        sessions.sort();
+        for sid in sessions {
+            let by_hand = format!("its objects under v1/{sid}/ in the transcripts bucket are left: delete them by hand");
+            let said = if CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
+                format!("guard: interrupted, session forget {sid} --purge not run: {by_hand}")
+            } else {
+                // A panic of the command's runner (stopped past its limit) is caught: a drop never panics.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ai_env_live(live, &["session", "forget", &sid, "--purge"]))) {
+                    Ok(out) if out.status.success() => format!("guard: purged the transcript of {sid}"),
+                    Ok(out) => format!("guard: session forget {sid} --purge exited {:?}: {by_hand}", out.status.code()),
+                    Err(_) => format!("guard: session forget {sid} --purge did not finish: {by_hand}"),
+                }
+            };
+            let _ = writeln!(std::io::stderr(), "{said}");
+        }
+    }
+}
+
+/// A remote chat's view on the Mac, as its session row names it: its lines,
+/// after asserting the file is a view (`wire::view::is_view_head`) holding at
+/// most `[transcript].view_messages` messages.
+fn assert_a_view(test: &str, live: &Live, session: &str) -> Vec<String> {
+    let row = ai_env_cli::bridge::registry::read(&live.paths, session).unwrap().unwrap_or_else(|| panic!("{test}: no session row of {session}"));
+    assert_eq!((row.transcript_home.as_deref(), row.origin.as_deref()), (Some("s3"), Some("vm")), "{test}: the session's transcript is kept in S3, begun in the VM");
+    let view = mac_projects().join(row.view.as_deref().unwrap_or_else(|| panic!("{test}: the row names no view")));
+    let bytes = std::fs::read(&view).unwrap_or_else(|e| panic!("{test}: {}: {e}", view.display()));
+    assert!(ai_env_cli::wire::view::is_view_head(&bytes[..bytes.len().min(ai_env_cli::wire::view::VIEW_HEAD_READ)]), "{test}: {} is no view", view.display());
+    let lines: Vec<String> = String::from_utf8_lossy(&bytes).lines().map(str::to_string).collect();
+    let messages = lines.iter().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|v| v["type"] == "user" || v["type"] == "assistant").count();
+    assert!(messages >= 1 && messages <= live.cfg.transcript.view_messages as usize, "{test}: the view holds {messages} messages (at most {})", live.cfg.transcript.view_messages);
+    lines
+}
+
+/// T9 S3 live (B6): a chat's turns land in S3, not on the Mac. Two turns of
+/// a chat in remote mode, then: the session row keeps its transcript in S3
+/// (`transcript_home`, `origin` vm); the Mac's manifest lists parts of the
+/// VM's (`v1/<sid>/vm/…`, each with its version), and S3 lists them; the
+/// Mac's file is the view (its mark first, at most the configured messages);
+/// each push was audited (S3 answered 200) and the view written; and a GET
+/// of a part by the Mac is refused (403). The chat's objects are purged at
+/// the end ([`PurgeTranscripts`]). Three Touch IDs: the chat's, the test
+/// process's runtime key, the purge.
+#[test]
+#[ignore = "live, S9's S3 store, starts a MicroVM and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
+fn live_s3_turn_lands_in_s3_not_on_mac() {
+    const TEST: &str = "live_s3_turn_lands_in_s3_not_on_mac";
+    if !s3_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _vms = SessionVms::new(&live);
+    let _purge = PurgeTranscripts(&live);
+    let ws = s8_fixture(&live, "live-s3-turn");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    for n in 1..=2 {
+        let turn = chat.turn(&format!("Reply with exactly OK {n}"));
+        assert_eq!(turn.result["is_error"], false, "{TEST}: turn {n}: {}", turn.result);
+    }
+    let (code, close) = chat.close();
+    assert_closed_well(TEST, &live, &chat, code, close);
+    let session = chat.session.clone().expect("the chat's session id");
+    let lines = assert_a_view(TEST, &live, &session);
+    let manifest = s3_manifest(TEST, &live, &session);
+    let parts = manifest_parts(&manifest);
+    let prefix = format!("v1/{session}/vm/");
+    assert!(!parts.is_empty() && parts.iter().all(|(k, v)| k.starts_with(&prefix) && v.is_some()), "{TEST}: the manifest's parts: {parts:?}");
+    let pushes = live_audit(&live, "transcript_push");
+    assert!(!pushes.is_empty() && pushes.iter().all(|r| r["detail"]["s3_status"] == "200"), "{TEST}: the pushes: {pushes:?}");
+    assert!(live_audit(&live, "transcript_view").iter().any(|r| r["detail"]["outcome"] == "written"), "{TEST}: the view was written");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (listed, refused) = rt.block_on(async {
+        use ai_env_cli::bridge::s3::{client::S3Client, S3Method};
+        let api = connect(&live.creds).await;
+        let target = s3_target(&live);
+        let listed: Vec<String> = S3Client::new(&api, &target).unwrap().list(&format!("v1/{session}/")).await.unwrap_or_else(|e| panic!("{TEST}: list: {}", no_account(&e.to_string()))).into_iter().map(|l| l.key).collect();
+        let (key, version) = &parts[0];
+        (listed, mac_s3(&api, &target, S3Method::Get, key, version.as_deref(), Vec::new(), Vec::new()).await)
+    });
+    for (key, _) in &parts {
+        assert!(listed.contains(key), "{TEST}: S3 lists {key}: {listed:?}");
+    }
+    eprintln!("{TEST}: {} parts in S3, the view {} lines; the Mac's GET of a part: {refused:?}", parts.len(), lines.len());
+    assert_eq!(refused, (403, Some("AccessDenied".to_string())), "{TEST}: the Mac cannot read the VM's transcript");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
+}
+
+/// T9 S3 live (B6): a reopen in a new VM restores the chat from S3. A word
+/// told in a chat is recalled after its VM was terminated (`vm terminate`
+/// syncs first): the reopened chat (`--resume`) starts a new VM, the
+/// transcript is pulled from S3 into it before the spawn
+/// (`transcript:restored`, a `transcript_pull` audit row `written`), the
+/// conversation goes on, and the Mac still holds only the view. The chat's
+/// objects are purged at the end ([`PurgeTranscripts`]). Four Touch IDs:
+/// two chats, the terminate and the purge.
+#[test]
+#[ignore = "live, S9's S3 store, starts two MicroVMs and asks the model (four Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
+fn live_s3_reopen_new_vm_restores() {
+    const TEST: &str = "live_s3_reopen_new_vm_restores";
+    if !s3_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _vms = SessionVms::new(&live);
+    let _purge = PurgeTranscripts(&live);
+    let ws = s8_fixture(&live, "live-s3-reopen");
+    let word = format!("harbour{}", uuid::Uuid::now_v7().simple().to_string().chars().rev().take(4).collect::<String>());
+    let mut first = Chat::open(TEST, &live, &ws, &[]);
+    first.initialize();
+    first.turn(&format!("Remember this word for later: {word}. Reply with exactly OK"));
+    let (code, close) = first.close();
+    let row = assert_closed_well(TEST, &live, &first, code, close);
+    let (vm1, session) = (note_part(&row, "vm").expect("the first VM"), first.session.clone().expect("the chat's session id"));
+    let terminate = ai_env_live(&live, &["vm", "terminate", &vm1, "--yes"]);
+    assert_eq!(terminate.status.code(), Some(0), "{TEST}: vm terminate");
+    let resume = format!("--resume={session}");
+    let mut second = Chat::open(TEST, &live, &ws, &[&resume]);
+    second.initialize();
+    let turn = second.turn("Which word did I ask you to remember? Reply with the word only.");
+    let (code, close) = second.close();
+    let row = assert_closed_well(TEST, &live, &second, code, close);
+    let answer = turn.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer {answer:?} lacks the word");
+    let vm2 = note_part(&row, "vm").expect("the second VM");
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    assert_eq!((note_part(&row, "vm_how").as_deref(), note_part(&row, "transcript").as_deref()), (Some("started"), Some("restored")), "{TEST}");
+    let pulls = live_audit(&live, "transcript_pull");
+    assert!(pulls.iter().any(|r| r["detail"]["vm"] == vm2.as_str() && r["detail"]["outcome"] == "written"), "{TEST}: the restore is audited: {pulls:?}");
+    assert!(live_audit(&live, "transcript_put").is_empty(), "{TEST}: nothing went up from the Mac");
+    assert_a_view(TEST, &live, &session);
+    let (a, b) = (first.output(), second.output());
+    sweep_live(&live, &[&a, &b, &terminate], &[]);
+}
+
+/// The audit row of `event` whose detail's `session` is `session`, the newest: (bytes, ms) as numbers.
+fn timed_row(test: &str, live: &Live, event: &str, session: &str) -> (u64, u64) {
+    let rows = live_audit(live, event);
+    let row = rows.iter().rev().find(|r| r["detail"]["session"] == session).unwrap_or_else(|| panic!("{test}: no {event} row of {session}: {rows:?}"));
+    let num = |k: &str| row["detail"][k].as_str().and_then(|v| v.parse().ok()).or_else(|| row["detail"][k].as_u64()).unwrap_or_else(|| panic!("{test}: {event}'s {k}: {row}"));
+    let bytes = if row["detail"].get("bytes").is_some() { num("bytes") } else { num("len") };
+    (bytes, num("ms"))
+}
+
+/// MB/s of `bytes` in `ms`.
+fn rate(bytes: u64, ms: u64) -> f64 {
+    bytes as f64 / 1_000_000.0 / (ms.max(1) as f64 / 1000.0)
+}
+
+/// T9 S3 live (B6): a 1 GiB chat begun on the Mac round-trips through S3,
+/// and claude's memory with it open is read. A synthetic transcript (never
+/// the development chat: JSONL of plain prompts and replies, written here
+/// under the fixture's project directory and removed on every path) ends
+/// with a compaction as 2.1.302 writes one and a short exchange after it:
+/// a turn's context is the summary and that exchange, never the 1 GiB
+/// before it, and the view the stage leaves is that exchange. A reopen
+/// pulls at most 64 MiB inline, so the chat is staged with `--warm`
+/// (`session stage --warm`: scanned, a multipart upload from the Mac, the
+/// view left in its place; then the workspace's VM warmed and the chat
+/// restored from S3 into it with no deadline, a `transcript_pull` row
+/// `written` for that VM). The chat reopens remote on that VM
+/// (`vm_how:reused`) and keeps the copy it holds (`transcript:kept`:
+/// nothing is pulled at the reopen); one turn (claude may parse the whole
+/// file first) makes the session's row, which `session sync` needs; with
+/// the chat still open, `vm exec` prints the VM's MemTotal and
+/// MemAvailable and the VmHWM and VmRSS of each claude process (printed,
+/// never judged). After the close the VM's copy is rewritten in place (a
+/// new inode) and `session sync` pushes it whole as a new generation's
+/// base. Each transfer's rate is printed (MB/s, from the audit) with the
+/// reopen's `initialize` time and the memory facts, and the chat's objects
+/// are purged at the end ([`PurgeTranscripts`]). The stage starts the
+/// warmed VM, not the chat: its row is in the test's root, so
+/// [`SessionVms`] ends it on every path. Eight Touch IDs: the test
+/// process's own, two for the stage and its warm (the runtime key, then
+/// the key and the setup-token together from a current combined.env; the
+/// restore adds none), the chat, two `vm exec`, the sync, the purge. About
+/// half an hour: at the 4 MB/s baselines the VM's pull and its full upload
+/// take about 4.5 minutes each, the stage what the Mac's uplink allows;
+/// each transfer may take 30 minutes (the stage command holds two, and the
+/// warm), the reopen's `initialize` and the turn 10 each. The warmed VM's
+/// wall (`max_duration_s`) is the sum of every bound from the stage to the
+/// sync, about two hours ([`wrapper_world`]'s 900 s would end it inside
+/// them), and `reuse_per_workspace` is set on: the reopen takes the warmed
+/// VM only through SELECT_VM's reuse.
+#[test]
+#[ignore = "live, S9's S3 store, a 1 GiB chat round trip through a warmed MicroVM and claude's memory with it open (about half an hour; eight Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
+fn live_s3_gib_round_trip_timing() {
+    const TEST: &str = "live_s3_gib_round_trip_timing";
+    const GIB: u64 = 1 << 30;
+    const TRANSFER_LIMIT: Duration = Duration::from_secs(1800);
+    // The reopen's initialize and its first turn: claude may parse the whole file before it answers either.
+    const TURN_LIMIT: Duration = Duration::from_secs(600);
+    if !s3_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    // The stage command's two transfers and the warm between them; then the warmed VM's wall, which starts after
+    // the upload: past every bound from the stage to the sync (the reopen, the turn, two `vm exec`, the close).
+    let stage_limit = TRANSFER_LIMIT * 2 + LIVE_INIT_LIMIT;
+    let wall = stage_limit + TURN_LIMIT * 2 + CRED_COMMAND_LIMIT * 2 + LIVE_EXIT_LIMIT + TRANSFER_LIMIT;
+    let live = wrapper_world(&[
+        ("suspend_on_close", toml::Value::Boolean(false)),
+        ("max_duration_s", toml::Value::Integer(i64::try_from(wall.as_secs()).unwrap())),
+        ("reuse_per_workspace", toml::Value::Boolean(true)),
+    ]);
+    let _vms = SessionVms::new(&live);
+    let _purge = PurgeTranscripts(&live);
+    let ws = s8_fixture(&live, "live-s3-gib");
+    let slug = ai_env_cli::wire::slug::project_dir_name(&ws).expect("the fixture's project directory name");
+    let dir = mac_projects().join(&slug);
+    let _gone = RemoveOnDrop(dir.clone());
+    std::fs::create_dir_all(&dir).unwrap();
+    let session = uuid::Uuid::now_v7().to_string();
+    // The synthetic chat, as the view fixture's tails are written (tests/fixtures/view/tails/branched.jsonl): one
+    // chain of prompts and replies of 64 KiB of plain words each to just past 1 GiB, ending on a reply (a reply's
+    // content an array of one text block); then a compaction (the boundary, with no parent, its logical parent the
+    // chain's last reply; the summary, in no view) and one short exchange after it, the newest leaf. Its times are
+    // the hour before now, the compaction half an hour after the chain: the chat's own turn comes after them all.
+    {
+        use std::io::Write as _;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(dir.join(format!("{session}.jsonl"))).unwrap());
+        let filler = "the quick brown fox jumps over the lazy dog ".repeat(1490);
+        let (cwd, start) = (ws.display().to_string(), ai_env_cli::wire::time::unix_now_ms() - 3_600_000);
+        let at = |ms: u64| ai_env_cli::wire::time::rfc3339_utc_ms(start + ms);
+        let entry = |kind: &str, uuid: &str, parent: serde_json::Value, ms: u64, content: serde_json::Value| {
+            serde_json::json!({"parentUuid": parent, "isSidechain": false, "userType": "external", "cwd": cwd, "sessionId": session, "version": "2.1.302", "gitBranch": "main", "type": kind, "message": {"role": kind, "content": content}, "uuid": uuid, "timestamp": at(ms)})
+        };
+        let mut put = |line: &serde_json::Value| {
+            let text = format!("{line}\n");
+            w.write_all(text.as_bytes()).unwrap();
+            text.len() as u64
+        };
+        let (mut written, mut parent, mut n) = (0u64, serde_json::Value::Null, 0u64);
+        while written < GIB || n % 2 == 1 {
+            let uuid = uuid::Uuid::now_v7().to_string();
+            let text = format!("{n} {filler}");
+            let line = if n % 2 == 0 { entry("user", &uuid, parent, n, serde_json::json!(text)) } else { entry("assistant", &uuid, parent, n, serde_json::json!([{"type": "text", "text": text}])) };
+            written += put(&line);
+            parent = serde_json::Value::String(uuid);
+            n += 1;
+        }
+        // The compaction as 2.1.302 writes it; preTokens is the chain's bytes at about four a token.
+        let boundary = uuid::Uuid::now_v7().to_string();
+        put(&serde_json::json!({
+            "parentUuid": null, "logicalParentUuid": parent, "isSidechain": false, "userType": "external", "cwd": cwd, "sessionId": session, "version": "2.1.302", "gitBranch": "main",
+            "type": "system", "subtype": "compact_boundary", "content": "Conversation compacted", "isMeta": false, "uuid": boundary, "timestamp": at(1_800_000),
+            "compactMetadata": {"trigger": "manual", "preTokens": written / 4},
+        }));
+        let summary = uuid::Uuid::now_v7().to_string();
+        let mut line = entry("user", &summary, serde_json::json!(boundary), 1_801_000, serde_json::json!("This session is being continued from a previous conversation: a synthetic chat of plain words, nothing to act on."));
+        line["isCompactSummary"] = serde_json::Value::Bool(true);
+        line["isVisibleInTranscriptOnly"] = serde_json::Value::Bool(true);
+        put(&line);
+        let prompt = uuid::Uuid::now_v7().to_string();
+        put(&entry("user", &prompt, serde_json::json!(summary), 1_860_000, serde_json::json!("A short question after the compaction")));
+        put(&entry("assistant", &uuid::Uuid::now_v7().to_string(), serde_json::json!(prompt), 1_865_000, serde_json::json!([{"type": "text", "text": "A short answer after the compaction"}])));
+        w.flush().unwrap();
+    }
+    // Staged with --warm: the Mac's upload, then the workspace's VM warmed and the chat restored from S3 into it with
+    // no deadline (a reopen pulls at most 64 MiB inline; P0 refuses this one when no VM of the workspace lives).
+    let t = Instant::now();
+    let staged = ai_env_live_within(&live, &["session", "stage", &session, "--warm", "--json"], stage_limit);
+    let stage_ms = t.elapsed().as_millis();
+    assert_eq!(staged.status.code(), Some(0), "{TEST}: session stage --warm");
+    let v: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap_or_else(|e| panic!("{TEST}: session stage --warm --json: {e}"));
+    assert_eq!(v["outcome"].as_str(), Some("staged"), "{TEST}: {v}");
+    assert!(v["bytes"].as_u64().is_some_and(|b| b >= GIB), "{TEST}: the whole chat went up: {v}");
+    assert_eq!(v["view"].as_str(), Some(format!("{slug}/{session}.jsonl").as_str()), "{TEST}: the view (the exchange after the compaction) in the chat's place: {v}");
+    let (up, up_ms) = timed_row(TEST, &live, "transcript_stage", &session);
+    let vm = v["restore"]["vm"].as_str().unwrap_or_else(|| panic!("{TEST}: the warm restored nothing: {v}")).to_string();
+    // The pull's own bytes and ms, from its audit row; the command's `restore` says the same bytes (its ms is the whole restore's).
+    let (down, down_ms) = timed_row(TEST, &live, "transcript_pull", &session);
+    assert_eq!((v["restore"]["outcome"].as_str(), v["restore"]["bytes"].as_u64()), (Some("restored"), Some(down)), "{TEST}: the chat restored into {vm}: {v}");
+    assert!(down >= GIB, "{TEST}: the whole chat came down: {down} bytes");
+    let pulled = || live_audit(&live, "transcript_pull").into_iter().filter(|r| r["detail"]["session"] == session.as_str()).collect::<Vec<_>>();
+    let pulls = pulled();
+    assert!(pulls.iter().any(|r| r["detail"]["vm"] == vm.as_str() && r["detail"]["outcome"] == "written"), "{TEST}: the pull into {vm}: {pulls:?}");
+    // The chat reopens remote on the warmed VM, which holds what S3 committed: nothing is pulled.
+    let resume = format!("--resume={session}");
+    let mut chat = Chat::open(TEST, &live, &ws, &[&resume]);
+    let init = chat.initialize_within(TURN_LIMIT);
+    // One cheap turn: the pump registers the session's row at a user line (`session sync` refuses a session with
+    // no row), and claude has the 1 GiB chat loaded.
+    let turn = chat.turn_within("Reply with exactly OK", TURN_LIMIT);
+    assert_eq!(chat.session.as_deref(), Some(session.as_str()), "{TEST}: the reopened chat is the staged session");
+    let named = ai_env_cli::bridge::registry::read(&live.paths, &session).unwrap().and_then(|r| r.microvm_id);
+    assert_eq!(named.as_deref(), Some(vm.as_str()), "{TEST}: the session's row names the warmed VM after the turn");
+    // The memory with the chat open: the VM's, then each process whose comm is claude (never its cmdline: the
+    // shim, PID 1, carries --claude), in shell builtins alone. Printed, never judged: neither its exit nor a probe
+    // stopped past its limit fails the test (an interrupt still ends it).
+    let script = "while read -r k v u; do case $k in MemTotal:|MemAvailable:) echo \"$k $v $u\";; esac; done < /proc/meminfo; \
+                  for d in /proc/[0-9]*; do read -r c 2>/dev/null < \"$d/comm\" || continue; [ \"$c\" = claude ] || continue; \
+                  s=; while read -r k v u; do case $k in VmHWM:|VmRSS:) s=\"$s $k $v $u\";; esac; done 2>/dev/null < \"$d/status\"; echo \"claude (pid ${d#/proc/}):$s\"; done";
+    let probe = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ai_env_live(&live, &["vm", "exec", &vm, "--", "sh", "-c", script]))) {
+        Ok(out) => Some(out),
+        Err(stop) if CRED_SIGNAL.load(Ordering::SeqCst) != 0 => std::panic::resume_unwind(stop),
+        Err(_) => None,
+    };
+    let said = probe.as_ref().map_or_else(|| format!("(stopped past {CRED_COMMAND_LIMIT:?})"), |p| String::from_utf8_lossy(&p.stdout).to_string());
+    eprintln!("{TEST}: with the chat open on {vm}, after a turn of {} ms (vm exec exit {:?}):\n{}", turn.ms, probe.as_ref().and_then(|p| p.status.code()), said.trim_end());
+    let memory = said.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ");
+    assert_eq!(turn.result["is_error"], false, "{TEST}: the turn: {}", turn.result);
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(
+        (note_part(&row, "vm").as_deref(), note_part(&row, "vm_how").as_deref(), note_part(&row, "transcript").as_deref()),
+        (Some(vm.as_str()), Some("reused"), Some("kept")),
+        "{TEST}: the reopen took the warmed VM, running, and kept the chat it holds"
+    );
+    assert_eq!(pulled(), pulls, "{TEST}: no pull at the reopen");
+    // The VM's copy rewritten in place (a new inode): the sync pushes it whole.
+    let file = format!("$HOME/.claude/projects/{slug}/{session}.jsonl");
+    let exec = ai_env_live(&live, &["vm", "exec", &vm, "--", "sh", "-c", &format!("cp \"{file}\" \"{file}.copy\" && mv \"{file}.copy\" \"{file}\"")]);
+    assert_eq!(exec.status.code(), Some(0), "{TEST}: vm exec");
+    let synced = ai_env_live_within(&live, &["session", "sync", &session, "--json"], TRANSFER_LIMIT);
+    assert_eq!(synced.status.code(), Some(0), "{TEST}: session sync");
+    let v: serde_json::Value = serde_json::from_slice(&synced.stdout).unwrap_or_else(|e| panic!("{TEST}: session sync --json: {e}"));
+    assert_eq!((v["outcome"].as_str(), v["pushed"]["kind"].as_str()), (Some("synced"), Some("base")), "{TEST}: a new generation's base: {v}");
+    // The newest push is the sync's: the turn's own step may have pushed a segment before it.
+    let (full, full_ms) = timed_row(TEST, &live, "transcript_push", &session);
+    assert!(full >= GIB, "{TEST}: the whole copy went up: {full} bytes");
+    eprintln!(
+        "{TEST}: the Mac's stage {up} bytes in {up_ms} ms ({:.1} MB/s), the VM's pull at the warm {down} bytes in {down_ms} ms ({:.1} MB/s; session stage --warm took {stage_ms} ms in all), the reopen's initialize on {vm} {} ms (Cursor waits {} s), the VM's full upload {full} bytes in {full_ms} ms ({:.1} MB/s); with the chat open, after a turn of {} ms: {memory}",
+        rate(up, up_ms),
+        rate(down, down_ms),
+        init.as_millis(),
+        LIVE_INIT_LIMIT.as_secs(),
+        rate(full, full_ms),
+        turn.ms
+    );
+    let out = chat.output();
+    let mut outs = vec![&staged, &out, &exec, &synced];
+    outs.extend(probe.as_ref());
+    sweep_live(&live, &outs, &[]);
+}
+
+/// T9 S3 live (B6): the Mac cannot read the VM's objects, nor write one.
+/// After a chat's turn landed in S3, the Mac's own runtime key (outside the
+/// gateway endpoint) is refused a GET of each part (by its version and as
+/// the current one) and a PUT of the next generation's base: 403
+/// `AccessDenied` each, the bucket policy's denies. The chat's objects are
+/// purged at the end ([`PurgeTranscripts`]). Three Touch IDs: the chat's,
+/// the test process's runtime key, the purge.
+#[test]
+#[ignore = "live, S9's S3 store, starts a MicroVM and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
+fn live_s3_mac_cannot_read_vm_objects() {
+    const TEST: &str = "live_s3_mac_cannot_read_vm_objects";
+    if !s3_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _vms = SessionVms::new(&live);
+    let _purge = PurgeTranscripts(&live);
+    let ws = s8_fixture(&live, "live-s3-mac-reads");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    chat.turn("Reply with exactly OK");
+    let (code, close) = chat.close();
+    assert_closed_well(TEST, &live, &chat, code, close);
+    let session = chat.session.clone().expect("the chat's session id");
+    let manifest = s3_manifest(TEST, &live, &session);
+    let parts = manifest_parts(&manifest);
+    assert!(!parts.is_empty(), "{TEST}: the turn landed in S3");
+    let gen = manifest.get("gen").and_then(toml::Value::as_integer).unwrap_or(1);
+    let answers = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use ai_env_cli::bridge::s3::{presign, S3Method};
+        let api = connect(&live.creds).await;
+        let target = s3_target(&live);
+        let mut answers = Vec::new();
+        for (key, version) in &parts {
+            answers.push((format!("GET {key} by its version"), mac_s3(&api, &target, S3Method::Get, key, version.as_deref(), Vec::new(), Vec::new()).await));
+            answers.push((format!("GET {key}"), mac_s3(&api, &target, S3Method::Get, key, None, Vec::new(), Vec::new()).await));
+        }
+        let body = b"{\"type\":\"user\"}\n".to_vec();
+        let sha = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&body))
+        };
+        let next = format!("v1/{session}/vm/g{}/base", gen + 1);
+        let headers = presign::write_headers(body.len() as u64, &sha, true).unwrap();
+        answers.push((format!("PUT {next}"), mac_s3(&api, &target, S3Method::Put, &next, None, headers, body).await));
+        answers
+    });
+    for (what, answer) in &answers {
+        eprintln!("{TEST}: {what}: {answer:?}");
+        assert_eq!(answer, &(403, Some("AccessDenied".to_string())), "{TEST}: {what}");
+    }
     let out = chat.output();
     sweep_live(&live, &[&out], &[]);
 }

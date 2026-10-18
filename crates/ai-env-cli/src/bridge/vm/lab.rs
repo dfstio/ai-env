@@ -96,6 +96,9 @@ pub async fn run_probe_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
             "reattach" => reattach(ctx, api, ep, started).await,
             "clock-after-resume" => clock_after_resume(ctx, api, ep, started).await,
             "in-vm-firewall" => in_vm_firewall(ctx, api, ep, started).await,
+            // S9 (G8): chunked-put here; protocol-v2 seeds a workspace, so `lab run` calls `run_protocol_v2`.
+            "chunked-put" => chunked_put(ctx, api, ep, started).await,
+            "protocol-v2" => Err(BridgeError::Config("protocol-v2 seeds the current directory's workspace: it runs through run_protocol_v2 (internal)".into())),
             other => Err(BridgeError::Config(format!("{other} is not a live probe"))),
         }
     })
@@ -2417,8 +2420,8 @@ async fn init_budget<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &
 
 /// The argv Cursor's extension starts a chat's claude with (2.1.282's, as
 /// `tests/common/mod.rs`'s `SESSION_ARGV`), before the wrapper's
-/// `argv::sanitise` (the debug flags stripped as `[wrapper]` says,
-/// `--session-mirror` last).
+/// `argv::sanitise` (the debug flags stripped as `[wrapper]` says; no
+/// `--session-mirror`: S9 keeps a remote chat's transcript in S3).
 const CURSOR_SESSION: [&str; 16] = [
     "--output-format",
     "stream-json",
@@ -2463,7 +2466,7 @@ fn lab_wait(ctx: &Ctx, d: Duration) -> Duration {
 /// The VM's argv of a Cursor chat: `claude`, then [`CURSOR_SESSION`] as the
 /// wrapper's `argv::sanitise` makes it under `[wrapper]`.
 fn cursor_argv(cfg: &crate::bridge::config::BridgeConfig) -> Result<Vec<String>, BridgeError> {
-    let opts = crate::wire::argv::SanitiseOpts { strip_add_dir: cfg.wrapper.strip_add_dir, strip_debug: cfg.wrapper.strip_debug };
+    let opts = crate::wire::argv::SanitiseOpts { strip_add_dir: cfg.wrapper.strip_add_dir, strip_debug: cfg.wrapper.strip_debug, mirror: false };
     let args = crate::wire::argv::sanitise(&CURSOR_SESSION.map(str::to_string), opts).map_err(|e| BridgeError::Config(format!("the session's arguments: {e}")))?;
     Ok(std::iter::once("claude".to_string()).chain(args).collect())
 }
@@ -2703,7 +2706,7 @@ async fn first_start<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>,
 /// in the VM agent's `.claude.json`, through `GET /settings`.
 async fn project_keys<A: MicrovmApi, D: crate::bridge::dataplane::DataPlane, T: crate::bridge::dataplane::TokenSource>(api: &A, dp: &D, tokens: &T, target: &AgentTarget, path: &str) -> Result<BTreeMap<String, serde_json::Value>, BridgeError> {
     use crate::bridge::dataplane::{exchange, Exchange};
-    let x = Exchange { api, tokens, vm_id: &target.vm_id, port: APP_PORT, route: crate::wire::workspace::SETTINGS_ROUTE, deadline: None, idempotent: true };
+    let x = Exchange { api, tokens, vm_id: &target.vm_id, port: APP_PORT, cap: crate::wire::frame::CAP_WORKSPACE_V1, route: crate::wire::workspace::SETTINGS_ROUTE, deadline: None, idempotent: true };
     let (reply, _) = exchange(&x, |t| async move { dp.get_settings(target, &t, path).await }).await?;
     Ok(reply.body.map(|c| c.project).unwrap_or_default())
 }
@@ -2755,6 +2758,401 @@ async fn fresh_claude_json<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx
         project_words(&after)
     );
     Ok(out)
+}
+
+// ---- S9: protocol-v2 and chunked-put (L6; S9 wave 2: G8) -------------------------------------
+//
+// Both measure the endpoint with ai-env's own client (reqwest on the one TLS
+// policy, `tls::reqwest_client()`; plain http to the lab's agent address, as
+// the data plane's), never a git child holding a token (design D12), each on
+// a vpc VM of its own, as a session's: protocol-v2 asks a seeded VM's
+// advertisement with `Git-Protocol: version=2` (the current directory's
+// workspace seeded first, as fresh-claude-json seeds it); chunked-put sends
+// `PUT /seed` chunked to an unseeded VM, then 1 MB and 20 MB with a
+// `Content-Length`. Each `PUT /seed` is an `update` of a VM never seeded, so
+// the shim answers it 409 `not_seeded` once it read the body (a chunked one
+// 411 first, without reading it): no helper runs, nothing is written. Under
+// the file-backed fake both refuse once their VM started, unless the
+// platform is emulated (a test's shim behind the routed endpoint).
+
+/// The most of an answer's body a probe keeps (an advertisement, a refusal's JSON).
+const S9_BODY_MAX: usize = 1 << 20;
+/// chunked-put's chunked body: this many chunks of [`CHUNKED_PART`] bytes.
+const CHUNKED_PARTS: usize = 4;
+const CHUNKED_PART: usize = 16 * 1024;
+/// chunked-put's timed bodies, each with its `Content-Length`: 1 MB and 20 MB.
+const TIMED_PUTS: [u64; 2] = [1_000_000, 20_000_000];
+/// The workspace path chunked-put's `PUT /seed` names: a VM never seeded has
+/// none, and nothing is written there.
+const CHUNKED_PUT_PATH: &str = "/ai-env-probe/chunked-put";
+/// The tip its `update` expects: any object id (a VM never seeded refuses before it looks).
+const CHUNKED_PUT_EXPECT: &str = "1111111111111111111111111111111111111111";
+
+/// An S9 probe's VM: a vpc VM of its own (900 s, label `probe:<name>`), as a session's.
+fn s9_flags(name: &str) -> run::RunFlags {
+    let mut f = flags(name, 900, None, None, true);
+    f.egress = Some(run::Egress::Vpc);
+    f.imply_internet = false;
+    f
+}
+
+/// The refusal of an S9 probe under the file-backed fake when the platform
+/// is not emulated (exit 9): no shim answers behind the fake's endpoint.
+fn s9_fake_refusal(name: &str) -> BridgeError {
+    BridgeError::Policy(format!("lab run {name}: the file-backed fake has no shim behind its endpoint (AI_ENV_BRIDGE_LAB_FAKE_API is set): it measures the real endpoint"))
+}
+
+/// A probe request's body.
+enum S9Body {
+    None,
+    /// Sent as it comes, with no length: `Transfer-Encoding: chunked`.
+    Chunked(Vec<bytes::Bytes>),
+    /// With its `Content-Length`.
+    Sized(Vec<u8>),
+}
+
+/// What one probe request brought back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Answer {
+    status: u16,
+    /// How the body came ([`framing`]).
+    framing: String,
+    /// From the request's send to the answer's head, and to its body's end.
+    head_ms: u128,
+    end_ms: u128,
+    /// The body, at most [`S9_BODY_MAX`] bytes of it.
+    body: Vec<u8>,
+    /// The endpoint's `x-aws-proxy-error`, scrubbed.
+    proxy_error: Option<String>,
+}
+
+impl Answer {
+    /// The shim's refusal, when the body is one.
+    fn refusal(&self) -> Option<crate::wire::workspace::WsRefusal> {
+        serde_json::from_slice(&self.body).ok()
+    }
+
+    /// `HTTP <status>`, its refusal's code (one this build knows, else
+    /// `unknown`: the VM's bytes never reach the note or `lab/probes.jsonl`)
+    /// and the endpoint's error when there are.
+    fn words(&self) -> String {
+        let mut w = format!("HTTP {}", self.status);
+        if let Some(r) = self.refusal() {
+            w.push_str(&format!(" {}", crate::wire::workspace::known_refusal(&r.code).unwrap_or("unknown")));
+        }
+        if let Some(e) = &self.proxy_error {
+            w.push_str(&format!(" (x-aws-proxy-error {e})"));
+        }
+        w
+    }
+}
+
+/// How an answer's body came, from its headers and HTTP version: `chunked`
+/// (a `Transfer-Encoding` naming it), `length:<n>` (a `Content-Length`),
+/// else `<version> unframed` (HTTP/2's frames, or an HTTP/1 body to the close).
+fn framing(headers: &reqwest::header::HeaderMap, version: reqwest::Version) -> String {
+    let coding = headers.get(reqwest::header::TRANSFER_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    if coding.split(',').any(|c| c.trim().eq_ignore_ascii_case("chunked")) {
+        return "chunked".to_string();
+    }
+    match headers.get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(n) => format!("length:{n}"),
+        None => format!("{version:?} unframed"),
+    }
+}
+
+/// The lab's plain-http client to the agent address (debug builds only, as
+/// the data plane's).
+#[cfg(debug_assertions)]
+fn s9_lab_client(addr: std::net::SocketAddr, host: &str) -> Result<reqwest::Client, BridgeError> {
+    crate::bridge::tls::lab_http_client(addr, host)
+}
+
+#[cfg(not(debug_assertions))]
+fn s9_lab_client(_addr: std::net::SocketAddr, _host: &str) -> Result<reqwest::Client, BridgeError> {
+    Err(BridgeError::Config("no lab client in a release build".into()))
+}
+
+/// `method path?pairs` to the VM of `target` through the endpoint, as the
+/// data plane sends one: `token`'s header and port, the session bearer
+/// (both marked sensitive), `headers`, `body`, within `timeout`; never
+/// redirected (a 3xx is the answer). The answer, its body read to its end
+/// (at most [`S9_BODY_MAX`] kept).
+#[allow(clippy::too_many_arguments)]
+async fn s9_send<K: AsRef<str>, V: AsRef<str>>(ctx: &Ctx, target: &AgentTarget, token: &AuthToken, method: reqwest::Method, path: &str, pairs: &[(K, V)], headers: &[(&'static str, &str)], body: S9Body, timeout: Duration) -> Result<Answer, BridgeError> {
+    let mut url = health::endpoint_url_query(&target.endpoint, path, pairs)?;
+    let host = url.host_str().unwrap_or_default().to_string();
+    let client = match ctx.knobs.agent_addr().map_err(BridgeError::Config)? {
+        Some(addr) => {
+            url.set_scheme("http").map_err(|()| BridgeError::Config("cannot make a lab URL plain http".into()))?;
+            s9_lab_client(addr, &host)?
+        }
+        None => crate::bridge::tls::reqwest_client().map_err(|e| BridgeError::Sdk { op: "tls", message: format!("cannot build the HTTPS client: {e}") })?,
+    };
+    let shown = url.as_str().to_string();
+    let value = token.value()?;
+    let mut auth = reqwest::header::HeaderValue::from_str(value.expose()).map_err(|_| BridgeError::Sdk { op: "probe", message: "the endpoint token is not a valid header value".into() })?;
+    auth.set_sensitive(true);
+    let mut req = client.request(method.clone(), url).header("x-aws-proxy-auth", auth).header("x-aws-proxy-port", token.port.to_string()).header(reqwest::header::AUTHORIZATION, health::bearer_header(&target.session_token)?).timeout(timeout);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req = match body {
+        S9Body::None => req,
+        S9Body::Chunked(parts) => req.body(reqwest::Body::wrap_stream(futures_util::stream::iter(parts.into_iter().map(Ok::<bytes::Bytes, std::io::Error>)))),
+        S9Body::Sized(bytes) => req.body(bytes),
+    };
+    let sent = Instant::now();
+    let mut resp = req.send().await.map_err(|e| health::transport_error_for(method.as_str(), "probe", &shown, &e))?;
+    let head_ms = sent.elapsed().as_millis();
+    let (status, how, proxy_error) = (resp.status().as_u16(), framing(resp.headers(), resp.version()), health::proxy_error_of(resp.headers()));
+    let mut kept = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| health::transport_error_for(method.as_str(), "probe", &shown, &e))? {
+        let room = S9_BODY_MAX.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    Ok(Answer { status, framing: how, head_ms, end_ms: sent.elapsed().as_millis(), body: kept, proxy_error })
+}
+
+/// A seeded VM's answer to `GET /workspace.git/info/refs?service=git-upload-pack`
+/// asked with `Git-Protocol: version=2`, judged: `v2` (a 200 whose first
+/// pkt-line is `version 2`), `v0` (a 200 opening with `# service=git-upload-pack`:
+/// the header was dropped on the way), else `failed:<status>`.
+fn protocol_v2_verdict(status: u16, body: &[u8]) -> String {
+    use crate::bridge::gitsmart::{parse_pkt, Pkt};
+    if status != 200 {
+        return format!("failed:{status}");
+    }
+    let first = match parse_pkt(body) {
+        Ok(Some((Pkt::Data(data), _))) => data.strip_suffix(b"\n").unwrap_or(data),
+        _ => return "failed:200".to_string(),
+    };
+    match first {
+        b"version 2" => "v2".to_string(),
+        b"# service=git-upload-pack" => "v0".to_string(),
+        _ => "failed:200".to_string(),
+    }
+}
+
+/// An advertisement's first pkt-line, for the note: scrubbed whole (a key
+/// id cut at the 80th character would no longer match), then printable
+/// ASCII, at most 80 characters (`none` when it has no data line).
+fn first_line(body: &[u8]) -> String {
+    use crate::bridge::gitsmart::{parse_pkt, Pkt};
+    match parse_pkt(body) {
+        Ok(Some((Pkt::Data(data), _))) => crate::wire::redact::scrub(&String::from_utf8_lossy(data.strip_suffix(b"\n").unwrap_or(data))).chars().take(80).map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' }).collect(),
+        _ => "none".to_string(),
+    }
+}
+
+/// chunked-put's verdict from the chunked `PUT /seed`'s answer: `forwarded`
+/// (the shim's own 411 `bad_request`: the body reached it chunked),
+/// `dechunked` (the shim's 409 `not_seeded`: the body reached it with a
+/// length, which it read), else `refused:<status>` (the endpoint answered
+/// itself; `refused:none` when no answer came, the connection cut).
+fn chunked_put_verdict(answer: Option<&Answer>) -> String {
+    use crate::wire::workspace::refusal;
+    let Some(a) = answer else { return "refused:none".to_string() };
+    match (a.status, a.refusal().map(|r| r.code)) {
+        (411, Some(code)) if code == refusal::BAD_REQUEST => "forwarded".to_string(),
+        (409, Some(code)) if code == refusal::NOT_SEEDED => "dechunked".to_string(),
+        (status, _) => format!("refused:{status}"),
+    }
+}
+
+/// One timed `PUT /seed` of `len` bytes in the note: its answer and how long
+/// it took, with the rate (the shim reads the whole body before its 409).
+fn timed_words(len: u64, answer: &Result<Answer, BridgeError>) -> String {
+    let mb = len / 1_000_000;
+    match answer {
+        Ok(a) => {
+            let secs = (a.end_ms as f64 / 1000.0).max(0.001);
+            format!("{mb} MB: {} in {} ms ({:.1} MB/s)", a.words(), a.end_ms, len as f64 / 1_000_000.0 / secs)
+        }
+        Err(e) => format!("{mb} MB: no answer ({})", crate::wire::redact::scrub(&e.to_string()).chars().take(160).collect::<String>()),
+    }
+}
+
+/// The query of chunked-put's `PUT /seed`: an `update` (branch `main`, any
+/// tip) at [`CHUNKED_PUT_PATH`].
+fn chunked_put_query() -> Vec<(&'static str, String)> {
+    use crate::wire::workspace::{SeedMode, SeedQuery};
+    SeedQuery { path: CHUNKED_PUT_PATH.into(), mode: SeedMode::Update, branch: Some("main".into()), detached: false, expect: Some(CHUNKED_PUT_EXPECT.into()) }.pairs()
+}
+
+/// A started S9 probe VM, its row read again (with the caps its `/health`
+/// recorded): refused under the fake unless the platform is emulated, and
+/// unless its caps name `cap` (exit 7: its image is older, `make deploy`).
+async fn s9_start<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, name: &str, cap: &'static str, started: &mut Started) -> Result<(VmInfo, VmRow, AgentTarget, ProbeOutcome), BridgeError> {
+    let p = plan(ctx, &s9_flags(name))?;
+    let (vm, row, target, out) = s6_start(ctx, api, ep, &p, started).await?;
+    if ctx.knobs.fake_api.is_some() && !ctx.knobs.emulated_platform() {
+        return Err(s9_fake_refusal(name));
+    }
+    let row = registry::read_row(&ctx.paths, &vm.id)?.unwrap_or(row);
+    crate::bridge::workspace::require_cap(&row.caps.clone().unwrap_or_default(), &vm.id, cap)?;
+    Ok((vm, row, target, out))
+}
+
+/// chunked-put (S9, L6): what the endpoint does with a chunked request body,
+/// and how long a 1 MB and a 20 MB `PUT /seed` with a `Content-Length` take
+/// to the VM's answer (the catalog's text; this section's head).
+async fn chunked_put<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, started: &mut Started) -> Result<ProbeOutcome, BridgeError> {
+    use crate::wire::workspace::{CODE_PORT, SEED_ROUTE};
+    let (vm, _row, target, mut out) = s9_start(ctx, api, ep, "chunked-put", crate::wire::frame::CAP_WORKSPACE_V1, started).await?;
+    let token = token::mint(api, &ctx.paths, &vm.id, CODE_PORT, crate::bridge::dataplane::TOKEN_MINUTES_SEED).await?;
+    let pairs = chunked_put_query();
+    let parts: Vec<bytes::Bytes> = (0..CHUNKED_PARTS).map(|_| bytes::Bytes::from(vec![b'.'; CHUNKED_PART])).collect();
+    let budget = |len: u64| crate::bridge::dataplane::request_timeout(len, Duration::ZERO);
+    let chunked = s9_send(ctx, &target, &token, reqwest::Method::PUT, SEED_ROUTE, &pairs, &[], S9Body::Chunked(parts), budget((CHUNKED_PARTS * CHUNKED_PART) as u64)).await;
+    let verdict = chunked_put_verdict(chunked.as_ref().ok());
+    let said = match &chunked {
+        Ok(a) => format!("{} in {} ms", a.words(), a.end_ms),
+        Err(e) => format!("no answer ({})", crate::wire::redact::scrub(&e.to_string()).chars().take(160).collect::<String>()),
+    };
+    let mut timed = Vec::new();
+    for len in TIMED_PUTS {
+        let body = vec![b'.'; usize::try_from(len).unwrap_or(0)];
+        let a = s9_send(ctx, &target, &token, reqwest::Method::PUT, SEED_ROUTE, &pairs, &[], S9Body::Sized(body), budget(len)).await;
+        timed.push(timed_words(len, &a));
+    }
+    out.verdict = verdict;
+    out.note = format!("{}: PUT {SEED_ROUTE} chunked ({CHUNKED_PARTS} chunks of {CHUNKED_PART} bytes) to the unseeded VM: {said}; with a Content-Length, an update of the unseeded VM: {}", vm.id, timed.join("; "));
+    Ok(out)
+}
+
+/// S9's protocol-v2 (L6) under the terminate guard: its VM, the seed of `ws`
+/// into it (the data plane holds `api` past a borrow, hence the `Arc`, as
+/// fresh-claude-json's seed does), then the advertisement.
+pub async fn run_protocol_v2<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: std::sync::Arc<A>, ep: &E, ws: &WorkspaceRef) -> Result<ProbeOutcome, BridgeError> {
+    let shared = &api;
+    guarded(ctx, &*api, ep, async move |started: &mut Started| protocol_v2(ctx, shared, ep, started, ws).await).await
+}
+
+/// protocol-v2 (S9, L6): whether `Git-Protocol: version=2` reaches the VM's
+/// http-backend through the endpoint (the catalog's text; this section's
+/// head). The VM must name `git_http_v1` (else exit 7 before the seed).
+async fn protocol_v2<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: &std::sync::Arc<A>, ep: &E, started: &mut Started, ws: &WorkspaceRef) -> Result<ProbeOutcome, BridgeError> {
+    use crate::bridge::dataplane::TokenSource as _;
+    use crate::bridge::workspace::{ensure_workspace, EnsureCtx, SeedLimits, SeedProgress, SeedWant};
+    use crate::wire::workspace::{budget, CODE_PORT, GIT_ADVERTISEMENT_TYPE, GIT_INFO_REFS_ROUTE, GIT_PROTOCOL_V2, GIT_UPLOAD_PACK_QUERY};
+    let (vm, row, target, mut out) = s9_start(ctx, &**api, ep, "protocol-v2", crate::wire::frame::CAP_GIT_HTTP_V1, started).await?;
+    let caps = row.caps.clone().unwrap_or_default();
+    let (dp, tokens) = crate::bridge::remote::pipeline::data_plane(ctx, api, &vm.id, true)?;
+    let progress = |p: SeedProgress| tracing::info!("protocol-v2 seed: {p:?}");
+    let seeding = EnsureCtx { api: &**api, dp: &*dp, tokens: &*tokens, paths: &ctx.paths, cfg: &ctx.cfg, target: &target, caps: &caps, ws, lim: SeedLimits::cli(&ctx.cfg, None), deadline: None, progress: &progress };
+    let seeded = ensure_workspace(&seeding, None, SeedWant::Auto).await?;
+    let token = tokens.token(CODE_PORT).await?;
+    let query: Vec<(&str, &str)> = GIT_UPLOAD_PACK_QUERY.split_once('=').into_iter().collect();
+    let headers = [("Git-Protocol", GIT_PROTOCOL_V2), ("Accept", GIT_ADVERTISEMENT_TYPE)];
+    let timeout = crate::bridge::dataplane::request_timeout(S9_BODY_MAX as u64, budget::GIT_ADVERTISE);
+    let a = s9_send(ctx, &target, &token, reqwest::Method::GET, GIT_INFO_REFS_ROUTE, &query, &headers, S9Body::None, timeout).await?;
+    out.verdict = protocol_v2_verdict(a.status, &a.body);
+    out.note = format!(
+        "{}: the seed of {}: {}; GET {GIT_INFO_REFS_ROUTE}?{GIT_UPLOAD_PACK_QUERY} with Git-Protocol: {GIT_PROTOCOL_V2}: {}, its body {} ({} bytes), the head in {} ms, the advertisement in {} ms; its first line: {}",
+        vm.id,
+        ws.vm_cwd,
+        seeded.word(),
+        a.words(),
+        a.framing,
+        a.body.len(),
+        a.head_ms,
+        a.end_ms,
+        first_line(&a.body)
+    );
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod g8_tests {
+    use super::*;
+
+    /// A pkt-line of `text`.
+    fn pkt(text: &str) -> Vec<u8> {
+        format!("{:04x}{text}", text.len() + 4).into_bytes()
+    }
+
+    /// protocol-v2's verdict: a v2 advertisement is `v2`, http-backend's v0
+    /// one (`# service=`, a flush, the refs) `v0`; any other status, an
+    /// empty or malformed body, an `ERR` line or a ref line first, `failed:`.
+    #[test]
+    fn protocol_v2_judges_the_advertisements_first_line() {
+        let v2 = [pkt("version 2\n"), pkt("agent=git/2.50.1\n"), pkt("ls-refs=unborn\n"), pkt("fetch=shallow wait-for-done\n"), b"0000".to_vec()].concat();
+        assert_eq!(protocol_v2_verdict(200, &v2), "v2");
+        assert_eq!(first_line(&v2), "version 2");
+        let v0 = [pkt("# service=git-upload-pack\n"), b"0000".to_vec(), pkt(&format!("{} HEAD\0multi_ack\n", "a".repeat(40))), b"0000".to_vec()].concat();
+        assert_eq!(protocol_v2_verdict(200, &v0), "v0");
+        assert_eq!(first_line(&v0), "# service=git-upload-pack");
+        for (status, body, want) in [(200, b"".to_vec(), "failed:200"), (200, b"zzzz".to_vec(), "failed:200"), (200, pkt("ERR not our repository\n"), "failed:200"), (200, pkt("version 1\n"), "failed:200"), (409, v2.clone(), "failed:409"), (403, Vec::new(), "failed:403"), (502, Vec::new(), "failed:502")] {
+            assert_eq!(protocol_v2_verdict(status, &body), want, "{status} {body:?}");
+        }
+        assert_eq!(first_line(b""), "none");
+        assert_eq!(first_line(&pkt("a\tb\u{1b}c\n")), "a?b?c", "control characters never reach the note");
+        // S9 phase 4 (F3): scrubbed before the cut, so a key id at the start or across the 80th character never shows.
+        let key = format!("{}{}", "AKIA", "Q7".repeat(8));
+        for line in [format!("{key} version 2\n"), format!("{} {key}\n", "x".repeat(69))] {
+            let shown = first_line(&pkt(&line));
+            assert!(shown.chars().count() <= 80 && !shown.contains("AKIAQ7"), "{shown}");
+        }
+        let odd = Answer { status: 409, body: serde_json::json!({"code": format!("{key}\u{1b}[2J"), "message": "x"}).to_string().into_bytes(), ..Answer::default() };
+        assert_eq!(odd.words(), "HTTP 409 unknown", "a code this build does not know is never echoed");
+        assert_eq!(answer(411, r#"{"code":"bad_request","message":"m"}"#).words(), "HTTP 411 bad_request");
+    }
+
+    fn answer(status: u16, body: &str) -> Answer {
+        Answer { status, body: body.as_bytes().to_vec(), ..Answer::default() }
+    }
+
+    /// chunked-put's verdict: the shim's own 411 is `forwarded`, its 409
+    /// `not_seeded` (it read a body with a length) `dechunked`; a 411 or a
+    /// 409 that is not the shim's, any other status, `refused:<status>`; no
+    /// answer at all `refused:none`.
+    #[test]
+    fn chunked_put_tells_the_shims_answers_from_the_endpoints() {
+        let shim_411 = answer(411, r#"{"code":"bad_request","message":"the body has no Content-Length: send its length"}"#);
+        let shim_409 = answer(409, r#"{"code":"not_seeded","message":"the VM was never seeded: nothing to update"}"#);
+        assert_eq!(chunked_put_verdict(Some(&shim_411)), "forwarded");
+        assert_eq!(chunked_put_verdict(Some(&shim_409)), "dechunked");
+        assert_eq!(chunked_put_verdict(Some(&answer(411, "Length Required"))), "refused:411", "the endpoint's own 411 carries no refusal of the shim's");
+        assert_eq!(chunked_put_verdict(Some(&answer(409, r#"{"code":"busy","message":"held"}"#))), "refused:409");
+        assert_eq!(chunked_put_verdict(Some(&answer(400, ""))), "refused:400");
+        assert_eq!(chunked_put_verdict(Some(&answer(501, ""))), "refused:501");
+        assert_eq!(chunked_put_verdict(None), "refused:none");
+        let with_error = Answer { proxy_error: Some("BAD_GATEWAY".into()), ..answer(502, "") };
+        assert_eq!(with_error.words(), "HTTP 502 (x-aws-proxy-error BAD_GATEWAY)");
+        assert_eq!(shim_411.words(), "HTTP 411 bad_request");
+    }
+
+    /// The framing word: chunked first (whatever else is said), then a
+    /// length, else the version's own framing.
+    #[test]
+    fn framing_names_chunked_a_length_or_neither() {
+        use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
+        let mut h = HeaderMap::new();
+        assert_eq!(framing(&h, reqwest::Version::HTTP_2), "HTTP/2.0 unframed");
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("311"));
+        assert_eq!(framing(&h, reqwest::Version::HTTP_11), "length:311");
+        h.insert(TRANSFER_ENCODING, HeaderValue::from_static("gzip, Chunked"));
+        assert_eq!(framing(&h, reqwest::Version::HTTP_11), "chunked");
+    }
+
+    /// The timed `PUT /seed`s: an update of the probe's path (a branch, a
+    /// tip), which the query's own check takes; their words name the size,
+    /// the answer, the time and the rate, or why none came (scrubbed).
+    #[test]
+    fn the_timed_puts_are_updates_and_say_their_rate() {
+        use crate::wire::workspace::{SeedMode, SeedQuery};
+        let pairs = chunked_put_query();
+        assert_eq!(pairs, [("path", CHUNKED_PUT_PATH.to_string()), ("mode", "update".to_string()), ("branch", "main".to_string()), ("expect", CHUNKED_PUT_EXPECT.to_string())]);
+        let q = SeedQuery { path: CHUNKED_PUT_PATH.into(), mode: SeedMode::Update, branch: Some("main".into()), detached: false, expect: Some(CHUNKED_PUT_EXPECT.into()) };
+        assert_eq!(q.check(), Ok(()));
+        let a = Answer { end_ms: 2000, ..answer(409, r#"{"code":"not_seeded","message":"m"}"#) };
+        assert_eq!(timed_words(20_000_000, &Ok(a)), "20 MB: HTTP 409 not_seeded in 2000 ms (10.0 MB/s)");
+        assert_eq!(timed_words(1_000_000, &Err(BridgeError::Endpoint("PUT https://h/seed: connection reset".into()))), "1 MB: no answer (endpoint: PUT https://h/seed: connection reset)");
+        assert_eq!(TIMED_PUTS, [1_000_000, 20_000_000], "the catalog's 1 MB and 20 MB");
+        assert!(s9_flags("chunked-put").egress == Some(run::Egress::Vpc) && !s9_flags("protocol-v2").imply_internet, "a vpc VM, as a session's");
+    }
 }
 
 #[cfg(test)]
@@ -3672,7 +4070,7 @@ mod tests {
         cfg.aws.image_version = version.into();
         let now = crate::wire::time::unix_now();
         let at = |ago: u64| crate::wire::time::rfc3339_utc(now - ago);
-        let records = records.iter().map(|(v, ago)| VerifiedRecord { image_arn: FAKE_IMAGE_ARN.into(), image_version: (*v).into(), connector: normalize_connector(CONNECTOR), at: at(*ago), dns: DNS_NONE.into(), dns_rule: DNS_RULE, ..VerifiedRecord::default() }).collect();
+        let records = records.iter().map(|(v, ago)| VerifiedRecord { image_arn: FAKE_IMAGE_ARN.into(), image_version: (*v).into(), connector: normalize_connector(CONNECTOR), at: at(*ago), dns: DNS_NONE.into(), dns_rule: DNS_RULE, egress_rule: crate::bridge::egress::EGRESS_RULE, ..VerifiedRecord::default() }).collect();
         EgressVerified { records, ..EgressVerified::default() }.save(&paths).unwrap();
         if dns {
             std::fs::create_dir_all(paths.probes().parent().unwrap()).unwrap();
@@ -3830,7 +4228,7 @@ mod tests {
 
     /// fresh-claude-json starts claude as a Cursor chat's: `claude`, the
     /// extension's argv sanitised as the wrapper sanitises it (the debug flags
-    /// only as `[wrapper].strip_debug` says, `--session-mirror` last), and the
+    /// only as `[wrapper].strip_debug` says, no `--session-mirror`), and the
     /// session's environment with the extension's entrypoint; a configured
     /// name the session refuses refuses the probe too (exit 9) when `lab run`
     /// makes its `CursorChat`, before any Touch ID.
@@ -3838,10 +4236,9 @@ mod tests {
     fn the_fresh_probe_starts_claude_as_cursor_starts_a_chat() {
         let argv = super::cursor_argv(&BridgeConfig::default()).unwrap();
         assert_eq!(argv.first().map(String::as_str), Some("claude"));
-        assert_eq!(argv.last().map(String::as_str), Some("--session-mirror"));
         assert!(argv.windows(2).any(|w| w == ["--permission-prompt-tool", "stdio"]) && argv.contains(&"--replay-user-messages".to_string()), "{argv:?}");
-        assert!(!argv.iter().any(|a| a.starts_with("--debug")), "{argv:?}");
-        assert_eq!(argv.len(), super::CURSOR_SESSION.len(), "the two debug flags out, claude and --session-mirror in");
+        assert!(!argv.iter().any(|a| a.starts_with("--debug") || a == "--session-mirror"), "{argv:?}");
+        assert_eq!(argv.len(), super::CURSOR_SESSION.len() - 1, "the two debug flags out, claude in, no --session-mirror (S9: the transcript is kept in S3)");
         let keep = BridgeConfig::parse("[wrapper]\nstrip_debug = false\n").unwrap();
         assert!(super::cursor_argv(&keep).unwrap().contains(&"--debug-to-stderr".to_string()));
         let env: BTreeMap<String, String> = super::cursor_env(&BridgeConfig::default()).unwrap().into_iter().collect();

@@ -14,7 +14,8 @@
 # Compiles check-plan.ts alone (it and the modules it imports are Pulumi-free, like print-policies.ts) into
 # $PLAN_CHECK_OUT (default <repo>/target/infra-plan), then node reads the plan from stdin. The config files default
 # to this infra/'s; a later --egress-config or --image-config wins (the scratch preview passes its copy's), and the
-# proxy's SSM documents are read from proxy/documents next to the egress config. The plan carries the account id: it
+# proxy's SSM documents are read from proxy/documents next to the egress config, as allow.txt from proxy/ (S9: the
+# `allow` value is it, then the transcripts bucket's host). The plan carries the account id: it
 # is never written to a file here. The compile never sees an operator key or the stack's passphrase (D18: `make deploy`
 # runs this under ai-env as deployer, and A39's unseal); only the check itself, which reads stdin, keeps the
 # environment. Exit: 0 ok, 1 the plan does not match, 2 usage.

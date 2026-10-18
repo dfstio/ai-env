@@ -98,13 +98,17 @@ pub const DEFAULT_RULES: [(&str, &str); 9] = [
     ("github-pat", "ghp_[A-Za-z0-9]{20}"),
     ("slack-token", "xox[bp]-[A-Za-z0-9-]{10}"),
     ("jwt", "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20}"),
-    // Userinfo is printable ASCII: the §10 text's `[^/ @:]` and `[^/ @]` also admit NUL and control bytes, and a
-    // binary's rodata packs unrelated literals tightly enough that `https://` plus a later `:` and a `0x40` byte
-    // read as credentials (measured on the staged shim binary, S7). The ranges are 0x21–0x7e without `/` and `@`,
-    // and without `:` before the first one; `\:\/\/` keeps the pattern's own text from matching itself. Accepted
-    // narrowing: userinfo holding raw non-ASCII bytes no longer matches (this pattern language cannot name bytes above
-    // 0x7e in a class), while percent-encoded userinfo, the valid URL form, still does.
-    ("url-credentials","\\:\\/\\/[!-.0-9;-?A-~]+:[!-.0-?A-~]+@"),
+    // One URL token (S9, F2): the user is RFC 3986's userinfo, unreserved, `%` and the sub-delims; the password
+    // also takes `:` and the raw `^`, `{`, `|`, `}`, `[` and `]` that generated passwords hold and libpq and WHATWG
+    // URL parsing accept unencoded (they delimit nothing in JSON, shell or prose). So a match never runs through `"`,
+    // `<`, `>`, `\`, `` ` ``, a space or a control byte, nor past `/`, `?` or `#`, where the authority ends. S7
+    // narrowed the §10 text's `[^/ @:]` and `[^/ @]` to printable ASCII (a binary's rodata packed `https://`, a later
+    // `:` and a `0x40` byte into credentials, measured on the staged shim binary); S8 then found compact JSON
+    // matching across fields, from a `"url":"https://host:8080"` to a later `"…@…"` value. `\:\/\/` keeps the
+    // pattern's own text from matching itself. Accepted narrowing: userinfo holding raw non-ASCII bytes, or a raw
+    // `"`, `<`, `>`, `\`, `` ` ``, `/`, `?` or `#`, no longer matches; percent-encoded userinfo, the valid URL form,
+    // still does.
+    ("url-credentials","\\:\\/\\/[A-Za-z0-9._~%!$&'()*+,;=-]+:[A-Za-z0-9._~%!$&'()*+,;=:^{|}\\[\\]-]+@"),
 ];
 
 // ---- pattern ----------------------------------------------------------------
@@ -1008,6 +1012,53 @@ fn repo_broad_allow(entry: &str) -> bool {
     }
 }
 
+/// `box review`'s settings-policy rule (S9 §3, `review::RULE_ALLOW_NOT_IN_POLICY`):
+/// each entry of a `settings.json` or `settings.local.json`'s
+/// `permissions.allow` that no document of `base` holds (the same file at
+/// the merge base, and at the commits reviewed before this one) and that is
+/// no `allow` line of `policy`, at its line, keyed `permissions.allow[i]`;
+/// an `allow` that is no array, unless a base holds the same, is one finding
+/// at its key. Entries compare as JSON values, so a policy line matches a
+/// string entry only. A document serde_json does not read (a lone
+/// surrogate, nesting past 128, bytes that are no UTF-8: Node's
+/// `JSON.parse` may still read its `permissions.allow`) is one finding at
+/// `permissions.allow`, line 0, unless a base holds the very same bytes:
+/// D8's repo mode, which names it otherwise, is off when the workspace
+/// trusts its settings. A document that is no JSON object, a `permissions`
+/// that is no object, and any other file name give none (D8's repo mode
+/// names the first two). Never a value: the key only.
+#[must_use]
+pub fn allow_beyond_policy(file_name: &str, bytes: &[u8], base: &[&[u8]], policy: &[String]) -> Vec<SettingsFinding> {
+    const RULE: &str = crate::bridge::review::RULE_ALLOW_NOT_IN_POLICY;
+    if json_kind(file_name) != Some(JsonKind::Settings) {
+        return Vec::new();
+    }
+    // `permissions.allow` of a document, when it parses to an object holding one.
+    let allow_in = |doc: &Value| -> Option<Value> { doc.get("permissions")?.as_object()?.get("allow").cloned() };
+    let allow_of = |bytes: &[u8]| -> Option<Value> { allow_in(&serde_json::from_slice::<Value>(bytes).ok()?) };
+    let Ok(doc) = serde_json::from_slice::<Value>(bytes) else {
+        return if base.contains(&bytes) { Vec::new() } else { vec![SettingsFinding::new(0, RULE, &["permissions", "allow"])] };
+    };
+    let Some(allow) = allow_in(&doc) else {
+        return Vec::new();
+    };
+    let held: Vec<Value> = base.iter().filter_map(|b| allow_of(b)).collect();
+    let at = Located::walk(bytes);
+    let Some(entries) = allow.as_array() else {
+        if held.contains(&allow) {
+            return Vec::new();
+        }
+        return vec![SettingsFinding::new(at.key_line(&["permissions", "allow"]), RULE, &["permissions", "allow"])];
+    };
+    let known = |e: &Value| held.iter().any(|h| h.as_array().is_some_and(|a| a.contains(e))) || e.as_str().is_some_and(|s| policy.iter().any(|p| p == s));
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !known(e))
+        .map(|(i, _)| SettingsFinding { line: at.item_line(&["permissions", "allow"], i), rule: RULE, key: format!("permissions.allow[{i}]") })
+        .collect()
+}
+
 /// Anything but `null`, `false`, `""`, `[]` and `{}`.
 fn non_empty(v: &Value) -> bool {
     match v {
@@ -1726,7 +1777,7 @@ mod tests {
         assert_eq!(DEFAULT_RULES[2].1, "-----BEGIN .*PRIVATE\\ KEY", "§10 text with an escaped space");
         assert_eq!(DEFAULT_RULES[4].1, "MYSQL_PWD\\=", "§10 text with an escaped '='");
         assert_eq!(DEFAULT_RULES[7].1, "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{20}", "deviation from §10: see DEFAULT_RULES");
-        assert_eq!(DEFAULT_RULES[8].1, "\\:\\/\\/[!-.0-9;-?A-~]+:[!-.0-?A-~]+@", "\u{a7}10 text restricted to printable userinfo, with the scheme separator escaped: see DEFAULT_RULES");
+        assert_eq!(DEFAULT_RULES[8].1, "\\:\\/\\/[A-Za-z0-9._~%!$&'()*+,;=-]+:[A-Za-z0-9._~%!$&'()*+,;=:^{|}\\[\\]-]+@", "\u{a7}10 text restricted to one URL token's userinfo, with the scheme separator escaped: see DEFAULT_RULES");
         for (id, src) in DEFAULT_RULES {
             assert!(!p(src).prefix.is_empty(), "{id} needs a literal prefix for the fast path");
         }
@@ -1752,7 +1803,7 @@ mod tests {
             // The shape of a standard HS256 token: 33 header characters after `eyJ`.
             ("jwt", format!("{}{}.{}{}.{}", "eyJ", "h".repeat(33), "eyJ", "p".repeat(60), "s".repeat(43))),
             ("url-credentials", format!("postgres{sep}{}:{}@db", "user", "pw")),
-            // Punctuation-heavy but printable userinfo still matches (the class is 0x21-0x7e without `/` and `@`).
+            // Punctuation-heavy userinfo still matches (the classes are RFC 3986's: unreserved, `%`, the sub-delims).
             ("url-credentials", format!("https{sep}{}:{}@host.test", "a.b-c_1", "p+w%21$=")),
         ]
     }
@@ -2340,5 +2391,91 @@ mod tests {
         std::fs::write(tmp.path().join("f"), "x").unwrap();
         let e = scan_dir(&tmp.path().join("f"), Profile::Image, &Rules::defaults(), &[]).unwrap_err();
         assert!(e.ends_with("not a directory"), "{e}");
+    }
+
+    // ---- S9: F2, `allow_beyond_policy` ----
+
+    /// F2: `url-credentials` matches one URL token. Credentials inside a JSON
+    /// string, a shell argument or percent-encoded still trip it, and so
+    /// does a password holding the raw `^`, `{`, `|`, `}`, `[` or `]` that
+    /// generated passwords carry; a match never runs through a quote, an
+    /// angle bracket, a backslash, a backtick or a space, nor past a query or
+    /// a fragment, so compact JSON's `"…://host:port","…@…"` (S8's false
+    /// positive) never reads as one, and a user never starts at an IPv6 `[`.
+    #[test]
+    fn url_credentials_is_one_url_token() {
+        let sep = "://";
+        for hit in [
+            format!(r#"{{"remote":"https{sep}{}:{}@github.com/o/r.git"}}"#, "user", "s3cret"),
+            format!("git clone 'https{sep}{}:{}@example.invalid/r'", "u", "p%40ss"),
+            format!("redis{sep}{}:{}@cache:6379/0", "default", "a:b;c=d"),
+            format!("x=ftp{sep}{}:{}@h", "o'brien", "(pass)*+!$&,~"),
+            format!("DATABASE_URL=postgres{sep}{}:{}@db.internal/app", "app", "Pa^ss{1}"),
+            format!("amqp{sep}{}:{}@mq", "svc", "a|b[2]c"),
+            format!("https{sep}h:1^x@y"),
+            format!("https{sep}h:1{{x@y"),
+            format!("https{sep}h:1|x@y"),
+            format!("https{sep}h:1}}x@y"),
+        ] {
+            assert_eq!(hits(&hit), ["url-credentials"], "{hit}");
+        }
+        for miss in [
+            format!(r#"{{"url":"https{sep}host:8080","email":"a@b.example"}}"#),
+            format!(r#"{{"url":"https{sep}host:8080/x","by":"me@example.invalid"}}"#),
+            format!("https{sep}host:8080?user=a@b"),
+            format!("https{sep}host:1#frag@x"),
+            format!("https{sep}[::1]:80@x"),
+            format!("https{sep}h:1>x@y"),
+            format!("https{sep}h:1<x@y"),
+            format!("https{sep}h:1\\x@y"),
+            format!("https{sep}h:1`x@y"),
+            format!("https{sep}h:1\"x@y"),
+            format!("https{sep}h:1 x@y"),
+            format!("https{sep}h:1\tx@y"),
+            format!("https{sep}h\u{e9}:p@y"),
+        ] {
+            assert!(hits(&miss).is_empty(), "{miss:?} tripped {:?}", hits(&miss));
+        }
+    }
+
+    fn beyond(json: &str, base: &[&str], policy: &[&str]) -> Vec<(usize, String)> {
+        let base: Vec<&[u8]> = base.iter().map(|b| b.as_bytes()).collect();
+        let policy: Vec<String> = policy.iter().map(|s| (*s).to_string()).collect();
+        allow_beyond_policy("settings.json", json.as_bytes(), &base, &policy).into_iter().inspect(|f| assert_eq!(f.rule, "allow-not-in-policy")).map(|f| (f.line, f.key)).collect()
+    }
+
+    /// `box review`'s policy rule: an allow entry neither a base nor the
+    /// policy holds is a finding at its line; a base's entries and the
+    /// policy's lines pass (strings only for the policy); a non-array
+    /// `allow` counts once unless a base has the same; other files, other
+    /// shapes and documents that do not parse give none.
+    #[test]
+    fn allow_beyond_policy_names_each_new_entry_outside_the_policy() {
+        let doc = "{\"permissions\": {\"allow\": [\n\"Read(./src/**)\",\n\"Bash(npm test:*)\",\n\"Bash(curl:*)\"]}}";
+        assert_eq!(beyond(doc, &[], &[]), [(2, "permissions.allow[0]".into()), (3, "permissions.allow[1]".into()), (4, "permissions.allow[2]".into())]);
+        assert_eq!(beyond(doc, &[], &["Read(./src/**)", "Bash(npm test:*)"]), [(4, "permissions.allow[2]".into())]);
+        let base = "{\"permissions\": {\"allow\": [\"Bash(curl:*)\"]}}";
+        assert_eq!(beyond(doc, &[base], &["Read(./src/**)"]), [(3, "permissions.allow[1]".into())], "the merge base held one");
+        assert_eq!(beyond(doc, &["not json", "{\"permissions\": []}", base], &["Read(./src/**)", "Bash(npm test:*)"]), []);
+        // A non-string entry is placed at its array's key (the walk locates strings).
+        assert_eq!(beyond("{\"permissions\": {\"allow\": [\n7, \"x\"]}}", &[], &["7"]), [(1, "permissions.allow[0]".into()), (2, "permissions.allow[1]".into())], "a policy line is a string");
+        assert_eq!(beyond("{\"permissions\": {\n\"allow\": \"Bash\"}}", &[], &[]), [(2, "permissions.allow".into())]);
+        assert_eq!(beyond("{\"permissions\": {\n\"allow\": \"Bash\"}}", &["{\"permissions\": {\"allow\": \"Bash\"}}"], &[]), []);
+        for none in ["{}", "[1]", "{\"permissions\": []}", "{\"permissions\": {\"deny\": [\"Bash\"]}}"] {
+            assert_eq!(beyond(none, &[], &[]), [], "{none}");
+        }
+        // What serde_json does not read fails closed (Node may still read its allow), unless a base holds those bytes.
+        let deep = format!("{{\"permissions\": {{\"allow\": [\"Bash(*)\"]}}, \"x\": {}1{}}}", "[".repeat(129), "]".repeat(129));
+        for unread in ["not json", "{\"permissions\": {\"allow\": [\"Bash(*)\"]}, \"x\": \"\\ud800\"}", deep.as_str()] {
+            assert_eq!(beyond(unread, &[], &[]), [(0, "permissions.allow".into())], "{unread}");
+            assert_eq!(beyond(unread, &[unread], &[]), [], "a base holds the same bytes: {unread}");
+        }
+        let mut raw = b"{\"permissions\": {\"allow\": [\"Bash(*)\"]}, \"x\": \"".to_vec();
+        raw.extend_from_slice(&[0xff, b'"', b'}']);
+        assert_eq!(allow_beyond_policy("settings.json", &raw, &[], &[]).iter().map(|f| (f.line, f.key.clone())).collect::<Vec<_>>(), [(0, "permissions.allow".to_string())], "a byte that is no UTF-8");
+        assert_eq!(allow_beyond_policy("settings.local.json", doc.as_bytes(), &[], &[]).len(), 3);
+        for other in ["managed-settings.json", ".claude.json", "config.json"] {
+            assert!(allow_beyond_policy(other, doc.as_bytes(), &[], &[]).is_empty(), "{other}");
+        }
     }
 }

@@ -31,22 +31,39 @@
 // attachments or the five stack policies (before it, the bootstrap, as the account root, may replace the three deploy
 // policies once, for their frozen descriptions).
 //
+// S9 (plans/s9-contracts.md §7.1 to §7.4, §7.8): the S3 gateway endpoint (Gateway, the region's S3 service, the proxy's
+// route table only, by URN and by value, its policy policies.ts s3EndpointPolicy), the transcripts bucket (its name the
+// account's, forceDestroy) and its settings (versioning, SSE-S3, BucketOwnerEnforced, the four public access blocks,
+// the lifecycle written out again below), the bucket policy (transcriptsBucketPolicy for the endpoint's id, built from
+// that endpoint by URN), and the exact `allow` value: allow.txt next to --egress-config, then the bucket's host
+// (egress-spec.ts allowValue); allow.txt itself names no AWS host (assertEgressSpec).
+//
 // Exit: 0 the plan matches; 1 it does not (each violation on stderr); 2 bad arguments or not a JSON plan.
 import * as fs from "fs";
 import * as path from "path";
 import {
     DNS_MODES, DOCUMENT_ROLES, egressNames, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY, NET, NaclRuleSpec,
-    PARAMETER_MAX_BYTES, PROVIDERS, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, RouteSpec, RuleSpec, VM_SG_DESCRIPTION, assertEgressSpec,
-    checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, egressSpec, loadEgressConfig, readProxyDocuments,
-    ruleOwner, stackInventory,
+    PARAMETER_MAX_BYTES, PROVIDERS, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, RouteSpec, RuleSpec, VM_SG_DESCRIPTION, allowValue, assertEgressSpec,
+    checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, egressSpec, loadEgressConfig, readAllowText,
+    readProxyDocuments, ruleOwner, stackInventory,
 } from "../egress-spec";
 import {
-    BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME, DEPLOY_POLICY_NAME,
-    EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, STACK_POLICIES,
-    STACK_USERS, USER_POLICY_ATTACHMENTS, attachmentName, buildRolePolicy, deployDnsPolicy, deployEgressPolicy, deployPolicy, deployerPolicy, executionRolePolicy,
-    lambdaTrustPolicy, operatorRolePolicy, operatorTrustPolicy, opsPolicy, policyArn, proxyRolePolicy, proxyTrustPolicy, roleArn, runtimePolicy,
+    BUCKET_PREFIX, BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME,
+    DEPLOY_POLICY_NAME, EGRESS_CHECK_PREFIX, EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME,
+    S3_ENDPOINT_SERVICE, SSM_INSTANCE_POLICY_ARN, STACK_POLICIES, STACK_USERS, TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, buildRolePolicy, deployDnsPolicy,
+    deployEgressPolicy, deployPolicy, deployerPolicy, executionRolePolicy, lambdaTrustPolicy, operatorRolePolicy, operatorTrustPolicy, opsPolicy, policyArn, proxyRolePolicy,
+    proxyTrustPolicy, roleArn, runtimePolicy, s3EndpointPolicy, transcriptsBucketName, transcriptsBucketPolicy,
 } from "../policies";
 
+/**
+ * S9: the transcripts bucket's lifecycle (contracts §7.2), written out again (not imported from transcripts.ts, a Pulumi
+ * module): per rule its id, status, prefix filter (none: every object) and the actions' days.
+ */
+const TRANSCRIPTS_LIFECYCLE = [
+    { id: "abort-multipart", status: "Enabled", prefix: null, abortDays: 1, noncurrentDays: null, expirationDays: null, expiredObjectDeleteMarker: null },
+    { id: "noncurrent-30-days", status: "Enabled", prefix: null, abortDays: null, noncurrentDays: 30, expirationDays: null, expiredObjectDeleteMarker: true },
+    { id: "egress-check-1-day", status: "Enabled", prefix: EGRESS_CHECK_PREFIX, abortDays: null, noncurrentDays: null, expirationDays: 1, expiredObjectDeleteMarker: null },
+];
 /** The budget's services, written out again (not imported from budget.ts): an edit there must show up here. */
 const BUDGET_SERVICES = ["AWS Lambda", "Amazon Elastic Compute Cloud - Compute", "EC2 - Other", "Amazon Virtual Private Cloud", "AmazonCloudWatch", "Amazon Route 53"];
 /**
@@ -143,8 +160,15 @@ const set = (v: unknown) => v !== undefined && v !== null && v !== "" && v !== f
 const userKeys = (o: Record<string, unknown>) => Object.keys(o).filter((k) => k !== "__defaults" && !(k.startsWith("__") && json(o[k]) === "{}") && set(o[k]));
 
 if (cfg.dnsMode !== mode) bad(`--mode ${mode}, but ${args.get("egress-config")} says dnsMode ${cfg.dnsMode}`);
+// S9: allow.txt next to the egress config (the `allow` value is it plus the transcripts bucket's host).
+let allowText: string | undefined;
 try {
-    assertEgressSpec(egressSpec(cfg));
+    allowText = readAllowText(path.join(path.dirname(egressConfigFile), "proxy"));
+} catch (e) {
+    bad(`allow.txt next to ${egressConfigFile}: ${(e as Error).message}`);
+}
+try {
+    assertEgressSpec(egressSpec(cfg), allowText);
 } catch (e) {
     bad((e as Error).message);
 }
@@ -225,6 +249,10 @@ for (const t of types) {
 }
 console.log(`  ${String(all.length).padStart(3)}  resources in total, the stack included (expected ${expectedTotal})`);
 if (all.length !== expectedTotal) bad(`${all.length} resources, expected ${expectedTotal}`);
+// The inventory's own size is pinned (contracts §7.1: S9 took it from 67 and 72 to 75 and 80): a resource added to the
+// stack changes this pin too, where review sees it.
+const pinnedTotal = cfg.dnsMode === "firewall" ? (cfg.enableDnsQueryLog ? 83 : 80) : 75;
+if (expectedTotal !== pinnedTotal) bad(`the stack inventory holds ${expectedTotal} resources (the stack included) in dnsMode ${cfg.dnsMode}, the pin says ${pinnedTotal} (75 in none, 80 in firewall, 83 with the query log)`);
 
 // ---- every resource: a child of the stack, the pinned provider of its package, unprotected, in the region ----
 const providerUrn = (name: string) => all.find((r) => r.type.startsWith("pulumi:providers:") && r.name === name)?.urn;
@@ -280,6 +308,11 @@ const T = {
     fwRule: "aws:route53/resolverFirewallRule:ResolverFirewallRule", fwAssoc: "aws:route53/resolverFirewallRuleGroupAssociation:ResolverFirewallRuleGroupAssociation",
     fwConfig: "aws:route53/resolverFirewallConfig:ResolverFirewallConfig", queryLog: "aws:route53/resolverQueryLogConfig:ResolverQueryLogConfig",
     queryLogAssoc: "aws:route53/resolverQueryLogConfigAssociation:ResolverQueryLogConfigAssociation",
+    // S9.
+    endpoint: "aws:ec2/vpcEndpoint:VpcEndpoint", bucket: "aws:s3/bucket:Bucket", versioning: "aws:s3/bucketVersioning:BucketVersioning",
+    encryption: "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", ownership: "aws:s3/bucketOwnershipControls:BucketOwnershipControls",
+    publicAccess: "aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock", lifecycle: "aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration",
+    bucketPolicy: "aws:s3/bucketPolicy:BucketPolicy",
 };
 
 // ---- IAM: role-level policy inputs refused, every document exactly the policies.ts function's output ----
@@ -287,7 +320,8 @@ const CREATING = new Set(["create", "replace", "create-replacement"]);
 const known_ = (v: unknown) => v !== undefined && v !== null && v !== UNKNOWN;
 const canon = (v: unknown): unknown => Array.isArray(v) ? v.map(canon)
     : v !== null && typeof v === "object" ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])])) : v;
-const bucketRes = (found.get("aws:s3/bucket:Bucket") ?? [])[0] ?? EMPTY;
+// The artifacts bucket by its name (S9: the transcripts bucket is the inventory's other bucket).
+const bucketRes = (found.get("aws:s3/bucket:Bucket") ?? []).find((r) => r.name === BUCKET_PREFIX) ?? EMPTY;
 const bucketName = [bucketRes.i.bucket, bucketRes.id].find((v) => known(v));
 const idOf = (r: Res) => (known(r.id) ? r.id : undefined);
 /**
@@ -317,6 +351,10 @@ const names: Names = {
         // while the instance is created or replaced (then so is the ops policy's document, which iamDoc accepts).
         proxyInstanceId: idOf(one(T.instance, NET.instance)) ?? UNKNOWN,
     },
+    // S9: the transcripts bucket (the account's), and the S3 gateway endpoint's id, which the bucket policy names: its
+    // oldState id on an existing stack, unknown only while the endpoint is created (then so is the bucket policy).
+    transcriptsBucket: transcriptsBucketName(accountId),
+    s3EndpointId: idOf(one(T.endpoint, NET.s3Endpoint)) ?? UNKNOWN,
 };
 /**
  * `prop` of `r` is the document `fn` builds. An unknown value is accepted only while a resource the value depends on
@@ -595,6 +633,57 @@ if (cfg.dnsMode === "firewall") {
         ref(qa, "resourceId", [vpc]);
     }
 }
+
+// ---- S9: the S3 gateway endpoint, the transcripts bucket and its settings, the bucket policy, the allow value ----
+const endpoint = one(T.endpoint, NET.s3Endpoint);
+if (endpoint !== EMPTY) {
+    eq("S3 endpoint vpcEndpointType", endpoint.i.vpcEndpointType, "Gateway");
+    eq("S3 endpoint serviceName", endpoint.i.serviceName, S3_ENDPOINT_SERVICE);
+    ref(endpoint, "vpcId", [vpc]);
+    // Exactly the proxy's route table, by URN and by value: on the VM table the VMs would reach S3 past squid.
+    ref(endpoint, "routeTableIds", [tables.proxy]);
+    eq("S3 endpoint routeTableIds count (the proxy's table only)", (Array.isArray(endpoint.i.routeTableIds) ? endpoint.i.routeTableIds : []).length, 1);
+    absent(endpoint, ["subnetIds", "securityGroupIds", "subnetConfigurations", "privateDnsEnabled", "serviceNetworkArn", "resourceConfigurationArn", "serviceRegion"]);
+    iamDoc(endpoint, "policy", "s3EndpointPolicy", () => s3EndpointPolicy(names));
+}
+const tBucket = one(T.bucket, TRANSCRIPTS_RESOURCE);
+if (tBucket !== EMPTY) {
+    eq("transcripts bucket name", tBucket.i.bucket, names.transcriptsBucket);
+    eq("transcripts bucket forceDestroy", tBucket.i.forceDestroy, true);
+    const setting = (t: string) => one(t, TRANSCRIPTS_RESOURCE);
+    for (const t of [T.versioning, T.encryption, T.ownership, T.publicAccess, T.lifecycle, T.bucketPolicy]) if (setting(t) !== EMPTY) ref(setting(t), "bucket", [tBucket]);
+    const obj = (v: unknown) => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+    const versioning = setting(T.versioning);
+    eq("transcripts versioning status", obj(versioning.i.versioningConfiguration).status, "Enabled");
+    absent(versioning, ["mfa"]);
+    const sse = Array.isArray(setting(T.encryption).i.rules) ? (setting(T.encryption).i.rules as unknown[]) : [];
+    const sseDefault = obj(obj(sse[0]).applyServerSideEncryptionByDefault);
+    eq("transcripts encryption (one SSE-S3 rule)", [sse.length, sseDefault.sseAlgorithm, set(sseDefault.kmsMasterKeyId)], [1, "AES256", false]);
+    eq("transcripts object ownership", obj(setting(T.ownership).i.rule).objectOwnership, "BucketOwnerEnforced");
+    const pab = setting(T.publicAccess);
+    eq("transcripts public access block", [pab.i.blockPublicAcls, pab.i.blockPublicPolicy, pab.i.ignorePublicAcls, pab.i.restrictPublicBuckets], [true, true, true, true]);
+    const days = (v: unknown, k: string) => (obj(v)[k] === undefined || obj(v)[k] === null ? null : obj(v)[k]);
+    const lifecycle = (Array.isArray(setting(T.lifecycle).i.rules) ? (setting(T.lifecycle).i.rules as unknown[]) : []).map((r) => {
+        const rule = obj(r);
+        const prefix = obj(rule.filter).prefix;
+        return {
+            id: rule.id, status: rule.status, prefix: typeof prefix === "string" && prefix !== "" ? prefix : null, abortDays: days(rule.abortIncompleteMultipartUpload, "daysAfterInitiation"),
+            noncurrentDays: days(rule.noncurrentVersionExpiration, "noncurrentDays"), expirationDays: days(rule.expiration, "days"),
+            expiredObjectDeleteMarker: obj(rule.expiration).expiredObjectDeleteMarker === true ? true : null,
+        };
+    });
+    eq("transcripts lifecycle rules", lifecycle, TRANSCRIPTS_LIFECYCLE);
+    // The bucket policy names the endpoint (aws:SourceVpce), so it must be built from that resource: a program naming any
+    // other endpoint, or none, would not depend on it (a fresh stack's preview leaves the document unknown).
+    const policy = setting(T.bucketPolicy);
+    iamDoc(policy, "policy", "transcriptsBucketPolicy", () => transcriptsBucketPolicy(names));
+    if (policy !== EMPTY && endpoint !== EMPTY && !(policy.deps.policy ?? []).includes(endpoint.urn)) {
+        bad(`${policy.type} ${policy.name}: policy does not depend on ${endpoint.urn.split("::").slice(-2).join("::")} (transcriptsBucketPolicy's aws:SourceVpce names the S3 gateway endpoint)`);
+    }
+}
+// The exact allow value: allow.txt, then the transcripts bucket's host (squid serves its virtual-hosted name only).
+const allowParam = one(T.parameter, "ai-env-proxy-allow");
+if (allowParam !== EMPTY && allowText !== undefined) eq("parameter allow (allow.txt, then the transcripts bucket's host)", allowParam.i.insecureValue, allowValue(allowText, names.transcriptsBucket));
 
 // ---- S8 operators: the users, the stack's managed policies, who holds which, the proxy's documents ----
 // policies.ts's lists, which the program, the inventory and the guard follow, against the ones written out above.

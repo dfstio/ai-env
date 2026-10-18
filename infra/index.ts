@@ -4,7 +4,9 @@
 // Amazon DNS, the squid proxy and the network connector `ai-env-egress`. S8 operators (plans/s8-operators-plan.md)
 // adds the operator identities (iam.ts): the users ai-env-deployer and ai-env-ops, without any key, holding the stack's
 // policies (the deployer the three deploy policies, its supplement and ai-env-ops; ops ai-env-ops), and the proxy's
-// three SSM documents (egress.ts, from infra/proxy/documents). The account root runs the bootstrap deploy once.
+// three SSM documents (egress.ts, from infra/proxy/documents). The account root runs the bootstrap deploy once. S9
+// (plans/s9-plan.md §5) adds the transcript store: the bucket ai-env-transcripts-<acct> with its settings
+// (transcripts.ts) and the S3 gateway endpoint on the proxy's route table (egress.ts), with five outputs.
 //
 // Why it looks like this: the MicroVM API exists in one region only, so both providers are explicit objects with
 // the region from a constant and the program refuses a stack whose aws:region or aws-native:region says otherwise
@@ -18,10 +20,11 @@ import * as aws from "@pulumi/aws";
 import * as awsnative from "@pulumi/aws-native";
 import { budgetSettings, createBudget } from "./budget";
 import { createEgress, guardEgress } from "./egress";
-import { assertEgressSpec, assertProxyDocuments, egressNames, egressSpec, loadEgressConfig, readProxyDocuments } from "./egress-spec";
+import { assertEgressSpec, assertProxyDocuments, egressNames, egressSpec, loadEgressConfig, readAllowText, readProxyDocuments } from "./egress-spec";
 import { createIam } from "./iam";
 import { createArtifacts, createImage, loadImageConfig, loadImageJson } from "./image";
-import { Names, PROJECT, REGION } from "./policies";
+import { Names, PROJECT, REGION, canonicalPolicySha256, transcriptsBucketName } from "./policies";
+import { createTranscripts } from "./transcripts";
 
 const stack = pulumi.getStack();
 
@@ -55,7 +58,9 @@ function loadEnvConfig(file: string): Record<string, string> {
 // the guard holds each Document resource to exactly what was read.
 const egressConfig = loadEgressConfig();
 const egress = egressSpec(egressConfig);
-assertEgressSpec(egress); // scratch:assert
+// S9: allow.txt names no AWS host (the stack adds the transcripts bucket's itself).
+const allowText = readAllowText();
+assertEgressSpec(egress, allowText); // scratch:assert
 const documents = readProxyDocuments();
 assertProxyDocuments(documents); // scratch:assert-documents
 const imageConfig = loadImageConfig();
@@ -70,11 +75,16 @@ const awsProvider = new aws.Provider(`aws-${REGION}`, { region: REGION });
 const nativeProvider = new awsnative.Provider(`aws-native-${REGION}`, { region: REGION });
 
 const accountId = aws.getCallerIdentityOutput({}, { provider: awsProvider }).accountId;
+// S9: the guard compares the transcript store's policies and the bucket's name for this account.
+guard.track("account", accountId);
 const artifacts = createArtifacts(imageConfig, imageJson, tags, awsProvider);
 const names: pulumi.Output<Names> = pulumi.all([accountId, artifacts.bucket.bucket]).apply(([acct, bucket]) => ({
     accountId: acct, region: REGION, bucket, imageName: imageConfig.imageName, logGroup: imageConfig.logGroup, egress: egressNames(egressConfig),
+    transcriptsBucket: transcriptsBucketName(acct),
 }));
-const net = createEgress(egress, guard, names, documents, tags, { aws: awsProvider, native: nativeProvider });
+const net = createEgress(egress, guard, names, accountId, documents, tags, { aws: awsProvider, native: nativeProvider });
+// S9: the bucket's policy names the S3 gateway endpoint (its aws:SourceVpce conditions): built from that resource.
+const transcripts = createTranscripts(guard, accountId, net.s3Endpoint.id, tags, awsProvider);
 // The deploy policy (ai-env-deployer's) waits for the VM subnet and security group (its CreateNetworkConnector
 // condition), as does the operator role's Deny in egress.ts (its NotResource).
 const deployNames: pulumi.Output<Names> = pulumi.all([names, net.vmSubnet.id, net.vmSecurityGroup.id]).apply(([n, vmSubnetId, vmSecurityGroupId]) => ({
@@ -145,3 +155,11 @@ export const deployDnsPolicyArn = iam.deployDnsPolicy.arn;
 export const proxyReloadDocument = net.documents.reload.name;
 export const proxyStatusDocument = net.documents.status.name;
 export const proxyPatchDocument = net.documents.patch.name;
+// S9 (contracts §7.6; `ai-env infra status` records them in state/infra.toml): the transcripts bucket, the S3 gateway
+// endpoint with the proxy's route table it sits on, and the canonical hashes of the two policies, which `ai-env egress
+// status` compares with the live documents (names, ids and hashes only: D17).
+export const transcriptsBucket = transcripts.bucket.bucket;
+export const s3EndpointId = net.s3Endpoint.id;
+export const s3EndpointPolicySha256 = net.s3EndpointPolicy.apply(canonicalPolicySha256);
+export const transcriptsBucketPolicySha256 = transcripts.policyDocument.apply(canonicalPolicySha256);
+export const proxyRouteTableId = net.proxyRouteTable.id;

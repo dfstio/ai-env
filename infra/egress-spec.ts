@@ -15,11 +15,15 @@
 // any resource, the guard (each document's content must be its file and pass checkProxyDocument), and check-plan (the
 // planned content against the files next to its --egress-config, then the same predicates). A Rust test
 // (bridge/egress/mod.rs the_proxy_documents_are_what_the_cli_sends) holds the same files to what the CLI sends.
+//
+// S9: the S3 gateway endpoint (NET.s3Endpoint) and the transcripts bucket with its six settings join the inventory,
+// and the `allow` parameter is allow.txt plus the bucket's virtual-hosted name (allowValue), the one AWS host squid
+// serves; allow.txt itself may name no amazonaws.com host (assertEgressSpec with the file's text).
 import * as fs from "fs";
 import * as path from "path";
 import {
     BUCKET_PREFIX, BUDGET_NAME, BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, EgressNames, PROXY_PARAMETERS, REGION, RUNTIME_POLICY_NAME, STACK_POLICIES, STACK_USERS,
-    USER_POLICY_ATTACHMENTS, attachmentName, dnsQueryLogGroupName,
+    TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, dnsQueryLogGroupName, transcriptsBucketHost,
 } from "./policies";
 
 export const DNS_MODES = ["none", "firewall"] as const;
@@ -209,10 +213,31 @@ export const NET = {
     instance: "ai-env-egress-proxy",
     firewall: "ai-env-egress-block-all",
     queryLog: "ai-env-egress-dns",
+    /** S9: the S3 gateway endpoint, on the proxy's route table only. */
+    s3Endpoint: "ai-env-s3",
     /** Pulumi names outside the network (the inventory pins them too). */
     logGroup: "egress-log-group",
     dnsLogGroup: "egress-dns-log-group",
 } as const;
+
+/**
+ * S9: the `allow` parameter's value: allow.txt (the base allowlist) with the transcripts bucket's virtual-hosted name
+ * as its last line. That host is the one AWS host squid serves (its virtual-hosted name only: path style goes to
+ * s3.<region>.amazonaws.com, which squid refuses); the gateway endpoint's policy confines what it reaches.
+ */
+export function allowValue(allowText: string, bucket: string): string {
+    return `${allowText.endsWith("\n") ? allowText : `${allowText}\n`}${transcriptsBucketHost(bucket)}\n`;
+}
+
+/** S9: allow.txt's text (the base allowlist) in `dir` (default infra/proxy). */
+export function readAllowText(dir = path.join(__dirname, "proxy")): string {
+    return fs.readFileSync(path.join(dir, "allow.txt"), "utf-8");
+}
+
+/** The hosts of an allowlist text: its lines, trimmed, without blank and `#` lines, lowercase. */
+function allowHosts(text: string): string[] {
+    return text.split("\n").map((l) => l.trim().toLowerCase()).filter((l) => l.length > 0 && !l.startsWith("#"));
+}
 
 /** Fixed: a changed description replaces the security group, which the connector's ENIs hold. */
 export const VM_SG_DESCRIPTION = "ai-env MicroVM egress connector ENIs: TCP 3128 to the proxy only";
@@ -366,11 +391,18 @@ const LOG_RETENTION_DAYS = [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400,
  * proxy IP outside its subnet, reserved (.0–.3) or the broadcast address; a resolver that is not a public IPv4
  * address; the VM SG with anything but exactly one egress rule TCP <proxyPort> → the proxy SG; a proxy SG rule
  * outside the design; any route on the VM table; DNS attributes that do not match the mode; a mode outside its enum.
+ * S9: with `allowText` (allow.txt), any host in or under amazonaws.com (or .aws, amazonaws.com.cn): every AWS service
+ * endpoint is shared by all customers, and a VM's own IMDS role credentials work at any of them (S7 D2); the stack adds
+ * the transcripts bucket's host itself (allowValue), and nothing else of AWS's may be served.
  */
-export function assertEgressSpec(spec: EgressSpec): void {
+export function assertEgressSpec(spec: EgressSpec, allowText?: string): void {
     const cfg = spec.cfg;
     const errors: string[] = [];
     const err = (msg: string) => errors.push(msg);
+    if (allowText !== undefined) {
+        const aws = allowHosts(allowText).filter((h) => ["amazonaws.com", "amazonaws.com.cn", "aws"].some((d) => h === d || h.endsWith(`.${d}`)));
+        if (aws.length > 0) err(`allow.txt names AWS service host(s) ${aws.join(", ")}: the stack adds only the transcripts bucket's host itself (S7 D2, S9)`);
+    }
 
     if (!(DNS_MODES as readonly string[]).includes(cfg.dnsMode)) err(`dnsMode must be one of ${DNS_MODES.join(", ")}, got ${cfg.dnsMode}`);
     if (typeof cfg.enableDnsQueryLog !== "boolean") err("enableDnsQueryLog must be true or false");
@@ -631,9 +663,10 @@ export const PROVIDER_INPUTS = ["region", "version", "skipCredentialsValidation"
  * guard refuses any resource outside it (CloudFormation stacks, Cloud Control and other generic resources, SSM
  * associations, extra providers, components, and every IAM kind the operator identities must never have: an access
  * key, a login profile, a group or group membership, a PolicyAttachment or UserPolicyAttachmentsExclusive, an
- * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 67 in
- * dnsMode none, 72 in firewall, the stack included. A resource added to the program must be added here, or the
- * preview fails.
+ * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 75 in
+ * dnsMode none, 80 in firewall, the stack included (S9 added eight: transcripts.ts's bucket ai-env-transcripts with its
+ * versioning, encryption, ownership controls, public access block, lifecycle and policy, and egress.ts's S3 gateway
+ * endpoint ai-env-s3; before S9, 67 and 72). A resource added to the program must be added here, or the preview fails.
  */
 export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory {
     const firewall = cfg.dnsMode === "firewall";
@@ -644,8 +677,14 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["pulumi:providers:aws", [PROVIDERS.aws]],
         ["pulumi:providers:aws-native", [PROVIDERS.awsNative]],
         // S3 (plans/s3-plan.md §8, §9).
-        ["aws:s3/bucket:Bucket", [BUCKET_PREFIX]],
-        ["aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock", [BUCKET_PREFIX]],
+        ["aws:s3/bucket:Bucket", [BUCKET_PREFIX, TRANSCRIPTS_RESOURCE]],
+        ["aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock", [BUCKET_PREFIX, TRANSCRIPTS_RESOURCE]],
+        // S9 (plans/s9-contracts.md §7.1): the transcripts bucket's settings, each a resource of its own (non-V2 types).
+        ["aws:s3/bucketVersioning:BucketVersioning", [TRANSCRIPTS_RESOURCE]],
+        ["aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", [TRANSCRIPTS_RESOURCE]],
+        ["aws:s3/bucketOwnershipControls:BucketOwnershipControls", [TRANSCRIPTS_RESOURCE]],
+        ["aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration", [TRANSCRIPTS_RESOURCE]],
+        ["aws:s3/bucketPolicy:BucketPolicy", [TRANSCRIPTS_RESOURCE]],
         ["aws:s3/bucketObjectv2:BucketObjectv2", ["image-zip"]],
         ["aws:cloudwatch/logGroup:LogGroup", ["image-log-group", NET.logGroup, ...(queryLog ? [NET.dnsLogGroup] : [])]],
         ["aws:iam/role:Role", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName]],
@@ -668,6 +707,8 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["aws:ec2/subnet:Subnet", [NET.proxy, NET.vms]],
         ["aws:ec2/routeTable:RouteTable", [NET.proxy, NET.vms]],
         ["aws:ec2/routeTableAssociation:RouteTableAssociation", [NET.proxy, NET.vms]],
+        // S9: the S3 gateway endpoint on the proxy's route table.
+        ["aws:ec2/vpcEndpoint:VpcEndpoint", [NET.s3Endpoint]],
         ["aws:ec2/networkAcl:NetworkAcl", [NET.vms]],
         ["aws:ec2/networkAclAssociation:NetworkAclAssociation", [NET.vms]],
         ["aws:ec2/defaultSecurityGroup:DefaultSecurityGroup", [NET.defaultSecurityGroup]],

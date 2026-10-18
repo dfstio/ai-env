@@ -26,11 +26,12 @@ fn wrapper() -> &'static str {
 /// its knobs — a set mode would turn these exec tests into piped runs — what
 /// S7's `local-scratch` login reads: the token, the keystore directory and
 /// its two lab knobs; S8's VM pin and transcript knob, the remote session's
-/// lab knobs and its trace; and the S8 operators' `ai-env as` marker and the
-/// pasteboard's osascript knob) or the fake (`tests/fakes/claude.sh`'s knobs
+/// lab knobs and its trace; the S8 operators' `ai-env as` marker and the
+/// pasteboard's osascript knob; S9's fake S3 address and code token minutes)
+/// or the fake (`tests/fakes/claude.sh`'s knobs
 /// but the argv log `command` sets). Every `AI_ENV_BRIDGE_*` knob the code
 /// reads is here but the bridge root (`tests/infra/image.rs` checks it).
-const WRAPPER_ENV: [&str; 26] = [
+const WRAPPER_ENV: [&str; 28] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -52,6 +53,8 @@ const WRAPPER_ENV: [&str; 26] = [
     "AI_ENV_BRIDGE_TRACE",
     "AI_ENV_BRIDGE_AS",
     "AI_ENV_BRIDGE_LAB_OSASCRIPT",
+    "AI_ENV_BRIDGE_LAB_S3_ADDR",
+    "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
     "AI_ENV_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "FAKE_STDOUT",
@@ -368,23 +371,92 @@ fn census_records_env_names_only() {
     assert_eq!(row["env_selected"]["CLAUDE_CONFIG_DIR"], format!("/x/sk-ant-[redacted:len={}]", canary.len()), "{row}");
 }
 
+/// What the fake claude prints when it runs (`FAKE_STDOUT`): a claude run
+/// with no arguments logs nothing, so the tests that must run none look for
+/// this on stdout too.
+const RAN_MARKER: &str = "fake-claude-ran-4f1c";
+
+/// How long one wrapper run may take in the tests that must run no claude
+/// (S8's rule, F9: every wait bounded).
+const RUN_LIMIT: Duration = Duration::from_secs(60);
+
 /// `ai-env-claude --help` (or `-h`) alone prints the wrapper's own usage and
 /// exits 0: nothing is read, nothing written, and no claude runs, although
 /// a `--help` taken as the real binary's path would reach the local fallback
 /// and the PATH here holds an executable `claude` (the kill switch set too).
+/// S9: the fake prints a marker whenever it runs, so a claude run with no
+/// arguments (which logs none) shows too; each run is bounded.
 #[test]
 fn help_prints_the_wrappers_usage_and_runs_no_claude() {
     let fake = FakeClaude::new();
     let path = fake.tmp().to_string_lossy().into_owned();
+    let marker = [("FAKE_STDOUT", RAN_MARKER)];
     for (flag, envs) in [("--help", vec![("PATH", path.as_str())]), ("-h", vec![("PATH", path.as_str())]), ("--help", vec![("PATH", path.as_str()), ("AI_ENV_BRIDGE_LOCAL", "1")])] {
-        let out = fake.command(Path::new(flag), &[], &envs).current_dir(fake.tmp()).output().expect("spawn wrapper");
+        let envs: Vec<(&str, &str)> = envs.into_iter().chain(marker).collect();
+        let mut cmd = fake.command(Path::new(flag), &[], &envs);
+        cmd.current_dir(fake.tmp());
+        let out = common::bounded::run_within(cmd, None, RUN_LIMIT, &format!("ai-env-claude {flag}"));
         let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
         assert_eq!(out.status.code(), Some(0), "{flag}: {stdout}{stderr}");
         assert!(stdout.starts_with("ai-env-claude ") && stdout.contains("(usage: ai-env-claude <realBinary> <claude args…> | --version | --help)"), "{flag}: {stdout}");
+        assert!(!stdout.contains(RAN_MARKER), "{flag}: a claude ran: {stdout}");
         assert!(stderr.is_empty(), "{flag}: {stderr}");
     }
     assert!(fake.logged().is_empty(), "a claude ran: {:?}", fake.logged());
     assert!(!fake.census_path().exists(), "the help wrote a census row");
+}
+
+/// S9 CUSTODY-4: a first argument that is no binary path (empty, starting
+/// with `-` even when it holds a `/`, a bare name other than `claude`) is
+/// exit 2 with the usage, before any config read or census row: no claude
+/// runs, although the local fallback would find an executable `claude` on
+/// this PATH (the fake prints a marker whenever it runs). The argument
+/// shows quoted, a control character escaped. A bare `claude` still takes
+/// the fallback, and a path still runs as given.
+#[test]
+fn a_first_argument_that_is_no_binary_path_runs_no_claude() {
+    let fake = FakeClaude::new();
+    fake.with_bridge_toml(&FakeClaude::roots_toml(fake.tmp()));
+    let path = fake.tmp().to_string_lossy().into_owned();
+    let envs = [("PATH", path.as_str()), ("FAKE_STDOUT", RAN_MARKER)];
+    let cases: [(&str, &[&str]); 10] = [
+        ("help", &[]),
+        ("-v", &[]),
+        ("--help", &["--verbose"]),
+        ("-h", &["auth", "status"]),
+        ("", &["--version"]),
+        ("foo", &STREAM_JSON),
+        (".", &["--version"]),
+        ("--version", &["--json"]),
+        ("hel\u{1b}[2Jp", &[]),
+        ("--mcp-config=/tmp/m.json", &["-p", "hi"]),
+    ];
+    for (first, args) in cases {
+        let mut cmd = fake.command(Path::new(first), args, &envs);
+        cmd.current_dir(fake.tmp());
+        let out = common::bounded::run_within(cmd, None, RUN_LIMIT, &format!("ai-env-claude {first:?}"));
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(2), "{first:?}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{first:?}: a claude ran: {stdout}");
+        assert_eq!(stderr.lines().count(), 1, "{first:?}: one line: {stderr}");
+        assert!(stderr.starts_with("ai-env-claude: the first argument ") && stderr.ends_with(" is no path to Cursor's claude  (usage: ai-env-claude <realBinary> <claude args…> | --version | --help)\n"), "{first:?}: {stderr}");
+        assert!(!stderr.chars().any(|c| c.is_control() && c != '\n'), "{first:?}: a control character printed: {stderr:?}");
+    }
+    assert!(text(&common::bounded::run_within(fake.command(Path::new("hel\u{1b}[2Jp"), &[], &envs), None, RUN_LIMIT, "ai-env-claude escaped").stderr).contains("\"hel\\u{1b}[2Jp\""));
+    assert!(fake.logged().is_empty(), "a claude ran: {:?}", fake.logged());
+    assert!(!fake.census_path().exists(), "a census row was written");
+    // A bare `claude` takes the local fallback (the fake on PATH), and a path runs as given.
+    let work = fake.tmp().join("work");
+    std::fs::create_dir(&work).unwrap();
+    for (real, args) in [(PathBuf::from("claude"), AUTH_STATUS), (fake.bin(), AUTH_STATUS)] {
+        let mut cmd = fake.command(&real, &args, &envs);
+        cmd.current_dir(&work);
+        let out = common::bounded::run_within(cmd, None, RUN_LIMIT, "ai-env-claude claude");
+        assert_eq!(out.status.code(), Some(0), "{}: {}", real.display(), text(&out.stderr));
+        assert_eq!(text(&out.stdout), format!("{RAN_MARKER}\n"), "{}", real.display());
+    }
+    assert_eq!(fake.logged(), [AUTH_STATUS, AUTH_STATUS].concat());
+    assert_eq!(fake.census().len(), 2, "one row per run that passed the check");
 }
 
 #[test]

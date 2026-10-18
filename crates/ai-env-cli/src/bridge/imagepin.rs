@@ -10,9 +10,10 @@
 //! and rewrites the lock atomically. `--check-bundle` is the part B
 //! preflight: the lock must name the version of the highest installed
 //! `anthropic.claude-code-<v>-darwin-arm64` bundle, else the deploy would
-//! ship a claude the Mac does not run. `--bundle-version` prints that
-//! bundle's version alone (`make claude-update` follows it). Nothing here
-//! downloads anything.
+//! ship a claude the Mac does not run; a live Cursor window still on another
+//! extension (S9, the census's) earns a note, never another verdict.
+//! `--bundle-version` prints that bundle's version alone (`make
+//! claude-update` follows it). Nothing here downloads anything.
 use crate::bridge::doctor::{installed_extension_names, pick_bundle};
 use crate::bridge::infra::write_atomic_mode;
 use crate::errors::{CliError, Result};
@@ -130,17 +131,45 @@ pub fn cmd_pin(manifest: Option<&Path>, lock: &Path, check_bundle: bool, bundle_
         return print_pin(&pin);
     }
     let bundle = installed_bundle()?;
-    if bundle == pin.version {
-        outln!("pin: lock {} equals the Cursor bundle", pin.version);
-        return Ok(());
+    let (verdict, notes) = bundle_check(&pin, lock, &bundle, &crate::bridge::doctor::running_windows());
+    // The notes first: P10 (`make gates`) shows the last line, the verdict's.
+    for note in notes {
+        outln!("{note}");
     }
-    // The pin and the test first: they always work, while make claude-update refuses before the bootstrap (no
-    // deployer key exists to ask for).
-    Err(CliError::Msg(format!(
-        "pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-pin CLAUDE_VERSION={bundle} && make test-docker (once the stack has its deployer, make claude-update does both and the deploy)",
-        pin.version,
-        lock.display()
-    )))
+    match verdict {
+        Ok(line) => {
+            outln!("{line}");
+            Ok(())
+        }
+        Err(e) => Err(CliError::Msg(e)),
+    }
+}
+
+/// `--check-bundle`'s verdict (pure): the lock (`pin`, read from `lock`)
+/// against the newest installed bundle (`bundle`), the deploy target: `Ok`
+/// with the line that says they are equal, `Err` with the one that names
+/// the fix. Then (S9) a note per live Cursor window on another extension
+/// than `bundle` (`running`: `census::running_extensions`), which never
+/// changes the verdict: the image follows the bundle, and a reload brings
+/// the window to it.
+pub fn bundle_check(pin: &ClaudePin, lock: &Path, bundle: &str, running: &[crate::bridge::census::RunningExtension]) -> (std::result::Result<String, String>, Vec<String>) {
+    let notes = running
+        .iter()
+        .filter(|w| w.ext != bundle)
+        .map(|w| format!("note: {}; the lock follows the installed {bundle}  <- reload that window", crate::bridge::doctor::running_window_text(w)))
+        .collect();
+    let verdict = if bundle == pin.version {
+        Ok(format!("pin: lock {} equals the Cursor bundle", pin.version))
+    } else {
+        // The pin and the test first: they always work, while make claude-update refuses before the bootstrap (no
+        // deployer key exists to ask for).
+        Err(format!(
+            "pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-pin CLAUDE_VERSION={bundle} && make test-docker (once the stack has its deployer, make claude-update does both and the deploy)",
+            pin.version,
+            lock.display()
+        ))
+    };
+    (verdict, notes)
 }
 
 #[cfg(test)]
@@ -171,6 +200,28 @@ mod tests {
         let pin = pin_from_manifest(&manifest("2.1.283", &sum, 240_902_136, "2026-09-25T01:39:37Z"), PLATFORM).unwrap();
         assert_eq!(pin, ClaudePin { version: "2.1.283".into(), platform: PLATFORM.into(), sha256: sum, size: 240_902_136, build_date: "2026-09-25T01:39:37Z".into() });
         assert_eq!(parse_lock(&render_lock(&pin).unwrap()).unwrap(), pin);
+    }
+
+    /// S9: `--check-bundle`'s verdict stays the lock against the newest
+    /// installed bundle (the deploy target); a live Cursor window on another
+    /// extension adds a note naming it and the reload, whatever the
+    /// verdict, and a window on the bundle adds none.
+    #[test]
+    fn check_bundle_notes_a_window_on_another_extension() {
+        use crate::bridge::census::RunningExtension;
+        let lock = Path::new("/r/image/claude.lock");
+        let started = crate::wire::time::parse_rfc3339_utc("2026-10-17T09:00:00Z").unwrap();
+        let on = |host: u32, ext: &str| RunningExtension { host, ext: ext.into(), started, seen: (started + 60) * 1000 };
+        let pin = |v: &str| ClaudePin { version: v.into(), platform: PLATFORM.into(), sha256: "ab".repeat(32), size: 1, build_date: "2026-09-25T01:39:37Z".into() };
+        let windows = [on(5101, "2.1.301"), on(5102, "2.1.302")];
+        let note = "note: a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:00Z); the lock follows the installed 2.1.302  <- reload that window".to_string();
+        let (verdict, notes) = bundle_check(&pin("2.1.302"), lock, "2.1.302", &windows);
+        assert_eq!((verdict, notes), (Ok("pin: lock 2.1.302 equals the Cursor bundle".to_string()), vec![note.clone()]), "the lock equals the bundle: the window does not change the verdict");
+        let (verdict, notes) = bundle_check(&pin("2.1.301"), lock, "2.1.302", &windows);
+        assert!(verdict.as_ref().is_err_and(|e| e.starts_with("pin: lock 2.1.301 (/r/image/claude.lock) differs from the Cursor bundle 2.1.302  <- make claude-pin CLAUDE_VERSION=2.1.302")), "the lock against the bundle, never the window's version: {verdict:?}");
+        assert_eq!(notes, vec![note]);
+        assert_eq!(bundle_check(&pin("2.1.302"), lock, "2.1.302", &windows[1..]).1, Vec::<String>::new(), "a window on the bundle");
+        assert_eq!(bundle_check(&pin("2.1.302"), lock, "2.1.302", &[]), (Ok("pin: lock 2.1.302 equals the Cursor bundle".to_string()), Vec::new()));
     }
 
     #[test]

@@ -25,6 +25,15 @@
 // deployer's supplement ai-env-deployer and ai-env-ops' own policy. The deployer holds the three deploy policies, its
 // supplement and ai-env-ops; ops holds ai-env-ops alone. Every key is issued out of band (D17, D23): no document here
 // is ever a key's, and the stack holds no access key.
+//
+// S9 (plans/s9-plan.md §5, plans/s9-contracts.md §7.3 to §7.5) adds the transcript store: the runtime user's objects
+// under `v1/` of the bucket ai-env-transcripts-<acct> (TranscriptObjects, ListTranscripts, both bound to the account by
+// s3:ResourceAccount), the deployer's bucket and endpoint actions, ai-env-ops' bucket reads, and two resource policies:
+// the S3 gateway endpoint's (s3EndpointPolicy: our `v1/*` for the runtime user only, plus the AL2023 repository bucket
+// the proxy's dnf reads) and the bucket's own, Deny only (transcriptsBucketPolicy). Their canonical hashes
+// (canonicalPolicySha256) are stack outputs, which `ai-env egress status` compares with the live documents.
+
+import * as crypto from "crypto";
 
 /** The one region: the MicroVM API answers 403 elsewhere. Never taken from config or the environment. */
 export const REGION = "eu-central-1";
@@ -92,6 +101,35 @@ export const ZIP_KEY_PREFIX = "ai-env/image-";
 /** The service that assumes the build and execution roles. */
 export const LAMBDA_SERVICE = "lambda.amazonaws.com";
 
+/** S9: the transcripts bucket is `ai-env-transcripts-<accountId>` (`wire::s3::BUCKET_PREFIX`): a fixed name, so the
+ * allowlist line and the policies are exact strings at preview time. */
+export const TRANSCRIPTS_BUCKET_PREFIX = "ai-env-transcripts-";
+/** S9: the Pulumi name of the transcripts bucket and of each of its settings (contracts §7.1). */
+export const TRANSCRIPTS_RESOURCE = "ai-env-transcripts";
+/** S9: every transcript object is under this prefix (`wire::s3::KEY_PREFIX`). */
+export const TRANSCRIPTS_KEY_PREFIX = "v1/";
+/** S9: the egress check's own objects (`wire::s3::EGRESS_CHECK_PREFIX`), expired after a day. */
+export const EGRESS_CHECK_PREFIX = "v1/_egress-check/";
+/**
+ * S9: the Amazon Linux 2023 repository bucket of the region. The proxy reaches S3 through the gateway endpoint from
+ * now on (it sits on the proxy's route table), so its `dnf` (and `make proxy-patch`) reads these objects through the
+ * endpoint's policy. Read off the proxy's repository configuration before the deploy (plan risk): a wrong name breaks
+ * the proxy's package updates. What else the proxy fetches over S3 (an SSM agent update) is refused at the endpoint.
+ */
+export const AL2023_REPO_BUCKET = "al2023-repos-eu-central-1-de612dc2";
+/** S9: the S3 gateway endpoint's service in the region. */
+export const S3_ENDPOINT_SERVICE = "com.amazonaws.eu-central-1.s3";
+
+/** S9: the transcripts bucket of `accountId`. */
+export function transcriptsBucketName(accountId: string): string {
+    return `${TRANSCRIPTS_BUCKET_PREFIX}${accountId}`;
+}
+
+/** S9: the bucket's virtual-hosted name (`wire::s3::bucket_host`), the one AWS host squid serves. */
+export function transcriptsBucketHost(bucket: string): string {
+    return `${bucket}.s3.${REGION}.amazonaws.com`;
+}
+
 /** The managed INTERNET_EGRESS network connector (the image build downloads packages and claude). */
 export function internetEgressConnectorArn(region: string): string {
     return `arn:aws:lambda:${region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS`;
@@ -158,12 +196,20 @@ export interface Names {
     imageName: string;
     logGroup: string;
     egress: EgressNames;
+    /** S9: the transcripts bucket, `ai-env-transcripts-<accountId>` (transcriptsBucketName). */
+    transcriptsBucket: string;
+    /**
+     * S9: the S3 gateway endpoint's id, which exists only once the stack created it: the bucket policy's
+     * `aws:SourceVpce` conditions name it. `print-policies` passes a placeholder of the same shape.
+     */
+    s3EndpointId?: string;
 }
 
 export interface Statement {
     Sid: string;
     Effect: "Allow" | "Deny";
-    Principal?: { Service: string | string[] };
+    /** A trust policy's service, or `*` in a resource policy (S9: the endpoint's and the bucket's, narrowed by conditions). */
+    Principal?: "*" | { Service: string | string[] };
     Action: string[];
     Resource?: string[];
     NotResource?: string[];
@@ -380,14 +426,99 @@ export function egressConnectorArns(n: Names): string[] {
     return byName === connectorArn ? [connectorArn] : [connectorArn, byName];
 }
 
+/**
+ * S9: the transcript objects the runtime key works with: presigned GETs and PUTs for the VM, the Mac's own multipart
+ * upload, deletes (gc, a compaction, `forget --purge`), ListObjectsV2 of `v1/`. S3 ARNs carry no account, so without
+ * `s3:ResourceAccount` both statements would allow a bucket of that name in any account (a name freed by a destroy and
+ * taken elsewhere); the signed `x-amz-expected-bucket-owner` refuses it as well.
+ */
+export const RUNTIME_TRANSCRIPT_ACTIONS = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"];
+
 export function runtimePolicy(n: Names): PolicyDocument {
+    const bucket = `arn:aws:s3:::${n.transcriptsBucket}`;
     return doc(
         { Sid: "MicrovmsOfTheImage", Effect: "Allow", Action: RUNTIME_IMAGE_ACTIONS, Resource: [imageArn(n)] },
         { Sid: "ListMicrovms", Effect: "Allow", Action: RUNTIME_LIST_ACTIONS, Resource: ["*"] },
         { Sid: "PassNetworkConnector", Effect: "Allow", Action: [PASS_CONNECTOR_ACTION], Resource: ["*"] },
         { Sid: "ReadTheEgressConnector", Effect: "Allow", Action: [GET_CONNECTOR_ACTION], Resource: egressConnectorArns(n) },
         { Sid: "PassExecutionRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, EXECUTION_ROLE_NAME)] },
+        {
+            Sid: "TranscriptObjects", Effect: "Allow", Action: RUNTIME_TRANSCRIPT_ACTIONS, Resource: [`${bucket}/${TRANSCRIPTS_KEY_PREFIX}*`],
+            Condition: { StringEquals: { "s3:ResourceAccount": n.accountId } },
+        },
+        {
+            Sid: "ListTranscripts", Effect: "Allow", Action: ["s3:ListBucket"], Resource: [bucket],
+            Condition: { StringLike: { "s3:prefix": [TRANSCRIPTS_KEY_PREFIX, `${TRANSCRIPTS_KEY_PREFIX}*`] }, StringEquals: { "s3:ResourceAccount": n.accountId } },
+        },
     );
+}
+
+/**
+ * S9: the S3 gateway endpoint's policy (contracts §7.3): through the endpoint, only the runtime user, only our
+ * account's bucket, only `v1/*` (reads by version and writes), plus anonymous reads of the AL2023 repository bucket
+ * the proxy's dnf needs. Everything else through the endpoint — another bucket by its virtual-hosted name or path
+ * style (fronting), our bucket outside `v1/`, the VM's own IMDS role credentials — is denied by the endpoint itself.
+ */
+export function s3EndpointPolicy(n: Pick<Names, "accountId" | "transcriptsBucket">): PolicyDocument {
+    return doc(
+        {
+            Sid: "TranscriptsOfTheRuntimeUser", Effect: "Allow", Principal: "*", Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"],
+            Resource: [`arn:aws:s3:::${n.transcriptsBucket}/${TRANSCRIPTS_KEY_PREFIX}*`],
+            Condition: { ArnEquals: { "aws:PrincipalArn": `arn:aws:iam::${n.accountId}:user/${RUNTIME_USER_NAME}` }, StringEquals: { "s3:ResourceAccount": n.accountId } },
+        },
+        { Sid: "Al2023Repos", Effect: "Allow", Principal: "*", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${AL2023_REPO_BUCKET}/*`] },
+    );
+}
+
+/**
+ * S9: the transcripts bucket's policy (contracts §7.4), Deny only: any request without TLS; reads of `v1/*` unless
+ * through our endpoint (the Mac never reads an object); the VM's writes (`v1/<sid>/vm/…`) unless through it; the Mac's
+ * writes (`v1/<sid>/mac/…`) through it; object reads and writes by any principal but the runtime user. Deletes are
+ * never denied (the Mac's gc and compaction; forceDestroy). Throws without the endpoint's id.
+ */
+export function transcriptsBucketPolicy(n: Pick<Names, "accountId" | "transcriptsBucket" | "s3EndpointId">): PolicyDocument {
+    const vpce = n.s3EndpointId;
+    if (vpce === undefined) throw new Error("transcriptsBucketPolicy: the S3 gateway endpoint's id is required (aws:SourceVpce)");
+    const bucket = `arn:aws:s3:::${n.transcriptsBucket}`;
+    const objects = `${bucket}/${TRANSCRIPTS_KEY_PREFIX}*`;
+    return doc(
+        { Sid: "DenyWithoutTls", Effect: "Deny", Principal: "*", Action: ["s3:*"], Resource: [bucket, `${bucket}/*`], Condition: { Bool: { "aws:SecureTransport": "false" } } },
+        {
+            Sid: "DenyReadsOutsideTheEndpoint", Effect: "Deny", Principal: "*", Action: ["s3:GetObject", "s3:GetObjectVersion"], Resource: [objects],
+            Condition: { StringNotEquals: { "aws:SourceVpce": vpce } },
+        },
+        {
+            Sid: "DenyVmWritesOutsideTheEndpoint", Effect: "Deny", Principal: "*", Action: ["s3:PutObject"], Resource: [`${bucket}/${TRANSCRIPTS_KEY_PREFIX}*/vm/*`],
+            Condition: { StringNotEquals: { "aws:SourceVpce": vpce } },
+        },
+        {
+            Sid: "DenyMacWritesThroughTheEndpoint", Effect: "Deny", Principal: "*", Action: ["s3:PutObject"], Resource: [`${bucket}/${TRANSCRIPTS_KEY_PREFIX}*/mac/*`],
+            Condition: { StringEquals: { "aws:SourceVpce": vpce } },
+        },
+        {
+            Sid: "DenyOtherPrincipals", Effect: "Deny", Principal: "*", Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], Resource: [`${bucket}/*`],
+            Condition: { ArnNotEquals: { "aws:PrincipalArn": `arn:aws:iam::${n.accountId}:user/${RUNTIME_USER_NAME}` } },
+        },
+    );
+}
+
+/**
+ * S9: a policy document's text in its canonical form (contracts §7.6; `bridge::infra::canonical_policy_sha256` in
+ * Rust is the same): every object's keys sorted, an array of exactly one string written as that string, no
+ * whitespace. AWS's normalised text of a document (keys reordered, `["x"]` turned into `"x"`) has the same form.
+ */
+export function canonicalPolicyText(document: unknown): string {
+    const canon = (v: unknown): unknown => {
+        if (Array.isArray(v)) return v.length === 1 && typeof v[0] === "string" ? v[0] : v.map(canon);
+        if (v !== null && typeof v === "object") return Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])]));
+        return v;
+    };
+    return JSON.stringify(canon(typeof document === "string" ? JSON.parse(document) : document));
+}
+
+/** S9: the canonical hash of a policy document (text or object): sha256 of [canonicalPolicyText], lowercase hex. */
+export function canonicalPolicySha256(document: unknown): string {
+    return crypto.createHash("sha256").update(canonicalPolicyText(document), "utf-8").digest("hex");
 }
 
 /**
@@ -476,6 +607,15 @@ export function deployPolicy(n: Names): PolicyDocument {
             Sid: "ArtifactsObjects", Effect: "Allow", Resource: [`${bucket}/*`],
             Action: ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutObjectTagging", "s3:GetObjectTagging", "s3:DeleteObjectTagging"],
         },
+        // S9: the transcripts bucket and its settings (versioning, encryption, ownership, public access block,
+        // lifecycle, policy), and its objects' deletion for forceDestroy only: the deployer never reads or writes one.
+        {
+            Sid: "TranscriptsBucket", Effect: "Allow", Resource: [`arn:aws:s3:::${n.transcriptsBucket}`],
+            Action: ["s3:CreateBucket", "s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucket*", "s3:PutBucket*", "s3:DeleteBucket*",
+                "s3:GetAccelerateConfiguration", "s3:GetLifecycleConfiguration", "s3:GetReplicationConfiguration", "s3:GetEncryptionConfiguration",
+                "s3:PutLifecycleConfiguration", "s3:PutEncryptionConfiguration"],
+        },
+        { Sid: "TranscriptsObjectsDestroy", Effect: "Allow", Resource: [`arn:aws:s3:::${n.transcriptsBucket}/*`], Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"] },
         {
             Sid: "LogGroup", Effect: "Allow", Resource: logGroupArns(n),
             Action: ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy", "logs:TagResource", "logs:UntagResource",
@@ -491,7 +631,7 @@ export function deployPolicy(n: Names): PolicyDocument {
 
 /**
  * ai-env-deploy-egress (S5): the VPC, subnets, route tables, security groups, the proxy instance with its role,
- * profile, parameters and log group, and the operator role; S8 operators adds the proxy's three SSM documents
+ * profile, parameters and log group, and the operator role; S9 the S3 gateway endpoint; S8 operators adds the proxy's three SSM documents
  * (ProxyDocuments: their whole lifecycle, never ssm:ModifyDocumentPermission, so a document can never be shared).
  * Held by ai-env-deployer like ai-env-deploy; names proven by Access Analyzer, not sufficiency. Sending the documents
  * is ai-env-ops' (opsPolicy's ProxyCommands), which the deployer holds too: one source of truth.
@@ -506,7 +646,7 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
                 "ec2:DescribeRouteTables", "ec2:DescribeSecurityGroups", "ec2:DescribeSecurityGroupRules", "ec2:DescribeNetworkAcls", "ec2:DescribeInstances",
                 "ec2:DescribeInstanceAttribute", "ec2:DescribeInstanceStatus", "ec2:DescribeInstanceTypes", "ec2:DescribeInstanceCreditSpecifications",
                 "ec2:DescribeVolumes", "ec2:DescribeNetworkInterfaces", "ec2:DescribeImages", "ec2:DescribeTags", "ec2:DescribeAvailabilityZones",
-                "ec2:DescribeAccountAttributes", "ec2:DescribePrefixLists"],
+                "ec2:DescribeAccountAttributes", "ec2:DescribePrefixLists", "ec2:DescribeVpcEndpoints"],
         },
         {
             Sid: "Ec2EgressNetwork", Effect: "Allow", Resource: [`arn:aws:ec2:${n.region}:${acct}:*`, `arn:aws:ec2:${n.region}::image/*`],
@@ -518,7 +658,9 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
                 "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress", "ec2:ModifySecurityGroupRules",
                 "ec2:UpdateSecurityGroupRuleDescriptionsIngress", "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
                 "ec2:RunInstances", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:StartInstances", "ec2:ModifyInstanceAttribute",
-                "ec2:ModifyInstanceMetadataOptions", "ec2:ModifyInstanceCreditSpecification", "ec2:CreateTags", "ec2:DeleteTags"],
+                "ec2:ModifyInstanceMetadataOptions", "ec2:ModifyInstanceCreditSpecification", "ec2:CreateTags", "ec2:DeleteTags",
+                // S9: the S3 gateway endpoint on the proxy's route table.
+                "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint", "ec2:DeleteVpcEndpoints"],
         },
         {
             Sid: "ProxyParameters", Effect: "Allow", Resource: [proxyParameterArn(n)],
@@ -656,7 +798,7 @@ export function deployerPolicy(n: Names): PolicyDocument {
  *     image with its versions and builds, the stack's three log groups (never a CloudTrail group: the command
  *     cloudtrail-payload prints for one is the deployer's, deployerPolicy's CloudTrailLogs), two service quotas, the
  *     three users (G7's simulation, doctor's key rows, `creds aws-set --check`), the ai-env-* and the two AWS managed
- *     policies, the Lambda service-linked role (P16).
+ *     policies, the Lambda service-linked role (P16), S9's transcripts bucket's settings and policy (never an object).
  * No IAM write (its own keys included), no iam:PassRole, no image, connector, Cloud Control, S3, budget or logs write.
  * `make check-policies` simulates both sides (its section 6).
  */
@@ -695,6 +837,11 @@ export function opsPolicy(n: Names): PolicyDocument {
             Action: ["iam:SimulatePrincipalPolicy", "iam:ListAccessKeys", "iam:ListAttachedUserPolicies", "iam:ListUserPolicies", "iam:ListGroupsForUser"],
         },
         { Sid: "ReadPolicies", Effect: "Allow", Resource: [...MANAGED_POLICY_ARNS, policyArn(n, `${PROJECT}-*`)], Action: ["iam:GetPolicy", "iam:GetPolicyVersion"] },
+        // S9: `ai-env egress status`'s transcripts-bucket row: the bucket's settings and policy, never an object.
+        {
+            Sid: "ReadTranscriptsBucket", Effect: "Allow", Resource: [`arn:aws:s3:::${n.transcriptsBucket}`],
+            Action: ["s3:GetBucketPolicy", "s3:GetBucketVersioning", "s3:GetBucketPublicAccessBlock", "s3:GetBucketOwnershipControls", "s3:GetEncryptionConfiguration", "s3:GetLifecycleConfiguration"],
+        },
         {
             Sid: "ReadLambdaServiceLinkedRole", Effect: "Allow", Resource: [`arn:aws:iam::${acct}:role/aws-service-role/${LAMBDA_SERVICE}/AWSServiceRoleForLambda`],
             Action: ["iam:GetRole"],
@@ -702,7 +849,8 @@ export function opsPolicy(n: Names): PolicyDocument {
     );
 }
 
-export type PolicyKind = "identity" | "trust";
+/** S9 adds `resource`: the S3 gateway endpoint's policy and the transcripts bucket's (Principal `*`, narrowed by conditions). */
+export type PolicyKind = "identity" | "trust" | "resource";
 
 export interface NamedPolicy {
     name: string;
@@ -727,5 +875,7 @@ export function allPolicies(n: Names): NamedPolicy[] {
         { name: "proxy", kind: "identity", document: proxyRolePolicy(n) },
         { name: "operator-trust", kind: "trust", document: operatorTrustPolicy() },
         { name: "operator", kind: "identity", document: operatorRolePolicy(n) },
+        { name: "s3-endpoint", kind: "resource", document: s3EndpointPolicy(n) },
+        { name: "transcripts-bucket", kind: "resource", document: transcriptsBucketPolicy(n) },
     ];
 }

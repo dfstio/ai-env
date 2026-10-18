@@ -181,6 +181,27 @@ name = "cursor_live"
 path = "tests/cursor_live.rs"
 required-features = ["bridge"]
 
+# S9 (wave 1, G3): `box review`, `box hook-install` and the pre-push hook; declared in phase 0 with an ignored
+# placeholder.
+[[test]]
+name = "review"
+path = "tests/review.rs"
+required-features = ["bridge"]
+
+# S9 (wave 1, G4): the S3 transcript store on the Mac against the tests' S3 (tests/common/fake_s3.rs) and the fake
+# API; declared in phase 0 with an ignored placeholder.
+[[test]]
+name = "s3_store"
+path = "tests/s3_store.rs"
+required-features = ["bridge", "shim"]
+
+# S9 (wave 1, G7): the fake git's descriptor test in a binary of its own; declared in phase 0 with an ignored
+# placeholder.
+[[test]]
+name = "workspace_fd"
+path = "tests/workspace_fd.rs"
+required-features = ["bridge", "shim"]
+
 # Negative fixture for `make lint-negative`: clippy must REJECT it (every clippy.toml
 # disallowed method is called once). Built only with the lint-negative feature.
 [[example]]

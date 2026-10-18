@@ -1,156 +1,35 @@
-//! The resume's transcript upload (S8 §8): before a `--resume` spawn, the
-//! Mac's mirror of the session (`seed::candidates` and its transcript files,
-//! the S2 seeder's rules) goes to the VM's projects directory through
-//! `GET`/`PUT /transcript`, only when the VM's copy is absent, shorter or
-//! different at equal length; a longer VM copy wins (409 `vm_longer`). At
-//! most `remote::TRANSCRIPT_MAX`. Built in S8 wave 1 (W4).
+//! The resume's transcript (S9, after the S3 cut-over): a chat's transcript
+//! is kept in S3, never on this Mac, and P3 restores it into the VM
+//! ([`restore`]: kept when the VM holds the committed prefix, else pulled,
+//! at most `wire::s3::INLINE_MAX` within Cursor's window; a chat begun on
+//! this Mac sent up inline first, at most `INLINE_MAX` too). `session stage
+//! UUID --warm` restores a larger one into the workspace's VM ahead, with no
+//! deadline. S8's upload of the Mac's mirror (`GET`/`PUT /transcript`,
+//! `remote::TRANSCRIPT_MAX`) went at the cut-over.
 //!
-//! What goes up is scanned first, as the seed is (S8 phase 4, review
-//! CUSTODY-2): a chat holds whatever its tools printed, on the Mac (before
-//! S8, under the kill switch, as a local child) or, mirrored, on a VM. Each
-//! file the upload may send is read once, its first `len` bytes, through the
-//! seed's tripwires (`blobscan::ScanSet`), its name too; a clean one is
-//! copied into a private directory under `state/tmp/` (`transcript-<pid>-*`,
-//! 0700, the copies 0600, removed with the upload) and the `PUT` sends that
-//! copy: exactly the bytes the scan read, whatever the Mac's file does
-//! meanwhile, and a file with a hit is written nowhere. A name that trips a
-//! rule refuses the whole upload before its first request (the rel rides
-//! every request); a hit in a file's bytes refuses it before its first `PUT`
-//! when the VM's copy of that file is absent, shorter or different at equal
-//! length. A file the VM holds already, the same or longer, is never sent,
-//! so what it holds is no finding: a chat reopened on the VM it ran on goes
-//! on (review F2-R1). The refusal is `WorkspaceRefused { finding }` (exit 9)
-//! naming `transcript:REL`, the line and the rule, never a value, audited
-//! `seed_refused` (step `transcript`). The wrapper's P1 runs the scan beside
-//! the Touch ID when the session names no VM of its own ([`scan_mac_copy`]:
-//! any finding refuses, so it starts no VM); [`ensure`] scans again what it
-//! sends (to a VM the session named, a resume miss's retry, a file that
-//! changed since).
-use super::blobscan::{finding_lines, shown_path, Finding, ScanSet};
-use super::{audit, blocking, code, require_capability, EnsureCtx, TranscriptOutcome, WorkspaceRef};
+//! What goes up from this Mac is scanned first, as the seed is (S8 phase 4,
+//! review CUSTODY-2): a chat begun here holds whatever its tools printed.
+//! The wrapper's P1 runs [`scan_mac_copy`] beside the Touch ID on the chat
+//! P3 will send up inline (a chat begun here, an S8 mirror): every file the
+//! inline upload sends (`s3::stage::locate`'s), read once through the seed's
+//! tripwires (`blobscan::ScanSet`) as the upload's own scan reads it
+//! (`s3::stage::scan_chat`), its name too, so a finding starts no VM. The
+//! refusal is `WorkspaceRefused { finding }` (exit 9) naming
+//! `transcript:REL`, the line and the rule, never a value, audited
+//! `seed_refused` (step `transcript`). [`restore`] scans again what it sends
+//! (a finding refuses before any request), and a chat S3 holds is never read
+//! on this Mac.
+use super::blobscan::ScanSet;
+use super::{audit, blocking, EnsureCtx, TranscriptOutcome, WorkspaceRef};
 use crate::bridge::api::MicrovmApi;
 use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::dataplane::{exchange, DataPlane, Exchange, TokenSource, Verdict};
 use crate::bridge::errors::BridgeError;
-use crate::bridge::registry::ensure_private_dir;
 use crate::bridge::remote::audit_event;
-use crate::bridge::seed::{candidates, transcript_files};
-use crate::wire::workspace::{refusal, transcript_rel_check, TranscriptWrite, APP_PORT};
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-
-/// One file of the Mac's copy as the scan read it: its rel below the
-/// session's project directory (`rel_in`) and under the VM's slug (`rel`),
-/// its length, the sha256 of the bytes read, the tripwires' hits in them
-/// (a refusal only if the file is to be sent), and their private copy,
-/// which the `PUT` sends (`None`: P1's scan keeps none, a file with a hit
-/// has none).
-struct Scanned {
-    rel_in: String,
-    rel: String,
-    len: u64,
-    sha: String,
-    hits: Vec<Finding>,
-    copy: Option<PathBuf>,
-}
-
-/// The Mac's copy of a session as the upload sends it: its files in the
-/// listing's order, how many it skipped (no transcript rel names them: never
-/// read, never sent), and the copies' directory, removed with them when dropped.
-struct MacCopy {
-    files: Vec<Scanned>,
-    skipped: u32,
-    _copies: Option<tempfile::TempDir>,
-}
-
-/// The directory one upload's copies go to (`state/tmp/transcript-<pid>-*`,
-/// 0700), removed with them when dropped; one a process left when it exited
-/// under it goes with the next seed's sweep of `state/tmp/`.
-fn copies_dir(paths: &Paths) -> Result<tempfile::TempDir, BridgeError> {
-    let tmp = paths.tmp();
-    ensure_private_dir(&tmp)?;
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("transcript-{}-", std::process::id()))
-        .tempdir_in(&tmp)
-        .map_err(|e| BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot create a scratch directory in {}: {e}", tmp.display()))))?;
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
-    Ok(dir)
-}
-
-/// `path`'s first `len` bytes, read once (a regular file, `O_NOFOLLOW`: one
-/// swapped for a symlink since the listing is never read through it) and
-/// run through `set`'s tripwires: their sha256, and the `(line, rule)` of
-/// every hit, never a value. Clean, they are written to `copy` when given
-/// (created new, 0600); a hit is written nowhere. A file shorter than `len`
-/// now is an error.
-fn read_scanned(set: &ScanSet, path: &Path, len: u64, copy: Option<&Path>) -> Result<(String, Vec<(usize, String)>), BridgeError> {
-    use sha2::{Digest, Sha256};
-    let at = |what: &str, p: &Path, e: std::io::Error| BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot {what} {}: {e}", p.display())));
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path).map_err(|e| at("open", path, e))?;
-    if !file.metadata().map_err(|e| at("stat", path, e))?.is_file() {
-        return Err(BridgeError::Io(std::io::Error::other(format!("{} is not a regular file", path.display()))));
-    }
-    let mut bytes = Vec::new();
-    file.take(len).read_to_end(&mut bytes).map_err(|e| at("read", path, e))?;
-    if bytes.len() as u64 != len {
-        return Err(BridgeError::Io(std::io::Error::other(format!("{} is shorter than its {len} bytes now", path.display()))));
-    }
-    let mut hits = set.rules.scan_bytes(&bytes);
-    hits.sort();
-    if let Some(copy) = copy.filter(|_| hits.is_empty()) {
-        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(copy).map_err(|e| at("create", copy, e))?;
-        out.write_all(&bytes).map_err(|e| at("write", copy, e))?;
-    }
-    Ok((hex::encode(Sha256::digest(&bytes)), hits))
-}
-
-/// The Mac's newest copy of `session_id` (the first of `seed::candidates`
-/// under `mirror_root` for `slugs`, its files as `seed::transcript_files`
-/// lists them) as the upload sends it under `vm_slug`, every file through
-/// `set` ([`read_scanned`]: its hits kept with it), its name too (the rel
-/// rides every request and names the VM's file: one that trips a rule is a
-/// finding, shown as `blobscan::PATH_NAME`); with `paths`, each clean one
-/// copied into a directory of its `state/tmp/` ([`copies_dir`]). A file no
-/// transcript rel admits is skipped, never read: it is never sent.
-/// `Ok(None)`: the Mac holds no copy. A name's finding is
-/// `WorkspaceRefused { finding }` (`transcript:REL: rule R`, at most
-/// `blobscan::FINDINGS_MAX` lines) once every file was read; the copies go
-/// with it. A hit in a file's bytes is its caller's to refuse
-/// ([`scan_mac_copy`] any, [`upload`] one it would send).
-fn scan_copy(set: &ScanSet, mirror_root: &Path, slugs: &[&str], session_id: &str, vm_slug: &str, paths: Option<&Paths>) -> Result<Option<MacCopy>, BridgeError> {
-    let Some(dir) = candidates(mirror_root, slugs, session_id).into_iter().next() else { return Ok(None) };
-    let listed = transcript_files(&dir, session_id)?;
-    if listed.is_empty() {
-        return Ok(None);
-    }
-    let copies = paths.map(copies_dir).transpose()?;
-    let (mut files, mut skipped, mut named) = (Vec::new(), 0u32, Vec::new());
-    for (n, (rel_in, len)) in listed.into_iter().enumerate() {
-        let rel = format!("{vm_slug}/{rel_in}");
-        if transcript_rel_check(&rel).is_err() {
-            skipped += 1;
-            continue;
-        }
-        let location = format!("transcript:{}", shown_path(set, &rel_in));
-        let finding = |(line, rule): (usize, String)| Finding { location: location.clone(), object: None, line, rule, key: None };
-        named.extend(set.rules.scan_bytes(rel_in.as_bytes()).into_iter().map(|(_, rule)| finding((0, rule))));
-        let copy = copies.as_ref().map(|d| d.path().join(n.to_string()));
-        let (sha, hits) = read_scanned(set, &dir.join(&rel_in), len, copy.as_deref())?;
-        let copy = copy.filter(|_| hits.is_empty());
-        files.push(Scanned { rel_in, rel, len, sha, hits: hits.into_iter().map(finding).collect(), copy });
-    }
-    if !named.is_empty() {
-        return Err(refused(&named));
-    }
-    Ok(Some(MacCopy { files, skipped, _copies: copies }))
-}
-
-/// The refusal `findings` make: `WorkspaceRefused { finding }` (exit 9),
-/// one line each ([`finding_lines`]).
-fn refused(findings: &[Finding]) -> BridgeError {
-    BridgeError::WorkspaceRefused { code: code::FINDING, message: finding_lines(findings) }
-}
+use crate::wire::workspace::{transcript_rel_check, APP_PORT};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 /// `e`, a refusal of the transcript, audited `seed_refused` (step
 /// `transcript`, the VM once one was chosen) on its way out.
@@ -164,132 +43,530 @@ fn audited(paths: &Paths, ws: &WorkspaceRef, vm: Option<&str>, e: BridgeError) -
 }
 
 /// P1's scan of a `--resume`'s transcript (the wrapper's, on the snapshot's
-/// blocking thread beside the Touch ID, for a session that names no VM of
-/// its own, so none known to hold the chat): the Mac's copy as [`ensure`]
-/// would send it under `vm_slug`, every file and name through the seed's
-/// tripwires (`ScanSet::load`: the built-ins, and `[review].tripwires` when
-/// that file exists), nothing copied, nothing sent. Any finding refuses the
-/// session before any VM is chosen (`WorkspaceRefused { finding }`, exit 9,
-/// audited `seed_refused`); no Mac copy, or a clean one, is `Ok`.
-pub(crate) fn scan_mac_copy(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, mirror_root: &Path, slugs: &[&str], session_id: &str, vm_slug: &str) -> Result<(), BridgeError> {
+/// blocking thread beside the Touch ID, for a chat P3 sends up inline: one
+/// begun on this Mac, or an S8 mirror): the chat under `mirror_root` for
+/// `slugs` as the inline upload takes it (`s3::stage::locate`, at most
+/// `wire::s3::INLINE_MAX`; a view in its place is no chat), every file and
+/// name through the seed's tripwires (`ScanSet::load`: the built-ins, and
+/// `[review].tripwires` when that file exists) as that upload's own scan
+/// reads them (`s3::stage::scan_chat`), nothing copied, nothing sent. Any
+/// finding refuses the session before any VM is chosen (`WorkspaceRefused
+/// { finding }`, exit 9, audited `seed_refused`); no Mac copy, or a clean
+/// one, is `Ok`.
+pub(crate) fn scan_mac_copy(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, mirror_root: &Path, slugs: &[&str], session_id: &str) -> Result<(), BridgeError> {
+    use crate::bridge::s3::stage;
     let set = ScanSet::load(paths, cfg, ws)?;
-    let found = scan_copy(&set, mirror_root, slugs, session_id, vm_slug, None).map_err(|e| audited(paths, ws, None, e))?;
-    let hits: Vec<Finding> = found.iter().flat_map(|c| &c.files).flat_map(|f| f.hits.iter().cloned()).collect();
-    if hits.is_empty() {
+    let found = stage::locate(mirror_root, slugs, session_id, crate::wire::s3::INLINE_MAX).map_err(|e| audited(paths, ws, None, e))?;
+    let Some(chat) = found.filter(|c| !crate::bridge::view::is_view_file(&c.main_path(session_id))) else { return Ok(()) };
+    stage::scan_chat(&set.rules, &chat, crate::wire::s3::MULTIPART_PART).map(drop).map_err(|e| audited(paths, ws, None, e))
+}
+
+// ---- S9 (G4): the streaming scan, the S3 restore, the upload of a Mac-begun chat ----------------
+
+/// The longest stretch of one line the streaming scan holds: past it the
+/// line is scanned in windows ([`LineScan`]).
+pub const LINE_WINDOW: usize = 8 << 20;
+/// What a window keeps of its end for the next, so a match across the
+/// boundary shorter than this is found whole (the built-in rules' are all
+/// far shorter).
+pub const WINDOW_OVERLAP: usize = 64 << 10;
+/// The chunk a file is read in.
+pub const SCAN_CHUNK: usize = 1 << 20;
+
+/// The tripwires over a byte stream, line by line, in bounded memory: the
+/// complete lines of each chunk are scanned at once with the bytes carried
+/// from the chunk before (the start of their first line), the rest carried;
+/// a line longer than [`LINE_WINDOW`] is scanned in windows that overlap by
+/// [`WINDOW_OVERLAP`]. The hits, `(line, rule)`, are those `Rules::scan_bytes`
+/// gives over the whole stream (each once), never a value. At most about
+/// `LINE_WINDOW` plus one chunk is held at a time, whatever the stream's size.
+pub struct LineScan<'r> {
+    rules: &'r crate::bridge::scan::Rules,
+    carry: Vec<u8>,
+    /// Lines completed before `carry`.
+    lines: usize,
+    hits: std::collections::BTreeSet<(usize, String)>,
+    peak: usize,
+}
+
+impl<'r> LineScan<'r> {
+    #[must_use]
+    pub fn new(rules: &'r crate::bridge::scan::Rules) -> LineScan<'r> {
+        LineScan { rules, carry: Vec::new(), lines: 0, hits: std::collections::BTreeSet::new(), peak: 0 }
+    }
+
+    /// Scan `hay`, whose first line is line `self.lines + 1`.
+    fn scan(&mut self, hay: &[u8]) {
+        let base = self.lines;
+        self.hits.extend(self.rules.scan_bytes(hay).into_iter().map(|(line, rule)| (base + line, rule)));
+    }
+
+    /// The next bytes of the stream.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        match chunk.iter().rposition(|b| *b == b'\n') {
+            Some(nl) => {
+                let mut batch = std::mem::take(&mut self.carry);
+                batch.extend_from_slice(&chunk[..=nl]);
+                self.peak = self.peak.max(batch.len());
+                self.scan(&batch);
+                self.lines += batch.iter().filter(|b| **b == b'\n').count();
+                self.carry = chunk[nl + 1..].to_vec();
+            }
+            None => {
+                self.carry.extend_from_slice(chunk);
+                self.peak = self.peak.max(self.carry.len());
+                if self.carry.len() > LINE_WINDOW {
+                    let window = std::mem::take(&mut self.carry);
+                    self.scan(&window);
+                    self.carry = window[window.len() - WINDOW_OVERLAP..].to_vec();
+                }
+            }
+        }
+    }
+
+    /// The most bytes held at once.
+    #[must_use]
+    pub fn peak(&self) -> usize {
+        self.peak
+    }
+
+    /// The hits, sorted by line, then rule (the last line scanned too, newline or not).
+    #[must_use]
+    pub fn finish(mut self) -> Vec<(usize, String)> {
+        let rest = std::mem::take(&mut self.carry);
+        if !rest.is_empty() {
+            self.scan(&rest);
+        }
+        self.hits.into_iter().collect()
+    }
+}
+
+/// What one read of a file found: its length, sha256, fingerprint (the
+/// sha256 of its last `FP_SPAN` bytes), the sha256 of each `part_len`
+/// stretch (a multipart upload's parts), the tripwires' hits, and the most
+/// bytes held at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDigest {
+    pub len: u64,
+    pub sha256: String,
+    pub fp: String,
+    pub parts: Vec<String>,
+    pub hits: Vec<(usize, String)>,
+    pub peak: usize,
+}
+
+/// One pass over `input` in [`SCAN_CHUNK`]s ([`FileDigest`]): every byte
+/// through the tripwires ([`LineScan`]), the whole sha256, the parts' and
+/// the fingerprint; nothing is kept but a chunk, the scan's carry and the
+/// last `FP_SPAN` bytes.
+pub fn digest_stream(rules: &crate::bridge::scan::Rules, input: &mut dyn Read, part_len: u64) -> Result<FileDigest, BridgeError> {
+    use sha2::{Digest, Sha256};
+    let span = usize::try_from(crate::wire::s3::FP_SPAN).unwrap_or(usize::MAX);
+    let part_len = part_len.max(1);
+    let (mut whole, mut part, mut in_part) = (Sha256::new(), Sha256::new(), 0u64);
+    let (mut parts, mut tail, mut len) = (Vec::new(), Vec::with_capacity(2 * span), 0u64);
+    let mut scan = LineScan::new(rules);
+    let mut buf = vec![0u8; SCAN_CHUNK];
+    loop {
+        let n = input.read(&mut buf).map_err(BridgeError::Io)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        whole.update(chunk);
+        scan.feed(chunk);
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let take = usize::try_from((part_len - in_part).min(rest.len() as u64)).unwrap_or(rest.len());
+            part.update(&rest[..take]);
+            in_part += take as u64;
+            rest = &rest[take..];
+            if in_part == part_len {
+                parts.push(hex::encode(std::mem::replace(&mut part, Sha256::new()).finalize()));
+                in_part = 0;
+            }
+        }
+        tail.extend_from_slice(chunk);
+        if tail.len() > 2 * span {
+            tail.drain(..tail.len() - span);
+        }
+        len += n as u64;
+    }
+    if in_part > 0 {
+        parts.push(hex::encode(part.finalize()));
+    }
+    let peak = scan.peak() + buf.len() + tail.capacity();
+    Ok(FileDigest { len, sha256: hex::encode(whole.finalize()), fp: crate::bridge::s3::manifest::fp_of(&tail), parts, hits: scan.finish(), peak })
+}
+
+/// P3's restore of a `--resume`'s transcript from S3 (S9; `remote::pipeline`
+/// calls it, the resume miss's retry again, and `session stage --warm` into
+/// the VM it warmed): nothing goes
+/// to a VM without `transcript_s3_v1` (exit 7). A chat S3 does not hold yet
+/// (no manifest) whose copy is on this Mac goes up first, inline (at most
+/// `wire::s3::INLINE_MAX`: P0 refused a larger one), scanned through the
+/// session's tripwires (a finding refuses before any request, audited
+/// `seed_refused`): one begun here (`s3::manifest::origin_of` none) as
+/// `session stage` uploads it (the manifest's origin `mac`, its view built
+/// here and left in the original's place, the original moved to `origin/`,
+/// audited `transcript_stage`); an S8 mirror (`s8_mirror`, a chat begun on a
+/// VM) in `session migrate-s9`'s gone-VM form (the manifest's origin `vm`,
+/// the view built here, the mirror deleted, audited `transcript_migrate`).
+/// A stage cut after its manifest and before its view is finished first
+/// ([`finish_cut_stage`]). Then: a manifest that commits nothing restores
+/// nothing; when the VM holds the committed prefix (its size at least
+/// `committed`, its bytes before it hashing to the manifest's fingerprint)
+/// it is kept; else the parts are presigned (GETs by version, expiring
+/// after the pull's budget), with a tail `/suspend` or `/terminate` pushed
+/// past `committed` (found by listing `g<max(gen, 1)>/t/`, where the sync
+/// signs it), and pulled (`POST /transcript/pull`: each part checked in the
+/// VM, renamed only when all passed): a tail is only ever the main
+/// transcript's (its key names no file); audited `transcript_pull`, the
+/// manifest's inode and VM updated for the next sync's rewrite check. A
+/// part that did not check is `BridgeError::S3` (exit 7), the VM's copy
+/// unchanged. Only the main transcript is restored here, all `--resume`
+/// needs, within P3's deadline: the subtree's files follow after the spawn
+/// ([`restore_subtree`], the code-out trigger's first step, no deadline).
+/// Under a deadline (generation 1's P3: `ctx.deadline`) the pull, its parts
+/// and its tail together, is at most `wire::s3::INLINE_MAX`: more is
+/// `TranscriptPullTooLarge` (exit 9) before any pull starts ([`pull_one`]),
+/// naming `session stage UUID --warm`. Without one (a resume miss's retry,
+/// `session stage --warm`) it pulls whatever the size.
+/// A chat begun on a VM that S3 holds nothing committed of (no manifest:
+/// closed before its first sync) is kept on a VM that holds its file, else
+/// restored from the tail the shim pushed from 0 (`g1/t/0000000000000000`,
+/// the URL handed before any sync), when S3 holds it.
+pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
+    ctx: &EnsureCtx<'_, A, D, T>,
+    sync: &crate::bridge::s3::TranscriptSync,
+    mac_projects: Option<&Path>,
+    slugs: &[&str],
+    sid: &str,
+    build: crate::bridge::s3::stage::ViewBuilder<'_>,
+) -> Result<TranscriptOutcome, BridgeError> {
+    use crate::bridge::s3::{manifest, stage};
+    super::require_cap(ctx.caps, &ctx.target.vm_id, crate::wire::frame::CAP_TRANSCRIPT_S3_V1)?;
+    let set = ScanSet::load(ctx.paths, ctx.cfg, ctx.ws)?;
+    let rules = std::sync::Arc::new(set.rules);
+    let sctx = crate::bridge::s3::sync::SyncCtx { api: ctx.api, dp: ctx.dp, tokens: ctx.tokens, paths: ctx.paths, target: ctx.target, sync, rules: &rules, deadline: ctx.deadline };
+    let rel = crate::bridge::s3::sync::main_rel(&sync.slug, sid);
+    let mut staged: Option<u64> = None;
+    match manifest::read(ctx.paths, sid)? {
+        Some(m) => {
+            if let Some(projects) = mac_projects {
+                finish_cut_stage(ctx.paths, sync, &rules, projects, slugs, sid, &m, &ctx.target.vm_id, build)?;
+            }
+        }
+        None => {
+            let origin = manifest::origin_of(ctx.paths, sid);
+            if origin == Some(manifest::ORIGIN_VM) {
+                return restore_unsynced(&sctx, sid, &rel).await;
+            }
+            let s8 = origin == Some(manifest::ORIGIN_S8_MIRROR);
+            let found = match mac_projects {
+                Some(p) => stage::locate(p, slugs, sid, crate::wire::s3::INLINE_MAX)?,
+                None => None,
+            };
+            let (Some(chat), Some(projects)) = (found.filter(|c| !crate::bridge::view::is_view_file(&c.main_path(sid))), mac_projects) else {
+                return Ok(TranscriptOutcome::NothingToRestore);
+            };
+            let t0 = std::time::Instant::now();
+            let digests = {
+                let (rules, chat) = (std::sync::Arc::clone(&rules), chat.clone());
+                blocking(move || stage::scan_chat(&rules, &chat, crate::wire::s3::MULTIPART_PART)).await?.map_err(|e| audited(ctx.paths, ctx.ws, Some(&ctx.target.vm_id), e))?
+            };
+            let client = crate::bridge::s3::client::S3Client::new(ctx.api, &sync.target)?;
+            let at = crate::wire::time::rfc3339_utc_ms(crate::wire::time::unix_now_ms());
+            let mut up = stage::upload_chat(&client, ctx.paths, sid, &chat, &digests, crate::wire::s3::MULTIPART_PART, &at).await?;
+            if s8 {
+                // S8's mirror is the remote chat's transcript: the chat began on a VM, whatever copy this Mac sent up.
+                up.manifest.origin = manifest::ORIGIN_VM.to_string();
+            }
+            {
+                let _held = manifest::lock(ctx.paths, sid).await?;
+                manifest::write(ctx.paths, &up.manifest)?;
+            }
+            let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if s8 {
+                stage::replace_mirror(ctx.paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, &rules, build, &ctx.target.vm_id)?;
+                audit(ctx.paths, audit_event::TRANSCRIPT_MIGRATE, &[("session", sid.to_string()), ("from", "gone_vm".to_string()), ("outcome", "migrated".to_string()), ("bytes", up.bytes.to_string())]);
+            } else {
+                stage::leave_view(ctx.paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, &rules, build)?;
+                audit(ctx.paths, audit_event::TRANSCRIPT_STAGE, &[("session", sid.to_string()), ("bytes", up.bytes.to_string()), ("parts", up.parts.to_string()), ("outcome", "staged".to_string()), ("ms", ms.to_string())]);
+            }
+            staged = Some(up.bytes);
+        }
+    }
+    let _held = manifest::lock(ctx.paths, sid).await?;
+    let Some(mut m) = manifest::read(ctx.paths, sid)? else { return Ok(TranscriptOutcome::NothingToRestore) };
+    if m.parts.is_empty() {
+        tracing::info!(session = sid, "transcript: the manifest commits nothing: nothing to restore");
+        return Ok(TranscriptOutcome::NothingToRestore);
+    }
+    // A fingerprint that is no sha256 (never one this Mac committed) counts as none: the VM's copy is then not kept.
+    let fp = (m.committed > 0 && crate::bridge::s3::sync::is_digest(&m.fp)).then(|| m.fp.clone());
+    let prefix = crate::wire::workspace::StatQuery { rel: rel.clone(), from: Some(m.committed), fp: fp.clone(), subtree: false };
+    let now = sctx.stat(&prefix).await?;
+    if staged.is_none() && fp.is_some() && now.present && now.size >= m.committed && now.fp_ok == Some(true) {
+        return Ok(TranscriptOutcome::KeptOnVm);
+    }
+    let t0 = std::time::Instant::now();
+    let client = crate::bridge::s3::client::S3Client::new(ctx.api, &sync.target)?;
+    // The sync hands the shim its tail URL under g<max(gen, 1)> (a Mac-begun chat's first VM bytes open generation 1).
+    let tail_gen = m.gen.max(1);
+    let tail = if m.committed > 0 {
+        let key = crate::wire::s3::S3Key::Tail { session: sid.to_string(), gen: tail_gen, offset: m.committed }.render();
+        client.list(&format!("v1/{sid}/vm/g{tail_gen}/t/")).await?.into_iter().find(|o| o.key == key && o.size > 0)
+    } else {
+        None
+    };
+    let mut pieces: Vec<(String, String, u64, Option<String>)> = m.parts.iter().map(|p| (p.key.clone(), p.version_id.clone(), p.len, Some(p.sha256.clone()))).collect();
+    if let Some(t) = &tail {
+        pieces.push((t.key.clone(), String::new(), t.size, None));
+    }
+    let whole = (m.parts.len() == 1 && tail.is_none()).then(|| m.parts[0].sha256.clone());
+    let (parts, bytes) = pull_one(&sctx, sid, &rel, &pieces, whole).await?;
+    let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(session = sid, parts, bytes, ms, "transcript restored from S3");
+    if let Ok(after) = sctx.stat(&prefix).await {
+        m.ino = after.ino;
+        m.vm = Some(ctx.target.vm_id.clone());
+        manifest::write(ctx.paths, &m)?;
+    }
+    Ok(match staged {
+        Some(bytes) => TranscriptOutcome::Staged { bytes },
+        None => TranscriptOutcome::Restored { parts, bytes },
+    })
+}
+
+/// [`restore`] of a chat begun on a VM that S3 holds nothing committed of
+/// (no manifest: it closed before its first sync completed): a VM holding
+/// its file keeps it; else the tail the shim pushed from 0 at `/suspend` or
+/// `/terminate` (`v1/<sid>/vm/g1/t/0000000000000000`, its whole transcript,
+/// no sha256 to check, as any tail), found by listing `g1/t/`, is pulled;
+/// else nothing is there to restore. The next sync pushes it as generation
+/// 1's base and supersedes that tail.
+async fn restore_unsynced<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
+    sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>,
+    sid: &str,
+    rel: &str,
+) -> Result<TranscriptOutcome, BridgeError> {
+    let held = sctx.stat(&crate::wire::workspace::StatQuery { rel: rel.to_string(), from: None, fp: None, subtree: false }).await?;
+    if held.present && held.size > 0 {
+        tracing::info!(session = sid, "transcript: a VM-begun chat S3 holds nothing committed of: the VM's copy is kept");
+        return Ok(TranscriptOutcome::KeptOnVm);
+    }
+    let client = crate::bridge::s3::client::S3Client::new(sctx.api, &sctx.sync.target)?;
+    let key = crate::wire::s3::S3Key::Tail { session: sid.to_string(), gen: 1, offset: 0 }.render();
+    let Some(tail) = client.list(&format!("{}{sid}/vm/g1/t/", crate::wire::s3::KEY_PREFIX)).await?.into_iter().find(|o| o.key == key && o.size > 0) else {
+        tracing::info!(session = sid, "transcript: a VM-begun chat that never reached S3: nothing to restore");
+        return Ok(TranscriptOutcome::NothingToRestore);
+    };
+    let (parts, bytes) = pull_one(sctx, sid, rel, &[(tail.key, String::new(), tail.size, None)], None).await?;
+    tracing::info!(session = sid, bytes, "transcript restored from its tail (closed before its first sync)");
+    Ok(TranscriptOutcome::Restored { parts, bytes })
+}
+
+/// What [`restore_subtree`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubtreeRestore {
+    /// Files pulled into the VM.
+    pub pulled: u32,
+    /// Files the VM holds as committed, or newer (kept).
+    pub kept: u32,
+    /// Files no transcript rel names (a Mac-begun chat's tool output: S3 and `origin/` keep them).
+    pub unnamed: u32,
+}
+
+/// The session's subtree files back into the VM (S9 phase 4: out of P3's
+/// init deadline, the code-out trigger's first step after the spawn, with
+/// no deadline of its own): one stat of the VM with its subtree, then each
+/// manifest file (into the VM's project directory: a Mac-begun chat's
+/// carry this Mac's slug) the VM lacks, holds shorter, or holds at the same
+/// length with another sha256, pulled from its own key, at most
+/// `TRANSFERS_MAX` at once; one the VM holds longer is newer than the
+/// commit (kept: the next sync pushes it). A subtree over the helper's caps
+/// (`too_large`) is read one stat per file instead (its whole-file
+/// sha256). Nothing to do without a manifest. A pull that fails is the
+/// error (the files pulled before it stay).
+pub async fn restore_subtree<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>, sid: &str) -> Result<SubtreeRestore, BridgeError> {
+    use futures_util::{StreamExt as _, TryStreamExt as _};
+    let mut done = SubtreeRestore::default();
+    let Some(m) = crate::bridge::s3::manifest::read(sctx.paths, sid)? else { return Ok(done) };
+    let mut due: Vec<(String, &crate::bridge::s3::manifest::ManifestFile)> = Vec::new();
+    for f in &m.files {
+        let frel = f.rel.split_once('/').map_or_else(|| f.rel.clone(), |(_, rest)| format!("{}/{rest}", sctx.sync.slug));
+        if transcript_rel_check(&frel).is_err() {
+            done.unnamed += 1;
+            continue;
+        }
+        if !due.iter().any(|(r, _)| *r == frel) {
+            due.push((frel, f));
+        }
+    }
+    if due.is_empty() {
+        return Ok(done);
+    }
+    let rel = crate::bridge::s3::sync::main_rel(&sctx.sync.slug, sid);
+    // What the VM holds: (size, sha256) by rel. From the committed length, as a sync stats: the main transcript's
+    // whole-file sha256 (a stat without `from`) is never asked for.
+    let held: Vec<(String, u64, String)> = match sctx.stat(&crate::wire::workspace::StatQuery { rel: rel.clone(), from: Some(m.committed), fp: None, subtree: true }).await {
+        Ok(stat) => stat.subtree.into_iter().map(|f| (f.rel, f.size, f.sha256)).collect(),
+        Err(BridgeError::WorkspaceRefused { code, .. }) if code == crate::wire::workspace::refusal::TOO_LARGE => {
+            let mut held = Vec::new();
+            for (frel, _) in &due {
+                let st = sctx.stat(&crate::wire::workspace::StatQuery { rel: frel.clone(), from: None, fp: None, subtree: false }).await?;
+                if let (true, Some(sha)) = (st.present, st.sha256) {
+                    held.push((frel.clone(), st.size, sha));
+                }
+            }
+            held
+        }
+        Err(e) => return Err(e),
+    };
+    let mut pulls = Vec::new();
+    for (frel, f) in due {
+        match held.iter().find(|(r, _, _)| *r == frel) {
+            Some((_, size, sha)) if *size > f.len || (*size == f.len && *sha == f.sha256) => done.kept += 1,
+            _ => pulls.push(pull_file(sctx, sid, frel, f.clone())),
+        }
+    }
+    let pulled: Vec<(u32, u64)> = futures_util::stream::iter(pulls).buffer_unordered(crate::wire::workspace::TRANSFERS_MAX).try_collect().await?;
+    done.pulled = u32::try_from(pulled.len()).unwrap_or(u32::MAX);
+    if done.unnamed > 0 {
+        tracing::info!(session = sid, unnamed = done.unnamed, "transcript: file(s) no transcript rel names kept in S3, not written in the VM");
+    }
+    Ok(done)
+}
+
+/// One subtree file of the manifest pulled into the VM at `frel`, from its own key alone ([`restore_subtree`]).
+async fn pull_file<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
+    sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>,
+    sid: &str,
+    frel: String,
+    f: crate::bridge::s3::manifest::ManifestFile,
+) -> Result<(u32, u64), BridgeError> {
+    let sha = Some(f.sha256.clone());
+    pull_one(sctx, sid, &frel, &[(f.key, f.version_id.unwrap_or_default(), f.len, sha.clone())], sha).await
+}
+
+/// A stage cut after its manifest and before its view (`session stage`,
+/// P3's inline upload, `migrate-s9`'s gone-VM form: the step stopped, or
+/// its view could not be built): the copy still in place under `projects`
+/// (not a view) whose length and sha256 are the manifest's first part, a
+/// `v1/<sid>/mac/<sha256>` object, leaves now as that step would have left
+/// it. A Mac-begun chat's (origin `mac`) moves to `origin/` behind its view
+/// (`stage::leave_view`); an S8 mirror (origin `vm`) is deleted behind its
+/// view (`stage::replace_mirror`). Any other copy is left alone: it is not
+/// the one S3 holds.
+#[allow(clippy::too_many_arguments)]
+fn finish_cut_stage(
+    paths: &Paths,
+    sync: &crate::bridge::s3::TranscriptSync,
+    rules: &crate::bridge::scan::Rules,
+    projects: &Path,
+    slugs: &[&str],
+    sid: &str,
+    m: &crate::bridge::s3::manifest::Manifest,
+    vm: &str,
+    build: crate::bridge::s3::stage::ViewBuilder<'_>,
+) -> Result<(), BridgeError> {
+    use crate::bridge::s3::{manifest, stage};
+    let Some(first) = m.parts.first() else { return Ok(()) };
+    if !matches!(crate::wire::s3::S3Key::parse(&first.key), Some(crate::wire::s3::S3Key::Mac { .. })) || !matches!(m.origin.as_str(), manifest::ORIGIN_MAC | manifest::ORIGIN_VM) {
         return Ok(());
     }
-    Err(audited(paths, ws, None, refused(&hits)))
+    let Ok(Some(chat)) = stage::locate(projects, slugs, sid, stage::STAGE_MAX) else { return Ok(()) };
+    let main = chat.main_path(sid);
+    if crate::bridge::view::is_view_file(&main) || chat.files.first().map(|(_, n)| *n) != Some(first.len) || stage::sha256_if_len(&main, first.len)?.as_deref() != Some(first.sha256.as_str()) {
+        return Ok(());
+    }
+    tracing::info!(session = sid, origin = %m.origin, "transcript: a stage cut before its view: the copy S3 holds leaves this Mac's projects now");
+    if m.origin == manifest::ORIGIN_MAC {
+        stage::leave_view(paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, rules, build)?;
+    } else {
+        stage::replace_mirror(paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, rules, build, vm)?;
+    }
+    Ok(())
 }
 
-/// [`super::ensure_transcript`]: each file of the Mac's newest copy of the
-/// session (the first of `seed::candidates`) under `vm_slug`, scanned and
-/// copied first ([`scan_copy`]: a name's finding refuses before any
-/// request), then stat'ed, and its copy put when the VM's copy is absent,
-/// shorter, or of the same length but other bytes ([`upload`]: a hit in a
-/// file to put refuses before the first `PUT`); the VM's answer must hold
-/// exactly the bytes sent.
-pub(crate) async fn ensure<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &EnsureCtx<'_, A, D, T>, mirror_root: &Path, slugs: &[&str], session_id: &str, vm_slug: &str) -> Result<TranscriptOutcome, BridgeError> {
-    require_capability(ctx.caps, &ctx.target.vm_id)?;
-    let found = {
-        let (paths, cfg, ws) = (ctx.paths.clone(), ctx.cfg.clone(), ctx.ws.clone());
-        let (root, slugs, id, vm_slug) = (mirror_root.to_path_buf(), slugs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(), session_id.to_string(), vm_slug.to_string());
-        blocking(move || -> Result<Option<MacCopy>, BridgeError> {
-            let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
-            let set = ScanSet::load(&paths, &cfg, &ws)?;
-            scan_copy(&set, &root, &refs, &id, &vm_slug, Some(&paths))
-        })
-        .await?
-        .map_err(|e| audited(ctx.paths, ctx.ws, Some(&ctx.target.vm_id), e))?
-    };
-    let outcome = match &found {
-        Some(copy) => upload(ctx, copy, session_id).await?,
-        None => TranscriptOutcome::NoMacCopy,
-    };
-    let (files, bytes) = match &outcome {
-        TranscriptOutcome::Uploaded { files, bytes } => (*files, *bytes),
-        _ => (0, 0),
-    };
-    audit(ctx.paths, audit_event::TRANSCRIPT_PUT, &[("vm", ctx.target.vm_id.clone()), ("outcome", outcome.word().into()), ("files", files.to_string()), ("bytes", bytes.to_string())]);
-    Ok(outcome)
-}
-
-/// [`ensure`]'s requests: every file of `copy` stat'ed first. One the VM
-/// holds the same, or longer, is never sent, and its hits are no finding
-/// (the VM holds those bytes already). A hit in any other refuses them all
-/// before the first `PUT` (`WorkspaceRefused { finding }`, audited
-/// `seed_refused` with the VM); else each goes up as its copy.
-async fn upload<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &EnsureCtx<'_, A, D, T>, copy: &MacCopy, session_id: &str) -> Result<TranscriptOutcome, BridgeError> {
-    let main = format!("{session_id}.jsonl");
-    let (mut uploaded, mut bytes) = (0u32, 0u64);
-    let mut longer: Option<(u64, u64)> = None;
-    let stat_x = Exchange { api: ctx.api, tokens: ctx.tokens, vm_id: &ctx.target.vm_id, port: APP_PORT, route: "GET /transcript", deadline: ctx.deadline, idempotent: true };
-    let mut due = Vec::new();
-    for file in &copy.files {
-        let rel = &file.rel;
-        let stat = match exchange(&stat_x, |t| async move { ctx.dp.transcript_stat(ctx.target, &t, rel).await }).await? {
-            (reply, Verdict::Done) => reply.body.ok_or_else(|| BridgeError::Protocol("GET /transcript answered without a stat".into()))?,
-            (reply, _) => return Err(BridgeError::Protocol(format!("GET /transcript answered HTTP {} where a stat was due", reply.status))),
-        };
-        if stat.present && stat.size > file.len {
-            if file.rel_in == main {
-                longer = Some((stat.size, file.len));
-            }
-            continue;
-        }
-        if stat.present && stat.size == file.len && stat.sha256.as_deref() == Some(file.sha.as_str()) {
-            continue;
-        }
-        due.push(file);
+/// One `POST /transcript/pull` of `rel` from `pieces` (key, version or
+/// empty, length, sha256 or none: a tail), presigned GETs expiring after the
+/// pull's budget, `whole` the file's sha256 when known; audited
+/// `transcript_pull`. Parts and bytes written; not written is `S3` (exit 7)
+/// naming the first part that failed its status, length or sha256. Under a
+/// deadline (a reopen's P3, inside Cursor's window: at the proxy's 4 to 16
+/// MB/s a GiB takes minutes) a pull of more than `wire::s3::INLINE_MAX` is
+/// `TranscriptPullTooLarge` (exit 9) before any presign or request.
+async fn pull_one<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
+    sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>,
+    sid: &str,
+    rel: &str,
+    pieces: &[(String, String, u64, Option<String>)],
+    whole: Option<String>,
+) -> Result<(u32, u64), BridgeError> {
+    use crate::bridge::s3::{presign, S3Method};
+    let t0 = std::time::Instant::now();
+    let bytes: u64 = pieces.iter().map(|p| p.2).sum();
+    if sctx.deadline.is_some() && bytes > crate::wire::s3::INLINE_MAX {
+        return Err(BridgeError::TranscriptPullTooLarge { session: sid.to_string(), bytes });
     }
-    let hits: Vec<Finding> = due.iter().flat_map(|f| f.hits.iter().cloned()).collect();
-    if !hits.is_empty() {
-        return Err(audited(ctx.paths, ctx.ws, Some(&ctx.target.vm_id), refused(&hits)));
+    let expires = presign::pull_expiry(bytes);
+    let mut parts = Vec::with_capacity(pieces.len());
+    for (key, version, len, sha) in pieces {
+        let query = if version.is_empty() { Vec::new() } else { vec![("versionId".to_string(), version.clone())] };
+        let url = sctx.api.presign(&presign::request(S3Method::Get, &sctx.sync.target, Some(key.clone()), query, Vec::new(), expires)).await?;
+        parts.push(crate::wire::workspace::PullPart { url, len: *len, sha256: sha.clone() });
     }
-    let put_x = Exchange { route: "PUT /transcript", idempotent: false, ..stat_x };
-    for file in due {
-        let (rel, len, sha) = (&file.rel, file.len, file.sha.as_str());
-        let body = file.copy.as_deref().ok_or_else(|| BridgeError::Io(std::io::Error::other(format!("{rel}: the scan kept no copy to send"))))?;
-        let answer = exchange(&put_x, |t| async move { ctx.dp.put_transcript(ctx.target, &t, rel, body, len).await }).await?;
-        match answer {
-            (reply, Verdict::Done) => {
-                let r = reply.body.ok_or_else(|| BridgeError::Protocol("PUT /transcript answered without a reply".into()))?;
-                if r.sha256 != sha || r.size != len {
-                    return Err(BridgeError::WorkspaceFailed { code: refusal::CHANGED, message: format!("{rel}: the VM's copy is not the {len} bytes sent: reopen the chat to send it again") });
-                }
-                if r.outcome == TranscriptWrite::Written {
-                    uploaded += 1;
-                    bytes += len;
-                }
-            }
-            (_, Verdict::VmLonger { size }) => {
-                if file.rel_in == main {
-                    longer = Some((size.unwrap_or(0), len));
-                }
-            }
-            (reply, _) => return Err(BridgeError::Protocol(format!("PUT /transcript answered HTTP {} where an upload's answer was due", reply.status))),
-        }
-    }
-    if copy.skipped > 0 {
-        tracing::info!("transcript: {} file(s) of {session_id} skipped: no transcript rel names them", copy.skipped);
-    }
-    Ok(match longer {
-        Some((vm, mac)) => TranscriptOutcome::VmLonger { vm, mac },
-        None if uploaded > 0 => TranscriptOutcome::Uploaded { files: uploaded, bytes },
-        None => TranscriptOutcome::AlreadyThere,
+    let req = crate::wire::workspace::TranscriptPull { rel: rel.to_string(), parts, sha256: whole, owner: sctx.sync.target.owner.clone(), proxy: sctx.sync.proxy.clone() };
+    let x = Exchange { api: sctx.api, tokens: sctx.tokens, vm_id: &sctx.target.vm_id, port: APP_PORT, cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1, route: "POST /transcript/pull", deadline: sctx.deadline, idempotent: false };
+    let reply = match exchange(&x, |t| {
+        let req = &req;
+        async move { sctx.dp.transcript_pull(sctx.target, &t, req).await }
     })
+    .await?
+    {
+        (reply, Verdict::Done) => reply.body.ok_or_else(|| BridgeError::Protocol("POST /transcript/pull answered without a reply".into()))?,
+        (reply, _) => return Err(BridgeError::Protocol(format!("POST /transcript/pull answered HTTP {} where a pull's answer was due", reply.status))),
+    };
+    let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let n = u32::try_from(pieces.len()).unwrap_or(u32::MAX);
+    let outcome = if reply.written { "written" } else { "failed" };
+    audit(sctx.paths, audit_event::TRANSCRIPT_PULL, &[("session", sid.to_string()), ("vm", sctx.target.vm_id.clone()), ("parts", n.to_string()), ("bytes", bytes.to_string()), ("outcome", outcome.to_string()), ("ms", ms.to_string())]);
+    if !reply.written {
+        let bad = reply.parts.iter().find(|p| !p.ok);
+        return Err(BridgeError::S3 { op: "transcript pull", status: bad.map_or(0, |p| p.s3_status), code: None });
+    }
+    Ok((n, bytes))
+}
+
+/// [`digest_stream`] over the first `len` bytes of `path` (a regular file,
+/// opened without following a symlink, never blocking); a file shorter than
+/// `len` now is an error.
+pub fn digest_file(rules: &crate::bridge::scan::Rules, path: &Path, len: u64, part_len: u64) -> Result<FileDigest, BridgeError> {
+    let at = |what: &str, e: std::io::Error| BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot {what} {}: {e}", path.display())));
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path).map_err(|e| at("open", e))?;
+    if !file.metadata().map_err(|e| at("stat", e))?.is_file() {
+        return Err(BridgeError::Io(std::io::Error::other(format!("{} is not a regular file", path.display()))));
+    }
+    let d = digest_stream(rules, &mut file.take(len), part_len)?;
+    if d.len != len {
+        return Err(BridgeError::Io(std::io::Error::other(format!("{} is shorter than its {len} bytes now", path.display()))));
+    }
+    Ok(d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bridge::agent::AgentTarget;
-    use crate::bridge::api::{AuthToken, FakeMicrovmApi};
-    use crate::bridge::dataplane::{CodeoutBody, DpReply};
-    use crate::bridge::workspace::{Head, SeedLimits, SeedProgress, WsKind};
-    use crate::wire::frame::CAP_WORKSPACE_V1;
+    use crate::bridge::api::FakeMicrovmApi;
+    use crate::bridge::dataplane::Unreached;
+    use crate::bridge::workspace::{code, Head, SeedLimits, SeedProgress, WsKind};
+    use crate::wire::frame::{CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
     use crate::wire::redact::Secret;
-    use crate::wire::workspace::{CodeoutRequest, ObjectFormat, SeedQuery, SeedReply, SeedState, SettingsCapture, TranscriptReply, TranscriptStat};
-    use std::sync::Mutex;
+    use crate::wire::workspace::ObjectFormat;
+    use std::path::PathBuf;
 
     const ID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 
@@ -342,11 +619,6 @@ mod tests {
             let text = std::fs::read_to_string(self.paths.audit()).unwrap_or_default();
             text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["event"] == event).collect()
         }
-
-        /// What is left in `state/tmp/`.
-        fn tmp_left(&self) -> Vec<String> {
-            std::fs::read_dir(self.paths.tmp()).map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
-        }
     }
 
     fn target() -> AgentTarget {
@@ -361,213 +633,71 @@ mod tests {
         }
     }
 
-    /// A VM's data plane holding `held` (rel, size, sha256) and nothing
-    /// else: its stat answers those, absent for any other rel, and records
-    /// the rel; a `PUT` panics (where it is used, none may go out).
-    struct Holding {
-        held: Vec<(String, u64, String)>,
-        stats: Mutex<Vec<String>>,
-    }
-
-    impl Holding {
-        fn new(held: Vec<(String, u64, String)>) -> Holding {
-            Holding { held, stats: Mutex::new(Vec::new()) }
-        }
-    }
-
-    impl DataPlane for Holding {
-        async fn seed_state(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<SeedState>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
-        async fn put_seed(&self, _: &AgentTarget, _: &AuthToken, _: &SeedQuery, _: &Path, _: u64) -> Result<DpReply<SeedReply>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
-        async fn post_codeout(&self, _: &AgentTarget, _: &AuthToken, _: &CodeoutRequest, _: &Path, _: u64) -> Result<DpReply<CodeoutBody>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
-        async fn transcript_stat(&self, _: &AgentTarget, _: &AuthToken, rel: &str) -> Result<DpReply<TranscriptStat>, BridgeError> {
-            self.stats.lock().unwrap().push(rel.to_string());
-            let stat = match self.held.iter().find(|(r, ..)| r == rel) {
-                Some((_, size, sha)) => TranscriptStat { present: true, size: *size, sha256: Some(sha.clone()), mtime: None },
-                None => TranscriptStat { present: false, size: 0, sha256: None, mtime: None },
-            };
-            Ok(DpReply::ok(200, stat))
-        }
-
-        async fn put_transcript(&self, _: &AgentTarget, _: &AuthToken, rel: &str, _: &Path, _: u64) -> Result<DpReply<TranscriptReply>, BridgeError> {
-            panic!("PUT /transcript of {rel}: none may go out here");
-        }
-
-        async fn get_settings(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<SettingsCapture>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-    }
-
-    /// CUSTODY-2: a hit in a subagent's file alone, on a VM that holds
-    /// neither file, refuses the whole upload before its first `PUT`: both
-    /// files stat'ed first (this data plane answers absent, and its `PUT`
-    /// panics: the clean transcript's would have gone out first), then exit
-    /// 9 naming `transcript:REL`, the line and the rule, never the value;
-    /// the clean transcript's copy gone with the refusal; `seed_refused`
-    /// audited with the VM, no `transcript_put`. P1's scan of the same copy
-    /// refuses the same way, before any VM (its row names none).
+    /// CUSTODY-2, after the S3 cut-over: a hit in a subagent's file alone
+    /// of a chat begun on this Mac refuses its inline upload before any
+    /// request ([`restore`]: no presign, no S3 call, nothing to the VM: the
+    /// data plane and the API are never reached), exit 9 naming
+    /// `transcript:REL`, the line and the rule, never the value;
+    /// `seed_refused` audited with the VM, no manifest written, the chat left
+    /// in place. P1's scan of the same copy refuses the same way, before any
+    /// VM (its row names none).
     #[tokio::test]
-    async fn a_tripwire_in_a_subagent_file_the_vm_lacks_refuses_the_upload_before_any_put() {
+    async fn a_tripwire_in_a_subagent_file_refuses_the_inline_upload_before_any_request() {
         let w = World::new();
-        w.plant(&format!("{ID}.jsonl"), &lines("nothing to see"));
+        let main = w.plant(&format!("{ID}.jsonl"), &lines("nothing to see"));
         w.plant(&format!("{ID}/subagents/agent-a1.jsonl"), &lines(&format!("aws_access_key_id = {}", key())));
-        let (api, target, caps, dp) = (FakeMicrovmApi::new(), target(), vec![CAP_WORKSPACE_V1.to_string()], Holding::new(Vec::new()));
-        let ctx = EnsureCtx { api: &api, dp: &dp, tokens: &Tokens, paths: &w.paths, cfg: &w.cfg, target: &target, caps: &caps, ws: &w.ws, lim: SeedLimits::wrapper(&w.cfg), deadline: None, progress: &|_: SeedProgress| {} };
+        let (api, target, caps) = (FakeMicrovmApi::new(), target(), vec![CAP_WORKSPACE_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()]);
+        let ctx = EnsureCtx { api: &api, dp: &Unreached, tokens: &Unreached, paths: &w.paths, cfg: &w.cfg, target: &target, caps: &caps, ws: &w.ws, lim: SeedLimits::wrapper(&w.cfg), deadline: None, progress: &|_: SeedProgress| {} };
+        // A lab bucket nobody listens at: a request would fail, never pass.
+        let lab = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Lab(([127, 0, 0, 1], 9).into()) };
+        let sync = crate::bridge::s3::TranscriptSync { target: lab, slug: "-vm".into(), mac_cwd: "/w".into(), mac_projects: w.projects.clone(), proxy: None, view_messages: 10 };
         let want = format!("transcript:{ID}/subagents/agent-a1.jsonl line 2: rule aws-access-key-id");
-        let e = ensure(&ctx, &w.projects, &["-mac"], ID, "-vm").await.unwrap_err();
+        let e = restore(&ctx, &sync, Some(&w.projects), &["-mac"], ID, &crate::wire::view::build_view).await.unwrap_err();
         assert_eq!(finding(e), want);
-        assert_eq!(*dp.stats.lock().unwrap(), [format!("-vm/{ID}.jsonl"), format!("-vm/{ID}/subagents/agent-a1.jsonl")], "both stat'ed first");
-        assert!(w.tmp_left().is_empty(), "the copies went with the refusal: {:?}", w.tmp_left());
+        assert!(api.calls().is_empty(), "no AWS call: {:?}", api.calls());
+        assert!(!w.paths.transcript_manifest(ID).exists() && !w.paths.transcript_stage(ID).exists(), "nothing staged");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), lines("nothing to see"), "the chat left in place");
         let rows = w.rows("seed_refused");
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!((rows[0]["detail"]["step"].as_str(), rows[0]["detail"]["code"].as_str(), rows[0]["detail"]["vm"].as_str()), (Some("transcript"), Some("finding"), Some("microvm-1")));
-        assert!(w.rows("transcript_put").is_empty(), "nothing went up");
-        assert_eq!(finding(scan_mac_copy(&w.paths, &w.cfg, &w.ws, &w.projects, &["-mac"], ID, "-vm").unwrap_err()), want);
+        assert!(w.rows("transcript_stage").is_empty() && w.rows("transcript_pull").is_empty(), "nothing went up");
+        assert_eq!(finding(scan_mac_copy(&w.paths, &w.cfg, &w.ws, &w.projects, &["-mac"], ID).unwrap_err()), want);
         let rows = w.rows("seed_refused");
         assert_eq!((rows.len(), rows[1]["detail"].get("vm")), (2, None), "P1's: no VM chosen yet");
         assert!(!std::fs::read_to_string(w.paths.audit()).unwrap().contains(&key()), "no value in the audit");
     }
 
-    /// P1's scan reads what the upload would send and nothing else: a clean
-    /// copy passes, and so do a hit in a file no transcript rel names (it is
-    /// never sent) and a session the Mac holds no copy of; a hit in the
-    /// transcript's second line refuses, and so does a subagent file whose
-    /// name trips a rule (the name shown as `a path name`). Both audited
-    /// `seed_refused` with no VM; nothing written to `state/tmp/`.
+    /// P1's scan reads what the inline upload sends to S3, every file of the
+    /// chat (a file no transcript rel names goes up too, and stays in S3
+    /// and `origin/`): a clean chat passes, and so do a session the Mac
+    /// holds no copy of and a view in the chat's place (never a Mac copy); a
+    /// hit in the transcript's second line refuses, so does one in a file
+    /// directly below the session, and a subagent file whose name trips a
+    /// rule (the name shown as `a path name`). Each audited `seed_refused`
+    /// with no VM; nothing written to `state/tmp/`.
     #[test]
-    fn p1s_scan_refuses_only_what_the_upload_would_send() {
+    fn p1s_scan_refuses_what_the_inline_upload_would_send() {
         let w = World::new();
-        let scan = |id: &str| scan_mac_copy(&w.paths, &w.cfg, &w.ws, &w.projects, &["-mac"], id, "-vm");
+        let scan = |id: &str| scan_mac_copy(&w.paths, &w.cfg, &w.ws, &w.projects, &["-mac"], id);
         let main = w.plant(&format!("{ID}.jsonl"), &lines("nothing to see"));
-        // Directly below the session: no transcript rel names it, so it never goes up.
-        w.plant(&format!("{ID}/stray.jsonl"), &lines(&format!("aws_access_key_id = {}", key())));
         scan(ID).unwrap();
         scan("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c").unwrap();
         std::fs::write(&main, lines(&format!("aws_access_key_id = {}", key()))).unwrap();
         assert_eq!(finding(scan(ID).unwrap_err()), format!("transcript:{ID}.jsonl line 2: rule aws-access-key-id"));
         std::fs::write(&main, lines("nothing to see")).unwrap();
+        // Directly below the session: no transcript rel names it, but the inline upload sends it to S3.
+        let stray = w.plant(&format!("{ID}/stray.jsonl"), &lines(&format!("aws_access_key_id = {}", key())));
+        assert_eq!(finding(scan(ID).unwrap_err()), format!("transcript:{ID}/stray.jsonl line 2: rule aws-access-key-id"));
+        std::fs::remove_file(stray).unwrap();
         w.plant(&format!("{ID}/subagents/agent-{}.jsonl", key()), &lines("nothing to see"));
         assert_eq!(finding(scan(ID).unwrap_err()), "transcript:a path name: rule aws-access-key-id");
+        // A view in the chat's place is no Mac copy: nothing to scan, whatever lies beside it.
+        std::fs::write(&main, format!("{}\"type\":\"ai-title\",\"aiTitle\":\"t\",\"sessionId\":\"{ID}\"}}\n", crate::wire::view::VIEW_MARK_PREFIX)).unwrap();
+        scan(ID).unwrap();
         let rows = w.rows("seed_refused");
-        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows.len(), 3, "{rows:?}");
         assert!(rows.iter().all(|r| r["detail"]["step"] == "transcript" && r["detail"].get("vm").is_none()), "{rows:?}");
         assert!(!w.paths.tmp().exists(), "P1 copies nothing");
-    }
-
-    /// The data plane of [`the_put_sends_exactly_the_bytes_the_scan_read`]:
-    /// its stat rewrites the Mac's file (the same length, an access key id in
-    /// it), as a local claude writing on would, and answers absent; its put
-    /// keeps the bytes it was given and answers them written.
-    struct Rewriting {
-        mac: PathBuf,
-        sent: Mutex<Vec<Vec<u8>>>,
-    }
-
-    impl DataPlane for Rewriting {
-        async fn seed_state(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<SeedState>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
-        async fn put_seed(&self, _: &AgentTarget, _: &AuthToken, _: &SeedQuery, _: &Path, _: u64) -> Result<DpReply<SeedReply>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
-        async fn post_codeout(&self, _: &AgentTarget, _: &AuthToken, _: &CodeoutRequest, _: &Path, _: u64) -> Result<DpReply<CodeoutBody>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
-        async fn transcript_stat(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<TranscriptStat>, BridgeError> {
-            let len = std::fs::metadata(&self.mac).unwrap().len() as usize;
-            let planted = format!("{{\"k\":\"{}\"}}", key());
-            std::fs::write(&self.mac, format!("{planted:<width$}\n", width = len - 1)).unwrap();
-            Ok(DpReply::ok(200, TranscriptStat { present: false, size: 0, sha256: None, mtime: None }))
-        }
-
-        async fn put_transcript(&self, _: &AgentTarget, _: &AuthToken, _: &str, body: &Path, len: u64) -> Result<DpReply<TranscriptReply>, BridgeError> {
-            use sha2::{Digest, Sha256};
-            let mut bytes = std::fs::read(body).unwrap();
-            bytes.truncate(len as usize);
-            let sha256 = hex::encode(Sha256::digest(&bytes));
-            self.sent.lock().unwrap().push(bytes);
-            Ok(DpReply::ok(201, TranscriptReply { outcome: TranscriptWrite::Written, size: len, sha256 }))
-        }
-
-        async fn get_settings(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<SettingsCapture>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-    }
-
-    /// Tokens that are always there.
-    struct Tokens;
-
-    impl TokenSource for Tokens {
-        async fn token(&self, port: u16) -> Result<AuthToken, BridgeError> {
-            Ok(AuthToken { headers: std::collections::BTreeMap::new(), port, expires_at_unix: u64::MAX })
-        }
-    }
-
-    /// What the `PUT` sends is exactly what the scan read: the Mac's file is
-    /// rewritten after the scan, before the stat's answer (the same length,
-    /// an access key id in it); the upload sends the scanned bytes, its
-    /// copy, the VM's answer matches them, and the copy is gone after.
-    #[tokio::test]
-    async fn the_put_sends_exactly_the_bytes_the_scan_read() {
-        let w = World::new();
-        let text = lines("nothing to see");
-        let mac = w.plant(&format!("{ID}.jsonl"), &text);
-        let dp = Rewriting { mac: mac.clone(), sent: Mutex::new(Vec::new()) };
-        let (api, target, caps) = (FakeMicrovmApi::new(), target(), vec![CAP_WORKSPACE_V1.to_string()]);
-        let ctx = EnsureCtx { api: &api, dp: &dp, tokens: &Tokens, paths: &w.paths, cfg: &w.cfg, target: &target, caps: &caps, ws: &w.ws, lim: SeedLimits::wrapper(&w.cfg), deadline: None, progress: &|_: SeedProgress| {} };
-        let up = ensure(&ctx, &w.projects, &["-mac"], ID, "-vm").await.unwrap();
-        assert_eq!(up, TranscriptOutcome::Uploaded { files: 1, bytes: text.len() as u64 });
-        assert_eq!(*dp.sent.lock().unwrap(), [text.into_bytes()], "the bytes the scan read, not the file's now");
-        assert!(std::fs::read_to_string(&mac).unwrap().contains(&key()), "the Mac's file changed meanwhile");
-        assert!(w.tmp_left().is_empty(), "the copy went with the upload: {:?}", w.tmp_left());
-    }
-
-    /// Review F2-R1: a chat reopened on the VM it ran on holds what that
-    /// VM's tools printed, mirrored to the Mac. A file with a hit that the
-    /// VM holds the same (its size and sha256) is never sent, so never
-    /// refused (`AlreadyThere`), and neither is one it holds longer
-    /// (`VmLonger`); held shorter, or other bytes at its length, it would be
-    /// sent, so the hit refuses it before any `PUT` (this data plane's
-    /// panics). Only the refusals are audited `seed_refused`.
-    #[tokio::test]
-    async fn a_hit_in_a_file_the_vm_holds_already_is_never_sent_so_never_refused() {
-        use sha2::{Digest, Sha256};
-        let w = World::new();
-        let text = lines(&format!("aws_access_key_id = {}", key()));
-        w.plant(&format!("{ID}.jsonl"), &text);
-        let (len, sha, other) = (text.len() as u64, hex::encode(Sha256::digest(text.as_bytes())), hex::encode(Sha256::digest(b"other bytes")));
-        let (api, target, caps) = (FakeMicrovmApi::new(), target(), vec![CAP_WORKSPACE_V1.to_string()]);
-        let want = format!("transcript:{ID}.jsonl line 2: rule aws-access-key-id");
-        let cases = [
-            ((len, sha), Some(TranscriptOutcome::AlreadyThere)),
-            ((len + 7, other.clone()), Some(TranscriptOutcome::VmLonger { vm: len + 7, mac: len })),
-            ((len - 7, other.clone()), None),
-            ((len, other), None),
-        ];
-        for ((size, held), outcome) in cases {
-            let dp = Holding::new(vec![(format!("-vm/{ID}.jsonl"), size, held)]);
-            let ctx = EnsureCtx { api: &api, dp: &dp, tokens: &Tokens, paths: &w.paths, cfg: &w.cfg, target: &target, caps: &caps, ws: &w.ws, lim: SeedLimits::wrapper(&w.cfg), deadline: None, progress: &|_: SeedProgress| {} };
-            let got = ensure(&ctx, &w.projects, &["-mac"], ID, "-vm").await;
-            match outcome {
-                Some(outcome) => assert_eq!(got.unwrap(), outcome, "held {size} bytes"),
-                None => assert_eq!(finding(got.unwrap_err()), want, "held {size} bytes"),
-            }
-        }
-        let puts: Vec<String> = w.rows("transcript_put").iter().map(|r| r["detail"]["outcome"].as_str().unwrap_or_default().to_string()).collect();
-        assert_eq!(puts, ["already_there", "vm_longer"]);
-        let rows = w.rows("seed_refused");
-        assert!(rows.len() == 2 && rows.iter().all(|r| r["detail"]["step"] == "transcript" && r["detail"]["vm"] == "microvm-1"), "{rows:?}");
-        assert!(w.tmp_left().is_empty(), "{:?}", w.tmp_left());
+        assert!(!std::fs::read_to_string(w.paths.audit()).unwrap().contains(&key()), "no value in the audit");
     }
 }

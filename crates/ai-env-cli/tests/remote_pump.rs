@@ -80,26 +80,28 @@ fn wait_for_fetch(rig: &common::remote::RemoteRig) {
     wait_for("the turn's code-out recorded (codeout_fetch promoted)", T, || audit_rows(rig, "codeout_fetch").iter().any(|r| r["detail"]["outcome"] == "promoted"));
 }
 
-/// T8.2 offline (plan Part A, the lead's integration): the extension
-/// reopens a chat in a dirty workspace and runs one turn on the rig's VM.
-/// The real wrapper in remote mode (`AI_ENV_BRIDGE_MODE=remote`, its cwd
-/// the workspace under the roots) goes through the routed endpoint to the
-/// in-process shim. Before the spawn the pipeline seeds the VM (its HEAD
-/// the Mac's, no origin, the Mac's uncommitted work carried uncommitted)
-/// and uploads the picker's transcript, which the CLI resumes from.
-/// `initialize` is answered with the wrapper's pid, not the VM's. One turn
-/// (echo, assistant, result): its mirror frame is written under the Mac's
-/// projects dir and never forwarded, and the CLI's `oauth_token_refresh`
-/// is answered `{"accessToken":null}` by the wrapper. The VM's argv carries
-/// `--session-mirror`, never `--add-dir` or the debug flags. The turn's
-/// result fetches the agent's commit (`FAKE_COMMIT`) into
-/// `refs/remotes/box/main` and the edit it left uncommitted
-/// (`FAKE_WIP_EDIT`) into a `box/wip/*` snapshot, the Mac's branches and
-/// worktree untouched; the code port's tokens last the seed's 15 minutes
-/// for the seed, the session's 5 for that code-out (plan §10). The host's
-/// EOF ends the session as the CLI's own exit does (half a second, a last
-/// mirror frame on the way): exit 0 within 1.5 s, the Mac's mirror the
-/// VM's transcript byte for byte,
+/// T8.2 offline (plan Part A, the lead's integration; S9 after the S3
+/// cut-over): the extension reopens a chat in a dirty workspace and runs
+/// one turn on the rig's VM. The real wrapper in remote mode
+/// (`AI_ENV_BRIDGE_MODE=remote`, its cwd the workspace under the roots)
+/// goes through the routed endpoint to the in-process shim. Before the
+/// spawn the pipeline seeds the VM (its HEAD the Mac's, no origin, the
+/// Mac's uncommitted work carried uncommitted) and restores the picker's
+/// transcript (a chat begun on the Mac: it goes up to the tests' S3, the
+/// Mac keeping its view, then is pulled into the VM), which the CLI resumes
+/// from. `initialize` is answered with the wrapper's pid, not the VM's. One
+/// turn (echo, assistant, result): no mirror frame reaches the host or the
+/// Mac (S9: the VM's argv carries no `--session-mirror`, never `--add-dir`
+/// or the debug flags), and the CLI's `oauth_token_refresh` is answered
+/// `{"accessToken":null}` by the wrapper. The turn's result fetches the
+/// agent's commit (`FAKE_COMMIT`) into `refs/remotes/box/main` and the edit
+/// it left uncommitted (`FAKE_WIP_EDIT`) into a `box/wip/*` snapshot, the
+/// Mac's branches and worktree untouched; the code port's tokens last the
+/// seed's 15 minutes for the seed, the session's 5 for that code-out (plan
+/// §10); the turn's transcript then goes to S3 and the view is rewritten.
+/// The host's EOF ends the session as the CLI's own exit does (half a
+/// second, a last mirror frame on the way, dropped and counted): exit 0
+/// within 1.5 s, the Mac holding only the chat's view,
 /// nothing left in the shim's spawn table. No other spawn lived, so the
 /// closing suspend reaches the fake API (SUSPENDED), and the platform's
 /// `/suspend` snapshots an edit made after the last fetch. The census end
@@ -154,10 +156,13 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     assert_eq!(git_in(&vm_dir, &status), git_in(&work, &status), "the carried WIP is uncommitted in the VM, as on the Mac");
     let kinds = (git_in(&vm_dir, &["diff", "--name-only"]), git_in(&vm_dir, &["diff", "--cached", "--name-only"]), git_in(&vm_dir, &["ls-files", "--others", "--exclude-standard"]));
     assert_eq!(kinds, ("README.md".to_string(), "staged.txt".to_string(), "notes.txt".to_string()), "an edit, a staged file, an untracked one");
-    // The transcript went up before the spawn too: the CLI resumed from it, at the workspace's VM path.
+    // The transcript was restored before the spawn too: the CLI resumed from it, at the workspace's VM path.
     let started = h.expect_out(is_init, T);
     assert_eq!((started["session_id"].as_str(), started["cwd"].as_str()), (Some(sid.as_str()), Some(vm_cwd.as_str())), "{started}");
-    assert!(h.env_log().iter().any(|l| l == "gen 1 resumed lines=1"), "the CLI found the uploaded transcript: {:?}", h.env_log());
+    assert!(h.env_log().iter().any(|l| l == "gen 1 resumed lines=1"), "the CLI found the restored transcript: {:?}", h.env_log());
+    let vm_transcript = h.rig().vm_projects().join(h.slug()).join(format!("{sid}.jsonl"));
+    assert_eq!(read(&vm_transcript), format!("{earlier}\n"), "the chat begun on the Mac, restored in the VM");
+    assert!(ai_env_cli::wire::view::is_view_head(read(&mac_transcript).as_bytes()), "the Mac keeps the view in its place: {}", read(&mac_transcript));
     // One turn.
     let u = h.send_user("hello");
     h.expect_out(|v| is_result_for(v, &u), T);
@@ -168,19 +173,20 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     assert!(is_echo_of(&frames[at + 1], &u), "{}", frames[at + 1]);
     let out = h.out_lines();
     assert!(!out.iter().any(|l| l.contains("transcript_mirror") || l.contains("oauth_token_refresh")), "a mirror frame or the refresh request reached the host: {out:?}");
-    // The mirror: the uploaded line, then the turn's two, written under the Mac's projects dir.
-    let vm_transcript = h.rig().vm_projects().join(h.slug()).join(format!("{sid}.jsonl"));
-    assert_eq!(read(&mac_transcript), read(&vm_transcript), "the Mac's mirror is the VM's transcript, byte for byte");
-    assert_eq!(read(&mac_transcript).lines().count(), 3);
-    // The VM's argv: --session-mirror added, --add-dir and the debug flags gone.
+    // The VM's argv: --add-dir and the debug flags gone, no --session-mirror (S9: the transcript is kept in S3).
     let argv = h.argv_log().into_iter().next().expect("the VM's CLI logged its argv");
-    assert_eq!(argv.last().map(String::as_str), Some("--session-mirror"), "{argv:?}");
     assert!(argv.contains(&resume), "{argv:?}");
-    for gone in ["--add-dir", "/Users/someone/elsewhere", "--debug", "--debug-to-stderr"] {
+    for gone in ["--add-dir", "/Users/someone/elsewhere", "--debug", "--debug-to-stderr", "--session-mirror"] {
         assert!(!argv.iter().any(|a| a == gone), "{gone}: {argv:?}");
     }
     // The turn's code-out: the agent's commit under box/main, the edit it left uncommitted in a box/wip/* snapshot on it.
     wait_for_fetch(h.rig());
+    // Then the turn's transcript to S3 (S9): the Mac's line and the turn's, byte for byte, its view on the Mac (the
+    // stage's view first, then the sync's).
+    synced(&mut h, &sid, 2);
+    let manifest = ai_env_cli::bridge::s3::manifest::read(&ai_env_cli::bridge::config::Paths::from_root_and_env(h.rig().bridge(), None), &sid).unwrap().expect("the chat's manifest");
+    let synced: Vec<u8> = manifest.parts.iter().flat_map(|p| h.rig().s3().get(&p.key).expect("each part in S3")).collect();
+    assert_eq!(synced, std::fs::read(&vm_transcript).unwrap(), "S3 holds the VM's transcript, the Mac's part first: {:?}", manifest.parts);
     let vm_head = git_in(&vm_dir, &["rev-parse", "HEAD"]);
     assert_eq!((git_in(&work, &["rev-parse", "refs/remotes/box/main"]), git_in(&work, &["rev-parse", "refs/remotes/box/main^"])), (vm_head.clone(), head.clone()), "the agent's commit on the seeded head");
     assert_eq!(git_in(&work, &["show", "refs/remotes/box/main:agent.txt"]), "from the VM");
@@ -195,8 +201,9 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     let (status_of, took) = h.wait(EXIT);
     assert_eq!(status_of.code(), Some(0), "{}", h.transcript());
     assert!(took < Duration::from_millis(CLOSE_BUDGET_MS), "the host's EOF to the exit: {took:?} (budget {CLOSE_BUDGET_MS} ms)\n{}", h.transcript());
-    assert_eq!(read(&mac_transcript), read(&vm_transcript), "the last mirror frame, after the EOF, reached the Mac too");
-    assert_eq!(read(&mac_transcript).lines().count(), 4);
+    let mac_file = read(&mac_transcript);
+    assert!(mac_file.lines().all(|l| l.starts_with(ai_env_cli::wire::view::VIEW_MARK_PREFIX)), "the last mirror frame, after the EOF, never reached the Mac: {mac_file}");
+    assert!(read(&vm_transcript).lines().all(|l| !mac_file.contains(l)), "no line of the VM's transcript on the Mac");
     // The shim keeps a dead leader unreaped a moment (its group id pinned for the group's ladder), then reaps it.
     let spawns = h.rig().shim.spawns.detail();
     assert!(spawns.iter().all(|s| !s.status.alive), "a spawn still lives in the shim's table at the wrapper's exit: {spawns:?}");
@@ -234,9 +241,9 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     }
     let legs: Vec<String> = part("legs").unwrap_or_default().split(',').map(|l| l.split('=').next().unwrap_or_default().to_string()).collect();
     assert_eq!(legs, LEG_NAMES, "{note}");
-    let words = ["vm", "vm_how", "vm_pid", "claude", "seed", "transcript", "fetch", "credential", "auth_timers", "pid_rewrite", "oauth_refresh_answered", "mirror"].map(|n| part(n).unwrap_or_default());
+    let words = ["vm", "vm_how", "vm_pid", "claude", "seed", "transcript", "fetch", "credential", "auth_timers", "pid_rewrite", "oauth_refresh_answered", "mirror", "mirror_dropped"].map(|n| part(n).unwrap_or_default());
     let vm_pid = vm_pid.to_string();
-    assert_eq!(words, [vm.as_str(), "started", vm_pid.as_str(), AUTH_TIMERS.claude, "seeded", "uploaded", "1/1", "combined", "match", "ok", "1", "2/0"].map(str::to_string), "{note}");
+    assert_eq!(words, [vm.as_str(), "started", vm_pid.as_str(), AUTH_TIMERS.claude, "seeded", "staged", "1/1", "combined", "match", "ok", "1", "0/0", "1"].map(str::to_string), "{note}");
     assert!(part("init_ms").and_then(|ms| ms.parse::<u64>().ok()).is_some(), "{note}");
     assert!(part("close_ms").and_then(|ms| ms.parse::<u64>().ok()).is_some_and(|ms| ms < CLOSE_BUDGET_MS), "{note}");
     // The registry row: the session's own, remote, its VM, spawn, acked seq, seeded head and the snapshot fetched.
@@ -248,7 +255,8 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     assert!(row.get("last_acked_seq").and_then(toml::Value::as_integer).is_some_and(|n| n > 0), "{row:?}");
     assert_eq!(row.get("exit").and_then(toml::Value::as_integer), Some(0), "{row:?}");
     assert_eq!(starts[0]["detail"]["spawn"].as_str(), part("spawn").as_deref(), "{starts:?}");
-    assert_eq!((h.audit_events("session_remote_end").len(), h.audit_events("session_remote_failed").len(), h.audit_events("transcript_put").len()), (1, 0, 1));
+    assert_eq!((h.audit_events("session_remote_end").len(), h.audit_events("session_remote_failed").len(), h.audit_events("transcript_stage").len()), (1, 0, 1));
+    assert!(h.audit_events("transcript_pull").iter().any(|r| r["detail"]["outcome"] == "written" && r["detail"]["vm"] == vm.as_str()), "the restore into the VM is audited");
     assert!(!h.err_text().lines().any(|l| l.starts_with("ai-env:")), "the wrapper speaks no ai-env: line: {}", h.err_text());
     assert_eq!(h.rig().decrypts() - touch, 1, "one Touch ID for the process (D1)");
     // Later, on the Mac: box fetch reaches the suspended VM (the endpoint resumes it) and brings /suspend's snapshot.
@@ -459,13 +467,28 @@ fn user(uuid: &str) -> String {
     Harness::user_line(uuid, "hi")
 }
 
+/// The entries of the `transcript_mirror` frames among `out`, as the frames
+/// carry them (no re-serialising), one line each.
+fn frame_entries(out: &[String]) -> String {
+    let mut mirrored = String::new();
+    for line in out.iter().filter(|l| l.contains(r#""type":"transcript_mirror""#)) {
+        let members: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> = serde_json::from_str(line).unwrap();
+        let entries: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(members["entries"].get()).unwrap();
+        mirrored.extend(entries.iter().map(|e| format!("{}\n", e.get())));
+    }
+    mirrored
+}
+
 /// FAKE_WRITE_TRANSCRIPT with --session-mirror: each turn appends its two
 /// entries to the fake's own transcript and sends one mirror frame holding
 /// the same two (its filePath under FAKE_CONFIG_DIR), before the turn's
 /// rate_limit_event line (the 2.1.296 fixture's) and its result; a second
 /// turn chains to the first. FAKE_FINAL_MIRROR_MS sends one more frame after
 /// EOF, appended to the file too: the frames' entries joined are the file,
-/// byte for byte. FAKE_EXIT_DELAY_MS holds the exit that long after EOF.
+/// byte for byte, but the api-request lines 2.1.302 writes after each user
+/// entry, which no frame carries (S9, `FAKE_API_REQUEST`; with it 0 the file
+/// is the entries alone). FAKE_EXIT_DELAY_MS holds the exit that long after
+/// EOF.
 #[test]
 fn the_fake_writes_its_transcript_and_mirrors_it_frame_for_frame() {
     let f = Fake::new();
@@ -495,19 +518,32 @@ fn the_fake_writes_its_transcript_and_mirrors_it_frame_for_frame() {
     let mirrors: Vec<&Value> = frames.iter().filter(|v| v["type"] == "transcript_mirror").collect();
     let path = shown.join("projects").join(f.slug()).join(format!("{sid}.jsonl"));
     assert!(mirrors.iter().all(|m| m["filePath"].as_str() == path.to_str()), "{mirrors:?}");
-    // The entries as their frames carry them, byte for byte (no re-serialising).
-    let mut mirrored = String::new();
-    for line in out.iter().filter(|l| l.contains(r#""type":"transcript_mirror""#)) {
-        let members: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> = serde_json::from_str(line).unwrap();
-        let entries: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(members["entries"].get()).unwrap();
-        mirrored.extend(entries.iter().map(|e| format!("{}\n", e.get())));
+    // The entries as their frames carry them, byte for byte (no re-serialising): the file but its api-request lines.
+    let mirrored = frame_entries(&out);
+    let text = read(&file);
+    assert_eq!(String::from_utf8(common::mirrored(text.as_bytes())).unwrap(), mirrored, "the frames' entries are the file but its api-request lines");
+    let all: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let kinds: Vec<&str> = all.iter().map(|v| v["type"].as_str().unwrap_or_default()).collect();
+    let turn = ["user", "api-request", "api-request-blob", "assistant"];
+    assert_eq!(kinds, turn.into_iter().chain(turn).chain(["summary"]).collect::<Vec<_>>());
+    for (at, n) in [(1, 1), (5, 2)] {
+        let id = format!("req_fake_{n}_1");
+        assert_eq!((all[at]["requestId"].as_str(), all[at]["sessionId"].as_str(), all[at + 1]["requestId"].as_str()), (Some(id.as_str()), Some(sid.as_str()), Some(id.as_str())), "{text}");
     }
-    assert_eq!(read(&file), mirrored, "the frames' entries are the file");
-    let entries: Vec<Value> = read(&file).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let entries: Vec<Value> = mirrored.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(entries.len(), 5);
     assert_eq!((entries[0]["uuid"].as_str(), entries[2]["uuid"].as_str()), (Some(u1.as_str()), Some(u2.as_str())));
     assert_eq!(entries[2]["parentUuid"], entries[1]["uuid"], "the second turn chains to the first");
     assert_eq!((entries[4]["type"].as_str(), &entries[4]["leafUuid"]), (Some("summary"), &entries[3]["uuid"]));
+    // FAKE_API_REQUEST=0 (2.1.296 and earlier): the file is the frames' entries, byte for byte.
+    let old = Fake::new();
+    let shown = old.root.join("mac").join(".claude");
+    let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_API_REQUEST", "0"), ("FAKE_FINAL_MIRROR_MS", "100"), ("FAKE_CONFIG_DIR", shown.to_str().unwrap())];
+    let (code, out, err) = old.run(&["--session-mirror"], &knobs, &format!("{INIT}\n{}\n{}\n", user(&u1), user(&u2)));
+    assert_eq!(code, Some(0), "{err}");
+    let file = old.config().join("projects").join(old.slug()).join(format!("{sid}.jsonl"));
+    assert_eq!(read(&file), frame_entries(&out), "FAKE_API_REQUEST=0: the frames' entries are the file");
+    assert_eq!(read(&file).lines().count(), 5);
 }
 
 /// FAKE_RESUME_NEEDS_FILE: a --resume whose transcript is missing from the
@@ -640,7 +676,7 @@ mod remote_link {
     use ai_env_cli::bridge::vm::registry::read_row;
     use ai_env_cli::bridge::workspace::{Head, WorkspaceRef, WsKind};
     use ai_env_cli::wire::frame::SpawnId;
-    use ai_env_cli::wire::workspace::{CodeoutRequest, ObjectFormat, SeedQuery, SeedReply, SeedState, SettingsCapture, TranscriptReply, TranscriptStat};
+    use ai_env_cli::wire::workspace::{CodeoutRequest, ObjectFormat, SeedQuery, SeedReply, SeedState, SettingsCapture, TranscriptStat};
     use bytes::Bytes;
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -679,10 +715,6 @@ mod remote_link {
         }
 
         async fn transcript_stat(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<TranscriptStat>, BridgeError> {
-            Err(unreached())
-        }
-
-        async fn put_transcript(&self, _: &AgentTarget, _: &AuthToken, _: &str, _: &Path, _: u64) -> Result<DpReply<TranscriptReply>, BridgeError> {
             Err(unreached())
         }
 
@@ -730,7 +762,7 @@ mod remote_link {
                     };
                     let api = FileFakeMicrovmApi::open(&fake).expect("the fake API");
                     let target = AgentTarget::from_row(&row).expect("the VM's target");
-                    let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::new(api), dp: Arc::new(NoDataPlane), tokens: Arc::new(NoDataPlane), paths, cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false });
+                    let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::new(api), dp: Arc::new(NoDataPlane), tokens: Arc::new(NoDataPlane), paths, cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false, transcript: None });
                     Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session })
                 })
             }),
@@ -962,11 +994,12 @@ fn last_line(err: &str) -> &str {
 
 /// D1, P0's argv and P4: one Touch ID for the whole session (a current
 /// `combined.env` opens the runtime key and the token together); the VM's
-/// argv carries `--session-mirror` and neither `--add-dir` nor the debug
-/// flags; the census end row names the VM, how it was chosen, the legs and
-/// the delivery; nothing on stderr says `ai-env:`.
+/// argv carries neither `--add-dir` nor the debug flags, nor (S9: the
+/// transcript is kept in S3) `--session-mirror`; the census end row names
+/// the VM, how it was chosen, the legs and the delivery; nothing on stderr
+/// says `ai-env:`.
 #[test]
-fn the_vm_argv_has_session_mirror_and_no_add_dir_or_debug_and_one_touch_id() {
+fn the_vm_argv_has_no_session_mirror_add_dir_or_debug_and_one_touch_id() {
     let mut p = Harness::prepare();
     let before = p.rig().decrypts();
     let mut h = p.spawn_on(common::Link::Remote, "", &["--add-dir", "/Users/someone/elsewhere"], &[]);
@@ -981,8 +1014,7 @@ fn the_vm_argv_has_session_mirror_and_no_add_dir_or_debug_and_one_touch_id() {
     assert_eq!(h.rig().decrypts() - before, 1, "one Touch ID per wrapper process (D1)");
     let argv = read(&h.root().join("argv.log"));
     let args: Vec<&str> = argv.lines().filter(|l| !l.starts_with("--- gen")).collect();
-    assert_eq!(args.last(), Some(&"--session-mirror"), "{argv}");
-    for gone in ["--add-dir", "/Users/someone/elsewhere", "--debug", "--debug-to-stderr"] {
+    for gone in ["--add-dir", "/Users/someone/elsewhere", "--debug", "--debug-to-stderr", "--session-mirror"] {
         assert!(!args.contains(&gone), "{gone}: {argv}");
     }
     let note = h.end_note();
@@ -998,10 +1030,11 @@ fn the_vm_argv_has_session_mirror_and_no_add_dir_or_debug_and_one_touch_id() {
 }
 
 /// Plan §2, D1 and L8: a `--resume` whose transcript the VM lacks
-/// (`AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` keeps generation 1 from uploading
-/// it) misses; the retry uploads it and respawns on the same VM with no
-/// second Touch ID, the token from the VM's cache, and the conversation goes
-/// on under that id.
+/// (`AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` keeps generation 1 from restoring
+/// it) misses; the retry restores it (S9: a chat begun on the Mac goes up
+/// to S3, then into the VM: `transcript:staged`) and respawns on the same
+/// VM with no second Touch ID, the token from the VM's cache, and the
+/// conversation goes on under that id.
 #[test]
 fn a_resume_miss_retries_on_the_same_vm_with_its_transcript_and_no_second_touch_id() {
     let mut p = Harness::prepare();
@@ -1027,7 +1060,7 @@ fn a_resume_miss_retries_on_the_same_vm_with_its_transcript_and_no_second_touch_
     let resumed: Vec<String> = read(&h.root().join("env.log")).lines().filter(|l| l.contains("resumed")).map(str::to_string).collect();
     assert_eq!(resumed, ["gen 1 resumed lines=missing", "gen 2 resumed lines=1"]);
     let note = h.end_note();
-    for part in ["transcript:uploaded", "credential:cached"] {
+    for part in ["transcript:staged", "credential:cached"] {
         assert!(note.split("; ").any(|p| p == part), "{part}: {note}");
     }
 }
@@ -1458,6 +1491,28 @@ fn closed(h: &mut Harness) -> Duration {
     took
 }
 
+/// S9: until `views` of session `sid`'s transcript steps wrote its view
+/// (`transcript_view`, `written`): after each turn's code-out the trigger
+/// syncs the transcript to S3, then rewrites the view on the Mac.
+fn synced(h: &mut Harness, sid: &str, views: usize) {
+    h.wait_until("the turn's transcript synced to S3 and its view written", T, |h| {
+        h.audit_events("transcript_view").iter().filter(|r| r["detail"]["session"] == sid && r["detail"]["outcome"] == "written").count() >= views
+    });
+}
+
+/// S9: what the tests' S3 holds of session `sid`, its manifest's parts in
+/// order (the rig's bridge): the transcript the Mac committed.
+fn held_in_s3(rig: &common::remote::RemoteRig, sid: &str) -> Vec<u8> {
+    let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None);
+    let m = ai_env_cli::bridge::s3::manifest::read(&paths, sid).unwrap().unwrap_or_else(|| panic!("no manifest of {sid}"));
+    m.parts.iter().flat_map(|p| rig.s3().get(&p.key).unwrap_or_else(|| panic!("{} not in S3", p.key))).collect()
+}
+
+/// S9: whether `path` is a chat's view (its first bytes the view's mark).
+fn is_view(path: &Path) -> bool {
+    ai_env_cli::wire::view::is_view_head(&std::fs::read(path).unwrap_or_default())
+}
+
 /// Every file under `dir` (recursively, links not followed), relative to it, sorted.
 fn files_under(dir: &Path) -> Vec<String> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -1591,9 +1646,9 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
 /// config dir (its `CLAUDE_CONFIG_DIR` the agent's `~/.claude` in the VM, no
 /// keychain pointer), and what it writes there (its settings, its transcript)
 /// stays there. The Mac keeps no config dir for the session (no scratch dir,
-/// as `local-scratch` makes one): its `~/.claude` holds the transcript's
-/// mirror alone, under the workspace's slug, and the registry names the VM's
-/// config dir by its VM path (Design A).
+/// as `local-scratch` makes one): its `~/.claude` holds the chat's view
+/// alone (S9: the transcript is kept in S3), under the workspace's slug, and
+/// the registry names the VM's config dir by its VM path (Design A).
 #[test]
 fn remote_child_runs_with_the_vm_config_dir_and_the_mac_keeps_none() {
     let settings = r#"{"permissions":{"allow":["Bash(ls:*)"]}}"#;
@@ -1601,6 +1656,7 @@ fn remote_child_runs_with_the_vm_config_dir_and_the_mac_keeps_none() {
     let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_WRITE_SETTINGS", user.as_str())]);
     started(&mut h);
     turn(&mut h, "hello");
+    synced(&mut h, &common::fake_fixed_sid(), 1);
     closed(&mut h);
     let vm_config = h.rig().vm_home().join(".claude");
     let line = h.env_log().into_iter().next().expect("the VM's CLI logged its environment");
@@ -1609,7 +1665,8 @@ fn remote_child_runs_with_the_vm_config_dir_and_the_mac_keeps_none() {
     let transcript = format!("projects/{}/{}.jsonl", h.slug(), common::fake_fixed_sid());
     assert!(vm_config.join(&transcript).is_file(), "the CLI's transcript, in the VM");
     let mac_config = h.root().join(".claude");
-    assert_eq!(files_under(&mac_config), [transcript], "the Mac's ~/.claude holds the transcript's mirror alone");
+    assert_eq!(files_under(&mac_config), std::slice::from_ref(&transcript), "the Mac's ~/.claude holds the chat's view alone");
+    assert!(is_view(&mac_config.join(&transcript)), "the view, never the transcript");
     assert!(h.scratch_names().is_empty(), "no scratch config dir on the Mac: {:?}", h.scratch_names());
     let rows = h.registry_rows();
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1673,11 +1730,12 @@ fn close_keeps_the_vm_running_while_the_config_probe_lives() {
 /// Q9 (plan §11): a CLI whose own exit comes a second after the host's EOF,
 /// its last mirror frame just before it (2.1.296 takes 0.5 to 1.1 s, S7
 /// B11), ends the session itself before the remote ladder's `detach{final}`
-/// at +1.2 s: exit 0 within 1.5 s, its last frame on the Mac (the mirror is
-/// the VM's transcript byte for byte), the end the CLI's own. Measured with
-/// the binary's wall-clock lane alone.
+/// at +1.2 s: exit 0 within 1.5 s, the end the CLI's own, its last frame
+/// read to the end, dropped and counted (S9: the transcript is kept in S3:
+/// nothing of it on the Mac, the line it carried on the VM's disk). Measured
+/// with the binary's wall-clock lane alone.
 #[test]
-fn a_child_exiting_1s_after_eof_keeps_its_last_mirror_frame() {
+fn a_child_exiting_1s_after_eof_ends_the_session_itself() {
     use ai_env_cli::bridge::remote::{CLOSE_BUDGET_MS, REMOTE_EOF_DETACH_AFTER_MS};
     let _alone = common::remote::alone();
     let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_FINAL_MIRROR_MS", "850"), ("FAKE_EXIT_DELAY_MS", "1000")];
@@ -1685,16 +1743,14 @@ fn a_child_exiting_1s_after_eof_keeps_its_last_mirror_frame() {
     started(&mut h);
     turn(&mut h, "hello");
     let file = format!("{}.jsonl", common::fake_fixed_sid());
-    let mac = h.prepared.mac_projects().join(h.slug()).join(&file);
     let vm = h.rig().vm_projects().join(h.slug()).join(&file);
-    assert_eq!(read(&mac), read(&vm), "the turn's frame mirrored");
     let took = closed(&mut h);
     assert!(took >= Duration::from_millis(1000) && took < Duration::from_millis(CLOSE_BUDGET_MS), "the CLI's own exit, a second after the EOF, within the budget: {took:?}");
-    let (mac, vm) = (read(&mac), read(&vm));
-    assert_eq!(mac, vm, "the last frame, 850 ms after the EOF, reached the Mac");
-    assert!(mac.lines().count() == 3 && mac.lines().last().is_some_and(|l| l.contains(r#""type":"summary""#)), "{mac}");
+    assert!(read(&vm).lines().last().is_some_and(|l| l.contains(r#""type":"summary""#)), "the last entry, 850 ms after the EOF, on the VM's disk: {}", read(&vm));
+    let mac = h.prepared.mac_projects();
+    assert!(files_under(&mac).iter().all(|rel| is_view(&mac.join(rel))), "nothing but a view on the Mac: {:?}", files_under(&mac));
     let note = h.end_note();
-    assert!(common::note_has(&note, "end:eof") && common::note_has(&note, "mirror:2/0"), "the CLI's own exit, before the detach at {REMOTE_EOF_DETACH_AFTER_MS} ms: {note}");
+    assert!(common::note_has(&note, "end:eof") && common::note_has(&note, "mirror:0/0") && common::note_has(&note, "mirror_dropped:1"), "the CLI's own exit, before the detach at {REMOTE_EOF_DETACH_AFTER_MS} ms, its last frame counted: {note}");
 }
 
 /// D5 and S4's workspace lock: Cursor's reload starts the config probe and
@@ -1823,6 +1879,67 @@ fn a_vm_without_the_s8_caps_is_never_selected() {
     let note = end_note_of(&h, h.pid());
     assert!(part_of(&note, "vm").is_some_and(|vm| vm != old) && part_of(&note, "vm_how").as_deref() == Some("started"), "the 7.0 VM {old} passed over: {note}");
     assert_eq!(runs(h.rig()), 2);
+}
+
+/// S9 (review CUT-1): SELECT_VM requires `transcript_s3_v1` of a VM it
+/// starts too, whose caps no row recorded yet (`vm run` reads no
+/// `/health`): its one `/health` names `workspace_v1` but not the transcript
+/// store (an image that predates it yet holds an egress pass: a publish
+/// that failed after the S9 deploy, a rollback). A fresh session there ends
+/// at P2, exit 7 naming `make deploy`, with no seed and no spawn: never a
+/// chat whose transcript no sync keeps and no session reuses. The VM's row
+/// keeps the caps its `/health` named, so the reuse passes it over.
+#[test]
+fn a_started_vm_without_the_transcript_store_is_exit_7_before_any_seed() {
+    use ai_env_cli::wire::frame::{CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
+    let mut p = Harness::prepare();
+    p.rig().update_fake(|s| s.health_caps.retain(|c| c != CAP_TRANSCRIPT_S3_V1));
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &[]);
+    h.send_initialize();
+    let (status, _) = h.wait(EXIT);
+    assert_eq!(status.code(), Some(7), "{}", h.transcript());
+    let failed = h.audit_events("session_remote_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(["step", "code", "why"].map(|k| failed[0]["detail"][k].as_str().unwrap_or_default().to_string()), ["select", "7", "old_image"], "{failed:?}");
+    let vm = failed[0]["detail"]["id"].as_str().expect("the VM SELECT_VM started").to_string();
+    let err = h.err_text();
+    assert_eq!(last_line(&err), format!("ai-env-claude: {vm} runs an image older than S9 (no transcript_s3_v1): run make deploy, then reopen the chat"), "{err}");
+    assert!(h.audit_events("seed").is_empty(), "no seed: {:?}", h.audit_events("seed"));
+    assert_eq!((h.spawn_count(), h.audit_events("session_remote_start").len()), (0, 0), "no spawn");
+    let rig = h.rig();
+    assert_eq!(runs(rig), 1, "the VM SELECT_VM started, alone");
+    assert!(!rig.vm_path(&rig.work()).join(".git").exists(), "nothing seeded on the VM");
+    let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None);
+    let caps = ai_env_cli::bridge::vm::registry::read_row(&paths, &vm).ok().flatten().and_then(|r| r.caps);
+    assert!(caps.as_ref().is_some_and(|c| c.iter().any(|c| c == CAP_WORKSPACE_V1) && !c.iter().any(|c| c == CAP_TRANSCRIPT_S3_V1)), "its row keeps the caps its /health named: {caps:?}");
+}
+
+/// S9 round 5 (R4): that state (an image that predates the transcript
+/// store yet holds an egress pass) is real for `vm warm`, and the wrapper's
+/// prewarm, too. No chat takes a VM without `transcript_s3_v1` (SELECT_VM
+/// passes it over, a session refuses one it starts), so the warm of a
+/// workspace the seed carries refuses the VM it started once its `/health`
+/// names the caps: exit 7 naming `make deploy`, nothing seeded, no token
+/// delivered, the VM named as one no chat or warm takes (never "a warm
+/// again reuses it").
+#[test]
+fn vm_warm_never_seeds_or_delivers_to_a_vm_without_the_transcript_store() {
+    use ai_env_cli::wire::frame::CAP_TRANSCRIPT_S3_V1;
+    let mut p = Harness::prepare();
+    let rig = p.rig();
+    rig.update_fake(|s| s.health_caps.retain(|c| c != CAP_TRANSCRIPT_S3_V1));
+    let work = rig.work().display().to_string();
+    let o = rig.run(&["vm", "warm", &work, "--json"], None);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(7), "{err}");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "", "no warm's report");
+    let vm = rig.fake().vms.keys().next().cloned().expect("the VM the warm started");
+    assert!(err.contains(&format!("lacks {CAP_TRANSCRIPT_S3_V1}")) && err.contains("make deploy"), "{err}");
+    assert!(err.contains(&format!("{vm} was started for this workspace and keeps running, but no chat or warm takes it: `ai-env vm terminate {vm}` ends it")), "{err}");
+    assert!(!err.contains("again reuses it"), "{err}");
+    assert!(!rig.vm_path(&rig.work()).join(".git").exists(), "nothing seeded on the VM");
+    assert!(audit_rows(rig, "credential_deliver").is_empty() && !rig.shim.spawns.credential().has(), "no token delivered");
+    assert_eq!(runs(rig), 1, "{:?}", rig.fake_calls());
 }
 
 /// D1: every wrapper process unseals the runtime key itself, once. Two
@@ -2205,8 +2322,9 @@ fn a_reused_vm_with_a_longer_idle_keeps_the_session_through_its_idle() {
 /// workspace's choice would take). The wrapper's `--resume` prefers the
 /// session's VM (`vm_select` says `prefer`): it is resumed, not replaced
 /// (`vm_how:resumed`, no RunMicrovm of its own), the transcript already
-/// there is not sent again, and the CLI resumes the same session from it;
-/// its next turn is mirrored as before.
+/// there is kept (S9: the VM holds what S3 committed, `transcript:kept`,
+/// nothing pulled), and the CLI resumes the same session from it; its next
+/// turn goes to S3 after the committed prefix, the Mac keeping the view.
 #[test]
 fn resume_on_the_same_vm_keeps_vm_and_session_id() {
     use ai_env_cli::bridge::api::VmState;
@@ -2214,8 +2332,8 @@ fn resume_on_the_same_vm_keeps_vm_and_session_id() {
     let init = started(&mut first);
     let sid = init["session_id"].as_str().expect("the session id").to_string();
     turn(&mut first, "first");
-    // The turn's code-out done: none still on its way (the endpoint would resume the VM the close suspends).
-    wait_for("the turn's code-out", T, || !audit_rows(first.rig(), "codeout_fetch").is_empty());
+    // The turn's code-out and transcript step done: none still on its way (the endpoint would resume the VM the close suspends).
+    synced(&mut first, &sid, 1);
     closed(&mut first);
     let vm = part_of(&end_note_of(&first, first.pid()), "vm").expect("the first session's VM");
     let rig = first.rig();
@@ -2235,34 +2353,43 @@ fn resume_on_the_same_vm_keeps_vm_and_session_id() {
     let init = started(&mut second);
     assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "the same session: {init}");
     turn(&mut second, "second");
+    let views = || audit_rows(rig, "transcript_view").iter().filter(|r| r["detail"]["session"] == sid.as_str() && r["detail"]["outcome"] == "written").count();
+    wait_for("the second turn's transcript synced and its view written", T, || views() >= 2);
     closed(&mut second);
     let note = end_note_of(&first, second.pid());
-    assert_eq!((part_of(&note, "vm"), part_of(&note, "vm_how"), part_of(&note, "transcript")), (Some(vm.clone()), Some("resumed".into()), Some("already_there".into())), "the session's VM, not the newer {newer}: {note}");
+    assert_eq!((part_of(&note, "vm"), part_of(&note, "vm_how"), part_of(&note, "transcript")), (Some(vm.clone()), Some("resumed".into()), Some("kept".into())), "the session's VM, not the newer {newer}: {note}");
+    assert!(audit_rows(rig, "transcript_pull").is_empty(), "nothing pulled for a VM that holds it");
     let selects = audit_rows(rig, "vm_select");
     let last = selects.last().expect("the resume's vm_select row");
     assert_eq!((last["detail"]["choice"].as_str(), last["detail"]["id"].as_str()), (Some("prefer"), Some(vm.as_str())), "{selects:?}");
     assert_eq!(runs(rig), 2, "the first session's VM and the newer one: none for the resume");
-    assert!(first.env_log().iter().any(|l| l == "gen 2 resumed lines=2"), "{:?}", first.env_log());
+    assert!(first.env_log().iter().any(|l| l == "gen 2 resumed lines=4"), "the VM's copy, its api-request lines too: {:?}", first.env_log());
     let file = format!("{sid}.jsonl");
     let (mac, vm_copy) = (first.prepared.mac_projects().join(first.slug()).join(&file), rig.vm_projects().join(first.slug()).join(&file));
-    assert_eq!((read(&mac), read(&mac).lines().count()), (read(&vm_copy), 4), "the mirror goes on, byte for byte");
+    assert_eq!((held_in_s3(rig, &sid), read(&vm_copy).lines().count()), (std::fs::read(&vm_copy).unwrap(), 8), "S3 holds both sessions' turns, byte for byte");
+    assert!(is_view(&mac), "the Mac keeps the view");
     let rows = first.registry_rows();
     let row = rows.iter().find(|r| r.get("session_id").and_then(toml::Value::as_str) == Some(sid.as_str())).unwrap_or_else(|| panic!("{rows:?}"));
     assert_eq!(row.get("microvm_id").and_then(toml::Value::as_str), Some(vm.as_str()), "{row:?}");
 }
 
-/// T8.5 offline: the picker reopens a chat whose VM is gone (terminated;
-/// the registry row still names it). The wrapper's `--resume` passes it
-/// over and starts a VM, and before the spawn uploads the Mac's mirror of the
-/// transcript to it (`transcript_put` before `session_remote_start`): the CLI
-/// resumes from it at once (no miss), the same session goes on, mirrored.
+/// T8.5 offline after the S3 cut-over: the picker reopens a chat whose VM
+/// is gone (terminated; the registry row still names it) and whose Mac copy
+/// is S8's mirror (a remote row without `transcript_home`). The wrapper's
+/// `--resume` passes the VM over and starts one; before the spawn P3 sends
+/// the mirror up in `session migrate-s9`'s gone-VM form (S3 then holds it
+/// as the VM-begun chat's, `transcript_migrate` migrated; the Mac keeps its
+/// view, the mirror deleted, nothing of it in `origin/`), then pulls it
+/// into the new VM (`transcript_pull` before `session_remote_start`): the
+/// CLI resumes from it at once (no miss), the same session goes on, its
+/// turn to S3 after it (`transcript:staged`).
 #[test]
-fn resume_into_a_new_vm_uploads_the_transcript_first() {
+fn resume_into_a_new_vm_restores_the_transcript_first() {
     use ai_env_cli::bridge::registry::{self, SessionRow, REGISTRY_SCHEMA_V};
     let mut p = Harness::prepare();
     let sid = common::uuid(0x8830);
     let earlier = format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#, common::uuid(0x8831));
-    p.plant_transcript(&sid, &[earlier.as_str()]);
+    let mirror = p.plant_transcript(&sid, &[earlier.as_str()]);
     let slug = p.slug();
     let rig = p.rig();
     // The chat's last VM: started for the workspace, then terminated (never run on this rig's shim).
@@ -2293,61 +2420,328 @@ fn resume_into_a_new_vm_uploads_the_transcript_first() {
     assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "{init}");
     assert!(h.env_log().iter().any(|l| l == "gen 1 resumed lines=1"), "the transcript was there before the CLI: {:?}", h.env_log());
     turn(&mut h, "after the VM was replaced");
+    // The view the mirror's migration left, then the turn's sync's.
+    synced(&mut h, &sid, 2);
     closed(&mut h);
     let note = h.end_note();
-    assert!(part_of(&note, "vm").is_some_and(|vm| vm != gone), "{note}");
-    assert_eq!((part_of(&note, "vm_how"), part_of(&note, "transcript")), (Some("started".into()), Some("uploaded".into())), "{note}");
+    let vm = part_of(&note, "vm").expect("the new VM");
+    assert_ne!(vm, gone, "{note}");
+    assert_eq!((part_of(&note, "vm_how"), part_of(&note, "transcript")), (Some("started".into()), Some("staged".into())), "{note}");
     assert_eq!(runs(h.rig()), 2, "a new VM");
     let events: Vec<(String, String)> = h.audit_rows().iter().map(|r| (r["event"].as_str().unwrap_or_default().to_string(), r["detail"]["outcome"].as_str().unwrap_or_default().to_string())).collect();
-    let put = events.iter().position(|(e, o)| e == "transcript_put" && o == "uploaded").unwrap_or_else(|| panic!("no transcript_put: {events:?}"));
-    let start = events.iter().position(|(e, _)| e == "session_remote_start").unwrap_or_else(|| panic!("no session_remote_start: {events:?}"));
-    assert!(put < start, "the transcript went up before the spawn: {events:?}");
-    let file = format!("{sid}.jsonl");
-    let (mac, vm_copy) = (h.prepared.mac_projects().join(&slug).join(&file), h.rig().vm_projects().join(&slug).join(&file));
-    assert_eq!((read(&mac), read(&mac).lines().count()), (read(&vm_copy), 3), "the conversation goes on, mirrored");
+    let at = |event: &str, outcome: &str| events.iter().position(|(e, o)| e == event && (outcome.is_empty() || o == outcome)).unwrap_or_else(|| panic!("no {event} {outcome}: {events:?}"));
+    let (migrated, pulled, start) = (at("transcript_migrate", "migrated"), at("transcript_pull", "written"), at("session_remote_start", ""));
+    assert!(migrated < pulled && pulled < start, "up to S3, into the VM, then the spawn: {events:?}");
+    let vm_copy = h.rig().vm_projects().join(&slug).join(format!("{sid}.jsonl"));
+    assert!(read(&vm_copy).starts_with(&format!("{earlier}\n")) && read(&vm_copy).lines().count() == 5, "the conversation goes on from the mirror's line: {}", read(&vm_copy));
+    assert_eq!(held_in_s3(h.rig(), &sid), std::fs::read(&vm_copy).unwrap(), "S3 holds the whole conversation");
+    assert!(is_view(&mirror), "the Mac keeps the view in the mirror's place");
+    assert!(!paths.transcript_origin(&sid).exists(), "an S8 mirror is not kept once S3 holds it");
 }
 
-/// T8.5's 409 (plan §8): the Mac's copy of a resumed transcript is on its
-/// way while the VM's CLI wrote on, so the VM's is longer by the time the
-/// upload arrives. The shim refuses it (409 `vm_longer`): the VM's copy wins,
-/// as it is, and the session goes on from it (`transcript:vm_longer`), the
-/// Mac's copy as it was.
+// ---- S9 R5-AWS-1: a big chat is made ready in its VM ahead, and a reopen pulls at most 64 MiB ----------
+//
+// Generation 1's restore runs under T0 + 50 s, and at the proxy's 4 to 16
+// MB/s a GiB takes minutes: a reopen pulls at most `wire::s3::INLINE_MAX`
+// in all, and `session stage UUID --warm` restores a larger chat into its
+// workspace's VM beforehand, where the reopen keeps it.
+
+/// S9 R5-AWS-1 (a): `session stage UUID --warm` makes a chat begun on this
+/// Mac ready in its workspace's VM. It is staged (the runtime key's Touch
+/// ID), the workspace warmed (its VM started and seeded, the token
+/// delivered: one Touch ID with the current combined.env), then the chat
+/// restored from S3 into that VM with no deadline: the VM holds it byte for
+/// byte, a `transcript_pull` row (written, its bytes and ms) names the VM,
+/// and the `--json` document's `restore` says the same. Two Touch IDs in
+/// all: the restore asks none. Run again it is idempotent: `already`, the
+/// warm's Touch ID alone, the restore `kept` (nothing pulled). The chat's
+/// reopen then takes that VM and keeps what it holds (`transcript:kept`, no
+/// pull), the CLI resuming from it.
 #[test]
-fn a_shorter_transcript_upload_is_409_and_the_vm_copy_wins() {
-    use ai_env_cli::wire::workspace::APP_PORT;
-    use common::fake_endpoint::Action;
+fn session_stage_warm_restores_the_chat_into_its_vm_and_the_reopen_keeps_it() {
     let mut p = Harness::prepare();
-    let sid = common::uuid(0x8840);
-    let entry = |n: u64| format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"line {n}"}}}}"#, common::uuid(0x8840 + n));
-    let first = entry(1);
-    let mac = p.plant_transcript(&sid, &[first.as_str()]);
-    let mac_text = read(&mac);
-    let longer: String = (1..=3).map(|n| format!("{}\n", entry(n))).collect();
+    let sid = common::uuid(0x9101);
+    let cwd = p.work();
+    let lines: Vec<String> = (0..3).map(|i| serde_json::json!({"type": "user", "uuid": common::uuid(0x9110 + i), "sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": format!("turn {i}")}}).to_string()).collect();
+    let chat = p.plant_transcript(&sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let bytes = std::fs::read(&chat).expect("the chat");
     let slug = p.slug();
-    let vm_copy = p.rig().vm_projects().join(&slug).join(format!("{sid}.jsonl"));
-    // The app port's first request is the transcript's stat; the second, its upload, waits at the endpoint.
-    p.rig().endpoint.script_port(APP_PORT, [Action::Forward, Action::Held]);
+    let vm = {
+        let rig = p.rig();
+        let stage = |touch_ids: usize| {
+            let before = rig.decrypts();
+            let o = rig.run(&["session", "stage", &sid, "--warm", "--json"], None);
+            assert!(o.status.success(), "session stage --warm: {}", String::from_utf8_lossy(&o.stderr));
+            assert_eq!(rig.decrypts() - before, touch_ids, "Touch IDs: {}", String::from_utf8_lossy(&o.stderr));
+            serde_json::from_slice::<Value>(&o.stdout).unwrap_or_else(|e| panic!("one JSON document ({e}): {}", String::from_utf8_lossy(&o.stdout)))
+        };
+        let doc = stage(2);
+        assert_eq!(doc["outcome"], "staged", "{doc}");
+        let restore = &doc["restore"];
+        let vm = restore["vm"].as_str().unwrap_or_else(|| panic!("the warmed VM: {doc}")).to_string();
+        assert_eq!((restore["outcome"].as_str(), restore["bytes"].as_u64()), (Some("restored"), Some(bytes.len() as u64)), "{doc}");
+        assert!(restore["ms"].as_u64().is_some(), "{doc}");
+        assert_eq!(std::fs::read(rig.vm_projects().join(&slug).join(format!("{sid}.jsonl"))).expect("the VM's copy"), bytes, "the VM holds the chat, byte for byte");
+        let pulls = audit_rows(rig, "transcript_pull");
+        assert_eq!(pulls.len(), 1, "{pulls:?}");
+        let d = &pulls[0]["detail"];
+        assert_eq!((d["session"].as_str(), d["vm"].as_str(), d["outcome"].as_str(), d["bytes"].as_str()), (Some(sid.as_str()), Some(vm.as_str()), Some("written"), Some(bytes.len().to_string().as_str())), "{d}");
+        assert!(d["ms"].as_str().is_some_and(|ms| ms.parse::<u64>().is_ok()), "{d}");
+        // Again: S3 holds it already, the VM too.
+        let doc = stage(1);
+        assert_eq!((doc["outcome"].as_str(), doc["restore"]["vm"].as_str(), doc["restore"]["outcome"].as_str(), doc["restore"]["bytes"].as_u64()), (Some("already"), Some(vm.as_str()), Some("kept"), Some(0)), "{doc}");
+        assert_eq!(audit_rows(rig, "transcript_pull").len(), 1, "nothing pulled again");
+        vm
+    };
     let resume = format!("--resume={sid}");
     let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
-    let init = h.send_initialize();
-    {
-        let rig = h.rig();
-        wait_for("the transcript's stat", T, || rig.endpoint.attempts().iter().any(|a| a.port == APP_PORT && a.path.starts_with("/transcript")));
-        std::fs::create_dir_all(vm_copy.parent().expect("the VM's project dir")).expect("mkdir the VM's project dir");
-        std::fs::write(&vm_copy, &longer).expect("the VM's longer copy");
-        rig.endpoint.release();
-    }
-    h.expect_out(|v| is_response_to(v, &init), T);
-    let started = h.expect_out(is_init, T);
-    assert_eq!(started["session_id"].as_str(), Some(sid.as_str()), "{started}");
-    assert!(h.env_log().iter().any(|l| l == "gen 1 resumed lines=3"), "the CLI resumed from the VM's copy: {:?}", h.env_log());
+    let init = started(&mut h);
+    assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "{init}");
     closed(&mut h);
-    let statuses: Vec<u16> = h.rig().endpoint.attempts().iter().filter(|a| a.port == APP_PORT && a.path.starts_with("/transcript")).map(|a| a.status).collect();
-    assert_eq!(statuses, [200, 409], "the stat, then the upload refused");
-    assert_eq!((read(&vm_copy), read(&mac)), (longer, mac_text), "the VM's copy wins, the Mac's stays");
-    assert_eq!(part_of(&h.end_note(), "transcript").as_deref(), Some("vm_longer"), "{}", h.end_note());
-    let puts = h.audit_events("transcript_put");
-    assert!(puts.len() == 1 && puts[0]["detail"]["outcome"] == "vm_longer", "{puts:?}");
+    let note = h.end_note();
+    assert_eq!((part_of(&note, "vm"), part_of(&note, "transcript")), (Some(vm), Some("kept".into())), "the warmed VM, which holds the chat: {note}");
+    assert!(matches!(part_of(&note, "vm_how").as_deref(), Some("reused" | "resumed")), "{note}");
+    assert_eq!(audit_rows(h.rig(), "transcript_pull").len(), 1, "the reopen pulled nothing");
+    assert!(h.env_log().iter().any(|l| *l == format!("gen 1 resumed lines={}", lines.len())), "the CLI resumed from the VM's copy: {:?}", h.env_log());
+}
+
+/// S9 R5-AWS-1 (b): a reopen of a chat S3 holds whose transcript is over
+/// what a reopen pulls inline (its manifest commits 70 MiB; nothing is in
+/// the tests' S3) is refused with no pull request, exit 9, the line naming
+/// `ai-env session stage UUID --warm`. While no VM of the workspace lives
+/// (a new one could not hold it), at P0: before any Touch ID and any AWS
+/// call. Once one lives that does not hold it (P0 cannot tell; P3's stat
+/// does), at P3 after the Touch ID: no part asked of S3, nothing pulled
+/// into the VM, no `transcript_pull` row, the VM named.
+#[test]
+fn a_reopen_over_what_it_pulls_inline_is_refused_at_p0_or_p3_before_any_pull() {
+    use ai_env_cli::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_VM};
+    use ai_env_cli::wire::s3::S3Key;
+    let mut p = Harness::prepare();
+    let sid = common::uuid(0x9102);
+    let slug = p.slug();
+    let resume = format!("--resume={sid}");
+    let base = S3Key::Base { session: sid.clone(), gen: 1 }.render();
+    let line = format!("ai-env-claude: the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline: run ai-env session stage {sid} --warm in a terminal, then reopen the chat");
+    let failed = |rig: &common::remote::RemoteRig| audit_rows(rig, "session_remote_failed").iter().map(|r| ["step", "code", "why", "id"].map(|k| r["detail"][k].as_str().unwrap_or_default().to_string())).collect::<Vec<_>>();
+    {
+        let rig = p.rig();
+        let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None);
+        let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
+        let mut m = Manifest::new(&sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
+        m.parts.push(ManifestPart { key: base.clone(), version_id: "fv1".into(), from: 0, len: 70 << 20, sha256: "a".repeat(64) });
+        (m.gen, m.committed, m.fp) = (1, 70 << 20, "b".repeat(64));
+        manifest::write(&paths, &m).expect("the chat's manifest");
+        // P0: no VM of the workspace yet.
+        let (before, calls) = (rig.decrypts(), rig.fake_calls().len());
+        let out = common::bounded::run_within(rig.wrapper(&[&resume], &[]), None, common::remote::LIMIT, "the wrapper");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(9), "{err}");
+        assert_eq!(last_line(&err), line, "{err}");
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (before, calls), "no Touch ID, no AWS call");
+        assert_eq!(failed(rig), [["precheck", "9", "transcript_pull_too_large", ""].map(str::to_string)]);
+        // A VM of the workspace lives, holding nothing of the chat: P0 cannot tell.
+        rig.start_vm();
+    }
+    let before = p.rig().decrypts();
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    h.send_initialize();
+    let (status, _) = h.wait(EXIT);
+    assert_eq!(status.code(), Some(9), "{}", h.transcript());
+    let err = h.err_text();
+    assert_eq!(last_line(&err), line, "{err}");
+    let rig = h.rig();
+    assert_eq!(rig.decrypts() - before, 1, "P1's Touch ID");
+    let vm = h.audit_events("vm_select")[0]["detail"]["id"].as_str().expect("the VM P2 took").to_string();
+    assert_eq!(failed(rig)[1], ["workspace", "9", "transcript_pull_too_large", vm.as_str()].map(str::to_string));
+    assert!(audit_rows(rig, "transcript_pull").is_empty() && h.audit_events("session_remote_start").is_empty(), "nothing pulled, nothing spawned");
+    assert!(!rig.s3().requests().iter().any(|q| q.key == base), "no part asked of S3: {:?}", rig.s3().requests());
+    assert!(!rig.vm_projects().join(&slug).join(format!("{sid}.jsonl")).exists(), "nothing of the chat in the VM");
+}
+
+/// S9 R5-AWS-1 with `[vm] reuse_per_workspace = false`: every reopen starts
+/// a new VM, which holds nothing, and `session stage --warm` would warm yet
+/// another, so the refusal's line asks for the switch first. At P0 when the
+/// committed parts alone are over the cap, though a VM of the workspace
+/// runs: no Touch ID, no AWS call. At P3 when a last tail takes the chat
+/// past it (P0 sees no tail): after the Touch ID and the new VM's start, no
+/// object asked of S3, nothing pulled.
+#[test]
+fn with_reuse_off_a_reopen_over_what_it_pulls_inline_names_the_switch() {
+    use ai_env_cli::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_VM};
+    use ai_env_cli::wire::s3::{S3Key, INLINE_MAX};
+    let mut p = Harness::prepare();
+    add_config(p.rig(), "[vm]\nreuse_per_workspace = false\n");
+    let sid = common::uuid(0x9105);
+    let slug = p.slug();
+    let resume = format!("--resume={sid}");
+    let base = S3Key::Base { session: sid.clone(), gen: 1 }.render();
+    let tail_key = S3Key::Tail { session: sid.clone(), gen: 1, offset: INLINE_MAX }.render();
+    let switch = format!(", and [vm] reuse_per_workspace is off: set it to true, run ai-env session stage {sid} --warm in a terminal, then reopen the chat");
+    // A manifest of one base of `len` bytes; nothing of it is in the rig's S3.
+    let manifest_of = |rig: &common::remote::RemoteRig, len: u64| {
+        let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
+        let mut m = Manifest::new(&sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
+        m.parts.push(ManifestPart { key: base.clone(), version_id: "fv1".into(), from: 0, len, sha256: "a".repeat(64) });
+        (m.gen, m.committed, m.fp) = (1, len, "b".repeat(64));
+        manifest::write(&ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None), &m).expect("the chat's manifest");
+    };
+    let started_by_hand = {
+        let rig = p.rig();
+        let vm = rig.start_vm();
+        manifest_of(rig, 70 << 20);
+        let (before, calls) = (rig.decrypts(), rig.fake_calls().len());
+        let out = common::bounded::run_within(rig.wrapper(&[&resume], &[]), None, common::remote::LIMIT, "the wrapper");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(9), "{err}");
+        assert_eq!(last_line(&err), format!("ai-env-claude: the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline{switch}"), "{err}");
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (before, calls), "P0: no Touch ID, no AWS call, though {vm} runs");
+        // The parts at the cap, and a tail past it that a /suspend pushed.
+        manifest_of(rig, INLINE_MAX);
+        rig.s3().put(&tail_key, format!("{}\n", serde_json::json!({"type": "user", "sessionId": sid, "message": {"role": "user", "content": "after the last sync"}})).as_bytes());
+        vm
+    };
+    let before = p.rig().decrypts();
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    h.send_initialize();
+    let (status, _) = h.wait(EXIT);
+    assert_eq!(status.code(), Some(9), "{}", h.transcript());
+    let err = h.err_text();
+    assert!(last_line(&err).ends_with(&format!(" a reopen pulls inline{switch}")), "P3: {err}");
+    let rig = h.rig();
+    assert_eq!(rig.decrypts() - before, 1, "P1's Touch ID");
+    let selects = h.audit_events("vm_select");
+    let select = &selects[0]["detail"];
+    let vm = select["id"].as_str().expect("the VM P2 took").to_string();
+    assert_eq!(select["how"].as_str(), Some("started"), "reuse off: a new VM, never {started_by_hand}: {select}");
+    let failed: Vec<[String; 4]> = audit_rows(rig, "session_remote_failed").iter().map(|r| ["step", "code", "why", "id"].map(|k| r["detail"][k].as_str().unwrap_or_default().to_string())).collect();
+    assert_eq!(failed.last(), Some(&["workspace", "9", "transcript_pull_too_large", vm.as_str()].map(str::to_string)), "{failed:?}");
+    assert!(audit_rows(rig, "transcript_pull").is_empty() && h.audit_events("session_remote_start").is_empty(), "nothing pulled, nothing spawned");
+    assert!(!rig.s3().requests().iter().any(|q| q.key == base || q.key == tail_key), "no object asked of S3: {:?}", rig.s3().requests());
+}
+
+/// R5-AWS-1: a chat begun on a VM that the rig's S3 holds whole, past what
+/// a reopen pulls inline: generation 1's base of `INLINE_MAX` bytes (64
+/// lines of 1 MiB) committed in the manifest (P0's cap on the parts alone
+/// passes it), and a tail of one line past it that its VM's `/suspend`
+/// pushed. The base's and the tail's bytes.
+fn chat_past_the_cap_in_s3(rig: &common::remote::RemoteRig, sid: &str, slug: &str) -> (Vec<u8>, Vec<u8>) {
+    use ai_env_cli::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_VM};
+    use ai_env_cli::wire::s3::{S3Key, FP_SPAN, INLINE_MAX};
+    let mut chat = vec![b'x'; usize::try_from(INLINE_MAX).unwrap()];
+    for end in (1..=64).map(|i| i * (1 << 20) - 1) {
+        chat[end] = b'\n';
+    }
+    let tail = format!("{}\n", serde_json::json!({"type": "user", "sessionId": sid, "message": {"role": "user", "content": "after the last sync"}})).into_bytes();
+    let base = S3Key::Base { session: sid.to_string(), gen: 1 }.render();
+    let version = rig.s3().put(&base, &chat);
+    let sha256 = rig.s3().objects().into_iter().find(|o| o.key == base && o.version_id == version).expect("the base in S3").sha256;
+    rig.s3().put(&S3Key::Tail { session: sid.to_string(), gen: 1, offset: INLINE_MAX }.render(), &tail);
+    let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
+    let mut m = Manifest::new(sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
+    let fp = sha256_of(&chat[chat.len() - usize::try_from(FP_SPAN).unwrap()..]);
+    m.parts.push(ManifestPart { key: base, version_id: version, from: 0, len: INLINE_MAX, sha256 });
+    (m.gen, m.committed, m.fp) = (1, INLINE_MAX, fp);
+    manifest::write(&ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None), &m).expect("the chat's manifest");
+    (chat, tail)
+}
+
+/// S9 R5-AWS-1, the way end to end: a chat begun on a VM, its VM gone, S3
+/// holding it whole past what a reopen pulls inline. Its reopen is refused
+/// at P3 (the parts alone pass P0; the VM P2 started holds nothing): exit
+/// 9, the line naming `ai-env session stage UUID --warm`. That command (a
+/// chat begun on a VM: nothing staged, its registry row's cwd the
+/// workspace) costs the warm's Touch ID alone and restores the chat into
+/// the workspace's VM with no deadline, every byte (`already`, `restore`
+/// `restored`). The reopen then takes that VM and keeps the chat
+/// (`transcript:kept`, no other pull), the CLI resuming from it.
+#[test]
+fn a_chat_past_the_cap_reopens_after_session_stage_warm() {
+    use ai_env_cli::bridge::registry::{self, SessionRow, REGISTRY_SCHEMA_V};
+    let mut p = Harness::prepare();
+    let sid = common::uuid(0x9104);
+    let slug = p.slug();
+    let (chat, tail) = {
+        let rig = p.rig();
+        let now = registry::now_rfc3339();
+        let row = SessionRow {
+            v: REGISTRY_SCHEMA_V,
+            session_id: sid.clone(),
+            slug: Some(slug.clone()),
+            cwd: Some(rig.work().display().to_string()),
+            created: now.clone(),
+            last_seen: now,
+            status: "closed".into(),
+            mode: "remote".into(),
+            route: "remote".into(),
+            exit: Some(0),
+            transcript_home: Some(ai_env_cli::bridge::s3::manifest::HOME_S3.into()),
+            ..SessionRow::default()
+        };
+        registry::write(&ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None), &row).expect("the session's registry row");
+        chat_past_the_cap_in_s3(rig, &sid, &slug)
+    };
+    let all = chat.len() + tail.len();
+    let resume = format!("--resume={sid}");
+    let mut first = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    first.send_initialize();
+    let (status, _) = first.wait(EXIT);
+    assert_eq!(status.code(), Some(9), "{}", first.transcript());
+    let err = first.err_text();
+    assert!(last_line(&err).ends_with(&format!(" a reopen pulls inline: run ai-env session stage {sid} --warm in a terminal, then reopen the chat")), "{err}");
+    let rig = first.rig();
+    let before = rig.decrypts();
+    let o = rig.run(&["session", "stage", &sid, "--warm", "--json"], None);
+    assert!(o.status.success(), "session stage --warm: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(rig.decrypts() - before, 1, "the warm's Touch ID alone: nothing staged, the restore asks none");
+    let doc: Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("one JSON document ({e}): {}", String::from_utf8_lossy(&o.stdout)));
+    let vm = doc["restore"]["vm"].as_str().unwrap_or_else(|| panic!("the warmed VM: {doc}")).to_string();
+    assert_eq!((doc["outcome"].as_str(), doc["restore"]["outcome"].as_str(), doc["restore"]["bytes"].as_u64()), (Some("already"), Some("restored"), Some(all as u64)), "{doc}");
+    let held = std::fs::read(rig.vm_projects().join(&slug).join(format!("{sid}.jsonl"))).expect("the VM's copy");
+    assert!(held.len() == all && held.starts_with(&chat) && held.ends_with(&tail), "the base, then the tail: {} bytes", held.len());
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]));
+    let init = started(&mut second);
+    assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "{init}");
+    closed(&mut second);
+    let note = end_note_of(&first, second.pid());
+    assert_eq!((part_of(&note, "vm"), part_of(&note, "transcript")), (Some(vm), Some("kept".into())), "{note}");
+    assert_eq!(audit_rows(rig, "transcript_pull").len(), 1, "the warm's pull alone");
+    assert!(first.env_log().iter().any(|l| l == "gen 1 resumed lines=65"), "the CLI resumed from the VM's copy: {:?}", first.env_log());
+}
+
+/// S9 R5-AWS-1 (c): a resume miss's retry pulls whatever the size (its
+/// restore has no deadline of its own; the generation's own bound aside).
+/// A chat S3 holds ([`chat_past_the_cap_in_s3`]), more than generation 1's
+/// P3 would pull. Generation 1 restores nothing
+/// (`AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip`) and its CLI misses after
+/// `initialize`; the retry pulls the whole chat into the VM, every byte (one
+/// `transcript_pull` row, written, two parts), and the CLI resumes from it
+/// (`transcript:restored`). A debug build hashes 64 MiB in some seconds.
+#[test]
+fn a_resume_miss_retry_pulls_a_chat_over_the_inline_cap() {
+    use ai_env_cli::wire::s3::INLINE_MAX;
+    let mut p = Harness::prepare();
+    let sid = common::uuid(0x9103);
+    let slug = p.slug();
+    let (chat, tail) = chat_past_the_cap_in_s3(p.rig(), &sid, &slug);
+    let resume = format!("--resume={sid}");
+    let knobs = [("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_RESUME_FAIL_AFTER_ACK", "1"), ("AI_ENV_BRIDGE_LAB_TRANSCRIPT", "skip")];
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &knobs);
+    let init = h.send_initialize();
+    h.expect_out(|v| is_response_to(v, &init), T);
+    let u = h.send_user("after the miss");
+    h.expect_out(|v| is_result_for(v, &u), T);
+    closed(&mut h);
+    let resumed: Vec<String> = h.env_log().into_iter().filter(|l| l.contains("resumed")).collect();
+    assert_eq!(resumed, ["gen 1 resumed lines=missing".to_string(), "gen 2 resumed lines=65".to_string()], "the retry's CLI found the whole chat");
+    let pulls = h.audit_events("transcript_pull");
+    assert_eq!(pulls.len(), 1, "{pulls:?}");
+    let d = &pulls[0]["detail"];
+    let all = INLINE_MAX + tail.len() as u64;
+    assert_eq!((d["outcome"].as_str(), d["parts"].as_str(), d["bytes"].as_str()), (Some("written"), Some("2"), Some(all.to_string().as_str())), "{d}");
+    let held = std::fs::read(h.rig().vm_projects().join(&slug).join(format!("{sid}.jsonl"))).expect("the VM's copy");
+    assert!(held.len() as u64 == all && held.starts_with(&chat) && held.ends_with(&tail), "the base, then the tail: {} bytes", held.len());
+    assert!(common::note_has(&h.end_note(), "transcript:restored"), "{}", h.end_note());
 }
 
 /// T8.5's VM gone mid-session: once the VM is terminated (`vm terminate`;
@@ -2381,6 +2775,100 @@ fn a_terminated_vm_mid_session_exits_8_naming_the_picker() {
     let rig = h.rig();
     assert!(rig.endpoint.hooks().iter().any(|k| k.vm == vm && k.name == "terminate" && k.status == 200), "{:?}", rig.endpoint.hooks());
     assert_eq!(wips(), before, "no snapshot at /terminate (L6)");
+}
+
+/// S9 (review CUT-5): before this Mac terminates a VM itself (`vm
+/// terminate ID`, or `--all`), it syncs each session whose transcript S3
+/// keeps there (`s3::commands::sync_before_terminate`). A line the VM's
+/// claude wrote after the turn's sync (here appended to its copy, as a
+/// summary written after the result) is committed to the manifest and held
+/// in S3 byte for byte before the VM ends, with no warning. The shim's
+/// `/terminate` tail push never moves the manifest's `committed`, so only
+/// that sync passes this. The session then loses its VM (exit 8).
+#[test]
+fn vm_terminate_syncs_a_live_sessions_transcript_to_s3_first() {
+    terminate_syncs_the_transcript_first(false);
+}
+
+/// S9 (review CUT-5): `vm terminate --all --yes` syncs each target's
+/// sessions first, as `vm terminate ID` does.
+#[test]
+fn vm_terminate_all_syncs_each_live_sessions_transcript_to_s3_first() {
+    terminate_syncs_the_transcript_first(true);
+}
+
+/// One session with a turn synced, a line on the VM after it, then `vm
+/// terminate` (`all`: `--all`) as the two tests above say.
+fn terminate_syncs_the_transcript_first(all: bool) {
+    use std::io::Write as _;
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
+    let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
+    turn(&mut h, "hello");
+    // The turn's code-out and transcript step done: nothing of the session's own trigger still on its way.
+    synced(&mut h, &sid, 1);
+    let vm = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    let vm_copy = h.rig().vm_projects().join(h.slug()).join(format!("{sid}.jsonl"));
+    let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(h.rig().bridge(), None);
+    let committed = || ai_env_cli::bridge::s3::manifest::read(&paths, &sid).unwrap().unwrap_or_else(|| panic!("no manifest of {sid}")).committed;
+    let at_turn = committed();
+    assert_eq!(at_turn, std::fs::metadata(&vm_copy).expect("the VM's copy").len(), "the turn's sync committed the VM's copy");
+    // What the VM's claude writes after the turn's sync: on the VM's disk alone.
+    let last: Value = serde_json::from_str(read(&vm_copy).lines().last().expect("the turn's entries")).expect("a transcript line");
+    let late = format!(r#"{{"type":"summary","summary":"written after the turn's sync","leafUuid":"{}"}}"#, last["uuid"].as_str().expect("its uuid"));
+    let mut f = std::fs::OpenOptions::new().append(true).open(&vm_copy).expect("open the VM's transcript");
+    writeln!(f, "{late}").expect("append the late line");
+    drop(f);
+    let held = std::fs::read(&vm_copy).expect("the VM's copy");
+    let args = if all { vec!["vm", "terminate", "--all", "--yes"] } else { vec!["vm", "terminate", vm.as_str(), "--yes"] };
+    let o = h.rig().run(&args, None);
+    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "vm terminate: {stderr}");
+    assert!(String::from_utf8_lossy(&o.stdout).contains(&vm), "the session's VM terminated: {}", String::from_utf8_lossy(&o.stdout));
+    assert!(!stderr.contains("not synced"), "the sync before the terminate warned: {stderr}");
+    let now = committed();
+    assert!(now > at_turn && now == held.len() as u64, "committed {now} of the VM's {} bytes (the turn's sync: {at_turn})", held.len());
+    assert_eq!(held_in_s3(h.rig(), &sid), held, "S3 holds the VM's copy, the late line too");
+    let (status, _) = h.wait(EXIT);
+    assert_eq!(status.code(), Some(8), "{}", h.transcript());
+}
+
+/// S9 round 5 (R1): `vm terminate` never wakes a VM the chat's closing
+/// suspend left SUSPENDED to sync it first. After the host's EOF the CLI
+/// writes one more line, which that suspend's `/suspend` pushed as the tail
+/// (`g1/t/<committed>`, through the URL the turn's sync handed). `vm
+/// terminate` then ends the VM with no request to it: no `/resume` (the
+/// platform's auto-resume), no warning, the manifest as the turn's sync left
+/// it, and S3 still holding the tail, byte for byte.
+#[test]
+fn vm_terminate_never_wakes_a_suspended_vm_to_sync_it() {
+    use ai_env_cli::bridge::api::VmState;
+    let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_FINAL_MIRROR_MS", "200"), ("FAKE_EXIT_DELAY_MS", "400")];
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &knobs);
+    let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
+    turn(&mut h, "hello");
+    synced(&mut h, &sid, 1);
+    let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(h.rig().bridge(), None);
+    let manifest = || ai_env_cli::bridge::s3::manifest::read(&paths, &sid).unwrap().unwrap_or_else(|| panic!("no manifest of {sid}"));
+    let at_turn = manifest();
+    closed(&mut h);
+    let vm = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    let written = std::fs::read(h.rig().vm_projects().join(h.slug()).join(format!("{sid}.jsonl"))).expect("the VM's copy");
+    assert!(written.len() as u64 > at_turn.committed, "the CLI wrote on after the turn's sync");
+    let late = &written[usize::try_from(at_turn.committed).unwrap()..];
+    let rig = h.rig();
+    wait_for("the VM suspended in the fake", Duration::from_secs(10), || rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended));
+    let tail = ai_env_cli::wire::s3::S3Key::Tail { session: sid.clone(), gen: at_turn.gen.max(1), offset: at_turn.committed }.render();
+    wait_for("the tail /suspend pushed", T, || rig.s3().get(&tail).is_some());
+    assert_eq!(rig.s3().get(&tail).as_deref(), Some(late), "the tail is what the CLI wrote after the sync");
+    let resumes = rig.endpoint.resumes();
+    let o = rig.run(&["vm", "terminate", &vm, "--yes"], None);
+    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "vm terminate: {stderr}");
+    assert!(!stderr.contains("not synced"), "{stderr}");
+    assert_eq!(rig.endpoint.resumes(), resumes, "no request resumed the VM: {:?}", rig.endpoint.hooks());
+    assert!(rig.fake().vms.get(&vm).is_some_and(|v| v.state.is_terminal()), "the VM ended");
+    assert_eq!(manifest(), at_turn, "no sync ran");
+    assert_eq!(rig.s3().get(&tail).as_deref(), Some(late), "the tail stays in S3");
 }
 
 /// T8.6 offline: the endpoint cuts every connection mid-turn (the turn's
@@ -2458,13 +2946,13 @@ fn a_symlinked_component_is_409_with_an_explanation() {
 /// T8.6 offline (D6's non-ASCII case): a git workspace at a Cyrillic path
 /// written in NFD on the Mac (as macOS can hand it out) is seeded at its NFC
 /// form, the only form the VM is sent (the VM's directory entry is NFC, the
-/// Mac's stays NFD), and the transcript of the CLI there (`FAKE_CWD` the NFC
-/// path) is mirrored on the Mac under one slug: the NFC path's, the one
-/// Cursor's picker reads. That the spawn's cwd is the NFC path is the
+/// Mac's stays NFD), and the chat of the CLI there (`FAKE_CWD` the NFC
+/// path) has its view on the Mac under one slug (S9: its transcript in S3):
+/// the NFC path's, the one Cursor's picker reads. That the spawn's cwd is the NFC path is the
 /// pipeline's unit test (`the_spawn_runs_at_the_vm_path_never_the_macs_spelling`):
 /// the rig's VM disk is APFS, where either spelling finds the seeded directory.
 #[test]
-fn an_nfd_workspace_path_is_seeded_at_its_nfc_form_and_mirrored_under_one_slug() {
+fn an_nfd_workspace_path_is_seeded_at_its_nfc_form_and_viewed_under_one_slug() {
     // Й as И + U+0306 (NFD); the NFC form is the precomposed Й.
     let (nfd, nfc) = ("\u{0418}\u{0306}\u{043e}\u{0433}\u{0430}", "\u{0419}\u{043e}\u{0433}\u{0430}");
     let mut p = Harness::prepare();
@@ -2484,6 +2972,7 @@ fn an_nfd_workspace_path_is_seeded_at_its_nfc_form_and_mirrored_under_one_slug()
     let mut h = p.launch_wrapper(cmd);
     started(&mut h);
     turn(&mut h, "hello");
+    synced(&mut h, &common::fake_fixed_sid(), 1);
     closed(&mut h);
     let rig = h.rig();
     assert_eq!(names_in(&rig.vm_path(&rig.work())), [nfc], "the VM's entry is the NFC name");
@@ -2495,9 +2984,11 @@ fn an_nfd_workspace_path_is_seeded_at_its_nfc_form_and_mirrored_under_one_slug()
     let mac_projects = h.prepared.mac_projects();
     assert_eq!(names_in(&mac_projects), std::slice::from_ref(&slug), "one slug on the Mac, the NFC path's");
     let file = format!("{}.jsonl", common::fake_fixed_sid());
-    assert_eq!(read(&mac_projects.join(&slug).join(&file)), read(&rig.vm_projects().join(&slug).join(&file)), "the mirror is the VM's transcript");
+    assert_eq!(names_in(&mac_projects.join(&slug)), std::slice::from_ref(&file), "the chat's view alone");
+    assert!(is_view(&mac_projects.join(&slug).join(&file)), "the view, never the transcript");
+    assert_eq!(held_in_s3(rig, &common::fake_fixed_sid()), std::fs::read(rig.vm_projects().join(&slug).join(&file)).unwrap(), "the transcript in S3, from the VM's NFC slug");
     let note = h.end_note();
-    assert!(common::note_has(&note, "seed:seeded") && common::note_has(&note, "mirror:1/0"), "{note}");
+    assert!(common::note_has(&note, "seed:seeded") && common::note_has(&note, "mirror:0/0"), "{note}");
 }
 
 /// FAKE_ENV_DUMP writes `--- gen <n>`, then every variable the fake started
@@ -2646,17 +3137,15 @@ fn vm_warm_prewarm_is_quiet_and_records_its_run_in_the_inherited_warm_lock() {
 
 // ---- phase 4 F2: the transcript scan -----------------------------------------------------
 //
-// Review CUSTODY-2: a `--resume` uploads the Mac's transcript of the chat,
-// and a chat holds whatever its tools printed: on the Mac (before S8, under
-// the kill switch, as a local child) or, mirrored, on a VM. Every file the
-// upload would send goes through the seed's tripwires first: at P1, beside
-// the Touch ID, when the session names no VM of its own (a finding starts no
-// VM and closes the dialog), and again as it goes up (to the VM the session
-// names, the resume miss's retry). A file the VM holds already is never sent,
-// so a finding in it refuses nothing (review F2-R1). The lib's units
-// (`bridge::workspace::transcript`) hold the rest: the bytes sent are the
-// bytes scanned, a file no rel names is never read, a name that trips a rule,
-// a hit the VM holds the same or longer.
+// Review CUSTODY-2, after the S3 cut-over: a `--resume` of a chat begun on
+// the Mac (or of an S8 mirror) sends its copy up to S3 inline, and a chat
+// holds whatever its tools printed. Every file the inline upload would send
+// goes through the seed's tripwires first: at P1, beside the Touch ID (a
+// finding starts no VM and closes the dialog), and again as it goes up (the
+// restore's `s3::stage::scan_chat`, the resume miss's retry too). A chat S3
+// holds is never read on the Mac, so what its VM holds refuses nothing
+// (review F2-R1). The lib's units (`bridge::workspace::transcript`,
+// `bridge::s3::stage`) hold the rest.
 
 /// A local chat's transcript line: a tool's result, `text`, to the prompt
 /// `parent` of session `sid`.
@@ -2670,9 +3159,9 @@ fn tool_output(sid: &str, parent: &str, text: &str) -> String {
 /// or in a subagent's file alone. The wrapper refuses at P1, beside the
 /// Touch ID (in the second case one that never answers, which the refusal
 /// closes): exit 9, the last line naming `transcript:REL`, the line and the
-/// rule, never the value; no VM started, nothing in the VM's projects dir,
-/// no `transcript_put`, one `seed_refused` (step `transcript`) and the
-/// pipeline's `session_remote_failed`; the value nowhere under the bridge dir.
+/// rule, never the value; no VM started, nothing in the VM's projects dir
+/// or in S3, one `seed_refused` (step `transcript`) and the pipeline's
+/// `session_remote_failed`; the value nowhere under the bridge dir.
 #[test]
 fn a_local_chats_transcript_with_a_tripwire_is_refused_before_any_byte_leaves() {
     let key = format!("{}{}", "AKIA", "T".repeat(16));
@@ -2708,7 +3197,7 @@ fn a_local_chats_transcript_with_a_tripwire_is_refused_before_any_byte_leaves() 
         let rig = h.rig();
         assert_eq!(runs(rig), 0, "refused at P1: no VM started");
         assert_eq!(files_under(&rig.vm_projects()), Vec::<String>::new(), "nothing in the VM's projects dir");
-        assert!(h.audit_events("transcript_put").is_empty(), "nothing went up");
+        assert!(rig.s3().requests().is_empty() && h.audit_events("transcript_stage").is_empty(), "nothing went up");
         let refused = h.audit_events("seed_refused");
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!((refused[0]["detail"]["step"].as_str(), refused[0]["detail"]["code"].as_str()), (Some("transcript"), Some("finding")), "{refused:?}");
@@ -2725,14 +3214,14 @@ fn a_local_chats_transcript_with_a_tripwire_is_refused_before_any_byte_leaves() 
 }
 
 /// CUSTODY-2, the resume miss's retry: what goes up is scanned again as it
-/// goes. P1 scans the Mac's copy clean; generation 1 sends none
+/// goes. P1 scans the Mac's copy clean; generation 1 restores nothing
 /// (`AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip`) and its CLI misses once
 /// `initialize` came; by then the Mac's copy has grown a line holding an
-/// AWS access key id. The retry finds the VM lacking the file and refuses
-/// before its first `PUT`: exit 9 naming `transcript:UUID.jsonl` line 2 and
-/// the rule, never the value; no copy on the VM's disk, no
-/// `transcript_put`, one `seed_refused` (step `transcript`, the session's
-/// VM named), and no second spawn.
+/// AWS access key id. The retry's restore scans the chat it would send up
+/// and refuses before any request: exit 9 naming `transcript:UUID.jsonl`
+/// line 2 and the rule, never the value; no copy on the VM's disk, nothing
+/// in S3, one `seed_refused` (step `transcript`, the session's VM named),
+/// and no second spawn.
 #[test]
 fn a_resume_miss_retry_scans_the_transcript_again_before_it_goes_up() {
     use std::io::Write as _;
@@ -2759,7 +3248,7 @@ fn a_resume_miss_retry_scans_the_transcript_again_before_it_goes_up() {
     let rig = h.rig();
     assert!(!rig.vm_projects().join(&slug).join(format!("{sid}.jsonl")).exists(), "no copy on the VM");
     assert_eq!(holding(&[&rig.vm_root(), &h.bridge()], std::slice::from_ref(&key)), Vec::<String>::new(), "the value on the VM's disk or under the bridge dir");
-    assert!(h.audit_events("transcript_put").is_empty(), "nothing went up");
+    assert!(rig.s3().requests().is_empty() && h.audit_events("transcript_stage").is_empty(), "nothing went up");
     let starts = h.audit_events("session_remote_start");
     assert_eq!(starts.len(), 1, "generation 1's only: {starts:?}");
     let refused = h.audit_events("seed_refused");
@@ -2771,14 +3260,15 @@ fn a_resume_miss_retry_scans_the_transcript_again_before_it_goes_up() {
     assert_eq!(h.spawn_count(), 1, "no second spawn");
 }
 
-/// Review F2-R1: a chat that ran on a VM holds what that VM's tools
-/// printed, and the Mac's copy is its mirror: here a line holding an AWS
-/// access key id, on both disks byte for byte. The picker reopens the chat
-/// while its VM lives (suspended by the close): the session names that VM
-/// (its row's), so P1 scans nothing; P3 finds the VM holding the same
-/// transcript, sends none of it and refuses nothing. The session resumes on
-/// that VM (`vm_how:resumed`, `transcript:already_there`), the CLI from the
-/// line; the VM's copy as it was, no `seed_refused`.
+/// Review F2-R1 after the S3 cut-over: a chat that ran on a VM holds what
+/// that VM's tools printed; the Mac holds only its view and S3 its
+/// transcript. Here a tool's line holding an AWS access key id lands on the
+/// VM's disk after the last sync. The picker reopens the chat while its VM
+/// lives (suspended by the close): S3 holds the chat (origin `vm`), so P1
+/// reads nothing on the Mac, and P3 finds the VM holding the committed
+/// prefix and keeps its copy: nothing is sent or pulled, nothing refused.
+/// The session resumes on that VM (`vm_how:resumed`, `transcript:kept`),
+/// the CLI from the line; the VM's copy as it was, no `seed_refused`.
 #[test]
 fn a_vm_chat_whose_tools_printed_a_key_shape_resumes_on_its_vm() {
     use ai_env_cli::bridge::api::VmState;
@@ -2787,46 +3277,46 @@ fn a_vm_chat_whose_tools_printed_a_key_shape_resumes_on_its_vm() {
     let mut first = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
     let sid = started(&mut first)["session_id"].as_str().expect("the session id").to_string();
     turn(&mut first, "show me the deploy config");
-    // The turn's code-out done: none still on its way (the endpoint would resume the VM the close suspends).
-    wait_for("the turn's code-out", T, || !audit_rows(first.rig(), "codeout_fetch").is_empty());
+    // The turn's code-out and transcript step done: none still on its way (the endpoint would resume the VM the close suspends).
+    synced(&mut first, &sid, 1);
     closed(&mut first);
     let vm = part_of(&end_note_of(&first, first.pid()), "vm").expect("the first session's VM");
     let rig = first.rig();
     wait_for("the closing suspend", T, || rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended));
-    // What a tool printed on the VM: in the VM's transcript, and through the mirror in the Mac's.
+    // What a tool printed on the VM, after the last sync: on the VM's disk only.
     let file = format!("{sid}.jsonl");
     let (mac, vm_copy) = (first.prepared.mac_projects().join(first.slug()).join(&file), rig.vm_projects().join(first.slug()).join(&file));
     let last: Value = serde_json::from_str(read(&vm_copy).lines().last().expect("the turn's entries")).expect("a transcript line");
     let printed = tool_output(&sid, last["uuid"].as_str().expect("its uuid"), &format!("aws_access_key_id = {key}"));
-    for path in [&mac, &vm_copy] {
-        let mut f = std::fs::OpenOptions::new().append(true).open(path).expect("open a transcript");
-        writeln!(f, "{printed}").expect("append the tool's output");
-    }
+    let mut f = std::fs::OpenOptions::new().append(true).open(&vm_copy).expect("open the VM's transcript");
+    writeln!(f, "{printed}").expect("append the tool's output");
+    drop(f);
     let held = read(&vm_copy);
-    assert_eq!(read(&mac), held, "the mirror, byte for byte");
+    assert!(is_view(&mac) && !read(&mac).contains(&key), "the Mac keeps the view, never what the VM's tools printed");
     let resume = format!("--resume={sid}");
     let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]));
     let init = started(&mut second);
     assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "the same session: {init}");
     closed(&mut second);
     let note = end_note_of(&first, second.pid());
-    assert_eq!((part_of(&note, "vm"), part_of(&note, "vm_how"), part_of(&note, "transcript")), (Some(vm.clone()), Some("resumed".into()), Some("already_there".into())), "{note}");
-    assert!(first.env_log().iter().any(|l| l == "gen 2 resumed lines=3"), "the CLI resumed from the VM's copy: {:?}", first.env_log());
-    assert_eq!(read(&vm_copy), held, "the VM's copy as it was: nothing sent");
-    assert!(audit_rows(rig, "seed_refused").is_empty(), "{:?}", audit_rows(rig, "seed_refused"));
+    assert_eq!((part_of(&note, "vm"), part_of(&note, "vm_how"), part_of(&note, "transcript")), (Some(vm.clone()), Some("resumed".into()), Some("kept".into())), "{note}");
+    assert!(first.env_log().iter().any(|l| l == "gen 2 resumed lines=5"), "the CLI resumed from the VM's copy: {:?}", first.env_log());
+    assert_eq!(read(&vm_copy), held, "the VM's copy as it was: nothing pulled");
+    assert!(audit_rows(rig, "seed_refused").is_empty() && audit_rows(rig, "transcript_pull").is_empty(), "nothing refused, nothing pulled");
 }
 
-/// Review F2-R1, its other half: the same kind of chat (the Mac's mirror
-/// holding the line, line 2) reopened once its VM is gone (terminated, its
-/// disk with it; the registry row still names it). The session names that
-/// VM, so P1 scans nothing, and SELECT_VM starts a new one; that VM lacks
-/// the transcript, so the upload would send the line: P3 refuses it before
-/// any `PUT`. Exit 9 naming `transcript:UUID.jsonl` line 2 and the rule,
-/// never the value; the new VM's projects dir empty, the value nowhere on
-/// its disk or under the bridge dir; no `transcript_put`, one `seed_refused`
-/// naming the new VM, and no spawn.
+/// Review F2-R1, its other half, after the S3 cut-over: a chat whose VM is
+/// gone (terminated, its disk with it; the registry row still names it)
+/// and whose Mac copy is S8's mirror, holding a tool's line with an AWS
+/// access key id (line 2). S3 does not hold it, so P3 would send the mirror
+/// up inline (`session migrate-s9`'s gone-VM form): P1 scans it, whichever
+/// VM the session names, and refuses before any VM. Exit 9 naming
+/// `transcript:UUID.jsonl` line 2 and the rule, never the value; no new VM
+/// (only the gone one's run), nothing in S3 or in the VM's projects dir,
+/// the value nowhere under the bridge dir; one `seed_refused` naming no VM,
+/// and no spawn.
 #[test]
-fn a_vm_chat_whose_tools_printed_a_key_shape_is_refused_on_a_new_vm() {
+fn a_vm_chat_whose_tools_printed_a_key_shape_is_refused_before_any_vm() {
     use ai_env_cli::bridge::registry::{self, SessionRow, REGISTRY_SCHEMA_V};
     let key = format!("{}{}", "AKIA", "X".repeat(16));
     let mut p = Harness::prepare();
@@ -2867,18 +3357,16 @@ fn a_vm_chat_whose_tools_printed_a_key_shape_is_refused_on_a_new_vm() {
     assert!(last_line(&err).starts_with(&format!("ai-env-claude: the chat's transcript would carry transcript:{sid}.jsonl line 2: rule aws-access-key-id")), "{err}");
     assert!(!err.contains(&key), "the value on stderr: {err}");
     let rig = h.rig();
-    assert_eq!(runs(rig), 2, "the chat's VM and a new one: P1 let the session through");
+    assert_eq!(runs(rig), 1, "the gone VM's run alone: refused at P1, no new VM");
     assert_eq!(files_under(&rig.vm_projects()), Vec::<String>::new(), "nothing in the VM's projects dir");
+    assert!(rig.s3().requests().is_empty(), "nothing went up: {:?}", rig.s3().requests());
     assert_eq!(holding(&[&rig.vm_root(), &h.bridge()], std::slice::from_ref(&key)), Vec::<String>::new(), "the value on the VM's disk or under the bridge dir");
-    assert!(h.audit_events("transcript_put").is_empty(), "nothing went up");
     let failed = h.audit_events("session_remote_failed");
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!((failed[0]["detail"]["step"].as_str(), failed[0]["detail"]["code"].as_str(), failed[0]["detail"]["why"].as_str()), (Some("workspace"), Some("9"), Some("finding")), "{failed:?}");
-    let new = failed[0]["detail"]["id"].as_str().expect("the new VM, named");
-    assert_ne!(new, gone, "{failed:?}");
     let refused = h.audit_events("seed_refused");
     assert_eq!(refused.len(), 1, "{refused:?}");
-    assert_eq!((refused[0]["detail"]["step"].as_str(), refused[0]["detail"]["vm"].as_str()), (Some("transcript"), Some(new)), "{refused:?}");
+    assert_eq!((refused[0]["detail"]["step"].as_str(), refused[0]["detail"].get("vm")), (Some("transcript"), None), "P1's: no VM chosen yet: {refused:?}");
     assert_eq!(h.spawn_count(), 0, "no spawn");
 }
 
@@ -3241,7 +3729,7 @@ fn the_vm_settings_diff_is_captured_into_quarantine() {
         assert!(lines.contains(&want.as_str()), "{want}: {out}");
     }
     let diff: Value = serde_json::from_str(&read(&dir.join("diff.json"))).unwrap();
-    assert_eq!((diff["v"].as_u64(), diff["vms"][0]["scopes"][2]["allow"]["added"].clone(), diff["added"][0]["rule"].as_str()), (Some(2), serde_json::json!([rule]), Some(rule)), "{diff}");
+    assert_eq!((diff["v"].as_u64(), diff["vms"][0]["scopes"][2]["allow"]["added"].clone(), diff["added"][0]["rule"].as_str()), (Some(3), serde_json::json!([rule]), Some(rule)), "{diff}");
 }
 
 /// T8.6 offline: `ai-env session drop-transport UUID` (the real command,
@@ -3428,12 +3916,12 @@ fn the_closing_suspend_waits_for_the_last_code_out() {
     let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[]);
     let init = started(&mut h);
     let sid = init["session_id"].as_str().expect("the init's session id").to_string();
-    // The start capture (8080) done first: the endpoint's next connection is the turn's code-out.
+    // The start capture (8080) done first; the code port's next request is the turn's code-out (S9: after its tail on
+    // 8080, so the code-out's own hold is waited for, never any connection: a close before the fetch starts none).
     wait_for("the start capture", T, || capture_file(h.rig(), &sid, "start.json").is_some());
     h.rig().endpoint.script_port(CODE_PORT, [Action::Held]);
-    let before = h.rig().endpoint.accepted();
     turn(&mut h, "one");
-    wait_for("the turn's code-out held at the endpoint", T, || h.rig().endpoint.accepted() > before);
+    wait_for("the turn's code-out held at the endpoint", T, || h.rig().endpoint.held() > 0);
     // The host's EOF. Once the close began (the trigger closes there), the code-out goes on to the VM: half the
     // trigger's CLOSE_WAIT in, or as soon as a suspend went out (one that did not wait for the trigger).
     h.close_stdin();
@@ -3665,4 +4153,305 @@ fn the_fake_says_an_init_per_turn_and_each_process_its_own_session() {
     let (code, out, err) = f.run(&["--resume", &resumed], &counter, &format!("{INIT}\n"));
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(inits(&out).first().and_then(|v| v["session_id"].as_str()), Some(resumed.as_str()));
+}
+
+// ---- S9 phase 0: the tests' S3 and the fake curl ------------------------------------------
+
+/// One HTTP/1.1 request to `url` (`http://<host:port><target>`) on a
+/// connection of its own: `headers` as given, then `body` (a
+/// `Content-Length` added for a body unless `headers` name one), read to the
+/// server's close: (status, lowercased headers, body).
+fn http_call(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    use std::io::{Read as _, Write as _};
+    let rest = url.strip_prefix("http://").unwrap_or_else(|| panic!("not an http URL: {url}"));
+    let (host, target) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let mut stream = std::net::TcpStream::connect(host).unwrap_or_else(|e| panic!("connect {host}: {e}"));
+    stream.set_read_timeout(Some(T)).expect("a read timeout");
+    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if !body.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).expect("send the head");
+    stream.write_all(body).expect("send the body");
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).expect("read the answer");
+    let end = answer.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or_else(|| panic!("no head: {}", String::from_utf8_lossy(&answer)));
+    let text = String::from_utf8_lossy(&answer[..end]).into_owned();
+    let mut lines = text.split("\r\n");
+    let status = lines.next().and_then(|l| l.split(' ').nth(1)).and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("no status: {text}"));
+    let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    (status, headers, answer[end + 4..].to_vec())
+}
+
+/// The value of the (lowercase) header `name` among `headers`.
+fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+/// The `<Code>` of an S3 error body (empty for none).
+fn s3_code(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    text.split_once("<Code>").and_then(|(_, rest)| rest.split_once("</Code>")).map(|(code, _)| code.to_string()).unwrap_or_default()
+}
+
+/// Lowercase hex of `bytes`' sha256.
+fn sha256_of(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// S9 phase 0: the tests' S3 (`common::fake_s3`, plans/s9-contracts.md
+/// §8.1) takes what is signed with the lab's key and refuses what S3 does:
+/// a signature that is not the request's (tampered, or a query changed
+/// after signing), a URL past its expiry, an unsigned `x-amz-*` header, a
+/// bucket owner not sent, not `LAB_OWNER` or never signed, another bucket;
+/// a PUT without its length or chunked, a checksum not its body's,
+/// `If-None-Match: *` over an object. It keeps versions (read back by id; a
+/// delete is a marker), lists the current objects, assembles a multipart
+/// upload from its parts in order, and records every request without a
+/// signature's value; a script answers a status, cuts a read, or waits.
+#[test]
+fn the_fake_s3_checks_signatures_checksums_and_conditions() {
+    use ai_env_cli::bridge::s3::{LAB_BUCKET, LAB_KEY_ID, LAB_OWNER};
+    use ai_env_cli::wire::s3::{sha256_b64, S3Key, SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT};
+    use common::fake_s3::{FakeS3, S3Action};
+    let s3 = FakeS3::start();
+    assert_eq!(s3.bucket(), LAB_BUCKET);
+    let ttl = Duration::from_secs(300);
+    let sid = common::uuid(0x9001);
+    let key = S3Key::Base { session: sid.clone(), gen: 1 }.render();
+    let owner = ("x-amz-expected-bucket-owner", LAB_OWNER);
+    // A PUT as the shim's curl sends it: its length, its checksum, If-None-Match and the owner, all signed.
+    let put = |key: &str, body: &[u8], checksum: &str| {
+        let len = body.len().to_string();
+        let url = s3.presign("PUT", key, &[], &[("content-length", len.as_str()), ("if-none-match", "*"), ("x-amz-checksum-sha256", checksum)], ttl);
+        http_call("PUT", &url, &[("Content-Length", len.as_str()), ("If-None-Match", "*"), ("x-amz-checksum-sha256", checksum), owner], body)
+    };
+    let refused = |method: &str, url: &str, headers: &[(&str, &str)]| {
+        let (status, _, body) = http_call(method, url, headers, b"");
+        (status, s3_code(&body))
+    };
+    let one = b"line 1\n";
+    let b64 = sha256_b64(&sha256_of(one)).expect("a sha256's base64");
+    let etag = format!("\"{}\"", &sha256_of(one)[..32]);
+    let (status, headers, _) = put(&key, one, &b64);
+    assert_eq!((status, header_of(&headers, "x-amz-version-id"), header_of(&headers, "etag"), header_of(&headers, "x-amz-checksum-sha256")), (200, Some("fv1"), Some(etag.as_str()), Some(b64.as_str())));
+    let (status, _, body) = put(&key, one, &b64);
+    assert_eq!((status, s3_code(&body)), (412, "PreconditionFailed".to_string()), "If-None-Match: * over the current version");
+    let other = S3Key::Base { session: sid.clone(), gen: 2 }.render();
+    let (status, _, body) = put(&other, b"not those bytes\n", &b64);
+    assert_eq!((status, s3_code(&body)), (400, "BadDigest".to_string()));
+    let no_length = s3.presign("PUT", &other, &[], &[], ttl);
+    assert_eq!(refused("PUT", &no_length, &[owner]), (411, "MissingContentLength".to_string()));
+    assert_eq!(refused("PUT", &no_length, &[owner, ("Transfer-Encoding", "chunked")]), (501, "NotImplemented".to_string()));
+    // A GET. No client of ours sends x-amz-checksum-mode (a pull checks each part's sha256 itself); sent
+    // unsigned, as with any x-amz-* header, S3 refuses it.
+    let get_url = s3.presign("GET", &key, &[], &[], ttl);
+    let (status, _, body) = http_call("GET", &get_url, &[owner], b"");
+    assert_eq!((status, body.as_slice()), (200, &one[..]));
+    assert_eq!(refused("GET", &get_url, &[owner, ("x-amz-checksum-mode", "ENABLED")]), (403, "AccessDenied".to_string()), "x-amz-checksum-mode unsigned");
+    // The refusals.
+    let signature = get_url.split("X-Amz-Signature=").nth(1).expect("a signature").to_string();
+    let flipped = format!("{}{}", &signature[..signature.len() - 1], if signature.ends_with('0') { '1' } else { '0' });
+    assert_eq!(refused("GET", &get_url.replace(&signature, &flipped), &[owner]), (403, "SignatureDoesNotMatch".to_string()));
+    let versioned = s3.presign("GET", &key, &[("versionId", "fv1")], &[], ttl);
+    assert_eq!(refused("GET", &versioned.replace("versionId=fv1", "versionId=fv2"), &[owner]), (403, "SignatureDoesNotMatch".to_string()), "a query changed after signing");
+    assert_eq!(refused("GET", &s3.presign("GET", &key, &[], &[], Duration::ZERO), &[owner]), (403, "AccessDenied".to_string()), "past its expiry");
+    assert_eq!(refused("GET", &get_url, &[owner, ("x-amz-meta-note", "unsigned")]), (403, "AccessDenied".to_string()), "an unsigned x-amz-* header");
+    assert_eq!(refused("GET", &get_url, &[("x-amz-expected-bucket-owner", "another-owner")]), (403, "AccessDenied".to_string()), "another owner");
+    assert_eq!(refused("GET", &get_url, &[]), (403, "AccessDenied".to_string()), "no owner sent");
+    let unsigned_owner = get_url.replace("X-Amz-SignedHeaders=host%3Bx-amz-expected-bucket-owner", "X-Amz-SignedHeaders=host");
+    assert_ne!(unsigned_owner, get_url);
+    assert_eq!(refused("GET", &unsigned_owner, &[]), (403, "AccessDenied".to_string()), "the owner never signed");
+    assert_eq!(refused("GET", &get_url.replace(LAB_BUCKET, "another-bucket"), &[owner]), (404, "NoSuchBucket".to_string()));
+    // Versions: a second one, the first read back by its id; a delete is a marker over both.
+    assert_eq!(s3.put(&key, b"line 1\nline 2\n"), "fv2");
+    let (status, _, body) = http_call("GET", &versioned, &[owner], b"");
+    assert_eq!((status, body.as_slice()), (200, &one[..]));
+    assert_eq!(refused("GET", &s3.presign("GET", &key, &[("versionId", "fv9")], &[], ttl), &[owner]), (404, "NoSuchVersion".to_string()));
+    let (status, headers, _) = http_call("DELETE", &s3.presign("DELETE", &key, &[], &[], ttl), &[owner], b"");
+    assert_eq!((status, header_of(&headers, "x-amz-delete-marker")), (204, Some("true")));
+    assert_eq!(refused("GET", &get_url, &[owner]), (404, "NoSuchKey".to_string()), "behind the marker");
+    assert_eq!(s3.get(&key), None);
+    let versions: Vec<(String, bool, bool)> = s3.objects().into_iter().filter(|o| o.key == key).map(|o| (o.version_id, o.delete_marker, o.current)).collect();
+    assert_eq!(versions, [("fv1".to_string(), false, false), ("fv2".to_string(), false, false), ("fv3".to_string(), true, true)]);
+    // ListObjectsV2: the current objects alone.
+    assert_eq!(s3.put(&other, b"other\n"), "fv4");
+    let (status, _, body) = http_call("GET", &s3.presign("GET", "", &[("list-type", "2"), ("prefix", "v1/")], &[], ttl), &[owner], b"");
+    let listed = String::from_utf8_lossy(&body).into_owned();
+    assert!(status == 200 && listed.contains(&format!("<Key>{other}</Key>")) && !listed.contains(&format!("<Key>{key}</Key>")), "{status}: {listed}");
+    // Multipart: initiate, two parts with their checksums, ListParts, complete in order.
+    let big = S3Key::Segment { session: sid.clone(), gen: 1, offset: 0 }.render();
+    let (status, _, body) = http_call("POST", &s3.presign("POST", &big, &[("uploads", "")], &[], ttl), &[owner], b"");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let upload = text.split_once("<UploadId>").and_then(|(_, r)| r.split_once("</UploadId>")).map(|(id, _)| id.to_string()).unwrap_or_else(|| panic!("{status}: {text}"));
+    let parts: [&[u8]; 2] = [b"the first part\n", b"the second part\n"];
+    let mut tags = Vec::new();
+    for (n, part) in parts.iter().enumerate() {
+        let (number, len, sum) = ((n + 1).to_string(), part.len().to_string(), sha256_b64(&sha256_of(part)).expect("a sha256's base64"));
+        let url = s3.presign("PUT", &big, &[("partNumber", number.as_str()), ("uploadId", upload.as_str())], &[("content-length", len.as_str()), ("x-amz-checksum-sha256", sum.as_str())], ttl);
+        let (status, headers, _) = http_call("PUT", &url, &[("Content-Length", len.as_str()), ("x-amz-checksum-sha256", sum.as_str()), owner], part);
+        assert_eq!(status, 200, "part {number}");
+        tags.push(header_of(&headers, "etag").expect("a part's ETag").to_string());
+    }
+    let (status, _, body) = http_call("GET", &s3.presign("GET", &big, &[("uploadId", upload.as_str())], &[], ttl), &[owner], b"");
+    assert!(status == 200 && String::from_utf8_lossy(&body).matches("<Part>").count() == 2, "ListParts: {}", String::from_utf8_lossy(&body));
+    let complete: String = tags.iter().enumerate().map(|(n, tag)| format!("<Part><PartNumber>{}</PartNumber><ETag>{tag}</ETag></Part>", n + 1)).collect();
+    let complete = format!("<CompleteMultipartUpload>{complete}</CompleteMultipartUpload>");
+    let (status, _, body) = http_call("POST", &s3.presign("POST", &big, &[("uploadId", upload.as_str())], &[], ttl), &[owner], complete.as_bytes());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(s3.get(&big), Some(parts.concat()));
+    // The script: a status, a cut read, a wait; each taken by one request.
+    s3.script(vec![S3Action::Status { status: 503, code: "SlowDown" }, S3Action::CutAfter { bytes: 3 }, S3Action::Delay(Duration::from_millis(300))]);
+    let current = s3.presign("GET", &other, &[], &[], ttl);
+    assert_eq!(refused("GET", &current, &[owner]), (503, "SlowDown".to_string()));
+    let (status, headers, body) = http_call("GET", &current, &[owner], b"");
+    assert_eq!((status, header_of(&headers, "content-length"), body.as_slice()), (200, Some("6"), &b"oth"[..]), "cut after 3 of its 6 bytes");
+    let asked = std::time::Instant::now();
+    let (status, _, body) = http_call("GET", &current, &[owner], b"");
+    assert!(status == 200 && body == b"other\n" && asked.elapsed() >= Duration::from_millis(300), "{status} after {:?}", asked.elapsed());
+    // The records: every request, its names and signed headers, never a signature's or a credential's value.
+    let requests = s3.requests();
+    let first = &requests[0];
+    assert_eq!((first.method.as_str(), first.key.as_str(), first.content_length, first.chunked, first.status, first.code.as_deref()), ("PUT", key.as_str(), Some(7), false, 200, None));
+    assert_eq!((first.signed_headers.join(";"), first.query_names.clone()), (SIGNED_HEADERS_PUT.to_string(), ["X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature"].map(String::from).to_vec()));
+    let got = requests.iter().find(|r| r.method == "GET" && r.status == 200).expect("the GET");
+    assert_eq!(got.signed_headers.join(";"), SIGNED_HEADERS_GET);
+    assert!(requests.iter().any(|r| r.chunked && r.status == 501) && requests.iter().filter(|r| r.status == 0).count() == 1, "{requests:?}");
+    let shown = format!("{requests:?}");
+    assert!(!shown.contains(&signature) && !shown.contains(LAB_KEY_ID), "{shown}");
+}
+
+/// S9 phase 0: the fake curl (`tests/fakes/s3-curl.sh`, §8.2) runs only as
+/// `-q -K /dev/fd/3` (exit 2 else; `--version` lists https) and logs who ran
+/// it, the descriptors it started with, the configuration fd 3 carried
+/// (kept as `<log>.<n>.config`) and its argv. With its knobs file alone it
+/// plays S3 (a PUT's body kept, a GET's body written, the status line on
+/// stderr, an error's `<Code>`, an exit of its own); with `S3CURL_REAL` it
+/// hands the configuration to a real curl, here against the tests' S3.
+#[test]
+fn the_fake_curl_logs_its_fd_3_config_and_plays_s3() {
+    use ai_env_cli::bridge::s3::LAB_OWNER;
+    use ai_env_cli::wire::s3::{sha256_b64, S3Key};
+    use common::fake_s3::FakeS3;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let (curl, log) = (root.join("curl"), root.join("curl.log"));
+    // The shim's call: the configuration on fd 3 alone, an environment of PATH and LC_ALL.
+    let run = |config: &str, stdin: &[u8]| {
+        let file = root.join("config.in");
+        std::fs::write(&file, config).unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exec \"$0\" -q -K /dev/fd/3 3<\"$1\"").arg(&curl).arg(&file).env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C");
+        // fd 3 alone, as the shim's spawn leaves it: never a pipe a parallel test's spawn had open for a moment.
+        common::without_stray_fds(&mut cmd);
+        let o = common::bounded::run_within(cmd, Some(stdin), T, "the fake curl");
+        (o.status.code(), o.stdout, String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let config = |url: &str, proto: &str, tail: &[String]| {
+        let write_out = r#"write-out = "%{stderr}ai-env-curl status=%{http_code} version=%header{x-amz-version-id} checksum=%header{x-amz-checksum-sha256} etag=%header{etag}\n""#;
+        let mut lines = vec![format!("url = \"{url}\""), "silent".to_string(), "show-error".to_string(), format!("proto = \"={proto}\""), "connect-timeout = 20".to_string(), "max-time = 60".to_string(), write_out.to_string()];
+        lines.extend_from_slice(tail);
+        lines.join("\n") + "\n"
+    };
+    let put_tail = |len: usize, sum: &str| {
+        let head = |h: &str| format!("header = \"{h}\"");
+        vec!["request = \"PUT\"".to_string(), "upload-file = \"-\"".to_string(), head(&format!("Content-Length: {len}")), head("Transfer-Encoding:"), head("Expect:"), head(&format!("x-amz-checksum-sha256: {sum}")), head("If-None-Match: *"), head(&format!("x-amz-expected-bucket-owner: {LAB_OWNER}")), "output = \"-\"".to_string()]
+    };
+    let get_tail = vec!["request = \"GET\"".to_string(), format!("header = \"x-amz-expected-bucket-owner: {LAB_OWNER}\""), "fail".to_string(), "output = \"-\"".to_string()];
+    let body = b"line 1\n";
+    let sum = sha256_b64(&sha256_of(body)).expect("a sha256's base64");
+    // Played: never reached.
+    let url = "https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/v1/k";
+    let saved = root.join("saved");
+    common::install_fake_curl(&curl, &log, &[("S3CURL_SAVE", saved.to_str().unwrap())]);
+    let put = config(url, "https", &put_tail(body.len(), &sum));
+    let (code, out, err) = run(&put, body);
+    assert_eq!((code, out.as_slice()), (Some(0), &b""[..]), "{err}");
+    assert_eq!(err, format!("ai-env-curl status=200 version=fake-version-1 checksum={sum} etag=\"fake-1\"\n"));
+    assert_eq!(std::fs::read(saved.join("1.put")).unwrap(), body, "the PUT's body, read to its end");
+    let held = root.join("held");
+    std::fs::write(&held, "held\n").unwrap();
+    common::install_fake_curl(&curl, &log, &[("S3CURL_BODY", held.to_str().unwrap()), ("S3CURL_VERSION", "fv7")]);
+    let get = config(url, "https", &get_tail);
+    let (code, out, err) = run(&get, b"");
+    assert_eq!((code, out.as_slice(), err.as_str()), (Some(0), &b"held\n"[..], "ai-env-curl status=200 version=fv7 checksum= etag=\"fake-2\"\n"));
+    common::install_fake_curl(&curl, &log, &[("S3CURL_STATUS", "412"), ("S3CURL_CODE", "PreconditionFailed")]);
+    let (code, out, err) = run(&put, body);
+    assert_eq!((code, String::from_utf8_lossy(&out).into_owned()), (Some(0), "<Error><Code>PreconditionFailed</Code></Error>".to_string()), "{err}");
+    assert!(err.starts_with("ai-env-curl status=412 "), "{err}");
+    common::install_fake_curl(&curl, &log, &[("S3CURL_STATUS", "404"), ("S3CURL_BODY", held.to_str().unwrap())]);
+    let (code, out, err) = run(&get, b"");
+    assert_eq!((code, out.as_slice()), (Some(0), &b""[..]), "a GET that says `fail` writes nothing: {err}");
+    common::install_fake_curl(&curl, &log, &[("S3CURL_FAIL", "28")]);
+    let (code, _, err) = run(&get, b"");
+    assert_eq!((code, err.as_str()), (Some(28), ""), "an exit of its own, no status line");
+    for (args, code, stream) in [(&["-s", "https://example.invalid/"][..], 2, "fake curl: unexpected argv\n"), (&["--version"][..], 0, "")] {
+        let mut cmd = Command::new(&curl);
+        cmd.args(args).env_clear();
+        let o = common::bounded::run_within(cmd, None, T, "the fake curl");
+        assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned()), (Some(code), stream.to_string()), "{args:?}");
+        if code == 0 {
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            assert!(text.starts_with("curl 8.11.1 ") && text.lines().any(|l| l.starts_with("Protocols:") && l.split_whitespace().any(|p| p == "https")), "{text}");
+        }
+    }
+    let calls = common::curl_calls(&log);
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    assert_eq!(calls.len(), 5, "every call with the right argv, and those alone: {calls:?}");
+    assert!(calls.iter().all(|c| c.uid == uid && c.fds == [3] && c.args == ["-q", "-K", "/dev/fd/3"]), "{calls:?}");
+    assert_eq!((calls[0].config.as_str(), calls[1].config.as_str()), (put.as_str(), get.as_str()), "fd 3's bytes, as they came");
+    assert_eq!((calls[0].conf("url"), calls[0].conf("header").len(), calls[1].conf("fail")), (vec![url.to_string()], 6, vec![String::new()]));
+    assert_eq!(std::fs::read_to_string(root.join("curl.log.2.config")).unwrap(), get, "kept as <log>.<n>.config");
+    // S3CURL_REAL: the real curl takes the same configuration, here against the tests' S3.
+    let s3 = FakeS3::start();
+    let key = S3Key::Base { session: common::uuid(0x9002), gen: 1 }.render();
+    let len = body.len().to_string();
+    let put_url = s3.presign("PUT", &key, &[], &[("content-length", len.as_str()), ("if-none-match", "*"), ("x-amz-checksum-sha256", sum.as_str())], Duration::from_secs(300));
+    common::install_fake_curl(&curl, &log, &[("S3CURL_REAL", "/usr/bin/curl")]);
+    let (code, out, err) = run(&config(&put_url, "http", &put_tail(body.len(), &sum)), body);
+    let etag = format!("\"{}\"", &sha256_of(body)[..32]);
+    assert_eq!((code, out.as_slice(), err), (Some(0), &b""[..], format!("ai-env-curl status=200 version=fv1 checksum={sum} etag={etag}\n")));
+    assert_eq!(s3.get(&key).as_deref(), Some(&body[..]));
+    let get_url = s3.presign("GET", &key, &[], &[], Duration::from_secs(300));
+    let (code, out, err) = run(&config(&get_url, "http", &get_tail), b"");
+    assert_eq!((code, out.as_slice(), err), (Some(0), &body[..], format!("ai-env-curl status=200 version=fv1 checksum= etag={etag}\n")));
+    let calls = common::curl_calls(&log);
+    assert_eq!((calls.len(), calls[5].conf("url"), calls[6].conf("url")), (7, vec![put_url], vec![get_url]), "the real curl's calls logged too");
+    assert!(s3.requests().iter().all(|r| r.status == 200), "{:?}", s3.requests());
+}
+
+/// S9 (D9, G5; plans/s9-contracts.md §10): a remote chat's transcript is
+/// kept in S3, never on this Mac. The VM's CLI
+/// runs without `--session-mirror`; the one frame it prints anyway (the
+/// fake's last one after the EOF) is dropped and counted: the end row says
+/// `mirror:0/0` then `mirror_dropped:1`. Nothing under the Mac's projects
+/// directory holds a line of the VM's transcript: what is there, if
+/// anything, is the chat's view (each file's head the view's mark).
+#[test]
+fn a_remote_session_writes_no_mirror() {
+    let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_FINAL_MIRROR_MS", "200"), ("FAKE_EXIT_DELAY_MS", "400")];
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &knobs);
+    started(&mut h);
+    turn(&mut h, "hello");
+    closed(&mut h);
+    let argv = read(&h.root().join("argv.log"));
+    assert!(!argv.lines().any(|l| l == "--session-mirror"), "{argv}");
+    let note = h.end_note();
+    assert!(common::note_has(&note, "mirror:0/0") && common::note_has(&note, "mirror_dropped:1"), "{note}");
+    assert!(note.contains("; mirror:0/0; mirror_dropped:1; dropped:"), "right after the mirror part: {note}");
+    let vm = read(&h.rig().vm_projects().join(h.slug()).join(format!("{}.jsonl", common::fake_fixed_sid())));
+    let needles: Vec<String> = vm.lines().filter(|l| l.contains("\"uuid\"") || l.contains("\"type\":\"summary\"")).map(str::to_string).collect();
+    assert!(!needles.is_empty(), "the VM's transcript holds the turn: {vm}");
+    let mac = h.prepared.mac_projects();
+    assert!(holding(&[&mac], &needles).is_empty(), "no line of the VM's transcript on the Mac");
+    for rel in files_under(&mac) {
+        let head: Vec<u8> = std::fs::read(mac.join(&rel)).unwrap().into_iter().take(ai_env_cli::wire::view::VIEW_HEAD_READ).collect();
+        assert!(ai_env_cli::wire::view::is_view_head(&head), "{rel} is a view, if anything");
+    }
 }

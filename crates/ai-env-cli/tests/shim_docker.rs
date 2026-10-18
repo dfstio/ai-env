@@ -1824,96 +1824,15 @@ fn l1_no_scan_finds_the_cached_credential_on_disk_or_in_a_cmdline() {
 //
 // The shim's helper is this very binary (`ai-env shim-io`, `current_exe` of
 // the mounted shim), started as the agent for each workspace route; the
-// transcript routes run it on the app port behind the session bearer. Two
-// tests replace it with a script (`--helper`, mounted with the fake claude)
-// to drive what the real helper never does on purpose: overstay its budget,
-// and run long while a spawn ends.
-
-/// The slug a transcript's rel starts with (the picker's, of `/Users/mike/w`).
-const SLUG: &str = "-Users-mike-w";
-
-/// A transcript's rel: `<slug>/<a session's uuid n>.jsonl`.
-fn transcript_rel(slug: &str, n: u64) -> String {
-    format!("{slug}/0199d2a0-0000-7000-8000-{n:012x}.jsonl")
-}
-
-impl Vm {
-    /// `method path` on the app port from the host, with the session bearer: (status, body).
-    fn app(&self, method: &str, path: &str, body: &str) -> (u16, String) {
-        http_with(self.c.port(8080), method, path, &format!("Authorization: Bearer {}\r\n", self.token), body)
-    }
-}
+// app port's routes run it behind the session bearer. Two tests replace it
+// with a script (`--helper`, mounted with the fake claude) to drive what
+// the real helper never does on purpose: overstay its budget, and run long
+// while a spawn ends. (S8's `PUT /transcript` tests went with the route at
+// S9's S3 cut-over; the transcript's S9 forms are G8's L1 tests.)
 
 /// A refusal's code (a 4xx or 5xx body of the workspace routes).
 fn refusal_code(body: &str) -> String {
     serde_json::from_str::<ai_env_cli::wire::workspace::WsRefusal>(body).unwrap_or_else(|e| panic!("a refusal ({e}): {body}")).code
-}
-
-/// T8.4's upload on Linux: `PUT /transcript` (the bearer, `Content-Length`)
-/// has the agent's helper write the transcript under the agent's
-/// `.claude/projects`: 201 `written` with its size and sha256; the file
-/// 0600, the agent's (1000:1000), its two directories made 0700 by the
-/// agent, no temp file left beside it, and nothing under `/Users/mike`
-/// anyone's but the agent's. `GET /transcript` then names it present, with
-/// the same size and sha256.
-#[test]
-#[ignore = "Docker: make test-docker"]
-fn l1_transcript_put_is_0600_owned_by_the_agent() {
-    use ai_env_cli::wire::workspace::{TranscriptReply, TranscriptStat, TranscriptWrite};
-    use sha2::Digest as _;
-    let vm = agent_l1(&[]);
-    let rel = transcript_rel(SLUG, 1);
-    let body = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"earlier\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"noted\"}}\n";
-    let sha = hex::encode(sha2::Sha256::digest(body.as_bytes()));
-    let (s, reply) = vm.app("PUT", &format!("/transcript?rel={rel}"), body);
-    assert_eq!(s, 201, "{reply}\n{}", vm.c.logs());
-    let reply: TranscriptReply = serde_json::from_str(&reply).unwrap_or_else(|e| panic!("{e}: {reply}"));
-    assert_eq!((reply.outcome, reply.size, reply.sha256.as_str()), (TranscriptWrite::Written, body.len() as u64, sha.as_str()));
-    let (projects, file) = ("/Users/mike/.claude/projects", format!("/Users/mike/.claude/projects/{rel}"));
-    assert_eq!(vm.c.sh(&format!("stat -c '%a %u:%g' '{file}'")), "600 1000:1000", "the transcript is the agent's, 0600");
-    let dirs = vm.c.sh(&format!("stat -c '%a %u:%g %n' {projects} {projects}/{SLUG}"));
-    assert_eq!(dirs, format!("700 1000:1000 {projects}\n700 1000:1000 {projects}/{SLUG}"), "the directories the agent made");
-    assert_eq!(vm.c.sh(&format!("cat '{file}'")), body.trim_end(), "the bytes sent");
-    assert_eq!(vm.c.sh(&format!("ls -A {projects}/{SLUG}")), rel.split_once('/').map(|(_, f)| f).unwrap_or_default(), "no temp file left beside it");
-    let stray = vm.c.exec_as("0", &["bash", "-c", NOT_THE_AGENTS]);
-    assert!(stray.status.success() && stray.stdout.is_empty(), "paths under /Users/mike that are not the agent's:\n{}", String::from_utf8_lossy(&stray.stdout));
-    let (s, stat) = vm.app("GET", &format!("/transcript?rel={rel}"), "");
-    assert_eq!(s, 200, "{stat}");
-    let stat: TranscriptStat = serde_json::from_str(&stat).unwrap_or_else(|e| panic!("{e}: {stat}"));
-    assert_eq!((stat.present, stat.size, stat.sha256.as_deref()), (true, body.len() as u64, Some(sha.as_str())));
-    assert!(vm.c.logs().lines().any(|l| l.starts_with("ai-env: workspace transcript-put status=201 ")), "{}", vm.c.logs());
-}
-
-/// T8.6's symlink on Linux, for a transcript: the agent planted a link
-/// where the helper writes, once at a slug's directory (to a directory of
-/// its own) and once at a transcript's own name (to a file of its own).
-/// `PUT` and `GET /transcript` of either are 409 `symlink_component`;
-/// nothing went through a link (the directory stays empty, the file keeps
-/// its bytes), no temp file is left anywhere, and nothing under
-/// `/Users/mike` is anyone's but the agent's.
-#[test]
-#[ignore = "Docker: make test-docker"]
-fn l1_a_symlink_planted_by_the_agent_makes_put_transcript_409() {
-    let vm = agent_l1(&[]);
-    let (linked_dir, linked_file) = (transcript_rel(SLUG, 1), transcript_rel("-Users-mike-x", 2));
-    vm.c.sh_as(
-        "1000",
-        &format!(
-            "mkdir -p /Users/mike/.claude/projects/-Users-mike-x /tmp/ai-env-s8-planted && printf 'the agent\\n' > /tmp/ai-env-s8-target \
-             && ln -s /tmp/ai-env-s8-planted /Users/mike/.claude/projects/{SLUG} && ln -s /tmp/ai-env-s8-target /Users/mike/.claude/projects/{linked_file}"
-        ),
-    );
-    for (rel, what) in [(&linked_dir, "a linked slug directory"), (&linked_file, "a linked transcript")] {
-        let (s, body) = vm.app("PUT", &format!("/transcript?rel={rel}"), "{\"type\":\"user\"}\n");
-        assert_eq!((s, refusal_code(&body).as_str()), (409, "symlink_component"), "PUT through {what}: {body}");
-        let (s, body) = vm.app("GET", &format!("/transcript?rel={rel}"), "");
-        assert_eq!((s, refusal_code(&body).as_str()), (409, "symlink_component"), "GET through {what}: {body}");
-    }
-    assert_eq!(vm.c.sh("ls -A /tmp/ai-env-s8-planted"), "", "nothing went through the linked directory");
-    assert_eq!(vm.c.sh("cat /tmp/ai-env-s8-target"), "the agent", "nothing went through the linked file");
-    assert_eq!(vm.c.sh("find / -xdev -name '.ai-env-*.tmp' 2>/dev/null; true"), "", "no temp file left");
-    let stray = vm.c.exec_as("0", &["bash", "-c", NOT_THE_AGENTS]);
-    assert!(stray.status.success() && stray.stdout.is_empty(), "paths under /Users/mike that are not the agent's:\n{}", String::from_utf8_lossy(&stray.stdout));
 }
 
 /// A script standing for `ai-env shim-io` that never answers and ignores
@@ -2042,6 +1961,123 @@ fn l1_a_running_helper_holds_off_the_idle_sweep() {
     assert_eq!(s, 200, "the helper's answer reached the client: {body}");
     assert_swept(&vm.c, &out);
     assert!(sweeps(&vm.c.logs()).len() > swept, "a sweep ran once no helper lived:\n{}", vm.c.logs());
+}
+
+// ---- S9 agent L1: the transcript's curl (G8) ------------------------------------------------
+//
+// The root shim pushes a range of the agent's transcript to S3 with curl as
+// uid 999 (`ai-env-net`; the base image has no such user, the uid is enough),
+// its presigned URL on fd 3 only. A decoy proxy on the container's own
+// address (gawk as root: an RFC 1918 proxy, as squid's is) takes curl's
+// CONNECT and holds it until the test lets it go, so curl lives with the URL
+// in its memory while the agent and root look for it.
+
+/// The decoy's port, its log of the request lines it took, and the file whose
+/// existence lets it answer.
+const HOLDING_PORT: u16 = 3128;
+const HOLDING_LOG: &str = "/tmp/ai-env-s9-decoy.log";
+const HOLDING_GO: &str = "/tmp/ai-env-s9-go";
+
+/// The holding decoy (gawk, `-v port= -v out= -v go=`): one connection, its
+/// request line logged once its head is read, then no answer until `go`
+/// exists, then 403, as squid refuses a host off its allowlist.
+const HOLDING_DECOY: &str = r#"BEGIN {
+  srv = "/inet4/tcp/" port "/0/0"
+  if ((srv |& getline first) > 0) {
+    sub(/\r$/, "", first)
+    while ((srv |& getline h) > 0) { sub(/\r$/, "", h); if (h == "") break }
+    print first >> out; fflush(out)
+    while (system("test -e " go) != 0) system("sleep 0.2")
+    printf "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" |& srv
+  }
+  close(srv)
+}"#;
+
+/// Every command line and environment uid 1000 can read, an entry a line
+/// (another uid's environ is refused it: skipped).
+const AGENT_PROC_DUMP: &str = "for d in /proc/[0-9]*; do for f in cmdline environ; do tr '\\0' '\\n' 2>/dev/null < \"$d/$f\"; echo; done; done; true";
+
+/// The slug a transcript's rel starts with (the picker's, of `/Users/mike/w`).
+const SLUG: &str = "-Users-mike-w";
+
+/// M3 on Linux (S9 plan §5: the URL is never in an argv, an environment or
+/// on disk, and uid 1000 cannot read uid 999's descriptors): while a push's
+/// curl holds its presigned URL (the decoy holds its CONNECT), curl runs as
+/// 999:999 with NO_NEW_PRIVS and the argv `-q -K /dev/fd/3`; the URL's
+/// signature (made at run time) is in no command line or environment the
+/// agent can read, nor in any process's (root's privileged dump), and the
+/// agent cannot open curl's environ, memory or fd 3. Once the decoy refuses
+/// the CONNECT, curl reports no HTTP status: the push is 500
+/// `transfer_failed`; the CONNECT named the bucket's host, and the shim's
+/// log never held the signature.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_curl_url_invisible_to_uid_1000() {
+    use ai_env_cli::wire::s3::{bucket_host, PresignedUrl, S3Key, SIGNED_HEADERS_PUT};
+    use ai_env_cli::wire::workspace::TranscriptPush;
+    use sha2::Digest as _;
+    let vm = agent_l1(&[]);
+    let ip = vm.c.ip();
+    let (port, out, go) = (format!("port={HOLDING_PORT}"), format!("out={HOLDING_LOG}"), format!("go={HOLDING_GO}"));
+    let started = docker(&["exec", "-d", "-u", "0", &vm.c.id, "gawk", "-v", &port, "-v", &out, "-v", &go, HOLDING_DECOY]);
+    assert!(started.status.success(), "the decoy: {}", String::from_utf8_lossy(&started.stderr));
+    let row = format!(":{HOLDING_PORT:04X} 00000000:0000 0A");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !vm.c.sh("cat /proc/net/tcp").contains(&row) {
+        assert!(Instant::now() < deadline, "the decoy is not listening on {HOLDING_PORT}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The agent's transcript, and a push of it through the decoy.
+    let (session, owner) = ("0199d2a0-0000-7000-8000-000000000009", "123456789012");
+    let rel = format!("{SLUG}/{session}.jsonl");
+    let body = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a turn\"}}\n";
+    vm.c.sh_as("1000", &format!("mkdir -p /Users/mike/.claude/projects/{SLUG} && printf '%s\\n' '{}' > /Users/mike/.claude/projects/{rel}", body.trim_end()));
+    let signature = hex::encode(sha2::Sha256::digest(SpawnId::new_v7().to_string().as_bytes()));
+    let bucket = format!("ai-env-transcripts-{owner}");
+    let key = S3Key::Base { session: session.into(), gen: 1 }.render();
+    let query = format!("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261018%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261018T080000Z&X-Amz-Expires=300&X-Amz-SignedHeaders={}&X-Amz-Signature={signature}", SIGNED_HEADERS_PUT.replace(';', "%3B"));
+    let url = PresignedUrl::new(format!("https://{}/{key}?{query}", bucket_host(&bucket))).expect("a presigned URL of the store");
+    let push = TranscriptPush { rel, from: 0, len: body.len() as u64, sha256: hex::encode(sha2::Sha256::digest(body.as_bytes())), url, owner: owner.into(), proxy: Some(format!("http://{ip}:{HOLDING_PORT}")) };
+    let (app, bearer, json) = (vm.c.port(8080), format!("Authorization: Bearer {}\r\n", vm.token), serde_json::to_string(&push).unwrap());
+    let pushed = std::thread::spawn(move || http_with(app, "POST", "/transcript/push", &bearer, &json));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let connect = loop {
+        let seen = vm.c.sh(&format!("cat {HOLDING_LOG} 2>/dev/null; true"));
+        if !seen.is_empty() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "curl never reached the decoy:\n{}", vm.c.logs());
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // curl now waits on the decoy, the URL in its memory.
+    let curls = vm.c.pids("curl");
+    assert_eq!(curls.len(), 1, "one curl: {curls:?}");
+    let pid = curls[0];
+    let status = vm.c.sh(&format!("grep -E '^(Uid|Gid|NoNewPrivs):' /proc/{pid}/status"));
+    assert_eq!(status.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(), ["Uid: 999 999 999 999", "Gid: 999 999 999 999", "NoNewPrivs: 1"], "curl runs as ai-env-net, no new privileges");
+    let argv = vm.c.sh(&format!("tr '\\0' '\\n' < /proc/{pid}/cmdline"));
+    let argv: Vec<&str> = argv.lines().collect();
+    assert!(argv.len() == 4 && argv[0].ends_with("curl") && argv[1..] == ["-q", "-K", "/dev/fd/3"], "curl's argv: {argv:?}");
+    // What the agent can read: every command line, its own environments; never the signature.
+    let seen = vm.c.exec_as("1000", &["sh", "-c", AGENT_PROC_DUMP]);
+    let seen = String::from_utf8_lossy(&seen.stdout);
+    assert!(seen.lines().any(|l| l == "/dev/fd/3"), "the agent's dump read curl's command line ({} lines)", seen.lines().count());
+    assert_eq!(seen.lines().filter(|l| l.contains(&signature)).count(), 0, "the URL is in a command line or an environment the agent reads");
+    let probe = format!("for n in environ mem fd/3; do err=$(dd if=/proc/{pid}/$n of=/dev/null bs=1 count=1 status=none 2>&1); echo \"$n rc=$?${{err:+ $err}}\"; done");
+    let denied = vm.c.sh_as("1000", &probe);
+    for (node, line) in ["environ", "mem", "fd/3"].iter().zip(denied.lines()) {
+        assert!(line.starts_with(&format!("{node} rc=1 ")) && line.ends_with("Permission denied"), "the agent opened curl's {node}: {line}");
+    }
+    assert_eq!(denied.lines().count(), 3, "{denied}");
+    // Root's privileged dump of every process: the URL is in no argv and no environment at all.
+    assert_eq!(vm.c.proc_hits(&[&signature], &["-q", "-K", "/dev/fd/3"]), 0, "the URL is in a command line or an environment");
+    vm.c.sh(&format!("touch {HOLDING_GO}"));
+    let (s, reply) = pushed.join().expect("the push's thread");
+    assert_eq!((s, refusal_code(&reply).as_str()), (500, "transfer_failed"), "curl reported no HTTP status: {reply}");
+    assert_eq!(connect.trim(), format!("CONNECT {}:443 HTTP/1.1", bucket_host(&bucket)), "curl went to the bucket's host through the proxy");
+    let logs = vm.c.wait_log(10, "ai-env: workspace transcript-push status=500 ");
+    assert!(!logs.contains(&signature) && !reply.contains(&signature), "the signature reached the shim's log or the reply");
+    vm.c.wait_gone(10, "curl");
 }
 
 // ---- L2: the locally built image ---------------------------------------------------------

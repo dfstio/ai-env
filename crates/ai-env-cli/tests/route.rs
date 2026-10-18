@@ -170,3 +170,321 @@ fn symlinked_cwd_inside_the_root_is_remote() {
     std::os::unix::fs::symlink(&r.outside, &back_out).expect("symlink");
     assert_eq!(decide(&session.argv, Some(&back_out), Some(&r.cfg)), Route::Local(LocalReason::OutsideRoots), "a symlink under the root that leaves it is outside");
 }
+
+// ---- S9 (G5): the local resume of a view -------------------------------------------------
+//
+// A remote chat's Mac file is its view (the last messages only, every line
+// starting with `wire::view::VIEW_MARK_PREFIX`); a local claude resuming it
+// would take it for the whole chat. The real wrapper refuses it, exit 9 with
+// `LOCAL_RESUME_REFUSAL`: in the kill switch (no census, no config), and on
+// every route but the remote one (its census row noting `view_refused:<word>`).
+// Each run's environment is the test's alone (HOME, PATH, the bridge root);
+// its real binary is a script that only notes that it ran.
+
+const VIEW_ID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+const PLAIN_ID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+
+/// A HOME whose projects directory holds the cwd's chats, a bridge root,
+/// and a stand-in for the real binary.
+struct ViewWorld {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    cwd: PathBuf,
+    chats: PathBuf,
+}
+
+impl ViewWorld {
+    fn new() -> ViewWorld {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        let cwd = root.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let slug = ai_env_cli::wire::slug::project_dir_name(&cwd).expect("the cwd's slug");
+        let chats = root.join("home/.claude/projects").join(slug);
+        std::fs::create_dir_all(&chats).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let claude = root.join("bin/claude");
+        std::fs::write(&claude, "#!/bin/sh\necho ran >> \"$0.ran\"\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ViewWorld { _tmp: tmp, root, cwd, chats }
+    }
+
+    /// Chat `id` as a view, modified `age_s` seconds ago.
+    fn view(&self, id: &str, age_s: u64) {
+        let line = format!("{}\"type\":\"ai-title\",\"aiTitle\":\"a remote chat\",\"sessionId\":\"{id}\"}}\n", ai_env_cli::wire::view::VIEW_MARK_PREFIX);
+        self.chat(id, &line, age_s);
+    }
+
+    /// Chat `id` as a transcript of its own, modified `age_s` seconds ago.
+    fn plain(&self, id: &str, age_s: u64) {
+        self.chat(id, &format!("{{\"type\":\"user\",\"sessionId\":\"{id}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"), age_s);
+    }
+
+    fn chat(&self, id: &str, text: &str, age_s: u64) {
+        let path = self.chats.join(format!("{id}.jsonl"));
+        std::fs::write(&path, text).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+    }
+
+    /// The wrapper with `args` after the stand-in real binary, in the cwd, its environment `envs` on the test's own.
+    fn run(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env-claude"));
+        cmd.arg(self.root.join("bin/claude")).args(args).current_dir(&self.cwd).env_clear();
+        cmd.env("HOME", self.root.join("home")).env("PATH", "/usr/bin:/bin").env("AI_ENV_BRIDGE_DIR", self.root.join("bridge"));
+        cmd.envs(envs.iter().copied()).stdin(std::process::Stdio::null());
+        cmd.output().expect("run the wrapper")
+    }
+
+    /// How many times the stand-in real binary ran.
+    fn ran(&self) -> usize {
+        std::fs::read_to_string(self.root.join("bin/claude.ran")).map_or(0, |t| t.lines().count())
+    }
+
+    /// The census rows, oldest first.
+    fn rows(&self) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(self.root.join("bridge/logs/census.jsonl")).unwrap_or_default();
+        text.lines().map(|l| serde_json::from_str(l).expect("a census row")).collect()
+    }
+
+    /// The census rows' notes, oldest first.
+    fn notes(&self) -> Vec<String> {
+        self.rows().iter().map(|r| r["note"].as_str().unwrap_or_default().to_string()).collect()
+    }
+}
+
+/// The wrapper's last stderr line.
+fn last_err(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default().to_string()
+}
+
+fn refusal_line() -> String {
+    format!("ai-env-claude: {}", ai_env_cli::wire::view::LOCAL_RESUME_REFUSAL)
+}
+
+/// Passthrough (no bridge.toml: the default mode), a local pump mode and a
+/// session outside the roots in remote mode: a `--resume` of a view, in each
+/// of its spellings, is exit 9 with the refusal; the census row is written
+/// first, noting `view_refused:resume`; the real binary never runs. A
+/// resume of a transcript of its own runs it, as before.
+#[test]
+fn passthrough_resume_of_a_view_exits_9() {
+    let w = ViewWorld::new();
+    w.view(VIEW_ID, 0);
+    w.plain(PLAIN_ID, 60);
+    let resume_eq = format!("--resume={VIEW_ID}");
+    for args in [&["--resume", VIEW_ID][..], &[resume_eq.as_str()], &["--print", "-r", VIEW_ID, "--output-format", "json"]] {
+        let out = w.run(args, &[]);
+        assert_eq!((out.status.code(), last_err(&out)), (Some(9), refusal_line()), "{args:?}");
+    }
+    let notes = w.notes();
+    assert_eq!(notes.len(), 3, "one census row per run: {notes:?}");
+    assert!(notes.iter().all(|n| n.split("; ").any(|p| p == "view_refused:resume")), "{notes:?}");
+    let stream = ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--resume", VIEW_ID];
+    let out = w.run(&stream, &[("AI_ENV_BRIDGE_MODE", "local-child")]);
+    assert_eq!((out.status.code(), last_err(&out)), (Some(9), refusal_line()), "a local pump mode");
+    std::fs::create_dir_all(w.root.join("bridge")).unwrap();
+    std::fs::write(w.root.join("bridge/bridge.toml"), format!("[workspaces]\nroots = [{:?}]\n", w.root.join("elsewhere"))).unwrap();
+    let out = w.run(&stream, &[("AI_ENV_BRIDGE_MODE", "remote")]);
+    assert_eq!((out.status.code(), last_err(&out)), (Some(9), refusal_line()), "remote mode, a session outside the roots");
+    assert_eq!(w.ran(), 0, "the real binary never ran");
+    let out = w.run(&["--resume", PLAIN_ID], &[]);
+    assert_eq!((out.status.code(), w.ran()), (Some(0), 1), "a transcript of its own resumes locally: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// The kill switch (`AI_ENV_BRIDGE_LOCAL=1`): a resume of a view is refused
+/// before its raw exec, exit 9 with the refusal, no census row and no
+/// config read; anything else still execs the real binary raw.
+#[test]
+fn kill_switch_refuses_a_view() {
+    let w = ViewWorld::new();
+    w.view(VIEW_ID, 0);
+    w.plain(PLAIN_ID, 60);
+    let kill = [("AI_ENV_BRIDGE_LOCAL", "1")];
+    for args in [&["--resume", VIEW_ID, "--output-format", "stream-json"][..], &["-r", VIEW_ID], &["-c"]] {
+        let out = w.run(args, &kill);
+        assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned()), (Some(9), format!("{}\n", refusal_line())), "{args:?}");
+    }
+    assert_eq!(w.ran(), 0);
+    assert!(w.notes().is_empty() && !w.root.join("bridge").exists(), "the kill switch writes nothing");
+    for args in [&["--resume", PLAIN_ID][..], &["--resume", "not-a-session-id"], &["--version"]] {
+        let before = w.ran();
+        assert_eq!(w.run(args, &kill).status.code(), Some(0), "{args:?}");
+        assert_eq!(w.ran(), before + 1, "{args:?}: raw exec");
+    }
+}
+
+/// `--continue` (or `-c`) resumes the newest chat of the cwd: when that is a
+/// view, exit 9 with the refusal, the census noting `view_refused:continue`;
+/// once a transcript of its own is the newest, it runs.
+#[test]
+fn continue_to_a_view_refused() {
+    let w = ViewWorld::new();
+    w.plain(PLAIN_ID, 120);
+    w.view(VIEW_ID, 0);
+    for args in [&["--continue"][..], &["-c", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json"]] {
+        let out = w.run(args, &[]);
+        assert_eq!((out.status.code(), last_err(&out)), (Some(9), refusal_line()), "{args:?}");
+    }
+    let notes = w.notes();
+    assert!(notes.len() == 2 && notes.iter().all(|n| n.split("; ").any(|p| p == "view_refused:continue")), "{notes:?}");
+    assert_eq!(w.ran(), 0);
+    w.plain(PLAIN_ID, 0);
+    w.view(VIEW_ID, 120);
+    let out = w.run(&["--continue"], &[]);
+    assert_eq!((out.status.code(), w.ran()), (Some(0), 1), "the newest is a transcript: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Remote mode, a session under the roots: its chat resumes from S3 in the
+/// VM, so its view here is no refusal (`view_refusal` is `None` on the
+/// remote route). The lab knob (debug builds) ends the run once the row is
+/// written, before the pump: no AWS. The row is the remote route's, with no
+/// `view_refused:` part, and the real binary never runs.
+#[cfg(debug_assertions)]
+#[test]
+fn remote_resume_of_a_view_is_not_refused() {
+    let w = ViewWorld::new();
+    w.view(VIEW_ID, 0);
+    std::fs::create_dir_all(w.root.join("bridge")).unwrap();
+    std::fs::write(w.root.join("bridge/bridge.toml"), format!("[workspaces]\nroots = [{:?}]\n", w.root)).unwrap();
+    let stream = ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--resume", VIEW_ID];
+    let out = w.run(&stream, &[("AI_ENV_BRIDGE_MODE", "remote"), ("AI_ENV_BRIDGE_LAB_EXIT", "3:boom")]);
+    assert_eq!((out.status.code(), last_err(&out)), (Some(3), "boom".to_string()), "past the view refusal to the knob: {}", String::from_utf8_lossy(&out.stderr));
+    let rows = w.rows();
+    assert_eq!(rows.iter().map(|r| r["route"].as_str()).collect::<Vec<_>>(), [Some("remote")], "one row, the remote route's: {rows:?}");
+    let note = rows[0]["note"].as_str().unwrap_or_default();
+    assert!(note.split("; ").any(|p| p == "lab_exit:3") && !note.split("; ").any(|p| p.starts_with("view_refused:")), "{note}");
+    assert_eq!(w.ran(), 0, "the real binary never ran");
+}
+
+// ---- S9 (M7; wave 2: G8): the argv fixtures re-captured from the census ------------------------
+
+/// What a census row must share with a fixture to stand for it: the route;
+/// a local one's reason, its leading words (the subcommand) and the flags
+/// it names; a session's resume, continue, added directory, MCP
+/// configuration, thinking off and no persistence. Never a value.
+fn argv_shape(args: &[String]) -> String {
+    match ai_env_cli::wire::argv::classify(args) {
+        Route::Local(reason) => {
+            let words: Vec<&str> = args.iter().take_while(|a| !a.starts_with('-')).map(String::as_str).collect();
+            let mut flags: Vec<&str> = args.iter().filter(|a| a.starts_with("--")).map(|a| a.split('=').next().unwrap_or(a)).collect();
+            flags.sort_unstable();
+            flags.dedup();
+            format!("local {} [{}] [{}]", reason.name(), words.join(" "), flags.join(" "))
+        }
+        Route::Remote(s) => format!(
+            "session resume={} continue={} add_dir={} mcp={} thinking_off={} no_persistence={}",
+            s.resume.is_some(),
+            s.continue_,
+            !s.add_dirs.is_empty(),
+            s.has_mcp_config,
+            s.thinking_disabled,
+            s.no_session_persistence
+        ),
+    }
+}
+
+/// A fixture file's text with only its `ext_version` and `argv` lines
+/// replaced (each on one line of its own, as every fixture writes them);
+/// every other byte as it was.
+fn rewritten(text: &str, ext: &str, argv: &[String]) -> String {
+    let list = argv.iter().map(|a| serde_json::to_string(a).expect("a JSON string")).collect::<Vec<_>>().join(", ");
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_start();
+        let indent = &line[..line.len() - body.len()];
+        if body.starts_with("\"ext_version\":") {
+            out.push_str(&format!("{indent}\"ext_version\": {},\n", serde_json::to_string(ext).expect("a JSON string")));
+        } else if body.starts_with("\"argv\":") {
+            out.push_str(&format!("{indent}\"argv\": [{list}],\n"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// A census row's CLI arguments: its argv past the wrapper and the bundled claude.
+fn row_args(row: &serde_json::Value) -> Option<Vec<String>> {
+    let argv = row["argv"].as_array()?;
+    (argv.len() >= 2).then(|| argv.iter().skip(2).filter_map(|a| a.as_str().map(str::to_string)).collect())
+}
+
+/// Offline, the capture's tools: every fixture has a shape of its own (so a
+/// census row stands for one fixture at most), a fixture rewritten with its
+/// own argv and version is byte for byte itself, and a rewrite changes the
+/// argv and the version only (the hand-owned route, reason, session and
+/// sanitised stay).
+#[test]
+fn argv_shapes_tell_the_fixtures_apart_and_a_rewrite_keeps_the_rest() {
+    let all = load_fixtures();
+    let shapes: BTreeSet<String> = all.iter().map(|f| argv_shape(&f.argv)).collect();
+    assert_eq!(shapes.len(), all.len(), "two fixtures share a shape: {shapes:#?}");
+    for f in &all {
+        let path = Path::new(FIXTURE_DIR).join(format!("{}.json", f.name));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(rewritten(&text, &f.ext_version, &f.argv), text, "{}: a rewrite with its own argv and version", f.name);
+        let argv: Vec<String> = f.argv.iter().cloned().chain(["--a \"quoted\" one".to_string()]).collect();
+        let changed = rewritten(&text, "9.9.9", &argv);
+        let (old, new): (serde_json::Value, serde_json::Value) = (serde_json::from_str(&text).unwrap(), serde_json::from_str(&changed).unwrap_or_else(|e| panic!("{}: {e}", f.name)));
+        assert_eq!((new["ext_version"].as_str(), new["argv"].as_array().map(Vec::len)), (Some("9.9.9"), Some(argv.len())), "{}", f.name);
+        let rest = |v: &serde_json::Value| v.as_object().unwrap().iter().filter(|(k, _)| *k != "ext_version" && *k != "argv").map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>();
+        assert_eq!(rest(&new), rest(&old), "{}: the hand-owned fields stay", f.name);
+    }
+    let row = serde_json::json!({"argv": ["/w/ai-env-claude", "/b/claude", "--version"]});
+    assert_eq!(row_args(&row), Some(vec!["--version".to_string()]));
+    assert_eq!(row_args(&serde_json::json!({"argv": ["/w/ai-env-claude"]})), None);
+}
+
+/// S9 M7 (`make argv-fixtures EXT=2.1.302`; gated: AI_ENV_ARGV_CAPTURE=1
+/// and AI_ENV_ARGV_EXT, never part of `make test`): for each fixture of
+/// `wire::argv::FIXTURE_NAMES`, the newest of the operator's census rows
+/// (`ai-env wrapper census --json`) of extension EXT whose argv has the
+/// fixture's shape ([`argv_shape`]) rewrites that fixture's `argv` and
+/// `ext_version`, in place and nothing else ([`rewritten`]): `route`,
+/// `reason`, `session` and `sanitised` stay hand-owned, so the known-answer
+/// tests still check the new argv. It prints the fixtures found and the
+/// ones missing (part B's Cursor checklist makes them); then
+/// `FIXTURE_EXT_VERSION` moves to EXT by hand.
+#[test]
+#[ignore = "S9 M7: make argv-fixtures EXT=N.N.N (rewrites tests/fixtures/argv/*.json from the census)"]
+fn capture_argv_fixtures_from_the_census() {
+    if std::env::var("AI_ENV_ARGV_CAPTURE").as_deref() != Ok("1") {
+        eprintln!("skipped: make argv-fixtures EXT=N.N.N runs it (AI_ENV_ARGV_CAPTURE=1, AI_ENV_ARGV_EXT)");
+        return;
+    }
+    let ext = std::env::var("AI_ENV_ARGV_EXT").unwrap_or_default();
+    let parts: Vec<&str> = ext.split('.').collect();
+    assert!(parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())), "AI_ENV_ARGV_EXT={ext:?} is not N.N.N");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env"));
+    cmd.args(["wrapper", "census", "--json"]).stdin(std::process::Stdio::null());
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy().to_string();
+        if k.starts_with("AI_ENV_BRIDGE_LAB_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let out = cmd.output().expect("ai-env wrapper census --json");
+    assert!(out.status.success(), "ai-env wrapper census --json: {}", String::from_utf8_lossy(&out.stderr));
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).filter(|r: &serde_json::Value| r["ext"] == ext.as_str()).collect();
+    let (mut found, mut missing) = (Vec::new(), Vec::new());
+    for name in FIXTURE_NAMES {
+        let path = Path::new(FIXTURE_DIR).join(format!("{name}.json"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: Fixture = serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let want = argv_shape(&fixture.argv);
+        let Some((row, args)) = rows.iter().rev().find_map(|r| row_args(r).filter(|a| argv_shape(a) == want).map(|a| (r, a))) else {
+            missing.push(name);
+            continue;
+        };
+        let new = rewritten(&text, &ext, &args);
+        let parsed: Fixture = serde_json::from_str(&new).unwrap_or_else(|e| panic!("{name}: the rewrite does not parse ({e})"));
+        assert_eq!((parsed.ext_version.as_str(), &parsed.argv, parsed.route.as_str()), (ext.as_str(), &args, fixture.route.as_str()), "{name}: the rewrite");
+        std::fs::write(&path, new).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        found.push(format!("{name} (pid {} at {})", row["pid"], row["ts"].as_str().unwrap_or("?")));
+    }
+    println!("argv-fixtures: {} of {} rewritten from extension {ext}'s census rows: {}", found.len(), FIXTURE_NAMES.len(), found.join(", "));
+    println!("argv-fixtures: missing (no {ext} row of their shape: make them in Cursor, part B's checklist, then run this again): {}", if missing.is_empty() { "none".to_string() } else { missing.join(", ") });
+    println!("argv-fixtures: then FIXTURE_EXT_VERSION (wire/argv.rs) moves to {ext} with its pins, and make test checks the hand-owned fields against the new argv");
+}

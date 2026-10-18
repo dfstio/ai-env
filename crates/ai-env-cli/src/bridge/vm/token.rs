@@ -4,7 +4,9 @@
 //! [`ALLOWED_PORTS`] (plan §2.8(2)), 1–60 minutes. The value is a `Secret`
 //! registered with the scrubber; the VM row keeps only its expiry
 //! (`token_expiries["<port>"]`), never the value. Internal mints (`/health`,
-//! gc, smoke) are [`INTERNAL_MINUTES`]-minute `Port(8080)` tokens.
+//! gc, smoke) are [`INTERNAL_MINUTES`]-minute `Port(8080)` tokens. S9:
+//! [`mint_unrecorded`] keeps not even the expiry, for a command that changes
+//! nothing on the Mac (`box fetch --dry-run`).
 use crate::bridge::api::{AuthToken, MicrovmApi, APP_PORT};
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
@@ -49,14 +51,22 @@ pub fn check_minutes(minutes: u16) -> Result<(), BridgeError> {
 /// exists its `token_expiries["<port>"]` is set to the expiry (a row that
 /// cannot be read or written costs a `warn!` in the log, never the token).
 pub async fn mint<A: MicrovmApi>(api: &A, paths: &Paths, id: &str, port: u16, minutes: u16) -> Result<AuthToken, BridgeError> {
+    let token = mint_unrecorded(api, id, port, minutes).await?;
+    if let Err(e) = record_expiry(paths, id, port, token.expires_at_unix) {
+        tracing::warn!("vm {id}: token minted for port {port}, but its expiry was not recorded in the row: {e}");
+    }
+    Ok(token)
+}
+
+/// [`mint`] without the row's bookkeeping (S9): the same checks before any
+/// call, every header value registered with the scrubber, and nothing
+/// written, so the VM's row stays as it was (`box fetch --dry-run`).
+pub async fn mint_unrecorded<A: MicrovmApi>(api: &A, id: &str, port: u16, minutes: u16) -> Result<AuthToken, BridgeError> {
     check_port(port)?;
     check_minutes(minutes)?;
     let token = api.create_auth_token(id, minutes, port).await?;
     for value in token.headers.values() {
         register_secret(value.expose());
-    }
-    if let Err(e) = record_expiry(paths, id, port, token.expires_at_unix) {
-        tracing::warn!("vm {id}: token minted for port {port}, but its expiry was not recorded in the row: {e}");
     }
     Ok(token)
 }
@@ -149,6 +159,35 @@ mod tests {
         let text = std::fs::read_to_string(paths.vms().join(format!("{}.toml", vm.id))).unwrap();
         assert!(!text.contains(t.headers[TOKEN_HEADER].expose().as_str()), "the value is never stored");
         assert!(api.calls().contains(&Call::Token { id: vm.id.clone(), minutes: INTERNAL_MINUTES, port: 8080 }));
+    }
+
+    /// S9: an unrecorded mint checks the same before any call and registers
+    /// the value with the scrubber, but writes nothing: a row's
+    /// `token_expiries` (and the whole file) stays as it was, and no row is
+    /// created.
+    #[tokio::test]
+    async fn an_unrecorded_mint_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let api = FakeMicrovmApi::new();
+        api.set_auto_advance(true);
+        let vm = api.run(&spec()).await.unwrap();
+        assert!(mint_unrecorded(&api, &vm.id, 9000, 5).await.is_err());
+        assert!(mint_unrecorded(&api, &vm.id, 9418, 0).await.is_err());
+        assert!(!api.calls().iter().any(|c| matches!(c, Call::Token { .. })), "refused before any call");
+        let t = mint_unrecorded(&api, &vm.id, 9418, 5).await.unwrap();
+        assert_eq!(t.port, 9418);
+        assert!(!paths.vms().exists(), "no row is created");
+        let row = VmRow { id: vm.id.clone(), status: RowStatus::Running, client_token: spec().client_token, ..VmRow::default() };
+        write_row(&paths, &row).unwrap();
+        let file = paths.vms().join(format!("{}.toml", vm.id));
+        let before = std::fs::read(&file).unwrap();
+        let t = mint_unrecorded(&api, &vm.id, 9418, 5).await.unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before, "the row is byte for byte as it was");
+        assert!(read_row(&paths, &vm.id).unwrap().unwrap().token_expiries.is_empty());
+        let value = t.headers[TOKEN_HEADER].expose().clone();
+        assert!(!crate::wire::redact::scrub(&format!("x {value} y")).contains(value.as_str()), "registered with the scrubber");
+        assert_eq!(api.calls().iter().filter(|c| matches!(c, Call::Token { port: 9418, minutes: 5, .. })).count(), 2);
     }
 
     #[tokio::test]

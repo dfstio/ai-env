@@ -180,7 +180,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: WrapperCmd,
     },
-    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget, drop-transport
+    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget, drop-transport; a remote chat's transcript in S3 (S9): stage, sync, gc --remote, migrate-s9
     #[cfg(feature = "bridge")]
     Session {
         #[command(subcommand)]
@@ -204,7 +204,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: VmCmd,
     },
-    /// The workspace a VM works in (S8): seed it into the VM, fetch the VM's commits into refs/remotes/box/*
+    /// The workspace a VM works in (S8): seed it into the VM, fetch the VM's commits into refs/remotes/box/*; review what a push would carry, and install the pre-push hook that reviews every push (S9)
     #[cfg(feature = "bridge")]
     Box {
         #[command(subcommand)]
@@ -496,7 +496,7 @@ pub enum VmCmd {
         #[arg(long)]
         no_wait: bool,
     },
-    /// Terminate one VM, or --all of yours (rows + own orphans)
+    /// Terminate one VM, or --all of yours (rows + own orphans); the remote chats a running one holds are synced to S3 first (a suspended one is never woken: its /suspend pushed their tails once) (S9)
     Terminate {
         /// MicroVM id
         #[arg(required_unless_present = "all", conflicts_with = "all")]
@@ -513,7 +513,7 @@ pub enum VmCmd {
     },
     /// Reconcile ListMicrovms with state/vms: report (default), --yes acts on registry VMs, --include-orphans also on your own orphans
     Gc {
-        /// Act (terminate expired registry VMs, adopt, clear stale rows)
+        /// Act (terminate expired registry VMs, the remote chats each running one holds synced to S3 first (S9); adopt, clear stale rows)
         #[arg(long)]
         yes: bool,
         /// Also terminate your own orphans older than AGE (90s, 30m, 1h, 2d)
@@ -563,7 +563,9 @@ pub enum VmCmd {
 /// `ai-env box …` (feature `bridge`, S8): the workspace a VM works in. A seed
 /// carries HEAD's commit and tree and a scanned snapshot of the uncommitted
 /// changes (never the history); a fetch brings the VM's commits and
-/// snapshots back into `refs/remotes/box/*`, never into your branches.
+/// snapshots back into `refs/remotes/box/*`, never into your branches. S9: a
+/// review of what a push would carry, and the pre-push hook that runs it on
+/// every push.
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum BoxCmd {
@@ -603,6 +605,38 @@ pub enum BoxCmd {
         /// The largest code-out in MiB (default: [seed].max_fetch_mib)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1024))]
         max_mib: Option<u32>,
+        /// Fetch through git smart-HTTP (upload-pack, protocol v2) instead of POST /codeout; the VM must name git_http_v1
+        #[arg(long, conflicts_with = "wip")]
+        smart_http: bool,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Review what a push would carry: the tripwires, the settings policy, the dotenv rule, the Cargo.lock checks and the pre-push hook's own path (a file behind a link included) over REV's commits that BASES lack; a finding is exit 9 (no AWS call, no Touch ID)
+    Review {
+        /// The commit to review (a branch, a tag, a sha)
+        #[arg(required_unless_present = "pre_push", conflicts_with = "pre_push")]
+        rev: Option<String>,
+        /// Where the range starts (repeatable; default: every remote-tracking ref but refs/remotes/box/* and box-quarantine/*)
+        #[arg(long = "base", value_name = "REV", conflicts_with = "pre_push")]
+        base: Vec<String>,
+        /// The repository (default: the current directory's)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+        /// The pre-push hook's call: REMOTE and URL as git passes them, the pushed refs on stdin
+        #[arg(long, num_args = 2, value_names = ["REMOTE", "URL"], hide = true)]
+        pre_push: Option<Vec<String>>,
+    },
+    /// Install the pre-push review hook in REPO (where git runs hooks: core.hooksPath honoured): every push is then reviewed first, and refused while the ai-env it names is missing; never over another hook
+    HookInstall {
+        /// The repository (default: the current directory's)
+        repo: Option<PathBuf>,
+        /// Print the hook's path and body; write nothing
+        #[arg(long)]
+        dry_run: bool,
         /// One JSON document
         #[arg(long)]
         json: bool,
@@ -689,7 +723,7 @@ pub enum EgressCmd {
         #[arg(long)]
         shell: bool,
     },
-    /// From a vpc VM: direct egress and DNS closed, the allowlist working; a pass is recorded in state/egress-verified.toml
+    /// From a vpc VM: direct egress and DNS closed, the allowlist working, S3 reached through the proxy for the transcripts bucket alone (S9); a pass is recorded in state/egress-verified.toml
     Check {
         /// A running VM started with `vm run --egress vpc --shell` (default: start one and terminate it after)
         #[arg(long, value_name = "ID")]
@@ -700,7 +734,7 @@ pub enum EgressCmd {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
-        /// Start nothing when the image version a new VM runs ([aws].image_version resolved live, as RunMicrovm does) already has a passing check with [aws].egress_connector_arn bound to that very build (createdAt) and to the connector's live facts, judged by the current DNS rule (a pass recorded before rule 1 never counts); an unaccepted DNS verdict is named (`make claude-update` runs it after every deploy)
+        /// Start nothing when the image version a new VM runs ([aws].image_version resolved live, as RunMicrovm does) already has a passing check with [aws].egress_connector_arn bound to that very build (createdAt) and to the connector's live facts, at most 7 days old and judged by the current DNS and egress rules (a pass recorded before DNS rule 1, or before S9's S3 cases, never counts: the check runs again and says why); an unaccepted DNS verdict is named (`make claude-update` runs it after every deploy)
         #[arg(long, conflicts_with_all = ["vm", "keep"])]
         if_needed: bool,
     },
@@ -933,7 +967,7 @@ pub enum WrapperCmd {
         #[arg(long, value_enum, value_name = "MODE")]
         mode: Option<WrapperModeArg>,
     },
-    /// Take claudeCode.claudeProcessWrapper out of Cursor's settings: what Cursor starts afterwards is its bundled claude (dry run unless --write; backs up settings.json; initialPermissionMode and bridge.toml stay)
+    /// Take claudeCode.claudeProcessWrapper out of Cursor's settings: what Cursor starts afterwards is its bundled claude (dry run unless --write; backs up settings.json; initialPermissionMode and bridge.toml stay); it warns first while remote chats keep only their view on this Mac, which Cursor would then resume here (S9)
     Uninstall {
         /// Edit settings.json (default: a dry run that shows what would be removed)
         #[arg(long)]
@@ -971,7 +1005,7 @@ pub enum WrapperCmd {
         #[arg(long)]
         record_probes: bool,
     },
-    /// Show whether Cursor's claudeProcessWrapper is set, which ai-env-claude it runs, the effective wrapper mode and roots, whether bridge.toml passes a remote session's start checks, and which extension Cursor last ran (read-only: no AWS, no Touch ID)
+    /// Show whether Cursor's claudeProcessWrapper is set, which ai-env-claude it runs, the effective wrapper mode and roots, whether bridge.toml passes a remote session's start checks, which extension Cursor last ran, and which one each open Cursor window runs (read-only: no AWS, no Touch ID)
     Status {
         /// Machine-readable output (doctor --json's shape)
         #[arg(long)]
@@ -979,7 +1013,8 @@ pub enum WrapperCmd {
     },
 }
 
-/// `ai-env session …` (feature `bridge`): the session registry the S2 pump writes.
+/// `ai-env session …` (feature `bridge`): the session registry the S2 pump
+/// writes, and (S9) the store in S3 of a remote chat's transcript.
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum SessionCmd {
@@ -1004,11 +1039,58 @@ pub enum SessionCmd {
     Forget {
         /// Session id (a uuid)
         uuid: String,
+        /// Also delete its S3 transcript, its manifest, the original kept under state/transcripts and the view
+        #[arg(long)]
+        purge: bool,
     },
     /// Close a remote session's socket from the wrapper's side; the session reattaches (T8.6)
     DropTransport {
         /// Session id (a uuid)
         uuid: String,
+    },
+    /// Upload a chat that began on this Mac to S3 (scanned first, resumable), then leave its view in place of the file: a chat over 64 MiB needs this, with --warm, before it reopens remote; refused (exit 9) when the cwd its transcript records is outside bridge.toml's roots or in no git repository, where it could never reopen
+    Stage {
+        /// Session id (a uuid)
+        uuid: String,
+        /// Then start or resume the VM of the chat's workspace now (ai-env vm warm of the cwd the chat began in, as its transcript records it, or as a remote chat's row does; it must lie in a git repository under bridge.toml's roots) and restore the chat from S3 into that VM, whatever its size: a reopen there keeps it, where a reopen pulls at most 64 MiB inside Cursor's window; a reopen takes that VM only with [vm].reuse_per_workspace on and no AI_ENV_BRIDGE_VM pin to another VM
+        #[arg(long)]
+        warm: bool,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Push a remote session's transcript from its VM to S3 now and rewrite its view
+    Sync {
+        /// Session id (a uuid)
+        uuid: String,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the S3 transcripts of sessions closed more than DAYS ago (a dry run without --yes)
+    Gc {
+        /// The store in S3 (required)
+        #[arg(long, required = true)]
+        remote: bool,
+        /// Days since the session's last activity
+        #[arg(long, value_name = "DAYS", default_value_t = 90, value_parser = clap::value_parser!(u32).range(1..=3650))]
+        older_than: u32,
+        /// Remove them (without it: list them)
+        #[arg(long)]
+        yes: bool,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move S8's mirrored transcripts of remote chats into S3 and leave their views (a dry run without --yes)
+    #[command(name = "migrate-s9")]
+    MigrateS9 {
+        /// Migrate them (without it: list them)
+        #[arg(long)]
+        yes: bool,
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1174,8 +1256,12 @@ pub fn run(cli: Cli) -> Result<()> {
             SessionCmd::List { json } => crate::bridge::registry::cmd_list(json),
             SessionCmd::Show { uuid, json, settings_diff: false } => crate::bridge::registry::cmd_show(&uuid, json),
             SessionCmd::Show { uuid, json, settings_diff: true } => crate::bridge::settings_capture::cmd_settings_diff(&uuid, json),
-            SessionCmd::Forget { uuid } => crate::bridge::registry::cmd_forget(&uuid),
+            SessionCmd::Forget { uuid, purge } => crate::bridge::registry::cmd_forget(&store, &uuid, purge),
             SessionCmd::DropTransport { uuid } => crate::bridge::registry::cmd_drop_transport(&uuid),
+            SessionCmd::Stage { uuid, warm, json } => crate::bridge::s3::stage::cmd_stage(&store, &uuid, warm, json),
+            SessionCmd::Sync { uuid, json } => crate::bridge::s3::cmd_sync(&store, &uuid, json),
+            SessionCmd::Gc { remote: _, older_than, yes, json } => crate::bridge::s3::cmd_gc(&store, older_than, yes, json),
+            SessionCmd::MigrateS9 { yes, json } => crate::bridge::s3::cmd_migrate_s9(&store, yes, json),
         },
         #[cfg(feature = "bridge")]
         Cmd::Infra { cmd } => match cmd {
@@ -1268,7 +1354,7 @@ mod tests {
         let Cmd::Box { cmd: BoxCmd::Seed { workspace: None, branch: None, no_wip: false, replace: false, dry_run: false, max_mib: None, json: false } } = cmd(&["box", "seed"]) else {
             panic!("box seed, every default")
         };
-        let Cmd::Box { cmd: BoxCmd::Fetch { target, wip: true, dry_run: true, max_mib: Some(256), json: true } } = cmd(&["box", "fetch", "ws", "--wip", "--dry-run", "--max-mib", "256", "--json"]) else {
+        let Cmd::Box { cmd: BoxCmd::Fetch { target, wip: true, dry_run: true, max_mib: Some(256), smart_http: false, json: true } } = cmd(&["box", "fetch", "ws", "--wip", "--dry-run", "--max-mib", "256", "--json"]) else {
             panic!("box fetch")
         };
         assert_eq!(target.as_deref(), Some("ws"));
@@ -1307,6 +1393,91 @@ mod tests {
         let warm = cli.find_subcommand_mut("vm").and_then(|vm| vm.find_subcommand_mut("warm")).expect("vm warm").render_help().to_string();
         assert!(warm.contains("--dry-run") && !warm.contains("--prewarm"), "{warm}");
         assert!(Cli::command().render_help().to_string().contains("box"));
+    }
+
+    /// S9's `box` commands (plans/s9-contracts.md §4.1 to §4.3): `review`
+    /// takes REV or the hook's hidden `--pre-push REMOTE URL`, never both,
+    /// and `--base` only with REV; `hook-install` its repository;
+    /// `fetch --smart-http` never with `--wip` (the snapshot is `/codeout`'s).
+    #[test]
+    fn box_review_hook_install_and_smart_http_parse() {
+        let Cmd::Box { cmd: BoxCmd::Review { rev: Some(rev), base, repo: None, json: false, pre_push: None } } = cmd(&["box", "review", "HEAD"]) else { panic!("box review HEAD") };
+        assert_eq!((rev.as_str(), base.len()), ("HEAD", 0));
+        let Cmd::Box { cmd: BoxCmd::Review { rev: Some(rev), base, repo: Some(repo), json: true, pre_push: None } } = cmd(&["box", "review", "dev", "--base", "origin/main", "--base", "origin/dev", "--repo", "/r", "--json"]) else {
+            panic!("box review with bases")
+        };
+        assert_eq!((rev.as_str(), base, repo), ("dev", vec!["origin/main".to_string(), "origin/dev".to_string()], std::path::PathBuf::from("/r")));
+        let Cmd::Box { cmd: BoxCmd::Review { rev: None, pre_push: Some(pushed), .. } } = cmd(&["box", "review", "--pre-push", "origin", "git@example.invalid:o/r.git"]) else { panic!("box review --pre-push") };
+        assert_eq!(pushed, ["origin", "git@example.invalid:o/r.git"]);
+        let Cmd::Box { cmd: BoxCmd::HookInstall { repo: None, dry_run: false, json: false } } = cmd(&["box", "hook-install"]) else { panic!("box hook-install") };
+        let Cmd::Box { cmd: BoxCmd::HookInstall { repo: Some(repo), dry_run: true, json: true } } = cmd(&["box", "hook-install", "/r", "--dry-run", "--json"]) else { panic!("box hook-install /r") };
+        assert_eq!(repo, std::path::PathBuf::from("/r"));
+        let Cmd::Box { cmd: BoxCmd::Fetch { smart_http: true, wip: false, dry_run: true, .. } } = cmd(&["box", "fetch", "--smart-http", "--dry-run"]) else { panic!("box fetch --smart-http") };
+        for bad in [
+            &["box", "review"][..],
+            &["box", "review", "HEAD", "--pre-push", "origin", "u"],
+            &["box", "review", "--pre-push", "origin"],
+            &["box", "review", "--base", "x", "--pre-push", "origin", "u"],
+            &["box", "hook-install", "/r", "/s"],
+            &["box", "fetch", "--smart-http", "--wip"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let review = long_help("box", "review");
+        assert!(!review.contains("--pre-push") && review.contains("--base"), "the hook's flag stays out of the help:\n{review}");
+    }
+
+    /// S9's `session` commands (§4.4): `stage`, `sync`, `gc --remote` (90
+    /// days unless told, 1 to 3650), `migrate-s9`, and `forget --purge`.
+    #[test]
+    fn session_s9_commands_parse() {
+        let id = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let Cmd::Session { cmd: SessionCmd::Stage { uuid, warm: true, json: true } } = cmd(&["session", "stage", id, "--warm", "--json"]) else { panic!("session stage") };
+        assert_eq!(uuid, id);
+        let Cmd::Session { cmd: SessionCmd::Stage { warm: false, json: false, .. } } = cmd(&["session", "stage", id]) else { panic!("session stage, every default") };
+        let Cmd::Session { cmd: SessionCmd::Sync { uuid, json: false } } = cmd(&["session", "sync", id]) else { panic!("session sync") };
+        assert_eq!(uuid, id);
+        let Cmd::Session { cmd: SessionCmd::Gc { remote: true, older_than: 90, yes: false, json: false } } = cmd(&["session", "gc", "--remote"]) else { panic!("session gc --remote") };
+        let Cmd::Session { cmd: SessionCmd::Gc { remote: true, older_than: 30, yes: true, json: true } } = cmd(&["session", "gc", "--remote", "--older-than", "30", "--yes", "--json"]) else { panic!("session gc, every flag") };
+        let Cmd::Session { cmd: SessionCmd::MigrateS9 { yes: true, json: false } } = cmd(&["session", "migrate-s9", "--yes"]) else { panic!("session migrate-s9") };
+        let Cmd::Session { cmd: SessionCmd::Forget { uuid, purge: true } } = cmd(&["session", "forget", id, "--purge"]) else { panic!("session forget --purge") };
+        assert_eq!(uuid, id);
+        let Cmd::Session { cmd: SessionCmd::Forget { purge: false, .. } } = cmd(&["session", "forget", id]) else { panic!("session forget") };
+        for bad in [
+            &["session", "gc"][..],
+            &["session", "gc", "--remote", "--older-than", "0"],
+            &["session", "gc", "--remote", "--older-than", "3651"],
+            &["session", "stage"],
+            &["session", "sync"],
+            &["session", "migrate_s9"],
+            &["session", "migrate-s9", id],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `session stage --help` says what `--warm` does (S9, R5-AWS-1): it
+    /// starts or resumes the VM of the chat's workspace now (the cwd the
+    /// chat began in, in a git repository under the roots) and restores the
+    /// chat from S3 into that VM, whatever its size, since a reopen pulls
+    /// at most 64 MiB inside Cursor's window; a chat over 64 MiB needs it. A
+    /// reopen takes that VM only with reuse on and no pin to another.
+    #[test]
+    fn session_stage_help_says_what_warm_does() {
+        let stage = long_help("session", "stage");
+        let want = "Then start or resume the VM of the chat's workspace now (ai-env vm warm of the cwd the chat began in, as its transcript records it, or as a remote chat's row does; it must lie in a git repository under bridge.toml's roots) and restore the chat from S3 into that VM, whatever its size: a reopen there keeps it, where a reopen pulls at most 64 MiB inside Cursor's window; a reopen takes that VM only with [vm].reuse_per_workspace on and no AI_ENV_BRIDGE_VM pin to another VM";
+        assert!(stage.contains(want) && stage.contains("a chat over 64 MiB needs this, with --warm, before it reopens remote"), "{stage}");
+    }
+
+    /// `vm terminate --help` and `vm gc --help` say whose chats are synced
+    /// first (S9): a running VM's; a suspended one is never woken, its
+    /// `/suspend` having pushed the tails once.
+    #[test]
+    fn vm_terminate_and_gc_helps_say_a_suspended_vm_is_never_woken() {
+        let terminate = long_help("vm", "terminate");
+        assert!(terminate.contains("the remote chats a running one holds are synced to S3 first (a suspended one is never woken: its /suspend pushed their tails once) (S9)"), "{terminate}");
+        let gc = long_help("vm", "gc");
+        assert!(gc.contains("the remote chats each running one holds synced to S3 first (S9)"), "{gc}");
     }
 
     /// Without the shim feature there is no `shim-io` (the bridge-only build).
@@ -1421,20 +1592,47 @@ mod shim_io_tests {
             &["codeout", "--path", "/Users/mike/w", "--wip", "--max-bytes", "1024"],
             &["snapshot", "--path", "/Users/mike/w"],
             &["transcript-stat", "--projects", "/p", "--rel", "s/u.jsonl"],
-            &["transcript-put", "--projects", "/p", "--rel", "s/u.jsonl", "--len", "9"],
             &["settings", "--path", "/Users/mike/w", "--git", "/usr/bin/git", "--fs-root", "/tmp/vm"],
+            // S9 (plans/s9-contracts.md §3.5).
+            &["transcript-stat", "--projects", "/p", "--rel", "s/u.jsonl", "--from", "9", "--fp", "ab", "--subtree"],
+            &["transcript-read", "--projects", "/p", "--rel", "s/u.jsonl", "--from", "0", "--len", "9"],
+            &["transcript-write", "--projects", "/p", "--rel", "s/u.jsonl", "--len", "9", "--sha256", "ab"],
+            &["transcript-view", "--projects", "/p", "--rel", "s/u.jsonl", "--n", "10"],
+            &["git-cgi", "--path", "/Users/mike/w", "--method", "GET", "--path-info", "/info/refs", "--query", "service=git-upload-pack", "--remote-addr", "10.0.0.1"],
+            &[
+                "git-cgi",
+                "--path",
+                "/Users/mike/w",
+                "--method",
+                "POST",
+                "--path-info",
+                "/git-upload-pack",
+                "--content-type",
+                "application/x-git-upload-pack-request",
+                "--content-length",
+                "9",
+                "--git-protocol",
+                "version=2",
+                "--remote-addr",
+                "10.0.0.1",
+            ],
         ] {
             let parsed = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
             let Cmd::ShimIo(io) = &parsed.cmd else { panic!("{args:?}") };
             let op = io.op.name();
             assert_eq!(args.iter().find(|a| crate::shim::wshelper::OPS.contains(*a)), Some(&op), "{args:?}");
         }
-        // Refused by clap: a mode it does not know, both or neither of --branch and --detached, a missing length.
+        // Refused by clap: a mode it does not know, both or neither of --branch and --detached; S9's method, a
+        // fingerprint without its offset, a missing length; S8's transcript-put, gone at the S3 cut-over.
         for args in [
             &["seed-apply", "--path", "/w", "--mode", "merge", "--branch", "main", "--len", "1"][..],
             &["seed-apply", "--path", "/w", "--mode", "clone", "--branch", "main", "--detached", "--len", "1"],
             &["seed-apply", "--path", "/w", "--mode", "clone", "--len", "1"],
-            &["transcript-put", "--projects", "/p", "--rel", "s/u.jsonl"],
+            &["git-cgi", "--path", "/Users/mike/w", "--method", "PUT", "--path-info", "/info/refs", "--remote-addr", "10.0.0.1"],
+            &["git-cgi", "--path", "/Users/mike/w", "--method", "GET", "--path-info", "/HEAD", "--remote-addr", "10.0.0.1"],
+            &["transcript-stat", "--projects", "/p", "--rel", "s/u.jsonl", "--fp", "ab"],
+            &["transcript-read", "--projects", "/p", "--rel", "s/u.jsonl", "--from", "0"],
+            &["transcript-put", "--projects", "/p", "--rel", "s/u.jsonl", "--len", "9"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }

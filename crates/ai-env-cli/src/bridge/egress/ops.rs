@@ -158,6 +158,35 @@ pub fn vpc_endpoints(vpc: &str) -> Result<Value, String> {
     aws_json("ec2", &["describe-vpc-endpoints", "--filters", &format!("Name=vpc-id,Values={vpc}")])
 }
 
+/// S3's eu-central-1 endpoint, pinned on the transcripts bucket's reads as
+/// `awscli::aws_cmd` pins every other service's (`awscli::endpoint` names
+/// no `s3api`, so these calls are built here).
+pub const S3_URL: &str = "https://s3.eu-central-1.amazonaws.com";
+
+/// `aws s3api <args…> --region eu-central-1 --endpoint-url` [`S3_URL`]
+/// `--output json` as the operator, parsed (an empty answer is `null`); an
+/// `Err` is the aws error's first line, naming the operation.
+fn s3api(args: &[&str]) -> Result<Value, String> {
+    let what = format!("aws s3api {}", args.first().copied().unwrap_or(""));
+    let mut all = vec!["s3api"];
+    all.extend_from_slice(args);
+    all.extend_from_slice(&["--region", crate::bridge::config::REGION, "--endpoint-url", S3_URL, "--output", "json"]);
+    let out = crate::bridge::awscli::operator_capture(&all, crate::bridge::awscli::CALL_TIMEOUT).map_err(|e| format!("{what}: {e}"))?;
+    if out.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&out).map_err(|e| format!("{what}: unexpected output: {e}"))
+}
+
+/// The transcripts bucket's settings `egress status` judges (S9): one read
+/// each of its versioning, default encryption, ownership controls, public
+/// access block and bucket policy, every one with `--expected-bucket-owner
+/// owner` (a bucket of that name in another account answers 403). Bucket
+/// reads only: ai-env-ops reads no object.
+pub fn bucket_reads(bucket: &str, owner: &str) -> [Result<Value, String>; 5] {
+    ["get-bucket-versioning", "get-bucket-encryption", "get-bucket-ownership-controls", "get-public-access-block", "get-bucket-policy"].map(|op| s3api(&[op, "--bucket", bucket, "--expected-bucket-owner", owner]))
+}
+
 /// Every peering connection of the account in the region (the caller keeps
 /// those with the VPC on either side: one call instead of a requester and
 /// an accepter query).

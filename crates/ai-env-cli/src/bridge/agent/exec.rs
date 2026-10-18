@@ -1557,8 +1557,10 @@ pub async fn smoke_credential<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: 
         let prepared = super::credential::prepare(ctx, api, ep, row, vm, &plan, supply).await?;
         let env = agent_env(ctx, api, ep, row, Some(vm))?;
         let spec = SpawnSpec { argv: argv.clone(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None };
+        // What the session did with the token, read once it ran: the source the line names (S9).
+        let report = prepared.delivery.report();
         let cap = capture(&env, spec, Some(prepared.delivery)).await?;
-        Ok::<_, CliError>((cap, prepared.source, plan.tag))
+        Ok::<_, CliError>((cap, delivered_source(prepared.source, &report), plan.tag))
     }
     .await;
     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1589,6 +1591,45 @@ pub async fn smoke_credential<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: 
             let line = format!("exec {shown} (credential): {e}");
             SmokeCred { ok: false, problem: Some(line.clone()), line, ms, is_error: None, source: "none" }
         }
+    }
+}
+
+/// Where the token the smoke's claude used came from, as the delivery's
+/// outcome says (S9; S8's `s8-w3-x2.md` open point 1): `cached` when the
+/// VM's cache held the seal and the session sent nothing (S8's census word
+/// for a remote session, `credential::CACHED`), else what `prepare` decided
+/// (`combined` or `setup-token`, unsealed and sent; `cached` when it counted
+/// on the VM's copy from the start). The line printed `combined` for a token
+/// that never went.
+fn delivered_source(prepared: &'static str, report: &crate::bridge::agent::DeliveryReport) -> &'static str {
+    if report.held_by_vm() {
+        super::credential::CACHED
+    } else {
+        prepared
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod credential_word_tests {
+    use super::*;
+    use crate::bridge::agent::DeliveryReport;
+
+    /// S9: the smoke's `(credential: …)` is the delivery's outcome: a token
+    /// unsealed (`combined`, `setup-token`) that the VM's cache made needless
+    /// went nowhere, so the line says `cached`; one that went, or a cache hit
+    /// after which the value was sent all the same, keeps its source.
+    #[test]
+    fn the_smokes_credential_word_is_what_the_session_did() {
+        let report = DeliveryReport::default();
+        assert_eq!(delivered_source("combined", &report), "combined", "nothing reported yet: the source");
+        report.note_held();
+        assert_eq!((delivered_source("combined", &report), delivered_source("setup-token", &report)), ("cached", "cached"));
+        let sent = DeliveryReport::default();
+        sent.note_sent();
+        assert_eq!(delivered_source("setup-token", &sent), "setup-token");
+        report.note_sent();
+        assert_eq!(delivered_source("combined", &report), "combined", "held, then sent: it went");
     }
 }
 

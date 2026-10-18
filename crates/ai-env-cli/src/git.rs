@@ -76,13 +76,112 @@ pub fn inspect(file: &Path) -> Option<GitContext> {
 
 /// Where git will actually look for the pre-commit hook (honors core.hooksPath).
 fn hooks_pre_commit_path(repo_root: &Path) -> PathBuf {
-    if let Some(out) = git(repo_root, &["rev-parse", "--git-path", "hooks/pre-commit"]) {
+    hook_path(repo_root, "pre-commit")
+}
+
+/// Where git runs the hook `name` of the repository at `repo_root` (honours
+/// `core.hooksPath`): `rev-parse --git-path hooks/<name>` through this
+/// module's plain `git` (never `gitrun::GitRun`, whose `core.hooksPath=/dev/null`
+/// would answer `/dev/null/<name>`), relative to `repo_root`; when git cannot
+/// answer, `<repo_root>/.git/hooks/<name>`. S9's pre-push hook
+/// (`bridge::review`) and the pre-commit guard share it.
+#[must_use]
+pub fn hook_path(repo_root: &Path, name: &str) -> PathBuf {
+    if let Some(out) = git(repo_root, &["rev-parse", "--git-path", &format!("hooks/{name}")]) {
         if out.status.success() {
             let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
             return if p.is_absolute() { p } else { repo_root.join(p) };
         }
     }
-    repo_root.join(".git/hooks/pre-commit")
+    repo_root.join(".git/hooks").join(name)
+}
+
+/// How much of a hook file [`install_hook`] reads for its mark (as
+/// `bridge::review::hook_state` does).
+const HOOK_HEAD_READ: u64 = 4096;
+
+/// What [`install_hook`] found at a hook's path, and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookInstall {
+    /// Nothing was there: the body is written (0755).
+    Installed,
+    /// A hook carrying the mark was there: kept as it is, or, when asked to
+    /// replace it and its text was not the body or its mode not 0755,
+    /// rewritten.
+    Marked { rewritten: bool },
+    /// Something else is there (a file without the mark, a directory, a
+    /// link to nothing): never written over.
+    Foreign,
+}
+
+/// Install the hook `body` at `path` (where git runs it: [`hook_path`])
+/// unless another hook is there (S9 factors it out of [`apply_fix`]'s
+/// pre-commit guard for the pre-push review hook, `ai-env box
+/// hook-install`). Nothing at `path`: `body` is written. A regular file
+/// (a link to one counts) carrying `mark` on a line of its own in its
+/// first 4 KiB is ours: kept, or with `replace` rewritten when its text is
+/// not `body` or its mode is not 0755 (git skips a hook it cannot execute,
+/// whatever its bytes). Anything else is foreign and never touched: it may
+/// end with `exit`, use another interpreter, or otherwise never reach
+/// appended code.
+/// A write makes the hooks directory, then renames a 0755 temporary file
+/// beside `path` over it: a hook is never seen half written, and a link at
+/// `path` is replaced, never written through.
+pub fn install_hook(path: &Path, body: &str, mark: &str, replace: bool) -> std::io::Result<HookInstall> {
+    use std::io::Read as _;
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_hook(path, body)?;
+            return Ok(HookInstall::Installed);
+        }
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return Ok(HookInstall::Foreign);
+    }
+    let mut head = Vec::new();
+    std::fs::File::open(path)?.take(HOOK_HEAD_READ).read_to_end(&mut head)?;
+    if !String::from_utf8_lossy(&head).lines().any(|l| l.trim_end() == mark) {
+        return Ok(HookInstall::Foreign);
+    }
+    if !replace || (std::fs::read(path)? == body.as_bytes() && is_mode_0755(path)?) {
+        return Ok(HookInstall::Marked { rewritten: false });
+    }
+    write_hook(path, body)?;
+    Ok(HookInstall::Marked { rewritten: true })
+}
+
+/// Whether the file at `path` (through a link) has the mode a hook is
+/// written with, 0755.
+pub fn is_mode_0755(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o777 == 0o755)
+}
+
+/// `body` at `path`, 0755, through a temporary file in its directory
+/// (made first) renamed over it; the temporary file goes on any failure.
+fn write_hook(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.ai-env-{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o755).open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        // The mode the umask left aside: a hook git cannot execute never runs.
+        f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Append the `!NAME` negation and install the pre-commit hook. Only called
@@ -182,4 +281,95 @@ fn ask_yes_no(prompt: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const MARK: &str = "# ai-env test hook";
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The pre-commit guard `apply_fix` installs stays byte for byte what it
+    /// was before S9 factored `install_hook` out beside it.
+    #[test]
+    fn the_pre_commit_guard_is_byte_identical() {
+        use sha2::{Digest, Sha256};
+        assert!(HOOK_BODY.starts_with("#!/bin/sh\n# ai-env pre-commit guard\n") && HOOK_BODY.ends_with("exit $?\n"));
+        assert_eq!(hex::encode(Sha256::digest(HOOK_BODY.as_bytes())), "1b0a9f4a5d7795336d8e5ac28c0fb41ef8b6d66c2e7b15ce5f666b07b72dd32c");
+    }
+
+    /// Nothing there: written, 0755, through no temporary file left behind;
+    /// ours (the mark on a line of its own): kept, or rewritten when asked
+    /// and different or no longer 0755; anything else, never touched: a
+    /// file without the mark, the mark past the first 4 KiB, a directory, a
+    /// dangling link.
+    #[test]
+    fn install_hook_writes_only_where_nothing_or_its_own_hook_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = tmp.path().join("hooks").join("pre-push");
+        let body = format!("#!/bin/sh\n{MARK}\nexit 0\n");
+        assert_eq!(install_hook(&hook, &body, MARK, true).unwrap(), HookInstall::Installed);
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), body);
+        assert_eq!(mode(&hook), 0o755);
+        assert_eq!(std::fs::read_dir(hook.parent().unwrap()).unwrap().count(), 1, "no temporary file is left");
+        assert_eq!(install_hook(&hook, &body, MARK, true).unwrap(), HookInstall::Marked { rewritten: false });
+        let newer = format!("#!/bin/sh\n{MARK}\nexit 1\n");
+        assert_eq!(install_hook(&hook, &newer, MARK, false).unwrap(), HookInstall::Marked { rewritten: false });
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), body, "kept unless asked to replace");
+        assert_eq!(install_hook(&hook, &newer, MARK, true).unwrap(), HookInstall::Marked { rewritten: true });
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), newer);
+        // The body, but no longer executable: git would skip it, so it is rewritten 0755.
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_mode_0755(&hook).unwrap());
+        assert_eq!(install_hook(&hook, &newer, MARK, false).unwrap(), HookInstall::Marked { rewritten: false }, "kept unless asked to replace");
+        assert_eq!(install_hook(&hook, &newer, MARK, true).unwrap(), HookInstall::Marked { rewritten: true });
+        assert_eq!((std::fs::read_to_string(&hook).unwrap(), mode(&hook)), (newer.clone(), 0o755));
+        assert_eq!(install_hook(&hook, &newer, MARK, true).unwrap(), HookInstall::Marked { rewritten: false });
+        for foreign in ["#!/bin/sh\n# someone's own hook\nexit 0\n".to_string(), format!("#!/bin/sh\n# {MARK} inside a line\n"), format!("#!/bin/sh\n{}\n{MARK}\n", "#".repeat(5000))] {
+            std::fs::write(&hook, &foreign).unwrap();
+            assert_eq!(install_hook(&hook, &body, MARK, true).unwrap(), HookInstall::Foreign);
+            assert_eq!(std::fs::read_to_string(&hook).unwrap(), foreign);
+        }
+        std::fs::remove_file(&hook).unwrap();
+        std::fs::create_dir(&hook).unwrap();
+        assert_eq!(install_hook(&hook, &body, MARK, true).unwrap(), HookInstall::Foreign);
+        std::fs::remove_dir(&hook).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &hook).unwrap();
+        assert_eq!(install_hook(&hook, &body, MARK, true).unwrap(), HookInstall::Foreign);
+        assert!(!tmp.path().join("nowhere").exists(), "never written through a link");
+    }
+
+    /// A link to a hook of ours is replaced by the new body; the file it
+    /// pointed at stays as it was.
+    #[test]
+    fn install_hook_replaces_a_link_never_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, hook) = (tmp.path().join("shared-hook"), tmp.path().join("pre-push"));
+        let old = format!("#!/bin/sh\n{MARK}\nexit 0\n");
+        std::fs::write(&target, &old).unwrap();
+        std::os::unix::fs::symlink(&target, &hook).unwrap();
+        let body = format!("#!/bin/sh\n{MARK}\nexit 1\n");
+        assert_eq!(install_hook(&hook, &body, MARK, true).unwrap(), HookInstall::Marked { rewritten: true });
+        assert!(!std::fs::symlink_metadata(&hook).unwrap().file_type().is_symlink());
+        assert_eq!((std::fs::read_to_string(&hook).unwrap(), std::fs::read_to_string(&target).unwrap()), (body, old));
+    }
+
+    /// `hook_path` answers where git runs a hook: `.git/hooks`, or
+    /// `core.hooksPath` (relative to the repository's top level).
+    #[test]
+    fn hook_path_follows_core_hooks_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        let git = |args: &[&str]| assert!(Command::new("git").args(args).current_dir(&repo).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap().status.success());
+        git(&["init", "-q"]);
+        git(&["config", "core.hooksPath", ".git/hooks"]);
+        assert_eq!(hook_path(&repo, "pre-push"), repo.join(".git/hooks/pre-push"));
+        git(&["config", "core.hooksPath", "githooks"]);
+        assert_eq!(hook_path(&repo, "pre-push"), repo.join("githooks/pre-push"));
+    }
 }

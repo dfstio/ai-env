@@ -37,8 +37,10 @@
 //! start returns its link at once and is pending until its first event,
 //! `Started` or `SpawnFailed` (never `Exit(None)`, so the [`EndReason`]s keep
 //! their meaning): a pending start is a live child, so the ladders run, the
-//! host is still read (up to `PENDING_IN_LINES` lines or `PENDING_IN_BYTES`
-//! queued), and a host EOF or a signal cancels it at once. A remote session
+//! host is still read (until the pump's own queue holds `PENDING_IN_LINES`
+//! lines or `PENDING_IN_BYTES`; the link's channel holds its [`CHANNEL_CAP`]
+//! lines more, of any size, as in every state: S8's TIMING-4, as designed),
+//! and a host EOF or a signal cancels it at once. A remote session
 //! fails closed: whatever ends it before or after the pump started is an
 //! exit with one `ai-env-claude:` line, printed last through `bridge::voice`,
 //! never a local run.
@@ -257,7 +259,8 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildPlan {
     pub program: PathBuf,
-    /// `argv::sanitise` with nothing stripped: the host's argv + one `--session-mirror`.
+    /// `argv::sanitise` with nothing stripped: the host's argv + one `--session-mirror` (a
+    /// remote session's VM argv is the pipeline's, without it: S9 keeps the transcript in S3).
     pub argv: Vec<String>,
     pub env_set: Vec<(String, OsString)>,
     pub env_remove: Vec<String>,
@@ -293,15 +296,15 @@ pub fn route_label(route: &Route) -> String {
 /// own environment in production). Pure apart from `canonicalize` inside the
 /// slug and mirror decisions; the scratch dir is only named here. A remote
 /// session's (S8) child is the CLI in the VM, run by the agent whose HOME is
-/// the Mac's (Design A): its config dir is the Mac HOME's `.claude`, which
-/// the mirror frames name and the writer mirrors into the Mac's projects dir
-/// (`mirror::decide` with a child that is not local), confined to the
-/// session's own project, the slug (`MirrorCfg::confined_to`); no scratch dir, no
-/// environment of the wrapper's (the pipeline builds the VM's), and the slug
-/// is the cwd's (no `CLAUDE_CODE_PROJECT_DIR_NAME`: the shim sets the VM's
+/// the Mac's (Design A): its config dir is the Mac HOME's `.claude`; it gets
+/// no mirror writer (S9 D9: its transcript is kept in S3, never on this
+/// Mac, `MirrorCfg::kept_in_s3`: a frame it prints anyway is dropped and
+/// counted, [`MIRROR_DROPPED_PART`]); no scratch dir, no environment of the
+/// wrapper's (the pipeline builds the VM's), and the slug is the cwd's (no
+/// `CLAUDE_CODE_PROJECT_DIR_NAME`: the shim sets the VM's
 /// `CLAUDE_CONFIG_DIR`, the wrapper forwards no override).
 pub fn child_plan(sess: &Session, env: &dyn Fn(&str) -> Option<OsString>, fresh_id: &mut dyn FnMut() -> String) -> Result<ChildPlan, String> {
-    let argv = argv::sanitise(&sess.args, SanitiseOpts { strip_add_dir: false, strip_debug: false }).map_err(|e| e.to_string())?;
+    let argv = argv::sanitise(&sess.args, SanitiseOpts { strip_add_dir: false, strip_debug: false, mirror: true }).map_err(|e| e.to_string())?;
     let nonempty = |k: &str| env(k).filter(|v| !v.is_empty());
     let mac_config_dir = match nonempty("CLAUDE_CONFIG_DIR") {
         Some(d) => PathBuf::from(d),
@@ -325,8 +328,8 @@ pub fn child_plan(sess: &Session, env: &dyn Fn(&str) -> Option<OsString>, fresh_
     let slug = child_slug(sess.cwd.as_deref(), config_dir_set, override_name.as_deref());
     let mut mirror = mirror::decide(matches!(sess.route, Route::Remote(_)), sess.mode != Mode::Remote, &child_config_dir, &mac_config_dir, mirror_root.as_deref());
     if sess.mode == Mode::Remote {
-        // The VM's frames name what the VM chose: the Mac's other projects are never theirs.
-        mirror = mirror.confined_to(slug.as_deref());
+        // A remote chat's transcript is kept in S3 (S9): none of its frames is written here.
+        mirror = mirror.kept_in_s3();
     }
     Ok(ChildPlan { program: sess.real_binary.clone(), argv, env_set, env_remove, child_config_dir, scratch, resume, slug, mirror })
 }
@@ -384,6 +387,9 @@ pub struct Outcome {
     pub respawns: u32,
     pub mirror_frames: u64,
     pub mirror_rejected: u64,
+    /// S9: a remote session's `transcript_mirror` frames dropped, its transcript
+    /// being kept in S3 ([`MIRROR_DROPPED_PART`]).
+    pub mirror_dropped: u64,
     pub dropped_lines: u64,
     pub oauth_answered: u64,
     pub init_latency_ms: Option<u64>,
@@ -418,9 +424,16 @@ pub struct Outcome {
 /// (`init_id_refused:<n>`, written only when `n` > 0; S8 W1's fix).
 pub const INIT_ID_REFUSED_PART: &str = "init_id_refused";
 
+/// The end row's part counting a remote session's `transcript_mirror`
+/// frames dropped, its transcript being kept in S3, never on this Mac
+/// (`mirror_dropped:<n>` right after `mirror:<frames>/<rejected>`, written
+/// only when `n` > 0; S9 D9).
+pub const MIRROR_DROPPED_PART: &str = "mirror_dropped";
+
 /// The census end row: a clone of `start` with `end`, `exit` and the note
 /// extended by `end:<reason>; child_pid:<n>; respawns:<n>; mirror:<frames>/<rejected>;
-/// dropped:<n>; oauth_refresh_answered:<n>` (+ `init_ms`, `eof_to_sigterm_ms` when known;
+/// dropped:<n>; oauth_refresh_answered:<n>` (S9's `mirror_dropped:<n>` right after the
+/// mirror part when n > 0; then `init_ms`, `eof_to_sigterm_ms` when known;
 /// `credential:<fd|env|inherited|none>` for `local-scratch`, a remote session's
 /// `credential:<combined|setup-token|cached>`; `synthetic_oauth:<class>` with the lab
 /// knob; `init_id_refused:<n>` when n > 0; `step:<step>` for a failed remote start; a remote link's parts
@@ -436,9 +449,12 @@ pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
         format!("child_pid:{}", out.child_pid.map_or_else(|| "-".to_string(), |p| p.to_string())),
         format!("respawns:{}", out.respawns),
         format!("mirror:{}/{}", out.mirror_frames, out.mirror_rejected),
-        format!("dropped:{}", out.dropped_lines),
-        format!("oauth_refresh_answered:{}", out.oauth_answered),
     ];
+    if out.mirror_dropped > 0 {
+        parts.push(format!("{MIRROR_DROPPED_PART}:{}", out.mirror_dropped));
+    }
+    parts.push(format!("dropped:{}", out.dropped_lines));
+    parts.push(format!("oauth_refresh_answered:{}", out.oauth_answered));
     if let Some(ms) = out.init_latency_ms {
         parts.push(format!("init_ms:{ms}"));
     }
@@ -481,6 +497,93 @@ pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
         _ => tail,
     });
     row
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod mirror_cut_tests {
+    use super::*;
+
+    const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+    fn start_row() -> CensusRow {
+        CensusRow {
+            v: 1,
+            ts: "2026-10-18T10:00:00Z".into(),
+            start: 1_000,
+            pid: 42,
+            ppid: 1,
+            ext: Some("2.1.302".into()),
+            route: "remote".into(),
+            reason: "session".into(),
+            argv: vec!["w".into(), "b".into(), "--output-format".into(), "stream-json".into()],
+            cwd: Some("/x".into()),
+            env_names: vec!["HOME".into()],
+            env_selected: std::collections::BTreeMap::new(),
+            note: Some("mode:remote".into()),
+            end: None,
+            exit: None,
+        }
+    }
+
+    /// A remote session in `dir`, and its child plan with `dir` as HOME.
+    fn remote(dir: &Path) -> (Session, ChildPlan) {
+        let args: Vec<String> = ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json"].iter().map(|s| (*s).to_string()).collect();
+        let route = argv::classify(&args);
+        let Route::Remote(session) = route.clone() else { panic!("not a session: {route:?}") };
+        let sess = Session { real_binary: PathBuf::from("/bin/claude"), args, route, session, cwd: Some(dir.to_path_buf()), paths: Paths::from_root_and_env(dir.join("bridge"), None), cfg: None, mode: Mode::Remote, start_row: start_row() };
+        let home = dir.as_os_str().to_owned();
+        let plan = child_plan(&sess, &move |k: &str| (k == "HOME").then(|| home.clone()), &mut || "x".to_string()).unwrap();
+        (sess, plan)
+    }
+
+    /// A `transcript_mirror` frame of the session's own project.
+    fn frame(dir: &Path) -> String {
+        let file = dir.join(".claude/projects").join(slug::project_dir_name(dir).unwrap()).join(format!("{SID}.jsonl"));
+        format!(r#"{{"type":"transcript_mirror","filePath":"{}","entries":[{{"type":"user","message":"the VM's entry"}}]}}"#, file.display())
+    }
+
+    /// A remote session's plan has no writer (S9 D9: its transcript is kept
+    /// in S3), whatever the project: none confined to its own either.
+    #[test]
+    fn a_remote_plan_never_mirrors() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, plan) = remote(d.path());
+        assert!(!plan.mirror.enabled && plan.mirror.project.is_none() && plan.mirror.reason.contains("kept in S3"), "{:?}", plan.mirror);
+    }
+
+    /// A remote session drops each mirror frame, its own project's too,
+    /// and counts it: nothing is created on this Mac, and the end row says
+    /// `mirror_dropped:<n>` right after `mirror:0/0`, only when n is above 0.
+    #[test]
+    fn a_remote_frame_is_dropped_and_counted_without_a_writer() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(d.path()).unwrap();
+        let (sess, plan) = remote(&dir);
+        let mut pump = Pump::new(sess, plan.clone(), None, Box::new(LocalLinks::new(plan)));
+        let note = end_row(&start_row(), &pump.snapshot_outcome(), 9_000).note.unwrap();
+        assert!(note.contains("; mirror:0/0; dropped:0; ") && !note.contains(MIRROR_DROPPED_PART), "only when n > 0: {note}");
+        for _ in 0..2 {
+            pump.on_child_line(Bytes::from(frame(&dir)));
+        }
+        assert_eq!(pump.out.mirror_dropped, 2);
+        assert!(!dir.join(".claude").exists(), "nothing written on this Mac");
+        let note = end_row(&start_row(), &pump.snapshot_outcome(), 9_000).note.unwrap();
+        assert!(note.contains("; respawns:0; mirror:0/0; mirror_dropped:2; dropped:0; "), "{note}");
+    }
+
+    /// S9's row fields (§5.7): kept in S3, begun in the VM when no manifest
+    /// says otherwise, its view's rel.
+    #[test]
+    fn the_s3_fields_of_a_remote_row() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let mut row = SessionRow { session_id: SID.into(), mode: "remote".into(), ..SessionRow::default() };
+        Pump::s3_fields(&mut row, &paths, Some("-Users-mike-w"));
+        assert_eq!((row.transcript_home.as_deref(), row.origin.as_deref(), row.view.clone()), (Some("s3"), Some("vm"), Some(format!("-Users-mike-w/{SID}.jsonl"))));
+        Pump::s3_fields(&mut row, &paths, None);
+        assert_eq!(row.view, None, "no slug, no view");
+    }
 }
 
 // ---- the child link ----------------------------------------------------------------------
@@ -1619,6 +1722,12 @@ impl Pump {
         let frame = claude::classify_child(&line);
         match &frame {
             ChildFrame::Mirror { file_path, entries } => {
+                // S9 (D9): a remote session without a writer (its transcript kept in S3) drops each frame and counts it.
+                if self.sess.mode == Mode::Remote && !self.mirror.cfg().enabled {
+                    self.out.mirror_dropped += 1;
+                    tracing::debug!("mirror frame of a remote session dropped: its transcript is kept in S3");
+                    return;
+                }
                 match self.mirror.append(file_path.as_deref(), entries) {
                     Ok(bytes) => tracing::debug!(bytes, "mirror frame appended"),
                     Err(e) => tracing::debug!(reject = ?e, "mirror frame not appended"),
@@ -1770,7 +1879,8 @@ impl Pump {
 
     /// The resume miss's one retry is possible: a `--resume` of
     /// `local-scratch` (the scratch dir re-seeded) or of a remote session
-    /// (the transcript uploaded to the VM), generation 1, no init forwarded.
+    /// (the transcript restored into the VM from S3), generation 1, no init
+    /// forwarded.
     fn retry_possible(&self) -> bool {
         matches!(self.sess.mode, Mode::LocalScratch | Mode::Remote) && self.gen == 1 && self.retries == 0 && self.plan.resume.is_some() && self.state.inits_forwarded() == 0
     }
@@ -1861,7 +1971,7 @@ impl Pump {
     /// A remote session's fields of the row (plan §2.4's reserved ones),
     /// from its link: the VM, the spawn, the last stdout seq handed to the
     /// pump, the seeded head, the newest WIP ref fetched, one `vms` entry per
-    /// generation.
+    /// generation; S9's ([`Pump::s3_fields`]).
     fn fill_remote(&mut self) {
         let Some(row) = self.row.as_mut() else { return };
         let Some(s) = self.links.snapshot() else { return };
@@ -1871,6 +1981,23 @@ impl Pump {
         row.seeded_head = s.seeded_head;
         row.last_wip_fetch = s.last_wip_fetch;
         row.vms = self.vms.iter().filter_map(|v| toml::Value::try_from(v).ok()).collect();
+        Self::s3_fields(row, &self.sess.paths, self.plan.slug.as_deref());
+    }
+
+    /// S9's fields of a remote session's row (§5.7): its transcript is kept
+    /// in S3 (`transcript_home`); where the chat began (`origin`:
+    /// `s3::manifest::origin_of`'s `vm` or `mac`, and `vm` for a chat no
+    /// manifest names yet, as `origin_of` reads a row kept in S3; its
+    /// `s8_mirror` is never written); the view's rel under the Mac's projects
+    /// directory (`view`).
+    fn s3_fields(row: &mut SessionRow, paths: &Paths, slug: Option<&str>) {
+        row.transcript_home = Some("s3".to_string());
+        match crate::bridge::s3::manifest::origin_of(paths, &row.session_id) {
+            Some(origin @ ("vm" | "mac")) => row.origin = Some(origin.to_string()),
+            Some(_) => {}
+            None => row.origin = Some("vm".to_string()),
+        }
+        row.view = slug.map(|s| format!("{s}/{}.jsonl", row.session_id));
     }
 
     fn write_row(&self) {
@@ -1955,21 +2082,22 @@ impl Pump {
     /// The seed retry: re-seed the scratch dir from the Mac's transcript and
     /// spawn generation 2 with the host state replayed. `false` when there
     /// was nothing to seed from (the miss then propagates). A remote session
-    /// seeds nothing here: generation 2's pipeline uploads the Mac's
-    /// transcript to the VM first (`StartWhy::ResumeRetry`, §8) and respawns
+    /// seeds nothing here: generation 2's pipeline restores the transcript
+    /// from S3 into the VM first (`StartWhy::ResumeRetry`, S9) and respawns
     /// on the same VM; its replay deadline starts at its `Started`. When
-    /// generation 1's upload found no Mac copy, there is nothing to upload
-    /// either: the miss propagates, as a local one with no source does.
+    /// generation 1's restore found nothing to restore (no manifest, no Mac
+    /// copy), there is nothing for the retry either: the miss propagates, as
+    /// a local one with no source does.
     fn respawn_after_miss(&mut self) -> bool {
         self.retries += 1;
         let Some(resume) = self.plan.resume.clone() else { return false };
         if self.kind == LinkKind::Remote {
-            if self.links.snapshot().and_then(|s| s.transcript) == Some(TranscriptOutcome::NoMacCopy.word()) {
-                tracing::warn!("resume miss for {resume}: no local transcript to upload");
-                self.audit("resume_seed_miss", &[("session_id", resume.clone()), ("reason", "no local transcript".to_string())]);
+            if self.links.snapshot().and_then(|s| s.transcript) == Some(TranscriptOutcome::NothingToRestore.word()) {
+                tracing::warn!("resume miss for {resume}: no transcript in S3 or on this Mac to restore");
+                self.audit("resume_seed_miss", &[("session_id", resume.clone()), ("reason", "nothing to restore".to_string())]);
                 return false;
             }
-            self.audit("resume_seed_retry", &[("session_id", resume.clone()), ("source", "put_transcript".to_string())]);
+            self.audit("resume_seed_retry", &[("session_id", resume.clone()), ("source", "s3".to_string())]);
             return self.respawn_and_replay(resume);
         }
         let detail: Vec<(&str, String)> = match seed_from_mac(&self.sess, &self.plan, &resume, true) {
@@ -2213,6 +2341,8 @@ impl Pump {
             // lines before it has answered initialize); an EOF is acted on at once. While
             // finishing, host lines are read only to notice an EOF. A pending remote start
             // takes no input yet: the host is still read up to its caps, so its EOF is seen.
+            // The caps count `in_q` alone (the line that crosses the bytes' cap stays whole),
+            // beside the link's CHANNEL_CAP slots, which the queue fills first (TIMING-4).
             let starting_room = self.starting && self.in_q.len() < PENDING_IN_LINES && self.in_q.bytes < PENDING_IN_BYTES;
             let read_host = self.host_open && (self.finish.is_some() || (self.child_input.is_some() && (self.in_q.len() < 2 || starting_room)));
             let write_out = !self.out_q.is_empty() && !self.host_gone;
@@ -2932,6 +3062,41 @@ fn record_start_row(sess: &Session) {
     }
 }
 
+/// What a remote session's close leaves once its waits are over (S9): the
+/// registry row's `last_wip_fetch` takes a fetch that ended inside them
+/// ([`wip_fetched_at_the_close`]), and this process's scratch under
+/// `state/tmp/` goes (a fetch given up at `codeout::CLOSE_WAIT` leaves its
+/// scratch repository: `snapshot::remove_own_scratch`). The census end row
+/// and `session_remote_end` are written before the waits (plan §11's order),
+/// so their `fetch:` counts never include that fetch; its `codeout_fetch`
+/// row and the workspace row do.
+fn after_close(pump: &mut Pump) {
+    if let Some(wip) = wip_fetched_at_the_close(&pump.sess, pump.row.as_ref()) {
+        if let Some(row) = pump.row.as_mut() {
+            row.last_wip_fetch = Some(wip);
+        }
+        pump.write_row();
+    }
+    crate::bridge::workspace::snapshot::remove_own_scratch(&pump.sess.paths);
+}
+
+/// The newest `refs/remotes/box/wip/*` a code-out from the session's VM
+/// promoted since the session started, as the workspace row of its cwd
+/// records it (`codeout::record_fetch`: the last fetch's VM, time and
+/// newest snapshot), when it is newer than the registry row's
+/// `last_wip_fetch` (snapshots are named by time: the greatest is the
+/// newest). `None` otherwise, and when either row is missing or unreadable.
+fn wip_fetched_at_the_close(sess: &Session, row: Option<&SessionRow>) -> Option<String> {
+    let row = row?;
+    let vm = row.microvm_id.as_deref()?;
+    let cwd = std::fs::canonicalize(sess.cwd.as_ref()?).ok()?;
+    let slug = slug::project_dir_name(&cwd).ok()?;
+    let ws = crate::bridge::workspace::rows::read(&sess.paths, &slug).ok()?.ws.remove(&*cwd.to_string_lossy())?;
+    let since = sess.start_row.start / 1000;
+    let wip = ws.last_wip.filter(|_| ws.last_fetch_vm.as_deref() == Some(vm) && ws.last_fetch_at.is_some_and(|at| at >= since))?;
+    (row.last_wip_fetch.as_deref() < Some(wip.as_str())).then_some(wip)
+}
+
 /// Pipe `sess` through the pump and exit with the child's code. Never returns.
 ///
 /// Order: the wrapper's voice → the runtime (before any Touch ID, so a
@@ -2946,8 +3111,10 @@ fn record_start_row(sess: &Session) {
 /// dir, the child's login ([`scratch_login`]: the sealed token, or one note
 /// line), the pre-spawn seed → the supervisor on a `LocalSet` → mirror
 /// fsync → registry row closed → census end row → the link's close
-/// (remote: within what is left of the hard stop) → the lab message or the
-/// one final line → exit.
+/// (remote: within what is left of the hard stop), then what its waits
+/// left ([`after_close`]: the row's `last_wip_fetch`, this process's
+/// scratch) → the lab message or the one final line → exit (which joins an
+/// unseal's SIGKILL step still running: `age_cmd::join_kills`).
 pub fn run(sess: Session) -> ! {
     // Only the wrapper pipes: its notes go to the log, its one final line to stderr.
     voice::set(voice::Voice::Wrapper);
@@ -3039,6 +3206,7 @@ pub fn run(sess: Session) -> ! {
         local.block_on(&rt, async move {
             let _ = tokio::time::timeout(budget, close).await;
         });
+        after_close(&mut pump);
     }
     if let Some(msg) = pump.lab_message.take() {
         eprintln!("{msg}");
@@ -3116,6 +3284,7 @@ mod tests {
             respawns: 1,
             mirror_frames: 2,
             mirror_rejected: 1,
+            mirror_dropped: 0,
             dropped_lines: 0,
             oauth_answered: 1,
             init_latency_ms: Some(120),
@@ -3267,7 +3436,7 @@ mod tests {
         let mut pump = local_pump(sess, plan, None);
         let events = [
             ChildEvent::Started(RemoteStarted { spawn_id: SpawnId::new_v7(), vm_pid: 42, claude_version: None }),
-            ChildEvent::SpawnFailed(SpawnFailure::from_failure(StartStep::Spawn, &Failure::OldImage { vm: "microvm-1".into() }, None)),
+            ChildEvent::SpawnFailed(SpawnFailure::from_failure(StartStep::Spawn, &Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }, None)),
             ChildEvent::Lost(LinkLoss::from_failure(&Failure::LinkLost { vm: "microvm-1".into() })),
             ChildEvent::Detached,
             ChildEvent::Rejected { how: "text" },
@@ -3975,7 +4144,7 @@ mod tests {
                 (StartStep::SelectVm, Failure::MaxConcurrent { running: 3 }, 9),
                 (StartStep::SelectVm, Failure::Select { code: 8, first_line: "microvm not found".into() }, 8),
                 (StartStep::Workspace, Failure::Finding { finding: "untracked .env: rule env-file-plaintext".into() }, 9),
-                (StartStep::Spawn, Failure::OldImage { vm: "microvm-1".into() }, 7),
+                (StartStep::Spawn, Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }, 7),
                 (StartStep::Deadline, Failure::Deadline { code: 5, step: "touchid" }, 5),
                 (StartStep::Spawn, Failure::Other { code: 1, step: "spawn", first_line: "broken pipe".into() }, 1),
             ];
@@ -4209,7 +4378,7 @@ mod tests {
 
         /// M28, the resume miss on the remote link: generation 1 reports the
         /// CLI's miss and exits 1; generation 2 starts as the retry of that
-        /// session (its pipeline uploads the transcript first), the host's
+        /// session (its pipeline restores the transcript from S3 first), the host's
         /// state is replayed to it, its answer to the replayed `initialize`
         /// reaches the host under the host's id with the wrapper's pid (and
         /// times the session's `init_ms`), and the miss itself never reaches
@@ -4253,7 +4422,7 @@ mod tests {
                 assert!(out.init_latency_ms.is_some(), "the retry's answer, the first the host got, is the session's init_ms");
                 assert!(end_note(&pump).split("; ").any(|p| p.starts_with("init_ms:")), "{}", end_note(&pump));
                 let audit = std::fs::read_to_string(pump.sess.paths.audit()).unwrap();
-                assert!(audit.contains("\"event\":\"resume_seed_retry\"") && audit.contains("\"source\":\"put_transcript\""), "{audit}");
+                assert!(audit.contains("\"event\":\"resume_seed_retry\"") && audit.contains("\"source\":\"s3\""), "{audit}");
             });
         }
 
@@ -4556,13 +4725,14 @@ mod tests {
             });
         }
 
-        /// A remote session mirrors the VM's frames into its own project only
-        /// (its cwd's slug): a frame naming another project of the Mac's (a
-        /// forgery the VM can print) is refused before anything is created
-        /// there, a subagent's `.meta.json` included, and counted
-        /// (`mirror:<appended>/<refused>`); its own frames append.
+        /// A remote session writes none of the VM's frames on this Mac (S9:
+        /// its transcript is kept in S3): one naming its own project and one
+        /// naming another of the Mac's (a forgery the VM can print, a
+        /// subagent's `.meta.json` included) are dropped alike and counted
+        /// (`mirror:0/0`, `mirror_dropped:3`), nothing created under the
+        /// Mac's projects dir; none reaches the host.
         #[test]
-        fn a_remote_sessions_mirror_writes_its_own_project_only() {
+        fn a_remote_sessions_frames_are_dropped_whatever_project_they_name() {
             let d = tempfile::tempdir().unwrap();
             on_local(async {
                 let (pump, hand, host, io) = remote_pump(d.path(), &[]);
@@ -4584,9 +4754,9 @@ mod tests {
                 far.exit(0).await;
                 let (code, mut pump) = ended(task).await;
                 pump.conclude(code);
-                assert!(!projects.join(other).exists(), "nothing was created in another project");
-                assert_eq!(std::fs::read_to_string(projects.join(&slug).join(format!("{SID}.jsonl"))).unwrap(), "{\"type\":\"user\",\"message\":\"the session's own\"}\n");
-                assert!(end_note(&pump).split("; ").any(|p| p == "mirror:1/2"), "{}", end_note(&pump));
+                assert!(!projects.exists(), "nothing was created on this Mac, its own project's frame neither");
+                let note = end_note(&pump);
+                assert!(note.split("; ").any(|p| p == "mirror:0/0") && note.split("; ").any(|p| p == "mirror_dropped:3"), "{note}");
                 assert!(!host.json().iter().any(|v| v["type"] == "transcript_mirror"), "no mirror frame reached the host");
             });
         }
@@ -4770,13 +4940,14 @@ mod tests {
         }
 
         /// A remote session's child plan: the VM's CLI runs with the Mac
-        /// HOME's `.claude` (Design A: the VM path its mirror frames name),
-        /// whose frames the writer mirrors into the Mac's projects dir (the
-        /// child is not local), its own project only; no scratch dir, no environment of the
-        /// wrapper's, the cwd's slug whatever `CLAUDE_CODE_PROJECT_DIR_NAME`
-        /// says, a `--resume` uuid kept; without HOME no plan (fail closed).
+        /// HOME's `.claude` (Design A: the VM path its frames name), whose
+        /// frames no writer mirrors into the Mac's projects dir (S9 D9: the
+        /// transcript is kept in S3), not even its own project's; no scratch
+        /// dir, no environment of the wrapper's, the cwd's slug whatever
+        /// `CLAUDE_CODE_PROJECT_DIR_NAME` says, a `--resume` uuid kept;
+        /// without HOME no plan (fail closed).
         #[test]
-        fn a_remote_child_plan_mirrors_the_vms_frames_and_spawns_nothing_here() {
+        fn a_remote_child_plan_mirrors_nothing_and_spawns_nothing_here() {
             let d = tempfile::tempdir().unwrap();
             let resume = format!("--resume={SID}");
             let sess = remote_session(d.path(), &[&resume]);
@@ -4786,8 +4957,7 @@ mod tests {
             assert_eq!((plan.scratch.as_deref(), plan.resume.as_deref()), (None, Some(SID)));
             assert!(plan.env_set.is_empty() && plan.env_remove.is_empty());
             assert_eq!(plan.slug, slug::project_dir_name(d.path()).ok(), "the cwd's slug, no override");
-            assert!(plan.mirror.enabled, "{}", plan.mirror.reason);
-            assert_eq!(plan.mirror.project, plan.slug, "the writer is confined to the session's project");
+            assert!(!plan.mirror.enabled && plan.mirror.project.is_none() && plan.mirror.reason.contains("kept in S3"), "{}", plan.mirror.reason);
             let projects = d.path().join(".claude").join("projects");
             assert_eq!((&plan.mirror.child_projects_root, &plan.mirror.dest_root), (&projects, &projects));
             assert!(child_plan(&sess, &env_of(vec![]), &mut || "x".into()).is_err());
@@ -4814,6 +4984,125 @@ mod tests {
                 let audit = std::fs::read_to_string(sess.paths.audit()).unwrap();
                 assert!(audit.contains("\"event\":\"session_remote_failed\"") && audit.contains(&format!("\"why\":\"{}\"", failure.word())) && audit.contains(&format!("\"code\":\"{code}\"")), "{audit}");
             }
+        }
+
+        /// S9 (G7), TIMING-4 (W1R-08's gap): the pending start's byte cap.
+        /// While the start is pending the link's channel takes its
+        /// `CHANNEL_CAP` lines first, whatever their size; then the pump's own
+        /// queue grows until it holds `PENDING_IN_BYTES` (here 32 lines of 2
+        /// MiB, far under `PENDING_IN_LINES`) and the host is read no more:
+        /// its channel fills and its next send waits until the start resolves.
+        /// Then every line reaches the spawn, in order.
+        #[test]
+        fn a_pending_start_reads_the_host_up_to_its_byte_cap() {
+            const BIG: usize = 2 << 20;
+            let big_n = PENDING_IN_BYTES / BIG;
+            let total = CHANNEL_CAP + big_n + CHANNEL_CAP + 16;
+            let pad = "x".repeat(BIG);
+            // Line i: the link's CHANNEL_CAP small ones first, then big_n of BIG bytes and more, then small ones.
+            let line = |i: usize| {
+                let big = (CHANNEL_CAP..CHANNEL_CAP + big_n).contains(&i);
+                Bytes::from(format!(r#"{{"type":"keep_alive","n":{i:05},"pad":"{}"}}"#, if big { pad.as_str() } else { "" }))
+            };
+            let seq = |l: &str| l.split_once(r#""n":"#).and_then(|(_, rest)| rest.get(..5)).and_then(|n| n.parse::<usize>().ok());
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                let mut sent = 0;
+                while sent < total {
+                    // A send that waits a second is one the pump will not take while the start is pending.
+                    match tokio::time::timeout(Duration::from_secs(1), host.lines.send(HostIn::Line(line(sent)))).await {
+                        Ok(r) => {
+                            r.expect("the host channel is open");
+                            sent += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                assert!((CHANNEL_CAP + big_n..total).contains(&sent), "the pending start read {sent} of {total} lines: the link's slots, then its queue up to its bytes (far under its {PENDING_IN_LINES} lines), then no more");
+                far.started().await;
+                let reader = tokio::task::spawn_local(async move {
+                    let mut got = Vec::new();
+                    while got.len() < total {
+                        got.push(seq(&far.next_input().await.expect("a line")));
+                    }
+                    (got, far)
+                });
+                for i in sent..total {
+                    tokio::time::timeout(T, host.lines.send(HostIn::Line(line(i)))).await.expect("the pump reads the host once started").expect("the host channel is open");
+                }
+                let (got, mut far) = tokio::time::timeout(T, reader).await.expect("every line within the bound").unwrap();
+                assert!(got.iter().enumerate().all(|(i, n)| *n == Some(i)), "every line, in order");
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                far.exit(0).await;
+                let (code, pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofTerm)));
+            });
+        }
+
+        /// S9 (G7): once a remote close's waits are over, the registry row
+        /// takes a code-out of the session's VM that ended inside them (the
+        /// end row was written before, and the trigger's report is gone with
+        /// the close): its workspace row's newest snapshot, newer than the
+        /// row's own; and this process's scratch under `state/tmp/` goes (a
+        /// fetch given up at the close leaves its own). A workspace row of
+        /// another VM's fetch, or of one before the session began, or an
+        /// older snapshot, changes nothing.
+        #[test]
+        fn after_its_waits_the_close_records_their_fetch_and_removes_its_scratch() {
+            const VM: &str = "microvm-1";
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                {
+                    let mut h = hand.borrow_mut();
+                    h.snap.vm = Some(VM.into());
+                    h.snap.last_wip_fetch = Some(format!("{}wip/20261018T100000Z-1", crate::bridge::codeout::BOX_REFS));
+                }
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.send(&user(1)).await;
+                assert!(far.next_input().await.is_some());
+                far.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                host.eof().await;
+                assert_eq!(far.next_input().await, None);
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                let wip = |name: &str| format!("{}wip/{name}", crate::bridge::codeout::BOX_REFS);
+                assert_eq!(registry_row(&pump, SID).last_wip_fetch, Some(wip("20261018T100000Z-1")), "the end's row, before the waits");
+                let paths = pump.sess.paths.clone();
+                let cwd = std::fs::canonicalize(d.path()).unwrap();
+                let slug = slug::project_dir_name(&cwd).unwrap();
+                let fetched = |vm: &str, at: u64, newest: &str| {
+                    let row = crate::bridge::workspace::rows::WsRow { root: cwd.display().to_string(), vm_root: cwd.display().to_string(), last_fetch_at: Some(at), last_fetch_vm: Some(vm.into()), last_wip: Some(wip(newest)), ..Default::default() };
+                    let rows = crate::bridge::workspace::rows::WorkspaceRows { v: crate::bridge::workspace::rows::ROWS_V, ws: [(cwd.display().to_string(), row)].into() };
+                    std::fs::create_dir_all(paths.workspaces()).unwrap();
+                    std::fs::write(paths.workspace_row(&slug), toml::to_string(&rows).unwrap()).unwrap();
+                };
+                let now = crate::wire::time::unix_now();
+                let own = std::process::id();
+                for dir in [format!("fetch-{own}-a1b2c3/repo.git"), "fetch-1-d4e5f6/repo.git".to_string()] {
+                    std::fs::create_dir_all(paths.tmp().join(dir)).unwrap();
+                }
+                fetched(VM, now, "20261018T100200Z-2");
+                after_close(&mut pump);
+                assert_eq!(registry_row(&pump, SID).last_wip_fetch, Some(wip("20261018T100200Z-2")), "the fetch that ended inside the waits");
+                assert_eq!(registry_row(&pump, SID).status, "closed");
+                let left: Vec<String> = std::fs::read_dir(paths.tmp()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+                assert_eq!(left, ["fetch-1-d4e5f6"], "this process's scratch went, another's stays");
+                for (vm, at, newest) in [("microvm-other", now, "20261018T100300Z-3"), (VM, 1, "20261018T100400Z-4"), (VM, now, "20261018T100100Z-1")] {
+                    fetched(vm, at, newest);
+                    after_close(&mut pump);
+                    assert_eq!(registry_row(&pump, SID).last_wip_fetch, Some(wip("20261018T100200Z-2")), "{vm} at {at}: {newest}");
+                }
+            });
         }
     }
 }

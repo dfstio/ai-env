@@ -254,6 +254,44 @@ impl Paths {
     pub fn egress_verified(&self) -> PathBuf {
         self.root.join("state").join("egress-verified.toml")
     }
+
+    /// `state/transcripts` (S9, 0700): what this Mac keeps of the transcript
+    /// store, one directory per session. Each function below takes a session
+    /// id `registry::is_uuid` already accepted: they only join.
+    #[must_use]
+    pub fn transcripts(&self) -> PathBuf {
+        self.root.join("state").join("transcripts")
+    }
+
+    /// `state/transcripts/<sid>` (0700).
+    #[must_use]
+    pub fn transcript_dir(&self, sid: &str) -> PathBuf {
+        self.transcripts().join(sid)
+    }
+
+    /// `state/transcripts/<sid>/manifest.toml` (0600): what S3 holds of the session (`s3::manifest`).
+    #[must_use]
+    pub fn transcript_manifest(&self, sid: &str) -> PathBuf {
+        self.transcript_dir(sid).join("manifest.toml")
+    }
+
+    /// `state/transcripts/<sid>/stage.toml` (0600): a multipart upload under way (`s3::stage`).
+    #[must_use]
+    pub fn transcript_stage(&self, sid: &str) -> PathBuf {
+        self.transcript_dir(sid).join("stage.toml")
+    }
+
+    /// `state/transcripts/<sid>/origin` (0700): a Mac-begun chat's `<sid>.jsonl` and `<sid>/` subtree, moved here.
+    #[must_use]
+    pub fn transcript_origin(&self, sid: &str) -> PathBuf {
+        self.transcript_dir(sid).join("origin")
+    }
+
+    /// `state/transcripts/<sid>.lock` (0600): one writer of the manifest at a time (flock).
+    #[must_use]
+    pub fn transcript_lock(&self, sid: &str) -> PathBuf {
+        self.transcripts().join(format!("{sid}.lock"))
+    }
 }
 
 /// `arn:aws:lambda:eu-central-1:<12 digits>:network-connector:<name>[:<N>]`,
@@ -960,6 +998,38 @@ pub struct BridgeConfig {
     pub panel: PanelCfg,
     pub transport: TransportCfg,
     pub seed: SeedCfg,
+    /// S9: `[transcript]`, a remote chat's view on this Mac.
+    pub transcript: TranscriptCfg,
+}
+
+/// `[transcript]` (S9): what this Mac keeps of a remote chat whose
+/// transcript is kept in S3. The inline cap of a chat begun on this Mac is
+/// the constant `wire::s3::INLINE_MAX`, not a key.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranscriptCfg {
+    /// Messages in a remote chat's view on the Mac (a user prompt, or one assistant reply collapsed): 1 to 50.
+    pub view_messages: u32,
+}
+
+impl Default for TranscriptCfg {
+    fn default() -> Self {
+        TranscriptCfg { view_messages: crate::wire::view::VIEW_MESSAGES_DEFAULT }
+    }
+}
+
+impl TranscriptCfg {
+    /// `view_messages` from 1 to `wire::view::VIEW_MESSAGES_MAX`, else
+    /// `Config` naming the key (exit 1). Run where the view is built, never
+    /// by `BridgeConfig::parse`: a bad value must not make the wrapper's
+    /// file unreadable.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        let max = crate::wire::view::VIEW_MESSAGES_MAX;
+        if !(1..=max).contains(&self.view_messages) {
+            return Err(BridgeError::Config(format!("[transcript].view_messages = {} is outside 1..={max}", self.view_messages)));
+        }
+        Ok(())
+    }
 }
 
 impl BridgeConfig {
@@ -1045,6 +1115,26 @@ mod tests {
         assert_eq!(p.infra_state(), PathBuf::from("/r/state/infra.toml"));
         assert_eq!(p.egress_lock(), PathBuf::from("/r/state/egress.lock"));
         assert_eq!(p.egress_verified(), PathBuf::from("/r/state/egress-verified.toml"));
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert_eq!(p.transcripts(), PathBuf::from("/r/state/transcripts"));
+        assert_eq!(p.transcript_dir(sid), PathBuf::from(format!("/r/state/transcripts/{sid}")));
+        assert_eq!(p.transcript_manifest(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/manifest.toml")));
+        assert_eq!(p.transcript_stage(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/stage.toml")));
+        assert_eq!(p.transcript_origin(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/origin")));
+        assert_eq!(p.transcript_lock(sid), PathBuf::from(format!("/r/state/transcripts/{sid}.lock")));
+    }
+
+    /// S9: `[transcript]` takes `view_messages` alone (10 unless set); a
+    /// value out of 1..=50 still parses (the wrapper reads its file) and is
+    /// refused where the view is built.
+    #[test]
+    fn the_transcript_table_takes_view_messages_and_validates_it_apart() {
+        assert_eq!(BridgeConfig::default().transcript.view_messages, 10);
+        assert_eq!(BridgeConfig::parse("[transcript]\nview_messages = 20\n").unwrap().transcript.view_messages, 20);
+        let zero = BridgeConfig::parse("[transcript]\nview_messages = 0\n").unwrap();
+        assert!(zero.transcript.validate().unwrap_err().to_string().contains("[transcript].view_messages = 0 is outside 1..=50"));
+        assert!(TranscriptCfg { view_messages: 51 }.validate().is_err() && TranscriptCfg { view_messages: 50 }.validate().is_ok());
+        assert!(BridgeConfig::parse("[transcript]\ninline_mib = 64\n").unwrap_err().to_string().contains("inline_mib"), "the inline cap is no key");
     }
 
     #[test]

@@ -9,19 +9,29 @@
 //! frame; the output comes back until the remote closes or the budget
 //! passes; the marker parser ignores the shell's echo of the script. The
 //! rendered `egress check` and dns-path scripts also run for real in
-//! /bin/bash behind the loopback server, with fake `curl` and `dig` on a
-//! pinned PATH (no network), modelling a closed VPC, a leaky one, a dead
-//! proxy, and platform DNS: the stub's empty NOERROR and every other reply
-//! a platform resolver can give (an SOA, NXDOMAIN, SERVFAIL, REFUSED, a
+//! /bin/bash behind a loopback shell ([`bash_shell`]), with fake `curl` and
+//! `dig` on a pinned PATH (no network), modelling a closed VPC, a leaky one,
+//! a dead proxy, and platform DNS: the stub's empty NOERROR and every other
+//! reply a platform resolver can give (an SOA, NXDOMAIN, SERVFAIL, REFUSED, a
 //! record, a forwarder that strips the SOA, an address).
-use ai_env_cli::bridge::egress::check::{dns_path_outcome, judge, parse_markers, render_dns_script, render_script, Verdict, CASES};
+//!
+//! S9, the stdin path (`run_script_frames_over`): the egress check's
+//! presigned URLs are typed only once the script asks (its `urls` marker,
+//! printed with the terminal's echo off). The loopback shell echoes what it
+//! receives as a terminal in cooked mode does until then, so a URL typed
+//! early would show in the output; the fake IMDS hands `s3-imds-role` the
+//! role's credentials, which must sign its PUT and never show.
+use ai_env_cli::bridge::egress::check::{dns_path_outcome, judge, judge_with, parse_markers, render_dns_script, render_script, script_frames, url_reads, urls_marker, FrontObject, S3Facts, Verdict, CASES};
 use ai_env_cli::bridge::egress::PROXY_IP;
-use ai_env_cli::bridge::vm::shell::{pump, run_script_over, session_init_id, PumpEnd, ESCAPE, SCRIPT_OUTPUT_MAX};
+use ai_env_cli::bridge::vm::shell::{pump, run_script_frames_over, run_script_over, session_init_id, Gated, PumpEnd, ESCAPE, SCRIPT_OUTPUT_MAX};
 use futures_util::{SinkExt, StreamExt};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 /// A server that first sends `greeting` (a text frame, as the platform's
 /// `session_init`), then answers every binary frame with `echo:<bytes>` as a
@@ -160,11 +170,16 @@ fn passing_markers() -> String {
     for c in &CASES {
         let line = match c.name {
             "allowed" | "allowed-last" => "rc=0 code=401 size=86 conn=1 hc=200 t403=no sq=no".to_string(),
-            "direct-name" => "rc=6 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
+            "direct-name" | "s3-direct" => "rc=6 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
             "direct-ipv4" | "direct-http" | "proxy-other-port" => "rc=28 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
             "direct-ipv6" => "rc=7 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
+            // The S9 S3 cases (§7.7): s3-own 200/200, the S3Denied cases 403 AccessDenied, proxy-s3-other-host a
+            // CONNECT 403 (the proxy- arm below), s3-direct no connection (the direct-name arm above).
+            "s3-own" => "rc=0 put=200 get=200 hc=200 s3=-".to_string(),
+            "s3-front-bucket" | "s3-front-path" => "rc=0 put=000 get=403 hc=200 s3=AccessDenied".to_string(),
+            "s3-own-outside-prefix" | "s3-imds-role" => "rc=0 put=403 get=000 hc=200 s3=AccessDenied".to_string(),
             n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
             n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none an=none au=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
             n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none an=none au=none".to_string(),
@@ -239,15 +254,76 @@ async fn a_close_ends_the_session_and_the_output_is_capped() {
 /// (`dead`: the proxy refuses connections; `dies`: after the first request;
 /// `late`: the VM reaches nothing for its first 3 connection attempts, as
 /// measured live 1 Oct 2026).
+///
+/// S9 (§7.7): it reads `-K`'s config (`user`, `header`) as curl does, and
+/// honours `-f` (an HTTP error is exit 22 and no body; without it, IMDS's
+/// HTML error page is the body). IMDSv2 hands out a session token to a PUT,
+/// and, to a request carrying it, the role `ai-env-vm-exec` and its
+/// credentials ([`IMDS_SECRETS`]; `FAKE_NO_ROLE`: the listing is IMDS's 404,
+/// `FAKE_IMDS_PARTIAL`: no Token). Through the opened tunnel (CONNECT 200),
+/// S3 serves a presigned PUT or GET of `v1/_egress-check/`, refuses one of
+/// `x/_egress-check/` and the fronting GETs of the public object with 403
+/// `AccessDenied`, and so a PUT signed (`--aws-sigv4`) with exactly the
+/// role's credentials; a `--aws-sigv4` request without them (an anonymous
+/// PUT) is no request at all (exit 2), and a PUT without `Content-Length: 0`
+/// gets S3's 411 `MissingContentLength`.
 const FAKE_CURL: &str = r#"#!/bin/sh
-fmt=; url=; noproxy=0; prev=
+fmt=; url=; noproxy=0; prev=; sigv4=0; method=GET; fail=0; hdrs=; kconf=; user=
 for a in "$@"; do
-  case "$prev" in -w) fmt=$a ;; --noproxy) noproxy=1 ;; esac
-  case "$a" in http://*|https://*) url=$a ;; esac
+  case "$prev" in -w) fmt=$a ;; --noproxy) noproxy=1 ;; -X) method=$a ;; -H) hdrs="$hdrs
+$a" ;; -K) kconf=$(cat "$a") ;; esac
+  case "$a" in http://*|https://*) url=$a ;; --aws-sigv4) sigv4=1 ;; -[!-]*f*) fail=1 ;; esac
   prev=$a
 done
+if [ -n "$kconf" ]; then
+  hdrs="$hdrs
+$(printf '%s\n' "$kconf" | sed -n 's/^header = "\(.*\)"$/\1/p')"
+  user=$(printf '%s\n' "$kconf" | sed -n 's/^user = "\(.*\)"$/\1/p')
+fi
+has() { printf '%s\n' "$hdrs" | grep -qxF "$1"; }
+filled() { printf '%s' "$fmt" | sed -e "s/%{http_code}/$1/" -e "s/%{http_connect}/$2/" -e "s/%{size_download}/0/" -e "s/%{num_connects}/1/" -e "s/%header{x-squid-error}//"; }
 case "$url" in https://*) proxy=${https_proxy:-} ;; *) proxy=${http_proxy:-} ;; esac
 [ "$noproxy" = 1 ] && proxy=
+# IMDSv2, as the check VM's execution role sees it.
+imds_err() {
+  if [ "$fail" = 1 ]; then printf 'curl: (22) The requested URL returned error: %s\n' "$1" >&2; exit 22; fi
+  printf '<?xml version="1.0" encoding="iso-8859-1"?>\n<html><head><title>%s - Not Found</title></head><body><h1>%s</h1></body></html>\n' "$1" "$1"
+  exit 0
+}
+case "$url" in
+  http://169.254.169.254/latest/api/token)
+    [ "$method" = PUT ] || imds_err 405
+    printf fake-imds-token; exit 0 ;;
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/*)
+    has 'X-aws-ec2-metadata-token: fake-imds-token' || imds_err 401
+    [ -z "${FAKE_NO_ROLE:-}" ] || imds_err 404
+    role=${url#http://169.254.169.254/latest/meta-data/iam/security-credentials/}
+    if [ -z "$role" ]; then printf ai-env-vm-exec; exit 0; fi
+    [ "$role" = ai-env-vm-exec ] || imds_err 404
+    printf '{\n  "Code" : "Success",\n  "LastUpdated" : "2026-10-18T09:00:00Z",\n  "Type" : "AWS-HMAC",\n  "AccessKeyId" : "fake-imds-key-id",\n  "SecretAccessKey" : "fake-imds-secret",\n'
+    [ -n "${FAKE_IMDS_PARTIAL:-}" ] || printf '  "Token" : "fake-imds-session-token",\n'
+    printf '  "Expiration" : "2026-10-18T15:00:00Z"\n}'
+    exit 0 ;;
+esac
+# S3 through the opened tunnel (the S9 egress-check requests, §7.7).
+s3code=; s3err=
+if [ "$sigv4" = 1 ]; then
+  if [ "$user" != "fake-imds-key-id:fake-imds-secret" ] || ! has 'x-amz-security-token: fake-imds-session-token'; then
+    printf 'curl: (2) fake curl: --aws-sigv4 without the role credentials\n' >&2
+    filled 000 000; exit 2
+  fi
+  s3code=403; s3err=AccessDenied
+else case "$url" in
+  *"/v1/_egress-check/"*) s3code=200 ;;
+  *"/x/_egress-check/"*) s3code=403; s3err=AccessDenied ;;
+  *copernicus-dem-30m*) s3code=403; s3err=AccessDenied ;;
+esac; fi
+if [ -n "$s3code" ] && [ "$method" = PUT ] && ! has 'Content-Length: 0'; then s3code=411; s3err=MissingContentLength; fi
+if [ -n "$s3code" ]; then
+  [ -n "$s3err" ] && printf '<Error><Code>%s</Code></Error>' "$s3err"
+  filled "$s3code" 200
+  exit 0
+fi
 code=000; size=0; conn=0; hc=000; xse=; rc=0; err=
 world=${FAKE_WORLD:-closed}
 if [ "$world" = late ]; then
@@ -356,10 +432,26 @@ exit 9
 /// script's name fails here.
 const FAKE_DNS_NAME: &str = "d00c0ffee12345678.example.com";
 
-/// Run `script` in /bin/bash (no rc files, a clean environment, the fakes
-/// first on PATH, `/etc/resolv.conf` replaced by `resolv`), killed after 60 s.
-fn run_bash(dir: &Path, script: &[u8], resolv: &str, env: &[(&str, &str)]) -> String {
-    use std::io::Write as _;
+/// The three fake presigned URLs the S3 cases (§7.7) read from stdin, in the
+/// order the script reads them into `AIENV_U`: s3-own's PUT and GET of
+/// `v1/_egress-check/<nonce>`, and s3-own-outside-prefix's PUT of
+/// `x/_egress-check/<nonce>`. The fake `curl` keys off the path (`/v1/` served,
+/// `/x/` refused). They are typed, as the Mac types them, only once the
+/// script asks; it reads them silently (`read -rs`), so they never reach the
+/// output.
+const S3_FAKE_URLS: [&str; 3] = [
+    "https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/v1/_egress-check/00c0ffee12345678?X-Amz-Fake=put",
+    "https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/v1/_egress-check/00c0ffee12345678?X-Amz-Fake=get",
+    "https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/x/_egress-check/00c0ffee12345678?X-Amz-Fake=outside",
+];
+
+/// What the fake IMDS hands the check VM (not credential-shaped): the role's access key id, secret and session token,
+/// and IMDS's own session token. None may ever reach the output.
+const IMDS_SECRETS: [&str; 4] = ["fake-imds-key-id", "fake-imds-secret", "fake-imds-session-token", "fake-imds-token"];
+
+/// The fakes on a pinned PATH under `dir` (`bin/`: curl, dig, and a `sleep` that returns at once) and `resolv` as the
+/// shell's `/etc/resolv.conf`; returns that file's path.
+fn install_fakes(dir: &Path, resolv: &str) -> String {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -369,41 +461,117 @@ fn run_bash(dir: &Path, script: &[u8], resolv: &str, env: &[(&str, &str)]) -> St
     }
     let conf = dir.join("resolv.conf");
     std::fs::write(&conf, resolv).unwrap();
-    let script = String::from_utf8_lossy(script).replace("/etc/resolv.conf", &conf.display().to_string());
-    let mut c = std::process::Command::new("/bin/bash");
-    c.args(["--norc", "--noprofile"]).env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("HOME", dir).env("LC_ALL", "C").env("FAKE_DNS_NAME", FAKE_DNS_NAME);
+    conf.display().to_string()
+}
+
+/// A loopback platform shell: /bin/bash (no rc files, a clean environment,
+/// the fakes first on PATH, `/etc/resolv.conf` replaced by `resolv`) reads
+/// the binary frames the client sends, in order, as its stdin; what it prints
+/// (stdout and stderr) goes back as binary frames, and the session closes
+/// when bash exits (killed after 60 s; the client's close ends its stdin).
+/// Like a terminal in cooked mode it echoes each frame as it receives it
+/// (prompt, CRLF) — until bash has printed the run's `urls` marker, which the
+/// script prints once it has turned the echo off. Returns the frames it got.
+async fn bash_shell(listener: tokio::net::TcpListener, dir: PathBuf, resolv: &'static str, env: &'static [(&'static str, &'static str)]) -> Vec<Vec<u8>> {
+    use tokio::io::AsyncWriteExt as _;
+    let (tcp, _) = listener.accept().await.unwrap();
+    let (mut tx, mut rx) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+    let conf = install_fakes(&dir, resolv);
+    let mut c = tokio::process::Command::new("/bin/bash");
+    c.args(["--norc", "--noprofile"]).env_clear().env("PATH", format!("{}:/usr/bin:/bin", dir.join("bin").display())).env("HOME", &dir).env("LC_ALL", "C").env("FAKE_DNS_NAME", FAKE_DNS_NAME);
     for (k, v) in env {
         c.env(k, v);
     }
-    let mut child = c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-    let _ = child.stdin.take().unwrap().write_all(script.as_bytes());
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(Duration::from_secs(60)) {
-        Ok(out) => out.unwrap(),
-        Err(_) => {
-            let _ = std::process::Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
-            panic!("bash did not finish within 60 s");
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let mut stdin = child.stdin.take();
+    let (mut stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let marker = urls_marker(NONCE).into_bytes();
+    let (mut got, mut printed, mut echoing) = (Vec::new(), Vec::<u8>::new(), true);
+    let (mut client_open, mut out_open, mut err_open) = (true, true, true);
+    let (mut ob, mut eb) = (vec![0u8; 8192], vec![0u8; 8192]);
+    let deadline = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(deadline);
+    while out_open || err_open {
+        let mut printing: Option<Vec<u8>> = None;
+        tokio::select! {
+            () = &mut deadline => {
+                let _ = child.start_kill();
+                break;
+            }
+            msg = rx.next(), if client_open => match msg {
+                Some(Ok(Message::Binary(b))) => {
+                    if echoing {
+                        let _ = tx.send(echo(&b)).await;
+                    }
+                    let text = String::from_utf8_lossy(&b).replace("/etc/resolv.conf", &conf);
+                    if let Some(input) = stdin.as_mut() {
+                        let _ = input.write_all(text.as_bytes()).await;
+                    }
+                    got.push(b.to_vec());
+                }
+                Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                    client_open = false;
+                    stdin = None;
+                }
+                Some(Ok(_)) => {}
+            },
+            n = stdout.read(&mut ob), if out_open => match n {
+                Ok(n) if n > 0 => printing = Some(ob[..n].to_vec()),
+                _ => out_open = false,
+            },
+            n = stderr.read(&mut eb), if err_open => match n {
+                Ok(n) if n > 0 => printing = Some(eb[..n].to_vec()),
+                _ => err_open = false,
+            },
         }
-    };
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+        if let Some(bytes) = printing {
+            printed.extend_from_slice(&bytes);
+            // The script turned the echo off before it printed the marker; set before the marker leaves, so before
+            // the client can answer it.
+            if printed.windows(marker.len()).any(|w| w == marker.as_slice()) {
+                echoing = false;
+            }
+            if client_open {
+                let _ = tx.send(Message::Binary(bytes.into())).await;
+            }
+        }
+    }
+    let _ = child.wait().await;
+    let _ = tx.send(Message::Close(None)).await;
+    got
 }
 
-/// The rendered script through the loopback shell, run by bash in `world`'s
-/// environment: the echo, then whatever bash printed.
-async fn through_bash(script: String, resolv: &'static str, env: &'static [(&'static str, &'static str)]) -> String {
+/// `script` typed into a loopback bash shell ([`bash_shell`]) as the Mac
+/// types it (`check::script_frames`): the fake presigned URLs, exactly as
+/// many as the script reads, and the rest of the script only once the shell
+/// printed the `urls` marker — or, `gate` false, right behind the script, as
+/// no Mac types them. Returns what came back and the frames the shell got.
+async fn bash_session(script: &str, gate: bool, resolv: &'static str, env: &'static [(&'static str, &'static str)]) -> (String, Vec<Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().to_path_buf();
-    let respond: Responder = Box::new(move |got| {
-        let printed = run_bash(&path, &got, resolv, env);
-        vec![echo(&got), Message::Binary(printed.into_bytes().into())]
-    });
-    let (out, _, _) = scripted(&script, Duration::from_secs(90), true, respond).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(bash_shell(listener, dir.path().to_path_buf(), resolv, env));
+    let ws = dial(addr).await;
+    let (first, then) = script_frames(script, &S3_FAKE_URLS[..url_reads(script)]).unwrap();
+    let marker = urls_marker(NONCE);
+    let after = if gate { marker.as_str() } else { "" };
+    let gated: Vec<Gated<'_>> = then.iter().map(|t| Gated { after, text: t.expose() }).collect();
+    let out = tokio::time::timeout(Duration::from_secs(120), run_script_frames_over(ws, first, &gated, Duration::from_secs(90))).await.expect("run_script_frames_over is bounded").unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(70), server).await.unwrap().unwrap();
     drop(dir);
-    out
+    (out, got)
+}
+
+/// The rendered script through the loopback bash shell, typed as the Mac
+/// types it, in `env`'s world: the echo, then whatever bash printed.
+async fn through_bash(script: String, resolv: &'static str, env: &'static [(&'static str, &'static str)]) -> String {
+    bash_session(&script, true, resolv, env).await.0
+}
+
+/// A WebSocket client to the loopback server at `addr`.
+async fn dial(addr: std::net::SocketAddr) -> WebSocketStream<tokio::net::TcpStream> {
+    let tcp = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(addr)).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::client_async(format!("ws://{addr}/shell"), tcp)).await.unwrap().unwrap().0
 }
 
 fn failing(j: &ai_env_cli::bridge::egress::check::Judgement) -> Vec<&'static str> {
@@ -415,9 +583,9 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
     let resolv = "# platform\nnameserver 10.42.0.2\nnameserver 10.42.0.3\n";
     let run = |resolv: &'static str, env: &'static [(&'static str, &'static str)]| through_bash(render_script(NONCE, PROXY_IP), resolv, env);
     // A closed VPC with a working proxy: every case passes, no DNS server replies.
-    let out = run(resolv, &[]).await;
+    let (out, got) = bash_session(&render_script(NONCE, PROXY_IP), true, resolv, &[]).await;
     let m = parse_markers(&out, NONCE).unwrap_or_else(|e| panic!("{e}"));
-    assert!(m.finished && m.cases.len() == CASES.len(), "{m:?}");
+    assert!(m.finished && m.urls && m.cases.len() == CASES.len(), "{m:?}");
     assert_eq!(m.get("dns-resolv-udp").unwrap().ns.as_deref(), Some("10.42.0.2"), "the first resolv.conf nameserver");
     assert_eq!(m.get("dns-subnet-tcp").unwrap().ns.as_deref(), Some("10.42.1.2"));
     assert_eq!(m.get("dns-public-port").unwrap().ns.as_deref(), Some("208.67.222.222"));
@@ -431,6 +599,32 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
     assert!(j.passed(), "{:?}", j.failures());
     assert_eq!(j.dns, "no-dns");
     assert!(!out.contains("93.184.215.14") && !out.contains("communications error") && !out.contains("ERR_ACCESS_DENIED 0") && !out.contains("CONNECT tunnel failed, response 403\n"), "what dig and curl saw never leaves the VM's shell variables");
+    // The S9 S3 cases (§7.7): s3-own stored and read back through the endpoint (CONNECT 200, both 200); the S3Denied
+    // cases 403 AccessDenied through the tunnel; proxy-s3-other-host a CONNECT 403; s3-direct made no connection.
+    let own = m.get("s3-own").unwrap();
+    assert_eq!((own.put, own.get, own.hc, own.s3.as_deref()), (Some(200), Some(200), Some(200), None), "s3-own: {own:?}");
+    for n in ["s3-front-bucket", "s3-front-path", "s3-own-outside-prefix", "s3-imds-role"] {
+        let r = m.get(n).unwrap();
+        assert_eq!((r.hc, r.s3.as_deref()), (Some(200), Some("AccessDenied")), "{n}: {r:?}");
+        assert!(r.put == Some(403) || r.get == Some(403), "{n}: 403 somewhere: {r:?}");
+    }
+    assert_eq!(m.get("proxy-s3-other-host").unwrap().hc, Some(403), "a CONNECT squid refuses");
+    assert_eq!(m.get("s3-direct").unwrap().conn, Some(0), "no direct connection to the bucket host");
+    for n in ["s3-own", "s3-front-bucket", "s3-front-path", "s3-own-outside-prefix", "s3-imds-role", "proxy-s3-other-host", "s3-direct"] {
+        assert_eq!(j.cases.iter().find(|c| c.name == n).unwrap().verdict, Verdict::Pass, "{n}");
+    }
+    // Custody (§2.2): the shell got the script up to its read loop, then — once it asked, its echo off — the URLs and
+    // the rest; no URL, and nothing IMDS handed over, reached the output.
+    assert_eq!(got.len(), 2, "the script, then the URLs and the rest");
+    let urls: String = S3_FAKE_URLS.iter().map(|u| format!("{u}\n")).collect();
+    assert!(got[1].starts_with(urls.as_bytes()) && !String::from_utf8_lossy(&got[0]).contains("X-Amz-Fake"), "the URLs went in the second frame only");
+    for u in &S3_FAKE_URLS {
+        assert!(!out.contains(u), "a presigned URL leaked into the shell output: {u}");
+    }
+    assert!(!out.contains("X-Amz-Fake"), "no query of a presigned URL in the output");
+    for secret in IMDS_SECRETS {
+        assert!(!out.contains(secret), "{secret} reached the shell output");
+    }
     // Direct egress to 1.1.1.1 answers, or connects and hangs (curl exit 28 after a connection): OPEN.
     const LEAKY: &[(&str, &str)] = &[("FAKE_WORLD", "leaky")];
     const HANG: &[(&str, &str)] = &[("FAKE_WORLD", "hang")];
@@ -505,11 +699,9 @@ async fn the_egress_check_script_runs_in_bash_and_is_judged() {
 async fn the_script_runs_the_tools_not_aliases_or_functions() {
     let tamper = "shopt -s expand_aliases\ncurl() { echo fake; }; dig() { echo 1.2.3.4; }; command() { echo fake; }; printf() { echo fake; }\nalias curl='echo fake' dig='echo 1.2.3.4' command='echo fake' printf='echo fake'\n";
     let script = render_script(NONCE, PROXY_IP);
+    // The URLs right behind the script (a tampered printf never prints the marker a Mac would wait for).
     let run = |script: String| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let respond: Responder = Box::new(move |got| vec![Message::Binary(run_bash(&path, &got, "nameserver 10.42.0.2\n", &[]).into_bytes().into())]);
-        let (out, _, _) = scripted(&format!("{tamper}{script}"), Duration::from_secs(90), true, respond).await;
+        let (out, _) = bash_session(&format!("{tamper}{script}"), false, "nameserver 10.42.0.2\n", &[]).await;
         judge(&parse_markers(&out, NONCE).unwrap())
     };
     let j = run(script.clone()).await;
@@ -622,6 +814,175 @@ async fn each_dns_query_of_the_script_is_load_bearing() {
     assert_ne!(unchecked, script, "the example.com query's exit code is checked");
     let j = judge(&parse_markers(&through_bash(unchecked, "nameserver 10.42.0.2\n", EXAMPLE_SILENT).await, NONCE).unwrap());
     assert!(j.passed() && j.dns == "platform-dns:fd00:ec2::253", "without that check a server that never answers example.com passes: {:?}", j.failures());
+}
+
+/// s3-imds-role in bash against the fake IMDS (§7.7): IMDSv2's session token
+/// goes with every request, and the role's credentials sign the PUT (a
+/// config on a file descriptor, never an argv) — 403 `AccessDenied` passes,
+/// and none of it reaches the output. Without a role (IMDS's 404) the case
+/// says `norole`, recorded `no_role` only for a VM without an execution role;
+/// a role without its session token says `nocreds`, and fails. Unsigned, or
+/// without a length, the PUT fails the case: each part of it is load-bearing.
+#[tokio::test]
+async fn the_imds_role_case_signs_with_the_roles_credentials() {
+    let resolv = "nameserver 10.42.0.2\n";
+    let imds = |m: &ai_env_cli::bridge::egress::check::Markers| m.get("s3-imds-role").cloned().unwrap();
+    let verdict = |j: &ai_env_cli::bridge::egress::check::Judgement| j.cases.iter().find(|c| c.name == "s3-imds-role").unwrap().clone();
+    let out = through_bash(render_script(NONCE, PROXY_IP), resolv, &[]).await;
+    for secret in IMDS_SECRETS {
+        assert!(!out.contains(secret), "{secret} reached the shell output");
+    }
+    let m = parse_markers(&out, NONCE).unwrap();
+    let r = imds(&m);
+    assert_eq!((r.put, r.get, r.hc, r.s3.as_deref()), (Some(403), Some(0), Some(200), Some("AccessDenied")), "{r:?}");
+    assert!(judge(&m).passed(), "{:?}", judge(&m).failures());
+    // No role (IMDS's 404, which -f keeps out of the role's name): recorded no_role only for a VM without one.
+    let m = parse_markers(&through_bash(render_script(NONCE, PROXY_IP), resolv, &[("FAKE_NO_ROLE", "1")]).await, NONCE).unwrap();
+    let r = imds(&m);
+    assert_eq!((r.put, r.get, r.hc, r.s3.as_deref()), (Some(0), Some(0), Some(0), Some("norole")), "{r:?}");
+    let without = S3Facts { has_role: false, front: FrontObject::Status(200) };
+    let j = judge_with(&m, &BTreeSet::new(), &without);
+    assert!(j.passed() && verdict(&j).verdict == Verdict::Recorded && j.summary().contains(" s3-imds-role=recorded:no_role "), "{:?} {}", j.failures(), j.summary());
+    let j = judge(&m);
+    assert_eq!(failing(&j), ["s3-imds-role"], "a VM with an execution role whose IMDS lists none fails");
+    assert!(verdict(&j).reason.contains("IMDS gave it no role (norole)"), "{}", verdict(&j).reason);
+    // A role without its session token: nothing complete to sign with.
+    let m = parse_markers(&through_bash(render_script(NONCE, PROXY_IP), resolv, &[("FAKE_IMDS_PARTIAL", "1")]).await, NONCE).unwrap();
+    assert_eq!(imds(&m).s3.as_deref(), Some("nocreds"));
+    assert_eq!(failing(&judge(&m)), ["s3-imds-role"]);
+    // The PUT unsigned (no credentials in the config: an anonymous PUT, which the endpoint would refuse all the same),
+    // or without a length: the case fails.
+    let script = render_script(NONCE, PROXY_IP);
+    let creds = r#"-K <(printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' "$aienv_ak" "$aienv_sk" "$aienv_tk") "#;
+    let length = "-H 'x-amz-content-sha256: UNSIGNED-PAYLOAD' -H 'Content-Length: 0' ";
+    for (what, mutant) in [("unsigned", script.replacen(creds, "", 1)), ("without a length", script.replacen(length, "-H 'x-amz-content-sha256: UNSIGNED-PAYLOAD' ", 1))] {
+        assert_ne!(mutant, script, "{what}: the part is in the script");
+        let j = judge(&parse_markers(&through_bash(mutant, resolv, &[]).await, NONCE).unwrap());
+        assert_eq!(failing(&j), ["s3-imds-role"], "{what}: {:?}", j.failures());
+    }
+}
+
+/// A terminal that echoes what it receives, as the platform shell's does in
+/// cooked mode: it echoes the script frame and every frame that arrives
+/// within `running` (the shell still running the script's earlier lines);
+/// then — the script having turned the echo off — it prints `marker` and
+/// reads what comes next silently (up to 2 s), prints the end and closes.
+/// `None`: the script never asks; it stays silent until the client closes.
+/// Returns each frame it received and whether it came after the marker.
+async fn cooked_terminal(listener: tokio::net::TcpListener, marker: Option<String>, running: Duration) -> Vec<(Vec<u8>, bool)> {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let (mut tx, mut rx) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+    let mut got = Vec::new();
+    let until = tokio::time::Instant::now() + running;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(until, rx.next()).await {
+        if let Message::Binary(b) = msg {
+            let _ = tx.send(echo(&b)).await;
+            got.push((b.to_vec(), false));
+        }
+    }
+    let Some(marker) = marker else {
+        while let Some(Ok(msg)) = rx.next().await {
+            if let Message::Binary(b) = msg {
+                got.push((b.to_vec(), false));
+            }
+        }
+        return got;
+    };
+    tx.send(Message::Binary(format!("{marker}\r\n").into_bytes().into())).await.unwrap();
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    while got.len() < 2 {
+        match tokio::time::timeout_at(until, rx.next()).await {
+            Ok(Some(Ok(Message::Binary(b)))) => got.push((b.to_vec(), true)),
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    let _ = tx.send(Message::Binary(format!("@@AIENV{NONCE} end\r\n").into_bytes().into())).await;
+    let _ = tx.send(Message::Close(None)).await;
+    got
+}
+
+/// The stdin path against a terminal that echoes what it receives
+/// (`cooked_terminal`): `run_script_frames_over` types the URLs only once the
+/// script's `urls` marker shows, so they arrive after the script turned the
+/// echo off and never reach the output. Typed right behind the script, as a
+/// client that does not wait for the marker types them, they are echoed. When
+/// the marker never shows, nothing more is typed.
+#[tokio::test]
+async fn the_urls_are_typed_only_once_the_script_asks_and_never_echoed() {
+    let marker = urls_marker(NONCE);
+    let then = format!("{}\nthe-rest-of-the-script\n", S3_FAKE_URLS[0]);
+    let bind = || async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() };
+    // As the Mac types them.
+    let listener = bind().await;
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(cooked_terminal(listener, Some(marker.clone()), Duration::from_millis(300)));
+    let out = run_script_frames_over(dial(addr).await, "the-script-up-to-its-read-loop\n", &[Gated { after: &marker, text: &then }], Duration::from_secs(10)).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    assert_eq!(got.iter().map(|(_, after)| *after).collect::<Vec<_>>(), [false, true], "the script at once, the URLs only after the marker");
+    assert_eq!(got[1].0, then.as_bytes());
+    assert!(out.contains("bash-5.2# the-script-up-to-its-read-loop\r\n") && out.contains(&marker) && out.contains(&format!("@@AIENV{NONCE} end")), "{out}");
+    assert!(!out.contains("X-Amz-Fake") && !out.contains("the-rest-of-the-script"), "nothing typed after the marker is echoed: {out}");
+    // Typed right behind the script, before it asked: echoed into the output.
+    let listener = bind().await;
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(cooked_terminal(listener, Some(marker.clone()), Duration::from_millis(300)));
+    let (mut tx, mut rx) = dial(addr).await.split();
+    tx.send(Message::Binary(b"the-script-up-to-its-read-loop\n".to_vec().into())).await.unwrap();
+    tx.send(Message::Binary(then.clone().into_bytes().into())).await.unwrap();
+    let mut naive = String::new();
+    while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(10), rx.next()).await {
+        match m {
+            Message::Text(t) => naive.push_str(&t),
+            Message::Binary(b) => naive.push_str(&String::from_utf8_lossy(&b)),
+            _ => {}
+        }
+    }
+    let got = tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    assert!(got.len() == 2 && !got[1].1 && naive.contains(S3_FAKE_URLS[0]), "typed before the script asked, the URL is echoed: {naive}");
+    // The script never asks: no URL is typed, and the session ends at its budget.
+    let listener = bind().await;
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(cooked_terminal(listener, None, Duration::from_millis(100)));
+    let t = Instant::now();
+    let out = run_script_frames_over(dial(addr).await, "the-script\n", &[Gated { after: &marker, text: &then }], Duration::from_millis(600)).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    assert!(t.elapsed() >= Duration::from_millis(600) && got.len() == 1 && !out.contains("X-Amz-Fake"), "{got:?}");
+}
+
+/// Each gated part waits for its own `after`, in the output that came after
+/// the previous part's: a second part gated on the same text is typed only
+/// when the text shows again, never on its first showing.
+#[tokio::test]
+async fn each_gated_part_waits_for_its_own_marker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let (mut tx, mut rx) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+        let mut order = Vec::new();
+        // One frame each step (or none within 400 ms); before steps 1 and 3 the shell prints GO — the second time
+        // split across two frames. The second part must not come on the first GO (step 2).
+        for step in 0..4 {
+            match step {
+                1 => tx.send(Message::Binary(b"GO\r\n".to_vec().into())).await.unwrap(),
+                3 => {
+                    tx.send(Message::Binary(b"G".to_vec().into())).await.unwrap();
+                    tx.send(Message::Binary(b"O\r\n".to_vec().into())).await.unwrap();
+                }
+                _ => {}
+            }
+            let frame = tokio::time::timeout(Duration::from_millis(400), rx.next()).await.ok().flatten().and_then(Result::ok);
+            order.push(format!("{frame:?}"));
+        }
+        let _ = tx.send(Message::Close(None)).await;
+        order
+    });
+    let out = run_script_frames_over(dial(addr).await, "one", &[Gated { after: "GO", text: "two" }, Gated { after: "GO", text: "three" }], Duration::from_secs(10)).await.unwrap();
+    let order = tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    let frame = |t: &str| format!("{:?}", Some(Message::Binary(t.as_bytes().to_vec().into())));
+    assert_eq!(order, [frame("one"), frame("two"), "None".to_string(), frame("three")], "a marker split across frames still counts");
+    assert_eq!(out, "GO\r\nGO\r\n");
 }
 
 #[test]

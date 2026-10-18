@@ -775,6 +775,32 @@ fn cli_auto_gc_terminates_expired_registry_vms_but_never_the_one_just_started() 
     assert_eq!(st.vms[&new].state, VmState::Running, "never the VM this run just started");
 }
 
+/// S9 phase 4 (T10): `[vm].auto_gc` syncs the transcripts an expired VM's
+/// sessions keep in S3 before it ends that VM, as `vm terminate` and `vm gc`
+/// do: the session's sync is tried (here it cannot run: no transcripts
+/// bucket is recorded), said as a warning naming the session, and the VM
+/// still ends.
+#[test]
+fn cli_auto_gc_syncs_an_expired_vms_sessions_first() {
+    const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let w = World::new("auto_gc = true");
+    let old = json(&w.run(&["vm", "run", "--max-duration", "60", "--egress", "internet", "--json"]))["id"].as_str().unwrap().to_string();
+    let row = ai_env_cli::bridge::registry::SessionRow {
+        session_id: SID.into(),
+        mode: "remote".into(),
+        status: "closed".into(),
+        slug: Some("-w".into()),
+        microvm_id: Some(old.clone()),
+        transcript_home: Some(ai_env_cli::bridge::s3::manifest::HOME_S3.into()),
+        ..ai_env_cli::bridge::registry::SessionRow::default()
+    };
+    ai_env_cli::bridge::registry::write(&ai_env_cli::bridge::config::Paths::from_root_and_env(w.bridge(), None), &row).unwrap();
+    let o = w.run(&["vm", "run", "--max-duration", "60", "--egress", "internet", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("ai-env: warning: {old}: the transcript of {SID} was not synced before it ends")), "{}", stderr(&o));
+    assert!(w.state().vms[&old].state.is_terminal(), "the expired VM still ends: {}", stderr(&o));
+}
+
 #[test]
 fn cli_run_names_the_kept_pending_row_after_two_ambiguous_failures() {
     let w = World::new("");

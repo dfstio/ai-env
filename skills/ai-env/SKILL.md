@@ -63,8 +63,9 @@ recipient only — never an `AGE-SECRET-KEY` private identity (the CLI refuses i
 ## MicroVM sessions (ai-env bridge)
 
 In the bridge's remote mode a Cursor chat whose workspace is under the configured roots runs
-in a disposable AWS MicroVM, not on the Mac. The Mac keeps the editor, the chat's transcript
-and the git history; the VM has a copy of the checkout to work in.
+in a disposable AWS MicroVM, not on the Mac. The Mac keeps the editor and the git history; the
+VM has a copy of the checkout to work in. The chat's transcript stays in the VM and in S3: the
+Mac holds only a view of its last 10 messages, which Cursor's history lists and reopens.
 
 **Signs you are in the VM:** `cat /proc/1/comm` prints `ai-env`, `id -u` prints `1000`, the
 checkout sits at the same path as on the Mac (under `/Users/mike`), and `git remote` prints
@@ -84,25 +85,52 @@ AWS asks for one Touch ID):
 ```sh doc-test
 ai-env session list                # the chats the wrapper ran (session show UUID names a chat's VM)
 ai-env box fetch WORKSPACE --wip   # the VM's commits and uncommitted files into refs/remotes/box/*
+ai-env box review BRANCH           # what a push of BRANCH would carry (no AWS, no Touch ID; exit 9 on a finding)
 ai-env vm list                     # the VMs that run or are suspended
 ```
 
 Review with git (`git log --oneline BRANCH..box/BRANCH`) and merge by hand; never push a
-`box/*` ref. `ai-env vm terminate ID` ends a VM (the next chat seeds a fresh one).
-`AI_ENV_BRIDGE_LOCAL=1` in Cursor's `claudeCode.environmentVariables` runs every chat on the
-Mac again. `ai-env wrapper status` is read-only (no AWS, no Touch ID) and shows whether Cursor's
-wrapper is set and where the chats Cursor starts next will run (it cannot see a chat already
-running). `ai-env wrapper uninstall` and `ai-env wrapper install`
+`box/*` or `box-quarantine/*` ref. `ai-env vm terminate ID` ends a VM (the next chat seeds a
+fresh one). `AI_ENV_BRIDGE_LOCAL=1` in Cursor's `claudeCode.environmentVariables` runs every
+chat on the Mac again. `ai-env wrapper status` is read-only (no AWS, no Touch ID) and shows
+whether Cursor's wrapper is set and where the chats Cursor starts next will run (it cannot see a
+chat already running). `ai-env wrapper uninstall` and `ai-env wrapper install`
 change where every later Cursor chat runs: they are the user's to run, never yours.
+
+**Before a push**, `ai-env box review BRANCH` checks what it would carry (the tripwires, the
+settings policy, the dotenv rule, the Cargo.lock rules, the pre-push hook's own path): read-only,
+so you may run it; exit 9 names each finding's file, line and rule, never the value. A checkout
+with the pre-push hook reviews every push itself. Never bypass it (`git push --no-verify`, a push
+from another clone, `core.hooksPath` pointed elsewhere), and never edit, remove, chain or commit
+the hook; on a finding, tell the user what the review found and let them decide.
+`ai-env box hook-install` writes into the user's repository: it is the user's to run (`--dry-run`
+only shows the hook).
+
+**Transcripts.** A remote chat's file under `~/.claude/projects/` is a view (its first line starts
+with `{"aiEnvView":1,`), not the chat: never edit, move or delete it, and never resume it on the
+Mac. `claude -c` or `claude --resume` in a terminal would load the view as if it were the whole
+chat (the wrapper refuses that, exit 9, but a terminal's claude never passes through it), and so
+would a Cursor reload with the wrapper off while such a chat's tab is open. `ai-env session stage`,
+`session sync`, `session gc --remote --yes`, `session migrate-s9 --yes` and
+`session forget UUID --purge` move or delete transcripts in S3 and ask for Touch IDs: they are the
+user's to run, never yours (without `--yes`, `session gc --remote` and `session migrate-s9` only
+list, with no AWS call).
 
 **Exits Cursor shows** as `Claude Code process exited with code N`, the last stderr line
 (`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed (nothing started;
 reopen the chat) · `5` no Touch ID in time, no sealed setup-token, or Anthropic refused it
-(`ai-env creds status`) · `7` AWS, or a VM image older than remote sessions (`make deploy`,
-which asks the user for the deployer's key) · `8` the VM is gone or unreachable (reopen the chat
-from the picker) · `9` a policy refusal: a secret or a widening setting in what the seed would
-carry (`ai-env box seed` lists the findings), a workspace that is not a git repository, or too
-many VMs (`ai-env vm list`).
+(`ai-env creds status`) · `7` AWS, or a VM image older than S9's remote sessions (the line names
+what it lacks; `make deploy`, which asks the user for the deployer's key) · `8` the VM is gone
+or unreachable (reopen the chat from the picker) · `9` a policy refusal: a secret or a widening
+setting in what the seed would carry (`ai-env box seed` lists the findings), a workspace that is
+not a git repository, too many VMs (`ai-env vm list`), the credential gate
+(`refused before any Touch ID: no credential for a vpc VM …`: the user runs the
+`ai-env egress check` (or `ai-env lab run dns-path`) the line names; since S9 a pass from
+before the check's S3 cases does not count), a chat transcript over the 64 MiB a reopen
+carries or pulls inline (the user runs the commands the line names in a terminal:
+`ai-env session stage UUID --warm`, which restores the chat into its workspace's VM, after
+`ai-env session migrate-s9 --yes` for a chat from before S9, and with `[vm] reuse_per_workspace`
+set back to true when the line says it is off), or a local resume of a remote chat's view.
 
 ## Deploying and operating the AWS side
 

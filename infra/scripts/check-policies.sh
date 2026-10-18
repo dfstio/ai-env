@@ -25,8 +25,12 @@
 # an admin-equivalent identity, not a boundary); section 8 proves every action a deny row names exists (Access
 # Analyzer), since a misspelled one would pass its row without proving anything. The proxy instance's and the
 # documents' ARNs are built here from egress-config.json, never printed, so a wrong ARN shape in policies.ts fails the
-# allowed rows. The caller's account id only lives in shell variables: nothing here writes it to a file. Read-only
-# against AWS; region always $REGION.
+# allowed rows. S9 (plans/s9-contracts.md §7.3 to §7.5): section 1 validates the two resource policies too (the
+# endpoint's as RESOURCE_POLICY, the bucket's as AWS::S3::Bucket); section 9 simulates the principal × endpoint matrix
+# of the transcript store: the runtime user, the VM's execution role (ai-env-vm-exec, whose credentials IMDS hands uid
+# 1000) and an anonymous caller, through the S3 gateway endpoint and outside it, against the endpoint's policy and the
+# bucket's beside each principal's own; and ai-env-ops' bucket reads (never an object). The caller's account id only
+# lives in shell variables: nothing here writes it to a file. Read-only against AWS; region always $REGION.
 #
 # Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, POLICIES_OUT.
 set -euo pipefail
@@ -61,9 +65,11 @@ bad=0
 while IFS=$'\t' read -r name type rtype; do
     doc=$(pp --name "$name")
     # IAM's size quotas (characters without whitespace; the printed JSON has none): a managed policy 6144, the runtime
-    # user's inline policy 2048, a role's trust policy 2048. Access Analyzer only warns; a deploy would fail.
+    # user's inline policy 2048, a role's trust policy 2048; S9's resource policies S3's and the VPC endpoint's 20480.
+    # Access Analyzer only warns; a deploy would fail.
     max=6144
     if [ "$name" = runtime ] || [ "$type" = RESOURCE_POLICY ]; then max=2048; fi
+    if [ "$name" = s3-endpoint ] || [ "$name" = transcripts-bucket ]; then max=20480; fi
     if [ "${#doc}" -gt "$max" ]; then
         printf 'size            %-16s %d characters, over the %d-character quota\n' "$name" "${#doc}" "$max" >&2
         bad=1
@@ -585,6 +591,77 @@ sim implicitDeny "deployer: share a document" "$reload_doc" - ssm:ModifyDocument
 sim implicitDeny "deployer: a group" "arn:aws:iam::$acct:group/not-ai-env" - iam:CreateGroup
 test "$failed" -eq 0 || { echo "check-policies: ai-env-deployer's five policies do not match plans/s8-operators-plan.md §1 (above)" >&2; exit 1; }
 
+# ---- 9. S9: the transcript store (contracts §7.3 to §7.5): the principal × endpoint matrix ----
+# simulate-custom-policy evaluates no VPC endpoint policy, and with a resource policy it takes an IAM user as the caller
+# only (no role, no anonymous caller). So both resource policies are simulated as identity documents without their
+# Principal, the caller named by aws:PrincipalArn in the context, as are aws:SourceVpce (through the endpoint, or not),
+# s3:ResourceAccount and aws:SecureTransport: the endpoint's alone (what it admits through itself: an Allow-only gate),
+# the bucket's (Deny only) beside what each principal holds. ai-env-vm-exec is the VM's execution role, whose
+# credentials IMDS hands uid 1000; the anonymous caller has no principal at all.
+as_identity() { node -e 'const d = JSON.parse(require("fs").readFileSync(0, "utf-8")); for (const s of d.Statement) delete s.Principal; process.stdout.write(JSON.stringify(d));'; }
+endpoint_doc=$(pp --name s3-endpoint | as_identity) || { echo "check-policies: cannot read the S3 endpoint policy" >&2; exit 1; }
+bucket_doc=$(pp --name transcripts-bucket | as_identity) || { echo "check-policies: cannot read the transcripts bucket policy" >&2; exit 1; }
+vpce=$(pp --arn s3-endpoint)
+t_bucket=$(pp --arn transcripts-bucket)
+t_vm=$(pp --arn transcripts-vm-object)
+t_mac=$(pp --arn transcripts-mac-object)
+t_check=$(pp --arn transcripts-egress-check)
+t_outside=$(pp --arn transcripts-outside-prefix)
+other_object=$(pp --arn other-bucket-object)
+al2023_object=$(pp --arn al2023-object)
+# s3ctx <principal arn or -> <endpoint|outside> [tls: true|false] [s3:prefix]: one request's context, a JSON list.
+s3ctx() {
+    local who=$1 via=$2 tls=${3:-true} prefix=${4:-} entries=() IFS=,
+    entries+=("{\"ContextKeyName\":\"s3:ResourceAccount\",\"ContextKeyValues\":[\"$acct\"],\"ContextKeyType\":\"string\"}")
+    entries+=("{\"ContextKeyName\":\"aws:SecureTransport\",\"ContextKeyValues\":[\"$tls\"],\"ContextKeyType\":\"boolean\"}")
+    if [ "$who" != - ]; then entries+=("{\"ContextKeyName\":\"aws:PrincipalArn\",\"ContextKeyValues\":[\"$who\"],\"ContextKeyType\":\"string\"}"); fi
+    if [ "$via" = endpoint ]; then entries+=("{\"ContextKeyName\":\"aws:SourceVpce\",\"ContextKeyValues\":[\"$vpce\"],\"ContextKeyType\":\"string\"}"); fi
+    if [ -n "$prefix" ]; then entries+=("{\"ContextKeyName\":\"s3:prefix\",\"ContextKeyValues\":[\"$prefix\"],\"ContextKeyType\":\"string\"}"); fi
+    printf '[%s]' "${entries[*]}"
+}
+# What the endpoint admits through itself: the runtime user's v1/* of our bucket in our account, the AL2023
+# repositories' reads; nothing else (fronting by another bucket's name or path, our bucket outside v1/, the VM's own
+# role, an anonymous caller).
+docs=("$endpoint_doc")
+sim allowed "endpoint: the runtime user's objects" "$t_vm" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject s3:GetObjectVersion s3:PutObject
+sim allowed "endpoint: the egress check's object" "$t_check" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject s3:PutObject
+sim implicitDeny "endpoint: our bucket outside v1/" "$t_outside" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject s3:PutObject
+sim implicitDeny "endpoint: another bucket (fronting)" "$other_object" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject s3:PutObject
+sim implicitDeny "endpoint: the VM's IMDS role" "$t_vm" "$(s3ctx "$exec_role" endpoint)" s3:GetObject s3:PutObject
+sim implicitDeny "endpoint: an anonymous caller" "$t_vm" "$(s3ctx - endpoint)" s3:GetObject s3:PutObject
+sim allowed "endpoint: the AL2023 repositories" "$al2023_object" "$(s3ctx - endpoint)" s3:GetObject
+sim implicitDeny "endpoint: AL2023 writes" "$al2023_object" "$(s3ctx - endpoint)" s3:PutObject
+# The bucket beside the runtime user's policy: reads and the VM's writes through the endpoint only, the Mac's writes
+# never through it, deletes either way, nothing without TLS, nothing outside v1/.
+docs=("$runtime" "$bucket_doc")
+sim allowed "bucket: runtime reads via the endpoint" "$t_vm" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject s3:GetObjectVersion
+sim allowed "bucket: runtime VM writes via the endpoint" "$t_vm" "$(s3ctx "$runtime_user" endpoint)" s3:PutObject
+sim explicitDeny "bucket: runtime Mac writes via the endpoint" "$t_mac" "$(s3ctx "$runtime_user" endpoint)" s3:PutObject
+sim explicitDeny "bucket: runtime reads outside it" "$t_vm" "$(s3ctx "$runtime_user" outside)" s3:GetObject s3:GetObjectVersion
+sim explicitDeny "bucket: runtime VM writes outside it" "$t_vm" "$(s3ctx "$runtime_user" outside)" s3:PutObject
+sim allowed "bucket: runtime Mac writes outside it" "$t_mac" "$(s3ctx "$runtime_user" outside)" s3:PutObject s3:AbortMultipartUpload s3:ListMultipartUploadParts
+sim allowed "bucket: runtime deletes" "$t_vm" "$(s3ctx "$runtime_user" outside)" s3:DeleteObject
+sim allowed "bucket: runtime lists v1/" "$t_bucket" "$(s3ctx "$runtime_user" outside true "v1/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/")" s3:ListBucket
+sim implicitDeny "bucket: runtime lists outside v1/" "$t_bucket" "$(s3ctx "$runtime_user" outside true "x/")" s3:ListBucket
+sim implicitDeny "bucket: runtime outside v1/" "$t_outside" "$(s3ctx "$runtime_user" outside)" s3:GetObject s3:PutObject
+sim explicitDeny "bucket: no TLS" "$t_vm" "$(s3ctx "$runtime_user" endpoint false)" s3:GetObject s3:PutObject s3:DeleteObject
+# The VM's execution role (its IMDS credentials) and an anonymous caller: every object read and write refused, through
+# the endpoint or not.
+docs=("$(pp --name execution)" "$bucket_doc")
+sim explicitDeny "bucket: the VM's IMDS role via the endpoint" "$t_vm" "$(s3ctx "$exec_role" endpoint)" s3:GetObject s3:PutObject
+sim explicitDeny "bucket: the VM's IMDS role outside it" "$t_mac" "$(s3ctx "$exec_role" outside)" s3:GetObject s3:PutObject
+docs=("$bucket_doc")
+sim explicitDeny "bucket: an anonymous caller via the endpoint" "$t_vm" "$(s3ctx - endpoint)" s3:GetObject s3:PutObject
+sim explicitDeny "bucket: an anonymous caller outside it" "$t_mac" "$(s3ctx - outside)" s3:GetObject s3:PutObject
+# ai-env-ops: the bucket's settings and policy for egress status, never an object.
+docs=("$(pp --proxy-instance-id "$proxy_id" --name ops)")
+sim allowed "ops: the transcripts bucket's settings" "$t_bucket" - s3:GetBucketPolicy s3:GetBucketVersioning s3:GetBucketPublicAccessBlock s3:GetBucketOwnershipControls \
+    s3:GetEncryptionConfiguration s3:GetLifecycleConfiguration
+sim allowed "ops: the VPC endpoints" "*" - ec2:DescribeVpcEndpoints
+sim implicitDeny "ops: transcript objects" "$t_vm" - s3:GetObject s3:PutObject s3:DeleteObject
+sim implicitDeny "ops: list or change the bucket" "$t_bucket" - s3:ListBucket s3:PutBucketPolicy s3:DeleteBucket
+test "$failed" -eq 0 || { echo "check-policies: the transcript store's policies do not match plans/s9-contracts.md §7.3 to §7.5 (above)" >&2; exit 1; }
+
 # ---- 8. every action a deny row names exists ----
 # simulate-custom-policy accepts invented names, so a deny row naming a misspelled action passes without proving
 # anything. Each is validated as section 1 validates the documents (its canary proved an invented name is an ERROR):
@@ -611,4 +688,4 @@ while IFS= read -r d; do
 done <<<"$chunks"
 test "$bad" -eq 0 || { echo "check-policies: a deny row names an action that does not exist (above): it passes without proving anything" >&2; exit 1; }
 printf 'validate-policy %-16s %-16s %d actions, no ERROR\n' "deny rows" IDENTITY_POLICY "$(wc -l <<<"$deny_names" | tr -d ' ')"
-echo "check-policies: ok (Access Analyzer clean of ERROR and SECURITY_WARNING; runtime policy matches §9 and S5; the proxy role holds its own parameters and log group only; the operator role creates ENIs only in the VM subnet with the VM security group, under the pinned managed policy; ai-env-ops runs the proxy's three documents and reads, nothing that deploys or widens egress; ai-env-deployer's five policies manage themselves, the ops user and the keys within their documented limits; every action a deny row names exists)"
+echo "check-policies: ok (Access Analyzer clean of ERROR and SECURITY_WARNING; runtime policy matches §9 and S5; the proxy role holds its own parameters and log group only; the operator role creates ENIs only in the VM subnet with the VM security group, under the pinned managed policy; ai-env-ops runs the proxy's three documents and reads, nothing that deploys or widens egress; ai-env-deployer's five policies manage themselves, the ops user and the keys within their documented limits; the transcript store admits the runtime user's v1/ through the endpoint only and refuses the VM's role and anonymous callers; every action a deny row names exists)"

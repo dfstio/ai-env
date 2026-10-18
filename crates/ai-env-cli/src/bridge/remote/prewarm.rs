@@ -166,6 +166,7 @@ fn decide(paths: &Paths, cfg: &BridgeConfig, cwd: &Path, pinned: bool) -> Result
     let flags = RunFlags { workspace: Some(cwd.to_path_buf()), egress: Some(Egress::Vpc), purpose: "session", wait: true, ..RunFlags::default() };
     let mut plan = RunPlan::from_cfg(cfg, &flags).map_err(|_| "config")?;
     plan.workspace_cap = true;
+    plan.transcript_cap = true;
     if !plan.reuse {
         return Err("reuse_off");
     }

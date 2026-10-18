@@ -43,7 +43,9 @@ pub const SETTINGS_NAMES: [&str; 2] = ["settings.json", "settings.local.json"];
 pub const DOTENV_EXEMPT: [&str; 4] = [".example", ".sample", ".template", ".dist"];
 /// L9: how many leading lines may carry the `AI_ENV=1` marker (the pre-commit guard's `head -32`).
 pub const MARKER_LINES: usize = 32;
-/// The most lines a finding refusal holds (the last counts what it left out).
+/// The most lines a finding refusal holds ([`finding_lines`]): up to this
+/// many findings, one line each; past it, the first `FINDINGS_MAX - 1` and a
+/// last line counting the others (`and N more finding(s)`).
 pub const FINDINGS_MAX: usize = 20;
 /// The most object ids one rule set's cache file holds; past it the file starts over with the last scan's.
 pub const CACHE_MAX: usize = 500_000;
@@ -79,6 +81,32 @@ impl ScanSet {
         let digest = rules.digest();
         let repo_settings = !workspace_cfg(cfg, ws).is_some_and(|w| w.trust_repo_settings);
         Ok(ScanSet { rules, digest, repo_settings })
+    }
+
+    /// `box review`'s scan (S9 §3), and the settings policy it judges allow
+    /// entries by (`scan::allow_beyond_policy`): the tripwires
+    /// [`ScanSet::load`] reads (so the clean cache is the seeds' and the
+    /// code-outs'), the policy `[review].settings_policy` names (empty when
+    /// that file does not exist: every new allow entry is then beyond it),
+    /// and D8's repo mode unless the deepest `[[workspace]]` whose path holds
+    /// `dir`, else `root`, sets `trust_repo_settings`. A review needs no
+    /// workspace: a repository outside the roots, or no bridge.toml at all
+    /// (`cfg` `None`: the empty `[review]`), is reviewed with the repo mode
+    /// on. A bad tripwires or policy file is exit 1 naming its line.
+    pub fn for_review(paths: &Paths, cfg: Option<&BridgeConfig>, dir: &std::path::Path, root: &std::path::Path) -> Result<(ScanSet, Vec<String>), BridgeError> {
+        let review = cfg.map(|c| c.review.clone()).unwrap_or_default();
+        let (rules, policy) = load_lists(Some((paths, &review)), None, None, true).map_err(BridgeError::Config)?;
+        let digest = rules.digest();
+        let deepest = |cfg: &BridgeConfig, p: &std::path::Path| {
+            cfg.workspace_overrides
+                .iter()
+                .filter_map(|w| std::fs::canonicalize(&w.path).ok().map(|c| (c, w.trust_repo_settings)))
+                .filter(|(c, _)| p.starts_with(c))
+                .max_by_key(|(c, _)| c.components().count())
+                .map(|(_, trust)| trust)
+        };
+        let trusted = cfg.and_then(|c| deepest(c, dir).or_else(|| deepest(c, root))).unwrap_or(false);
+        Ok((ScanSet { rules, digest, repo_settings: !trusted }, policy))
     }
 }
 
@@ -166,7 +194,8 @@ impl ScanReport {
 
     /// The refusal the findings make: `WorkspaceRefused { finding }` (exit
     /// 9), its first line the first finding, at most [`FINDINGS_MAX`] lines
-    /// (the last one then counting the rest); `None` when clean.
+    /// ([`finding_lines`]: past that many findings, the last line counts the
+    /// rest); `None` when clean.
     #[must_use]
     pub fn refusal(&self) -> Option<BridgeError> {
         if self.findings.is_empty() {
@@ -176,7 +205,10 @@ impl ScanReport {
     }
 }
 
-/// [`ScanReport::refusal`]'s message: one line per finding, at most [`FINDINGS_MAX`].
+/// [`ScanReport::refusal`]'s message (and `box review`'s): one line per
+/// finding while they are at most [`FINDINGS_MAX`]; past that, the first
+/// `FINDINGS_MAX - 1` and `and N more finding(s)`, so never more than
+/// [`FINDINGS_MAX`] lines.
 #[must_use]
 pub fn finding_lines(findings: &[Finding]) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -283,8 +315,9 @@ pub fn tree_entries(git: &GitRun, tree: &str) -> Result<Vec<TreeEntry>, BridgeEr
 
 /// Whether `name` is `want` (lowercase ASCII) as the Mac's disk compares
 /// names: APFS folds case, ASCII's and the two letters outside it that fold
-/// into it (U+017F LONG S as `s`, U+212A KELVIN SIGN as `k`).
-fn folds_to(name: &str, want: &str) -> bool {
+/// into it (U+017F LONG S as `s`, U+212A KELVIN SIGN as `k`). `box review`
+/// names cargo's files by it too.
+pub(crate) fn folds_to(name: &str, want: &str) -> bool {
     let fold = |c: char| match c {
         '\u{17f}' => 's',
         '\u{212a}' => 'k',
@@ -583,14 +616,17 @@ pub fn scan_objects(git: &GitRun, list: &[Listed], set: &ScanSet, cache: &mut Cl
 /// holds at that path is skipped (the code-out reads only what changed). A
 /// `.claude` that is a symlink is [`SETTINGS_SYMLINK`] changed or not: the
 /// settings read through it are not at a path this scan reads. A gitlink is
-/// noted (a submodule is never carried). Nothing when the workspace trusts
-/// its repo settings, but the notes.
+/// noted (a submodule is never carried), its path as [`shown_path`] shows
+/// it, scrubbed. Nothing when the workspace trusts its repo settings, but
+/// the notes.
 pub fn scan_settings(git: &GitRun, trees: &[(String, Vec<TreeEntry>)], set: &ScanSet, unchanged: &dyn Fn(&TreeEntry) -> bool, report: &mut ScanReport) -> Result<(), BridgeError> {
     let mut read: BTreeSet<(String, String)> = BTreeSet::new();
     for (label, entries) in trees {
         for e in entries {
             if e.mode == "160000" {
-                let note = format!("{} is a submodule: not carried", e.path);
+                // The path as the other notes name theirs: shown, then scrubbed alone (a bare k=v value runs to the
+                // line's end, so a scrub of the whole note would mask the rest of it).
+                let note = format!("{} is a submodule: not carried", scrub(&shown_path(set, &e.path)));
                 if !report.notes.contains(&note) {
                     report.notes.push(note);
                 }
@@ -618,7 +654,10 @@ pub fn scan_settings(git: &GitRun, trees: &[(String, Vec<TreeEntry>)], set: &Sca
             let mut findings = Vec::new();
             read_objects(git, std::slice::from_ref(&e.id), |_, bytes| findings = settings_findings_mode(name, bytes, &[], SettingsMode::Repo))?;
             for f in findings {
-                report.findings.push(Finding { location: at(), object: Some(short(&e.id)), line: f.line, rule: f.rule.to_string(), key: Some(f.key).filter(|k| !k.is_empty()) });
+                // A key path that trips a tripwire (a token as a JSON key) is never shown, nor one cut short (a cut can
+                // leave part of a token that no longer matches): the seed's, the code-out's and the review's reports.
+                let key = Some(f.key).filter(|k| !k.is_empty() && !k.ends_with('\u{2026}') && set.rules.scan_bytes(k.as_bytes()).is_empty());
+                report.findings.push(Finding { location: at(), object: Some(short(&e.id)), line: f.line, rule: f.rule.to_string(), key });
             }
         }
     }
@@ -694,5 +733,60 @@ mod tests {
         assert_eq!(tree_names(&bytes, 20), all);
         assert_eq!(tree_names(&bytes[..bytes.len() - 5], 20), all, "the last id cut: its name was read");
         assert!(tree_names(b"100644 x", 20).is_empty());
+    }
+
+    /// F6: a refusal holds at most 20 lines. Twenty findings are all named;
+    /// past twenty, the first 19 and a last line counting the others.
+    #[test]
+    fn findings_max_is_twenty_lines_the_last_counting_the_rest() {
+        assert_eq!(FINDINGS_MAX, 20);
+        let found = |n: usize| -> Vec<Finding> { (1..=n).map(|i| Finding { location: format!("HEAD:f{i}.txt"), object: None, line: i, rule: "aws-access-key-id".into(), key: None }).collect() };
+        let twenty = finding_lines(&found(20));
+        assert_eq!(twenty.lines().count(), 20);
+        assert_eq!(twenty.lines().last(), Some("HEAD:f20.txt line 20: rule aws-access-key-id"), "twenty: every one named");
+        let more = finding_lines(&found(25));
+        let lines: Vec<&str> = more.lines().collect();
+        assert_eq!(lines.len(), 20);
+        assert_eq!(lines[18], "HEAD:f19.txt line 19: rule aws-access-key-id");
+        assert_eq!(lines[19], "and 6 more finding(s)");
+        assert_eq!(finding_lines(&found(21)).lines().last(), Some("and 2 more finding(s)"));
+        assert_eq!(finding_lines(&[]), "");
+        let refusal = ScanReport { findings: found(25), ..ScanReport::default() }.refusal().unwrap().to_string();
+        assert_eq!(refusal.lines().count(), 20, "{refusal}");
+    }
+
+    /// `box review`'s set: the policy file's allow lines, the tripwires the
+    /// seeds read, and the repo mode unless the deepest `[[workspace]]`
+    /// holding the repository trusts its settings (none, or no bridge.toml:
+    /// on); a bad policy line is an error naming the file and the line.
+    #[test]
+    fn the_review_set_loads_the_policy_and_honours_a_trusting_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let paths = Paths::from_root_and_env(root.join("bridge"), None);
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let (repo, other) = (root.join("work/app"), root.join("elsewhere/app"));
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let (set, policy) = ScanSet::for_review(&paths, None, &repo, &repo).unwrap();
+        assert!(set.repo_settings && policy.is_empty());
+        assert_eq!(set.digest, Rules::defaults().digest(), "the built-ins alone without the files");
+        std::fs::write(paths.root.join("settings-policy.txt"), "# reviewed\nallow Bash(npm test:*)\n").unwrap();
+        std::fs::write(paths.root.join("tripwires.txt"), "INTERNAL-[0-9]{4}\n").unwrap();
+        let s = |p: &std::path::Path| format!("{:?}", p.display().to_string());
+        let text = format!("[workspaces]\nroots = [{}]\n\n[[workspace]]\npath = {}\ntrust_repo_settings = true\n\n[[workspace]]\npath = {}\n", s(&root.join("work")), s(&repo), s(&repo.join("sub")));
+        let cfg = BridgeConfig::parse(&text).unwrap();
+        let (set, policy) = ScanSet::for_review(&paths, Some(&cfg), &repo, &repo).unwrap();
+        assert!(!set.repo_settings, "the workspace trusts its repo settings");
+        assert_eq!(policy, ["Bash(npm test:*)"]);
+        assert_eq!(set.rules.ids().last(), Some("tripwire:1"));
+        assert_eq!(set.digest, set.rules.digest());
+        let (set, _) = ScanSet::for_review(&paths, Some(&cfg), &repo.join("sub"), &repo).unwrap();
+        assert!(set.repo_settings, "the deepest [[workspace]] decides");
+        let (set, _) = ScanSet::for_review(&paths, Some(&cfg), &other, &other).unwrap();
+        assert!(set.repo_settings, "outside every [[workspace]]");
+        std::fs::write(paths.root.join("settings-policy.txt"), "alow x\n").unwrap();
+        let e = ScanSet::for_review(&paths, Some(&cfg), &repo, &repo).unwrap_err().to_string();
+        assert!(e.contains("settings-policy.txt:1: expected `allow <entry>`"), "{e}");
     }
 }

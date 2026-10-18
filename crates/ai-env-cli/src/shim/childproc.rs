@@ -7,6 +7,10 @@
 //! Everything a child runs between fork and exec is prepared before the
 //! fork ([`cwd_parts`], [`fd_walk_end`]): [`child_setup`] only makes
 //! async-signal-safe calls on that data and allocates nothing.
+//!
+//! S9: curl, which moves the transcript store's bytes ([`spawn_curl`]),
+//! starts through the same setup as `ai-env-net` (uid and gid 999), in `/`,
+//! its configuration (the presigned URL in it) on fd 3 alone.
 use std::ffi::CString;
 use std::io;
 
@@ -148,9 +152,122 @@ pub(crate) fn cwd_parts(path: &[u8]) -> Result<Vec<CString>, String> {
     parts.into_iter().map(|p| CString::new(p).map_err(|_| "holds a NUL byte".to_string())).collect()
 }
 
+// ---- curl (S9) -----------------------------------------------------------------------------
+
+/// curl's `PATH` (its environment is otherwise cleared).
+const CURL_PATH: &str = "/usr/bin:/bin";
+/// The argv after the program: no `.curlrc` (`-q`, first), the configuration from fd 3.
+pub(crate) const CURL_ARGS: [&str; 3] = ["-q", "-K", "/dev/fd/3"];
+
+/// A close-on-exec pipe already holding `bytes`, its write end closed: the
+/// read end, for a child's fd 3. `bytes` fits the pipe's buffer (a curl
+/// configuration is a few KiB), so the write never waits for a reader.
+fn preloaded_pipe(bytes: &[u8]) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    #[cfg(target_os = "linux")]
+    // SAFETY: `fds` is an array of two ints for pipe2 to fill.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: as above.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both fds were just created and belong to nobody else.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    #[cfg(not(target_os = "linux"))]
+    for fd in [&read, &write] {
+        // SAFETY: a valid fd we own.
+        if unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    io::Write::write_all(&mut std::fs::File::from(write), bytes)?;
+    Ok(read)
+}
+
+/// curl for the transcript store's transfers (S9 §3.4): `program -q -K
+/// /dev/fd/3`, as `ids` (uid, gid: `ai-env-net`) when given, its environment
+/// `PATH` and `LC_ALL` alone, its stdin, stdout and stderr pipes to the root
+/// shim, and its configuration (`config`: the presigned URL is in it) on
+/// fd 3 from a pipe that already holds it whole: never an argv, an
+/// environment or a file, and fd 3 is a descriptor the agent (uid 1000)
+/// cannot open in another uid's process. With `ids` the pipe is theirs
+/// (0600): curl opens `/dev/fd/3` anew, which checks the pipe's own inode,
+/// and a pipe belongs to its maker, the root shim. Started through
+/// [`child_setup`] in `/`: setsid, NO_NEW_PRIVS, the signal dispositions,
+/// every other descriptor from 3 close-on-exec. Killed when dropped.
+pub(crate) fn spawn_curl(program: &std::path::Path, ids: Option<(u32, u32)>, config: &[u8]) -> io::Result<tokio::process::Child> {
+    use std::os::fd::AsRawFd as _;
+    use std::process::Stdio;
+    let pipe = preloaded_pipe(config)?;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(CURL_ARGS).env_clear().env("PATH", CURL_PATH).env("LC_ALL", "C").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    if let Some((uid, gid)) = ids {
+        // SAFETY: fchown(2) on the pipe's read end, a valid fd this function owns.
+        if unsafe { libc::fchown(pipe.as_raw_fd(), uid, gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        cmd.gid(gid);
+        cmd.uid(uid);
+    }
+    let (fd, fd_walk) = (pipe.as_raw_fd(), fd_walk_end());
+    // SAFETY: the closure runs in the forked child, after std applied the
+    // stdio and the uid/gid, before exec; it makes only async-signal-safe
+    // calls on data prepared here (no allocation, no lock).
+    unsafe {
+        cmd.pre_exec(move || child_setup(&[], Some(fd), fd_walk));
+    }
+    let spawned = {
+        #[cfg(test)]
+        let _fork = crate::test_locks::forking();
+        cmd.spawn()
+    };
+    // The parent's read end: the child has its own on fd 3.
+    drop(pipe);
+    spawned
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// curl's start (S9 §3.4), with a script for the program: its argv is
+    /// exactly `-q -K /dev/fd/3`, fd 3 holds the configuration and is its
+    /// only descriptor past stderr, its environment is `PATH` and `LC_ALL`,
+    /// its working directory `/`, its session its own; stdin and stdout are
+    /// the caller's pipes.
+    #[tokio::test]
+    async fn curl_starts_with_its_config_on_fd_3_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("curl");
+        let body = "fds=''\nfor n in $(seq 3 63); do [ -e /dev/fd/$n ] && fds=\"$fds$n,\"; done\nvars=$(env | cut -d= -f1 | grep -v -e '^PWD$' -e '^SHLVL$' -e '^_$' -e '^OLDPWD$' | sort | tr '\\n' ,)\nsid=$(ps -o sess= -p $$ 2>/dev/null | tr -d ' ')\nprintf 'argv=%s|fds=%s|vars=%s|cwd=%s|leader=%s\\n' \"$*\" \"$fds\" \"$vars\" \"$(pwd)\" \"$([ \"$sid\" = $$ ] && echo yes || echo no)\"\ncat <&3\ncat\n";
+        std::fs::write(&script, format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warmed = {
+            let _fork = crate::test_locks::forking();
+            std::process::Command::new(&script).arg("warm").status().unwrap()
+        };
+        assert!(warmed.success());
+        let config = "url = \"https://example.invalid/k\"\nsilent\n";
+        let mut child = spawn_curl(&script, None, config.as_bytes()).unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"from stdin\n").await.unwrap();
+        drop(stdin);
+        let mut out = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut out).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let mut lines = out.lines();
+        let facts = lines.next().unwrap();
+        assert!(facts.starts_with("argv=-q -K /dev/fd/3|fds=3,|vars=LC_ALL,PATH,|cwd=/|"), "{facts}");
+        if cfg!(target_os = "linux") || facts.ends_with("leader=yes") {
+            assert!(facts.ends_with("leader=yes"), "its own session: {facts}");
+        }
+        assert_eq!(lines.collect::<Vec<_>>(), ["url = \"https://example.invalid/k\"", "silent", "from stdin"], "fd 3's configuration, then stdin");
+    }
 
     #[test]
     fn cwd_rules() {

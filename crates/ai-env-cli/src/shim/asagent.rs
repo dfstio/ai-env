@@ -22,11 +22,15 @@
 //! last seed's record (in memory, so it survives a suspend), and the lock
 //! that serialises seed, code-out and snapshot (a request waits at most
 //! `budget::BUSY_WAIT`, then 409 `busy` with `Retry-After`); and the answers
-//! the routes give (`refused`, `answered`).
+//! the routes give (`refused`, `answered`). S9's git CGI (`gitcgi`) takes no
+//! lock, only one of its own two slots ([`WorkspaceSlot::try_cgi`]), and
+//! reads its helper's output past the head as a CGI's
+//! ([`AgentProc::read_cgi_head`], [`AgentProc::into_stream`]).
 use crate::shim::childproc::{child_setup, cwd_parts, fd_walk_end, CWD_ERRNO_BASE};
 use crate::shim::health::ShimState;
 use crate::shim::spawn::{killpg, wait_exited, HelperHold};
 use crate::wire::workspace::{budget, parse_head, read_head_line_async, refusal, head_line, HelperHead, SeedRecord, SnapshotReply, WorkspaceView, WsRefusal, HEAD_LINE_MAX};
+use crate::wire::workspace::{GIT_CGI_HEADERS, GIT_CGI_HEAD_MAX, GIT_CGI_MAX};
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -55,8 +59,8 @@ pub const STREAM_RATE: u64 = 1_000_000;
 pub const KILL_AFTER: Duration = Duration::from_secs(2);
 /// A body's run given up (its budget passed, the feed cut, so its stdin is
 /// closed): how long the helper has to end by itself before TERM. Its EOF
-/// path takes milliseconds and removes what it wrote (a transcript put's
-/// temp file); a helper that ends sooner is reaped at once.
+/// path takes milliseconds and removes what it wrote (a seed's or a
+/// transcript write's temp file); a helper that ends sooner is reaped at once.
 pub const EOF_GRACE: Duration = Duration::from_millis(500);
 /// A 409 `busy`'s `Retry-After`, in seconds.
 pub const RETRY_AFTER_S: u64 = 5;
@@ -318,54 +322,103 @@ impl AgentProc {
     }
 
     /// The payload after the head: `prefix`, then exactly `len` bytes of
-    /// stdout, as a response body. The run is finished (off the body's
-    /// path: the client has every byte) from the read that brings its last
-    /// byte: a body with a `Content-Length` is never polled past it. The
-    /// deadline is extended for the transfer; `keep` (the workspace's lock)
-    /// is held until the run ended; a body dropped early ends the run.
+    /// stdout, as a response body. A task of its own reads the helper
+    /// ([`payload_pump`]) and hands the body each chunk, so the run's
+    /// deadline holds whether or not the client reads (a client that stops
+    /// reading leaves the body unpolled): the run is finished (off the
+    /// body's path) from the read that brings its last byte, the deadline
+    /// is extended for the transfer, `keep` (the workspace's lock) is held
+    /// until the run ended; a body dropped early, or a chunk the client has
+    /// not taken by the deadline, ends the run.
     pub fn into_body(mut self, prefix: Vec<u8>, len: u64, keep: Option<SlotGuard>) -> Body {
         self.extend(transfer(len));
-        struct Feed {
-            proc: Option<AgentProc>,
-            left: u64,
-            keep: Option<SlotGuard>,
-        }
-        let rest = futures_util::stream::unfold(Feed { proc: Some(self), left: len, keep }, |mut f| async move {
-            let mut proc = f.proc.take()?;
-            if f.left == 0 {
-                // No payload at all.
-                finish_after(proc, f.keep.take());
-                return None;
-            }
-            let want = usize::try_from(f.left).unwrap_or(CHUNK).min(CHUNK);
-            let mut buf = vec![0u8; want];
-            let read = tokio::time::timeout_at(proc.deadline, proc.stdout.read(&mut buf)).await;
-            match read {
-                Ok(Ok(n)) if n > 0 => {
-                    buf.truncate(n);
-                    f.left -= n as u64;
-                    if f.left == 0 {
-                        finish_after(proc, f.keep.take());
-                    } else {
-                        f.proc = Some(proc);
-                    }
-                    Some((Ok(Bytes::from(buf)), f))
-                }
-                other => {
-                    let why = match other {
-                        Ok(Ok(_)) => io::Error::new(io::ErrorKind::UnexpectedEof, "the helper's payload ended early"),
-                        Ok(Err(e)) => e,
-                        Err(_) => io::Error::new(io::ErrorKind::TimedOut, "the helper's payload outlived its budget"),
-                    };
-                    errln!("ai-env: workspace {} payload cut: {why}", proc.op);
-                    proc.stop().await;
-                    drop(f.keep.take());
-                    Some((Err(why), f))
-                }
-            }
-        });
-        Body::from_stream(futures_util::stream::once(async move { Ok::<_, io::Error>(Bytes::from(prefix)) }).chain(rest))
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(payload_pump(self, len, keep, tx));
+        Body::from_stream(futures_util::stream::once(async move { Ok::<_, io::Error>(Bytes::from(prefix)) }).chain(piped(rx, Some(len))))
     }
+}
+
+/// What a pump hands its response body.
+enum Piece {
+    Data(Bytes),
+    /// The body is whole: its end (a chunked body's last chunk) follows.
+    End,
+    /// The run was cut: the body ends in this error (a chunked body without its last chunk).
+    Cut(io::Error),
+}
+
+/// A pump's pieces as a response body's stream: each chunk as it comes;
+/// `End` ends it; a cut, or the channel closed without `End`, ends it in
+/// error, unless `len` bytes were due and all came (a body with its
+/// length is whole then, and never polled past it).
+fn piped(rx: tokio::sync::mpsc::Receiver<Piece>, len: Option<u64>) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> + Send {
+    futures_util::stream::unfold(Some((rx, 0u64)), move |state| async move {
+        let (mut rx, got) = state?;
+        match rx.recv().await {
+            Some(Piece::Data(b)) => {
+                let got = got + b.len() as u64;
+                Some((Ok(b), Some((rx, got))))
+            }
+            Some(Piece::End) => None,
+            Some(Piece::Cut(e)) => Some((Err(e), None)),
+            None if len == Some(got) => None,
+            None => Some((Err(io::Error::other("the helper's stream was cut")), None)),
+        }
+    })
+}
+
+/// A run's error: its deadline passed with the body's last chunk untaken or its stdout unread.
+fn outlived(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, format!("the {what} outlived its budget"))
+}
+
+/// [`AgentProc::into_body`]'s task: `len` bytes of the helper's stdout to
+/// `tx`, chunk by chunk, each read and each hand-over within the deadline,
+/// the body's drop watched while reading. Once the last byte is read the
+/// run is finished off the body's path ([`finish_after`]), then `keep`
+/// goes; anything else (an early EOF, a read error, the deadline, the body
+/// dropped) ends the run now, then `keep` goes, and the body ends in error.
+async fn payload_pump(mut proc: AgentProc, len: u64, keep: Option<SlotGuard>, tx: tokio::sync::mpsc::Sender<Piece>) {
+    let (op, deadline) = (proc.op, proc.deadline);
+    let mut left = len;
+    let why = loop {
+        if left == 0 {
+            // No payload at all.
+            finish_after(proc, keep);
+            return;
+        }
+        let want = usize::try_from(left).unwrap_or(CHUNK).min(CHUNK);
+        let mut buf = vec![0u8; want];
+        let read = tokio::select! {
+            biased;
+            () = tx.closed() => break io::Error::other("the response body was dropped"),
+            r = tokio::time::timeout_at(deadline, proc.stdout.read(&mut buf)) => r,
+        };
+        match read {
+            Ok(Ok(n)) if n > 0 => {
+                buf.truncate(n);
+                left -= n as u64;
+                if left == 0 {
+                    // The client gets every byte whatever the run does now: it is finished off the body's path.
+                    finish_after(proc, keep);
+                    let _ = tokio::time::timeout_at(deadline, tx.send(Piece::Data(Bytes::from(buf)))).await;
+                    return;
+                }
+                match tokio::time::timeout_at(deadline, tx.send(Piece::Data(Bytes::from(buf)))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break io::Error::other("the response body was dropped"),
+                    Err(_) => break outlived("helper's payload"),
+                }
+            }
+            Ok(Ok(_)) => break io::Error::new(io::ErrorKind::UnexpectedEof, "the helper's payload ended early"),
+            Ok(Err(e)) => break e,
+            Err(_) => break outlived("helper's payload"),
+        }
+    };
+    errln!("ai-env: workspace {op} payload cut: {why}");
+    proc.stop().await;
+    drop(keep);
+    let _ = tx.try_send(Piece::Cut(why));
 }
 
 /// Finish `proc` off the body's path (the client has every byte), then let `keep` go.
@@ -459,6 +512,458 @@ async fn finish_head<T: DeserializeOwned>(mut proc: AgentProc) -> Result<HelperH
             proc.stop().await;
             Err(e)
         }
+    }
+}
+
+// ---- the git CGI's head and stream (S9) ----------------------------------------------------
+
+/// The longest value of a CGI header the root shim passes on (S9 §1.3).
+pub const CGI_VALUE_MAX: usize = 1024;
+
+/// What the root shim passes on of a CGI's header block (S9 §1.3): the
+/// `GIT_CGI_HEADERS` it names, each as the CGI gave it, in its order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgiHead {
+    pub headers: Vec<(axum::http::HeaderName, HeaderValue)>,
+}
+
+/// RFC 9110's `tchar`: what a header's name is made of.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// A CGI's header block (its lines ended by LF or CRLF, up to the first
+/// blank one) as the root shim takes it: every line a `name: value` whose
+/// name is a token (no folded line), a `Status` that is absent or 200, and
+/// each of `GIT_CGI_HEADERS` at most once with a value of at most
+/// [`CGI_VALUE_MAX`] bytes and no control character. Those are kept, every
+/// other header dropped. `Err` says why the block is refused: the route
+/// answers 500 `git_failed`, never the CGI's own status (a CGI 403 would make
+/// the Mac re-mint its token).
+pub fn parse_cgi_head(block: &[u8]) -> Result<CgiHead, String> {
+    let mut head = CgiHead::default();
+    let mut status = false;
+    for raw in block.split_inclusive(|b| *b == b'\n') {
+        // What follows the last LF is no line: the block ended before its blank line.
+        let Some(line) = raw.strip_suffix(b"\n") else { break };
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return Ok(head);
+        }
+        let Some(colon) = line.iter().position(|b| *b == b':') else { return Err("has a line that is no header".into()) };
+        let (name, value) = (&line[..colon], line[colon + 1..].trim_ascii());
+        if name.is_empty() || !name.iter().all(|b| is_tchar(*b)) {
+            return Err("has a header name that is no token (or a folded line)".into());
+        }
+        if name.eq_ignore_ascii_case(b"status") {
+            if std::mem::replace(&mut status, true) {
+                return Err("names its status twice".into());
+            }
+            if value.split(|b| *b == b' ').next() != Some(&b"200"[..]) {
+                return Err(format!("answered status {}", String::from_utf8_lossy(&value[..value.len().min(64)])));
+            }
+            continue;
+        }
+        let Some(known) = GIT_CGI_HEADERS.iter().find(|h| name.eq_ignore_ascii_case(h.as_bytes())) else { continue };
+        if value.len() > CGI_VALUE_MAX || value.iter().any(u8::is_ascii_control) {
+            return Err(format!("gives {known} a value over {CGI_VALUE_MAX} bytes or with a control character"));
+        }
+        let name = axum::http::HeaderName::from_static(known);
+        if head.headers.iter().any(|(n, _)| *n == name) {
+            return Err(format!("names {known} twice"));
+        }
+        let value = HeaderValue::from_bytes(value).map_err(|_| format!("gives {known} a value that is no header value"))?;
+        head.headers.push((name, value));
+    }
+    Err("ends before its blank line".into())
+}
+
+impl AgentProc {
+    /// The CGI's header block after the head (S9 §1.3: `git-cgi` copies
+    /// http-backend's output past its own head), within the deadline: at
+    /// most `GIT_CGI_HEAD_MAX` bytes up to its blank line, as
+    /// [`parse_cgi_head`] takes it. A block over the cap, cut short or
+    /// refused is [`AgentProcError::BadHead`]; a helper that ended before its
+    /// block did and failed, [`AgentProcError::Exit`]. What follows the
+    /// block stays for [`AgentProc::into_stream`].
+    pub async fn read_cgi_head(&mut self) -> Result<CgiHead, AgentProcError> {
+        use tokio::io::AsyncBufReadExt as _;
+        let deadline = self.deadline;
+        let stdout = &mut self.stdout;
+        let read = async move {
+            let mut block = Vec::new();
+            loop {
+                let start = block.len();
+                if start >= GIT_CGI_HEAD_MAX {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("is over {GIT_CGI_HEAD_MAX} bytes")));
+                }
+                let left = u64::try_from(GIT_CGI_HEAD_MAX - start).unwrap_or(0);
+                if (&mut *stdout).take(left).read_until(b'\n', &mut block).await? == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ended before its blank line"));
+                }
+                // A line the cap cut is caught above; one cut by EOF, by the next read.
+                if matches!(&block[start..], b"\n" | b"\r\n") {
+                    return Ok(block);
+                }
+            }
+        };
+        match tokio::time::timeout_at(deadline, read).await {
+            Err(_) => Err(AgentProcError::Timeout),
+            Ok(Ok(block)) => parse_cgi_head(&block).map_err(|why| AgentProcError::BadHead(format!("the CGI's head {why}"))),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                let status = self.reap().await?;
+                if status.success() {
+                    return Err(AgentProcError::BadHead(format!("the CGI's head {e}")));
+                }
+                Err(AgentProcError::Exit { code: status.code(), stderr: self.stderr_line().await })
+            }
+            Ok(Err(e)) => Err(AgentProcError::BadHead(format!("the CGI's head {e}"))),
+        }
+    }
+
+    /// The CGI's body after its header block (S9 §1.3) as a response body:
+    /// no length is known, so it goes out chunked, to the helper's EOF,
+    /// within the deadline (never extended: the route's budget counts from
+    /// the request) and at most `cap` bytes. A task of its own reads the
+    /// helper ([`cgi_pump`]), so the deadline, the cap and the release of
+    /// the run hold whether or not the client reads (one that stops reading
+    /// leaves the body unpolled, and hyper only flushes then). It ends only
+    /// once the helper has exited 0; past the cap or the deadline (a chunk
+    /// the client has not taken by then too), or on any other exit, it ends
+    /// with an error, which leaves the chunked body without its last chunk:
+    /// a cut pack never looks complete. `keep` (the CGI's slot) is held
+    /// until the run ended; a body dropped early ends the run at once.
+    pub fn into_stream(self, cap: u64, keep: Option<CgiSlot>) -> Body {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(cgi_pump(self, cap, keep, tx));
+        Body::from_stream(piped(rx, None))
+    }
+}
+
+/// [`AgentProc::into_stream`]'s task: the helper's stdout to `tx` to its
+/// EOF, each read and each hand-over within the deadline, at most `cap`
+/// bytes, the body's drop watched while reading. At EOF the run is
+/// finished: exit 0 lets `keep` go and ends the body whole, any other exit
+/// ends it in error (`finish` reaped it already). Past the cap or the
+/// deadline, on a read error or the body dropped, the run is ended now,
+/// then `keep` goes, and the body ends in error.
+async fn cgi_pump(mut proc: AgentProc, cap: u64, keep: Option<CgiSlot>, tx: tokio::sync::mpsc::Sender<Piece>) {
+    let (op, deadline) = (proc.op, proc.deadline);
+    let mut sent = 0u64;
+    let why = loop {
+        if Instant::now() >= deadline {
+            break outlived("CGI's body");
+        }
+        let mut buf = vec![0u8; CHUNK];
+        let read = tokio::select! {
+            biased;
+            () = tx.closed() => break io::Error::other("the response body was dropped"),
+            r = tokio::time::timeout_at(deadline, proc.stdout.read(&mut buf)) => r,
+        };
+        match read {
+            Ok(Ok(0)) => {
+                let why = match proc.finish().await {
+                    Ok(()) => {
+                        drop(keep);
+                        let _ = tokio::time::timeout_at(deadline, tx.send(Piece::End)).await;
+                        return;
+                    }
+                    Err(e) => io::Error::other(format!("the helper failed after the CGI's head: {}", e.refusal(op).message)),
+                };
+                errln!("ai-env: workspace {op} stream cut: {why}");
+                drop(keep);
+                // A full channel loses this piece: the body then sees the channel close without its end, an error too.
+                let _ = tx.try_send(Piece::Cut(why));
+                return;
+            }
+            Ok(Ok(n)) if sent + n as u64 <= cap => {
+                sent += n as u64;
+                buf.truncate(n);
+                match tokio::time::timeout_at(deadline, tx.send(Piece::Data(Bytes::from(buf)))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break io::Error::other("the response body was dropped"),
+                    Err(_) => break outlived("CGI's body"),
+                }
+            }
+            Ok(Ok(_)) => break io::Error::other(format!("the CGI's body passed {cap} bytes")),
+            Ok(Err(e)) => break e,
+            Err(_) => break outlived("CGI's body"),
+        }
+    };
+    errln!("ai-env: workspace {op} stream cut: {why}");
+    proc.stop().await;
+    drop(keep);
+    let _ = tx.try_send(Piece::Cut(why));
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod cgi_tests {
+    use super::*;
+    use crate::shim::health::{ProbeSpec, ShimOpts};
+    use crate::shim::sys::RealSys;
+    use crate::wire::workspace::GitCgiReply;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// The helper's own head, as `git-cgi` writes it before the CGI's output.
+    const HEAD: &str = r#"{"ok":true,"reply":{"object_format":"sha1","git_version":"2.50.1"}}"#;
+
+    fn home() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let p = std::fs::canonicalize(t.path()).unwrap();
+        (t, p)
+    }
+
+    /// A shim whose helper is the script `body` (run once first, as
+    /// `tests::shim`'s: macOS assesses a new executable at its first exec),
+    /// its home `dir`.
+    fn shim(dir: &Path, name: &str, body: &str) -> Arc<ShimState> {
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warmed = {
+            let _fork = crate::test_locks::forking();
+            std::process::Command::new(&script).arg("warm").status().unwrap()
+        };
+        assert!(warmed.success());
+        let opts = ShimOpts { helper: Some(script), home: dir.to_path_buf(), ..ShimOpts::default() };
+        Arc::new(ShimState::with(PathBuf::from("/nonexistent/claude"), opts, ProbeSpec::default(), Arc::new(RealSys)))
+    }
+
+    /// One `GET /` of a server whose answer is the helper's CGI body (its
+    /// head and its header block read first, the four headers passed on),
+    /// streamed with `cap` under `budget`, one of the shim's CGI slots held:
+    /// the raw response, read to the server's close.
+    async fn served(state: Arc<ShimState>, budget: Duration, cap: u64) -> Vec<u8> {
+        let addr = serve_cgi(state, budget, cap).await;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), s.read_to_end(&mut got)).await.expect("the server closes within 30 s").unwrap();
+        got
+    }
+
+    /// A server whose `GET /` answers as [`served`] reads it: its address.
+    async fn serve_cgi(state: Arc<ShimState>, budget: Duration, cap: u64) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let state = state.clone();
+                async move {
+                    let cmd = AgentCmd { op: "git-cgi", args: Vec::new(), budget, stdin: false, during_stop: false };
+                    let mut proc = AgentProc::start(&state, cmd).await.unwrap();
+                    assert!(proc.head::<GitCgiReply>().await.unwrap().ok);
+                    let cgi = proc.read_cgi_head().await.unwrap();
+                    let mut res = Response::new(proc.into_stream(cap, state.workspace.try_cgi()));
+                    for (name, value) in cgi.headers {
+                        res.headers_mut().insert(name, value);
+                    }
+                    res
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// A chunked response's head (lowercase), its body's bytes, and whether
+    /// the body ended with its last chunk.
+    fn chunked(raw: &[u8]) -> (String, Vec<u8>, bool) {
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a head") + 4;
+        let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+        let (mut rest, mut body) = (&raw[end..], Vec::new());
+        loop {
+            let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else { return (head, body, false) };
+            let size = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap().trim(), 16).unwrap();
+            rest = &rest[nl + 2..];
+            if size == 0 {
+                return (head, body, rest == b"\r\n");
+            }
+            if rest.len() < size + 2 {
+                body.extend_from_slice(&rest[..rest.len().min(size)]);
+                return (head, body, false);
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// Until every CGI slot is free again and no helper runs (at most 10 s).
+    async fn idle(state: &ShimState) {
+        if let Err(why) = idle_within(state, Duration::from_secs(10)).await {
+            panic!("{why}");
+        }
+    }
+
+    /// Until every CGI slot is free again and no helper runs, at most `within`; else what is still held.
+    async fn idle_within(state: &ShimState, within: Duration) -> Result<(), String> {
+        let until = std::time::Instant::now() + within;
+        loop {
+            let slots: Vec<CgiSlot> = (0..GIT_CGI_MAX).filter_map(|_| state.workspace.try_cgi()).collect();
+            if slots.len() == GIT_CGI_MAX && state.spawns.helpers() == 0 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= until {
+                return Err(format!("slots free {}, helpers {} after {within:?}", slots.len(), state.spawns.helpers()));
+            }
+            drop(slots);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `GET /` sent to `addr`, then the response read up to its head's end
+    /// and on until its bytes hold `until`: the open stream and what was read.
+    async fn read_up_to(addr: std::net::SocketAddr, until: &[u8]) -> (tokio::net::TcpStream, Vec<u8>) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 256];
+        while !(got.windows(4).any(|w| w == b"\r\n\r\n") && got.windows(until.len()).any(|w| w == until)) {
+            let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await.expect("the answer within 10 s").unwrap();
+            assert!(n > 0, "the server closed early: {}", String::from_utf8_lossy(&got));
+            got.extend_from_slice(&buf[..n]);
+        }
+        (s, got)
+    }
+
+    /// S9 phase 4 (CGI-1): a client that reads the head and then stops
+    /// reading, its socket open (the body unpolled: hyper only flushes),
+    /// never holds the run past its budget. The helper writing 16 MiB (more
+    /// than any socket buffer takes) under a 2 s budget is ended, its slot
+    /// and its hold freed within the budget and the kill's grace, the
+    /// client still connected.
+    #[tokio::test]
+    async fn a_stalled_reader_never_holds_the_run_past_its_budget() {
+        let (_t, dir) = home();
+        let big = shim(&dir, "big", &format!("printf '%s\\n' '{HEAD}'\nprintf 'Content-Type: application/x-git-upload-pack-result\\r\\n\\r\\n'\ndd if=/dev/zero bs=65536 count=256 2>/dev/null\nexit 0\n"));
+        let t = std::time::Instant::now();
+        let addr = serve_cgi(big.clone(), Duration::from_secs(2), 1 << 30).await;
+        let (stalled, _) = read_up_to(addr, b"\r\n\r\n").await;
+        let freed = idle_within(&big, Duration::from_secs(2) + KILL_AFTER + Duration::from_secs(1)).await;
+        assert!(freed.is_ok(), "{freed:?} at {:?}, the client still connected", t.elapsed());
+        drop(stalled);
+    }
+
+    /// S9 phase 4 (CGI-1): a body dropped early (the client closed after the
+    /// first bytes) ends the run at once, the helper still sleeping and
+    /// far from its 20 s budget: its slot and its hold freed within 5 s.
+    #[tokio::test]
+    async fn a_dropped_body_ends_the_run_at_once() {
+        let (_t, dir) = home();
+        let slow = shim(&dir, "partial", &format!("printf '%s\\n' '{HEAD}'\nprintf 'Content-Type: application/x-git-upload-pack-result\\r\\n\\r\\n'\nprintf 'partial'\nsleep 30\n"));
+        let addr = serve_cgi(slow.clone(), Duration::from_secs(20), 1 << 20).await;
+        let (closed, _) = read_up_to(addr, b"partial").await;
+        drop(closed);
+        let freed = idle_within(&slow, Duration::from_secs(5)).await;
+        assert!(freed.is_ok(), "{freed:?}");
+    }
+
+    /// The CGI's body streams chunked (no length) to the helper's EOF and
+    /// gets its last chunk only once the helper exited 0. A helper that
+    /// exits non-zero after its head and part of the body, a body past the
+    /// cap and one past the deadline each end the stream with an error: the
+    /// bytes sent so far, then no last chunk, so a cut pack never looks
+    /// complete. The run's slot and its helper count go with it every time.
+    #[tokio::test]
+    async fn a_stream_after_a_failed_exit_ends_in_error() {
+        let (_t, dir) = home();
+        let cgi = format!("printf '%s\\n' '{HEAD}'\nprintf 'Content-Type: application/x-git-upload-pack-result\\r\\nX-Other: dropped\\r\\n\\r\\n'\nprintf 'partial pack'\n");
+        let ok = shim(&dir, "ok", &format!("{cgi}exit 0\n"));
+        let (head, body, complete) = chunked(&served(ok.clone(), Duration::from_secs(20), 1 << 20).await);
+        assert!(complete && body == b"partial pack", "{head}{}", String::from_utf8_lossy(&body));
+        assert!(head.contains("transfer-encoding: chunked") && !head.contains("content-length") && head.contains("content-type: application/x-git-upload-pack-result") && !head.contains("x-other"), "{head}");
+        idle(&ok).await;
+        let failed = shim(&dir, "failed", &format!("{cgi}exit 3\n"));
+        let (head, body, complete) = chunked(&served(failed.clone(), Duration::from_secs(20), 1 << 20).await);
+        assert!(!complete && body == b"partial pack", "a failed exit ends in error: {head}{}", String::from_utf8_lossy(&body));
+        idle(&failed).await;
+        let (_, body, complete) = chunked(&served(ok.clone(), Duration::from_secs(20), 4).await);
+        assert!(!complete && body.is_empty(), "past the cap: {}", String::from_utf8_lossy(&body));
+        idle(&ok).await;
+        let slow = shim(&dir, "slow", &format!("{cgi}sleep 30\n"));
+        let t = std::time::Instant::now();
+        let (_, body, complete) = chunked(&served(slow.clone(), Duration::from_secs(2), 1 << 20).await);
+        assert!(!complete && body == b"partial pack", "past the deadline: {}", String::from_utf8_lossy(&body));
+        assert!(t.elapsed() < Duration::from_secs(2) + KILL_AFTER + Duration::from_secs(3), "{:?}", t.elapsed());
+        idle(&slow).await;
+    }
+
+    /// The header blocks the root shim takes and refuses (S9 §1.3 rows 14
+    /// and 15): the four headers kept in any case, every other dropped, LF
+    /// or CRLF; a status other than 200, a line that is no header, a folded
+    /// line, a value with a control character or over 1 KiB, a header twice
+    /// and a block without its blank line refused.
+    #[test]
+    fn a_cgi_head_passes_its_four_headers_and_a_200_only() {
+        let block = b"Expires: Fri, 01 Jan 1980 00:00:00 GMT\r\nPragma: no-cache\r\ncache-control: no-cache, max-age=0, must-revalidate\r\nCONTENT-TYPE: application/x-git-upload-pack-advertisement\r\nSet-Cookie: a=b\r\nLocation: http://example.invalid/\r\nContent-Length: 9\r\nX-Aws-Proxy-Auth: no\r\nStatus: 200 OK\r\n\r\nbody";
+        let head = parse_cgi_head(block).unwrap();
+        let names: Vec<&str> = head.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["expires", "pragma", "cache-control", "content-type"]);
+        assert_eq!(head.headers[3].1, "application/x-git-upload-pack-advertisement");
+        assert_eq!(parse_cgi_head(b"Content-Type: text/plain\nStatus: 200\n\n").unwrap().headers.len(), 1, "LF lines, a bare 200");
+        assert_eq!(parse_cgi_head(b"\r\n").unwrap(), CgiHead::default(), "no header at all");
+        let long = format!("Pragma: {}\r\n\r\n", "x".repeat(CGI_VALUE_MAX + 1));
+        let exactly = format!("Pragma: {}\r\n\r\n", "x".repeat(CGI_VALUE_MAX));
+        assert!(parse_cgi_head(exactly.as_bytes()).is_ok());
+        for (bad, why) in [
+            (&b"Status: 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n"[..], "status 403"),
+            (b"Status: 404 Not Found\r\n\r\n", "status 404"),
+            (b"Status: 500 Internal Server Error\r\n\r\n", "status 500"),
+            (b"Status: 2000\r\n\r\n", "status 2000"),
+            (b"Status: 200 OK\r\nStatus: 200 OK\r\n\r\n", "twice"),
+            (b"Garbage\r\n\r\n", "no header"),
+            (b"Content-Type: text/plain\r\n continued\r\n\r\n", "no header"),
+            (b"Content-Type: text/plain\r\n X-Folded: x\r\n\r\n", "no token"),
+            (b"Bad Name: x\r\n\r\n", "no token"),
+            (b": x\r\n\r\n", "no token"),
+            (b"Content-Type: a\x01b\r\n\r\n", "control"),
+            (b"Content-Type: a\rInjected: b\r\n\r\n", "control"),
+            (long.as_bytes(), "over 1024"),
+            (b"Pragma: no-cache\r\nPRAGMA: no-cache\r\n\r\n", "twice"),
+            (b"Content-Type: text/plain\r\n", "blank line"),
+        ] {
+            let e = parse_cgi_head(bad).unwrap_err();
+            assert!(e.contains(why), "{}: {e}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// The header block is read within its cap: a block over
+    /// `GIT_CGI_HEAD_MAX` is a bad head (500), a helper that ends before its
+    /// blank line one too when it exited 0, its failure when it did not;
+    /// the body's first bytes, already read past the block, stay for the stream.
+    #[tokio::test]
+    async fn a_cgi_head_over_its_cap_or_cut_short_is_refused() {
+        let (_t, dir) = home();
+        let cmd = || AgentCmd { op: "git-cgi", args: Vec::new(), budget: Duration::from_secs(20), stdin: false, during_stop: false };
+        let pad = "X-Pad: ".to_string() + &"p".repeat(1000);
+        let big = shim(&dir, "big", &format!("printf '%s\\n' '{HEAD}'\ni=0\nwhile [ $i -lt 17 ]; do printf '%s\\r\\n' '{pad}'; i=$((i+1)); done\nprintf '\\r\\n'\n"));
+        let mut proc = AgentProc::start(&big, cmd()).await.unwrap();
+        proc.head::<GitCgiReply>().await.unwrap();
+        let e = proc.read_cgi_head().await.unwrap_err();
+        assert!(matches!(&e, AgentProcError::BadHead(m) if m.contains("over 16384 bytes")), "{e:?}");
+        proc.stop().await;
+        let cut = shim(&dir, "cut", &format!("printf '%s\\n' '{HEAD}'\nprintf 'Content-Type: text/plain\\r\\n'\nexit 0\n"));
+        let mut proc = AgentProc::start(&cut, cmd()).await.unwrap();
+        proc.head::<GitCgiReply>().await.unwrap();
+        let e = proc.read_cgi_head().await.unwrap_err();
+        assert!(matches!(&e, AgentProcError::BadHead(m) if m.contains("blank line")), "{e:?}");
+        assert_eq!(e.refusal("git-cgi").status(), 500);
+        let failed = shim(&dir, "failed", &format!("printf '%s\\n' '{HEAD}'\necho 'fatal: http-backend broke' >&2\nexit 2\n"));
+        let mut proc = AgentProc::start(&failed, cmd()).await.unwrap();
+        proc.head::<GitCgiReply>().await.unwrap();
+        let e = proc.read_cgi_head().await.unwrap_err();
+        assert!(matches!(&e, AgentProcError::Exit { code: Some(2), stderr } if stderr.contains("http-backend broke")), "{e:?}");
+        let whole = shim(&dir, "whole", &format!("printf '%s\\n' '{HEAD}'\nprintf 'Content-Type: text/plain\\n\\nthe body'\n"));
+        let mut proc = AgentProc::start(&whole, cmd()).await.unwrap();
+        proc.head::<GitCgiReply>().await.unwrap();
+        assert_eq!(proc.read_cgi_head().await.unwrap().headers.len(), 1);
+        let mut rest = Vec::new();
+        proc.stdout.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"the body");
+        proc.finish().await.unwrap();
     }
 }
 
@@ -603,8 +1108,14 @@ impl SlotShared {
 /// The VM's one workspace (module doc).
 pub struct WorkspaceSlot {
     shared: Arc<SlotShared>,
-    /// One transcript write at a time (its check, then its rename).
-    pub transcripts: tokio::sync::Mutex<()>,
+    /// The git CGI's runs (S9): `GIT_CGI_MAX` at once, never waited for.
+    cgi: Arc<tokio::sync::Semaphore>,
+}
+
+/// One git CGI run's slot ([`WorkspaceSlot::try_cgi`]); dropped (its stream
+/// ended, or its answer was a refusal), it is free again.
+pub struct CgiSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// The workspace held for one op; dropped, it is free again.
@@ -622,7 +1133,7 @@ impl Drop for SlotGuard {
 impl Default for WorkspaceSlot {
     fn default() -> Self {
         let shared = SlotShared { lock: Arc::new(tokio::sync::Mutex::new(())), state: Mutex::new(SlotState::default()), wait: Mutex::new(budget::BUSY_WAIT) };
-        WorkspaceSlot { shared: Arc::new(shared), transcripts: tokio::sync::Mutex::new(()) }
+        WorkspaceSlot { shared: Arc::new(shared), cgi: Arc::new(tokio::sync::Semaphore::new(GIT_CGI_MAX)) }
     }
 }
 
@@ -650,6 +1161,13 @@ impl WorkspaceSlot {
         let lock = self.shared.lock.clone().try_lock_owned().ok()?;
         self.shared.state().busy = Some(op);
         Some(SlotGuard { _lock: lock, shared: self.shared.clone() })
+    }
+
+    /// One of the git CGI's `GIT_CGI_MAX` slots, if one is free now (S9):
+    /// the CGI only reads, so it takes no workspace lock, and a run past the
+    /// slots is refused at once (409 `busy`), never queued.
+    pub fn try_cgi(&self) -> Option<CgiSlot> {
+        self.cgi.clone().try_acquire_owned().ok().map(|p| CgiSlot { _permit: p })
     }
 
     /// The last seed's record.
@@ -702,7 +1220,7 @@ pub fn answered<T: Serialize>(status: u16, reply: &T) -> Response {
 pub const WORKSPACE_HELD: &str = "another seed, code-out or snapshot holds the workspace";
 
 /// 409 `busy`: `held` says who held what `op` waited for, past the wait
-/// ([`WORKSPACE_HELD`], or the transcripts' own lock).
+/// ([`WORKSPACE_HELD`], or a transfer's own rel: S9's `s3xfer`).
 #[must_use]
 pub fn busy(op: &str, held: &str, waited: Duration) -> WsRefusal {
     WsRefusal::new(refusal::BUSY, &format!("{held} ({op} waited {} s)", waited.as_secs()))
@@ -959,6 +1477,48 @@ mod tests {
         }
     }
 
+    /// S9 phase 4 (CGI-1, S8's `/codeout`): a payload body dropped early
+    /// (the client closed after its first bytes) ends the run at once, the
+    /// helper far from its budget, and its hold goes with it.
+    #[tokio::test]
+    async fn a_payload_body_dropped_early_ends_the_run() {
+        let (_t, dir) = home();
+        let script = "printf '{\"ok\":true,\"reply\":{},\"len\":200000}\\n'\nhead -c 1000 /dev/zero | tr '\\0' x\nsleep 30\n";
+        let state = Arc::new(shim(&dir, script));
+        let serving = state.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let state = serving.clone();
+                async move {
+                    let mut proc = AgentProc::start(&state, cmd("codeout", Duration::from_secs(20))).await.unwrap();
+                    let len = proc.head::<SeedState>().await.unwrap().len.unwrap();
+                    let mut res = Response::new(proc.into_body(b"prefix\n".to_vec(), len, None));
+                    res.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(7 + len));
+                    res
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !got.windows(10).any(|w| w == b"prefix\nxxx") {
+            let n = tokio::time::timeout(Duration::from_secs(10), s.read(&mut buf)).await.expect("the payload's first bytes").unwrap();
+            assert!(n > 0, "closed early");
+            got.extend_from_slice(&buf[..n]);
+        }
+        drop(s);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while state.spawns.helpers() != 0 {
+            assert!(std::time::Instant::now() < until, "the helper still held 5 s after the body went");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// A body the helper stops reading is still read to its end, every
     /// chunk past the helper's exit, so the client gets the answer, not a
     /// reset.
@@ -981,8 +1541,8 @@ mod tests {
     /// A body that stalls is cut at the budget, which closes the helper's
     /// stdin, and the helper ends by itself on its EOF path within
     /// [`EOF_GRACE`] (here 50 ms of work after the EOF), before any TERM: what
-    /// it wrote goes with it (a transcript put's temp file, F8's
-    /// DATAPLANE-5). The answer is still the 504.
+    /// it wrote goes with it (a temp file, F8's DATAPLANE-5). The answer is
+    /// still the 504.
     #[tokio::test]
     async fn a_body_cut_at_its_budget_lets_the_helper_end_by_itself() {
         let (_t, dir) = home();
@@ -991,9 +1551,9 @@ mod tests {
         let state = shim(&dir, &script);
         let stalled = Body::from_stream(futures_util::stream::once(async { Ok::<_, io::Error>(Bytes::from_static(b"the first bytes")) }).chain(futures_util::stream::pending()));
         let t = std::time::Instant::now();
-        let e = run_with_body::<SeedState>(&state, cmd("transcript-put", Duration::from_secs(1)), stalled).await.unwrap_err();
+        let e = run_with_body::<SeedState>(&state, cmd("seed-apply", Duration::from_secs(1)), stalled).await.unwrap_err();
         assert!(matches!(e, AgentProcError::Timeout), "{e:?}");
-        assert_eq!(e.refusal("transcript-put").status(), 504);
+        assert_eq!(e.refusal("seed-apply").status(), 504);
         assert!(done.exists() && !tmp.exists(), "the helper ended by itself, its temp file removed: done {}, temp file {}", done.exists(), tmp.exists());
         assert!(t.elapsed() < Duration::from_secs(1) + EOF_GRACE + Duration::from_secs(1), "{:?}", t.elapsed());
         assert_eq!(state.spawns.helpers(), 0);

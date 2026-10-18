@@ -910,6 +910,29 @@ impl MicrovmApi for SdkMicrovmApi {
     }
 }
 
+/// S9: presigning with the runtime key, signed by hand as `get_connector`
+/// signs: this client's own credentials provider (a temporary credential's
+/// token is signed into the query), `s3`, [`REGION`], nothing sent. A refused
+/// profile fails before anything is resolved, as every other call of such a
+/// client does; the lab's loopback S3 takes the lab key only, never this one.
+impl crate::bridge::s3::S3Sign for SdkMicrovmApi {
+    async fn presign(&self, req: &crate::bridge::s3::PresignReq) -> std::result::Result<crate::wire::s3::PresignedUrl, BridgeError> {
+        const OP: &str = "presign";
+        if let Some(why) = &self.refusal {
+            return Err(BridgeError::Config(why.clone()));
+        }
+        if matches!(req.target.endpoint, crate::bridge::s3::S3Endpoint::Lab(_)) {
+            return Err(BridgeError::Config(format!("{OP}: the lab's S3 is signed with the lab key, never the runtime key")));
+        }
+        let provider = self.credentials.as_ref().ok_or_else(|| BridgeError::CredentialsUnavailable(format!("{OP}: this client resolved no credentials provider")))?;
+        let creds = {
+            use aws_sdk_lambdamicrovms::config::ProvideCredentials as _;
+            provider.provide_credentials().await.map_err(|e| with_profile_hint(self.profile.as_deref(), BridgeError::CredentialsUnavailable(format!("{OP}: {}", scrub(&e.to_string())))))?
+        };
+        crate::bridge::s3::presign::sign(creds, req, std::time::SystemTime::now())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

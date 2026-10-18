@@ -11,7 +11,10 @@
 //! new, and the trigger coalesces a burst of results into one fetch. Last,
 //! through the endpoint and the native shim's real helper (the rig of
 //! `tests/common/remote.rs`): a ref the agent names after the setup-token
-//! reaches no output, git argument, ref or record of the Mac's.
+//! reaches no output, git argument, ref or record of the Mac's. S9: a
+//! manifest naming a tree or a blob promotes neither, only counts them; a
+//! ref `box_refs` skipped first is named, and a `wip_ref` naming a blob is
+//! not reported.
 use super::fixture::{api, caps, ensure_ctx, git, git_cmd, git_ok, git_out, target, FakeVm, Tokens, World};
 use ai_env_cli::bridge::codeout::{fetch, import, CodeoutCtx, FetchOpts, Import, BOX_QUARANTINE_REFS, BOX_REFS, INCOMING_REFS};
 use ai_env_cli::bridge::workspace::{ensure_workspace, resolve, SeedProgress, SeedWant};
@@ -299,7 +302,7 @@ async fn a_fetch_brings_the_vms_commits_and_snapshot_into_box_refs() {
     let agent = git(&vm.dir, &["rev-parse", "HEAD"]);
     std::fs::write(vm.dir.join("b.txt"), "b, edited\n").unwrap();
     let before = repo.state();
-    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: Arc::new(vm), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false };
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: Arc::new(vm), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
     let report = fetch(&ctx, FetchOpts::per_result(&cfg)).await.unwrap();
     assert!(report.ok && report.quarantined.is_empty(), "{report:?}");
     assert_eq!(report.promoted.get(&format!("{BOX_REFS}main")), Some(&agent));
@@ -342,7 +345,7 @@ async fn the_trigger_fetches_after_results_without_blocking() {
     let progress = |_: SeedProgress| {};
     ensure_workspace(&ensure_ctx(&fake_api, &vm, &paths, &cfg, &t, &c, &ws, &progress), None, SeedWant::Auto).await.unwrap();
     std::fs::write(vm.dir.join("edit.txt"), "the agent's edit\n").unwrap();
-    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: vm.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false };
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: vm.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
     let fetches = || vm.calls().iter().filter(|c| c.starts_with("POST /codeout")).count();
     let trigger = CodeoutTrigger::spawn(ctx);
     let asked = std::time::Instant::now();
@@ -378,7 +381,7 @@ async fn a_real_remote_named_box_is_refused() {
     let (paths, cfg) = (w.paths(), w.cfg(""));
     let ws = resolve(&cfg, &repo.dir, None).unwrap();
     let vm = FakeVm::new(&w.root.join("vm"), &w.root.join("vm-projects"));
-    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: Arc::new(vm), tokens: Arc::new(Tokens), paths, cfg: Arc::new(cfg.clone()), target: target(), ws, capture_settings: false };
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: Arc::new(vm), tokens: Arc::new(Tokens), paths, cfg: Arc::new(cfg.clone()), target: target(), ws, capture_settings: false, transcript: None };
     let e = fetch(&ctx, FetchOpts::per_result(&cfg)).await.unwrap_err();
     assert!(e.to_string().contains("remote named box"), "{e}");
     assert!(ctx.dp.calls().is_empty(), "nothing was asked of the VM");
@@ -582,5 +585,97 @@ fn existing_box_refs_meet_the_vms_names_as_the_macs_disk_folds_them() {
         assert_eq!(mac.git(&["rev-parse", &format!("{BOX_REFS}{existing}")]), base, "box/{existing} as it was");
     }
     assert_eq!(mac.git(&["for-each-ref", "--format=%(refname)", BOX_REFS]).lines().count(), 5, "box/été, box/fix-sort, box/Ünter/x, box/café, box/main");
+    assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
+}
+
+// ---- S9: the lead's integration (G2's R2) ------------------------------------------------------
+
+/// The helper lists only refs that name a commit, and the import holds that
+/// rule whoever made the manifest (S9, G2's R2 moved into `import`): a
+/// hostile `/codeout` manifest naming a tree as a branch and a blob and a
+/// tree as snapshots, its `wip_ref` the blob's, has those three refs left
+/// out once the pack is indexed: counted (`not_commits`), never named,
+/// skipped or promoted, no `wip_ref` reported, the blob never in the Mac's
+/// store; its clean branch is promoted. A manifest whose HEAD names a tree
+/// is `not_seeded` (exit 9), and no ref moves.
+#[test]
+fn a_codeout_manifest_naming_a_tree_or_a_blob_promotes_neither() {
+    use ai_env_cli::bridge::errors::BridgeError;
+    let w = World::new();
+    let mac = w.repo("app");
+    let base = mac.head();
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let dev = commit_with(&vm, &base, &[("100644", "dev.txt", b"dev\n")], "dev");
+    let o = git_out(&vm, &["hash-object", "-w", "--stdin"], Some(b"a blob, not a commit\n"));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let blob = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let tree = git(&vm, &["rev-parse", &format!("{dev}^{{tree}}")]);
+    let snapshot = "refs/wip/20261018T090000Z-1".to_string();
+    let refs = BTreeMap::from([
+        ("refs/heads/dev".to_string(), dev.clone()),
+        ("refs/heads/treed".to_string(), tree.clone()),
+        (snapshot.clone(), blob.clone()),
+        ("refs/wip/20261018T090000Z-2".to_string(), tree.clone()),
+    ]);
+    let file = w.root.join("codeout.pack");
+    let manifest = CodeoutManifest { wip_ref: Some(snapshot), ..codeout_of(&vm, &refs, &base, &file) };
+    assert_eq!(manifest.check(), Ok(()));
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let got = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &file, haves: std::slice::from_ref(&base), max_blob: 64 << 20, keep_wip: 64 }).unwrap();
+    assert_eq!((&got.promoted, got.quarantined.len(), got.not_commits, &got.skipped, got.hidden, &got.wip_ref), (&BTreeMap::from([(format!("{BOX_REFS}dev"), dev.clone())]), 0, 3, &Vec::<String>::new(), 0, &None), "{got:?}");
+    assert_eq!(mac.git(&["for-each-ref", "--format=%(refname)", "refs/remotes/"]), format!("{BOX_REFS}dev"), "no box ref names the tree or the blob");
+    assert!(!git_ok(&mac.dir, &["cat-file", "-e", &blob]), "the blob stayed in the scratch");
+    assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
+    // A HEAD naming a tree: the VM's repository has no commit checked out, as the helper answers.
+    let before = mac.state();
+    let headless = CodeoutManifest { head: tree, wip_ref: None, ..manifest };
+    assert_eq!(headless.check(), Ok(()));
+    let e = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &headless, pack: &file, haves: std::slice::from_ref(&base), max_blob: 64 << 20, keep_wip: 64 }).unwrap_err();
+    assert!(matches!(&e, BridgeError::WorkspaceRefused { code, message } if *code == ai_env_cli::wire::workspace::refusal::NOT_SEEDED && message.contains("its HEAD names a tree")), "{e:?}");
+    assert_eq!(ai_env_cli::errors::CliError::from(e).exit_code(), 9);
+    assert_eq!(mac.state().refs, before.refs, "no ref moved");
+    assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
+}
+
+/// The commit-only rule meets the refs `box_refs` and the clash check let
+/// through (S9, the lead's integration, I1-R3): a snapshot ref naming a
+/// blob, skipped because its name folds to that of a commit's snapshot
+/// `box_refs` took first, is named as skipped, never counted; as the
+/// manifest's `wip_ref` its object is still read, and no `wip_ref` is
+/// reported. A branch naming a tree that `box_refs` takes first is counted,
+/// and the commit's branch whose name folds to its own is skipped and named.
+#[test]
+fn the_commit_only_rule_meets_what_box_refs_let_through() {
+    let w = World::new();
+    let mac = w.repo("app");
+    let base = mac.head();
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let dev = commit_with(&vm, &base, &[("100644", "dev.txt", b"dev\n")], "dev");
+    let o = git_out(&vm, &["hash-object", "-w", "--stdin"], Some(b"a blob, not a commit\n"));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let blob = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let tree = git(&vm, &["rev-parse", &format!("{dev}^{{tree}}")]);
+    let snapshot = "refs/wip/20261018t090000z-1".to_string();
+    let refs = BTreeMap::from([
+        ("refs/heads/Twin".to_string(), tree),
+        ("refs/heads/dev".to_string(), dev.clone()),
+        ("refs/heads/twin".to_string(), dev.clone()),
+        ("refs/wip/20261018T090000Z-1".to_string(), dev.clone()),
+        (snapshot.clone(), blob.clone()),
+    ]);
+    let file = w.root.join("codeout.pack");
+    let manifest = CodeoutManifest { wip_ref: Some(snapshot.clone()), ..codeout_of(&vm, &refs, &base, &file) };
+    assert_eq!(manifest.check(), Ok(()));
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let got = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &file, haves: std::slice::from_ref(&base), max_blob: 64 << 20, keep_wip: 64 }).unwrap();
+    let promoted = BTreeMap::from([(format!("{BOX_REFS}dev"), dev.clone()), (format!("{BOX_REFS}wip/20261018T090000Z-1"), dev.clone())]);
+    let skipped: Vec<&str> = got.skipped.iter().map(|s| s.split_once(' ').map_or(s.as_str(), |(r, _)| r)).collect();
+    assert_eq!((&got.promoted, got.not_commits, skipped, got.hidden, &got.wip_ref), (&promoted, 1, vec!["refs/heads/twin", snapshot.as_str()], 0, &None), "{got:?}");
+    assert_eq!(mac.git(&["for-each-ref", "--format=%(refname)", "refs/remotes/"]), format!("{BOX_REFS}dev\n{BOX_REFS}wip/20261018T090000Z-1"), "no box ref names the tree or the blob");
+    assert!(!git_ok(&mac.dir, &["cat-file", "-e", &blob]), "the blob stayed in the scratch");
     assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
 }

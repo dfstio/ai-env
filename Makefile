@@ -1,7 +1,7 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
 .PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-egress-run test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance acceptance-run clean \
-        claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight
+        claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight argv-fixtures
 
 SHELL        := /bin/bash
 # The switches that delete, rotate, write, pick a version, skip a gate, widen a live run or pick an identity (YES, KEEP,
@@ -124,11 +124,15 @@ test: ## Unit + integration tests in all four feature sets
 # AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend; S7: the
 # wrapper's synthetic oauth_token_refresh, and the unseal budget of its local-scratch and of every credentialed
 # vm and lab command; S8: the remote session's transcript knob, a resume that uploads no transcript, and S2's pump
-# knobs, which S8's live wrapper runs meet: s8-smoke, test-aws CRED=1, acceptance). tests/infra/image.rs holds the
-# list to every AI_ENV_BRIDGE_LAB_* name the code and infra/scripts read.
+# knobs, which S8's live wrapper runs meet: s8-smoke, test-aws CRED=1, acceptance; S9: the fake S3's address and the
+# code token's minutes). tests/infra/image.rs holds the list to every AI_ENV_BRIDGE_LAB_* name the code and
+# infra/scripts read. test-aws SLOW=1 then sets the code token's minutes again, for its test process: the re-mint
+# test mints its tokens in that process, and the vm, box and session commands and the chats it runs drop every
+# lab knob.
 LAB_KNOBS    := AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_SHELL AI_ENV_BRIDGE_LAB_ASSUME_TTY \
                 AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS AI_ENV_BRIDGE_LAB_TRANSCRIPT AI_ENV_BRIDGE_LAB_EXIT \
-                AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS AI_ENV_BRIDGE_LAB_OSASCRIPT
+                AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS AI_ENV_BRIDGE_LAB_OSASCRIPT \
+                AI_ENV_BRIDGE_LAB_S3_ADDR AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES
 LAB_UNSET    := env $(addprefix -u ,$(LAB_KNOBS))
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
@@ -136,9 +140,9 @@ LAB_UNSET    := env $(addprefix -u ,$(LAB_KNOBS))
 # help: the suspension's Touch IDs are then the runner's), and test-aws-readonly as ai-env as ops: their tests are
 # built first without any key in their environment (D18: a dependency's build script or proc macro never sees it), as
 # test-egress's are, and so is the probes' operator CLI; the run then finds them built and keeps the key.
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command: 10 beside the test process's one, 11 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension and its restore, two more (the ops key's, one per egress suspend; none when the run is under ai-env as ops or as deployer); live_wrapper_smoke is skipped: make s8-smoke runs it)
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command: 10 beside the test process's one, 11 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension and its restore, two more (the ops key's, one per egress suspend; none when the run is under ai-env as ops or as deployer); live_wrapper_smoke is skipped: make s8-smoke runs it). S9: the smart-HTTP tests run in the plain form (live_box_fetch_smart_http_matches_codeout, live_smart_http_wrong_port_token_403_twice, live_review_loop_and_tag_leak, live_vm_has_no_push_path: vpc VMs of fixtures under target/s8, one Touch ID per ai-env command); SLOW=1 adds the code token's re-mint after its expiry (live_smart_http_remints_after_expiry: SLOW=1 also sets AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2 for the test process, whose own MintingTokens mint its 9418 tokens: the vm, box and session commands and the chats it runs drop every lab knob); S3=1 runs the S3 store's live tests alone (live_s3_*: chats in remote mode after S9's cut-over, the setup-token sealed, each chat's objects purged from S3 at its test's end with one Touch ID more; the 1 GiB round trip takes tens of minutes)
 	$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run
-	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1) $(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture$(if $(filter 1,$(call cmdline,CRED)), --skip live_wrapper_smoke)
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1 AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2) $(if $(filter 1,$(call cmdline,S3)),AI_ENV_S3_TESTS=1 )$(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture$(if $(filter 1,$(call cmdline,CRED)), --skip live_wrapper_smoke)$(if $(filter 1,$(call cmdline,S3)), live_s3_)
 	@$(if $(filter 1,$(call cmdline,PROBES)),$(AI_ENV_BUILD) || exit $$?; rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
 
@@ -151,16 +155,28 @@ test-claude: ## T7.2 (live, this Mac): the sealed setup-token drives the real cl
 # turn answered and its close passed (exit 0 within 1.5 s, end:eof, pid_rewrite:ok), then judges its fetch and seed:
 # a pass that fails before that leaves no record.
 # test-cursor checks one Cursor step's evidence (tests/cursor_live.rs): STEP, SINCE and WORKSPACE count only on the
-# make command line (SINCE is egress-logs' window too, 1h by default), and a missing or unknown STEP stops before
+# make command line (SINCE is egress-logs' window too, 1h by default), and a missing or unknown STEP, or a missing or
+# empty SINCE (S9: evidence of an earlier step never passes for this one; SINCE=all reads every row), stops before
 # cargo. doc-test runs tests/readme.rs, the README's and SKILL.md's doc-test, which make test runs too.
 s8-smoke: ## T8.2 gate: tests/aws.rs live_wrapper_smoke, three passes, each a chat of the real ai-env-claude in remote mode on the fixture target/s8/live-wrapper-smoke (made anew; [workspaces].roots must hold target/s8): the seed, one turn, its code-out fetched before the close, exit 0 within 1.5 s; one Touch ID each, plus the test process's own (its runtime key): 4 in all; the test's VM terminated at its end; each pass's record appended to target/s8/smoke.jsonl once its close passed
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --exact live_wrapper_smoke --nocapture --test-threads=1
 
-test-cursor: ## S8 part B: one Cursor step's evidence (tests/cursor_live.rs; no VM, no Touch ID, no AWS: the census, the registry, the audit, the lab rows, the git refs): STEP=t8_3|t8_4|t8_5|t8_6|t8_7, optional SINCE=TIME (RFC 3339 UTC: only rows from then on, such as the step's start taken with date -u +%Y-%m-%dT%H:%M:%SZ) and WORKSPACE=PATH (the chats' workspace; default this checkout)
+test-cursor: ## S8 part B: one Cursor step's evidence (tests/cursor_live.rs; no VM, no Touch ID, no AWS: the census, the registry, the audit, the lab rows, the git refs): STEP=t8_3|t8_4|t8_5|t8_6|t8_7|t9_s3 (S9: the S3 store's chats), SINCE=TIME (required, RFC 3339 UTC: only rows from then on, the step's start taken with date -u +%Y-%m-%dT%H:%M:%SZ before the step; SINCE=all reads every row) and WORKSPACE=PATH (optional: the chats' workspace; default this checkout)
 	@step='$(call cmdline,STEP)'; case "$$step" in t8_3|t8_4|t8_5|t8_6|t8_7) ;; \
-	  '') echo "test-cursor: STEP is missing: make test-cursor STEP=t8_3 (or t8_4, t8_5, t8_6, t8_7) after that step in Cursor"; exit 2 ;; \
-	  *) echo "test-cursor: STEP=$$step names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7"; exit 2 ;; esac
+	  t9_s3) ;; \
+	  '') echo "test-cursor: STEP is missing: make test-cursor STEP=t8_3 (or t8_4, t8_5, t8_6, t8_7) after that step in Cursor, or STEP=t9_s3 after S9's"; exit 2 ;; \
+	  *) echo "test-cursor: STEP=$$step names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7, t9_s3"; exit 2 ;; esac
+	@test -n '$(call cmdline,SINCE)' || { echo "test-cursor: SINCE is missing: take the step's start (date -u +%Y-%m-%dT%H:%M:%SZ) before the step in Cursor, or pass SINCE=all to read every row"; exit 2; }
 	$(LAB_UNSET) AI_ENV_CURSOR_TESTS=1 AI_ENV_CURSOR_STEP=$(call cmdline,STEP) $(if $(call cmdline,SINCE),AI_ENV_CURSOR_SINCE='$(call cmdline,SINCE)' )$(if $(call cmdline,WORKSPACE),AI_ENV_CURSOR_WORKSPACE='$(call cmdline,WORKSPACE)' )$(CARGO) test -p $(PKG) --features bridge --test cursor_live -- --ignored --nocapture --test-threads=1
+
+# S9 (M7): the argv fixtures re-captured from the census (tests/route.rs capture_argv_fixtures_from_the_census, gated):
+# for each fixture the newest census row of extension EXT whose argv has the fixture's shape; only argv and
+# ext_version are rewritten, route, reason, session and sanitised stay hand-owned (the KAT stays a real check). EXT
+# counts only on the command line; a missing, empty or malformed one stops before cargo. Reads the census, no AWS.
+argv-fixtures: ## S9 (M7): rewrite argv and ext_version of tests/fixtures/argv/*.json from the census rows of extension EXT (EXT=N.N.N, required, such as 2.1.302: each fixture takes the newest row of its shape at that version; route, reason, session and sanitised stay hand-owned), printing the fixtures found and missing (part B: B7, after the Cursor checklist)
+	@ext='$(call cmdline,EXT)'; case "$$ext" in '') echo "argv-fixtures: EXT is missing: make argv-fixtures EXT=2.1.302 (the extension version whose census rows to take)"; exit 2 ;; esac; \
+	  printf '%s\n' "$$ext" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "argv-fixtures: EXT=$$ext is not N.N.N (such as 2.1.302)"; exit 2; }
+	$(LAB_UNSET) AI_ENV_ARGV_CAPTURE=1 AI_ENV_ARGV_EXT='$(call cmdline,EXT)' $(CARGO) test -p $(PKG) --features bridge --test route -- --ignored --exact capture_argv_fixtures_from_the_census --nocapture --test-threads=1
 
 doc-test: ## The README's and SKILL.md's sh doc-test blocks in their dry forms (tests/readme.rs; also part of make test)
 	$(CARGO) test -p $(PKG) --features bridge --test readme
@@ -567,7 +583,7 @@ ACCEPT_SH     = set -uo pipefail; unset $(LAB_KNOBS) AI_ENV_BRIDGE_LOCAL AI_ENV_
                 repo() { git_ init -q -b main "$$1" && git_ -C "$$1" add -A && git_ -C "$$1" commit -q -m fixture; }; \
                 standin() { printf '\043!/bin/sh\necho "$$$$ $$*" > "%s/ran"\nexit 0\n' "$$1" > "$$1/claude" && chmod 755 "$$1/claude"; };
 
-acceptance: ## (ops: one Touch ID first, then the smoke's two) S8 acceptance, live (v6 §6, the S8 subset; part B, after make install: the installed pair, or ACCEPT_BIN=DIR): [workspaces].roots must hold target/s8, checked first; doctor exits 0 in eu-central-1 (its AWS rows as ai-env-ops), ai-env and ai-env-claude are one version, creds status; then the negatives, each its own line: (a) a remote-mode session outside the roots execs the stand-in claude (census route local, reason outside_roots), (b) an AKIA-shaped value in a tracked file and (c) a committed bypassPermissions each make box seed --dry-run exit 9 naming it, (d) no egress connector: the remote wrapper refuses at the precheck, exit 9 (no Touch ID, no unseal row; it asks for vpc egress whatever [egress].require says), (e) AI_ENV_BRIDGE_LOCAL=1 execs the stand-in with no census row, (f) AWS_REGION=eu-west-3 leaves eu-central-1, (g) ai-env alone: doctor [NO ] exit 1, wrapper install exit 5; last vm smoke --max-duration 900, then vm list holds none of its VM: the runtime key's two Touch IDs, nothing between the ops key's and them needs one; a VM's own negatives (a 9418 token on 8080, curl without the proxy, ai-env vm list in the VM) are part B's; target/s8/acceptance removed on every exit (target/s8 too when the run made it); refused under make -i or -p
+acceptance: ## (ops: one Touch ID first, then the smoke's two) S8 acceptance, live (v6 §6, the S8 subset; part B, after make install: the installed pair, or ACCEPT_BIN=DIR): [workspaces].roots must hold target/s8, checked first; doctor exits 0 in eu-central-1 (its AWS rows as ai-env-ops), ai-env and ai-env-claude are one version, creds status; then the negatives, each its own line: (a) a remote-mode session outside the roots execs the stand-in claude (census route local, reason outside_roots), (b) an AKIA-shaped value in a tracked file and (c) a committed bypassPermissions each make box seed --dry-run exit 9 naming it, (d) no egress connector: the remote wrapper refuses at the precheck, exit 9 (no Touch ID, no unseal row; it asks for vpc egress whatever [egress].require says), and on its line (h) [egress].require = true: vm run without --egress exits 9 from its plan, before any Touch ID or AWS call (a scratch bridge.toml in the step's directory names no connector, and an image of the example account), (e) AI_ENV_BRIDGE_LOCAL=1 execs the stand-in with no census row, (f) AWS_REGION=eu-west-3 leaves eu-central-1, (g) ai-env alone: doctor [NO ] exit 1, wrapper install exit 5; last vm smoke --max-duration 900, then vm list holds none of its VM: the runtime key's two Touch IDs, nothing between the ops key's and them needs one; a VM's own negatives (a 9418 token on 8080, curl without the proxy, ai-env vm list in the VM) are part B's; target/s8/acceptance removed on every exit (target/s8 too when the run made it); refused under make -i or -p
 	@$(if $(findstring i,$(MAKE_SWITCHES)),$(error acceptance: not under make -i (a failed step would be ignored: the next ones would run and the last line say ok): run make acceptance without it))$(call NOT_UNDER_P,acceptance)
 	@$(call TIER,ops,acceptance) $(MAKE) --no-print-directory acceptance-run
 
@@ -623,7 +639,12 @@ acceptance-run:
 	  test "$${unseals:-0}" = 0 || fail "$$unseals credential_unseal audit row(s) of pid $$pid: a credential was unsealed"; \
 	  rows=$$("$$ai" wrapper census --json) || fail "ai-env wrapper census failed"; row=$$(grep -F "\"pid\":$$pid," <<<"$$rows" | grep -F '"end":' | tail -1); \
 	  grep -qF 'step:precheck' <<<"$$row" && ! grep -qF 'touchid=' <<<"$$row" || fail "the census end row of pid $$pid shows no refusal at the precheck before any Touch ID: $${row:-none}"; \
-	  echo "acceptance: egress-required: ok (no egress connector: the remote wrapper refused at the precheck: exit 9, no Touch ID, no credential_unseal row)"
+	  printf '[aws]\nimage_arn = "arn:aws:lambda:eu-central-1:%s:microvm-image:ai-env-acceptance"\n\n[egress]\nrequire = true\n' "$$(printf '%s%s' 123456 789012)" > "$$a/require.toml" || fail "cannot write $$a/require.toml"; \
+	  (exec env AI_ENV_BRIDGE_CONFIG="$$a/require.toml" "$$ai" vm run) < /dev/null > "$$a/run.out" 2>&1 & pid=$$!; wait $$pid; rc=$$?; \
+	  test $$rc -eq 9 && grep -qF 'egress connector required' "$$a/run.out" || fail "(h) ai-env vm run without --egress under [egress].require = true exited $$rc, not 9 naming the egress connector: $$(cat "$$a/run.out")"; \
+	  vmrows=$$(tail -n +$$((seen + 1)) "$$bridge/audit.jsonl" 2>/dev/null | grep -F "\"pid\":$$pid," | grep -cF '"event":"vm_' || true); \
+	  test "$${vmrows:-0}" = 0 || fail "(h) $$vmrows vm audit row(s) of pid $$pid: vm run went past its plan"; \
+	  echo "acceptance: egress-required: ok (no egress connector: the remote wrapper refused at the precheck: exit 9, no Touch ID, no credential_unseal row; (h) [egress].require = true: vm run without --egress refused by its plan, exit 9 before any Touch ID or AWS call)"
 	@$(call ACCEPT_SH,kill-switch) mkdir -p "$$a/repo"; printf 'acceptance fixture\n' > "$$a/repo/README.md"; repo "$$a/repo" > /dev/null || fail "git could not make the fixture repository $$a/repo"; \
 	  standin "$$a" || fail "cannot write the stand-in claude"; \
 	  (cd "$$a/repo" && exec env AI_ENV_BRIDGE_LOCAL=1 AI_ENV_BRIDGE_MODE=remote "$$wrap" "$$a/claude" $(ACCEPT_ARGV)) < /dev/null > "$$a/out" 2>&1 & pid=$$!; wait $$pid; rc=$$?; \
@@ -651,7 +672,7 @@ acceptance-run:
 	  list=$$("$$ai" vm list --json); rc=$$?; test $$rc -eq 0 || fail "ai-env vm list exited $$rc"; \
 	  ! grep -qF "\"$$id\"" <<<"$$list" || fail "vm list still holds $$id"; \
 	  echo "acceptance: smoke: ok ($$id: PENDING, RUNNING, /health 200, TERMINATED; vm list holds none of it)"
-	@echo "acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; $(ACCEPT_DIR) removed"
+	@echo "acceptance: ok: doctor, versions, creds, the negatives (a) to (h), the smoke; $(ACCEPT_DIR) removed"
 
 clean: ## Remove build artifacts (keeps image/ sources)
 	cargo clean

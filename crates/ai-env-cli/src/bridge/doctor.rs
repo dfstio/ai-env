@@ -520,19 +520,60 @@ pub fn bundle_version(dir_name: &str) -> Option<String> {
     semver(ver).map(|_| ver.to_string())
 }
 
-/// doctor's Cursor rows from the extensions directory `ext_dir`: the installed bundle (the selection P10, gate G4 and
-/// `make claude-update` share), the fixture drift and the image's claude against that bundle; and what the bundled
-/// claude's `--version` printed (`version_of` runs it), which the PATH row compares with.
+/// doctor's Cursor rows from the extensions directory `ext_dir` ([`bundle_rows`]), with the live Cursor windows read
+/// from the census tail ([`running_windows`]); and what the bundled claude's `--version` printed (`version_of` runs
+/// it), which the PATH row compares with.
 #[must_use]
 pub fn cursor_bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>) -> (Vec<DoctorLine>, Option<String>) {
+    bundle_rows(ext_dir, image_claude, version_of, &running_windows())
+}
+
+/// [`cursor_bundle_rows`] on the live windows `running` (no census read: `ext_dir` and what `version_of` runs are its
+/// other inputs): the installed bundle (the selection P10, gate G4 and `make claude-update` share), a `[!! ]` per live
+/// Cursor window on another extension than that bundle ([`rows_running_windows`]: a window keeps the extension it
+/// loaded until it is reloaded), the fixture drift of the installed and the running versions, and the image's claude
+/// against that bundle.
+#[must_use]
+pub fn bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, running: &[crate::bridge::census::RunningExtension]) -> (Vec<DoctorLine>, Option<String>) {
     let dirs = installed_extension_names(ext_dir);
     let bundle = pick_bundle(&dirs);
     let bundled_out = bundle.as_ref().and_then(|(_, dir)| version_of(&ext_dir.join(dir).join("resources").join("native-binary").join("claude")));
     let ver = bundle.as_ref().map(|(v, _)| v.as_str());
     let mut lines = vec![row_cursor_bundle(&dirs, bundled_out.as_deref())];
-    lines.extend(row_fixture_drift(ver));
+    lines.extend(rows_running_windows(ver, running));
+    lines.extend(row_fixture_drift(ver, running));
     lines.extend(row_image_claude(image_claude, ver));
     (lines, bundled_out)
+}
+
+/// The extension each live Cursor window runs (S9): `census::running_extensions` of the census tail (the last
+/// `wrapper_status::CENSUS_TAIL_CHUNKS` × 64 KiB) with `registry::process_identity`. None when the bridge root does not
+/// resolve or the census cannot be read (doctor's census row and `wrapper status` say why).
+#[must_use]
+pub fn running_windows() -> Vec<crate::bridge::census::RunningExtension> {
+    let Ok(paths) = Paths::resolve() else {
+        return Vec::new();
+    };
+    crate::bridge::census::read_tail(&paths.census(), crate::bridge::wrapper_status::CENSUS_TAIL_CHUNKS)
+        .map(|rows| crate::bridge::census::running_extensions(&rows, &crate::bridge::registry::process_identity))
+        .unwrap_or_default()
+}
+
+/// One live window as the rows name it (doctor's, `wrapper status`'s, `infra pin --check-bundle`'s note): its
+/// extension, its host's pid and since when that host runs.
+pub(crate) fn running_window_text(w: &crate::bridge::census::RunningExtension) -> String {
+    format!("a Cursor window runs extension {} (host pid {}, since {})", w.ext, w.host, crate::wire::time::rfc3339_utc(w.started))
+}
+
+/// A `[!! ]` per live Cursor window (`running`) on another extension than the installed bundle (`installed`):
+/// `a Cursor window runs extension 2.1.301 (host pid N, since T); 2.1.302 is installed  <- reload that window`. None
+/// without an installed bundle (`row_cursor_bundle` says so), nor for a window on it.
+#[must_use]
+pub fn rows_running_windows(installed: Option<&str>, running: &[crate::bridge::census::RunningExtension]) -> Vec<DoctorLine> {
+    let Some(installed) = installed else {
+        return Vec::new();
+    };
+    running.iter().filter(|w| w.ext != installed).map(|w| DoctorLine::row(Tag::Warn, format!("{}; {installed} is installed  <- reload that window", running_window_text(w)))).collect()
 }
 
 #[must_use]
@@ -553,15 +594,25 @@ pub fn row_cursor_bundle(dirs: &[String], bundled_version: Option<&str>) -> Doct
 
 /// `Some(Warn)` when the installed bundle (the directory version that
 /// `row_cursor_bundle` reports) differs from the version the argv fixtures
-/// were captured from; `None` when they agree or no bundle is installed.
+/// were captured from, or (S9) a live Cursor window (`running`) runs
+/// another version than both: the argv the wrapper sees now is that
+/// window's. The installed bundle's drift is re-captured (the other
+/// windows' versions named beside it); a window's alone, when the installed
+/// bundle matches the fixtures (or none is installed), is reloaded. `None`
+/// when they all agree, or there is nothing to compare.
 #[must_use]
-pub fn row_fixture_drift(bundle_version: Option<&str>) -> Option<DoctorLine> {
+pub fn row_fixture_drift(bundle_version: Option<&str>, running: &[crate::bridge::census::RunningExtension]) -> Option<DoctorLine> {
+    let recapture = "re-capture tests/fixtures/argv from `ai-env wrapper census`";
+    let others: std::collections::BTreeSet<&str> = running.iter().map(|w| w.ext.as_str()).filter(|v| *v != FIXTURE_EXT_VERSION && Some(*v) != bundle_version).collect();
+    let others = others.into_iter().collect::<Vec<_>>().join(", ");
     match bundle_version {
-        Some(v) if v != FIXTURE_EXT_VERSION => Some(DoctorLine::row(
-            Tag::Warn,
-            format!("cursor extension {v} ≠ fixtures tagged {FIXTURE_EXT_VERSION}  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"),
-        )),
-        _ => None,
+        Some(v) if v != FIXTURE_EXT_VERSION => {
+            let windows = if others.is_empty() { String::new() } else { format!("; a Cursor window runs {others}") };
+            Some(DoctorLine::row(Tag::Warn, format!("cursor extension {v} ≠ fixtures tagged {FIXTURE_EXT_VERSION}{windows}  <- {recapture}")))
+        }
+        _ if others.is_empty() => None,
+        Some(_) => Some(DoctorLine::row(Tag::Warn, format!("a Cursor window runs extension {others} ≠ fixtures tagged {FIXTURE_EXT_VERSION}  <- reload that window (the installed bundle matches the fixtures)"))),
+        None => Some(DoctorLine::row(Tag::Warn, format!("a Cursor window runs extension {others} ≠ fixtures tagged {FIXTURE_EXT_VERSION}  <- {recapture}"))),
     }
 }
 
@@ -731,6 +782,156 @@ pub fn row_review_files(tripwires: &Path, tripwires_exist: bool, policy: &Path, 
     }
 }
 
+/// S9 (§4.2): the pre-push review hook of each repository root in
+/// `state/workspaces/*.toml` (`review::hook_state`), in root order: `[ok ]`
+/// installed, `[!! ]` missing or foreign with its fix (`box hook-install`;
+/// for another hook the one line it needs, worded to stay true once it has
+/// it), `[-  ]` unknown (the root is gone, or no repository). An installed
+/// hook git skips (not executable for this user, as git asks access(2)) or
+/// that a merged commit can replace (in the work tree,
+/// `review::hook_in_work_tree`) is `[!! ]` too. No workspace yet: no row;
+/// a row file that does not parse: one `[!! ]` naming it.
+#[must_use]
+pub fn row_pre_push_hooks(paths: &Paths) -> Vec<DoctorLine> {
+    use crate::bridge::review::{calls_review, chain_line, hook_in_work_tree, hook_state, running_ai_env, HookState};
+    let Ok(dir) = std::fs::read_dir(paths.workspaces()) else { return Vec::new() };
+    let mut slugs: Vec<String> = dir.filter_map(Result::ok).filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".toml")).map(str::to_string)).collect();
+    slugs.sort();
+    let mut lines = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
+    for slug in slugs {
+        match crate::bridge::workspace::rows::read(paths, &slug) {
+            Ok(rows) => roots.extend(rows.ws.into_values().map(|w| w.root).filter(|r| !r.is_empty())),
+            Err(e) => lines.push(DoctorLine::row(Tag::Warn, format!("workspace rows unreadable: {e}"))),
+        }
+    }
+    let ai_env = running_ai_env().unwrap_or_else(|_| "ai-env".to_string());
+    for root in roots {
+        lines.push(match hook_state(Path::new(&root)) {
+            HookState::Installed(hook) if !crate::bridge::sibling::exists_exec(&hook).1 => {
+                DoctorLine::row(Tag::Warn, format!("pre-push review hook in {root} is not executable: git skips it  <- ai-env box hook-install {root}"))
+            }
+            HookState::Installed(hook) if hook_in_work_tree(Path::new(&root), &hook) => {
+                DoctorLine::row(Tag::Warn, format!("pre-push review hook in {root} lives in the work tree ({}, core.hooksPath), or git reads a configuration file there that can move it: a merged or checked-out commit can replace it", hook.display()))
+            }
+            HookState::Installed(_) => DoctorLine::row(Tag::Ok, format!("pre-push review hook in {root}")),
+            HookState::Missing(_) => DoctorLine::row(Tag::Warn, format!("no pre-push review hook in {root}: its pushes are not reviewed  <- ai-env box hook-install {root}")),
+            HookState::Foreign(hook) => {
+                let calls = if calls_review(&hook) { ", which calls box review --pre-push" } else { "" };
+                DoctorLine::row(Tag::Warn, format!("{root} has another pre-push hook ({}){calls}: its pushes are reviewed only if it runs this first, before any exit or read of its stdin  <- {}", hook.display(), chain_line(&ai_env).replace('\n', "; ")))
+            }
+            HookState::Unknown(why) => DoctorLine::row(Tag::Skip, format!("pre-push review hook in {root} not checked: {why}")),
+        });
+    }
+    lines
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod pre_push_hook_tests {
+    use super::*;
+    use crate::bridge::review::{chain_line, hook_body, PRE_PUSH_MARK};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let o = Command::new("git").args(args).current_dir(dir).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// A repository at `dir` whose hooks git runs from `.git/hooks` (set in
+    /// the repository: the plain git reads this user's global config too).
+    fn repo(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "core.hooksPath", ".git/hooks"]);
+        dir.join(".git/hooks/pre-push")
+    }
+
+    fn text(line: &DoctorLine) -> (Tag, String) {
+        match line {
+            DoctorLine::Row { tag, text } => (*tag, text.clone()),
+            DoctorLine::Plain(t) => panic!("a plain line: {t}"),
+        }
+    }
+
+    /// `body` at `hook` with `mode`, its directory made.
+    fn hook_file(hook: &Path, body: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(hook, body).unwrap();
+        std::fs::set_permissions(hook, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The workspace rows naming `roots`, each its own cwd.
+    fn rows_naming(paths: &Paths, roots: &[&Path]) {
+        std::fs::create_dir_all(paths.workspaces()).unwrap();
+        let text: String = roots.iter().map(|r| format!("[ws.{:?}]\nroot = {:?}\n", r.display().to_string(), r.display().to_string())).collect();
+        std::fs::write(paths.workspace_row("app"), format!("v = 1\n{text}")).unwrap();
+    }
+
+    /// One row per root of the workspace rows, in root order (a root two
+    /// rows name, once): ours installed `[ok ]`; missing and foreign
+    /// `[!! ]` with their fixes; a root that is gone `[-  ]`. No rows
+    /// directory: no row; a row file that does not parse: named.
+    #[test]
+    fn each_workspace_root_gets_its_hook_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let paths = Paths::from_root_and_env(base.join("bridge"), None);
+        assert!(row_pre_push_hooks(&paths).is_empty(), "no workspace yet");
+        let (a, b, c, gone) = (base.join("work/a"), base.join("work/b"), base.join("work/c"), base.join("work/gone"));
+        let hook_a = repo(&a);
+        hook_file(&hook_a, &hook_body("/opt/ai-env/bin/ai-env"), 0o755);
+        repo(&b);
+        let hook_c = repo(&c);
+        hook_file(&hook_c, "#!/bin/sh\n# the team's own checks\nexit 0\n", 0o755);
+        std::fs::create_dir_all(paths.workspaces()).unwrap();
+        let row = |cwd: &Path, root: &Path| format!("[ws.{:?}]\nroot = {:?}\n", cwd.display().to_string(), root.display().to_string());
+        std::fs::write(paths.workspace_row("app"), format!("v = 1\n{}{}", row(&a.join("sub"), &a), row(&c, &c))).unwrap();
+        std::fs::write(paths.workspace_row("other"), format!("v = 1\n{}{}{}", row(&b, &b), row(&a, &a), row(&gone, &gone))).unwrap();
+        let rows: Vec<(Tag, String)> = row_pre_push_hooks(&paths).iter().map(text).collect();
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert_eq!(rows[0], (Tag::Ok, format!("pre-push review hook in {}", a.display())));
+        assert_eq!(rows[1], (Tag::Warn, format!("no pre-push review hook in {}: its pushes are not reviewed  <- ai-env box hook-install {}", b.display(), b.display())));
+        assert_eq!(rows[2].0, Tag::Warn);
+        assert!(rows[2].1.starts_with(&format!("{} has another pre-push hook ({}): its pushes are reviewed only if it runs this first, before any exit or read of its stdin  <- ai_env_refs=$(cat; echo .); ai_env_refs=${{ai_env_refs%.}}; printf '%s' \"$ai_env_refs\" | '", c.display(), hook_c.display())), "{}", rows[2].1);
+        assert!(rows[2].1.ends_with("' box review --pre-push \"$1\" \"$2\" || exit 1"), "{}", rows[2].1);
+        assert_eq!(rows[3].0, Tag::Skip);
+        assert!(rows[3].1.starts_with(&format!("pre-push review hook in {} not checked: ", gone.display())), "{}", rows[3].1);
+        assert_eq!(std::fs::read_to_string(&hook_a).unwrap().lines().nth(1), Some(PRE_PUSH_MARK));
+        std::fs::write(paths.workspace_row("broken"), "v = [\n").unwrap();
+        let rows: Vec<(Tag, String)> = row_pre_push_hooks(&paths).iter().map(text).collect();
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].0 == Tag::Warn && rows[0].1.starts_with("workspace rows unreadable: ") && rows[0].1.contains("broken.toml"), "{:?}", rows[0]);
+    }
+
+    /// An installed hook the push never runs is no `[ok ]`: one that lost
+    /// its exec bit (git skips it), one where `core.hooksPath` puts it in
+    /// the work tree (a merged commit can replace it). Another hook that
+    /// already calls the review is said to, and still `[!! ]`: whether it
+    /// exits first is not read.
+    #[test]
+    fn an_installed_hook_git_skips_or_a_merge_can_replace_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let paths = Paths::from_root_and_env(base.join("bridge"), None);
+        let (d, e, f) = (base.join("work/d"), base.join("work/e"), base.join("work/f"));
+        hook_file(&repo(&d), &hook_body("/opt/ai-env/bin/ai-env"), 0o644);
+        repo(&e);
+        git(&e, &["config", "core.hooksPath", ".githooks"]);
+        let hook_e = e.join(".githooks/pre-push");
+        hook_file(&hook_e, &hook_body("/opt/ai-env/bin/ai-env"), 0o755);
+        let hook_f = repo(&f);
+        hook_file(&hook_f, &format!("#!/bin/sh\nnpm test || exit 1\n{}\n", chain_line("/opt/ai-env/bin/ai-env")), 0o755);
+        rows_naming(&paths, &[&d, &e, &f]);
+        let rows: Vec<(Tag, String)> = row_pre_push_hooks(&paths).iter().map(text).collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0], (Tag::Warn, format!("pre-push review hook in {} is not executable: git skips it  <- ai-env box hook-install {}", d.display(), d.display())));
+        assert_eq!(rows[1], (Tag::Warn, format!("pre-push review hook in {} lives in the work tree ({}, core.hooksPath), or git reads a configuration file there that can move it: a merged or checked-out commit can replace it", e.display(), hook_e.display())));
+        assert_eq!(rows[2].0, Tag::Warn);
+        assert!(rows[2].1.starts_with(&format!("{} has another pre-push hook ({}), which calls box review --pre-push: its pushes are reviewed only if it runs this first, before any exit or read of its stdin  <- ai_env_refs=$(cat; echo .); ai_env_refs=${{ai_env_refs%.}}; printf '%s' \"$ai_env_refs\" | '", f.display(), hook_f.display())), "{}", rows[2].1);
+    }
+}
+
 /// The pinned managed base image version, from the
 /// `list-managed-microvm-image-versions` call: `None` when it was not made
 /// (no operator identity, `[-  ]`); `Some(Err)` when the call itself failed (a
@@ -881,20 +1082,30 @@ pub fn rows_bridge_settings(
     vec![DoctorLine::row(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector, DNS acceptance, [creds] and the credential gate not checked ({why})"))]
 }
 
+/// What a mode the wrapper takes as remote does with no root to route on
+/// (S9, [`rows_s8`] and [`rows_s8_loaded`]): no session goes remote, so none
+/// fails closed yet; the file is wrong all the same.
+const NO_ROOT_YET: &str = "every Cursor chat runs on this Mac until bridge.toml names a root, then every chat under it exits 1 at its start";
+
 /// The S8 rows bridge.toml alone decides (plan §12): the wrapper's mode
 /// (`[wrapper] mode`: `remote` without a root is `[!! ]`, every chat running
 /// here; a value the wrapper does not know is `[NO ]`, every chat under the
-/// roots failing closed), one `[!! ]` per `[[workspace]]` still setting the
-/// deprecated `seed_allow_dirty` (D2), and the `[seed]` caps (`[NO ]` when
-/// the wrapper, `box` and `vm warm` refuse them). The image's
-/// `workspace_v1` is [`row_workspace_cap`]'s.
+/// roots failing closed, or, with no root, every chat running here until
+/// bridge.toml names one; S9: the value quoted through
+/// `wrapper_status::shown_mode`, scrubbed and capped), one `[!! ]` per
+/// `[[workspace]]` still setting the deprecated `seed_allow_dirty` (D2), and
+/// the `[seed]` caps (`[NO ]` when the wrapper, `box` and `vm warm` refuse
+/// them). The image's `workspace_v1` is [`row_workspace_cap`]'s.
 #[must_use]
 pub fn rows_s8(cfg: &BridgeConfig) -> Vec<DoctorLine> {
+    let shown = || crate::bridge::wrapper_status::shown_mode(&cfg.wrapper.mode);
+    let mode_fix = "ai-env wrapper install --write --mode remote (or passthrough)";
     let mut rows = vec![match cfg.wrapper.wrapper_mode() {
         Ok(WrapperMode::Remote) if cfg.roots().is_empty() => DoctorLine::row(Tag::Warn, "wrapper mode remote, but no [workspaces].roots: every Cursor chat runs on this Mac  <- add the roots to bridge.toml"),
         Ok(WrapperMode::Remote) => DoctorLine::row(Tag::Ok, format!("wrapper mode remote: Cursor's chats under the {} root(s) run in their workspace's MicroVM (AI_ENV_BRIDGE_LOCAL=1 runs them here)", cfg.roots().len())),
         Ok(WrapperMode::Passthrough) => DoctorLine::row(Tag::Ok, "wrapper mode passthrough: Cursor's chats run on this Mac (ai-env wrapper install --write --mode remote runs them in MicroVMs)"),
-        Err(e) => DoctorLine::row(Tag::No, format!("{e}: every Cursor chat under the roots fails closed  <- ai-env wrapper install --write --mode remote (or passthrough)")),
+        Err(_) if cfg.roots().is_empty() => DoctorLine::row(Tag::No, format!("bridge.toml [wrapper] mode {} (no root), which names no mode: {NO_ROOT_YET}  <- {mode_fix}", shown())),
+        Err(_) => DoctorLine::row(Tag::No, format!("config: [wrapper].mode = {}: must be \"passthrough\" or \"remote\": every Cursor chat under the roots fails closed  <- {mode_fix}", shown())),
     }];
     rows.extend(cfg.workspace_overrides.iter().filter_map(crate::bridge::config::WorkspaceCfg::deprecation).map(|note| DoctorLine::row(Tag::Warn, format!("{note}  <- remove it from bridge.toml"))));
     let seed = &cfg.seed;
@@ -914,8 +1125,10 @@ pub fn rows_s8(cfg: &BridgeConfig) -> Vec<DoctorLine> {
 /// [`rows_s8`] for what bridge.toml loaded as (the defaults when there is
 /// none); for a file that does not load, the one row the wrapper still acts
 /// on: its mode as `route::Broken` reads the file (`[NO ]` when that is
-/// remote, a mode it cannot read included, as the wrapper takes it). There
-/// are no `[seed]` caps to show.
+/// remote, a mode it cannot read included, as the wrapper takes it; with
+/// roots it reads and none, every chat runs here until bridge.toml names
+/// one, the mode quoted through `wrapper_status::shown_mode`). There are no
+/// `[seed]` caps to show.
 #[must_use]
 pub fn rows_s8_loaded(paths: &Paths, loaded: &Result<Option<BridgeConfig>, BridgeError>) -> Vec<DoctorLine> {
     use crate::bridge::route::{effective_mode_loaded, Broken, Loaded, Mode};
@@ -925,8 +1138,16 @@ pub fn rows_s8_loaded(paths: &Paths, loaded: &Result<Option<BridgeConfig>, Bridg
         Err(_) => {}
     }
     let broken = Broken::read(std::fs::read_to_string(&paths.config).ok().as_deref());
+    let fix = "  <- fix bridge.toml (the bridge.toml row above)";
+    let rootless = broken.roots.as_ref().is_some_and(Vec::is_empty);
+    let shown = match &broken.mode {
+        Some(Some(mode)) => crate::bridge::wrapper_status::shown_mode(mode),
+        Some(None) => "unset".to_string(),
+        None => "unreadable".to_string(),
+    };
     vec![match effective_mode_loaded(None, &Loaded { broken: Some(broken), ..Loaded::default() }).0 {
-        Mode::Remote => DoctorLine::row(Tag::No, "wrapper mode remote, but bridge.toml does not load: every Cursor chat under its roots (every chat, when the roots cannot be read) exits 1 naming the error  <- fix bridge.toml (the bridge.toml row above)"),
+        Mode::Remote if rootless => DoctorLine::row(Tag::No, format!("bridge.toml, which does not load, [wrapper] mode {shown} (no root): {NO_ROOT_YET}{fix}")),
+        Mode::Remote => DoctorLine::row(Tag::No, format!("wrapper mode remote, but bridge.toml does not load: every Cursor chat under its roots (every chat, when the roots cannot be read) exits 1 naming the error{fix}")),
         _ => DoctorLine::row(Tag::Skip, "wrapper mode passthrough as far as bridge.toml still reads: Cursor's chats run on this Mac"),
     }]
 }
@@ -1479,6 +1700,7 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             let (tw, sp) = (cfg.review.tripwires_path(paths), cfg.review.settings_policy_path(paths));
             lines.push(row_review_files(&tw, tw.is_file(), &sp, sp.is_file()));
             lines.extend(rows_s8_loaded(paths, loaded));
+            lines.extend(row_pre_push_hooks(paths));
             lines.push(row_workspace_cap(vms.as_deref().unwrap_or_default(), &state, &cfg));
             state.ok().flatten()
         }
@@ -1877,6 +2099,7 @@ mod tests {
                 at: crate::wire::time::rfc3339_utc(now),
                 dns: "no-dns".into(),
                 dns_rule: crate::bridge::egress::DNS_RULE,
+                egress_rule: crate::bridge::egress::EGRESS_RULE,
                 connector_facts: ConnectorFacts { id: "nc-1".into(), network_protocol: "IPv4".into(), subnet_ids: vec!["subnet-1".into()], security_group_ids: vec!["sg-1".into()], ..ConnectorFacts::default() },
                 image_created_at: Some(1_790_000_000),
                 ..VerifiedRecord::default()
@@ -2271,9 +2494,11 @@ mod tests {
     }
 
     /// The S8 rows bridge.toml decides: the wrapper's mode (remote without a
-    /// root warns, a mode nobody knows is `[NO ]`), one warning per
-    /// workspace still setting `seed_allow_dirty`, the `[seed]` caps (`[NO ]`
-    /// naming the key the commands refuse).
+    /// root warns, a mode nobody knows is `[NO ]`, failing every chat under
+    /// the roots closed, or with no root running every chat here until one
+    /// is named; S9: such a mode quoted scrubbed and capped, never raw), one
+    /// warning per workspace still setting `seed_allow_dirty`, the `[seed]`
+    /// caps (`[NO ]` naming the key the commands refuse).
     #[test]
     fn the_s8_rows_name_the_mode_the_deprecation_and_the_seed_caps() {
         let rows = |toml: &str| -> Vec<(Tag, String)> { rows_s8(&BridgeConfig::parse(toml).unwrap()).iter().map(text).collect() };
@@ -2287,9 +2512,22 @@ mod tests {
         assert!(remote[0].1.starts_with("wrapper mode remote: Cursor's chats under the 1 root(s) run in their workspace's MicroVM"), "{}", remote[0].1);
         let rootless = rows("[wrapper]\nmode = \"remote\"\n");
         assert_eq!(rootless[0].0, Tag::Warn, "{rootless:?}");
+        let unknown = rows("[wrapper]\nmode = \"local\"\n[workspaces]\nroots = [\"/Users/mike/w\"]\n");
+        assert_eq!(unknown[0], (Tag::No, "config: [wrapper].mode = \"local\": must be \"passthrough\" or \"remote\": every Cursor chat under the roots fails closed  <- ai-env wrapper install --write --mode remote (or passthrough)".to_string()));
+        // With no root no chat goes remote, so none fails closed yet: every chat runs here until a root comes.
         let unknown = rows("[wrapper]\nmode = \"local\"\n");
-        assert_eq!(unknown[0].0, Tag::No);
-        assert!(unknown[0].1.contains("[wrapper].mode = \"local\"") && unknown[0].1.contains("fails closed"), "{}", unknown[0].1);
+        assert_eq!(unknown[0], (Tag::No, "bridge.toml [wrapper] mode \"local\" (no root), which names no mode: every Cursor chat runs on this Mac until bridge.toml names a root, then every chat under it exits 1 at its start  <- ai-env wrapper install --write --mode remote (or passthrough)".to_string()));
+        // A key-shaped value (built at run time) is shown scrubbed and capped, with a root or without.
+        let token = format!("{}oat01-{}", "sk-ant-", "Q".repeat(40));
+        let masked = format!("\"sk-ant-[redacted:len={}]\"", token.len());
+        for (toml, want) in [
+            (format!("[wrapper]\nmode = \"{token}\"\n[workspaces]\nroots = [\"/a\"]\n"), format!("config: [wrapper].mode = {masked}: must be")),
+            (format!("[wrapper]\nmode = \"{token}\"\n"), format!("bridge.toml [wrapper] mode {masked} (no root), which names no mode: ")),
+            (format!("[wrapper]\nmode = \"{}\"\n", "m".repeat(100)), format!("bridge.toml [wrapper] mode {:?} (no root)", "m".repeat(64))),
+        ] {
+            let row = rows(&toml).remove(0);
+            assert!(row.0 == Tag::No && row.1.starts_with(&want) && !row.1.contains(&token) && !row.1.contains(&"m".repeat(65)), "{toml:?}: {row:?}");
+        }
         let dirty = rows("[[workspace]]\npath = \"/a\"\nseed_allow_dirty = true\n[[workspace]]\npath = \"/b\"\n[seed]\nmax_mib = 32\n");
         assert_eq!(dirty.len(), 3, "{dirty:?}");
         assert_eq!(dirty[1].0, Tag::Warn);
@@ -2301,8 +2539,10 @@ mod tests {
     /// For a bridge.toml that does not load, the S8 rows are the one mode
     /// row the wrapper acts on, the file read as `route::Broken` reads it:
     /// remote (a mode that cannot be read included) is `[NO ]`, passthrough
-    /// or no mode `[-  ]`, never the default's `[ok ] passthrough`; a file
-    /// that loads, or none, keeps [`rows_s8`]'s rows.
+    /// or no mode `[-  ]`, never the default's `[ok ] passthrough`; with
+    /// roots it reads and none (S9), every chat runs here until bridge.toml
+    /// names one, the mode quoted scrubbed; a file that loads, or none,
+    /// keeps [`rows_s8`]'s rows.
     #[test]
     fn the_s8_rows_of_a_bridge_toml_that_does_not_load_follow_the_wrapper() {
         let d = tempfile::tempdir().unwrap();
@@ -2339,6 +2579,19 @@ mod tests {
         assert_eq!(rows(Some(remote)), rows_of(remote), "a file that loads");
         let absent = rows_s8_loaded(&paths, &BridgeConfig::load(&paths)).iter().map(text).collect::<Vec<_>>();
         assert_eq!(absent, rows_of(""), "no bridge.toml: the defaults");
+        // Remote, or a mode it cannot read (F1: an unknown [wrapper] key, a header-less mode), roots read and none.
+        let token = format!("{}oat01-{}", "sk-ant-", "Q".repeat(40));
+        let until = "every Cursor chat runs on this Mac until bridge.toml names a root, then every chat under it exits 1 at its start  <- fix bridge.toml (the bridge.toml row above)";
+        for (toml, mode) in [
+            ("[wrapper]\nmode = \"remote\"\n[vm]\nmax_idle = 300\n".to_string(), "\"remote\"".to_string()),
+            ("[wrapper]\nmode = 1\n".to_string(), "unreadable".to_string()),
+            ("[wrapper]\nmode = \"passthrough\"\nnope = 1\n".to_string(), "unreadable".to_string()),
+            ("mode = \"remote\"\n".to_string(), "unreadable".to_string()),
+            (format!("[wrapper]\nmode = \"{token}\"\n[vm]\nmax_idle = 300\n"), format!("\"sk-ant-[redacted:len={}]\"", token.len())),
+        ] {
+            let got = rows(Some(toml.as_str()));
+            assert_eq!(got, vec![(Tag::No, format!("bridge.toml, which does not load, [wrapper] mode {mode} (no root): {until}"))], "{toml:?}");
+        }
     }
 
     /// The image's `workspace_v1` (L5): a live VM without it is named (make
@@ -2693,20 +2946,72 @@ mod tests {
         std::fs::write(dir.join(bundle("2.1.300")), "").unwrap();
         std::fs::write(dir.join(".obsolete"), r#"{"anthropic.claude-code-2.1.288-darwin-arm64": true}"#).unwrap();
         let asked = std::cell::RefCell::new(Vec::new());
-        let (lines, out) = cursor_bundle_rows(dir, Some("2.1.287"), &|bin: &Path| {
-            asked.borrow_mut().push(bin.to_path_buf());
-            Some("2.1.287 (Claude Code)".to_string())
-        });
+        // The rows on no live window (`cursor_bundle_rows` reads them from the bridge's census: not here).
+        let (lines, out) = bundle_rows(
+            dir,
+            Some("2.1.287"),
+            &|bin: &Path| {
+                asked.borrow_mut().push(bin.to_path_buf());
+                Some("2.1.287 (Claude Code)".to_string())
+            },
+            &[],
+        );
         assert_eq!(*asked.borrow(), vec![dir.join(bundle("2.1.287")).join("resources").join("native-binary").join("claude")]);
         assert_eq!(out.as_deref(), Some("2.1.287 (Claude Code)"));
         let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
         assert!(texts[0].contains("cursor extension 2.1.287, bundled claude 2.1.287") && !texts[0].contains("versions installed"), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("image claude 2.1.287 = Cursor bundle")), "{texts:?}");
-        let (lines, _) = cursor_bundle_rows(dir, Some("2.1.286"), &|_: &Path| None);
+        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[]);
         let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
         assert!(texts.iter().any(|t| t.contains("image claude 2.1.286 != Cursor bundle 2.1.287  <- make claude-update")), "{texts:?}");
-        let (lines, out) = cursor_bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") });
+        let (lines, out) = bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") }, &[]);
         assert_eq!((lines.len(), text(&lines[0]).0, out), (1, Tag::Skip, None));
+    }
+
+    /// S9: a live Cursor window on another extension than the installed one
+    /// is named (`[!! ]`, its host's pid and since when it runs, the reload
+    /// that brings it to the installed one), read from the census through
+    /// `census::running_extensions` (a dead host, or a pid given to a later
+    /// process, names nothing); a window on the installed extension, or
+    /// none at all, adds no row. The fixture drift judges the running
+    /// versions too.
+    #[test]
+    fn a_window_on_an_older_extension_is_named() {
+        use crate::bridge::census::{running_extensions, RunningExtension};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let bundle = |v: &str| format!("anthropic.claude-code-{v}-darwin-arm64");
+        for v in ["2.1.301", "2.1.302"] {
+            std::fs::create_dir(dir.join(bundle(v))).unwrap();
+        }
+        let since = crate::wire::time::parse_rfc3339_utc("2026-10-17T09:00:00Z").unwrap();
+        let row = |ppid: u64, start_s: u64, ext: &str| serde_json::json!({"v": 1, "start": start_s * 1000, "pid": 4242, "ppid": ppid, "ext": ext, "route": "remote", "reason": "session"});
+        let rows = vec![row(5101, since + 60, "2.1.301"), row(5102, since + 120, "2.1.302"), row(5103, since + 60, "2.1.300"), row(5104, since + 60, "2.1.299")];
+        // 5101 and 5102 live since `since`; 5103 gone; 5104's pid a process that started after its row.
+        let identity = |pid: u32| -> Option<(String, u64)> {
+            match pid {
+                5101 | 5102 => Some(("Cursor Helper (Plugin)".into(), since)),
+                5104 => Some(("other".into(), since + 3600)),
+                _ => None,
+            }
+        };
+        let running = running_extensions(&rows, &identity);
+        assert_eq!(running.iter().map(|w| (w.host, w.ext.as_str())).collect::<Vec<_>>(), [(5101, "2.1.301"), (5102, "2.1.302")]);
+        let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &running);
+        let texts: Vec<(Tag, String)> = lines.iter().map(text).collect();
+        let older = (Tag::Warn, "a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:00Z); 2.1.302 is installed  <- reload that window".to_string());
+        assert_eq!(texts.iter().filter(|(_, t)| t.starts_with("a Cursor window runs extension ")).cloned().collect::<Vec<_>>(), vec![older.clone()], "the window on the installed 2.1.302 adds no row: {texts:?}");
+        assert_eq!(texts[0].0, Tag::Ok, "the installed bundle first: {texts:?}");
+        assert_eq!(texts[1], older, "right after it: {texts:?}");
+        let drift = texts.iter().find(|(_, t)| t.contains("fixtures tagged")).expect("the fixtures are 2.1.278's");
+        assert_eq!(drift, &(Tag::Warn, format!("cursor extension 2.1.302 ≠ fixtures tagged {FIXTURE_EXT_VERSION}; a Cursor window runs 2.1.301  <- re-capture tests/fixtures/argv from `ai-env wrapper census`")));
+        // No live window, or every one on the installed extension: no window row.
+        for windows in [Vec::new(), vec![RunningExtension { host: 5102, ext: "2.1.302".into(), started: since, seen: (since + 120) * 1000 }]] {
+            let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &windows);
+            assert!(lines.iter().all(|l| !text(l).1.starts_with("a Cursor window runs")), "{windows:?}");
+        }
+        // No installed bundle: nothing to reload a window onto (the bundle row says it is missing).
+        assert!(rows_running_windows(None, &running).is_empty());
     }
 
     #[test]
@@ -2727,14 +3032,29 @@ mod tests {
         assert_eq!(text(&row_path_claude(None, None)).0, Tag::Skip);
     }
 
+    /// The fixtures against the installed bundle and (S9) the versions live
+    /// windows run: the installed one's drift is re-captured, a window's
+    /// own other version named beside it; a window alone on another version
+    /// than matching fixtures is reloaded; with no bundle installed, a
+    /// window's drift is re-captured.
     #[test]
     fn fixture_drift_row() {
+        use crate::bridge::census::RunningExtension;
+        let on = |ext: &str| RunningExtension { host: 4200, ext: ext.into(), started: 1, seen: 1000 };
         assert_eq!(FIXTURE_EXT_VERSION, "2.1.278");
-        assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION)), None, "the fixtures match the installed bundle");
-        assert_eq!(row_fixture_drift(None), None, "no bundle: nothing to drift from");
-        let (tag, t) = text(&row_fixture_drift(Some("2.1.290")).unwrap());
+        assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[]), None, "the fixtures match the installed bundle");
+        assert_eq!(row_fixture_drift(None, &[]), None, "no bundle: nothing to drift from");
+        assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[on(FIXTURE_EXT_VERSION)]), None, "a window on the fixtures' version");
+        let (tag, t) = text(&row_fixture_drift(Some("2.1.290"), &[]).unwrap());
         assert_eq!(tag, Tag::Warn);
         assert!(t.starts_with("cursor extension 2.1.290 ≠ fixtures tagged 2.1.278  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"), "{t}");
+        assert_eq!(row_fixture_drift(Some("2.1.290"), &[on("2.1.290"), on(FIXTURE_EXT_VERSION)]), row_fixture_drift(Some("2.1.290"), &[]), "windows on the installed or the fixtures' version add nothing");
+        let (_, t) = text(&row_fixture_drift(Some("2.1.290"), &[on("2.1.289"), on("2.1.288"), on("2.1.289")]).unwrap());
+        assert_eq!(t, "cursor extension 2.1.290 ≠ fixtures tagged 2.1.278; a Cursor window runs 2.1.288, 2.1.289  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
+        let (tag, t) = text(&row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[on("2.1.277")]).unwrap());
+        assert_eq!((tag, t.as_str()), (Tag::Warn, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.278  <- reload that window (the installed bundle matches the fixtures)"));
+        let (_, t) = text(&row_fixture_drift(None, &[on("2.1.277")]).unwrap());
+        assert_eq!(t, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.278  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
     }
 
     #[test]

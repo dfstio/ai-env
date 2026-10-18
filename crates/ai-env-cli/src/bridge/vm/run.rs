@@ -225,6 +225,11 @@ pub struct RunPlan {
     /// and `vm warm`, which seed the workspace through its routes. `false`
     /// from [`RunPlan::from_cfg`].
     pub workspace_cap: bool,
+    /// S9 (as `workspace_cap`, for `transcript_s3_v1`): reuse no VM whose
+    /// recorded caps lack the transcript store, and refuse a pinned one
+    /// (exit 7, `make deploy`). The session's P0, the prewarm and `vm warm`
+    /// (with its seed) set it; `false` from [`RunPlan::from_cfg`].
+    pub transcript_cap: bool,
     /// Pad the run-hook payload with spaces after its opening `{` to exactly
     /// this many bytes ([`padded_payload`]); shorter than the payload is a
     /// config error, longer than 4096 is sent as is (the API decides).
@@ -356,6 +361,7 @@ impl RunPlan {
             pad_payload_to: None,
             choice: Choice::Workspace,
             workspace_cap: false,
+            transcript_cap: false,
         })
     }
 }
@@ -1005,8 +1011,9 @@ pub struct SelectFailure {
     /// The client token of the pending row this call wrote, set as soon as
     /// the row exists; `None` when the failure came before a pending row was
     /// written (version resolution, the workspace lock, reuse, `MaxConcurrent`,
-    /// `Busy`, a failed pending write).
-    pub client_token: Option<String>,
+    /// `Busy`, a failed pending write). Boxed, as `ran` is (S9: `BridgeError`
+    /// grew to 56 bytes with its `S3` variant).
+    pub client_token: Option<Box<str>>,
     /// The VM `RunMicrovm` made, on every failure after it answered — alive
     /// or not (the egress gate terminated it, the RUNNING wait timed out and
     /// terminated it, it went TERMINATED, GetMicrovm never found it). `None`
@@ -1114,7 +1121,7 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
     }
     let max_duration_s = to_i32(plan.max_duration_s, "--max-duration")?;
     let (mut row, payload) = place(api, paths, plan, &version.version).await?;
-    let token = Some(row.client_token.clone());
+    let token: Option<Box<str>> = Some(row.client_token.as_str().into());
     let fail = |error: BridgeError, kept_pending: Option<Box<VmRow>>, started: Option<String>| SelectFailure { error, kept_pending, started, client_token: token.clone(), ran: None };
     let spec = RunSpec {
         image_arn: plan.image_arn.clone(),
@@ -1354,7 +1361,8 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted
 /// row passes with any); the plan's egress and shell; none of other
 /// connectors than `wanted` (a row without connectors, written before S5,
 /// goes to the gate); with `workspace_cap`, none whose caps lack
-/// `workspace_v1`.
+/// `workspace_v1`; with `transcript_cap` (S9), none whose caps lack
+/// `transcript_s3_v1`.
 pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, workspace: &str, version: Option<&str>, preferred: Option<&str>, now: u64) -> bool {
     !r.is_pending_row()
         && r.workspace.as_deref() == Some(workspace)
@@ -1366,6 +1374,7 @@ pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, 
         && r.shell == plan.shell
         && ExpectedEcho::for_row(r).is_none_or(|e| &e == wanted)
         && !(plan.workspace_cap && vm_capability(r) == Capability::No)
+        && !(plan.transcript_cap && crate::bridge::workspace::vm_capability_of(r, crate::wire::frame::CAP_TRANSCRIPT_S3_V1) == Capability::No)
 }
 
 /// One reuse candidate, as [`try_reuse`] and a pinned VM ([`select_pinned`])
@@ -1511,6 +1520,10 @@ async fn select_pinned<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wa
     }
     if plan.workspace_cap && vm_capability(&row) == Capability::No {
         return Err(BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, message: pinned(format!("image version {} predates the workspace routes", row.image_version)) }.into());
+    }
+    if plan.transcript_cap && crate::bridge::workspace::vm_capability_of(&row, crate::wire::frame::CAP_TRANSCRIPT_S3_V1) == Capability::No {
+        let cap = crate::wire::frame::CAP_TRANSCRIPT_S3_V1;
+        return Err(BridgeError::NoCapability { cap, message: pinned(format!("image version {} predates the transcript store", row.image_version)) }.into());
     }
     match reuse_row(api, paths, plan, row, poll).await? {
         Ok(selected) => Ok(selected),

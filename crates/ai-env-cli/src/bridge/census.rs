@@ -296,15 +296,39 @@ pub fn record(path: &Path, row: &CensusRow) -> Result<(), BridgeError> {
     Ok(())
 }
 
-/// Every parseable row (oldest first), or the last `last` of them. A missing
-/// file is an empty census; unparseable lines are skipped, never fatal.
-pub fn read_rows(path: &Path, last: Option<usize>) -> Result<Vec<serde_json::Value>, BridgeError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+/// `path` opened for reading as the writer guards its file
+/// (`logging::open_log_file`: `O_NOFOLLOW`, then a regular file on the
+/// descriptor), and `O_NONBLOCK`: a symlink, a FIFO, a directory or any
+/// other non-regular file is an error naming the path, never followed or
+/// waited on. `None` when there is no file. [`read_rows`] and [`read_tail`]
+/// open with it, so every reader of the census, the audit and the probe
+/// rows does.
+pub fn open_for_read(path: &Path) -> Result<Option<std::fs::File>, BridgeError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path);
+    let file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(BridgeError::Config(format!("{} is a symlink; refusing to read it", path.display()))),
         Err(e) => return Err(BridgeError::Io(e)),
     };
-    let mut rows: Vec<serde_json::Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if !file.metadata()?.is_file() {
+        return Err(BridgeError::Config(format!("{} is not a regular file", path.display())));
+    }
+    Ok(Some(file))
+}
+
+/// Every parseable row (oldest first), or the last `last` of them. A missing
+/// file is an empty census; unparseable lines (one that is not UTF-8
+/// included) are skipped, never fatal. Opened by [`open_for_read`].
+pub fn read_rows(path: &Path, last: Option<usize>) -> Result<Vec<serde_json::Value>, BridgeError> {
+    use std::io::Read;
+    let Some(mut file) = open_for_read(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut rows: Vec<serde_json::Value> = bytes.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice(l).ok()).collect();
     if let Some(n) = last {
         let skip = rows.len().saturating_sub(n);
         rows.drain(..skip);
@@ -319,25 +343,15 @@ pub fn read_rows(path: &Path, last: Option<usize>) -> Result<Vec<serde_json::Val
 /// first. A line the window cuts is dropped, so every row is whole, and the
 /// last `chunks` rows are always among them (no row is longer than
 /// [`MAX_ROW_BYTES`]). A missing file is an empty census; unparseable lines,
-/// a partial last line among them, are skipped. Opened as the writer guards
-/// its file (`logging::open_log_file`: `O_NOFOLLOW`, then a regular file on
-/// the descriptor), and `O_NONBLOCK`: a symlink, a FIFO or any other
-/// non-regular file is an error naming the path, never followed or waited on.
+/// a partial last line among them, are skipped. Opened by [`open_for_read`]:
+/// a symlink, a FIFO or any other non-regular file is an error naming the
+/// path, never followed or waited on.
 pub fn read_tail(path: &Path, chunks: usize) -> Result<Vec<serde_json::Value>, BridgeError> {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::OpenOptionsExt;
-    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path);
-    let mut file = match opened {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(BridgeError::Config(format!("{} is a symlink; refusing to read it", path.display()))),
-        Err(e) => return Err(BridgeError::Io(e)),
+    let Some(mut file) = open_for_read(path)? else {
+        return Ok(Vec::new());
     };
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(BridgeError::Config(format!("{} is not a regular file", path.display())));
-    }
-    let len = meta.len();
+    let len = file.metadata()?.len();
     let window = u64::try_from(chunks).unwrap_or(u64::MAX).saturating_mul(MAX_ROW_BYTES as u64);
     let start = len.saturating_sub(window.saturating_add(1));
     file.seek(SeekFrom::Start(start))?;
@@ -347,6 +361,63 @@ pub fn read_tail(path: &Path, chunks: usize) -> Result<Vec<serde_json::Value>, B
     // whole only when the byte before the window ends a line.
     let whole = if start == 0 { &buf[..] } else { buf.iter().position(|b| *b == b'\n').map_or(&[][..], |i| &buf[i + 1..]) };
     Ok(whole.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice(l).ok()).collect())
+}
+
+/// What a row's `ext` is printed as when it is not in the shape the census
+/// writes (a version): only the wrapper writes the census, but nothing
+/// stops another hand.
+pub const UNRECOGNISED_EXT: &str = "unrecognised";
+
+/// One Cursor window whose extension host still runs, as the census shows
+/// it ([`running_extensions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningExtension {
+    /// The window's extension host: its rows' `ppid`.
+    pub host: u32,
+    /// The extension version its newest row names (`ext`); [`UNRECOGNISED_EXT`]
+    /// when that value is not a version's shape (1 to 32 characters of
+    /// `[0-9A-Za-z.+-]`).
+    pub ext: String,
+    /// When the host started (unix seconds), as the system says.
+    pub started: u64,
+    /// That newest row's `start` (unix ms).
+    pub seen: u64,
+}
+
+/// The extension each Cursor window runs now, from the census `rows` (as
+/// [`read_tail`] returns them): the rows grouped by `ppid`, the window's
+/// extension host, and each host's newest row that names an extension (by
+/// `start`; of equal ones the later in the file). A host counts while
+/// `identity` (`registry::process_identity`: its executable's name and
+/// when it started, unix seconds; `None` when it is gone) shows it started
+/// no later than that row: a pid the system gave a later process never
+/// counts, and a window keeps the extension it loaded until a reload starts
+/// a new host. A row without `ppid`, `start` or `ext`, or whose `ppid` is
+/// 0 or 1 (no window), is skipped. Sorted by when each host started, then
+/// its pid.
+#[must_use]
+pub fn running_extensions(rows: &[serde_json::Value], identity: &dyn Fn(u32) -> Option<(String, u64)>) -> Vec<RunningExtension> {
+    let mut newest: BTreeMap<u32, (u64, &str)> = BTreeMap::new();
+    for row in rows {
+        let host = row.get("ppid").and_then(serde_json::Value::as_u64).and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 1);
+        let (Some(host), Some(start), Some(ext)) = (host, row.get("start").and_then(serde_json::Value::as_u64), row.get("ext").and_then(serde_json::Value::as_str)) else {
+            continue;
+        };
+        let seen = newest.entry(host).or_insert((start, ext));
+        if start >= seen.0 {
+            *seen = (start, ext);
+        }
+    }
+    let shaped = |ext: &str| !ext.is_empty() && ext.len() <= 32 && ext.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-'));
+    let mut out: Vec<RunningExtension> = newest
+        .into_iter()
+        .filter_map(|(host, (seen, ext))| {
+            let (_, started) = identity(host)?;
+            (started.saturating_mul(1000) <= seen).then(|| RunningExtension { host, ext: if shaped(ext) { ext.to_string() } else { UNRECOGNISED_EXT.to_string() }, started, seen })
+        })
+        .collect();
+    out.sort_by_key(|w| (w.started, w.host));
+    out
 }
 
 #[cfg(test)]
@@ -681,6 +752,112 @@ mod tests {
         let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("opening a FIFO must not block");
         assert_eq!(got, Err(format!("config: {} is not a regular file", fifo.display())));
         assert_eq!(read_tail(root.path(), 1).unwrap_err().to_string(), format!("config: {} is not a regular file", root.path().display()));
+    }
+
+    /// Every reader of the census, the audit and the probe rows opens as the
+    /// tail does ([`open_for_read`]): a symlink in the file's place is
+    /// refused, never followed (its target untouched and unread); a FIFO or
+    /// a directory is no regular file, refused at once (the FIFO's open
+    /// never waits for a writer). Each error names the path; a missing file
+    /// is still an empty census, and a line that is not UTF-8 is skipped
+    /// like any unparseable one.
+    #[cfg(unix)]
+    #[test]
+    fn read_rows_refuses_a_symlink_a_fifo_or_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real.jsonl");
+        let mut bytes = line_of(1, 200).into_bytes();
+        bytes.extend_from_slice(b"\xff\xfe not utf-8\n");
+        bytes.extend_from_slice(line_of(2, 200).as_bytes());
+        std::fs::write(&real, &bytes).unwrap();
+        assert_eq!(numbers(&read_rows(&real, None).unwrap()), vec![1, 2], "a line that is not UTF-8 is skipped, never fatal");
+        assert_eq!(read_rows(&root.path().join("absent.jsonl"), None).unwrap(), Vec::<serde_json::Value>::new());
+        let link = root.path().join("census.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_rows(&link, None).unwrap_err().to_string(), format!("config: {} is a symlink; refusing to read it", link.display()));
+        assert_eq!(crate::bridge::audit::read_rows(&link, Some(1)).unwrap_err().to_string(), format!("config: {} is a symlink; refusing to read it", link.display()), "the audit's reader too");
+        let fifo = root.path().join("fifo.jsonl");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // On a thread with a deadline: without O_NONBLOCK the open would wait for a writer forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = fifo.clone();
+        std::thread::spawn(move || tx.send(read_rows(&at, None).map_err(|e| e.to_string())).unwrap());
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("opening a FIFO must not block");
+        assert_eq!(got, Err(format!("config: {} is not a regular file", fifo.display())));
+        assert_eq!(read_rows(root.path(), None).unwrap_err().to_string(), format!("config: {} is not a regular file", root.path().display()));
+        assert!(matches!(open_for_read(&root.path().join("absent")), Ok(None)));
+        assert!(open_for_read(&real).unwrap().is_some());
+    }
+
+    /// One census row of host `ppid` started at `start` (unix ms) naming `ext`.
+    fn host_row(ppid: u64, start: u64, ext: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"v": 1, "start": start, "pid": 4242, "ppid": ppid, "ext": ext, "route": "remote", "reason": "session"})
+    }
+
+    /// The extension each live window runs: each host's newest row that
+    /// names one, by `start` (an end row is its start row's clone, and an
+    /// older row later in the file changes nothing); a dead host, and a pid
+    /// the system gave a process that started after the host's newest row,
+    /// never count; two live windows on two versions are both named, by
+    /// when their hosts started. A row naming no extension, or of no window
+    /// (`ppid` 0 or 1), is skipped; an `ext` of another shape is printed as
+    /// unrecognised, never as written.
+    #[test]
+    fn running_extensions_take_each_live_hosts_newest_row() {
+        let s = |secs: u64| secs * 1000;
+        let rows = vec![
+            // Host 100: dead.
+            host_row(100, s(1_000), Some("2.1.290")),
+            // Host 200: its pid now another process's, started after its newest row.
+            host_row(200, s(1_000), Some("2.1.296")),
+            // Host 300: its newest row naming an extension decides; a later one naming none changes nothing.
+            host_row(300, s(2_000), Some("2.1.301")),
+            host_row(300, s(3_000), Some("2.1.302")),
+            host_row(300, s(3_500), None),
+            // Host 400: a window still on 2.1.301; its older row comes later in the file, an end row too.
+            host_row(400, s(2_500), Some("2.1.301")),
+            host_row(400, s(1_500), Some("2.1.299")),
+            {
+                let mut end = host_row(400, s(2_500), Some("2.1.301"));
+                end["end"] = serde_json::json!(s(2_600));
+                end
+            },
+            // No window: launchd's child, a row with no ppid.
+            host_row(1, s(4_000), Some("2.1.302")),
+            serde_json::json!({"start": s(4_000), "ext": "2.1.302"}),
+            // Host 500: a forged ext.
+            host_row(500, s(4_000), Some("2.1.302\n  [ok ] forged")),
+        ];
+        let identity = |pid: u32| -> Option<(String, u64)> {
+            match pid {
+                200 => Some(("launchd-thing".into(), 1_500)),
+                300 => Some(("Cursor Helper (Plugin)".into(), 1_900)),
+                400 => Some(("Cursor Helper (Plugin)".into(), 1_200)),
+                500 => Some(("Cursor Helper (Plugin)".into(), 3_999)),
+                1 => Some(("launchd".into(), 0)),
+                _ => None,
+            }
+        };
+        let got = running_extensions(&rows, &identity);
+        assert_eq!(
+            got,
+            vec![
+                RunningExtension { host: 400, ext: "2.1.301".into(), started: 1_200, seen: s(2_500) },
+                RunningExtension { host: 300, ext: "2.1.302".into(), started: 1_900, seen: s(3_000) },
+                RunningExtension { host: 500, ext: UNRECOGNISED_EXT.into(), started: 3_999, seen: s(4_000) },
+            ]
+        );
+        // A host that started in its newest row's second still counts; one a second later does not.
+        assert_eq!(running_extensions(&[host_row(600, s(5_000) + 999, Some("2.1.302"))], &|_| Some((String::new(), 5_000))).len(), 1);
+        assert!(running_extensions(&[host_row(600, s(5_000) + 999, Some("2.1.302"))], &|_| Some((String::new(), 5_001))).is_empty());
+        assert!(running_extensions(&[], &identity).is_empty());
+        // This process stands for a live host: its own start, read from the system, is before now.
+        let me = std::process::id();
+        let now_ms = crate::wire::time::unix_now_ms();
+        let live = running_extensions(&[host_row(u64::from(me), now_ms, Some("2.1.302"))], &crate::bridge::registry::process_identity);
+        assert_eq!(live.iter().map(|w| (w.host, w.ext.as_str())).collect::<Vec<_>>(), [(me, "2.1.302")]);
     }
 
     /// A row of exactly [`MAX_ROW_BYTES`] (the largest `record` writes) is

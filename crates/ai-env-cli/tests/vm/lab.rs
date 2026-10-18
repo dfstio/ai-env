@@ -31,7 +31,7 @@ use super::cli::{code, stderr, stdout, World};
 use crate::common::CONNECTOR;
 use ai_env_cli::bridge::api::{Call, FakeFailure};
 use ai_env_cli::bridge::egress::check::{denied_host, CASES, FAKE_SHELL_KNOB, FAKE_SHELL_NOTE};
-use ai_env_cli::bridge::egress::{param_name, parse_extras, parse_hosts, value_sha256, EgressVerified, VerifiedRecord, DNS_RULE, EXTRAS_HEADER, PARAMS, SUSPENDED_HEADER};
+use ai_env_cli::bridge::egress::{param_name, parse_extras, parse_hosts, value_sha256, EgressVerified, VerifiedRecord, DNS_RULE, EGRESS_RULE, EXTRAS_HEADER, PARAMS, SUSPENDED_HEADER};
 use ai_env_cli::bridge::infra::InfraState;
 use ai_env_cli::wire::time::unix_now;
 use std::fs;
@@ -579,10 +579,16 @@ fn lab_list_shows_the_four_s8_probes_and_fresh_claude_json_needs_a_git_workspace
     }
     assert_eq!(listed.iter().filter(|r| r["stage"] == "S8").count(), 4, "exactly four S8 probes");
     let says = "lab run fresh-claude-json seeds the current directory's workspace into its fresh VM, as a session's is: ";
-    let outside = w.cmd(&["lab", "run", "fresh-claude-json"]).current_dir(w.root().join("outside")).output().unwrap();
+    // Each run to its end within the file's bound (S9: F9's waits), stdin /dev/null as `output()` gave it.
+    let fresh_from = |dir: PathBuf| {
+        let mut c = w.cmd(&["lab", "run", "fresh-claude-json"]);
+        c.current_dir(dir).stdin(std::process::Stdio::null());
+        bounded(c)
+    };
+    let outside = fresh_from(w.root().join("outside"));
     assert_eq!(code(&outside), 9, "{}", stderr(&outside));
     assert!(stderr(&outside).contains(says) && stderr(&outside).contains("is outside [workspaces].roots"), "{}", stderr(&outside));
-    let no_git = w.cmd(&["lab", "run", "fresh-claude-json"]).current_dir(w.ws()).output().unwrap();
+    let no_git = fresh_from(w.ws());
     assert_eq!(code(&no_git), 9, "{}", stderr(&no_git));
     let ws = fs::canonicalize(w.ws()).unwrap();
     assert!(stderr(&no_git).contains(&format!("{says}{} is no git repository; run it from a git workspace under the roots", ws.display())), "{}", stderr(&no_git));
@@ -633,7 +639,7 @@ fn lab_dup_probes_need_the_census_evidence_of_a_remote_resume() {
     let w = World::new("");
     let o = w.run(&["lab", "run", "dup-init", "--manual", "no-duplicate"]);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
-    assert!(stderr(&o).contains("dup-init: no remote resume in the census; the dup probes need a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, or respawns:1 or more)"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("dup-init: no remote resume in the census; the dup probes need a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more)"), "{}", stderr(&o));
     assert!(stderr(&o).trim_end().ends_with("; nothing recorded"), "{}", stderr(&o));
     for bad in ["ok", "duplicate:"] {
         let o = w.run(&["lab", "run", "dup-user-replay", "--manual", bad]);
@@ -709,9 +715,10 @@ fn run_fresh(rig: &rig::remote::RemoteRig) -> std::process::Output {
 /// identical VM path, HEAD the Mac's), reads the project's keys of the
 /// agent's `.claude.json` (none: fresh), delivers the token on fd 3 and
 /// starts the VM's claude as Cursor starts a chat's (the extension's argv
-/// sanitised: no debug flag, `--session-mirror` last; the session's
-/// environment with the extension's entrypoint, and the proxy variables) in
-/// that path: `initialize`, then one turn. The fake answers both: no-stall,
+/// sanitised: no debug flag, no `--session-mirror`, S9 keeping a remote
+/// chat's transcript in S3; the session's environment with the extension's
+/// entrypoint, and the proxy variables) in that path: `initialize`, then
+/// one turn. The fake answers both: no-stall,
 /// one Touch ID (combined.env), the VM terminated. With `FAKE_ONBOARDING` it
 /// answers nothing: stall:initialize after Cursor's window (6 s under the
 /// rig's backoff), its stderr line in the note, the command failing after
@@ -739,7 +746,6 @@ fn fresh_claude_json_runs_offline_on_the_emulated_platform() {
         "--enable-auth-status",
         "--no-chrome",
         "--replay-user-messages",
-        "--session-mirror",
     ];
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap();
@@ -754,7 +760,7 @@ fn fresh_claude_json_runs_offline_on_the_emulated_platform() {
     assert!(row["claude"].as_str().is_some() && row["shim"].as_str().is_some(), "stamped with the VM's /health: {row}");
     let note = row["note"].as_str().unwrap();
     let vm_cwd = rig.vm_cwd();
-    let head = format!(": the seed of {vm_cwd}: seeded; projects[the path] in the agent's .claude.json before: none (fresh); claude as Cursor starts a chat (15 arguments, CLAUDE_CODE_ENTRYPOINT=claude-vscode): answered initialize in ");
+    let head = format!(": the seed of {vm_cwd}: seeded; projects[the path] in the agent's .claude.json before: none (fresh); claude as Cursor starts a chat (14 arguments, CLAUDE_CODE_ENTRYPOINT=claude-vscode): answered initialize in ");
     assert!(note.contains(&head), "{note}");
     assert!(note.contains(" ms; the turn's result in ") && note.ends_with(" ms (success); it asked its host: nothing; its first stderr line: none; projects[the path] after: none (fresh)"), "{note}");
     let fake = rig.fake();
@@ -797,7 +803,7 @@ fn fresh_claude_json_runs_offline_on_the_emulated_platform() {
     let row = rig_rows(&rig, "fresh-claude-json").pop().expect("the stall is recorded");
     assert_eq!(row["verdict"].as_str(), Some("stall:initialize"), "{row}");
     let note = row["note"].as_str().unwrap();
-    assert!(note.contains("before: none (fresh); claude as Cursor starts a chat (15 arguments, CLAUDE_CODE_ENTRYPOINT=claude-vscode): no answer to initialize within 6 s (then claude exited 1); no turn sent; it asked its host: nothing; its first stderr line: fake claude: onboarding (FAKE_ONBOARDING): waiting for an answer on a terminal; nothing is answered; projects[the path] after: none (fresh)"), "{note}");
+    assert!(note.contains("before: none (fresh); claude as Cursor starts a chat (14 arguments, CLAUDE_CODE_ENTRYPOINT=claude-vscode): no answer to initialize within 6 s (then claude exited 1); no turn sent; it asked its host: nothing; its first stderr line: fake claude: onboarding (FAKE_ONBOARDING): waiting for an answer on a terminal; nothing is answered; projects[the path] after: none (fresh)"), "{note}");
     let stdin = fs::read_to_string(root.join("onboarding").join("stdin.log")).unwrap();
     assert_eq!(stdin.lines().count(), 1, "the initialize alone: no turn after no answer: {stdin}");
     assert!(rig.fake().vms.values().all(|v| v.state.is_terminal()), "the terminate guard ended the VM");
@@ -852,7 +858,7 @@ fn probe_rows_of_the_old_schema_parse_in_lab_list() {
     let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entry = list.as_array().unwrap().iter().find(|r| r["probe"] == "entrypoint").unwrap();
     assert_eq!(entry["last_verdict"], "claude-vscode");
-    assert_eq!(list.as_array().unwrap().len(), 30, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4");
+    assert_eq!(list.as_array().unwrap().len(), 32, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4, S9 2");
 }
 
 #[test]
@@ -1316,6 +1322,13 @@ fn transcript_with(w: &World, replace: &[(&str, &str)]) -> PathBuf {
             "direct-ipv4" | "direct-http" | "proxy-other-port" => "rc=28 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
+            // The S9 S3 cases (§7.7): s3-own stored and read back through the endpoint; the S3Denied cases 403
+            // AccessDenied through the tunnel; s3-direct made no connection; proxy-s3-other-host is a CONNECT 403 (the
+            // proxy- arm below catches it).
+            "s3-direct" => "rc=6 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
+            "s3-own" => "rc=0 put=200 get=200 hc=200 s3=-".to_string(),
+            "s3-front-bucket" | "s3-front-path" => "rc=0 put=000 get=403 hc=200 s3=AccessDenied".to_string(),
+            "s3-own-outside-prefix" | "s3-imds-role" => "rc=0 put=403 get=000 hc=200 s3=AccessDenied".to_string(),
             n if n.starts_with("proxy-") || n == "denied" => "rc=56 code=000 size=0 conn=1 hc=403 t403=yes sq=no".to_string(),
             n if n.starts_with("dns-public") => format!("rc=9 ns={} res=no st=none ra=none an=none au=none", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }),
             n if n.starts_with("dns-platform6") => "rc=9 ns=fd00:ec2::253 res=no st=none ra=none an=none au=none".to_string(),
@@ -1345,6 +1358,7 @@ fn squid_log(w: &World, client: &str, skip: Option<&str>, extra: &[&str]) {
         "TCP_DENIED/403 3900 GET api.anthropic.com:8080".to_string(),
         "TCP_DENIED/403 3900 CONNECT api.anthropic.com:8443".to_string(),
         "TCP_DENIED/403 3900 CONNECT github.com:443".to_string(),
+        "TCP_DENIED/403 3900 CONNECT s3.eu-central-1.amazonaws.com:443".to_string(),
         format!("TCP_DENIED/403 3900 CONNECT {host}:443"),
         "TCP_TUNNEL/200 1 CONNECT api.anthropic.com:443".to_string(),
     ];
@@ -1657,6 +1671,46 @@ fn egress_check_revokes_and_records_nothing_when_a_network_row_is_unknown() {
     no_vm_left(&w);
 }
 
+/// S9's `s3-imds-role` (§7.7) is judged by what the Mac knows of the check VM's execution role. Without one (the
+/// role unset in bridge.toml) IMDS had nothing to give: the case is recorded `no_role` and the pass says so; with one
+/// (this world's), the same transcript fails the check (exit 9, every pass of the connector revoked). The report names
+/// the S3 facts, and `--json` carries each S3 case's statuses and `<Code>`.
+#[test]
+fn egress_check_judges_the_imds_role_case_by_the_vms_execution_role() {
+    let w = green_network();
+    squid_log(&w, "10.42.1.17", None, &[]);
+    let t = transcript_file(&w, Some(("s3-imds-role", "rc=0 put=000 get=000 hc=000 s3=norole")));
+    let path = w.bridge().join("bridge.toml");
+    let with_role = fs::read_to_string(&path).unwrap();
+    let without = with_role.replace("execution_role_arn = \"arn:aws:iam::123456789012:role/ai-env-exec\"\n", "");
+    assert_ne!(without, with_role, "the world's VMs run with an execution role");
+    fs::write(&path, without).unwrap();
+    let o = check_with(&w, &["egress", "check", "--json"], &t);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let case = |name: &str| doc["cases"].as_array().unwrap().iter().find(|c| c["name"] == name).unwrap().clone();
+    let imds = case("s3-imds-role");
+    assert_eq!((imds["verdict"].as_str(), imds["s3_code"].as_str(), imds["put"].as_u64()), (Some("recorded"), Some("norole"), Some(0)), "{imds}");
+    let own = case("s3-own");
+    assert_eq!((own["put"].as_u64(), own["get"].as_u64(), own["connect_code"].as_u64(), own["s3_code"].as_str()), (Some(200), Some(200), Some(200), None), "{own}");
+    assert_eq!((case("s3-front-path")["get"].as_u64(), case("s3-front-path")["s3_code"].as_str()), (Some(403), Some("AccessDenied")));
+    assert_eq!((doc["execution_role"].as_bool(), doc["front_object"]["readable"].as_bool(), doc["front_object"]["status"].as_u64()), (Some(false), Some(true), None), "the lab's front object is not asked: {doc}");
+    let rec = verified(&w).records.into_iter().find(|r| r.connector == CONNECTOR).expect("recorded");
+    assert!(rec.cases.contains(" s3-imds-role=recorded:no_role ") && rec.egress_rule == EGRESS_RULE, "{rec:?}");
+    no_vm_left(&w);
+    // With the role: IMDS listing none is a failure, which revokes.
+    fs::write(&path, &with_role).unwrap();
+    seed_verified(&w);
+    let o = check_with(&w, &["egress", "check"], &t);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("FAIL      s3-imds-role") && out.contains("the check VM runs with an execution role, but IMDS gave it no role (norole)"), "{out}");
+    assert!(out.contains("s3: the front object copernicus-dem-30m/tileList.txt was not asked (lab: the shell's transcript is a file, AI_ENV_BRIDGE_LAB_FAKE_SHELL); the check VM runs with an execution role"), "{out}");
+    let v = verified(&w);
+    assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "revoked, nothing recorded: {v:?}");
+    no_vm_left(&w);
+}
+
 /// `proxy-github`'s marker when the proxy opened github.com's tunnel (github.com answers 200).
 const GITHUB_TUNNEL: &str = "rc=0 code=200 size=284512 conn=1 hc=200 t403=no sq=no";
 /// The `extras` line `ai-env egress allow some-ws github.com` writes.
@@ -1683,7 +1737,7 @@ fn egress_check_records_a_pass_with_github_allowlisted_and_says_so() {
     assert!(out.lines().any(|l| l == said), "{out}");
     assert!(stderr(&o).contains(&format!("egress check: {said}")), "{}", stderr(&o));
     assert!(
-        out.contains("squid log: from 10.42.1.17: 2 tunnels to api.anthropic.com:443; TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443, CONNECT 1.1.1.1:443, CONNECT api.anthropic.com:8443, GET api.anthropic.com:8080; no tunnel to a refused host; allowlisted, not required refused: github.com (after "),
+        out.contains("squid log: from 10.42.1.17: 2 tunnels to api.anthropic.com:443; TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443, CONNECT 1.1.1.1:443, CONNECT api.anthropic.com:8443, CONNECT s3.eu-central-1.amazonaws.com:443, GET api.anthropic.com:8080; no tunnel to a refused host; allowlisted, not required refused: github.com (after "),
         "{out}"
     );
     assert!(out.contains("egress check passed: recorded for image version 1.0"), "{out}");
@@ -1899,6 +1953,7 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
         at: recorded_at.clone(),
         dns: "no-dns".into(),
         dns_rule: DNS_RULE,
+        egress_rule: EGRESS_RULE,
         connector_facts: facts,
         image_created_at: Some(1_789_804_800),
         ..VerifiedRecord::default()
@@ -1988,6 +2043,13 @@ fn egress_check_if_needed_starts_nothing_for_a_version_already_verified() {
     let _ = fs::remove_file(w.root().join("aws.log"));
     runs("an earlier DNS rule");
     assert_eq!(aws_calls(&w).lines().filter(|l| l.starts_with("lambda-core get-network-connector ")).count(), 1, "only the network verification's read: --if-needed stopped at the rule: {}", aws_calls(&w));
+    // Likewise a pass judged by an earlier egress rule (rule 0: before S9's S3 cases, §7.7): the full check runs, and
+    // says why.
+    seed(vec![VerifiedRecord { egress_rule: 0, ..rec.clone() }]);
+    let o = check_with(&w, &["egress", "check", "--if-needed"], &t);
+    assert!(!stdout(&o).contains("nothing started") && stdout(&o).contains("egress check of microvm-"), "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains(&format!("egress check: the recorded pass of image version 1.0 was judged by an earlier egress rule (0, now {EGRESS_RULE}): checking again")), "{}", stderr(&o));
+    seed(vec![rec.clone()]);
     versions(serde_json::json!([v10("2026-09-19T11:00:05+03:00")]));
     runs("another build");
     versions(serde_json::json!([v10(BUILD)]));
@@ -2108,6 +2170,7 @@ fn egress_check_if_needed_never_skips_for_a_padded_image_version() {
         at: "2026-10-02T06:10:00Z".into(),
         dns: "no-dns".into(),
         dns_rule: DNS_RULE,
+        egress_rule: EGRESS_RULE,
         connector_facts: ai_env_cli::bridge::egress::ConnectorFacts::from_get(&golden).unwrap(),
         image_created_at: Some(1_789_804_800),
         ..VerifiedRecord::default()
@@ -2535,4 +2598,166 @@ fn lab_ctrl_c_with_stderr_a_closed_pipe_ends_the_vm_with_3() {
     let alive: Vec<&String> = st.vms.values().filter(|v| !v.state.is_terminal()).map(|v| &v.id).collect();
     assert_eq!((status.code(), alive), (Some(3), Vec::<&String>::new()), "exit 3, the VM ended: {vms:?}; stderr's first line {first:?}");
     assert!(rows(&w, "e0").is_empty(), "nothing recorded");
+}
+
+// ---- S9 (G8): protocol-v2 and chunked-put, offline on the emulated platform ---------------------
+//
+// Both run end to end on the remote rig, as fresh-claude-json does (the fake
+// API, the routed endpoint, the in-process shim and its real helper; a new
+// rig per run: a probe's terminate drains the rig's one shim): protocol-v2
+// seeds the rig's workspace and asks the VM's advertisement with
+// `Git-Protocol: version=2` (the rig's git is a logging passthrough to this
+// Mac's, whose http-backend answers v2); chunked-put sends `PUT /seed`
+// chunked to its unseeded VM, then 1 MB and 20 MB with a length (the routed
+// endpoint forwards a body as it comes, so the shim sees it chunked).
+
+/// A remote rig for one S9 probe run, its VM's git logging every name it got
+/// and its uid (`FAKE_GIT_ENV_ALL`); the fake API's `/health` names
+/// `git_http_v1` exactly when `git_http` says, as an S9 image's does and an
+/// older one's does not (whatever the rig's own caps are: the cut-over adds
+/// it to them).
+#[cfg(feature = "shim")]
+fn s9_rig(root: &Path, git_http: bool) -> rig::remote::RemoteRig {
+    let rig = rig::remote::RemoteRig::new(root);
+    rig.set_vm_git_knobs(&[("FAKE_GIT_ENV_ALL", "1")]);
+    let cap = ai_env_cli::wire::frame::CAP_GIT_HTTP_V1.to_string();
+    rig.update_fake(|s| {
+        s.health_caps.retain(|c| *c != cap);
+        if git_http {
+            s.health_caps.push(cap);
+        }
+    });
+    rig
+}
+
+/// `ai-env lab run <name>` from `rig`'s workspace, to its end (bounded).
+#[cfg(feature = "shim")]
+fn run_s9(rig: &rig::remote::RemoteRig, name: &str) -> std::process::Output {
+    let mut cmd = rig.ai_env(&["lab", "run", name]);
+    cmd.current_dir(rig.work()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    finished(cmd.spawn().expect("spawn ai-env"))
+}
+
+/// S9 L6 offline: `ai-env lab run protocol-v2` starts a vpc VM of its own
+/// (label `probe:protocol-v2`), seeds the rig's workspace into it, and asks
+/// `GET /workspace.git/info/refs?service=git-upload-pack` with
+/// `Git-Protocol: version=2` through the endpoint with its own client: the
+/// VM's http-backend (run as the agent by the helper, its environment
+/// carrying `HTTP_GIT_PROTOCOL`) answers protocol v2, chunked; recorded `v2`
+/// (its expectation), one Touch ID, the VM terminated by the guard. A VM
+/// whose `/health` names no `git_http_v1` (an image before S9) is refused
+/// with exit 7 before the seed, nothing recorded, its VM ended too.
+#[cfg(feature = "shim")]
+#[test]
+fn protocol_v2_records_v2_through_the_emulated_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let rig = s9_rig(&root.join("v2"), true);
+    let before = rig.decrypts();
+    let o = run_s9(&rig, "protocol-v2");
+    let (out, err) = (stdout(&o), stderr(&o));
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(out.contains("recorded protocol-v2=v2 (expected v2)"), "{out}");
+    let row = rig_rows(&rig, "protocol-v2").pop().expect("a protocol-v2 row");
+    assert_eq!((row["verdict"].as_str(), row["stage"].as_str()), (Some("v2"), Some("S9")), "{row}");
+    let note = row["note"].as_str().unwrap();
+    let head = format!(": the seed of {}: seeded; GET /workspace.git/info/refs?service=git-upload-pack with Git-Protocol: version=2: HTTP 200, its body chunked (", rig.vm_cwd());
+    assert!(note.contains(&head) && note.ends_with("; its first line: version 2"), "{note}");
+    assert!(note.contains(" ms, the advertisement in "), "the times to the head and the advertisement: {note}");
+    let fake = rig.fake();
+    let vm = fake.vms.values().find(|v| note.starts_with(&format!("{}: ", v.id))).expect("the note names the probe's VM");
+    assert!(vm.state.is_terminal(), "the terminate guard ended {}", vm.id);
+    assert_eq!(fake.vms.len(), 1, "one VM");
+    assert_eq!(rig.decrypts() - before, 1, "one Touch ID: the runtime key");
+    let backend: Vec<_> = rig.vm_git_calls().into_iter().filter(|c| c.args.iter().any(|a| a == "http-backend")).collect();
+    assert_eq!(backend.len(), 1, "one http-backend run: the advertisement");
+    // The advertisement's GET: `GitRun::vm`'s five names and the CGI's own for it, never a bearer, a user or a config carrier.
+    let want = ["GIT_CONFIG_GLOBAL", "GIT_HTTP_EXPORT_ALL", "GIT_PROJECT_ROOT", "GIT_TERMINAL_PROMPT", "HOME", "HTTP_GIT_PROTOCOL", "LC_ALL", "PATH", "PATH_INFO", "QUERY_STRING", "REMOTE_ADDR", "REQUEST_METHOD"];
+    assert_eq!(backend[0].env, want, "http-backend's environment for the advertisement");
+    // SAFETY: getuid cannot fail.
+    assert_eq!(backend[0].uid, Some(unsafe { libc::getuid() }), "the helper's git runs as the agent (here the rig's own uid)");
+    drop(rig);
+
+    // An image before S9: its `/health` names no git_http_v1.
+    let rig = s9_rig(&root.join("old-image"), false);
+    let o = run_s9(&rig, "protocol-v2");
+    let err = stderr(&o);
+    assert_eq!(code(&o), 7, "{}\n{err}", stdout(&o));
+    assert!(err.contains("git_http_v1"), "the refusal names the capability: {err}");
+    assert!(rig_rows(&rig, "protocol-v2").is_empty(), "nothing recorded");
+    assert!(rig.fake().vms.values().all(|v| v.state.is_terminal()), "the terminate guard ended the VM");
+    assert!(!rig.vm_git_calls().iter().any(|c| c.args.iter().any(|a| a == "http-backend")), "no advertisement was asked");
+}
+
+/// S9 L6 offline: `ai-env lab run chunked-put` starts a vpc VM of its own and
+/// sends `PUT /seed` chunked to it, never seeded: the endpoint forwards the
+/// body as it comes, so the shim answers its own 411 `bad_request`:
+/// recorded `forwarded`. The 1 MB and 20 MB `PUT /seed` with a length that
+/// follow are each read whole and answered 409 `not_seeded`, their times
+/// and rates in the note; no helper ran (no git call in the VM), nothing was
+/// written at the probe's path, and the VM was ended.
+#[cfg(feature = "shim")]
+#[test]
+fn chunked_put_records_forwarded_and_times_the_puts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let rig = s9_rig(&root.join("chunked"), false);
+    let o = run_s9(&rig, "chunked-put");
+    let (out, err) = (stdout(&o), stderr(&o));
+    assert_eq!(code(&o), 0, "{out}\n{err}");
+    assert!(out.contains("recorded chunked-put=forwarded (expected recorded)"), "{out}");
+    let row = rig_rows(&rig, "chunked-put").pop().expect("a chunked-put row");
+    assert_eq!((row["verdict"].as_str(), row["stage"].as_str()), (Some("forwarded"), Some("S9")), "{row}");
+    let note = row["note"].as_str().unwrap();
+    assert!(note.contains(": PUT /seed chunked (4 chunks of 16384 bytes) to the unseeded VM: HTTP 411 bad_request in "), "{note}");
+    for size in ["; with a Content-Length, an update of the unseeded VM: 1 MB: HTTP 409 not_seeded in ", "; 20 MB: HTTP 409 not_seeded in "] {
+        assert!(note.contains(size), "{size:?} in {note}");
+    }
+    assert!(note.ends_with(" MB/s)"), "the rate: {note}");
+    let seeds: Vec<u16> = rig.endpoint.attempts().iter().filter(|a| a.port == 9418 && a.path.starts_with("/seed")).map(|a| a.status).collect();
+    assert_eq!(seeds, [411, 409, 409], "the chunked PUT, then the two with a length");
+    assert!(rig.vm_git_calls().is_empty(), "no helper ran a git");
+    assert!(!rig.vm_path(Path::new("/ai-env-probe")).exists(), "nothing written at the probe's path");
+    assert!(rig.fake().vms.values().all(|v| v.state.is_terminal()), "the terminate guard ended the VM");
+}
+
+/// protocol-v2 seeds the current directory's workspace, so it resolves it
+/// first, before any call or Touch ID, as fresh-claude-json does: outside
+/// the roots, or in a root that is no git repository, it refuses (exit 9)
+/// naming the probe, and nothing is recorded. chunked-put takes no
+/// workspace: under the plain fake (no shim behind its endpoint) it starts
+/// its VM, refuses (exit 9) and ends it, recording nothing.
+#[test]
+fn protocol_v2_needs_a_git_workspace_and_chunked_put_refuses_the_plain_fake() {
+    let w = World::new("");
+    let says = "lab run protocol-v2 seeds the current directory's workspace into its fresh VM, then asks its git advertisement: ";
+    let from = |dir: PathBuf| {
+        let mut c = w.cmd(&["lab", "run", "protocol-v2"]);
+        c.current_dir(dir).stdin(std::process::Stdio::null());
+        bounded(c)
+    };
+    let outside = from(w.root().join("outside"));
+    assert_eq!(code(&outside), 9, "{}", stderr(&outside));
+    assert!(stderr(&outside).contains(says) && stderr(&outside).contains("is outside [workspaces].roots"), "{}", stderr(&outside));
+    let no_git = from(w.ws());
+    assert_eq!(code(&no_git), 9, "{}", stderr(&no_git));
+    let ws = fs::canonicalize(w.ws()).unwrap();
+    assert!(stderr(&no_git).contains(&format!("{says}{} is no git repository; run it from a git workspace under the roots", ws.display())), "{}", stderr(&no_git));
+    for o in [&outside, &no_git] {
+        assert!(!stderr(o).contains("not built"), "{}", stderr(o));
+    }
+    assert!(rows(&w, "protocol-v2").is_empty(), "nothing recorded");
+    assert_eq!(w.state().calls.len(), 0, "refused before any call");
+    // A vpc VM, as a session's: without the connector the plan refuses, before any VM.
+    let o = s5_run(&w, &["lab", "run", "chunked-put"]);
+    assert_eq!(code(&o), 9, "a vpc probe needs the connector: {}", stderr(&o));
+    assert!(stderr(&o).contains("egress_connector_arn"), "{}", stderr(&o));
+    assert_eq!(w.runs(), 0);
+    connect(&w, CONNECTOR);
+    let o = s5_run(&w, &["lab", "run", "chunked-put"]);
+    assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("lab run chunked-put: the file-backed fake has no shim behind its endpoint"), "{}", stderr(&o));
+    assert!(rows(&w, "chunked-put").is_empty(), "nothing recorded");
+    assert_eq!(w.state().specs.last().map(|s| s.egress_connectors.clone()), Some(vec![CONNECTOR.to_string()]), "its VM was a vpc one");
+    no_vm_left(&w);
 }

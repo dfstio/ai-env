@@ -31,9 +31,13 @@ pub enum BridgeError {
     /// The VM answers no `/agent` (404): an image older than S6.
     NoAgent(String),
     /// S8: the VM lacks a capability a step needs (`cap`, e.g. `workspace_v1`:
-    /// the seed, code-out, transcript and settings routes): an image older
-    /// than S8. Never retried; nothing was sent.
+    /// the seed, code-out, transcript and settings routes; S9's
+    /// `git_http_v1`, `transcript_s3_v1`): an image older than the stage
+    /// that added it (`wire::frame::cap_stage`). Never retried; nothing was sent.
     NoCapability { cap: &'static str, message: String },
+    /// S9: S3 answered an error the transcript store does not act on itself
+    /// (`op`: what was asked, `code`: S3's `<Code>` when known).
+    S3 { op: &'static str, status: u16, code: Option<String> },
     // exit 5
     /// S7: the VM's credential cache no longer holds the seal a delivery
     /// expected it to hold (it went after it was checked), and no unsealed
@@ -77,6 +81,15 @@ pub enum BridgeError {
     /// `not_a_git_repo` or `wip_too_large`); `message` names the path, ref or
     /// rule, never a value.
     WorkspaceRefused { code: &'static str, message: String },
+    /// S9: a session's transcript over what a seed or a reopen carries
+    /// inline (S2's text, unchanged): `remote::Failure::TranscriptTooLarge`
+    /// names `ai-env session stage`.
+    TranscriptTooLarge { session: String, bytes: u64 },
+    /// S9 (R5-AWS-1): a reopen's restore under the init deadline would pull
+    /// more of the chat's transcript from S3 than `wire::s3::INLINE_MAX` in
+    /// all: refused before any pull. `remote::Failure::TranscriptPullTooLarge`
+    /// names `ai-env session stage UUID --warm`.
+    TranscriptPullTooLarge { session: String, bytes: u64 },
     // exit 1 (vm exec maps `not_found` to 127 and `exec` to 126, like a shell, and `limit` to 9)
     /// The VM could not start the command: `code` is the shim's `spawn_err`
     /// code (`not_found`, `exec`, `cwd`, `limit`), `message` its scrubbed text.
@@ -123,7 +136,7 @@ impl fmt::Display for BridgeError {
             BridgeError::Sdk { op, message } => write!(f, "aws {op}: {message}"),
             BridgeError::Quota(m) => write!(f, "aws quota: {m}"),
             BridgeError::Validation(m) => write!(f, "aws validation: {m}{}", connector_hint(m)),
-            BridgeError::Http { status, body } => write!(f, "endpoint HTTP {status}: {body}"),
+            BridgeError::Http { status, body } => write!(f, "endpoint HTTP {status}: {}", crate::wire::redact::scrub(body)),
             BridgeError::Conflict(m) => write!(f, "aws conflict: {m}"),
             BridgeError::Throttled(m) => write!(f, "aws throttled (after retries): {m}"),
             BridgeError::AccessDenied(m) if m.contains("PassNetworkConnector") => {
@@ -150,7 +163,16 @@ impl fmt::Display for BridgeError {
             },
             BridgeError::NoAgent(m) => write!(f, "the VM's shim has no /agent ({m}): its image is older than S6; start a VM of the current image"),
             // The S8 texts are scrubbed here too: a message may quote what the VM or git said.
-            BridgeError::NoCapability { cap, message } => write!(f, "the VM's shim lacks {cap} ({}): its image is older than S8; run make deploy, then use a VM of the new image", scrub(message)),
+            BridgeError::NoCapability { cap, message } => {
+                write!(f, "the VM's shim lacks {cap} ({}): its image is older than {}; run make deploy, then use a VM of the new image", scrub(message), crate::wire::frame::cap_stage(cap))
+            }
+            BridgeError::S3 { op, status, code } => {
+                write!(f, "s3 {op}: HTTP {status}")?;
+                if let Some(c) = code {
+                    write!(f, " ({})", scrub(c))?;
+                }
+                Ok(())
+            }
             BridgeError::CredentialsUnavailable(m) => write!(f, "credentials unavailable: {m}"),
             BridgeError::CredentialMissing(m) => write!(f, "credential not on the VM: {m}"),
             BridgeError::Cancelled => f.write_str("cancelled"),
@@ -193,6 +215,8 @@ impl fmt::Display for BridgeError {
             BridgeError::MaxConcurrent(n) => write!(f, "[vm].max_concurrent={n} reached"),
             BridgeError::Policy(m) => write!(f, "refused: {m}"),
             BridgeError::WorkspaceRefused { code, message } => write!(f, "workspace refused ({code}): {}", scrub(message)),
+            BridgeError::TranscriptTooLarge { bytes, .. } => write!(f, "transcript too large to seed: {bytes} bytes"),
+            BridgeError::TranscriptPullTooLarge { bytes, .. } => write!(f, "the transcript in S3 is {bytes} bytes: a reopen pulls at most {} inline", crate::wire::s3::INLINE_MAX),
             BridgeError::SpawnRefused { code, message } => write!(f, "the VM could not start the command ({code}): {message}"),
             BridgeError::Config(m) => write!(f, "config: {m}"),
             BridgeError::Io(e) => write!(f, "{e}"),
@@ -227,7 +251,8 @@ impl From<BridgeError> for CliError {
             | BridgeError::Ambiguous { .. }
             | BridgeError::EndpointThrottled { .. }
             | BridgeError::NoAgent(_)
-            | BridgeError::NoCapability { .. } => CliError::Aws(text),
+            | BridgeError::NoCapability { .. }
+            | BridgeError::S3 { .. } => CliError::Aws(text),
             BridgeError::CredentialsUnavailable(_) | BridgeError::CredentialMissing(_) => CliError::AuthUnavailable(text),
             BridgeError::Cancelled => CliError::Cancelled,
             BridgeError::Transport(_)
@@ -246,12 +271,25 @@ impl From<BridgeError> for CliError {
             | BridgeError::PayloadTooLarge(_)
             | BridgeError::MaxConcurrent(_)
             | BridgeError::Policy(_)
-            | BridgeError::WorkspaceRefused { .. } => CliError::Policy(text),
+            | BridgeError::WorkspaceRefused { .. }
+            | BridgeError::TranscriptTooLarge { .. }
+            | BridgeError::TranscriptPullTooLarge { .. } => CliError::Policy(text),
             BridgeError::Config(_) | BridgeError::Busy(_) | BridgeError::SpawnRefused { .. } | BridgeError::WorkspaceFailed { .. } => CliError::Msg(text),
             BridgeError::Io(io) => CliError::from(io),
             BridgeError::Cli(e) => e,
         }
     }
+}
+
+/// S9's phase-0 stubs that return a [`BridgeError`] (the data plane's,
+/// the presigner's): what an operation a later S9 wave builds answers until
+/// then, `WorkspaceFailed { not_built }` with `<what>: not built yet
+/// (<wave>)` (exit 1), `wave` as `S9 wave 1: G4`. A stub returns it and
+/// never panics; the wave that builds the code removes the stub. A command's
+/// stub uses `crate::errors::not_built` (the same text).
+#[must_use]
+pub fn not_built(what: &str, wave: &str) -> BridgeError {
+    BridgeError::WorkspaceFailed { code: crate::bridge::workspace::code::NOT_BUILT, message: format!("{what}: not built yet ({wave})") }
 }
 
 /// The hint a RunMicrovm failure that names a network connector gets: a
@@ -409,6 +447,12 @@ mod tests {
             (BridgeError::WorkspaceRefused { code: crate::bridge::workspace::code::WIP_TOO_LARGE, message: "/Users/mike/w".into() }, 9),
             (BridgeError::WorkspaceFailed { code: crate::wire::workspace::refusal::GIT_FAILED, message: "git exited 128".into() }, 1),
             (BridgeError::WorkspaceFailed { code: crate::bridge::workspace::code::UNSUPPORTED_REPO, message: "a shallow repository".into() }, 1),
+            // S9: an S3 error, a transcript over the inline cap, a phase-0 stub, an image without S9's caps.
+            (BridgeError::S3 { op: "transcript push", status: 403, code: Some("AccessDenied".into()) }, 7),
+            (BridgeError::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1 << 30 }, 9),
+            (BridgeError::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1 << 30 }, 9),
+            (not_built("box review", "S9 wave 1: G3"), 1),
+            (BridgeError::NoCapability { cap: crate::wire::frame::CAP_GIT_HTTP_V1, message: "microvm-1 names no git_http_v1 in its caps".into() }, 7),
         ];
         for (e, code) in cases {
             let text = e.to_string();
@@ -575,7 +619,9 @@ mod tests {
         let named = BridgeError::egress_mismatch("microvm-x", vec![id_conn], vec!["arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress".into()], true).to_string();
         assert!(named.contains("echoed egress arn:") && !named.contains("connector's Id") && !named.contains("infra-status"), "{named}");
         let e2 = BridgeError::egress_mismatch("microvm-x", vec![internet.clone()], vec![internet], true).to_string();
-        assert!(std::mem::size_of::<BridgeError>() <= 48, "boxed: {}", std::mem::size_of::<BridgeError>());
+        // S9's `S3` (a static op, a status and S3's code: 42 bytes) takes it from 48 to 56; still far under
+        // clippy's result_large_err (128).
+        assert!(std::mem::size_of::<BridgeError>() <= 56, "boxed: {}", std::mem::size_of::<BridgeError>());
         assert!(!e2.contains("connector's Id"), "{e2}");
     }
 }

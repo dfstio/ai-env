@@ -151,14 +151,23 @@ fn record_probes(paths: &Paths, rows: &[serde_json::Value]) -> Result<()> {
 
 // ---- census ------------------------------------------------------------------------
 
+/// `text` with every control character escaped as Rust writes it (`\n`,
+/// `\t`, `\u{1b}`): a census value another hand wrote never moves the
+/// terminal's cursor, colours it or forges a line (S9).
+fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { c.escape_debug().to_string() } else { c.to_string() }).collect()
+}
+
 /// The text rendering of one census row: `ts route reason ext cwd argv[2..]`
 /// (the argv tail joined by spaces, at most 120 characters, `…` when cut).
 /// The S2 pump's end row (it carries `end`) also shows `exit=<n> dur=<ms>ms`
 /// before the argv tail (`exit=null` when the wrapper could not know it).
+/// Every value goes through [`printable`] first, so no control character
+/// reaches the terminal (S9).
 fn census_line(row: &serde_json::Value) -> String {
-    let field = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("-").to_string();
-    let argv: Vec<&str> = row.get("argv").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|t| t.as_str()).collect()).unwrap_or_default();
-    let tail = argv.iter().skip(2).copied().collect::<Vec<_>>().join(" ");
+    let field = |k: &str| printable(row.get(k).and_then(|v| v.as_str()).unwrap_or("-"));
+    let argv: Vec<String> = row.get("argv").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|t| t.as_str()).map(printable).collect()).unwrap_or_default();
+    let tail = argv.iter().skip(2).map(String::as_str).collect::<Vec<_>>().join(" ");
     let tail = if tail.chars().count() > 120 { format!("{}\u{2026}", tail.chars().take(119).collect::<String>()) } else { tail };
     let end = match row.get("end").and_then(serde_json::Value::as_u64) {
         Some(end) => {
@@ -1249,64 +1258,18 @@ fn shown(v: &serde_json::Value) -> String {
 /// when every chat under the roots then fails closed
 /// ([`wrapper_mode_report`]), and the `install` that undoes it (with
 /// `--permission-mode` when the file's `initialPermissionMode` is not the
-/// one `install` would pick, or `install` would refuse bridge.toml's).
+/// one `install` would pick, or `install` would refuse bridge.toml's). S9
+/// (§6.4): before anything is written, and in the dry run, a warning on
+/// stderr while remote chats keep only their view on this Mac
+/// ([`views_warning`]): with the wrapper off, Cursor resumes an open one
+/// here, from its view.
 pub fn uninstall(write: bool) -> Result<()> {
-    let path = cursor_settings_path();
-    let by_hand = format!("remove {} from {} by hand", json_str(WRAPPER_SETTING), path.display());
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            outln!("{by_hand}");
-            bail!("{} is a symlink — refusing to edit it", path.display());
-        }
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            outln!("settings: {} (absent)", path.display());
-            outln!("  {WRAPPER_SETTING}: unset (nothing to remove)");
-            return Ok(());
-        }
-        Err(e) => bail!("cannot stat {}: {e}", path.display()),
-    };
-    let before = stamp(Some(&meta));
-    let old_text = std::fs::read_to_string(&path).map_err(|e| CliError::Msg(format!("cannot read {}: {e}", path.display())))?;
-    let old = match parse_settings(&old_text) {
-        Ok(v) => Some(v),
-        Err(_) if strip_jsonc(&old_text).trim().is_empty() => None,
-        Err(e) => {
-            outln!("{by_hand}");
-            bail!("cannot parse {}: {e}", path.display());
-        }
-    };
-    let Some(wrapper) = old.as_ref().and_then(|v| v.get(WRAPPER_SETTING)) else {
-        outln!("settings: {}", path.display());
-        outln!("  {WRAPPER_SETTING}: unset (nothing to remove)");
+    let projects = view_projects(&|name| std::env::var_os(name));
+    let Some(old) = uninstall_settings(&cursor_settings_path(), projects.as_deref(), write, &mut |line| eprintln!("ai-env: warning: {line}"))? else {
         return Ok(());
     };
-    let (new_text, removed) = match remove_settings(&old_text, &[WRAPPER_SETTING]) {
-        Ok(r) => r,
-        Err(e) => {
-            outln!("{by_hand}");
-            bail!("{}: {e}", path.display());
-        }
-    };
-    let permission = old.as_ref().and_then(|v| v.get(PERMISSION_SETTING));
+    let permission = old.get(PERMISSION_SETTING);
     let was = permission.map_or_else(|| "unset".to_string(), shown);
-    outln!("settings: {}", path.display());
-    outln!("  {WRAPPER_SETTING}: {} -> unset", shown(wrapper));
-    outln!("  {PERMISSION_SETTING}: {was} (left alone)");
-    if removed > 1 {
-        outln!("note: {WRAPPER_SETTING} was set {removed} times; every one is removed");
-    }
-    if wrapper.as_str().and_then(|w| Path::new(w).file_name()).is_none_or(|n| n != "ai-env-claude") {
-        outln!("note: {} is not an ai-env-claude; removed all the same (the backup keeps it)", shown(wrapper));
-    }
-    if write {
-        if let Some(bak) = commit_settings(&path, Some(&meta), before, &old_text, &new_text)? {
-            outln!("backup: {}", bak.display());
-        }
-        outln!("wrote: {}", path.display());
-    } else {
-        outln!("dry run: nothing written; re-run with --write");
-    }
     outln!();
     let spawned = "(a new chat, a reopened or restored one, its config probe) runs its bundled claude on this Mac: no ai-env-claude, no census, no MicroVM, no Touch ID.";
     if write {
@@ -1318,7 +1281,7 @@ pub fn uninstall(write: bool) -> Result<()> {
         outln!("A chat already running keeps the process it started with; after the write, a window reload restarts the restored chats without the wrapper.");
     }
     // Cursor's variables, as the extension hands them to every process it starts, the wrapper back too.
-    let (report, closed) = wrapper_mode_report(&old.as_ref().map(CursorEnv::of).unwrap_or_default());
+    let (report, closed) = wrapper_mode_report(&CursorEnv::of(&old));
     outln!("{report}");
     if let Some(code) = closed {
         outln!("note: with the wrapper back, every Cursor chat under bridge.toml's roots (every chat, when they cannot be read) exits {code} naming the error until bridge.toml is fixed (ai-env wrapper status shows it)");
@@ -1340,6 +1303,127 @@ pub fn uninstall(write: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `<projects>` as `wire::view::local_view_target` finds it (`env` reads the
+/// environment): `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`,
+/// an empty value counting as unset; `None` with neither.
+fn view_projects(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let nonempty = |k: &str| env(k).filter(|v| !v.is_empty());
+    match nonempty("CLAUDE_CONFIG_DIR") {
+        Some(dir) => Some(PathBuf::from(dir).join("projects")),
+        None => Some(PathBuf::from(nonempty("HOME")?).join(".claude").join("projects")),
+    }
+}
+
+/// The view files among `<projects>/*/*.jsonl` (`projects`): those whose
+/// first `wire::view::VIEW_HEAD_READ` bytes `wire::view::is_view_head` takes.
+/// Regular files only, opened as the census is (`census::open_for_read`:
+/// never through a link, never waiting on a FIFO); one level of project
+/// directories, a link to one followed as claude follows it.
+fn count_views(projects: &Path) -> usize {
+    use crate::wire::view::{is_view_head, VIEW_HEAD_READ};
+    use std::io::Read;
+    let Ok(dirs) = std::fs::read_dir(projects) else {
+        return 0;
+    };
+    dirs.flatten()
+        .filter(|d| d.path().is_dir())
+        .filter_map(|d| std::fs::read_dir(d.path()).ok())
+        .flat_map(|files| files.flatten())
+        .filter(|f| f.path().extension().is_some_and(|e| e == "jsonl"))
+        .filter(|f| {
+            let Ok(Some(file)) = crate::bridge::census::open_for_read(&f.path()) else {
+                return false;
+            };
+            let mut head = Vec::with_capacity(VIEW_HEAD_READ);
+            file.take(VIEW_HEAD_READ as u64).read_to_end(&mut head).is_ok() && is_view_head(&head)
+        })
+        .count()
+}
+
+/// What `uninstall` warns of while views exist under `projects` (S9,
+/// §6.4; [`count_views`]): a remote chat's transcript is kept in S3 and the
+/// Mac holds only its view, which Cursor, with the wrapper off, resumes on
+/// this Mac for any of those chats still open (a window reload respawns them
+/// with `--resume`). `None` without a view; one line, §6.4's, for any count.
+fn views_warning(projects: &Path) -> Option<String> {
+    let at = projects.display();
+    match count_views(projects) {
+        0 => None,
+        n => Some(format!("{n} remote chats keep only their view under {at}: with the wrapper off, Cursor resumes an open one on this Mac; close their tabs first")),
+    }
+}
+
+/// [`uninstall`]'s edit of Cursor's settings file at `path`: the wrapper key
+/// out (every top-level copy), what changes, then the write (`write`) or the
+/// dry run's line, the views' warning ([`views_warning`] of `projects`) to
+/// `warn` before either, so before anything is written. `Ok(None)` when
+/// there is nothing to remove (no file, an empty one, no wrapper key);
+/// else the settings as they were, for the report that follows. A symlink,
+/// a file that does not parse or a removal that does not verify is exit 1,
+/// nothing written.
+fn uninstall_settings(path: &Path, projects: Option<&Path>, write: bool, warn: &mut dyn FnMut(&str)) -> Result<Option<serde_json::Value>> {
+    let by_hand = format!("remove {} from {} by hand", json_str(WRAPPER_SETTING), path.display());
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            outln!("{by_hand}");
+            bail!("{} is a symlink — refusing to edit it", path.display());
+        }
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            outln!("settings: {} (absent)", path.display());
+            outln!("  {WRAPPER_SETTING}: unset (nothing to remove)");
+            return Ok(None);
+        }
+        Err(e) => bail!("cannot stat {}: {e}", path.display()),
+    };
+    let before = stamp(Some(&meta));
+    let old_text = std::fs::read_to_string(path).map_err(|e| CliError::Msg(format!("cannot read {}: {e}", path.display())))?;
+    let old = match parse_settings(&old_text) {
+        Ok(v) => Some(v),
+        Err(_) if strip_jsonc(&old_text).trim().is_empty() => None,
+        Err(e) => {
+            outln!("{by_hand}");
+            bail!("cannot parse {}: {e}", path.display());
+        }
+    };
+    let Some(wrapper) = old.as_ref().and_then(|v| v.get(WRAPPER_SETTING)) else {
+        outln!("settings: {}", path.display());
+        outln!("  {WRAPPER_SETTING}: unset (nothing to remove)");
+        return Ok(None);
+    };
+    let (new_text, removed) = match remove_settings(&old_text, &[WRAPPER_SETTING]) {
+        Ok(r) => r,
+        Err(e) => {
+            outln!("{by_hand}");
+            bail!("{}: {e}", path.display());
+        }
+    };
+    let permission = old.as_ref().and_then(|v| v.get(PERMISSION_SETTING));
+    let was = permission.map_or_else(|| "unset".to_string(), shown);
+    outln!("settings: {}", path.display());
+    outln!("  {WRAPPER_SETTING}: {} -> unset", shown(wrapper));
+    outln!("  {PERMISSION_SETTING}: {was} (left alone)");
+    if removed > 1 {
+        outln!("note: {WRAPPER_SETTING} was set {removed} times; every one is removed");
+    }
+    if wrapper.as_str().and_then(|w| Path::new(w).file_name()).is_none_or(|n| n != "ai-env-claude") {
+        outln!("note: {} is not an ai-env-claude; removed all the same (the backup keeps it)", shown(wrapper));
+    }
+    // §6.4: the views, before anything is written (and in the dry run).
+    if let Some(line) = projects.and_then(views_warning) {
+        warn(&line);
+    }
+    if write {
+        if let Some(bak) = commit_settings(path, Some(&meta), before, &old_text, &new_text)? {
+            outln!("backup: {}", bak.display());
+        }
+        outln!("wrote: {}", path.display());
+    } else {
+        outln!("dry run: nothing written; re-run with --write");
+    }
+    Ok(old)
 }
 
 /// The write phase of `install --write`, separated so the guards are unit
@@ -1937,6 +2021,104 @@ mod tests {
         assert!(census_line(&end).contains("exit=null dur=5123ms  --output-format"), "{}", census_line(&end));
         let start = session_row(&[]);
         assert!(!census_line(&start).contains("exit="), "a start row has no end fields");
+    }
+
+    /// S9: a census another hand wrote (a newline and a forged row, an
+    /// escape sequence, a carriage return, a NUL, DEL, a C1 control) in any
+    /// field the line prints, the argv tail included, never reaches the
+    /// terminal as a control character: each is escaped as Rust writes it,
+    /// and the line stays one line.
+    #[test]
+    fn census_line_never_prints_a_control_character() {
+        let forged = "\n2026-09-23T08:00:00Z  remote session  forged";
+        let row = serde_json::json!({
+            "ts": format!("2026-09-23T08:00:00Z{forged}"),
+            "route": "remote\u{1b}[2J",
+            "reason": "session\r",
+            "ext": "2.1.278\u{0}",
+            "cwd": "/Users/mike/w\u{7f}\u{9b}31m",
+            "argv": ["/w/ai-env-claude", "/b/claude\u{1b}]0;title\u{7}", "--output-format", "stream-json\u{1b}[1A", "\t--verbose"],
+            "start": 1_000_u64,
+            "end": 2_000_u64,
+            "exit": 0,
+        });
+        let line = census_line(&row);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+        for want in ["2026-09-23T08:00:00Z\\n2026-09-23T08:00:00Z  remote session  forged", "remote\\u{1b}[2J", "session\\r", "2.1.278\\0", "/Users/mike/w\\u{7f}\\u{9b}31m", "stream-json\\u{1b}[1A \\t--verbose"] {
+            assert!(line.contains(want), "{want:?} missing from {line:?}");
+        }
+        // A plain row prints as it did.
+        assert_eq!(printable("2026-09-23T08:00:00Z /a b—ü"), "2026-09-23T08:00:00Z /a b—ü");
+    }
+
+    /// S9 (§6.4): while remote chats keep only their view under
+    /// `<projects>` (a file whose first bytes are the view's mark), the
+    /// dry run and `--write` both warn before anything is written (the
+    /// settings file still holds the key when the warning goes out),
+    /// counting each view once: a transcript, a symlink to a view, a view
+    /// one directory too deep, a file that is not `.jsonl` or a FIFO is
+    /// none. No view, or no `<projects>`, no warning.
+    #[test]
+    fn uninstall_warns_while_views_exist() {
+        use crate::wire::view::VIEW_MARK_PREFIX;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let projects = dir.path().join("projects");
+        let slug = projects.join("-Users-mike-w");
+        std::fs::create_dir_all(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").join("subagents")).unwrap();
+        let view = format!("{VIEW_MARK_PREFIX}\"type\":\"ai-title\",\"aiTitle\":\"t\",\"sessionId\":\"s\"}}\n");
+        std::fs::write(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl"), &view).unwrap();
+        std::fs::write(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c.jsonl"), "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n").unwrap();
+        std::fs::write(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").join("subagents").join("agent-a1.jsonl"), &view).unwrap();
+        std::fs::write(slug.join("notes.txt"), &view).unwrap();
+        std::os::unix::fs::symlink(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl"), slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d.jsonl")).unwrap();
+        let fifo = std::ffi::CString::new(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e.jsonl").into_os_string().into_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let other = projects.join("-Users-mike-x");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a60.jsonl"), &view).unwrap();
+        let text = format!("{{\n  {}: \"/x/ai-env-claude\",\n  {}: \"default\"\n}}\n", json_str(WRAPPER_SETTING), json_str(PERMISSION_SETTING));
+        let want = format!("2 remote chats keep only their view under {}: with the wrapper off, Cursor resumes an open one on this Mac; close their tabs first", projects.display());
+        for write in [false, true] {
+            std::fs::write(&settings, &text).unwrap();
+            let mut warned = Vec::new();
+            let old = uninstall_settings(&settings, Some(&projects), write, &mut |line| {
+                assert_eq!(std::fs::read_to_string(&settings).unwrap(), text, "write {write}: the warning goes out before anything is written");
+                warned.push(line.to_string());
+            })
+            .unwrap();
+            assert_eq!(warned, std::slice::from_ref(&want), "write {write}");
+            assert!(old.is_some_and(|v| v.get(WRAPPER_SETTING).is_some()), "write {write}: the settings as they were");
+            assert_eq!(std::fs::read_to_string(&settings).unwrap() == text, !write, "write {write}: written only with --write");
+        }
+        // One view: §6.4's one line, with 1; no view, no <projects>, or nothing to remove: no warning.
+        std::fs::remove_dir_all(&other).unwrap();
+        assert_eq!(views_warning(&projects), Some(format!("1 remote chats keep only their view under {}: with the wrapper off, Cursor resumes an open one on this Mac; close their tabs first", projects.display())));
+        std::fs::remove_file(slug.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl")).unwrap();
+        assert_eq!(views_warning(&projects), None, "the transcript, the dangling link, the deep view, the text file and the FIFO count for nothing");
+        assert_eq!(views_warning(&dir.path().join("absent")), None);
+        std::fs::write(&settings, &text).unwrap();
+        let mut warned = 0;
+        assert!(uninstall_settings(&settings, None, false, &mut |_| warned += 1).unwrap().is_some());
+        std::fs::write(&settings, "{}\n").unwrap();
+        std::fs::write(other_view(&projects), &view).unwrap();
+        assert!(uninstall_settings(&settings, Some(&projects), true, &mut |_| warned += 1).unwrap().is_none(), "no wrapper key: nothing to remove");
+        assert_eq!(warned, 0);
+        // `<projects>` as the kill switch finds it.
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(*v));
+        assert_eq!(view_projects(&env(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/c")])), Some(PathBuf::from("/c/projects")));
+        assert_eq!(view_projects(&env(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "")])), Some(PathBuf::from("/h/.claude/projects")));
+        assert_eq!(view_projects(&env(&[("HOME", "")])), None);
+        assert_eq!(view_projects(&env(&[])), None);
+    }
+
+    /// A view file of its own project directory under `projects`.
+    fn other_view(projects: &Path) -> PathBuf {
+        let dir = projects.join("-Users-mike-y");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a61.jsonl")
     }
 
     #[test]

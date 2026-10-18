@@ -38,6 +38,8 @@ mod transcript;
 mod cli;
 #[path = "workspace/e2e.rs"]
 mod e2e;
+#[path = "workspace/smart_http.rs"]
+mod smart_http;
 
 use ai_env_cli::gitrun::{GitRun, OVERRIDES};
 use common::{git_calls, git_real, install_fake_git, GitCall};
@@ -175,31 +177,6 @@ fn files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Each call is one log line: the `GIT_*` names it started with (never a
-/// value; the knobs file's are read after), the descriptors from 3 up it
-/// started with, every argument as given (a tab, a newline and a `%` in one
-/// survive); then the real git runs it.
-#[test]
-fn the_fake_git_logs_each_call_then_runs_the_real_git() {
-    let f = FakeGit::new(&[]);
-    let o = f.run(&["init", "-q", "-b", "main"], &[("GIT_FAKE_PROBE", "a value")], true, b"");
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(f.repo().join(".git").is_dir(), "the real git ran");
-    let message = "one\ttwo\nthree 100% done";
-    let o = f.run(&["-c", "user.name=t", "-c", "user.email=t@ai-env.invalid", "commit", "-q", "--allow-empty", "-m", message], &[], false, b"");
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let calls = f.calls();
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    assert_eq!((calls[0].sub(), calls[0].env.as_slice(), calls[0].fds.as_slice()), (Some("init"), ["GIT_CONFIG_GLOBAL", "GIT_FAKE_PROBE"].map(String::from).as_slice(), [3].as_slice()));
-    assert_eq!((calls[1].sub(), calls[1].fds.as_slice()), (Some("commit"), [].as_slice()));
-    assert_eq!(calls[1].args.last().map(String::as_str), Some(message), "{calls:?}");
-    assert!(calls[1].has("--allow-empty"));
-    let log = std::fs::read_to_string(f.root.join("git.log")).unwrap();
-    assert!(!log.contains("a value"), "never a value: {log}");
-    let subject = Command::new(git_real()).args(["log", "-1", "--format=%B"]).current_dir(f.repo()).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&subject.stdout).trim_end(), message, "the real git committed it");
-}
-
 /// `FAKE_GIT_FAIL` fails that subcommand alone (128, git's `fatal:`
 /// shape), after logging it. `FAKE_GIT_KEEP_PACK` keeps a copy of what
 /// `pack-objects --stdout` wrote (the caller gets the same bytes) and of
@@ -257,4 +234,114 @@ fn gitrun_reaches_the_fake_git_on_either_side() {
         ]
     );
     assert!(index.exists(), "the real git wrote the run's own index");
+}
+
+/// S9: with `FAKE_GIT_ENV_ALL=1` the line starts with the caller's uid and
+/// `env=` names every variable the call started with, not only `GIT_*`
+/// (never a value; the knobs file's are read after, and the four names the
+/// fake's own /bin/sh adds are left out): under `env -i` with two names of
+/// its own, exactly those two.
+#[test]
+fn the_fake_git_logs_every_name_and_its_uid() {
+    let f = FakeGit::new(&[("FAKE_GIT_ENV_ALL", "1")]);
+    let o = Command::new("/usr/bin/env").args(["-i", "LC_ALL=C", "S9_PROBE=a value"]).arg(f.git()).arg("--version").current_dir(f.repo()).output().unwrap();
+    assert!(o.status.success() && o.stdout.starts_with(b"git version"), "{}", String::from_utf8_lossy(&o.stderr));
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let calls = f.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!((calls[0].uid, calls[0].env.as_slice(), calls[0].args.as_slice()), (Some(uid), ["LC_ALL", "S9_PROBE"].map(String::from).as_slice(), ["--version".to_string()].as_slice()));
+    let log = std::fs::read_to_string(f.root.join("git.log")).unwrap();
+    assert!(log.starts_with(&format!("uid={uid}\tenv=LC_ALL,S9_PROBE\tfds=")) && !log.contains("a value"), "{log}");
+    // Without the knob: no uid, the GIT_* names alone.
+    let plain = FakeGit::new(&[]);
+    let o = Command::new("/usr/bin/env").args(["-i", "LC_ALL=C", "S9_PROBE=a value"]).arg(plain.git()).arg("--version").current_dir(plain.repo()).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let calls = plain.calls();
+    assert_eq!((calls.len(), calls[0].uid, calls[0].env.as_slice()), (1, None, [].as_slice()), "{calls:?}");
+}
+
+// ---- S9 (G7): a seed's notes ------------------------------------------------------------------
+
+/// S9: a seed's notes of what it does not carry name their paths as a
+/// finding names one (`blobscan::shown_path`, then the scrubber): a nested
+/// repository whose name a custom tripwire matches is `a path name`, one
+/// whose name holds the setup-token's shape (built at run time) shows none
+/// of it; one with an ordinary name keeps it. Notes reach stderr (`box
+/// seed`, Cursor's line), where a tripwire-shaped name never goes.
+#[test]
+fn a_seed_note_never_shows_a_tripping_path() {
+    use ai_env_cli::bridge::workspace::{prepare, resolve, SeedLimits};
+    let w = fixture::World::new();
+    std::fs::write(w.paths().root.join("tripwires.txt"), "zq[0-9]{6}\n").unwrap();
+    let repo = w.repo("app");
+    let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
+    for inner in ["zq123456".to_string(), format!("x-{token}"), "inner".to_string()] {
+        let _ = fixture::Repo::create(&repo.dir.join(inner));
+    }
+    repo.write("real.txt", "x\n");
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &repo.dir, None).unwrap();
+    let notes = prepare(&paths, &cfg, &ws, &SeedLimits::cli(&cfg, None)).unwrap().summary().notes;
+    let shown: Vec<String> = notes.iter().map(|n| n.replace(&token, "<TOKEN>")).collect();
+    assert!(notes.iter().all(|n| !n.contains("zq123") && !n.contains(&token[7..])), "{shown:#?}");
+    assert!(notes.iter().any(|n| n == "a path name is a nested repository: not carried"), "{shown:#?}");
+    assert!(notes.iter().any(|n| n == "inner/ is a nested repository: not carried"), "{shown:#?}");
+    assert_eq!(notes.iter().filter(|n| n.ends_with(" is a nested repository: not carried")).count(), 3, "{shown:#?}");
+}
+
+/// `head` committed in `repo` as gitlinks at `paths`, each left unpopulated
+/// (an empty directory, as a clone without its submodules leaves it), so the
+/// worktree holds nothing uncommitted to carry.
+fn commit_gitlinks(repo: &fixture::Repo, head: &str, paths: &[&str]) {
+    for path in paths {
+        repo.git(&["update-index", "--add", "--cacheinfo", &format!("160000,{head},{path}")]);
+        std::fs::create_dir_all(repo.dir.join(path)).unwrap();
+    }
+    repo.git(&["commit", "-q", "-m", "submodules"]);
+}
+
+/// S9: a committed gitlink at a path a rule matches (a custom tripwire, the
+/// setup-token's shape built at run time) never reaches a note: the tree
+/// that holds it names it, so the seed is refused on that tree's finding,
+/// which shows `a path name` (exit 9), before any note is made.
+#[test]
+fn a_gitlink_at_a_tripping_path_refuses_the_seed_before_any_note() {
+    use ai_env_cli::bridge::errors::BridgeError;
+    use ai_env_cli::bridge::workspace::{code, prepare, resolve, SeedLimits};
+    let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
+    for path in ["zq654321".to_string(), format!("y-{token}")] {
+        let w = fixture::World::new();
+        std::fs::write(w.paths().root.join("tripwires.txt"), "zq[0-9]{6}\n").unwrap();
+        let repo = w.repo("app");
+        commit_gitlinks(&repo, &repo.head(), &[&path]);
+        let (paths, cfg) = (w.paths(), w.cfg(""));
+        let ws = resolve(&cfg, &repo.dir, None).unwrap();
+        let e = prepare(&paths, &cfg, &ws, &SeedLimits::cli(&cfg, None)).expect_err("the seed refused");
+        let text = e.to_string().replace(&token, "<TOKEN>");
+        assert!(matches!(&e, BridgeError::WorkspaceRefused { code: c, .. } if *c == code::FINDING), "{text}");
+        assert!(text.contains("a path name (tree ") && !text.contains("zq654") && !text.contains("<TOKEN>"), "{text}");
+    }
+}
+
+/// S9: a seed's note of a submodule it does not carry names the gitlink's
+/// path as the other notes name theirs (`blobscan::shown_path`, then the
+/// scrubber). No rule matches a key-shaped segment (`token=<value>`, built
+/// at run time), so the seed goes on, and the note shows no value; an
+/// ordinary path keeps its name. The note is `blobscan::scan_settings`'
+/// (nothing else reads a gitlink's path, as `rev-list --objects` lists
+/// none).
+#[test]
+fn a_seed_note_never_shows_a_key_shaped_submodule_path() {
+    use ai_env_cli::bridge::workspace::{prepare, resolve, SeedLimits};
+    let w = fixture::World::new();
+    let repo = w.repo("app");
+    let keyed = format!("vendor/{}={}", "token", "Kq4_".repeat(5));
+    commit_gitlinks(&repo, &repo.head(), &[&keyed, "vendor/lib"]);
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &repo.dir, None).unwrap();
+    let notes = prepare(&paths, &cfg, &ws, &SeedLimits::cli(&cfg, None)).unwrap().summary().notes;
+    assert!(notes.iter().all(|n| !n.contains("Kq4_")), "{notes:#?}");
+    assert!(notes.iter().any(|n| n == "vendor/token=[redacted:len=20] is a submodule: not carried"), "{notes:#?}");
+    assert!(notes.iter().any(|n| n == "vendor/lib is a submodule: not carried"), "{notes:#?}");
 }

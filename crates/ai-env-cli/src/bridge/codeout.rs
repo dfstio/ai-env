@@ -161,6 +161,14 @@ pub fn hidden_note(n: usize) -> String {
     format!("{n} {HIDDEN_TAIL}")
 }
 
+/// What a code-out says of the `n` VM refs [`import`] left out because
+/// their object is no commit (a tree, a blob, a tag: what the helper never
+/// lists), never naming one.
+#[must_use]
+pub fn not_commit_note(n: usize) -> String {
+    format!("{n} VM ref(s) skipped: an object that is no commit (a tree, a blob or a tag; not shown)")
+}
+
 /// [`hidden_note`] past its count: how the trigger tells a report whose
 /// fetch kept refs out, which it says as it says a failure.
 const HIDDEN_TAIL: &str = "VM ref(s) skipped: a name that looks like a credential (not shown)";
@@ -178,7 +186,8 @@ pub struct FetchReport {
     /// The refs with a scan finding, moved under [`BOX_QUARANTINE_REFS`].
     pub quarantined: BTreeMap<String, String>,
     /// The snapshot this fetch asked for (the VM's `refs/wip/*`), when one was
-    /// made and its name does not look like a credential ([`credential_shaped`]).
+    /// made, its name does not look like a credential ([`credential_shaped`])
+    /// and the import found no tree, blob or tag there ([`Imported::wip_ref`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wip_ref: Option<String>,
     /// The pack's bytes (0 when nothing was new).
@@ -187,7 +196,8 @@ pub struct FetchReport {
     /// Why it failed, or what it noted: each VM ref [`box_refs`] skipped (a
     /// branch under a [`BOX_RESERVED`] name, one whose box name another
     /// takes), by name; how many [`credential_shaped`] kept out, never by
-    /// name ([`hidden_note`]).
+    /// name ([`hidden_note`]); how many name no commit (a tree, a blob or a
+    /// tag), never by name ([`not_commit_note`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -205,6 +215,11 @@ pub struct CodeoutCtx<A, D, T> {
     pub ws: WorkspaceRef,
     /// Capture the VM's settings after each fetch (T8.7, `settings_capture`).
     pub capture_settings: bool,
+    /// S9: sync the transcript to S3 and rewrite the view after each fetch
+    /// (`s3::TranscriptSync`, built at the session's P0); `None` for `box
+    /// fetch` and a session that keeps no transcript
+    /// (`--no-session-persistence`): P0 refuses one that cannot sync it.
+    pub transcript: Option<crate::bridge::s3::TranscriptSync>,
 }
 
 /// How long a code-out waits for the workspace's fetch lock.
@@ -263,7 +278,14 @@ pub struct Imported {
     pub skipped: Vec<String>,
     /// How many VM refs [`credential_shaped`] kept out (never in `skipped`).
     pub hidden: usize,
-    /// The manifest's `wip_ref`, unless [`credential_shaped`] kept it out.
+    /// How many VM refs past [`box_refs`] and the clash check name a tree, a
+    /// blob or a tag (as the pack shows), left out (never in `skipped`, never
+    /// named; [`not_commit_note`]). One skipped before that is in `skipped`,
+    /// whatever its object.
+    pub not_commits: usize,
+    /// The manifest's `wip_ref`, unless [`credential_shaped`] kept it out, or
+    /// its object is a tree, a blob or a tag (known once the pack is read:
+    /// [`import`]).
     pub wip_ref: Option<String>,
     /// The findings of the quarantined refs.
     pub findings: Vec<crate::bridge::workspace::blobscan::Finding>,
@@ -346,7 +368,20 @@ fn clashes(name: &str, existing: &BTreeMap<String, String>) -> bool {
 /// and named. A ref whose name looks like a credential ([`credential_shaped`],
 /// the scans' rules) is kept out before all of that, counted in `hidden`,
 /// never named: no git argument, ref or note holds its name, and `wip_ref`
-/// is `None` when the manifest's is one. The user's branches, index and
+/// is `None` when the manifest's is one. Once the pack is indexed, the
+/// helper's rule that a ref names a commit (its listing's `%(objecttype)`)
+/// holds whoever made the manifest (S9, the lead's integration of G2's R2: a
+/// hostile `/codeout` manifest, or a smart-HTTP fetch's, whose `ls-refs`
+/// shows no type but a tag's), on the refs that pass [`credential_shaped`],
+/// [`box_refs`] and the clash check: one whose object is a tree, a blob or
+/// a tag is left out, counted in `not_commits`, never named or promoted. One
+/// skipped before is named as skipped, as any skipped ref is, whatever its
+/// object; so a ref to a tree or a blob that [`box_refs`] takes first
+/// leaves a commit's ref whose name folds to the same skipped. A `wip_ref`
+/// whose object is a tree, a blob or a tag is then `None`, its own ref
+/// passed or skipped, and a manifest whose HEAD names one is `not_seeded`
+/// (exit 9), as the helper answers. With no ref passing all three, the pack
+/// is not read and none of this runs. The user's branches, index and
 /// working tree are never touched. First, the incoming refs a process that
 /// is gone left are deleted (`sweep_incoming`).
 pub fn import(i: &Import<'_>) -> Result<Imported, BridgeError> {
@@ -396,6 +431,23 @@ pub fn import(i: &Import<'_>) -> Result<Imported, BridgeError> {
     child.finish().map_err(|e| BridgeError::WorkspaceFailed { code: refusal::BAD_PACK, message: format!("the code-out pack does not index: {e}") })?;
     if let Some(Ok(Err(e))) = fed {
         return Err(BridgeError::Io(e));
+    }
+    // Only commits go on (the helper lists nothing else): an object that is not there at all is no
+    // type's, and `update-ref` below refuses its ref (`bad_refs`), as it always did. The `wip_ref`'s
+    // object is read too, its ref wanted or skipped.
+    let ids: BTreeSet<&String> = wanted.values().chain([&i.manifest.head]).chain(out.wip_ref.as_ref().and_then(|w| i.manifest.refs.get(w))).collect();
+    let types = object_types(&scratch.git(), &ids)?;
+    if let Some(other) = types.get(&i.manifest.head).filter(|t| *t != "commit") {
+        return Err(BridgeError::WorkspaceRefused { code: refusal::NOT_SEEDED, message: format!("the code-out's manifest: the VM's repository has no commit checked out (its HEAD names a {other})") });
+    }
+    let is_commit = |id: &String| types.get(id).is_none_or(|t| t == "commit");
+    let listed = wanted.len();
+    wanted.retain(|_, id| is_commit(id));
+    out.not_commits = listed - wanted.len();
+    out.wip_ref = out.wip_ref.take().filter(|w| i.manifest.refs.get(w).is_some_and(is_commit));
+    if wanted.is_empty() {
+        out.tips = existing;
+        return Ok(out);
     }
     let mut stdin = String::new();
     for (suffix, id) in &wanted {
@@ -489,15 +541,159 @@ fn promote(i: &Import<'_>, set: &ScanSet, user: &GitRun, incoming: &str, wanted:
     Ok(out)
 }
 
-/// One code-out fetch (plan §7): under the workspace's fetch lock; a real
-/// remote named `box` refused; `POST /codeout` with the haves
-/// ([`haves_of`]) into a scratch file; then [`import`]. A 204 is nothing
-/// new. The workspace row and the audit (`codeout_fetch`, with how many refs
+/// One code-out fetch (plan §7): `begin_fetch` (the workspace's fetch
+/// lock, a real remote named `box` refused, the haves, the scratch); `POST
+/// /codeout` with the haves ([`haves_of`]) into the scratch's file; then
+/// `finish_fetch` ([`import`], the report, the workspace row and the
+/// audit: `codeout_fetch` with `via` `codeout` and how many refs
 /// [`credential_shaped`] kept out, never a name; `box_fetch_finding` per
-/// quarantined ref) record it.
+/// quarantined ref). A 204 is nothing new. `box fetch --smart-http` is
+/// [`fetch_smart_http`], between the same two.
 pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, opts: FetchOpts) -> Result<FetchReport, BridgeError> {
+    let begun = begin_fetch(ctx).await?;
+    let req = CodeoutRequest { path: ctx.ws.vm_root.clone(), haves: begun.haves.clone(), wip: opts.wip, max_bytes: opts.max_bytes };
+    let dest = begun.pack();
+    let x = Exchange { api: &*ctx.api, tokens: &*ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, cap: crate::wire::frame::CAP_WORKSPACE_V1, route: "POST /codeout", deadline: None, idempotent: false };
+    let (reply, verdict) = exchange(&x, |t| {
+        let (req, dest) = (&req, &dest);
+        async move { ctx.dp.post_codeout(&ctx.target, &t, req, dest, opts.max_bytes).await }
+    })
+    .await?;
+    let body = match (reply.status, verdict, reply.body) {
+        (204, _, _) => return Ok(nothing_new(ctx, begun, Via::Codeout)),
+        (_, Verdict::Done, Some(body)) => body,
+        (status, _, _) => return Err(BridgeError::Protocol(format!("POST /codeout answered HTTP {status} where a pack was due"))),
+    };
+    finish_fetch(ctx, begun, Received { manifest: body.manifest, pack_bytes: body.pack_bytes }, Via::Codeout).await
+}
+
+/// `box fetch --smart-http` (S9 plan §2, §4.3): [`fetch`] through git
+/// smart-HTTP v2 (`gitsmart::Client`) in place of `POST /codeout`, between
+/// the same `begin_fetch` and `finish_fetch`. The advertisement (v2, the
+/// Mac's object format) and `ls-refs` (the four prefixes) give the VM's refs
+/// as a code-out manifest (`gitsmart::manifest_of`, the helper's rules); a
+/// ref [`credential_shaped`] keeps out, or one without a box name
+/// ([`box_refs`]), is never wanted ([`wants_of`]). Nothing new is every
+/// listed tip among the haves, the helper's rule for its 204 (`all_had`);
+/// a ref kept out counts there too (its tip is never a have), so [`import`]
+/// then counts or names it, as after a code-out. Else `fetch` brings the
+/// wants' pack (thin against the haves, at most `opts.max_bytes`), and
+/// [`import`] takes it as it takes a code-out's, its commit-only rule
+/// leaving out (counted) a ref it takes whose object the pack shows to be a
+/// tree or a blob, which `ls-refs` cannot tell from a commit. No `fetch`
+/// ever wants nothing: with every ref kept out, the import reads no pack,
+/// so none is asked for (the VM's http-backend answers a fetch without a
+/// want with its head alone, a cut answer: G1). No snapshot: the VM's
+/// uncommitted work comes through `POST /codeout` only (`--wip`, refused
+/// here). The audit's `via` is `smart-http`.
+pub async fn fetch_smart_http<A: MicrovmApi, D: crate::bridge::gitsmart::GitHttp, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, opts: FetchOpts) -> Result<FetchReport, BridgeError> {
+    use crate::bridge::gitsmart::{manifest_of, Client};
+    if opts.wip {
+        return Err(BridgeError::Config("a smart-HTTP fetch takes no snapshot of the VM's uncommitted work: box fetch --wip goes through POST /codeout".into()));
+    }
+    let begun = begin_fetch(ctx).await?;
+    let WsKind::Git { object_format, .. } = &ctx.ws.kind;
+    let client = Client { api: &*ctx.api, tokens: &*ctx.tokens, git: &*ctx.dp, target: &ctx.target };
+    let advert = client.advertise(*object_format).await?;
+    let manifest = manifest_of(&client.ls_refs(&advert).await?, advert.object_format)?;
+    let wants = wants_of(&manifest, &ScanSet::load(&ctx.paths, &ctx.cfg, &ctx.ws)?.rules);
+    if all_had(&manifest, &begun.haves) {
+        return Ok(nothing_new(ctx, begun, Via::SmartHttp));
+    }
+    if wants.is_empty() {
+        // Every ref kept out: the import takes none and reads no pack, so none is asked for.
+        return finish_fetch(ctx, begun, Received { manifest, pack_bytes: 0 }, Via::SmartHttp).await;
+    }
+    let pack_bytes = client.fetch_pack(&advert, &wants, &begun.haves, &begun.pack(), opts.max_bytes).await?;
+    finish_fetch(ctx, begun, Received { manifest, pack_bytes }, Via::SmartHttp).await
+}
+
+/// Whether every tip `manifest` lists is one of `haves`: the helper's rule
+/// for nothing new (its 204: every tip among the haves it holds, so its pack
+/// would hold no object). A ref [`import`] keeps out counts too.
+fn all_had(manifest: &CodeoutManifest, haves: &[String]) -> bool {
+    manifest.refs.values().all(|id| haves.contains(id))
+}
+
+/// The types of `ids` in `git`'s repository (`cat-file --batch-check`: the
+/// pack [`import`] indexed, and through the alternates the Mac's store),
+/// each by its id; an object not there is left out.
+fn object_types(git: &GitRun, ids: &BTreeSet<&String>) -> Result<BTreeMap<String, String>, BridgeError> {
+    let asked: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    let listed = git.output_stdin(["cat-file", "--batch-check=%(objectname) %(objecttype)"], asked.as_bytes()).map_err(git_failed("git cat-file of the code-out's refs"))?;
+    Ok(String::from_utf8_lossy(&listed).lines().filter_map(|l| l.split_once(' ')).filter(|(_, t)| *t != "missing").map(|(id, t)| (id.to_string(), t.to_string())).collect())
+}
+
+/// The commits a smart-HTTP fetch asks the VM for: the ids of `manifest`'s
+/// refs that [`import`] takes, once each in byte order. Never one of a ref
+/// whose name [`credential_shaped`] finds (`rules`), nor of one without a
+/// box name or whose box name another takes ([`box_refs`]): none of their
+/// objects crosses.
+#[must_use]
+pub fn wants_of(manifest: &CodeoutManifest, rules: &Rules) -> Vec<String> {
+    let shown: BTreeMap<String, String> = manifest.refs.iter().filter(|(r, _)| !credential_shaped(r, rules)).map(|(r, id)| (r.clone(), id.clone())).collect();
+    let (taken, _) = box_refs(&shown);
+    let ids: BTreeSet<String> = taken.values().filter_map(|vm_ref| shown.get(vm_ref).cloned()).collect();
+    ids.into_iter().collect()
+}
+
+/// How a fetch reached the VM: the `codeout_fetch` audit row's `via`, and
+/// `box fetch --json`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// `POST /codeout` (S8): the per-result trigger's and plain `box fetch`'s.
+    Codeout,
+    /// Git smart-HTTP v2 (S9): `box fetch --smart-http` ([`fetch_smart_http`]).
+    SmartHttp,
+}
+
+impl Via {
+    /// `codeout` or `smart-http`.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Via::Codeout => "codeout",
+            Via::SmartHttp => "smart-http",
+        }
+    }
+}
+
+/// A fetch begun ([`begin_fetch`]): the workspace's fetch lock, held to its
+/// end; when it began; the haves; the scratch directory its pack lands in
+/// ([`Begun::pack`]), which goes with it.
+pub(crate) struct Begun {
+    lock: crate::bridge::vm::lock::FlockGuard,
+    started: std::time::Instant,
+    haves: Vec<String>,
+    scratch: Scratch,
+}
+
+impl Begun {
+    /// Where the VM's pack is written, in the scratch directory.
+    fn pack(&self) -> std::path::PathBuf {
+        self.scratch.dir().join("codeout.pack")
+    }
+}
+
+/// What the VM sent a fetch: its manifest (checked) and the pack's bytes in [`Begun::pack`].
+pub(crate) struct Received {
+    pub manifest: CodeoutManifest,
+    pub pack_bytes: u64,
+}
+
+/// Milliseconds since `started`.
+fn ms_since(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A fetch's start, either mode's (S9 §4.3): the workspace's fetch lock
+/// (at most [`FETCH_LOCK_BUDGET`]); a real remote named `box` refused (its
+/// `refs/remotes/box/*` would be the code-out's); the haves ([`haves_of`]:
+/// the Mac's HEAD, the VM's seeded head, the box tips); a scratch directory
+/// under `state/tmp` for the pack.
+pub(crate) async fn begin_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>) -> Result<Begun, BridgeError> {
     let started = std::time::Instant::now();
-    let _lock = crate::bridge::vm::lock::lock_exclusive(&ctx.paths.workspace_fetch_lock(&ctx.ws.slug), FETCH_LOCK_BUDGET, "the workspace's fetch lock").await?;
+    let lock = crate::bridge::vm::lock::lock_exclusive(&ctx.paths.workspace_fetch_lock(&ctx.ws.slug), FETCH_LOCK_BUDGET, "the workspace's fetch lock").await?;
     let (paths, ws) = (ctx.paths.clone(), ctx.ws.clone());
     let vm = ctx.target.vm_id.clone();
     let (haves, scratch) = blocking(move || -> Result<(Vec<String>, Scratch), BridgeError> {
@@ -513,25 +709,20 @@ pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx
         Ok((haves_of(head.as_deref(), seeded.as_deref(), &tips), scratch))
     })
     .await??;
-    let req = CodeoutRequest { path: ctx.ws.vm_root.clone(), haves: haves.clone(), wip: opts.wip, max_bytes: opts.max_bytes };
-    let dest = scratch.dir().join("codeout.pack");
-    let x = Exchange { api: &*ctx.api, tokens: &*ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, route: "POST /codeout", deadline: None, idempotent: false };
-    let (reply, verdict) = exchange(&x, |t| {
-        let (req, dest) = (&req, &dest);
-        async move { ctx.dp.post_codeout(&ctx.target, &t, req, dest, opts.max_bytes).await }
-    })
-    .await?;
-    let ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let body = match (reply.status, verdict, reply.body) {
-        (204, _, _) => {
-            let report = FetchReport { at: rfc3339_utc(unix_now()), ok: true, ms: ms(), ..FetchReport::default() };
-            audit(&ctx.paths, audit_event::CODEOUT_FETCH, &[("vm", ctx.target.vm_id.clone()), ("outcome", "nothing_new".into()), ("ms", report.ms.to_string())]);
-            return Ok(report);
-        }
-        (_, Verdict::Done, Some(body)) => body,
-        (status, _, _) => return Err(BridgeError::Protocol(format!("POST /codeout answered HTTP {status} where a pack was due"))),
-    };
-    let (paths, cfg, ws, manifest) = (ctx.paths.clone(), ctx.cfg.clone(), ctx.ws.clone(), body.manifest.clone());
+    Ok(Begun { lock, started, haves, scratch })
+}
+
+/// A fetch's end, either mode's (S9 §4.3): the pack [`import`]ed off the
+/// runtime's thread (the scratch directory then removed); the report, which
+/// names what was skipped, kept out, not snapshotted or quarantined; the
+/// workspace row and the audit ([`record_fetch`], `via`); then the fetch
+/// lock let go.
+pub(crate) async fn finish_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, received: Received, via: Via) -> Result<FetchReport, BridgeError> {
+    let dest = begun.pack();
+    let Begun { lock, started, haves, scratch } = begun;
+    let Received { manifest, pack_bytes } = received;
+    let wip_skipped = manifest.wip_skipped.clone();
+    let (paths, cfg, ws) = (ctx.paths.clone(), ctx.cfg.clone(), ctx.ws.clone());
     let keep = cfg.seed.keep_wip_refs as usize;
     let max_blob = u64::from(cfg.seed.max_blob_mib) * MIB;
     let imported = blocking(move || {
@@ -544,7 +735,10 @@ pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx
     if imported.hidden > 0 {
         notes.push(hidden_note(imported.hidden));
     }
-    if let Some(why) = &body.manifest.wip_skipped {
+    if imported.not_commits > 0 {
+        notes.push(not_commit_note(imported.not_commits));
+    }
+    if let Some(why) = &wip_skipped {
         notes.push(format!("no snapshot of the VM's uncommitted work: {why}"));
     }
     if !imported.findings.is_empty() {
@@ -556,12 +750,22 @@ pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx
         promoted: imported.promoted.clone(),
         quarantined: imported.quarantined.clone(),
         wip_ref: imported.wip_ref.clone(),
-        bytes: body.pack_bytes,
-        ms: ms(),
+        bytes: pack_bytes,
+        ms: ms_since(started),
         note: (!notes.is_empty()).then(|| notes.join("; ")),
     };
-    record_fetch(ctx, &report, &imported).await;
+    record_fetch(ctx, &report, &imported, via).await;
+    drop(lock);
     Ok(report)
+}
+
+/// A fetch with nothing new (the code-out's 204; a smart-HTTP fetch whose
+/// listed tips the haves hold): its report and its `codeout_fetch` row; the
+/// scratch directory and the lock go with `begun`.
+fn nothing_new<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, via: Via) -> FetchReport {
+    let report = FetchReport { at: rfc3339_utc(unix_now()), ok: true, ms: ms_since(begun.started), ..FetchReport::default() };
+    audit(&ctx.paths, audit_event::CODEOUT_FETCH, &[("vm", ctx.target.vm_id.clone()), ("via", via.word().into()), ("outcome", "nothing_new".into()), ("ms", report.ms.to_string())]);
+    report
 }
 
 /// `git <args>`' lines, none when it exits 1 (`config --get-regexp` without a match).
@@ -574,8 +778,8 @@ fn refs_or_none(git: &GitRun, args: &[&str]) -> Result<Vec<String>, BridgeError>
 }
 
 /// The workspace row (off the runtime's thread, within `rows::ROWS_WAIT`)
-/// and the audit of one fetch (best effort).
-async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, imported: &Imported) {
+/// and the audit of one fetch (best effort), `via` the way it reached the VM.
+async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, imported: &Imported, via: Via) {
     let now = unix_now();
     let newest_wip = report.promoted.keys().filter(|n| n.starts_with(&format!("{BOX_REFS}wip/"))).max().cloned();
     let (paths, ws, vm, tips) = (ctx.paths.clone(), ctx.ws.clone(), ctx.target.vm_id.clone(), imported.tips.clone());
@@ -600,6 +804,7 @@ async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, 
         audit_event::CODEOUT_FETCH,
         &[
             ("vm", ctx.target.vm_id.clone()),
+            ("via", via.word().into()),
             ("outcome", if report.quarantined.is_empty() { "promoted" } else { "quarantined" }.into()),
             ("promoted", report.promoted.len().to_string()),
             ("quarantined", report.quarantined.len().to_string()),
@@ -612,6 +817,36 @@ async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, 
     let rules = rules.into_iter().collect::<Vec<_>>().join(",");
     for name in report.quarantined.keys() {
         audit(&ctx.paths, audit_event::BOX_FETCH_FINDING, &[("vm", ctx.target.vm_id.clone()), ("ref", name.clone()), ("rules", rules.clone())]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod g2_tests {
+    use super::*;
+    use crate::wire::workspace::ObjectFormat;
+
+    /// A smart-HTTP fetch wants what the import would take, each commit
+    /// once: never a ref whose name looks like a credential (the
+    /// setup-token's shape, built here), nor a branch the box namespace
+    /// keeps (`wip`), so none of their objects crosses; `via`'s two words.
+    #[test]
+    fn wants_are_the_commits_of_the_refs_the_import_takes() {
+        let rules = Rules::with_extras("", "tripwires").unwrap();
+        let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
+        let id = |n: u32| format!("{n:040x}");
+        let refs = BTreeMap::from([
+            ("refs/heads/main".to_string(), id(1)),
+            ("refs/heads/dev".to_string(), id(1)),
+            ("refs/heads/wip".to_string(), id(2)),
+            (format!("refs/heads/x-{token}"), id(3)),
+            ("refs/wip/20261018T080000Z-1".to_string(), id(4)),
+            ("refs/ai-env/seed-wip".to_string(), id(5)),
+        ]);
+        let manifest = CodeoutManifest { v: 1, object_format: ObjectFormat::Sha1, refs, head: id(1), branch: Some("main".into()), wip_ref: None, wip_skipped: None };
+        assert_eq!(manifest.check(), Ok(()));
+        assert_eq!(wants_of(&manifest, &rules), [id(1), id(4), id(5)]);
+        assert_eq!((Via::Codeout.word(), Via::SmartHttp.word()), ("codeout", "smart-http"));
     }
 }
 
@@ -657,6 +892,9 @@ struct TriggerState {
     session: Option<String>,
     /// The session named last has no start capture taken by this trigger yet.
     start_due: bool,
+    /// The session named last has had no transcript step of its own yet (S9
+    /// phase 4): its placeholder view, a tail URL, its subtree restored.
+    begin_due: bool,
     /// The task runs a piece of work: a fetch and its turn's captures, or a
     /// start capture.
     busy: bool,
@@ -733,9 +971,11 @@ impl Drop for TaskGone {
 
 impl CodeoutTrigger {
     /// The trigger of one session, its task on the current runtime (none
-    /// outside a runtime: every report then says so).
+    /// outside a runtime: every report then says so). With
+    /// `ctx.transcript` (S9) the same task syncs the session's transcript to
+    /// S3 after each fetch, `ctx.api` presigning.
     #[must_use]
-    pub fn spawn<A: MicrovmApi + 'static, D: DataPlane + 'static, T: TokenSource + 'static>(ctx: CodeoutCtx<A, D, T>) -> CodeoutTrigger {
+    pub fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, D: DataPlane + 'static, T: TokenSource + 'static>(ctx: CodeoutCtx<A, D, T>) -> CodeoutTrigger {
         let shared = Arc::new(TriggerShared::default());
         let task = match tokio::runtime::Handle::try_current() {
             Ok(rt) => Some(rt.spawn(run(ctx, shared.clone()))),
@@ -783,6 +1023,7 @@ impl CodeoutTrigger {
         }
         st.session = Some(session_id.to_string());
         st.start_due = true;
+        st.begin_due = true;
         drop(st);
         self.shared.wake.notify_one();
     }
@@ -827,6 +1068,9 @@ impl Drop for CodeoutTrigger {
 enum Work {
     /// The start capture of this session (T8.7).
     Start(String),
+    /// The first transcript step of this session (S9 phase 4,
+    /// [`transcript_begin`]).
+    Begin(String),
     /// A fetch, then a turn's capture of each session it was asked for.
     Fetch(Vec<String>),
 }
@@ -859,13 +1103,90 @@ async fn capture_session_settings<A, D: DataPlane, T: TokenSource>(ctx: &Codeout
     }
 }
 
+/// The first transcript step of a session the trigger is told of (S9 phase
+/// 4), before any fetch still queued: a placeholder view when nothing is at
+/// its path (`s3::sync::write_placeholder_view`: a chat closed before its
+/// first sync is still listed), a tail URL (`hand_fresh_tail`: from 0 when
+/// S3 holds nothing of it, so `/suspend` and `/terminate` push its bytes
+/// even before a sync), then its subtree's files restored into the VM
+/// (`workspace::transcript::restore_subtree`, out of P3's deadline). Never
+/// fatal (logged), given up at once when the trigger closes.
+async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: &str) {
+    let sctx = crate::bridge::s3::sync::SyncCtx { api: &*ctx.api, dp: &*ctx.dp, tokens: &*ctx.tokens, paths: &ctx.paths, target: &ctx.target, sync, rules, deadline: None };
+    let begin = async {
+        match crate::bridge::s3::sync::write_placeholder_view(sync, session, rules) {
+            Ok(Some(outcome)) => tracing::info!(session, outcome = outcome.word(), "placeholder view"),
+            Ok(None) => {}
+            Err(e) => tracing::info!(session, "placeholder view not written: {e}"),
+        }
+        sctx.hand_fresh_tail(session).await;
+        match crate::bridge::workspace::transcript::restore_subtree(&sctx, session).await {
+            Ok(r) => tracing::info!(session, pulled = r.pulled, kept = r.kept, unnamed = r.unnamed, "transcript subtree restored"),
+            Err(e) => {
+                tracing::warn!(session, "transcript subtree not restored: {e}");
+                voice::warn(&format!("the subagent and tool files of {session} were not restored into the VM: {e}"));
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        () = until_closed(shared) => tracing::info!(session, "transcript begin given up: the session closes"),
+        () = begin => {}
+    }
+}
+
+/// A fresh tail URL for `session` before its turn's fetch (S9 phase 4:
+/// the bytes between a result and the sync that commits them always have
+/// one); given up at once when the trigger closes.
+async fn tail_before_turn<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: &str) {
+    let sctx = crate::bridge::s3::sync::SyncCtx { api: &*ctx.api, dp: &*ctx.dp, tokens: &*ctx.tokens, paths: &ctx.paths, target: &ctx.target, sync, rules, deadline: None };
+    tokio::select! {
+        biased;
+        () = until_closed(shared) => {}
+        () = sctx.hand_fresh_tail(session) => {}
+    }
+}
+
+/// The transcript step of one session (S9), after its turn's fetch and
+/// capture: one sync to S3 and its view (`s3::sync`), never fatal (logged),
+/// given up at once when the trigger closes (what the last turn left is the
+/// tail the shim pushes at `/suspend` or `/terminate`); each of its requests
+/// keeps its own budget. Without its tripwires (`rules`) nothing is synced:
+/// a view is never written unmasked.
+async fn sync_transcript<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: &str) {
+    let sctx = crate::bridge::s3::sync::SyncCtx { api: &*ctx.api, dp: &*ctx.dp, tokens: &*ctx.tokens, paths: &ctx.paths, target: &ctx.target, sync, rules, deadline: None };
+    tokio::select! {
+        biased;
+        () = until_closed(shared) => tracing::info!(session, "transcript sync given up: the session closes"),
+        got = sctx.sync_session(session) => match got {
+            Ok(r) => tracing::info!(session, outcome = r.outcome(), committed = r.committed, files = r.files, "transcript synced"),
+            Err(e) => {
+                tracing::warn!(session, "transcript not synced: {e}");
+                voice::warn(&format!("the transcript of {session} did not reach S3 this turn: {e}"));
+            }
+        },
+    }
+}
+
 /// The trigger's task: a session's start capture once it is named, one
-/// fetch per wake while asked (then a turn's capture), until closed. Each
-/// piece of work is `busy` from its taking (under the state's lock, so a
-/// close sees it or none starts) to its end.
-async fn run<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, T>, shared: Arc<TriggerShared>) {
+/// fetch per wake while asked (then a turn's capture, then with
+/// `ctx.transcript` the transcript's sync), until closed. Each piece of work
+/// is `busy` from its taking (under the state's lock, so a close sees it or
+/// none starts) to its end.
+async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, T>, shared: Arc<TriggerShared>) {
     use crate::bridge::settings_capture::CapturePhase;
     let _gone = TaskGone(Arc::clone(&shared));
+    // The view's tripwires, read once: without them no sync runs (a view is never written unmasked).
+    let rules = match &ctx.transcript {
+        Some(_) => match ScanSet::load(&ctx.paths, &ctx.cfg, &ctx.ws) {
+            Ok(set) => Some(set.rules),
+            Err(e) => {
+                voice::warn(&format!("the session's transcript is not synced to S3: its tripwires do not load ({e})"));
+                None
+            }
+        },
+        None => None,
+    };
     loop {
         let work = loop {
             {
@@ -877,6 +1198,12 @@ async fn run<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, 
                     if let Some(id) = st.session.clone() {
                         st.busy = true;
                         break Work::Start(id);
+                    }
+                }
+                if std::mem::take(&mut st.begin_due) && ctx.transcript.is_some() && rules.is_some() {
+                    if let Some(id) = st.session.clone() {
+                        st.busy = true;
+                        break Work::Begin(id);
                     }
                 }
                 if st.pending {
@@ -898,8 +1225,26 @@ async fn run<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, 
                 shared.idle(false);
                 continue;
             }
+            Work::Begin(id) => {
+                if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
+                    transcript_begin(&ctx, &shared, sync, rules, &id).await;
+                }
+                shared.idle(false);
+                continue;
+            }
             Work::Fetch(asked) => asked,
         };
+        // S9: a fresh tail URL for each asking session before the fetch, so the turn's bytes have one until its sync.
+        if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
+            for id in asked.iter().filter(|_| !shared.state().closed) {
+                tail_before_turn(&ctx, &shared, sync, rules, id).await;
+            }
+        }
+        // No fetch starts after the close: a close that came while the tails went (each given up at once) ends the
+        // task here. S8's task started its fetch as it took the work, with nothing to wait for between.
+        if shared.state().closed {
+            return;
+        }
         let report = match fetch(&ctx, FetchOpts::per_result(&ctx.cfg)).await {
             Ok(r) => r,
             Err(e) => {
@@ -921,6 +1266,12 @@ async fn run<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, 
         // Each session whose result asked for this fetch, a queued one's too: a `/clear` before it started named the next session, whose start capture ran first.
         for id in asked.iter().filter(|_| ctx.capture_settings && !closed) {
             capture_session_settings(&ctx, &shared, id, CapturePhase::Turn).await;
+        }
+        // S9: then each such session's transcript to S3, and its view.
+        if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
+            for id in asked.iter().filter(|_| !shared.state().closed) {
+                sync_transcript(&ctx, &shared, sync, rules, id).await;
+            }
         }
         shared.idle(false);
     }
@@ -963,6 +1314,7 @@ mod tests {
             target: AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: Secret::new("t".into()), vpc: true, shell: false },
             ws: ws.clone(),
             capture_settings: true,
+            transcript: None,
         };
         let quiet = CodeoutTrigger::spawn(ctx());
         let t = std::time::Instant::now();
@@ -1003,16 +1355,20 @@ mod tests {
     /// `get_settings` answers a capture of the trigger's workspace, or holds
     /// forever (`hold`), and counts its requests. With a `gate`, each answer
     /// waits for a permit; `changing`, each answer's project keys differ
-    /// from the one before (every capture is written).
+    /// from the one before (every capture is written). `POST
+    /// /transcript/tail` is counted (`tails`) and unserved, but from the
+    /// `hold_tail`-th one on (0 the first) it holds forever.
     struct SettingsVm {
         hold: bool,
         gets: std::sync::atomic::AtomicUsize,
         gate: Option<tokio::sync::Semaphore>,
         changing: bool,
+        tails: std::sync::atomic::AtomicUsize,
+        hold_tail: Option<usize>,
     }
 
     fn settings_vm(hold: bool) -> SettingsVm {
-        SettingsVm { hold, gets: std::sync::atomic::AtomicUsize::new(0), gate: None, changing: false }
+        SettingsVm { hold, gets: std::sync::atomic::AtomicUsize::new(0), gate: None, changing: false, tails: std::sync::atomic::AtomicUsize::new(0), hold_tail: None }
     }
 
     impl TokenSource for SettingsVm {
@@ -1038,10 +1394,6 @@ mod tests {
             Err(BridgeError::Endpoint("unreached".into()))
         }
 
-        async fn put_transcript(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &str, _: &Path, _: u64) -> Result<crate::bridge::dataplane::DpReply<crate::wire::workspace::TranscriptReply>, BridgeError> {
-            Err(BridgeError::Endpoint("unreached".into()))
-        }
-
         async fn get_settings(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, path: &str) -> Result<crate::bridge::dataplane::DpReply<crate::wire::workspace::SettingsCapture>, BridgeError> {
             let n = self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.hold {
@@ -1055,6 +1407,14 @@ mod tests {
                 project.insert("allowedTools".to_string(), serde_json::json!([format!("Bash(echo {n})")]));
             }
             Ok(crate::bridge::dataplane::DpReply::ok(200, crate::wire::workspace::SettingsCapture { path: path.to_string(), files: Vec::new(), project, at: "2026-10-12T10:00:00Z".into() }))
+        }
+
+        async fn transcript_tail(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &crate::wire::workspace::TranscriptTail) -> Result<crate::bridge::dataplane::DpReply<()>, BridgeError> {
+            let n = self.tails.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hold_tail.is_some_and(|from| n >= from) {
+                std::future::pending::<()>().await;
+            }
+            Err(BridgeError::Config("POST /transcript/tail: this VM does not serve it".into()))
         }
     }
 
@@ -1079,6 +1439,7 @@ mod tests {
                 seed_branch: None,
             },
             capture_settings: true,
+            transcript: None,
         }
     }
 
@@ -1119,6 +1480,44 @@ mod tests {
         let _ = trigger.close(CLOSE_WAIT).await;
     }
 
+    /// S9 phase 4 (T2): a session the trigger is told of gets its
+    /// placeholder view at once, before any fetch (none is asked here), so a
+    /// chat closed before its first sync is still listed in Cursor's
+    /// picker; its tail is offered (this VM serves no transcript route: it
+    /// fails, logged, never fatal) and its subtree has nothing to restore
+    /// (no manifest). A file already at the view's path is never replaced.
+    #[tokio::test]
+    async fn a_named_session_gets_its_placeholder_view_before_any_fetch() {
+        use crate::bridge::s3::{S3Endpoint, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let ctx = |vm: Arc<SettingsVm>| {
+            let mut ctx = settings_ctx(dir.path(), vm);
+            ctx.capture_settings = false;
+            let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab("127.0.0.1:9".parse().unwrap()) };
+            ctx.transcript = Some(TranscriptSync { target, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: projects.clone(), proxy: None, view_messages: 10 });
+            ctx
+        };
+        let trigger = CodeoutTrigger::spawn(ctx(Arc::new(settings_vm(false))));
+        trigger.set_session(SESSION);
+        let view = projects.join("-w").join(format!("{SESSION}.jsonl"));
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !view.exists() && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(crate::bridge::view::is_view_file(&view), "the placeholder view, marked");
+        assert!(std::fs::read_to_string(&view).unwrap().contains(crate::bridge::s3::sync::PLACEHOLDER_TEXT));
+        assert!(trigger.last().is_none(), "no fetch was asked");
+        let _ = trigger.close(CLOSE_WAIT).await;
+        // A file there already (a view, or a transcript): left as it is.
+        std::fs::write(&view, b"{\"type\":\"user\"}\n").unwrap();
+        let trigger = CodeoutTrigger::spawn(ctx(Arc::new(settings_vm(false))));
+        trigger.set_session(SESSION);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = trigger.close(CLOSE_WAIT).await;
+        assert_eq!(std::fs::read(&view).unwrap(), b"{\"type\":\"user\"}\n");
+    }
+
     /// Never inside the close budget: a capture still waiting for the VM as
     /// the trigger closes is given up at once (not after `CLOSE_WAIT`), and
     /// nothing of it is written.
@@ -1138,6 +1537,40 @@ mod tests {
         assert!(t.elapsed() < CLOSE_WAIT, "given up at once, not waited for: {:?}", t.elapsed());
         assert!(!Paths::from_root_and_env(dir.path().to_path_buf(), None).quarantine().exists(), "nothing written");
         assert!(events(dir.path()).is_empty(), "{:?}", events(dir.path()));
+    }
+
+    /// S9 round 5 (R3): no fetch starts after the close. A turn's fresh
+    /// tail goes to the VM before its fetch (S9); a close while that tail
+    /// waits at the VM gives it up at once, and the fetch never starts: the
+    /// close finds no report and the task ended, and no `codeout_fetch` row
+    /// is written. S8's task went from the work to its fetch with nothing
+    /// to wait for between.
+    #[tokio::test]
+    async fn a_close_while_the_turns_tail_waits_starts_no_fetch() {
+        use crate::bridge::s3::{S3Endpoint, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        // The session's first tail (its naming's) is refused at once; the turn's waits at the VM.
+        let vm = Arc::new(SettingsVm { hold_tail: Some(1), ..settings_vm(false) });
+        let mut ctx = settings_ctx(dir.path(), vm.clone());
+        ctx.capture_settings = false;
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab("127.0.0.1:9".parse().unwrap()) };
+        ctx.transcript = Some(TranscriptSync { target, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: dir.path().join("projects"), proxy: None, view_messages: 10 });
+        let trigger = CodeoutTrigger::spawn(ctx);
+        let watch = trigger.watch();
+        trigger.set_session(SESSION);
+        trigger.request();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while vm.tails.load(SeqCst) < 2 && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(vm.tails.load(SeqCst), 2, "the turn's tail waits at the VM");
+        let t = std::time::Instant::now();
+        assert_eq!(trigger.close(CLOSE_WAIT).await, None, "no fetch ran");
+        assert!(t.elapsed() < CLOSE_WAIT, "the tail given up at once: {:?}", t.elapsed());
+        assert!(watch.done());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!events(dir.path()).iter().any(|e| e.starts_with("codeout_fetch")), "{:?}", events(dir.path()));
     }
 
     /// A fetch queued by a session's result keeps that session's turn
@@ -1458,7 +1891,8 @@ mod tests {
     /// part of it or a tripwire matches it (each built at run time: the
     /// setup-token's shape, an AWS key id, a `token=` assignment, a custom
     /// tripwire); a branch, a snapshot, the seeded WIP and a detached HEAD
-    /// named as ai-env and people name them do not.
+    /// named as ai-env and people name them do not. The two notes that count
+    /// refs, naming none, read as the contracts pin them (S9 §13, I1).
     #[test]
     fn credential_shaped_names_are_the_scrubbers_and_the_tripwires() {
         let rules = Rules::with_extras("internal-[0-9]{6}\n", "tripwires").unwrap();
@@ -1471,6 +1905,7 @@ mod tests {
             assert!(!credential_shaped(name, &rules), "{name}");
         }
         assert_eq!(hidden_note(2), "2 VM ref(s) skipped: a name that looks like a credential (not shown)");
+        assert_eq!(not_commit_note(2), "2 VM ref(s) skipped: an object that is no commit (a tree, a blob or a tag; not shown)");
     }
 
     #[test]

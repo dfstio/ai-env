@@ -1,10 +1,11 @@
 //! `ai-env wrapper status [--json]` (plans/wrapper-status-uninstall-plan.md
 //! §2): whether Cursor's `claudeCode.claudeProcessWrapper` is set, which
 //! `ai-env-claude` it runs, the mode and roots Cursor's chats get, whether
-//! bridge.toml passes the checks a remote session runs at its start, and which
-//! extension Cursor last ran. Read-only: no AWS call, no Touch ID, no write;
-//! the one process it starts is the sibling's `--version`, as doctor and
-//! install do (never claude, never the path the settings name). The rows are
+//! bridge.toml passes the checks a remote session runs at its start, which
+//! extension Cursor last ran, and (S9) which one each Cursor window whose
+//! extension host still runs is on. Read-only: no AWS call, no Touch ID, no
+//! write; the one process it starts is the sibling's `--version`, as doctor
+//! and install do (never claude, never the path the settings name). The rows are
 //! doctor's (its row builders where one fits, its tags) and so is the report
 //! (`commands::doctor_report_under`: exit 1 only on a `[NO ]` row, so "not
 //! installed" is `[-  ]` and exit 0; `--json` is `doctor --json`'s shape).
@@ -13,13 +14,14 @@
 //! steer the wrapper ([`CursorEnv`]) and nothing else: no other entry's name
 //! or value is ever printed; of those four it shows whether
 //! `AI_ENV_BRIDGE_LOCAL` is `1`, and the others' values scrubbed and capped.
-use crate::bridge::census::read_tail;
+use crate::bridge::census::{read_tail, running_extensions, RunningExtension};
 use crate::bridge::config::{BridgeConfig, Paths, WrapperMode};
 use crate::bridge::doctor::{
     cursor_settings_path, installed_extension_names, parse_settings, pick_bundle, row_bridge_config, row_cursor_bundle, row_same_version, row_settings_unparseable, row_sibling, row_wrapper_setting, rows_s8_loaded,
-    run_capture, strip_jsonc, WRAPPER_SETTING,
+    run_capture, running_window_text, strip_jsonc, WRAPPER_SETTING,
 };
 use crate::bridge::errors::BridgeError;
+use crate::bridge::registry::process_identity;
 use crate::bridge::remote::env::session_env;
 use crate::bridge::remote::link::StartStep;
 use crate::bridge::remote::{Failure, MODE_NOTES};
@@ -319,28 +321,24 @@ fn configured_mode(loaded: &Loaded) -> String {
 /// while that holds: the wrapper routes Cursor's chats (`wraps`,
 /// [`Spawn::wraps`]) and Cursor's `AI_ENV_BRIDGE_MODE` (`env`) names no mode
 /// other than the file's (`loaded`, as `route::load_for_wrapper` gives it).
-/// Doctor's row quotes the mode as written: it is kept scrubbed
-/// ([`scrubbed`]). Its `[NO ]` (a mode the wrapper does not know, a remote
-/// file that does not load) has every chat under the roots fail closed;
-/// with no root to route on ([`has_roots`]) every chat runs on this Mac
-/// instead, which the row then says, still `[NO ]` with doctor's fix (the
-/// file is wrong all the same: a root ends every chat under it at its
-/// start). Else the file alone ([`configured_mode`]): no wrapper, the kill
-/// switch, a wrapper that cannot run or the variable leaves Cursor's chats
-/// to the effective mode's row. It is `[-  ]`, but doctor's `[NO ]` stays
-/// `[NO ]` with a fix, the file being wrong whatever runs now, and doctor's
-/// `[!! ]` (remote without a root) stays `[!! ]` with its fix: once the
-/// file's mode applies, every chat still runs on this Mac.
+/// Doctor's row quotes the mode scrubbed and capped ([`shown_mode`]); it is
+/// kept scrubbed all the same ([`scrubbed`]). Its `[NO ]` (a mode the
+/// wrapper does not know, a remote file that does not load) has every chat
+/// under the roots fail closed, or, with no root to route on, says every
+/// chat runs on this Mac until bridge.toml names one (S9: doctor's own
+/// words, no longer this row's). Else the file alone ([`configured_mode`]):
+/// no wrapper, the kill switch, a wrapper that cannot run or the variable
+/// leaves Cursor's chats to the effective mode's row. It is `[-  ]`, but
+/// doctor's `[NO ]` stays `[NO ]` with a fix, the file being wrong whatever
+/// runs now, and doctor's `[!! ]` (remote without a root) stays `[!! ]`
+/// with its fix: once the file's mode applies, every chat still runs on
+/// this Mac.
 #[must_use]
 pub fn row_configured_mode(doctor: DoctorLine, loaded: &Loaded, env: &CursorEnv, wraps: bool) -> DoctorLine {
     let file = effective_mode_loaded(None, loaded).0;
     let broken = loaded.broken.is_some();
     if wraps && env.named_mode().is_none_or(|m| m == file.name()) {
-        if !doctor.is_no() || has_roots(loaded) {
-            return scrubbed(doctor);
-        }
-        let fix = if broken { "fix bridge.toml (the bridge.toml row above)" } else { "ai-env wrapper install --write --mode remote (or passthrough)" };
-        return DoctorLine::row(Tag::No, format!("{}: every Cursor chat runs on this Mac until bridge.toml names a root, then every chat under it exits 1 at its start  <- {fix}", configured_mode(loaded)));
+        return scrubbed(doctor);
     }
     let text = format!("{}: not what Cursor's chats get now (the effective mode below)", configured_mode(loaded));
     match (&doctor, broken) {
@@ -436,11 +434,13 @@ pub fn rows_roots(loaded: &Loaded, mode: Mode, wraps: bool) -> Vec<DoctorLine> {
 /// `[seed]`, the `vm` checks (`vm::cmd::config_checks`), the run plan
 /// without a workspace (`vm::run::RunPlan::from_cfg`: `[aws].image_arn`,
 /// `[vm]`'s run limits and idle policy, the connector vpc egress needs),
-/// `[creds]` (`vm::cmd::sealed_token_plan`'s first check) and the names
+/// `[creds]` (`vm::cmd::sealed_token_plan`'s first check), the names
 /// `[wrapper] env_forward` and `env_extra` may hold (`remote::env::session_env`,
-/// given no variable). Not what else P0 reads: the chat's directory and
-/// arguments, Cursor's environment, the sealed files, the recorded checks.
-/// `Err`: the exit code of the failure P0 makes of the error
+/// given no variable) and S9's `[transcript]` (`view_messages`, which P0
+/// checks as it builds the session's transcript sync). Not what else P0
+/// reads: the chat's directory and arguments, Cursor's environment, the
+/// sealed files, the recorded checks, the transcripts bucket state/infra.toml
+/// records. `Err`: the exit code of the failure P0 makes of the error
 /// (`remote::Failure`) and the error's first line, scrubbed. Pure: nothing
 /// is read or printed.
 fn remote_checks(cfg: &BridgeConfig) -> std::result::Result<(), (i32, String)> {
@@ -456,7 +456,8 @@ fn remote_checks(cfg: &BridgeConfig) -> std::result::Result<(), (i32, String)> {
         ended(Failure::from_error(StartStep::Precheck, e, None), text)
     })?;
     cfg.creds.validate().map_err(config)?;
-    session_env(cfg, &|_| None).map(drop).map_err(|what| ended(Failure::Refused { what: what.clone() }, what))
+    session_env(cfg, &|_| None).map_err(|what| ended(Failure::Refused { what: what.clone() }, what))?;
+    cfg.transcript.validate().map_err(config)
 }
 
 /// Whether bridge.toml passes the checks a remote session runs at its start
@@ -631,6 +632,36 @@ pub fn row_last_extension(rows: &[Value], installed: Option<&str>, census: &Path
     }
 }
 
+/// One row per Cursor window whose extension host still runs (S9, `windows`:
+/// `census::running_extensions` of the census tail): a window keeps the
+/// extension it loaded until a reload starts a new host, so what its host
+/// ran is what it runs now, whatever changed in Cursor's settings since.
+/// `[ok ]` on the installed extension (`installed`); `[!! ]` on another,
+/// with the reload that brings it there and where that reload sends the
+/// window's open chats (`restart`, as [`row_last_extension`]'s hint; the
+/// bundled claude on this Mac while the wrapper does not route Cursor's
+/// chats, `wraps` false); `[-  ]` with nothing installed to compare.
+#[must_use]
+pub fn rows_live_windows(windows: &[RunningExtension], installed: Option<&str>, wraps: bool, restart: Restart) -> Vec<DoctorLine> {
+    let reload = match (wraps, restart) {
+        (false, _) => " (it restarts its open chats on this Mac, without the wrapper)",
+        (true, Restart::Here) => " (it restarts its open chats on this Mac)",
+        (true, Restart::MicroVm) => ": it restarts its open chats through the wrapper, those under the roots in their MicroVM (to keep one on this Mac: the README's \"No wrapper at all\")",
+        (true, Restart::Exit) => ": it restarts its open chats through the wrapper, and those under the roots exit at their start until bridge.toml is fixed (the rows above)",
+    };
+    windows
+        .iter()
+        .map(|w| {
+            let window = running_window_text(w);
+            match installed {
+                Some(v) if v == w.ext => DoctorLine::row(Tag::Ok, window),
+                Some(v) => DoctorLine::row(Tag::Warn, format!("{window}; {v} is installed  <- reload that window{reload}")),
+                None => DoctorLine::row(Tag::Skip, window),
+            }
+        })
+        .collect()
+}
+
 /// A census row of a stream-json session: `route` remote, or one of the two
 /// reasons a session stays local for (outside the roots, no bridge.toml).
 fn is_session_row(row: &Value) -> bool {
@@ -690,8 +721,8 @@ fn first_line(line: DoctorLine) -> DoctorLine {
 /// Collect the inputs and build every row, in the plan's order: Cursor's
 /// settings, the wrapper key, the sibling, Cursor's variables, bridge.toml,
 /// its mode, the mode Cursor's chats get, the roots, the checks a remote
-/// session runs at its start, the extension installed and the one Cursor
-/// last ran, the newest session's place.
+/// session runs at its start, the extension installed, the one Cursor last
+/// ran and each live window's (S9), the newest session's place.
 #[must_use]
 pub fn rows() -> Vec<DoctorLine> {
     let mut lines = Vec::new();
@@ -770,7 +801,9 @@ pub fn rows() -> Vec<DoctorLine> {
         let census = p.census();
         match read_tail(&census, CENSUS_TAIL_CHUNKS) {
             Ok(rows) => {
-                lines.push(row_last_extension(&rows, pick_bundle(&dirs).map(|(v, _)| v).as_deref(), &census, wraps, changed, Restart::of(mode, &wrapper)));
+                let (installed, restart) = (pick_bundle(&dirs).map(|(v, _)| v), Restart::of(mode, &wrapper));
+                lines.push(row_last_extension(&rows, installed.as_deref(), &census, wraps, changed, restart));
+                lines.extend(rows_live_windows(&running_extensions(&rows, &process_identity), installed.as_deref(), wraps, restart));
                 lines.push(row_last_session(&rows, wraps, changed));
             }
             Err(e) => lines.push(DoctorLine::row(Tag::Warn, format!("census unreadable: {e}"))),
@@ -1057,12 +1090,14 @@ mod tests {
 
     /// bridge.toml's mode row is doctor's while that holds: the wrapper
     /// routes Cursor's chats and Cursor's mode variable names no mode other
-    /// than the file's; but doctor's `[NO ]`, which fails every chat under
-    /// the roots closed, says with no root that every chat runs here. Else
-    /// it is the file alone, `[-  ]`: no wrapper, the kill switch, another
-    /// mode named; doctor's `[NO ]` (a mode the wrapper does not know, a
-    /// remote file that does not load) stays `[NO ]`, and its `[!! ]`
-    /// (remote without a root) stays `[!! ]`, each with its fix.
+    /// than the file's; doctor's `[NO ]`, which fails every chat under the
+    /// roots closed, says itself (S9) with no root that every chat runs
+    /// here. Else it is the file alone, `[-  ]`: no wrapper, the kill switch,
+    /// another mode named; doctor's `[NO ]` (a mode the wrapper does not
+    /// know, a remote file that does not load) stays `[NO ]`, and its `[!! ]`
+    /// (remote without a root) stays `[!! ]`, each with its fix. An unknown
+    /// `[wrapper]` key makes the mode unreadable (F1), one in another table
+    /// does not.
     #[test]
     fn the_mode_row_is_doctors_only_while_it_holds() {
         use crate::bridge::doctor::rows_s8;
@@ -1115,7 +1150,8 @@ mod tests {
         let paths = Paths::from_root_and_env(d.path().to_path_buf(), None);
         let fix = "  <- fix bridge.toml (the bridge.toml row above)";
         for (toml, want) in [
-            ("[wrapper]\nmode = \"remote\"\nnope = 1\n[workspaces]\nroots = [\"/a\"]\n", (Tag::No, format!("bridge.toml, which does not load, [wrapper] mode \"remote\" (1 root){now}{fix}"))),
+            ("[wrapper]\nmode = \"remote\"\n[vm]\nnope = 1\n[workspaces]\nroots = [\"/a\"]\n", (Tag::No, format!("bridge.toml, which does not load, [wrapper] mode \"remote\" (1 root){now}{fix}"))),
+            ("[wrapper]\nmode = \"passthrough\"\nnope = 1\n[workspaces]\nroots = [\"/a\"]\n", (Tag::No, format!("bridge.toml, which does not load, [wrapper] mode unreadable (1 root){now}{fix}"))),
             ("[wrapper\n", (Tag::No, format!("bridge.toml, which does not load, [wrapper] mode unreadable (its roots unreadable){now}{fix}"))),
             ("nope = 1\n", (Tag::Skip, format!("bridge.toml, which does not load, [wrapper] mode unset (no root){now}"))),
         ] {
@@ -1126,7 +1162,7 @@ mod tests {
             assert_eq!(text(&row_configured_mode(doctor, &l, &kill, false)), want, "{toml:?}");
         }
         // Remote (or a mode it cannot read), not loading, its roots read and none: every chat runs here until one comes.
-        for (toml, mode) in [("[wrapper]\nmode = \"remote\"\nnope = 1\n", "\"remote\""), ("[wrapper]\nmode = 1\n", "unreadable")] {
+        for (toml, mode) in [("[wrapper]\nmode = \"remote\"\n[vm]\nnope = 1\n", "\"remote\""), ("[wrapper]\nmode = 1\n", "unreadable"), ("[wrapper]\nmode = \"remote\"\nnope = 1\n", "unreadable")] {
             std::fs::write(&paths.config, toml).unwrap();
             let doctor = rows_s8_loaded(&paths, &BridgeConfig::load(&paths)).remove(0);
             assert!(doctor.is_no(), "{toml:?}: doctor's fails closed");
@@ -1195,6 +1231,8 @@ mod tests {
             // The names a session's environment may hold: P0's refusal, exit 9.
             (names.as_str(), 9, "[wrapper].env_forward holds \"no-name\": not a variable name ([A-Za-z_][A-Za-z0-9_]*)".to_string()),
             (&format!("{AWS}[wrapper]\nenv_extra = [\"NODE_OPTIONS\"]\n"), 9, "[wrapper].env_extra names NODE_OPTIONS: it changes how claude and node start in the VM; remove it from bridge.toml".to_string()),
+            // S9: the view's size, which P0 checks as it builds the session's transcript sync (exit 1).
+            (&format!("{AWS}[transcript]\nview_messages = 0\n"), 1, format!("config: [transcript].view_messages = 0 is outside 1..={}", crate::wire::view::VIEW_MESSAGES_MAX)),
         ] {
             let l = rooted(toml);
             assert_eq!(fails_closed(Mode::Remote, &l), Some(Closed::Check(code, first.clone())), "{toml}");
@@ -1321,6 +1359,42 @@ mod tests {
         assert_eq!(last(&[], Some("2.1.300"), false).0, Tag::Skip);
     }
 
+    /// S9: one row per Cursor window whose extension host still runs, from
+    /// `census::running_extensions`: `[ok ]` on the installed extension,
+    /// `[!! ]` on another with the reload that brings it there and where the
+    /// reload sends its open chats (the wrapper's [`Restart`], or the bundled
+    /// claude while the wrapper does not route them), `[-  ]` with nothing
+    /// installed; none without a live window. The window's own words
+    /// (`ext`) print only in a version's shape.
+    #[test]
+    fn each_live_window_is_named_with_its_extension() {
+        let since = crate::wire::time::parse_rfc3339_utc("2026-10-17T09:00:00Z").unwrap();
+        let row = |ppid: u64, ext: &str| serde_json::json!({"v": 1, "start": (since + 60) * 1000, "pid": 4242, "ppid": ppid, "ext": ext, "route": "remote", "reason": "session"});
+        let rows = [row(5101, "2.1.301"), row(5102, "2.1.302"), row(5103, "2.1.300"), row(5104, "2.1.302\n  [ok ] forged")];
+        let identity = |pid: u32| -> Option<(String, u64)> { (pid != 5103).then(|| ("Cursor Helper (Plugin)".to_string(), since + u64::from(pid - 5100))) };
+        let windows = running_extensions(&rows, &identity);
+        let older = "a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:01Z); 2.1.302 is installed  <- reload that window";
+        let installed = (Tag::Ok, "a Cursor window runs extension 2.1.302 (host pid 5102, since 2026-10-17T09:00:02Z)".to_string());
+        let forged = "a Cursor window runs extension unrecognised (host pid 5104, since 2026-10-17T09:00:04Z); 2.1.302 is installed  <- reload that window";
+        for (wraps, restart, hint) in [
+            (true, Restart::Here, " (it restarts its open chats on this Mac)"),
+            (true, Restart::MicroVm, ": it restarts its open chats through the wrapper, those under the roots in their MicroVM (to keep one on this Mac: the README's \"No wrapper at all\")"),
+            (true, Restart::Exit, ": it restarts its open chats through the wrapper, and those under the roots exit at their start until bridge.toml is fixed (the rows above)"),
+            (false, Restart::MicroVm, " (it restarts its open chats on this Mac, without the wrapper)"),
+        ] {
+            assert_eq!(
+                texts(&rows_live_windows(&windows, Some("2.1.302"), wraps, restart)),
+                vec![(Tag::Warn, format!("{older}{hint}")), installed.clone(), (Tag::Warn, format!("{forged}{hint}"))],
+                "{wraps} {restart:?}"
+            );
+        }
+        assert_eq!(texts(&rows_live_windows(&windows[..1], None, true, Restart::Here)), vec![(Tag::Skip, "a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:01Z)".to_string())], "nothing installed to compare");
+        assert!(rows_live_windows(&[], Some("2.1.302"), true, Restart::Here).is_empty());
+        for t in texts(&rows_live_windows(&windows, Some("2.1.302"), true, Restart::Exit)) {
+            assert!(!t.1.contains("window reload") && !t.1.contains("Cursor last ran") && !t.1.contains('\n'), "{t:?}");
+        }
+    }
+
     /// A census row's `ext` and `ts` print only in the shapes the wrapper
     /// writes (a version, a timestamp), else as `unrecognised`: a newline and
     /// a forged row after it, a control character, a long or empty value
@@ -1434,16 +1508,17 @@ mod tests {
     }
 
     /// Doctor's mode row, kept while the wrapper routes in the file's mode,
-    /// quotes `[wrapper] mode` as written: status prints it scrubbed; the
-    /// file alone shows it scrubbed and capped.
+    /// quotes `[wrapper] mode` scrubbed and capped (S9: through
+    /// [`shown_mode`]), as the file alone shows it; status keeps it
+    /// scrubbed.
     #[test]
     fn the_mode_rows_never_show_a_secret_looking_mode() {
         use crate::bridge::doctor::rows_s8;
         let token = format!("{}oat01-{}", "sk-ant-", "Q".repeat(40));
         let l = loaded(&format!("[wrapper]\nmode = \"{token}\"\n[workspaces]\nroots = [\"/a\"]\n"));
         let doctor = rows_s8(l.cfg.as_ref().unwrap()).remove(0);
-        assert!(text(&doctor).1.contains(&token), "doctor's row quotes it");
         let masked = format!("\"sk-ant-[redacted:len={}]\"", token.len());
+        assert!(!text(&doctor).1.contains(&token) && text(&doctor).1.contains(&masked), "doctor's row quotes it scrubbed: {doctor:?}");
         let kept = text(&row_configured_mode(doctor.clone(), &l, &CursorEnv::default(), true));
         assert_eq!(kept, (Tag::No, format!("config: [wrapper].mode = {masked}: must be \"passthrough\" or \"remote\": every Cursor chat under the roots fails closed  <- ai-env wrapper install --write --mode remote (or passthrough)")));
         let alone = text(&row_configured_mode(doctor, &l, &CursorEnv::default(), false));

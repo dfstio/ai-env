@@ -201,7 +201,7 @@ pub struct ProbeSpec {
 
 /// Every probe the stages record (plan §7), S1 and S3 included so `lab list`
 /// shows the whole picture.
-pub const CATALOG: [ProbeSpec; 30] = [
+pub const CATALOG: [ProbeSpec; 32] = [
     ProbeSpec { name: "entrypoint", stage: "S1", source: Source::Census, expect: Expect::Exact("claude-vscode"), recorded_by: "ai-env wrapper census --record-probes", what: "CLAUDE_CODE_ENTRYPOINT the extension sets for the wrapper" },
     ProbeSpec { name: "stock-ext-oauth", stage: "S1", source: Source::Census, expect: Expect::Exact("absent"), recorded_by: "ai-env wrapper census --record-probes", what: "whether the stock extension advertises OAuth refresh (CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH among a session's environment names); S7's second half in the note: with the debug-build knob AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS the wrapper's pump sends the extension one oauth_token_refresh of its own once the session is initialized, the census end row records the class of the answer (synthetic_oauth:<class>; the stock extension answers error(getOAuthToken callback is not provided.)), and --record-probes puts it in this row's note" },
     ProbeSpec { name: "image-version-delete", stage: "S3", source: Source::Deploy, expect: Expect::Exact("kept"), recorded_by: "make deploy RECORD_PROBE=1", what: "whether an image update deletes earlier versions" },
@@ -236,10 +236,14 @@ pub const CATALOG: [ProbeSpec; 30] = [
     // S8 (plan L8): what Cursor shows after a resume the VM's transcript missed (the miss, the seed retry and the
     // replay), recorded by hand from Cursor with the newest remote session's census evidence; the trust prompt of
     // a fresh VM; the wrapper's own initialize budget, from the census.
-    ProbeSpec { name: "dup-init", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-init --manual VERDICT (after a resume in Cursor)", what: "after a resume whose transcript the VM lacked (T8.5: the upload before the spawn, or the resume miss, the seed retry and the replay), whether Cursor shows the session's start twice: no-duplicate, or duplicate:<what>; observed in Cursor, and recorded only with that resume's census evidence, which the note carries: the newest census end row of a remote session that resumed a conversation (--resume), answered initialize and found its VM without the transcript (transcript:uploaded, or respawns:1 or more), with its session, VM, transcript word, respawns, init_ms, end and exit" },
+    ProbeSpec { name: "dup-init", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-init --manual VERDICT (after a resume in Cursor)", what: "after a resume whose transcript the VM lacked (T8.5: the transcript put there before the spawn, S8's upload or S9's restore from S3, or the resume miss, the seed retry and the replay), whether Cursor shows the session's start twice: no-duplicate, or duplicate:<what>; observed in Cursor, and recorded only with that resume's census evidence, which the note carries: the newest census end row of a remote session that resumed a conversation (--resume), answered initialize and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more), with its session, VM, transcript word, respawns, init_ms, end and exit" },
     ProbeSpec { name: "dup-user-replay", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-user-replay --manual VERDICT (after a resume in Cursor)", what: "after the same resume, whether Cursor shows the replayed user message twice (a doubled bubble): no-duplicate, or duplicate:<what>; observed in Cursor, with the census evidence as dup-init's" },
     ProbeSpec { name: "fresh-claude-json", stage: "S8", source: Source::Live, expect: Expect::Exact("no-stall"), recorded_by: "ai-env lab run fresh-claude-json", what: "whether the image's claude, started as Cursor starts a session (the extension's stream-json argv as the wrapper sends it, its entrypoint, the setup-token on fd 3) in the current directory's workspace seeded into a fresh VM whose .claude.json has no entry for it, answers without a trust dialog or onboarding: no-stall (initialize answered within Cursor's 60 s window, then one turn's result, no error), or stall:initialize (no answer to initialize, or claude exited first), stall:turn (no result for the turn within 120 s, or claude exited first) or stall:turn-error (an error result); the project's .claude.json keys before and after, claude's requests to its host and its first stderr line in the note (on a stall the seed then writes the project's hasTrustDialogAccepted, L7)" },
     ProbeSpec { name: "init-wrapper", stage: "S8", source: Source::Census, expect: Expect::Exact("within-budget"), recorded_by: "ai-env wrapper census --record-probes", what: "how long the wrapper's remote sessions take to answer initialize, from the census end rows (T0 to the forwarded answer, with the legs touchid, select, workspace, gate and spawn): the newest cold row (vm_how:started) against 30 s and the newest warm one (vm_how:reused or resumed) against 5 s, each with its Touch ID leg in the note: within-budget, over:<cold|warm>, or gap:<cold|warm> while the census holds no such row; a pinned VM's rows and starts that never answered are not judged; not recorded until remote end rows exist" },
+    // S9 (plan L6): what the endpoint does with git smart-HTTP v2 and with a chunked request body, each measured
+    // with ai-env's own clients, never a git child holding a token (design D12).
+    ProbeSpec { name: "protocol-v2", stage: "S9", source: Source::Live, expect: Expect::Exact("v2"), recorded_by: "ai-env lab run protocol-v2", what: "whether git smart-HTTP v2 reaches the VM's http-backend through the endpoint: ai-env's own client asks a seeded VM's GET /workspace.git/info/refs?service=git-upload-pack with Git-Protocol: version=2: v2 (the header passed and http-backend answered version 2), v0 (it answered the v0 # service= advertisement: the header was dropped), or failed:<status>; the response's framing (chunked or a length) and the time to the advertisement in the note" },
+    ProbeSpec { name: "chunked-put", stage: "S9", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run chunked-put", what: "what the endpoint does with a chunked request body: a PUT /seed with Transfer-Encoding: chunked to an unseeded VM: forwarded (the shim saw it chunked and answered 411), dechunked (it arrived with a Content-Length), or refused:<status> (the endpoint answered itself); 1 MB and 20 MB PUT /seed timings with a Content-Length in the note" },
 ];
 
 /// The catalog entry of `name`.
@@ -374,8 +378,11 @@ pub fn init_wrapper_verdict(rows: &[serde_json::Value]) -> Option<ProbeRow> {
 /// The census evidence the dup probes are recorded with (S8 T8.5): the
 /// newest end row of a remote session whose argv resumes a conversation
 /// (`--resume UUID`), that answered `initialize` (`init_ms`) and found its
-/// VM without the transcript (`transcript:uploaded`, the upload before the
-/// spawn, or `respawns` of 1 or more, the resume miss's seed retry). `Ok`
+/// VM without the transcript (`transcript:uploaded`, S8's upload before the
+/// spawn, or S9's `transcript:restored`, its pull from S3, or
+/// `transcript:staged`, a chat S3 did not hold yet, begun on this Mac or an
+/// S8 mirror, sent up at the reopen and pulled into the VM; or `respawns` of
+/// 1 or more, the resume miss's seed retry). `Ok`
 /// is that row in the note's words, naming the forced replay only when the
 /// start row recorded `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` and the end row a
 /// retry (L8: a release wrapper, or another value, forces nothing); `Err`
@@ -383,7 +390,7 @@ pub fn init_wrapper_verdict(rows: &[serde_json::Value]) -> Option<ProbeRow> {
 /// to get the evidence.
 pub fn resume_evidence(rows: &[serde_json::Value]) -> std::result::Result<String, String> {
     use crate::bridge::remote::census_part::{TRANSCRIPT, VM, VM_HOW};
-    const NEEDS: &str = "a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, or respawns:1 or more)";
+    const NEEDS: &str = "a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more)";
     let resumed = |r: &serde_json::Value| -> Option<String> {
         let argv: Vec<String> = r.get("argv")?.as_array()?.iter().skip(2).filter_map(|a| a.as_str().map(str::to_string)).collect();
         crate::wire::argv::value_of(&argv, "--resume").filter(|id| crate::wire::workspace::is_uuid(id)).map(str::to_string)
@@ -392,7 +399,7 @@ pub fn resume_evidence(rows: &[serde_json::Value]) -> std::result::Result<String
     let end_of = |start: &serde_json::Value| rows.iter().rev().find(|r| is_end_row(r) && r.get("pid") == start.get("pid") && r.get("start") == start.get("start"));
     let qualifies = |end: &serde_json::Value| {
         let parts = note_parts(end);
-        part(&parts, "init_ms").is_some() && (part(&parts, TRANSCRIPT) == Some("uploaded") || part(&parts, "respawns").and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n >= 1))
+        part(&parts, "init_ms").is_some() && (matches!(part(&parts, TRANSCRIPT), Some("uploaded" | "restored" | "staged")) || part(&parts, "respawns").and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n >= 1))
     };
     if let Some((start, id, end)) = starts.iter().rev().find_map(|(s, id)| end_of(s).filter(|e| qualifies(e)).map(|e| (*s, id, e))) {
         let parts = note_parts(end);
@@ -1554,8 +1561,17 @@ mod tests {
                 ("init-wrapper", Source::Census, "within-budget".to_string(), "ai-env wrapper census --record-probes"),
             ]
         );
-        assert_eq!(CATALOG.len(), 30, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4");
+        assert_eq!(CATALOG.len(), 32, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4, S9 2");
         assert_eq!(Source::Cursor.name(), "cursor");
+    }
+
+    /// S9's two probes (plan L6): live, `lab run`'s own, measured by
+    /// ai-env's clients; `protocol-v2` expects exactly `v2`, `chunked-put`
+    /// records what it saw.
+    #[test]
+    fn the_two_s9_probes_have_their_source_recorder_and_expectation() {
+        let s9: Vec<(&str, Source, String, &str)> = CATALOG.iter().filter(|p| p.stage == "S9").map(|p| (p.name, p.source, p.expect.expectation().render(), p.recorded_by)).collect();
+        assert_eq!(s9, [("protocol-v2", Source::Live, "v2".to_string(), "ai-env lab run protocol-v2"), ("chunked-put", Source::Live, "recorded".to_string(), "ai-env lab run chunked-put")]);
     }
 
     /// A session id of the picker's shape, built at run time.
@@ -1648,10 +1664,10 @@ mod tests {
 
     /// The dup probes' census evidence (T8.5): the newest end row of a
     /// remote session that resumed (`--resume`), answered initialize and
-    /// found its VM without the transcript (uploaded, or the resume miss's
-    /// seed retry); without one the refusal names what the newest remote
-    /// resume lacks, or that there is none. An end row is its start row's by
-    /// pid and start, never by pid alone.
+    /// found its VM without the transcript (uploaded; S9's restored or
+    /// staged; or the resume miss's seed retry); without one the refusal
+    /// names what the newest remote resume lacks, or that there is none. An
+    /// end row is its start row's by pid and start, never by pid alone.
     #[test]
     fn a_dup_probe_needs_the_census_evidence_of_a_remote_resume_into_a_vm_without_its_transcript() {
         let (a, b) = (sid(0x8a01), sid(0x8a02));
@@ -1692,6 +1708,14 @@ mod tests {
         // Only the miss's retry, the transcript word missing: still a resume into a VM without it.
         let retry = session(28, 9, "mode:remote", &["--resume", &b], Some(&remote_tail(Some(7_000), "reused", 900).replace("respawns:0", "respawns:2")), 0);
         assert!(resume_evidence(&retry).unwrap().contains("respawns:2"));
+        // S9: a restore from S3 into the new VM is the same evidence; a VM that kept the committed prefix is not.
+        let restored = session(31, 12, "mode:remote", &["--resume", &b], Some(&format!("{}; transcript:restored", remote_tail(Some(8_000), "started", 900))), 0);
+        assert_eq!(resume_evidence(&restored).unwrap(), format!("census: session {b} resumed in remote mode at 2026-10-13T10:12:00Z (wrapper pid 31) on microvm-started (vm_how:started): transcript:restored, respawns:0, init_ms:8000, end:eof, exit 0"));
+        let kept = session(32, 13, "mode:remote", &["--resume", &b], Some(&format!("{}; transcript:kept", remote_tail(Some(3_000), "reused", 900))), 0);
+        assert!(resume_evidence(&kept).unwrap_err().contains("found its VM holding the transcript (transcript:kept, respawns:0)"));
+        // A chat S3 did not hold yet (begun on this Mac, an S8 mirror), sent up at the reopen and pulled into the new VM.
+        let staged = session(33, 14, "mode:remote", &["--resume", &b], Some(&format!("{}; transcript:staged", remote_tail(Some(8_500), "started", 900))), 0);
+        assert_eq!(resume_evidence(&staged).unwrap(), format!("census: session {b} resumed in remote mode at 2026-10-13T10:14:00Z (wrapper pid 33) on microvm-started (vm_how:started): transcript:staged, respawns:0, init_ms:8500, end:eof, exit 0"));
         // A --resume that is no uuid is no resume of a conversation.
         let odd = session(29, 10, "mode:remote", &["--resume", "../x"], Some(&format!("{}; transcript:uploaded", remote_tail(Some(7_000), "started", 900))), 0);
         assert!(resume_evidence(&odd).unwrap_err().starts_with("no remote resume in the census"));

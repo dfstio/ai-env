@@ -21,7 +21,11 @@
 //!   VM, a rule approved on a VM the session left stays in the diff, and
 //!   among `settings-sync`'s candidates (`already in the image` once
 //!   promoted), until the session is forgotten (`session forget` removes the
-//!   whole quarantine directory).
+//!   whole quarantine directory);
+//! - `checked.json` (S9, L9): `{at, vm}` of the last turn's capture that
+//!   equalled its VM's newest one (none is written then), so the diff says
+//!   the settings were checked unchanged, not never compared; a written
+//!   turn's capture removes it.
 //!
 //! The quarantine keeps no secret (`at_rest`, every file): each file's text
 //! is kept re-written from its document with every `env` value replaced by
@@ -43,14 +47,15 @@
 //! masked. The rules added in any of them are shown once, their union (the
 //! scopes and VMs that added each), then each VM's other changes. The diff
 //! is written to [`DIFF_FILE`] beside the captures, `diff.json` of
-//! [`DIFF_V`] 2: `{v, session, path, start, start_vm, added: [{kind, rule,
-//! scopes, vms}], vms: [{vm, current, at, scopes, project}]}`, the union
-//! first, then each VM's whole diff ([`VmDiff`]), the session's last VM
-//! (`current`, `latest.json`'s) before the VMs it left (by id); a VM not
-//! recorded leaves `vm` out, as `start_vm`. Version 1 held one comparison's
-//! `latest`, `scopes` and `project` at the top. A rule a tripwire matches is
-//! never shown, and every rule and key is shown scrubbed
-//! ([`SettingsDiff::shown`]). `wrapper settings-sync` promotes the safe
+//! [`DIFF_V`] 3: `{v, session, path, start, start_vm, added: [{kind, rule,
+//! scopes, vms}], vms: [{vm, current, at, scopes, project}], checked: {at,
+//! vm}}`, the union first, then each VM's whole diff ([`VmDiff`]), the
+//! session's last VM (`current`, `latest.json`'s) before the VMs it left (by
+//! id); a VM not recorded leaves `vm` out, as `start_vm`, and no
+//! `checked.json` leaves `checked` out. Version 1 held one comparison's
+//! `latest`, `scopes` and `project` at the top; version 2 had no `checked`.
+//! A rule a tripwire matches is never shown, and every rule and key is shown
+//! scrubbed ([`SettingsDiff::shown`]). `wrapper settings-sync` promotes the safe
 //! added rules into the image (`bridge::wrapper::settings_sync`,
 //! [`SettingsDiff::added_rules`], [`rule_refusal`]).
 use crate::bridge::agent::AgentTarget;
@@ -83,9 +88,14 @@ pub const DIFF_FILE: &str = "diff.json";
 /// capture is given up (logged and audited) and the next code-out tries again.
 pub const CAPTURE_WAIT: Duration = Duration::from_secs(20);
 
-/// The schema version of [`SettingsDiff`] (`diff.json`'s `v`): 2 since each
-/// VM's last capture is kept and compared (1 compared one capture).
-pub const DIFF_V: u8 = 2;
+/// The schema version of [`SettingsDiff`] (`diff.json`'s `v`): 3 since it
+/// carries the last check (`checked`, S9); 2 kept and compared each VM's
+/// last capture (1 compared one capture).
+pub const DIFF_V: u8 = 3;
+
+/// The last turn's capture that equalled its VM's newest one, beside the
+/// captures (S9, L9: [`SettingsChecked`]).
+pub const CHECKED_FILE: &str = "checked.json";
 
 /// A kept capture of a VM the session left is named `latest-<VM id>.json`.
 const LEFT_PREFIX: &str = "latest-";
@@ -222,6 +232,74 @@ impl KeptCapture {
     }
 }
 
+/// `checked.json` (S9, L9): when the last turn's capture that equalled its
+/// VM's newest one was read in the VM, and which VM; written only for a
+/// capture that names its VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsChecked {
+    /// The capture's own time (RFC 3339 UTC, as `GET /settings` answered it).
+    pub at: String,
+    /// The VM it was read in.
+    pub vm: String,
+}
+
+/// `quarantine/<session>/settings/checked.json`; `Config` for anything that
+/// is not a session id, before any path is built from it.
+fn checked_path(paths: &Paths, session_id: &str) -> std::result::Result<PathBuf, BridgeError> {
+    if !is_uuid(session_id) {
+        return Err(BridgeError::Config(format!("not a session id: {session_id:?}")));
+    }
+    Ok(settings_dir(paths, session_id).join(CHECKED_FILE))
+}
+
+/// A turn's capture (`kept`) equalled its VM's newest one: `checked.json`
+/// says when and in which VM (0600, in the session's private directory).
+/// Best effort: one that cannot be written is logged, the capture itself
+/// stays unwritten as it should.
+fn note_checked(paths: &Paths, session_id: &str, kept: &KeptCapture) {
+    let Some(vm) = kept.vm.clone() else { return };
+    let checked = SettingsChecked { at: kept.capture.at.clone(), vm };
+    let written = checked_path(paths, session_id).and_then(|path| {
+        private_settings_dir(paths, session_id)?;
+        let mut text = serde_json::to_string_pretty(&checked).map_err(|e| BridgeError::Config(format!("cannot render {CHECKED_FILE}: {e}")))?;
+        text.push('\n');
+        write_atomic_mode(&path, text.as_bytes(), 0o600)
+    });
+    if let Err(e) = written {
+        tracing::warn!("settings capture: {CHECKED_FILE} not written: {e}");
+    }
+}
+
+/// A turn's capture was written: the last check no longer stands for the
+/// newest capture, so `checked.json` goes (best effort, never through a
+/// link: `remove_file` takes the link itself).
+fn forget_checked(paths: &Paths, session_id: &str) {
+    let Ok(path) = checked_path(paths, session_id) else { return };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("settings capture: {} not removed: {e}", path.display()),
+    }
+}
+
+/// `checked.json` of `session_id` (a regular file, never followed through a
+/// symlink); `None` when there is none, or (logged) when it does not read
+/// as one: the diff goes on without it.
+fn read_checked(paths: &Paths, session_id: &str) -> std::result::Result<Option<SettingsChecked>, BridgeError> {
+    let path = checked_path(paths, session_id)?;
+    let Some(text) = read_regular_file(&path)? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&text) {
+        Ok(checked) => Ok(Some(checked)),
+        Err(e) => {
+            tracing::warn!("settings capture: {} is not a check: {}", path.display(), e.to_string().lines().next().unwrap_or("unparseable"));
+            Ok(None)
+        }
+    }
+}
+
 /// The capture at `path` (a regular file, never followed through a
 /// symlink); `None` when there is none.
 pub fn read_capture(path: &Path) -> std::result::Result<Option<KeptCapture>, BridgeError> {
@@ -261,7 +339,7 @@ async fn fetch_settings<D: DataPlane, T: TokenSource>(dp: &D, tokens: &T, target
                 tokens.forget(APP_PORT);
             }
             Verdict::Fail(e) | Verdict::Busy { error: e } | Verdict::Reread { error: e } | Verdict::Throttled { error: e, .. } | Verdict::CheckVm { error: e } => return Err(e),
-            Verdict::Kept { .. } | Verdict::VmLonger { .. } => return Err(BridgeError::Protocol(format!("{route} answered HTTP {}, which no settings route answers", reply.status))),
+            Verdict::Kept { .. } => return Err(BridgeError::Protocol(format!("{route} answered HTTP {}, which no settings route answers", reply.status))),
         }
     };
     capture.check().map_err(|e| BridgeError::Protocol(format!("{SETTINGS_ROUTE}: the capture {e}")))?;
@@ -360,8 +438,10 @@ fn at_rest(capture: SettingsCapture, rules: &Rules) -> SettingsCapture {
 /// that VM's last capture ([`leave`]) and `kept` takes its place; else
 /// `kept` is written only when it differs from its VM's newest capture on
 /// disk (`latest.json`, else its `latest-<VM id>.json`, else `start.json`
-/// when read in that VM; one that cannot be read counts as different). Once
-/// `latest.json` is `kept`'s, that VM's older `latest-<VM id>.json` goes.
+/// when read in that VM; one that cannot be read counts as different); an
+/// unwritten one leaves `checked.json` (S9, [`note_checked`]), a written one
+/// takes it away. Once `latest.json` is `kept`'s, that VM's older
+/// `latest-<VM id>.json` goes.
 fn store(paths: &Paths, session_id: &str, phase: CapturePhase, kept: &KeptCapture) -> std::result::Result<bool, BridgeError> {
     let path = capture_path(paths, session_id, phase)?;
     let vm = kept.vm.as_deref().filter(|_| phase == CapturePhase::Turn);
@@ -384,6 +464,7 @@ fn store(paths: &Paths, session_id: &str, phase: CapturePhase, kept: &KeptCaptur
             Err(_) => None,
         };
         if newest.is_some_and(|n| same_settings(&n.capture, &kept.capture)) {
+            note_checked(paths, session_id, kept);
             return Ok(false);
         }
     }
@@ -391,6 +472,9 @@ fn store(paths: &Paths, session_id: &str, phase: CapturePhase, kept: &KeptCaptur
     let mut text = serde_json::to_string_pretty(kept).map_err(|e| BridgeError::Config(format!("cannot render the settings capture: {e}")))?;
     text.push('\n');
     write_atomic_mode(&path, text.as_bytes(), 0o600)?;
+    if phase == CapturePhase::Turn {
+        forget_checked(paths, session_id);
+    }
     if let Some(older) = &older {
         match std::fs::remove_file(older) {
             Ok(()) => tracing::info!("settings capture: {} went (latest.json is that VM's now)", older.display()),
@@ -599,7 +683,8 @@ pub struct VmDiff {
 }
 
 /// `session show --settings-diff`: the session's VM settings, each VM's
-/// last capture against the start (`diff.json`, [`DIFF_V`] 2).
+/// last capture against the start, and the last check (`diff.json`,
+/// [`DIFF_V`] 3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsDiff {
     pub v: u8,
@@ -618,6 +703,10 @@ pub struct SettingsDiff {
     /// first, then each VM it left, by id; none before any capture after a
     /// result.
     pub vms: Vec<VmDiff>,
+    /// S9 (L9): the last turn's capture that equalled its VM's newest one
+    /// (`checked.json`); left out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<SettingsChecked>,
 }
 
 /// The three rule lists of `permissions`.
@@ -718,6 +807,7 @@ impl SettingsDiff {
                     ..v.clone()
                 })
                 .collect(),
+            checked: self.checked.as_ref().map(|c| SettingsChecked { at: shown_name(&c.at), vm: shown_name(&c.vm) }),
             ..self.clone()
         }
     }
@@ -897,7 +987,7 @@ pub fn diff(session_id: &str, captures: &Captures) -> SettingsDiff {
     let start = &captures.start.capture;
     let vms: Vec<VmDiff> = captures.latest.iter().map(|c| vm_diff(start, c, true)).chain(captures.left.iter().map(|c| vm_diff(start, c, false))).collect();
     let path = captures.latest.as_ref().map_or(&start.path, |l| &l.capture.path).clone();
-    SettingsDiff { v: DIFF_V, session: session_id.to_string(), path, start: start.at.clone(), start_vm: captures.start.vm.clone(), added: union_of(&vms), vms }
+    SettingsDiff { v: DIFF_V, session: session_id.to_string(), path, start: start.at.clone(), start_vm: captures.start.vm.clone(), added: union_of(&vms), vms, checked: captures.checked.clone() }
 }
 
 /// A session's captures ([`read_captures`]).
@@ -911,11 +1001,14 @@ pub struct Captures {
     /// `latest-<VM id>.json`: the last capture of each VM the session left,
     /// by VM id, each named its file's VM.
     pub left: Vec<KeptCapture>,
+    /// `checked.json` (S9): the last turn's capture that equalled its VM's
+    /// newest one.
+    pub checked: Option<SettingsChecked>,
 }
 
 /// The captures of `session_id` under `paths`: `start.json` (required),
-/// `latest.json`, and each `latest-<VM id>.json` but one of `latest.json`'s
-/// own VM (older: a write cut short left it).
+/// `latest.json`, each `latest-<VM id>.json` but one of `latest.json`'s own
+/// VM (older: a write cut short left it), and `checked.json` (S9).
 pub fn read_captures(paths: &Paths, session_id: &str) -> Result<Captures> {
     let start_path = capture_path(paths, session_id, CapturePhase::Start)?;
     let Some(start) = read_capture(&start_path)? else {
@@ -931,7 +1024,7 @@ pub fn read_captures(paths: &Paths, session_id: &str) -> Result<Captures> {
             left.push(KeptCapture { vm: Some(vm), ..kept });
         }
     }
-    Ok(Captures { start, latest, left })
+    Ok(Captures { start, latest, left, checked: read_checked(paths, session_id)? })
 }
 
 /// The tripwires (`[review].tripwires` with the built-ins) of the bridge at `paths`.
@@ -967,7 +1060,11 @@ fn diff_lines(d: &SettingsDiff) -> Vec<String> {
     let start_vm = d.start_vm.as_deref().map(|vm| format!(" in {vm}")).unwrap_or_default();
     let mut out = vec![format!("settings of session {} in its VMs ({}): start {}{start_vm}", d.session, d.path, d.start)];
     if d.vms.is_empty() {
-        out.push("no capture after a result yet: nothing to compare (a capture follows each code-out)".into());
+        out.push(match &d.checked {
+            // S9 (L9): turns ran and their captures equalled the start's, so nothing was written to compare.
+            Some(c) => format!("no change since the start capture (last checked {} in VM {})", c.at, c.vm),
+            None => "no capture after a result yet: nothing to compare (a capture follows each code-out)".into(),
+        });
         return out;
     }
     if d.added.is_empty() {
@@ -1035,7 +1132,7 @@ mod tests {
     use crate::bridge::api::AuthToken;
     use crate::bridge::dataplane::{CodeoutBody, DpReply};
     use crate::wire::redact::Secret;
-    use crate::wire::workspace::{CodeoutRequest, SeedQuery, SeedReply, SeedState, TranscriptReply, TranscriptStat, WsRefusal};
+    use crate::wire::workspace::{CodeoutRequest, SeedQuery, SeedReply, SeedState, TranscriptStat, WsRefusal};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1105,10 +1202,6 @@ mod tests {
             unreached()
         }
 
-        async fn put_transcript(&self, _: &AgentTarget, _: &AuthToken, _: &str, _: &Path, _: u64) -> std::result::Result<DpReply<TranscriptReply>, BridgeError> {
-            unreached()
-        }
-
         async fn get_settings(&self, _: &AgentTarget, _: &AuthToken, path: &str) -> std::result::Result<DpReply<SettingsCapture>, BridgeError> {
             assert_eq!(path, VM_ROOT, "the workspace's VM path is asked for");
             self.gets.fetch_add(1, Ordering::SeqCst);
@@ -1131,7 +1224,7 @@ mod tests {
     /// `start` and `latest` as captures kept with no VM named (W8's first
     /// build's, or planted by hand).
     fn two(start: &SettingsCapture, latest: &SettingsCapture) -> Captures {
-        Captures { start: KeptCapture { vm: None, capture: start.clone() }, latest: Some(KeptCapture { vm: None, capture: latest.clone() }), left: Vec::new() }
+        Captures { start: KeptCapture { vm: None, capture: start.clone() }, latest: Some(KeptCapture { vm: None, capture: latest.clone() }), left: Vec::new(), checked: None }
     }
 
     fn mode_of(p: &Path) -> u32 {
@@ -1165,7 +1258,9 @@ mod tests {
             assert!(matches!(left_capture_path(&paths, ID, bad), Err(BridgeError::Config(_))), "{bad:?}");
         }
         assert_eq!([left_vm("latest-microvm-1.json"), left_vm("latest.json"), left_vm("latest-.json"), left_vm("latest-a.b.json"), left_vm(".latest-microvm-1.json.7.tmp")], [Some("microvm-1"), None, None, None, None]);
-        assert_eq!((DIFF_FILE, DIFF_V, CapturePhase::Start.word(), CapturePhase::Turn.word()), ("diff.json", 2, "start", "turn"));
+        assert_eq!((DIFF_FILE, DIFF_V, CHECKED_FILE, CapturePhase::Start.word(), CapturePhase::Turn.word()), ("diff.json", 3, "checked.json", "start", "turn"));
+        assert_eq!(checked_path(&paths, ID).unwrap(), PathBuf::from(format!("/b/quarantine/{ID}/settings/checked.json")));
+        assert!(matches!(checked_path(&paths, "../../etc"), Err(BridgeError::Config(_))));
     }
 
     /// The session's start capture is written once (0600 in 0700
@@ -1207,6 +1302,57 @@ mod tests {
         assert_eq!(rows.len(), 4, "four written: {rows:?}");
         assert!(rows.iter().all(|r| r["session_id"] == ID && r["detail"]["outcome"] == "written" && r["detail"]["vm"] == "microvm-1"), "{rows:?}");
         assert_eq!(rows[0]["detail"]["phase"], "start");
+    }
+
+    /// S9 (L9): turns whose captures equal the start's write no
+    /// `latest.json`, so the diff had nothing to compare and said none was
+    /// taken. Each such turn now leaves `checked.json` (`{at, vm}`, 0600 in
+    /// the 0700 directory, no audit row: nothing was captured), and the diff
+    /// says the settings are unchanged since the start, last checked then
+    /// and there (`diff.json` v3 carries it). A turn that changes them writes
+    /// `latest.json` and takes the check away; a capture that names no VM
+    /// leaves none.
+    #[tokio::test]
+    async fn a_turn_capture_equal_to_the_start_leaves_a_check_and_the_diff_says_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let start = capture_of(Some("{}"), None, None, "2026-10-12T10:00:00Z");
+        let same = |at: &str| SettingsCapture { at: at.into(), ..start.clone() };
+        let vm = Vm::answering(vec![DpReply::ok(200, start.clone()), DpReply::ok(200, same("2026-10-12T10:05:00Z")), DpReply::ok(200, same("2026-10-12T10:09:00Z"))]);
+        assert!(capture(&vm, &vm, &target(), &paths, ID, VM_ROOT, CapturePhase::Start).await.unwrap());
+        assert!(!capture(&vm, &vm, &target(), &paths, ID, VM_ROOT, CapturePhase::Turn).await.unwrap(), "nothing captured");
+        let checked = checked_path(&paths, ID).unwrap();
+        assert_eq!(names(&paths), ["checked.json", "start.json"]);
+        assert_eq!((mode_of(&checked), mode_of(checked.parent().unwrap())), (0o600, 0o700));
+        let text = std::fs::read_to_string(&checked).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), serde_json::json!({"at": "2026-10-12T10:05:00Z", "vm": "microvm-1"}));
+        assert!(!capture(&vm, &vm, &target(), &paths, ID, VM_ROOT, CapturePhase::Turn).await.unwrap());
+        assert_eq!(read_checked(&paths, ID).unwrap(), Some(SettingsChecked { at: "2026-10-12T10:09:00Z".into(), vm: "microvm-1".into() }), "the last check");
+        assert_eq!(audit_rows(&paths).len(), 1, "the start's row only: a check captures nothing");
+        assert_eq!(left_vms(&settings_dir(&paths, ID)).unwrap(), Vec::<String>::new(), "checked.json is no VM's capture");
+        let captures = read_captures(&paths, ID).unwrap();
+        assert!(captures.latest.is_none() && captures.left.is_empty(), "{captures:?}");
+        let d = diff(ID, &captures).shown(&Rules::defaults());
+        assert_eq!((d.v, d.vms.len(), d.checked.clone()), (3, 0, Some(SettingsChecked { at: "2026-10-12T10:09:00Z".into(), vm: "microvm-1".into() })));
+        let lines = diff_lines(&d);
+        assert_eq!(lines, [format!("settings of session {ID} in its VMs ({VM_ROOT}): start 2026-10-12T10:00:00Z in microvm-1"), "no change since the start capture (last checked 2026-10-12T10:09:00Z in VM microvm-1)".to_string()]);
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!((json["v"].as_u64(), json["checked"]["at"].as_str(), json["checked"]["vm"].as_str()), (Some(3), Some("2026-10-12T10:09:00Z"), Some("microvm-1")), "{json}");
+        // A turn that changes the settings: latest.json written, the check gone, the diff compares.
+        let vm = Vm::answering(vec![DpReply::ok(200, capture_of(Some("{}"), None, Some("{\"permissions\":{\"allow\":[\"Read\"]}}"), "2026-10-12T10:15:00Z"))]);
+        assert!(capture(&vm, &vm, &target(), &paths, ID, VM_ROOT, CapturePhase::Turn).await.unwrap());
+        assert_eq!(names(&paths), ["latest.json", "start.json"]);
+        let d = diff(ID, &read_captures(&paths, ID).unwrap());
+        assert!(d.checked.is_none() && d.vms.len() == 1, "{d:?}");
+        assert!(serde_json::to_value(&d).unwrap().get("checked").is_none(), "left out when there is none");
+        // A check that does not read as one is ignored (logged), never fatal to the diff.
+        std::fs::write(&checked, "not json").unwrap();
+        assert_eq!(read_checked(&paths, ID).unwrap(), None);
+        assert!(read_captures(&paths, ID).unwrap().checked.is_none());
+        // A capture that names no VM (by hand) leaves no check.
+        std::fs::remove_file(&checked).unwrap();
+        note_checked(&paths, ID, &KeptCapture { vm: None, capture: start });
+        assert!(!checked.exists());
     }
 
     /// A refused token is minted again once, then the refusal is the
@@ -1290,7 +1436,7 @@ mod tests {
         latest.project.insert("allowedTools".into(), serde_json::json!(["Bash(npm test)"]));
         latest.project.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
         let d = diff(ID, &two(&start, &latest));
-        assert_eq!((d.v, d.vms.len(), d.vms[0].current, d.vms[0].vm.as_deref(), d.start_vm.as_deref()), (2, 1, true, None, None), "one VM, not recorded");
+        assert_eq!((d.v, d.vms.len(), d.vms[0].current, d.vms[0].vm.as_deref(), d.start_vm.as_deref(), d.checked.as_ref()), (3, 1, true, None, None, None), "one VM, not recorded, never checked");
         let local = &d.vms[0].scopes[2];
         assert_eq!(local.allow, ListDiff { added: vec!["Bash(git status)".into(), format!("Bash(curl -H {secret})")], removed: vec!["Bash(ls)".into()] });
         assert_eq!(local.deny, ListDiff { added: vec![], removed: vec!["Bash(rm:*)".into()] });
@@ -1500,9 +1646,11 @@ mod tests {
             assert!(text.iter().any(|l| l == want), "{want}: {text:#?}");
         }
         let json: Value = serde_json::to_value(d.shown(&Rules::defaults())).unwrap();
-        assert_eq!((json["v"].as_u64(), json["start_vm"].as_str(), json["added"][0]["vms"][0].as_str(), json["vms"][1]["vm"].as_str()), (Some(2), Some("microvm-a1"), Some("microvm-a1"), Some("microvm-a1")), "{json}");
-        // Unchanged on the second VM: nothing written, nothing moved.
+        assert_eq!((json["v"].as_u64(), json["start_vm"].as_str(), json["added"][0]["vms"][0].as_str(), json["vms"][1]["vm"].as_str()), (Some(3), Some("microvm-a1"), Some("microvm-a1"), Some("microvm-a1")), "{json}");
+        assert!(json.get("checked").is_none(), "no turn equalled its VM's newest capture yet: {json}");
+        // Unchanged on the second VM: nothing written, nothing moved; the check noted (S9), gone again at the next write.
         assert!(!capture(&vm, &vm, &b, &paths, ID, VM_ROOT, CapturePhase::Turn).await.unwrap());
+        assert_eq!(read_checked(&paths, ID).unwrap(), Some(SettingsChecked { at: "2026-10-12T11:00:00Z".into(), vm: "microvm-b2".into() }));
         // The first VM back (a pin), the rule gone there: it takes latest.json, the second's kept, its own older one gone.
         let vm = Vm::answering(vec![DpReply::ok(200, SettingsCapture { at: "2026-10-12T12:00:00Z".into(), ..seeded })]);
         assert!(capture(&vm, &vm, &a, &paths, ID, VM_ROOT, CapturePhase::Turn).await.unwrap());

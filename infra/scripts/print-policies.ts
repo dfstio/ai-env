@@ -3,13 +3,16 @@
 //
 //   node print-policies.js --account-id <12 digits> --image-config infra/image-config.json --egress-config infra/egress-config.json
 //                          [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--proxy-instance-id ID]
+//                          [--s3-endpoint-id ID]
 //       one line per document: <name> TAB <IDENTITY_POLICY|RESOURCE_POLICY> TAB <resource type or ->
 //   ... --name <name>
 //       that document as compact JSON (what validate-policy / simulate-custom-policy take)
 //   ... --arn image|execution-role|build-role|egress|connector|connector-by-name|other-connector|proxy-parameter|squid-log-group|image-log-group|
 //             dns-log-group|runtime-user|ops-user|deployer-user|proxy-role|operator-role|ssm-instance-policy|operator-policy|deploy-policy|
-//             deploy-egress-policy|deploy-dns-policy|deployer-policy|ops-policy
-//       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach)
+//             deploy-egress-policy|deploy-dns-policy|deployer-policy|ops-policy|transcripts-bucket|transcripts-vm-object|transcripts-mac-object|
+//             transcripts-egress-check|transcripts-outside-prefix|other-bucket-object|al2023-object|s3-endpoint
+//       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach); `s3-endpoint`
+//       prints the endpoint id the bucket policy names (an id, the simulations' aws:SourceVpce)
 //
 // The egress documents (S5) are the proxy role's trust and inline policy and the operator role's trust and inline
 // Deny (`operator`); the deploy policy's CreateNetworkConnector condition and the operator role's Deny name the VM
@@ -25,17 +28,25 @@
 // or the documents either: check-policies builds them from egress-config.json's names. The users' and the stack's
 // policies' ARNs are printed (--arn), as the targets of section 6 and 7's simulations.
 //
+// S9: the two resource policies of the transcript store, `s3-endpoint` (the S3 gateway endpoint's: RESOURCE_POLICY with
+// no resource type, which Access Analyzer has none for) and `transcripts-bucket` (the bucket's: AWS::S3::Bucket). The
+// bucket policy names the endpoint's id, which exists only in a stack: --s3-endpoint-id, else a placeholder of the real
+// shape (the contracts' example), which `--arn s3-endpoint` prints so the simulations' aws:SourceVpce is the one the
+// document names. The transcripts bucket's name is the account's (transcriptsBucketName); the object ARNs the
+// simulations ask are printed (--arn transcripts-*), so a wrong key shape in policies.ts fails them.
+//
 // The account id is passed in by the caller (from `aws sts get-caller-identity`) and only ever printed to stdout.
 import * as fs from "fs";
 import { egressNames, loadEgressConfig } from "../egress-spec";
 import {
-    BUCKET_PREFIX, BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME,
-    DEPLOY_POLICY_NAME, EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, OPS_USER_NAME, REGION, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, allPolicies, dnsQueryLogGroupArns,
-    egressLogGroupArns, imageArn, internetEgressConnectorArn, logGroupArns, policyArn, proxyParameterArn, roleArn, userArn,
+    AL2023_REPO_BUCKET, BUCKET_PREFIX, BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME,
+    DEPLOY_POLICY_NAME, EGRESS_CHECK_PREFIX, EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, OPS_USER_NAME, REGION, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN,
+    TRANSCRIPTS_KEY_PREFIX, allPolicies, dnsQueryLogGroupArns, egressLogGroupArns, imageArn, internetEgressConnectorArn, logGroupArns, policyArn, proxyParameterArn, roleArn,
+    transcriptsBucketName, userArn,
 } from "../policies";
 
 function usage(msg: string): never {
-    process.stderr.write(`print-policies: ${msg}\nusage: print-policies --account-id <12 digits> --image-config <file> --egress-config <file> [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--proxy-instance-id ID] [--name NAME | --arn KIND]\n`);
+    process.stderr.write(`print-policies: ${msg}\nusage: print-policies --account-id <12 digits> --image-config <file> --egress-config <file> [--bucket NAME] [--vm-subnet-id ID] [--vm-security-group-id ID] [--connector-arn ARN] [--proxy-instance-id ID] [--s3-endpoint-id ID] [--name NAME | --arn KIND]\n`);
     process.exit(2);
 }
 
@@ -70,6 +81,9 @@ const names: Names = {
         // And the proxy instance's id (S8 operators: opsPolicy scopes start, stop and SendCommand to exactly it).
         proxyInstanceId: args.get("proxy-instance-id") ?? "i-0123456789abcdef0",
     },
+    // S9: the transcripts bucket (the account's) and the S3 gateway endpoint's id (a placeholder of the real shape).
+    transcriptsBucket: transcriptsBucketName(accountId),
+    s3EndpointId: args.get("s3-endpoint-id") ?? "vpce-0123456789abcdef0",
 };
 const policies = allPolicies(names);
 
@@ -107,11 +121,24 @@ if (name !== undefined) {
         ["deploy-dns-policy", policyArn(names, DEPLOY_DNS_POLICY_NAME)],
         ["deployer-policy", policyArn(names, DEPLOYER_POLICY_NAME)],
         ["ops-policy", policyArn(names, OPS_POLICY_NAME)],
+        // S9: the transcripts bucket and objects of each kind of key (a VM's segment, a Mac-begun chat's object, the
+        // egress check's, one outside `v1/`), another bucket's object, an AL2023 repository object, the endpoint's id.
+        ["transcripts-bucket", `arn:aws:s3:::${names.transcriptsBucket}`],
+        ["transcripts-vm-object", `arn:aws:s3:::${names.transcriptsBucket}/${TRANSCRIPTS_KEY_PREFIX}0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/vm/g1/s/000000000000bc55`],
+        ["transcripts-mac-object", `arn:aws:s3:::${names.transcriptsBucket}/${TRANSCRIPTS_KEY_PREFIX}0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/mac/${"0".repeat(64)}`],
+        ["transcripts-egress-check", `arn:aws:s3:::${names.transcriptsBucket}/${EGRESS_CHECK_PREFIX}0123abcd`],
+        ["transcripts-outside-prefix", `arn:aws:s3:::${names.transcriptsBucket}/x/_egress-check/0123abcd`],
+        ["other-bucket-object", "arn:aws:s3:::not-ai-env-transcripts/v1/x"],
+        ["al2023-object", `arn:aws:s3:::${AL2023_REPO_BUCKET}/core/mirrors/latest/aarch64/mirror.list`],
+        ["s3-endpoint", names.s3EndpointId as string],
     ]);
     process.stdout.write(`${arns.get(arn) ?? usage(`no ARN kind ${arn}`)}\n`);
 } else {
     for (const p of policies) {
-        const [type, resource] = p.kind === "trust" ? ["RESOURCE_POLICY", "AWS::IAM::AssumeRolePolicyDocument"] : ["IDENTITY_POLICY", "-"];
+        // S9's resource policies: the bucket's is validated as an S3 bucket policy; the endpoint's has no resource type.
+        const [type, resource] = p.kind === "trust" ? ["RESOURCE_POLICY", "AWS::IAM::AssumeRolePolicyDocument"]
+            : p.kind === "resource" ? ["RESOURCE_POLICY", p.name === "transcripts-bucket" ? "AWS::S3::Bucket" : "-"]
+            : ["IDENTITY_POLICY", "-"];
         process.stdout.write(`${p.name}\t${type}\t${resource}\n`);
     }
 }

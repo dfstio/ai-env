@@ -1054,6 +1054,14 @@ impl MicrovmApi for FakeMicrovmApi {
     }
 }
 
+/// S9: presigning with the lab's key (`s3::LAB_KEY_ID`, `s3::LAB_SECRET`) for the tests' fake S3 (G4 builds it).
+impl crate::bridge::s3::S3Sign for FakeMicrovmApi {
+    /// Signed with the lab key (`LAB_KEY_ID`, `LAB_SECRET`), as the tests' S3 checks it.
+    async fn presign(&self, req: &crate::bridge::s3::PresignReq) -> Result<crate::wire::s3::PresignedUrl, BridgeError> {
+        crate::bridge::s3::presign::sign(crate::bridge::s3::presign::lab_credentials(), req, std::time::SystemTime::now())
+    }
+}
+
 impl EndpointClient for FakeMicrovmApi {
     async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
         self.state().get_health(endpoint, token, port_header)

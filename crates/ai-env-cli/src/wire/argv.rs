@@ -279,18 +279,23 @@ pub fn classify(args: &[String]) -> Route {
 pub struct SanitiseOpts {
     pub strip_add_dir: bool,
     pub strip_debug: bool,
+    /// Append the one `--session-mirror` (S9: a remote chat's transcript is
+    /// kept in S3, so the remote route passes `false`: its child mirrors
+    /// nothing to the Mac).
+    pub mirror: bool,
 }
 
 impl Default for SanitiseOpts {
     fn default() -> Self {
-        SanitiseOpts { strip_add_dir: true, strip_debug: true }
+        SanitiseOpts { strip_add_dir: true, strip_debug: true, mirror: true }
     }
 }
 
 /// The argv sent to the remote child: `--bare` rejected; `--add-dir` pairs and
 /// `--add-dir=` dropped; `--debug`/`--debug-file` dropped when `strip_debug`;
-/// exactly one trailing `--session-mirror`; every other token, and every
-/// value of a value-taking flag, copied byte-for-byte in order.
+/// every `--session-mirror` given dropped, and exactly one trailing
+/// `--session-mirror` when `mirror`; every other token, and every value of a
+/// value-taking flag, copied byte-for-byte in order.
 pub fn sanitise(args: &[String], opts: SanitiseOpts) -> Result<Vec<String>, ArgvError> {
     let mut out = Vec::with_capacity(args.len() + 1);
     let mut i = 0;
@@ -346,7 +351,9 @@ pub fn sanitise(args: &[String], opts: SanitiseOpts) -> Result<Vec<String>, Argv
         out.push(tok.to_string());
         i += 1;
     }
-    out.push("--session-mirror".to_string());
+    if opts.mirror {
+        out.push("--session-mirror".to_string());
+    }
     Ok(out)
 }
 
@@ -496,9 +503,23 @@ mod tests {
 
     #[test]
     fn sanitise_keeps_debug_when_disabled() {
-        let opts = SanitiseOpts { strip_add_dir: true, strip_debug: false };
+        let opts = SanitiseOpts { strip_add_dir: true, strip_debug: false, mirror: true };
         let out = sanitise(&v(&["--debug", "--debug-file", "/l"]), opts).unwrap();
         assert_eq!(out, v(&["--debug", "--debug-file", "/l", "--session-mirror"]));
+    }
+
+    /// S9 (M2): a remote chat's child mirrors nothing once its transcript is
+    /// kept in S3: without `mirror` no `--session-mirror` is left, not even
+    /// one the host passed; the rest is sanitised as before.
+    #[test]
+    fn remote_has_no_session_mirror() {
+        let opts = SanitiseOpts { mirror: false, ..SanitiseOpts::default() };
+        let args = v(&["--output-format", "stream-json", "--session-mirror", "--add-dir", "/y", "--debug", "-p", "--session-mirror"]);
+        let out = sanitise(&args, opts).unwrap();
+        assert_eq!(out, v(&["--output-format", "stream-json", "-p"]));
+        assert!(!out.iter().any(|a| a == "--session-mirror"));
+        assert_eq!(sanitise(&args, SanitiseOpts::default()).unwrap().last().map(String::as_str), Some("--session-mirror"), "the default still mirrors");
+        assert!(SanitiseOpts::default().mirror);
     }
 
     #[test]
@@ -513,7 +534,7 @@ mod tests {
         let tail = v(&["--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"]);
         let out = sanitise(&tail, SanitiseOpts::default()).unwrap();
         assert_eq!(out, v(&["--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]));
-        let kept = sanitise(&tail, SanitiseOpts { strip_add_dir: true, strip_debug: false }).unwrap();
+        let kept = sanitise(&tail, SanitiseOpts { strip_add_dir: true, strip_debug: false, mirror: true }).unwrap();
         assert_eq!(kept.len(), tail.len() + 1, "strip_debug=false keeps every tail flag");
         assert!(matches!(classify(&v(&["--output-format", "stream-json", "--debug-to-stderr"])), Route::Remote(s) if s.debug), "--debug-to-stderr counts as a debug flag");
     }

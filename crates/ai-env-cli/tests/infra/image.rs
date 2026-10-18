@@ -416,10 +416,10 @@ fn the_make_child_carries_no_outer_make_or_operator_state() {
 
 const MUST_NOT_RUN: &[&str] = &["aws", "pulumi", "docker", "curl", "gpg", "cargo", "npm", "node", "zip", "shasum", "rustup", "sleep"];
 
-/// `$(LAB_UNSET)` as the live recipes run it: the fifteen lab knobs
+/// `$(LAB_UNSET)` as the live recipes run it: the seventeen lab knobs
 /// (`the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read` holds the
 /// Makefile's list to every one the code and ops.sh read).
-const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT";
+const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES";
 
 /// The stand-in's log line of the operator CLI's keyless build (D18: infra.mk's `$(AI_ENV_BUILD)`, TIER's first
 /// step, and ops.sh's need_ai_env): `--version`, with no marker and no lab knob in its environment.
@@ -1511,6 +1511,18 @@ fn with_operators(mut o: Value) -> Value {
     o
 }
 
+/// `o` as an S9 stack exports it: the transcripts bucket, the proxy's S3 gateway endpoint and route table, and the
+/// canonical hashes of the endpoint's and the bucket's policies (fake ids; the hashes made up), which `ai-env infra
+/// status` records and `ai-env egress status` compares with the live store.
+fn with_s9(mut o: Value) -> Value {
+    o["transcriptsBucket"] = json!("ai-env-transcripts-123456789012");
+    o["s3EndpointId"] = json!("vpce-0123456789abcdef0");
+    o["s3EndpointPolicySha256"] = json!("e1".repeat(32));
+    o["transcriptsBucketPolicySha256"] = json!("b1".repeat(32));
+    o["proxyRouteTableId"] = json!("rtb-0a1b2c3d4e5f60002");
+    o
+}
+
 /// state/infra.toml as the real `ai-env infra status --write` renders `o`
 /// (its live reads answered, or refused, by the stateful aws): ops.sh
 /// compares the stack outputs with exactly this format.
@@ -2263,6 +2275,47 @@ fn post_deploy_skips_what_a_stale_state_or_a_stopped_proxy_cannot_do() {
     }
 }
 
+/// S9: post-deploy's lag check covers the transcript store. A deploy that only changes the S3 endpoint's policy (an
+/// AL2023_REPO_BUCKET fix) leaves state/infra.toml one hash behind: post-deploy names that key and runs no egress
+/// status, which would judge the live endpoint by the old hash and fail the deploy on DRIFT before make infra-status
+/// WRITE=1 could record the new one. The same for the store's other keys, and for a state from before the S9 deploy
+/// (all five); a current state still runs egress status, and its drift fails the deploy.
+#[test]
+fn post_deploy_names_a_transcript_store_change_as_lag_never_drift() {
+    let deployed = with_s9(outputs());
+    let before = |changes: &[(&str, String)]| {
+        let mut o = deployed.clone();
+        for (k, v) in changes {
+            o[*k] = json!(v);
+        }
+        o
+    };
+    // (what, the recorded state, the lag post-deploy names; none: egress status runs)
+    let cases = [
+        ("the endpoint's policy alone", before(&[("s3EndpointPolicySha256", "e0".repeat(32))]), "s3_endpoint_policy_sha256"),
+        ("the bucket's policy alone", before(&[("transcriptsBucketPolicySha256", "b0".repeat(32))]), "transcripts_bucket_policy_sha256"),
+        ("a replaced endpoint (the bucket policy names it)", before(&[("s3EndpointId", "vpce-0fedcba9876543210".into()), ("transcriptsBucketPolicySha256", "b0".repeat(32))]), "s3_endpoint_id transcripts_bucket_policy_sha256"),
+        ("a state from before the S9 deploy", outputs(), "transcripts_bucket s3_endpoint_id s3_endpoint_policy_sha256 transcripts_bucket_policy_sha256 proxy_route_table_id"),
+        ("a current state", deployed.clone(), ""),
+    ];
+    for (what, recorded, lag) in &cases {
+        let (t, bin) = post_deploy_tree(Some(recorded), "running", "2", "2");
+        write_outputs(t.path(), &deployed);
+        // What the real egress status finds against an old store: the live endpoint is not the recorded one.
+        let out = ops5(t.path(), &bin, &["post-deploy"]).env("FAKE_AIENV_STATUS_RC", "1").env("FAKE_AIENV_DRIFT", "vpc-endpoints").bounded();
+        let text = all(&out);
+        let c = calls(t.path());
+        assert!(c.iter().any(|l| l.starts_with("egress reload --if-changed")), "{what}: the same proxy instance is still reloaded: {c:#?}");
+        if lag.is_empty() {
+            assert!(!out.status.success() && text.contains("deploy: DRIFT: ai-env egress status found drift in vpc-endpoints"), "{what}: {text}");
+            continue;
+        }
+        assert!(out.status.success(), "{what}: {text}");
+        assert!(text.contains(&format!("predates this deploy ({lag} differ from the stack outputs): make infra-status WRITE=1")), "{what}: {text}");
+        assert!(!text.contains("DRIFT") && !c.iter().any(|l| l.starts_with("egress status")), "{what}: no egress status against the old state: {text}");
+    }
+}
+
 #[test]
 fn post_deploy_after_a_failure_still_reloads_and_warns_but_checks_no_drift() {
     let mut replaced = outputs();
@@ -2681,7 +2734,7 @@ fn the_live_s5_targets_drop_every_lab_knob() {
         &["proxy-start"],
         &["proxy-patch"],
         &["s8-smoke"],
-        &["test-cursor", "STEP=t8_3"],
+        &["test-cursor", "STEP=t8_3", "SINCE=all"],
     ];
     for args in live {
         let out = run(args);
@@ -5378,10 +5431,12 @@ fn make_n_of_the_s8_targets_names_their_commands_and_runs_nothing() {
     assert!(!w.join("target").exists(), "make -n made {}", w.join("target").display());
 }
 
-/// test-cursor checks STEP before cargo runs: a missing STEP (also one only
-/// the environment names) and one that names no step are exit 2, naming the
-/// five steps; a step runs the checks with the gate, the step and the
-/// filters the command line gives, and no lab knob.
+/// test-cursor checks STEP and SINCE before cargo runs: a missing STEP (also
+/// one only the environment names) and one that names no step are exit 2,
+/// naming the five steps; a missing or empty SINCE (also one only the
+/// environment names) is exit 2 too, naming SINCE=all; a step runs the
+/// checks with the gate, the step and the filters the command line gives,
+/// and no lab knob.
 #[test]
 fn test_cursor_refuses_a_missing_or_unknown_step_before_cargo() {
     let t = tempfile::tempdir().unwrap();
@@ -5412,9 +5467,22 @@ fn test_cursor_refuses_a_missing_or_unknown_step_before_cargo() {
     let (out, calls) = run(&["test-cursor", "STEP=t8_6", "SINCE=2026-10-14T09:00:00Z", "WORKSPACE=/tmp/a b"], &[("AI_ENV_BRIDGE_LAB_TRANSCRIPT", "skip"), ("AI_ENV_BRIDGE_LAB_FAKE_API", "/f.json")]);
     assert!(out.status.success(), "{}", all(&out));
     assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP=t8_6 SINCE=2026-10-14T09:00:00Z WORKSPACE=/tmp/a b] [LAB=]")]);
-    let (out, calls) = run(&["test-cursor", "STEP=t8_3"], &[("SINCE", "2026-10-14T09:00:00Z"), ("WORKSPACE", "/w")]);
+    // SINCE counts only on the command line (S9, L10): none, one only the environment names, and an empty one are
+    // all missing, before cargo.
+    let since = "test-cursor: SINCE is missing: take the step's start (date -u +%Y-%m-%dT%H:%M:%SZ) before the step in Cursor, or pass SINCE=all to read every row";
+    for (what, args, envs) in [
+        ("no SINCE", &["test-cursor", "STEP=t8_3"][..], &[][..]),
+        ("SINCE in the environment only", &["test-cursor", "STEP=t8_3"][..], &[("SINCE", "2026-10-14T09:00:00Z"), ("WORKSPACE", "/w")][..]),
+        ("an empty SINCE", &["test-cursor", "STEP=t8_3", "SINCE="][..], &[][..]),
+    ] {
+        let (out, calls) = run(args, envs);
+        assert_eq!(out.status.code(), Some(2), "{what}: {}", all(&out));
+        assert!(all(&out).contains(since), "{what}: {}", all(&out));
+        assert_eq!(calls, Vec::<String>::new(), "{what}: cargo ran");
+    }
+    let (out, calls) = run(&["test-cursor", "STEP=t8_3", "SINCE=all"], &[("WORKSPACE", "/w")]);
     assert!(out.status.success(), "{}", all(&out));
-    assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP=t8_3 SINCE=unset WORKSPACE=unset] [LAB=]")], "the environment's filters never reach the checks");
+    assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP=t8_3 SINCE=all WORKSPACE=unset] [LAB=]")], "the environment's WORKSPACE never reaches the checks");
 }
 
 /// The `ai-env` of the pair `make acceptance` runs (ACCEPT_BIN), a
@@ -5607,6 +5675,15 @@ fn acceptance_runs_each_step_and_negative_and_stops_at_the_first_that_fails() {
     let lone_dir = tempfile::tempdir().unwrap();
     let lone = lone_dir.path().canonicalize().unwrap().join("ai-env");
     std::fs::copy(bin(), &lone).unwrap();
+    // S9's negative (h), made to fail: the real ai-env for everything but `vm run`, which goes past its plan (a
+    // regression of [egress].require: a VM started), or refuses as it should after writing a VM's audit row.
+    let regressed = lone_dir.path().canonicalize().unwrap().join("regressed-ai-env");
+    script(&regressed, &format!("case \"${{1:-}} ${{2:-}}\" in \"vm run\") echo '{{\"id\":\"microvm-0123456789abcdef0\"}}'; exit 0 ;; esac\nexec '{}' \"$@\"", bin()));
+    let audited = lone_dir.path().canonicalize().unwrap().join("audited-ai-env");
+    script(
+        &audited,
+        &format!("case \"${{1:-}} ${{2:-}}\" in \"vm run\") echo \"{{\\\"v\\\":1,\\\"event\\\":\\\"vm_egress_internet\\\",\\\"pid\\\":$$,\\\"detail\\\":{{}}}}\" >> \"$AI_ENV_BRIDGE_DIR/audit.jsonl\"; echo 'ai-env: egress connector required (vpc egress asked for, or [egress].require=true) and none configured' >&2; exit 9 ;; esac\nexec '{}' \"$@\"", bin()),
+    );
     // What the recipe plants (it puts the value together with printf).
     let key = format!("{}{}", "AKIA", "Q7ZT".repeat(4));
     #[derive(Clone, Copy, PartialEq)]
@@ -5650,6 +5727,8 @@ fn acceptance_runs_each_step_and_negative_and_stops_at_the_first_that_fails() {
         ("(d) an unseal", World::Green, session("egress-required", "unseal"), Some(("egress-required", "1 credential_unseal audit row(s) of pid "))),
         ("(d) no precheck row", World::Green, session("egress-required", "refuse"), Some(("egress-required", "shows no refusal at the precheck before any Touch ID: none"))),
         ("(d) the stand-in ran", World::Green, session("egress-required", "ran"), Some(("egress-required", "the stand-in claude ran: a session under the roots in remote mode runs no Mac binary"))),
+        ("(h) vm run past its plan", World::Green, vec![("FAKE_ACCEPT_REAL", regressed.display().to_string())], Some(("egress-required", "(h) ai-env vm run without --egress under [egress].require = true exited 0, not 9 naming the egress connector: {\"id\":\"microvm-0123456789abcdef0\"}"))),
+        ("(h) a VM's audit row", World::Green, vec![("FAKE_ACCEPT_REAL", audited.display().to_string())], Some(("egress-required", "(h) 1 vm audit row(s) of pid "))),
         ("(e) the switch ignored", World::Green, session("kill-switch", "remote"), Some(("kill-switch", "ai-env-claude exited 5 saying: ai-env-claude: "))),
         ("(e) not exec'd in place", World::Green, session("kill-switch", "child"), Some(("kill-switch", "the stand-in claude did not run in place of ai-env-claude"))),
         ("(e) a census row", World::Green, session("kill-switch", "passthrough"), Some(("kill-switch", "a census row of pid"))),
@@ -5714,8 +5793,11 @@ fn acceptance_runs_each_step_and_negative_and_stops_at_the_first_that_fails() {
                 assert!(out.status.success(), "{what}: {text}");
                 let at: Vec<usize> = ACCEPT_STEPS.iter().map(|step| text.find(&format!("acceptance: {step}: ok (")).unwrap_or_else(|| panic!("{what}: no ok line for {step}: {text}"))).collect();
                 assert!(at.windows(2).all(|p| p[0] < p[1]), "{what}: the steps in order: {text}");
-                assert!(text.ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; target/s8/acceptance removed\n"), "{what}: {text}");
+                assert!(text.ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (h), the smoke; target/s8/acceptance removed\n"), "{what}: {text}");
                 assert_eq!(calls[calls.len() - 2..], ["ai-env vm smoke --max-duration 900 --json", "ai-env vm list --json"], "{what}: the two Touch IDs last: {calls:#?}");
+                // (h): the real vm run, refused by its plan before any Touch ID or AWS call (no backend, no VM row).
+                assert!(calls.iter().any(|c| c == "ai-env vm run") && text.contains("(h) [egress].require = true: vm run without --egress refused by its plan, exit 9 before any Touch ID or AWS call)"), "{what}: {text}");
+                assert!(!read(&a.root().join("bridge/audit.jsonl")).contains("\"event\":\"vm_"), "{what}: (h)'s vm run wrote a VM's audit row");
                 // Its identity probe, in the region it pins. Not the whole line: S8 operators' doctor (W2a) runs its
                 // operator identity row under the runner's marker (the steps run under ai-env as ops) through
                 // bridge::awscli, which may add its pinned --endpoint-url.
@@ -5785,7 +5867,7 @@ fn acceptance_refuses_make_i_before_any_step() {
     let a = Acceptance::new(&lone);
     let out = a.run(&[], &a.pair.display().to_string(), &[]);
     assert!(a.pair.display().to_string().contains('i'));
-    assert!(out.status.success() && all(&out).ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (g), the smoke; target/s8/acceptance removed\n"), "{}", all(&out));
+    assert!(out.status.success() && all(&out).ends_with("acceptance: ok: doctor, versions, creds, the negatives (a) to (h), the smoke; target/s8/acceptance removed\n"), "{}", all(&out));
 }
 
 // ---- S8: the scrub lists ----
@@ -5916,5 +5998,182 @@ fn make_n_perf_wrapper_adds_the_prewarm_run_only_with_prewarm_1_on_the_command_l
     let prewarm = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/prewarm.rs"));
     let ignored = "#[ignore = \"perf measurement: make perf-wrapper PREWARM=1 (AI_ENV_PERF_TESTS=1, release)\"]\nfn t8_6_prewarm_auth_status_overhead_median_100_runs() {\n";
     assert!(prewarm.contains(ignored), "tests/prewarm.rs's perf test, which the overhead filter names, is no longer ignored as make perf-wrapper's");
+    assert_eq!(read(&log), "", "make -n ran a tool");
+}
+
+// ---- S9 (G7): claude-update's node_modules ------------------------------------------------------
+
+/// The steps' make of [`claude_update_checks_infra_node_modules_before_test_docker`]: each call logged; claude-pin
+/// writes the lock and test-docker the zip, its image.json and its stamp, as the real ones do; a deploy moves the
+/// stack outputs' claudeVersion to the version it deployed (FAKE_DEPLOYS).
+const CLAUDE_UPDATE_FAKE_MAKE: &str = r#"printf 'make %s\n' "$*" >> "$FAKE_AIENV_LOG"
+case " $* " in
+  *" claude-pin "*) for a in "$@"; do case "$a" in CLAUDE_VERSION=*) printf 'CLAUDE_VERSION=%s\nCLAUDE_PLATFORM=linux-arm64\n' "${a#CLAUDE_VERSION=}" > "$LOCK" ;; esac; done ;;
+  *" test-docker "*) v=$(sed -n 's/^CLAUDE_VERSION=//p' "$LOCK"); mkdir -p "$IMAGE_OUT"; printf 'a zip of %s' "$v" > "$IMAGE_OUT/image.zip"; printf '{"claudeVersion":"%s"}\n' "$v" > "$IMAGE_OUT/image.json"; shasum -a 256 "$IMAGE_OUT/image.zip" | cut -d' ' -f1 > "$IMAGE_OUT/test-docker.ok" ;;
+  *" deploy "*) sed -i '' "s/\"claudeVersion\":\"[^\"]*\"/\"claudeVersion\":\"$FAKE_DEPLOYS\"/" "$FAKE_PULUMI_OUTPUTS" ;;
+esac
+exit 0"#;
+
+/// S9 (S8's B9: claude-update ran make test-docker, then make deploy failed for want of infra/node_modules): with a
+/// deploy due, claude-update checks the Pulumi program's `infra/node_modules` among its preconditions, before the
+/// pin, make test-docker or any runner: without its tsc (make deploy's check-policies and plan check compile with it)
+/// it refuses naming make infra-install, nothing run, nothing changed; with it, the run goes on to its first step. With
+/// nothing to deploy it asks for none. ops.sh runs from a copy under the test's tempdir, so the `infra/` it takes for
+/// the program's is the test's.
+#[test]
+fn claude_update_checks_infra_node_modules_before_test_docker() {
+    let refusal = "/node_modules is missing (make deploy's check-policies and plan check run its tsc): make infra-install, then make claude-update: nothing changed";
+    for (what, bundle, modules, refused) in [("a deploy due, no node_modules", "2.1.288", false, true), ("a deploy due, node_modules installed", "2.1.288", true, false), ("nothing to deploy, no node_modules", "2.1.287", false, false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bin = s5_bin(t);
+        script(&bin.join("make"), CLAUDE_UPDATE_FAKE_MAKE);
+        script(&bin.join("docker"), "exit 0");
+        script(&bin.join("curl"), "exit 6");
+        std::fs::create_dir_all(t.join("image")).unwrap();
+        let lock = "CLAUDE_VERSION=2.1.287\nCLAUDE_PLATFORM=linux-arm64\n";
+        std::fs::write(t.join("image/claude.lock"), lock).unwrap();
+        let mut o = outputs();
+        o["claudeVersion"] = json!("2.1.287");
+        o["latestActiveImageVersion"] = json!("3.0");
+        o["bucket"] = json!("ai-env-artifacts-0000000");
+        o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
+        write_outputs(t, &with_operators(o));
+        std::fs::create_dir_all(t.join("aws/image")).unwrap();
+        std::fs::write(t.join("aws/image/state"), "UPDATED").unwrap();
+        std::fs::write(t.join("aws/image/active"), "3.0").unwrap();
+        std::fs::write(t.join("aws/image/uri"), "s3://ai-env-artifacts-0000000/ai-env/image-0123456789abcdef.zip").unwrap();
+        seed_proxy(t, "running");
+        let ops = t.join("infra/scripts/ops.sh");
+        std::fs::create_dir_all(ops.parent().unwrap()).unwrap();
+        std::fs::copy(Path::new(REPO).join("infra/scripts/ops.sh"), &ops).unwrap();
+        if modules {
+            script(&t.join("infra/node_modules/.bin/tsc"), "exit 0");
+        }
+        let mut cmd = Command::new("/bin/bash");
+        isolate(&mut cmd, t).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        s5_env(&mut cmd, t);
+        let out = cmd
+            .arg(&ops)
+            .arg("claude-update")
+            .current_dir(t)
+            .env("REGION", "eu-central-1")
+            .env("IMAGE_NAME", "ai-env-agent")
+            .env("IMAGE_OUT", t.join("out"))
+            .env("STACK", "dev")
+            .env("IMAGE_WAIT_TIMEOUT", "5")
+            .env("IMAGE_WAIT_POLL", "1")
+            .env("VERSIONS_WARN", "40")
+            .env("VERSIONS_QUOTA", "50")
+            .env("CONNECTOR_WAIT_TIMEOUT", "5")
+            .env("CONNECTOR_WAIT_POLL", "1")
+            .env("AI_ENV_CLI", bin.join("ai-env-stand-in"))
+            .env("LOCK", "image/claude.lock")
+            .env("CLAUDE_RELEASES", "https://downloads.invalid/claude-code-releases")
+            .env("CLAUDE_GPG_FPR", "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
+            .env("FAKE_AIENV_BUNDLE", bundle)
+            .env("FAKE_DEPLOYS", bundle)
+            .env("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")
+            .env("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")
+            .bounded();
+        let text = all(&out);
+        let c = calls(t);
+        assert_eq!(text.contains(refusal), refused, "{what}: {text}");
+        if refused {
+            assert_eq!(out.status.code(), Some(1), "{what}: {text}");
+            assert!(text.contains(&format!("claude-update: {}{refusal}", t.join("infra").display())) || text.contains("/infra/node_modules is missing ("), "{what}: the refusal names the program's directory: {text}");
+            assert!(c.iter().all(|l| !l.starts_with("make ") && !l.starts_with("as ") && !l.starts_with("run ")), "{what}: nothing ran (no pin, no test-docker, no runner): {c:#?}");
+            assert_eq!(std::fs::read_to_string(t.join("image/claude.lock")).unwrap(), lock, "{what}: the lock untouched");
+            assert!(!t.join("out/claude-update.pending").exists(), "{what}: no deploy began");
+        } else if modules {
+            assert!(text.contains("claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288") && c.iter().any(|l| l.starts_with("make --no-print-directory claude-pin CLAUDE_VERSION=2.1.288")), "{what}: past the check, its first step: {text}");
+        } else {
+            assert!(out.status.success() && text.contains("is pinned and deployed"), "{what}: {text}");
+        }
+    }
+}
+
+/// S9 phase 4 (the surviving mutant M38): the S3 gateway endpoint's policy
+/// as `infra/policies.ts` builds it (`s3EndpointPolicy`, printed by
+/// `scripts/print-policies.ts`, compiled with the infra's own tsc as
+/// check-policies.sh compiles it and run with node, offline) is contracts
+/// §7.3's for the example account: its canonical hash, in Rust
+/// (`canonical_policy_sha256`) and in TypeScript (`canonicalPolicySha256`),
+/// is the one `bridge::infra`'s test pins for §7.3's literal. Nothing else
+/// holds policies.ts's document to it offline: the egress guard, the plan
+/// check and the stack output compare policies.ts with itself, and
+/// check-policies' simulation that our bucket outside `v1/` is denied needs
+/// AWS. A widened resource (`<bucket>/*`), an action or a condition more or
+/// less, fails here.
+#[test]
+fn the_endpoint_policy_of_policies_ts_is_the_pinned_one() {
+    const PINNED: &str = "0e80ca5ab63a4465e3921f4247d90b35f8c941fdd124370bad974db63765ec27";
+    let infra = Path::new(REPO).join("infra");
+    let tsc = infra.join("node_modules/.bin/tsc");
+    assert!(tsc.exists(), "{} is missing: make infra-install", tsc.display());
+    let out = tempfile::tempdir().unwrap();
+    let o = Command::new(&tsc)
+        .args(["--strict", "--target", "es2022", "--module", "commonjs", "--moduleResolution", "node", "--types", "node", "--rootDir", ".", "--outDir"])
+        .arg(out.path())
+        .arg("scripts/print-policies.ts")
+        .current_dir(&infra)
+        .bounded();
+    assert!(o.status.success(), "tsc: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let o = Command::new("node")
+        .arg(out.path().join("scripts/print-policies.js"))
+        .args(["--account-id", "123456789012", "--image-config", "image-config.json", "--egress-config", "egress-config.json", "--name", "s3-endpoint"])
+        .current_dir(&infra)
+        .bounded();
+    assert!(o.status.success(), "print-policies: {}", String::from_utf8_lossy(&o.stderr));
+    let doc = String::from_utf8(o.stdout).unwrap();
+    assert_eq!(ai_env_cli::bridge::infra::canonical_policy_sha256(doc.trim()).unwrap(), PINNED, "policies.ts's endpoint policy is not §7.3's: {doc}");
+    let policies = out.path().join("policies.js");
+    let script = format!(
+        "const p = require({:?}); process.stdout.write(p.canonicalPolicySha256(p.s3EndpointPolicy({{ accountId: '123456789012', transcriptsBucket: p.transcriptsBucketName('123456789012') }})));",
+        policies.display().to_string()
+    );
+    let o = Command::new("node").args(["-e", &script]).bounded();
+    assert_eq!(String::from_utf8_lossy(&o.stdout), PINNED, "TypeScript's own hash of it: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+// ---- S9: test-aws SLOW=1, the code token's minutes ----
+
+/// `make -n test-aws SLOW=1` (S9's re-mint after expiry, live_smart_http_remints_after_expiry): the keyless compile
+/// (D2) sets no lab knob, and the run sets `AI_ENV_AWS_SLOW=1` and `AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2` after
+/// `$(LAB_UNSET)`, as operands of its `env` after the `-u` list: env sets them once every knob is unset, so the test
+/// process gets the minutes again (the commands and chats it runs drop every knob). Without SLOW=1 on the command
+/// line (in the environment it is ignored) no line sets a lab knob or the slow switch. Nothing runs.
+#[test]
+fn make_n_test_aws_slow_1_sets_the_code_token_minutes_again_after_lab_unset() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make(t.path(), &bin, &["-n", "test-aws"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws";
+    let compile = format!("{NO_KEY} {LAB_UNSET} {cargo} --no-run");
+    let tail = format!("{cargo} -- --ignored --test-threads=1 --nocapture");
+    let run_line = |text: &str| text.lines().find(|l| l.ends_with(&tail)).unwrap_or_else(|| panic!("no test run in the dry run: {text}")).to_string();
+    // A knob set, not one an `-u` names: an `AI_ENV_BRIDGE_LAB_*=` word.
+    let knobs_set = |text: &str| text.split_whitespace().filter(|w| w.starts_with("AI_ENV_BRIDGE_LAB_") && w.contains('=')).map(str::to_string).collect::<Vec<_>>();
+
+    let slow = dry(&["SLOW=1"], &[]);
+    assert_eq!(slow.lines().next(), Some(compile.as_str()), "the keyless compile first, no knob set: {slow}");
+    // The `$(if …)`s that expand to nothing (S3, CRED) leave their spaces.
+    assert_eq!(
+        run_line(&slow),
+        format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2  {tail}"),
+        "env unsets every knob, then sets the minutes again for the test process"
+    );
+    assert_eq!(knobs_set(&slow), ["AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2"], "the minutes alone, on the run's line: {slow}");
+    for (what, plain) in [("no SLOW", dry(&[], &[])), ("SLOW=1 in the environment, which is ignored", dry(&[], &[("SLOW", "1")]))] {
+        assert_eq!(plain.lines().next(), Some(compile.as_str()), "{what}: {plain}");
+        assert_eq!(run_line(&plain), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1   {tail}"), "{what}");
+        assert!(knobs_set(&plain).is_empty() && !plain.contains("AI_ENV_AWS_SLOW"), "{what}: a lab knob or the slow switch set: {plain}");
+    }
     assert_eq!(read(&log), "", "make -n ran a tool");
 }

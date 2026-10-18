@@ -101,6 +101,12 @@ pub struct SessionRow {
     pub seeded_head: Option<String>,
     pub last_wip_fetch: Option<String>,
     pub vms: Vec<toml::Value>,
+    /// S9: `"s3"` once the session's transcript is kept in S3 (never on this Mac).
+    pub transcript_home: Option<String>,
+    /// S9: `"vm"` or `"mac"`, where the chat began (`s3::manifest::origin_of`).
+    pub origin: Option<String>,
+    /// S9: `<slug>/<sid>.jsonl`, the view's rel under the Mac's projects directory.
+    pub view: Option<String>,
 }
 
 /// What [`forget`] removed.
@@ -325,18 +331,8 @@ fn sort_rows(rows: &mut [SessionRow]) {
 /// active check could not run, so nothing is removed.
 pub fn forget(paths: &Paths, session_id: &str) -> Result<ForgetReport, BridgeError> {
     let row_path = path_for(paths, session_id)?;
-    match read(paths, session_id) {
-        Ok(Some(row)) if row.status == "active" && pid_alive(row.pid) => {
-            return Err(BridgeError::Config(format!("session {session_id} is still active (wrapper pid {}); close it first", row.pid)));
-        }
-        Ok(_) => {}
-        Err(e @ BridgeError::Config(_)) => tracing::warn!("session registry: forgetting an unreadable row: {e}"),
-        Err(e) => return Err(e),
-    }
+    forget_check(paths, session_id)?;
     let scratch = paths.scratch().join(session_id);
-    if let Some(owner) = scratch_owner(&scratch).filter(|pid| pid_alive(*pid)) {
-        return Err(BridgeError::Config(format!("the scratch config dir of session {session_id} is in use by wrapper pid {owner}; close that session first")));
-    }
     let removed_scratch = remove_real_dir(&scratch)?;
     // `quarantine` itself a real directory too: a symlinked one would lead every path below it elsewhere.
     let removed_quarantine = match std::fs::symlink_metadata(paths.quarantine()) {
@@ -350,6 +346,29 @@ pub fn forget(paths: &Paths, session_id: &str) -> Result<ForgetReport, BridgeErr
     };
     let removed_row = remove_if_present(&row_path)?;
     Ok(ForgetReport { removed_row, removed_scratch, removed_quarantine })
+}
+
+/// [`forget`]'s two refusals, before anything is removed (S9: `session
+/// forget --purge` runs them before its S3 half, so a live session's
+/// transcript is never deleted): a non-uuid; an `active` row whose wrapper
+/// pid is alive; a scratch dir whose owner is alive (`Config`, exit 1). A
+/// row that does not parse is warned about and passes (a corrupt row cannot
+/// belong to a live wrapper); an I/O error reading it is returned.
+pub fn forget_check(paths: &Paths, session_id: &str) -> Result<(), BridgeError> {
+    path_for(paths, session_id)?;
+    match read(paths, session_id) {
+        Ok(Some(row)) if row.status == "active" && pid_alive(row.pid) => {
+            return Err(BridgeError::Config(format!("session {session_id} is still active (wrapper pid {}); close it first", row.pid)));
+        }
+        Ok(_) => {}
+        Err(e @ BridgeError::Config(_)) => tracing::warn!("session registry: forgetting an unreadable row: {e}"),
+        Err(e) => return Err(e),
+    }
+    let scratch = paths.scratch().join(session_id);
+    if let Some(owner) = scratch_owner(&scratch).filter(|pid| pid_alive(*pid)) {
+        return Err(BridgeError::Config(format!("the scratch config dir of session {session_id} is in use by wrapper pid {owner}; close that session first")));
+    }
+    Ok(())
 }
 
 /// The file a pump writes into a scratch config dir while its child uses it
@@ -479,19 +498,31 @@ pub fn cmd_show(uuid: &str, json: bool) -> crate::errors::Result<()> {
     Ok(())
 }
 
-/// `ai-env session forget UUID`: delete the row, the derived scratch dir and
-/// the session's quarantine (refused while the session is active). A
-/// non-uuid is a usage error (exit 2); nothing to remove exits 1 with `no
-/// session <uuid>`.
-pub fn cmd_forget(uuid: &str) -> crate::errors::Result<()> {
+/// `ai-env session forget UUID [--purge]`: delete the row, the derived
+/// scratch dir and the session's quarantine (refused while the session is
+/// active); with `--purge` (S9) first its S3 transcript, its manifest,
+/// `state/transcripts/<sid>/` and the view (`s3::forget_purge`), only once
+/// [`forget_check`] passed. A non-uuid is a usage error (exit 2); nothing to
+/// remove exits 1 with `no session <uuid>`.
+pub fn cmd_forget(store: &crate::store::Keystore, uuid: &str, purge: bool) -> crate::errors::Result<()> {
     if !is_uuid(uuid) {
         return Err(CliError::Usage(format!("not a session id: {uuid}")));
     }
     let paths = Paths::resolve()?;
-    let Some(what) = forget_suffix(forget(&paths, uuid)?) else {
-        bail!("no session {uuid}");
-    };
-    outln!("forgot {uuid}{what}");
+    forget_session(store, &paths, uuid, purge)
+}
+
+/// [`cmd_forget`] once the id and the paths are in hand: the checks, then the purge (with `purge`), then [`forget`].
+fn forget_session(store: &crate::store::Keystore, paths: &Paths, uuid: &str, purge: bool) -> crate::errors::Result<()> {
+    forget_check(paths, uuid)?;
+    let purged = if purge { crate::bridge::s3::forget_purge(store, paths, uuid)? } else { false };
+    let what = forget_suffix(forget(paths, uuid)?);
+    match (what, purged) {
+        (Some(what), true) => outln!("forgot {uuid}{what} and purged its transcript"),
+        (Some(what), false) => outln!("forgot {uuid}{what}"),
+        (None, true) => outln!("forgot {uuid} (its transcript purged)"),
+        (None, false) => bail!("no session {uuid}"),
+    }
     Ok(())
 }
 
@@ -529,8 +560,10 @@ pub const WRAPPER_EXE: &str = "ai-env-claude";
 
 /// What the system says of a live `pid`: its executable's file name and
 /// when it started (unix seconds); `None` when it is gone or cannot be read.
+/// S9: also how the census tells a live Cursor window's extension host
+/// (`census::running_extensions`).
 #[cfg(target_vendor = "apple")]
-fn process_identity(pid: u32) -> Option<(String, u64)> {
+pub(crate) fn process_identity(pid: u32) -> Option<(String, u64)> {
     use std::os::unix::ffi::OsStringExt;
     let pid = libc::c_int::try_from(pid).ok().filter(|p| *p > 0)?;
     let mut buf = vec![0u8; usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).ok()?];
@@ -554,7 +587,7 @@ fn process_identity(pid: u32) -> Option<(String, u64)> {
 /// What the system says of a live `pid` (see the Mac's): `/proc/<pid>/exe`'s
 /// file name, and its start from `/proc/<pid>/stat` and the boot time.
 #[cfg(target_os = "linux")]
-fn process_identity(pid: u32) -> Option<(String, u64)> {
+pub(crate) fn process_identity(pid: u32) -> Option<(String, u64)> {
     let name = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?.file_name()?.to_string_lossy().into_owned();
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Past the command's closing parenthesis the fields start at the third; the start time is the 22nd.
@@ -567,7 +600,7 @@ fn process_identity(pid: u32) -> Option<(String, u64)> {
 
 /// No way to read a process here: nothing is ever confirmed.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn process_identity(_pid: u32) -> Option<(String, u64)> {
+pub(crate) fn process_identity(_pid: u32) -> Option<(String, u64)> {
     None
 }
 
@@ -597,13 +630,27 @@ fn judge_wrapper(row: &SessionRow, pid: u32, identity: Option<(String, u64)>) ->
     Ok(())
 }
 
+/// The `drop_transport` audit row of a drop signalled to `pid`, the wrapper
+/// of session `uuid` (S9, `remote::audit_event::DROP_TRANSPORT`): `session`
+/// and `wrapper_pid`, so t8_6 ties its evidence (the wrapper's end row, its
+/// `agent_reconnect` rows) to this drop. A row that cannot be written is a
+/// warning: the drop has gone out.
+fn audit_drop_transport(paths: &Paths, uuid: &str, pid: u32) {
+    use crate::bridge::audit;
+    let row = audit::AuditRow::new(crate::bridge::remote::audit_event::DROP_TRANSPORT, Some(uuid), audit::detail(&[("session", uuid.to_string()), ("wrapper_pid", pid.to_string())]));
+    if let Err(e) = audit::append(&paths.audit(), &row) {
+        eprintln!("ai-env: warning: audit row drop_transport not written: {e}");
+    }
+}
+
 /// `ai-env session drop-transport UUID` (S8 T8.6): the owning wrapper closes
 /// its session's socket from its side, and the session reattaches by its
 /// reconnect rules (the row `detached`, then `active` again), no line lost
 /// or doubled: [`drop_transport_target`], [`confirm_wrapper`], then
-/// [`DROP_TRANSPORT_SIGNAL`] to that wrapper. A non-uuid is a usage error
-/// (exit 2); an unknown session, or one that is not an active remote
-/// session of a live wrapper, exits 1 naming why.
+/// [`DROP_TRANSPORT_SIGNAL`] to that wrapper, then (S9) its `drop_transport`
+/// audit row ([`audit_drop_transport`]). A non-uuid is a usage error (exit
+/// 2); an unknown session, or one that is not an active remote session of a
+/// live wrapper, exits 1 naming why, and audits nothing.
 pub fn cmd_drop_transport(uuid: &str) -> crate::errors::Result<()> {
     if !is_uuid(uuid) {
         return Err(CliError::Usage(format!("not a session id: {uuid}")));
@@ -619,8 +666,32 @@ pub fn cmd_drop_transport(uuid: &str) -> crate::errors::Result<()> {
     if unsafe { libc::kill(target, DROP_TRANSPORT_SIGNAL) } != 0 {
         bail!("session {uuid}'s wrapper (pid {pid}) could not be signalled: {}", std::io::Error::last_os_error());
     }
+    audit_drop_transport(&paths, uuid, pid);
     outln!("session {uuid}: its wrapper (pid {pid}) drops the transport and reattaches (session show {uuid}: detached, then active)");
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod drop_transport_tests {
+    use super::*;
+
+    /// S9: a drop signalled to a session's wrapper is audited as
+    /// `drop_transport` with the session and the wrapper's pid, the row t8_6
+    /// chains to that wrapper's end row and reconnects; the row's own `pid`
+    /// is the command's, and the session id is the row's too.
+    #[test]
+    fn a_drop_is_audited_with_the_session_and_its_wrappers_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        audit_drop_transport(&paths, sid, 4242);
+        let rows = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0]["event"].as_str(), rows[0]["session_id"].as_str()), (Some(crate::bridge::remote::audit_event::DROP_TRANSPORT), Some(sid)));
+        assert_eq!(rows[0]["detail"], serde_json::json!({"session": sid, "wrapper_pid": "4242"}));
+        assert_eq!(rows[0]["pid"], std::process::id(), "the writing process: the command's, not the wrapper's");
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +762,9 @@ mod tests {
             seeded_head: Some("head-1".into()),
             last_wip_fetch: Some("2026-09-25T10:01:00Z".into()),
             vms: Vec::new(),
+            transcript_home: Some("s3".into()),
+            origin: Some("vm".into()),
+            view: Some(format!("-Users-mike-Documents-DeFi-ai-env/{sid}.jsonl")),
         }
     }
 
@@ -1056,6 +1130,27 @@ mod tests {
         assert!(started > 0 && started <= time::unix_now(), "{started}");
         assert_eq!(process_identity(i32::MAX as u32), None);
         assert_eq!(process_identity(0), None);
+    }
+
+    /// S9 (§4.4): `--purge` runs only once `forget`'s own checks passed: an
+    /// active row is refused (exit 1) before the purge, which would delete
+    /// the live session's transcript; without `--purge` a closed row goes
+    /// as in S8. (The purge itself is G4's, tested in `tests/s3_store.rs`.)
+    #[test]
+    fn forget_purge_checks_the_session_before_the_purge() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        let store = crate::store::Keystore::resolve(Some(d.path().join("keys"))).unwrap();
+        let live = SessionRow { status: "active".into(), mode: "remote".into(), pid: std::process::id(), ..row(1, "") };
+        write(&p, &live).unwrap();
+        let e = forget_session(&store, &p, &id(1), true).unwrap_err();
+        assert_eq!(e.exit_code(), 1);
+        assert!(e.to_string().contains("is still active") && !e.to_string().contains("not built"), "the check first: {e}");
+        assert_eq!(read(&p, &id(1)).unwrap(), Some(live), "nothing removed");
+        write(&p, &row(2, "")).unwrap();
+        forget_session(&store, &p, &id(2), false).unwrap();
+        assert_eq!(read(&p, &id(2)).unwrap(), None, "without --purge: S8's forget");
+        assert!(forget_session(&store, &p, &id(2), false).unwrap_err().to_string().contains("no session"));
     }
 
     #[test]

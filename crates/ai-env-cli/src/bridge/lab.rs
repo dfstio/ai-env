@@ -120,9 +120,18 @@ pub fn pump_knobs() -> PumpKnobs {
 
 // ---- S4: `ai-env vm` / `lab` knobs ---------------------------------------------------
 
-/// The S4 knob names (and S6's agent address, S7's unseal budget), for the
-/// banner and the test harnesses' scrub lists.
-pub const VM_KNOBS: [&str; 5] = ["AI_ENV_BRIDGE_LAB_FAKE_API", "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "AI_ENV_BRIDGE_LAB_BACKOFF_MS", "AI_ENV_BRIDGE_LAB_AGENT_ADDR", crate::bridge::pump::UNSEAL_TIMEOUT_KNOB];
+/// The S4 knob names (and S6's agent address, S7's unseal budget, S9's
+/// loopback S3 and code-token minutes), for the banner and the test
+/// harnesses' scrub lists.
+pub const VM_KNOBS: [&str; 7] = [
+    "AI_ENV_BRIDGE_LAB_FAKE_API",
+    "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
+    "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
+    "AI_ENV_BRIDGE_LAB_AGENT_ADDR",
+    crate::bridge::pump::UNSEAL_TIMEOUT_KNOB,
+    "AI_ENV_BRIDGE_LAB_S3_ADDR",
+    "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
+];
 
 /// The S4 knobs `ai-env vm` and `ai-env lab` honour (debug builds only).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -149,6 +158,15 @@ pub struct VmKnobs {
     /// test reaches its deadline in a second or two. Whole seconds read best
     /// (the deadline and the countdown say seconds).
     pub unseal_timeout: Option<Duration>,
+    /// `AI_ENV_BRIDGE_LAB_S3_ADDR=127.0.0.1:<port>` (S9): the transcript
+    /// store is the tests' loopback fake S3 at this address (path-style,
+    /// plain http, the lab's bucket and key) instead of the stack's bucket.
+    /// Honoured only together with the fake API; see [`VmKnobs::s3_addr`].
+    pub s3_addr: Option<String>,
+    /// `AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=<n>` (S9): a 9418 token's
+    /// minutes for `dataplane::MintingTokens` (the live re-mint test), 1 to
+    /// 15; honoured without the fake API. See [`VmKnobs::code_token_minutes`].
+    pub code_token_minutes: Option<u16>,
 }
 
 impl VmKnobs {
@@ -173,6 +191,12 @@ impl VmKnobs {
         if self.unseal_timeout.is_some() {
             out.push(VM_KNOBS[4]);
         }
+        if self.s3_addr.is_some() {
+            out.push(VM_KNOBS[5]);
+        }
+        if self.code_token_minutes.is_some() {
+            out.push(VM_KNOBS[6]);
+        }
         out
     }
 
@@ -190,6 +214,28 @@ impl VmKnobs {
             Ok(a) if a.ip().is_loopback() && a.port() != 0 => Ok(Some(a)),
             _ => Err(format!("{}={raw:?}: expected a loopback ip:port", VM_KNOBS[3])),
         }
+    }
+
+    /// The validated loopback S3 address (S9), as [`VmKnobs::agent_addr`]:
+    /// `Ok(None)` when unset; an error when set without the fake API or when
+    /// not a loopback `ip:port` with a port.
+    pub fn s3_addr(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        let Some(raw) = &self.s3_addr else {
+            return Ok(None);
+        };
+        if self.fake_api.is_none() {
+            return Err(format!("{} needs {} (it never applies to the real service)", VM_KNOBS[5], VM_KNOBS[0]));
+        }
+        match raw.trim().parse::<std::net::SocketAddr>() {
+            Ok(a) if a.ip().is_loopback() && a.port() != 0 => Ok(Some(a)),
+            _ => Err(format!("{}={raw:?}: expected a loopback ip:port", VM_KNOBS[5])),
+        }
+    }
+
+    /// A 9418 token's minutes (S9): the knob's value from 1 to 15, else none.
+    #[must_use]
+    pub fn code_token_minutes(&self) -> Option<u16> {
+        self.code_token_minutes.filter(|m| (1..=15).contains(m))
     }
 
     /// Is the platform emulated: the fake API with a valid agent address, so
@@ -215,6 +261,8 @@ pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: 
         backoff_ms: backoff_ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| *ms > 0),
         agent_addr: None,
         unseal_timeout: None,
+        s3_addr: None,
+        code_token_minutes: None,
     }
 }
 
@@ -226,6 +274,8 @@ pub fn vm_knobs() -> VmKnobs {
     VmKnobs {
         agent_addr: get(VM_KNOBS[3]).filter(|v| !v.trim().is_empty()),
         unseal_timeout: crate::bridge::pump::parse_ms_knob(get(VM_KNOBS[4]).as_deref()),
+        s3_addr: get(VM_KNOBS[5]).filter(|v| !v.trim().is_empty()),
+        code_token_minutes: get(VM_KNOBS[6]).and_then(|v| v.trim().parse::<u16>().ok()),
         ..parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref())
     }
 }
@@ -327,6 +377,26 @@ mod tests {
         assert!(!knobs(false, Some("127.0.0.1:18080")).emulated_platform(), "the address alone is never the real service's");
         assert!(!knobs(true, Some("10.0.0.5:18080")).emulated_platform(), "not loopback");
         assert!(!VmKnobs::default().emulated_platform(), "release builds: every knob off");
+    }
+
+    /// S9's two knobs: the loopback S3 as the agent address (the fake API
+    /// and loopback only), the code token's minutes from 1 to 15 (without
+    /// the fake API); both announced; neither set by `parse_vm_knobs`.
+    #[test]
+    fn the_s9_knobs_need_their_conditions_and_are_announced() {
+        assert_eq!((VM_KNOBS[5], VM_KNOBS[6]), ("AI_ENV_BRIDGE_LAB_S3_ADDR", "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES"));
+        let s3 = |fake: bool, addr: &str| VmKnobs { fake_api: fake.then(|| std::path::PathBuf::from("/f.json")), s3_addr: Some(addr.to_string()), ..VmKnobs::default() };
+        assert_eq!(VmKnobs::default().s3_addr(), Ok(None));
+        assert_eq!(s3(true, "127.0.0.1:19000").s3_addr(), Ok(Some("127.0.0.1:19000".parse().unwrap())));
+        assert!(s3(false, "127.0.0.1:19000").s3_addr().unwrap_err().contains("needs AI_ENV_BRIDGE_LAB_FAKE_API"));
+        for bad in ["10.0.0.5:19000", "127.0.0.1", "127.0.0.1:0", "s3.amazonaws.com:443"] {
+            assert!(s3(true, bad).s3_addr().is_err(), "{bad}");
+        }
+        assert_eq!(s3(true, "127.0.0.1:1").active(), vec![VM_KNOBS[0], VM_KNOBS[5]]);
+        let minutes = |m: u16| VmKnobs { code_token_minutes: Some(m), ..VmKnobs::default() }.code_token_minutes();
+        assert_eq!((minutes(1), minutes(15), minutes(0), minutes(16)), (Some(1), Some(15), None, None));
+        assert_eq!(VmKnobs { code_token_minutes: Some(2), ..VmKnobs::default() }.active(), vec![VM_KNOBS[6]], "honoured, and announced, without the fake API");
+        assert_eq!((parse_vm_knobs(None, None, None).s3_addr, parse_vm_knobs(None, None, None).code_token_minutes), (None, None), "set by vm_knobs alone");
     }
 
     #[cfg(debug_assertions)]

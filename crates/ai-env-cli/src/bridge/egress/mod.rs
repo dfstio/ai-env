@@ -615,6 +615,11 @@ pub struct VerifiedRecord {
     /// before the field (example.com asked, any platform reply passed),
     /// which the credential gate and `--if-needed` never honour.
     pub dns_rule: u32,
+    /// The egress check's rule the run passed by ([`EGRESS_RULE`]); 0 for
+    /// records written before the field (S9: no transcript store's cases),
+    /// which the credential gate and `--if-needed` never honour.
+    #[serde(default)]
+    pub egress_rule: u32,
     /// What the squid-log cross-check found.
     pub squid_log: String,
     /// The VM-independent network verification the check ran before
@@ -735,6 +740,13 @@ pub const DNS_PLATFORM_PREFIX: &str = "platform-dns:";
 /// asked and a platform reply passed whatever its status — evidence the
 /// gate cannot tell from the new, so it is never honoured.
 pub const DNS_RULE: u32 = 1;
+/// The egress check's rule a record passed by (`VerifiedRecord::egress_rule`,
+/// S9): 1, the transcript store's seven cases (`s3-own`, the fronting
+/// refusals, `s3-imds-role`, `proxy-s3-other-host`, `s3-direct`); 0 (no
+/// field) for every record written before S9: a pass that never showed our
+/// bucket confined, which the credential gate never honours (condition
+/// `egress_rule`, [`credential_precheck`]) and `--if-needed` checks again.
+pub const EGRESS_RULE: u32 = 1;
 
 /// Does `verdict` let credentials in? `no-dns` always; `platform-dns:` only
 /// followed by a non-empty list in which every entry parses, is a platform
@@ -939,8 +951,9 @@ impl GatePass {
 /// token would stop being a second factor); a passing `ai-env egress check` is
 /// recorded for the row's image, image version and that connector, no older
 /// than [`MAX_RECORD_AGE_S`], with complete facts and a known build; that record
-/// judged DNS by the current rule ([`DNS_RULE`]) and its verdict is accepted
-/// ([`dns_verdict_ok`] with `[egress].accept_platform_dns`); and `dns_path`, the
+/// judged DNS by the current rule ([`DNS_RULE`]), passed the current egress
+/// rule ([`EGRESS_RULE`]: S9's transcript store's cases ran) and its DNS
+/// verdict is accepted ([`dns_verdict_ok`] with `[egress].accept_platform_dns`); and `dns_path`, the
 /// newest dns-path verdict as [`newest_dns_path`] read it (the network-wide kill
 /// switch), is readable, recorded and accepted too.
 ///
@@ -955,6 +968,12 @@ pub fn credential_precheck(cfg: &BridgeConfig, row: &VmRow, verified: &EgressVer
         return Err(GateRefusal::new(
             "dns_rule",
             "the recorded `ai-env egress check` judged DNS by an earlier rule (example.com asked; a platform reply passed whatever its status): run `ai-env egress check`",
+        ));
+    }
+    if record.egress_rule < EGRESS_RULE {
+        return Err(GateRefusal::new(
+            "egress_rule",
+            "the recorded `ai-env egress check` passed by an earlier rule, before the transcript store's cases (our bucket allowed, fronting refused): run `ai-env egress check`",
         ));
     }
     let accepted = cfg.egress.accepted_resolvers();
@@ -1444,6 +1463,7 @@ mod tests {
             at: "2026-10-01T10:00:00Z".into(),
             dns: DNS_NONE.into(),
             dns_rule: DNS_RULE,
+            egress_rule: EGRESS_RULE,
             connector_facts: facts(),
             image_created_at: Some(1_790_000_000),
             ..VerifiedRecord::default()
@@ -1718,6 +1738,15 @@ mod tests {
         let mut old_rule = EgressVerified::default();
         old_rule.record(VerifiedRecord { dns_rule: 0, at: REC_AT.into(), ..rec("2.0", CONN) }, 100);
         assert_eq!(pre(&cfg, &row, &old_rule, &at(DNS_NONE), NOW).condition, "dns_rule");
+        // S9: a pass from before the transcript store's cases (a record without the field reads as rule 0) never
+        // counts, whatever its DNS; the current rule's does.
+        let mut pre_s9 = EgressVerified::default();
+        pre_s9.record(VerifiedRecord { egress_rule: 0, at: REC_AT.into(), ..rec("2.0", CONN) }, 100);
+        let r = pre(&cfg, &row, &pre_s9, &at(DNS_NONE), NOW);
+        assert!(r.condition == "egress_rule" && r.why.contains("transcript store's cases") && r.why.contains("run `ai-env egress check`"), "{r:?}");
+        assert_eq!(gate(&cfg, &row, &live, &pre_s9, &at(DNS_NONE)).condition, "egress_rule", "the gate's too");
+        assert_eq!(rec("2.0", CONN).egress_rule, EGRESS_RULE);
+        credential_precheck(&cfg, &row, &verified, &at(DNS_NONE), NOW).unwrap();
         let mut leaky = EgressVerified::default();
         leaky.record(VerifiedRecord { dns: "platform-dns:9.9.9.9".into(), at: REC_AT.into(), ..rec("2.0", CONN) }, 100);
         let r = pre(&cfg, &row, &leaky, &at(DNS_NONE), NOW);

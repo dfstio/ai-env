@@ -280,6 +280,13 @@ fn gc_hint(items: std::result::Result<Vec<gc::GcItem>, BridgeError>) {
 
 /// `ai-env vm …`.
 pub fn main(store: &Keystore, cmd: VmCmd) -> Result<()> {
+    main_with(store, cmd, None).map(drop)
+}
+
+/// [`main`]; and for `vm warm`, given `chat` (`session stage --warm`, S9
+/// R5-AWS-1), that chat restored from S3 into the VM the warm made ready, on
+/// the warm's own backend (no Touch ID of its own): what the restore did.
+pub(crate) fn main_with(store: &Keystore, cmd: VmCmd, chat: Option<crate::bridge::s3::stage::ChatRestore>) -> Result<Option<crate::bridge::s3::stage::WarmRestore>> {
     // S8: the prewarm the wrapper started is quiet (its notes go to the log) and audited as such; it records
     // itself in the warm lock it inherits on fd 3 until it ends.
     let _record = match &cmd {
@@ -294,10 +301,13 @@ pub fn main(store: &Keystore, cmd: VmCmd) -> Result<()> {
     crate::bridge::signals::note_dispositions();
     let ctx = Ctx::load()?;
     // Everything that can be refused without AWS is refused before the Touch ID.
-    let pre = Pre::check(&ctx, &cmd)?;
+    let mut pre = Pre::check(&ctx, &cmd)?;
+    if let Pre::Warm(w) = &mut pre {
+        w.chat = chat;
+    }
     // `vm warm --dry-run` (S8): the plan, said; no AWS call, no Touch ID.
     if let (VmCmd::Warm { dry_run: true, json, .. }, Pre::Warm(warm)) = (&cmd, &pre) {
-        return warm_dry_run(&ctx, warm, *json);
+        return warm_dry_run(&ctx, warm, *json).map(|()| None);
     }
     // Only `vm exec` knows that the setup-token's own prompt is one `vm warm` could have taken ahead of time.
     let token_prompt = matches!(&pre, Pre::Exec(plan) if plan.credential.as_ref().is_some_and(|c| c.file.is_none()));
@@ -328,7 +338,7 @@ pub fn main(store: &Keystore, cmd: VmCmd) -> Result<()> {
                 Backend::Fake(f) => warm(&ctx, std::sync::Arc::new(f.clone()), f, w, *json, *prewarm, supply).await,
             };
         }
-        with_backend!(&b, |api, ep| dispatch(&ctx, api, ep, cmd, pre, supply).await).map_err(|e| {
+        with_backend!(&b, |api, ep| dispatch(&ctx, api, ep, cmd, pre, supply).await).map(|()| None).map_err(|e| {
             if token_prompt && crate::bridge::unseal::is_deadline(&e) {
                 crate::bridge::creds::with_note(e, "nothing was started; `ai-env vm warm <workspace>` delivers the token to that workspace's VM ahead of time, so a command there needs no Touch ID for it")
             } else {
@@ -559,19 +569,21 @@ pub(crate) fn provisional_gate(ctx: &Ctx, plan: &run::RunPlan) -> Result<()> {
     } else {
         ""
     };
-    Err(BridgeError::Policy(format!("no credential for a vpc VM of image version {version}{whose}: {} (nothing was unsealed or started)", r.why)).into())
+    // The reason before the note on the version: the remote wrapper's line keeps 160 characters of this text.
+    Err(BridgeError::Policy(format!("no credential for a vpc VM of image version {version}: {}{whose} (nothing was unsealed or started)", r.why)).into())
 }
 
 /// How far `credential_precheck` got before it refused with `condition`, in
 /// its own order: no record for the version, then the record's time and
-/// age, then its DNS rule and verdict, then the newest dns-path verdict,
-/// which every version shares. What it judges before the record (the
-/// configuration, the row) is alike for every candidate.
+/// age, then its DNS rule, its egress rule (S9) and its DNS verdict, then the
+/// newest dns-path verdict, which every version shares. What it judges
+/// before the record (the configuration, the row) is alike for every
+/// candidate.
 fn precheck_stage(condition: &str) -> u8 {
     match condition {
         "no_record" => 0,
         "record_time" | "record_age" => 1,
-        "dns_rule" | "dns_record" => 2,
+        "dns_rule" | "egress_rule" | "dns_record" => 2,
         _ => 3,
     }
 }
@@ -582,7 +594,7 @@ fn smoke_flags(max_duration: u32, no_execution_role: bool, egress: Option<run::E
     run::RunFlags { max_duration_s: Some(max_duration), label: Some("smoke".into()), no_execution_role, egress, wait: true, purpose: "smoke", imply_internet: true, ..run::RunFlags::default() }
 }
 
-async fn dispatch<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, cmd: VmCmd, pre: Pre, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
+async fn dispatch<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, cmd: VmCmd, pre: Pre, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
     match (cmd, pre) {
         (VmCmd::Images { json, managed }, _) => images(ctx, api, json, managed).await,
         (VmCmd::Run { json, .. }, Pre::Run(plan)) => run_cmd(ctx, api, &plan, json).await,
@@ -757,6 +769,8 @@ struct Warm {
     cred: crate::bridge::agent::credential::CredentialPlan,
     seed: std::result::Result<crate::bridge::workspace::WorkspaceRef, String>,
     prepared: std::cell::Cell<Option<crate::bridge::workspace::PreparedSeed>>,
+    /// `session stage --warm`'s chat (S9), restored into the VM once warm ([`main_with`]).
+    chat: Option<crate::bridge::s3::stage::ChatRestore>,
 }
 
 /// `vm warm`'s prechecks (S7, S8), all before the Touch ID: the run plan;
@@ -781,7 +795,9 @@ fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool) -> Result<W
     };
     // A seed goes only to a VM that serves the workspace routes (L5).
     plan.workspace_cap = seed.is_ok();
-    Ok(Warm { plan, cred, seed, prepared: std::cell::Cell::new(prepared) })
+    // S9: and the transcript store's (a session's restore pulls its chat from S3 there).
+    plan.transcript_cap = seed.is_ok();
+    Ok(Warm { plan, cred, seed, prepared: std::cell::Cell::new(prepared), chat: None })
 }
 
 /// The workspace `vm warm` seeds (S8 §11): `workspace::resolve`'s. One the
@@ -955,8 +971,10 @@ impl Drop for WarmRecord {
 }
 
 /// `vm warm <workspace>` (S7, S8): the workspace's VM (started with vpc
-/// egress when it has none), its `/health` (which records the shim's caps),
-/// then, in parallel, the seed (S8: `workspace::ensure_workspace` with the
+/// egress when it has none), its `/health` (which records the shim's caps;
+/// S9: for a workspace the seed carries, one without `transcript_s3_v1` is
+/// exit 7, nothing seeded or delivered: no chat takes it), then, in
+/// parallel, the seed (S8: `workspace::ensure_workspace` with the
 /// CLI's caps, of the snapshot the prechecks scanned before the Touch ID;
 /// none for a workspace the seed cannot carry, said) and the
 /// credential's local and live gate with its token; then the setup-token
@@ -976,8 +994,15 @@ impl Drop for WarmRecord {
 /// frame leaves, so the row then says whether the VM may hold the token, as
 /// `creds status` does: any delivery the row records, of this seal or an
 /// earlier one, is named with `ai-env vm terminate`.
+///
+/// Given `session stage --warm`'s chat (`w.chat`, S9 R5-AWS-1), last, once
+/// the warm's lines are out: that chat restored from S3 into this VM with
+/// no deadline (`s3::stage::restore_into`, on this warm's API: no Touch ID
+/// of its own), so the next reopen there keeps it within Cursor's window;
+/// what it did is the result. A stop gives the restore up where it stands
+/// (the VM renames a pulled file into place only once every part checked).
 #[allow(clippy::too_many_arguments)]
-async fn warm<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: std::sync::Arc<A>, ep: &E, w: &Warm, json: bool, prewarm: bool, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<()> {
+async fn warm<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient>(ctx: &Ctx, api: std::sync::Arc<A>, ep: &E, w: &Warm, json: bool, prewarm: bool, supply: Option<crate::bridge::agent::credential::CredentialSupply<'_>>) -> Result<Option<crate::bridge::s3::stage::WarmRestore>> {
     use crate::bridge::agent::credential::{self, CredentialFlags, Warmed};
     use crate::bridge::signals::{say, stoppable, Stops};
     let supply = supply.ok_or_else(|| CliError::Msg("internal: vm warm without its keystore".into()))?;
@@ -1009,15 +1034,27 @@ async fn warm<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: std::s
             run::Selected::Reused { row, vm, .. } => (row, vm, true),
         };
         let (health, _) = health::read_health(&*api, ep, &ctx.paths, &vm.id, ctx.backoff()).await?;
+        // S9: a VM without the transcript store is one no chat takes (SELECT_VM passes it over, and a session
+        // refuses one it starts: `remote::pipeline::workspace_caps`), so nothing is seeded or delivered there. Its
+        // image predates the store yet holds an egress pass (a publish that failed after the S9 deploy, a rollback).
+        let cap = crate::wire::frame::CAP_TRANSCRIPT_S3_V1;
+        if plan.transcript_cap && !health.caps.iter().any(|c| c == cap) {
+            let e: CliError = BridgeError::NoCapability { cap, message: format!("{} (image version {}) does not serve the transcript store", vm.id, vm.image_version) }.into();
+            // Not `warm_kept`'s note (a warm again reuses it): no chat or warm takes this one.
+            return Err(match started.borrow_mut().take() {
+                Some(id) => crate::bridge::creds::with_note(e, &format!("{id} was started for this workspace and keeps running, but no chat or warm takes it: `ai-env vm terminate {id}` ends it")),
+                None => e,
+            });
+        }
         let row = registry::read_row(&ctx.paths, &vm.id)?.unwrap_or(row);
         let flags = CredentialFlags { with_credential: true, ..CredentialFlags::default() };
         let cred = credential::check(&ctx.cfg, &ctx.paths, &row, &[], &flags)?.ok_or_else(|| CliError::Msg("internal: no credential plan".into()))?;
         // The seed beside the gate and the token (S8): neither waits for the other.
         let (seeded, prepared) = tokio::try_join!(seed_on(ctx, &api, &row, &vm, &health.caps, &w.seed, w.prepared.take()), credential::prepare(ctx, &*api, ep, &row, &vm, &cred, supply))?;
         let env = crate::bridge::agent::exec::agent_env(ctx, &*api, ep, &row, Some(&vm))?;
-        Ok::<_, CliError>((vm, reused, cred, env, prepared.delivery, seeded))
+        Ok::<_, CliError>((row, health.caps, vm, reused, cred, env, prepared.delivery, seeded))
     };
-    let (vm, reused, cred, env, delivery, seeded) = match stoppable(&mut stops, ready).await {
+    let (row, caps, vm, reused, cred, env, delivery, seeded) = match stoppable(&mut stops, ready).await {
         Ok(r) => r.map_err(started_note)?,
         Err(stop) => {
             let known = started.borrow().clone();
@@ -1067,20 +1104,32 @@ async fn warm<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: std::s
     }
     if prewarm {
         tracing::info!(vm = %vm.id, warmed = word, seed = seed_word.unwrap_or("none"), "prewarmed");
-        return Ok(());
+        return Ok(None);
     }
     if json {
-        return json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "seed": seed_word, "seed_note": seed_note }));
+        json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "seed": seed_word, "seed_note": seed_note }))?;
+    } else {
+        let how = if warmed == Warmed::Delivered { "now holds" } else { "already held" };
+        outln!("{} {how} the setup-token (seal {}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
+        if let Some(word) = seed_word {
+            outln!("{}: the workspace's checkout {word}", vm.id);
+        }
     }
-    let how = if warmed == Warmed::Delivered { "now holds" } else { "already held" };
-    outln!("{} {how} the setup-token (seal {}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
-    if let Some(word) = seed_word {
-        outln!("{}: the workspace's checkout {word}", vm.id);
+    let Some(chat) = &w.chat else { return Ok(None) };
+    let ws = w.seed.as_ref().map_err(|why| CliError::Msg(format!("{} was not restored into {}: {why}", chat.session, vm.id)))?;
+    match stoppable(&mut stops, crate::bridge::s3::stage::restore_into(ctx, &api, &row, &vm, &caps, ws, chat)).await {
+        Ok(r) => r.map(Some).map_err(|e| started_note(e.into())),
+        Err(stop) => {
+            say(&format!("ai-env: {} ({}) while {} was being restored into {}: the restore was given up; run it again", stop.word(), stop.name(), chat.session, vm.id));
+            if let Some(id) = started.borrow().as_deref() {
+                say(&format!("ai-env: {}", kept(id)));
+            }
+            Err(CliError::Exit(stop.status()))
+        }
     }
-    Ok(())
 }
 
-async fn run_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: bool) -> Result<()> {
+async fn run_cmd<A: MicrovmApi + crate::bridge::s3::S3Sign>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: bool) -> Result<()> {
     warn_plan(plan);
     if plan.egress == run::Egress::Vpc {
         match connector_state_line(&ctx.paths, plan.egress_connectors.first().map(String::as_str)) {
@@ -1117,8 +1166,14 @@ async fn run_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, plan: &run::RunPlan, json: b
 /// `[vm].auto_gc = true` (plan S4 D17): after a `vm run`, terminate the
 /// registry VMs whose wall passed or is under a minute away — never the VM
 /// this run just started or reused, never an orphan, never another owner's.
-async fn auto_gc<A: MicrovmApi>(ctx: &Ctx, api: &A, items: &[gc::GcItem], just_selected: &str) {
+/// Each running one is synced first, as `vm terminate` and `vm gc` sync
+/// theirs (S9 plan §5: the transcripts its sessions keep in S3, best
+/// effort, bounded; a failure is a warning; a suspended one is not woken).
+async fn auto_gc<A: MicrovmApi + crate::bridge::s3::S3Sign>(ctx: &Ctx, api: &A, items: &[gc::GcItem], just_selected: &str) {
     for id in items.iter().filter(|i| i.class == gc::GcClass::RegistryExpired).filter_map(|i| i.id.as_deref()).filter(|id| *id != just_selected) {
+        for w in crate::bridge::s3::commands::sync_before_terminate(ctx, api, id).await {
+            eprintln!("ai-env: warning: {w}");
+        }
         match run::terminate_and_record(api, &ctx.paths, id, "gc-expired", None).await {
             Ok(_) => eprintln!("ai-env: auto_gc: terminated {id} (its wall passed or is under a minute away)"),
             Err(e) => eprintln!("ai-env: auto_gc: could not terminate {id}: {e}"),
@@ -1252,7 +1307,7 @@ async fn suspend_resume<A: MicrovmApi>(ctx: &Ctx, api: &A, id: &str, suspend: bo
     Ok(())
 }
 
-async fn terminate<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, id: Option<&str>, all: bool, yes: bool, no_wait: bool) -> Result<()> {
+async fn terminate<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, id: Option<&str>, all: bool, yes: bool, no_wait: bool) -> Result<()> {
     let wait = (!no_wait).then(|| ctx.poll(run::Poll::SETTLE));
     if all {
         let arn = ctx.image_arn()?;
@@ -1275,6 +1330,10 @@ async fn terminate<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E,
         let mut failed = Vec::new();
         for t in &targets {
             let start = Instant::now();
+            // S9: a running VM's sessions' transcripts to S3 first (best effort; its tails go up at /terminate; a suspended one is not woken: its /suspend pushed them, once).
+            for w in crate::bridge::s3::commands::sync_before_terminate(ctx, api, t).await {
+                eprintln!("ai-env: warning: {w}");
+            }
             match run::terminate_and_record(api, &ctx.paths, t, "operator", wait).await {
                 Ok(_) if wait.is_none() => outln!("{t} terminate requested"),
                 Ok(_) => outln!("{t} terminated ({})", ms_s(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))),
@@ -1306,6 +1365,10 @@ async fn terminate<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E,
         Err(e) => return Err(e.into()),
     }
     let start = Instant::now();
+    // S9: a running VM's sessions' transcripts to S3 first (best effort; its tails go up at /terminate; a suspended one is not woken: its /suspend pushed them, once).
+    for w in crate::bridge::s3::commands::sync_before_terminate(ctx, api, id).await {
+        eprintln!("ai-env: warning: {w}");
+    }
     let vm = run::terminate_and_record(api, &ctx.paths, id, "operator", wait).await?;
     if wait.is_none() {
         outln!("{id} terminate requested");
@@ -1316,9 +1379,11 @@ async fn terminate<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E,
     Ok(())
 }
 
-async fn gc_cmd<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, opts: &gc::GcOpts, json: bool) -> Result<()> {
+async fn gc_cmd<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, opts: &gc::GcOpts, json: bool) -> Result<()> {
     let arn = ctx.image_arn()?;
-    let report = gc::gc(api, ep, &ctx.paths, &arn, opts).await?;
+    // S9: each running VM gc terminates has its sessions' transcripts synced to S3 first (best effort; a suspended one is not woken).
+    let sync_first = |id: String| async move { crate::bridge::s3::commands::sync_before_terminate(ctx, api, &id).await };
+    let report = gc::gc_syncing(api, ep, &ctx.paths, &arn, opts, sync_first).await?;
     for e in &report.errors {
         tracing::warn!("vm gc: {e}");
     }
@@ -1932,6 +1997,9 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
     // S8's fresh-claude-json seeds the current directory's workspace into its VM and starts claude there as Cursor
     // starts a chat: both made before any Touch ID (a refusal is exit 9, as a session's P0).
     let fresh = if name == "fresh-claude-json" { Some((fresh_workspace(&ctx)?, lab::CursorChat::new(&ctx.cfg)?)) } else { None };
+    // S9's protocol-v2 (G8) seeds the current directory's workspace into its VM as well, resolved before any Touch ID;
+    // chunked-put needs none (its VM is never seeded).
+    let smart = if name == "protocol-v2" { Some(protocol_v2_workspace(&ctx)?) } else { None };
     // S8 operators: connector-pending reads the throw-away connector as the operator. Its identity and account
     // answer come first (its Touch ID before the runtime key's, never on a runtime thread), its refusals keep
     // their class, and an operator of another account than the connector's is refused here, before the runtime
@@ -1965,6 +2033,14 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
             return with_backend!(&b, |api, ep| lab::run_probe_with(&ctx, api, ep, name, id, Some(supply)).await.map_err(CliError::from));
         }
         let b = backend(store, &ctx).await?;
+        if let Some(ws) = &smart {
+            // protocol-v2's seed holds the API past a borrow, as fresh-claude-json's does.
+            return match &b {
+                Backend::Sdk(api, ep) => lab::run_protocol_v2(&ctx, std::sync::Arc::clone(api), &**ep, ws).await,
+                Backend::Fake(f) => lab::run_protocol_v2(&ctx, std::sync::Arc::new(f.clone()), f, ws).await,
+            }
+            .map_err(CliError::from);
+        }
         with_backend!(&b, |api, ep| lab::run_probe(&ctx, api, ep, name, id).await.map_err(CliError::from))
     })?;
     let mut row = probes::stamped(&ctx.paths, spec, &outcome.verdict, with_note(outcome.note, note.as_ref()));
@@ -1989,6 +2065,23 @@ fn lab_run(store: &Keystore, name: &str, id: Option<&str>, log: Option<&std::pat
 fn fresh_workspace(ctx: &Ctx) -> Result<crate::bridge::workspace::WorkspaceRef> {
     use crate::bridge::workspace::code;
     const WHAT: &str = "lab run fresh-claude-json seeds the current directory's workspace into its fresh VM, as a session's is";
+    let cwd = std::env::current_dir().map_err(|e| CliError::Msg(format!("{WHAT}: the current directory: {e}")))?;
+    crate::bridge::workspace::resolve(&ctx.cfg, &cwd, None).map_err(|e| {
+        CliError::from(match e {
+            BridgeError::WorkspaceRefused { code: code::NOT_A_GIT_REPO, .. } => BridgeError::WorkspaceRefused { code: code::NOT_A_GIT_REPO, message: format!("{WHAT}: {} is no git repository; run it from a git workspace under the roots", cwd.display()) },
+            BridgeError::WorkspaceRefused { code, message } => BridgeError::WorkspaceRefused { code, message: format!("{WHAT}: {message}") },
+            other => other,
+        })
+    })
+}
+
+/// The workspace `lab run protocol-v2` seeds into its VM (S9, G8): the
+/// current directory's, as [`fresh_workspace`] takes it, before any Touch ID
+/// or AWS call; a refusal names the probe (exit 9 outside the roots or for a
+/// directory that is no git repository).
+fn protocol_v2_workspace(ctx: &Ctx) -> Result<crate::bridge::workspace::WorkspaceRef> {
+    use crate::bridge::workspace::code;
+    const WHAT: &str = "lab run protocol-v2 seeds the current directory's workspace into its fresh VM, then asks its git advertisement";
     let cwd = std::env::current_dir().map_err(|e| CliError::Msg(format!("{WHAT}: the current directory: {e}")))?;
     crate::bridge::workspace::resolve(&ctx.cfg, &cwd, None).map_err(|e| {
         CliError::from(match e {
@@ -2276,6 +2369,17 @@ mod tests {
         assert_eq!(ctx(crate::bridge::lab::parse_vm_knobs(None, None, Some("5"))).backend_name(), "sdk+knobs");
         assert_eq!(ctx(crate::bridge::lab::parse_vm_knobs(None, Some("1"), None)).backend_name(), "sdk+knobs");
         assert_eq!(ctx(crate::bridge::lab::parse_vm_knobs(Some("/f.json"), None, Some("5"))).backend_name(), "fake");
+    }
+
+    /// The gate's local half ranks a refusal by how far the precheck got:
+    /// S9's `egress_rule` is the record's own, beside its DNS rule and
+    /// verdict, past its age and before the dns-path verdict every version
+    /// shares (a stale pass of one version never hides another's old rule).
+    #[test]
+    fn the_egress_rule_ranks_with_the_records_own_rules() {
+        assert_eq!(precheck_stage("egress_rule"), precheck_stage("dns_rule"));
+        assert!(precheck_stage("record_age") < precheck_stage("egress_rule") && precheck_stage("egress_rule") < precheck_stage("dns_path_missing"));
+        assert!(precheck_stage("no_record") < precheck_stage("record_time"));
     }
 
     #[test]

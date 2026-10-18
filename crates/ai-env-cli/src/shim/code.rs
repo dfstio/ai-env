@@ -17,7 +17,11 @@
 //! the last seed's record in memory (`ShimState.workspace`): a seed at
 //! another path is 409 `other_workspace`, a clone of a seeded VM 409
 //! `changed`, an update or a replace of an unseeded one 409 `not_seeded`.
-//! Git smart-HTTP (S9) and every other path answer 404.
+//!
+//! S9 adds git smart-HTTP (`gitcgi`), as `CAP_GIT_HTTP_V1` is named: the
+//! literal routes `GET /workspace.git/info/refs?service=git-upload-pack` and
+//! `POST /workspace.git/git-upload-pack`, and `/workspace.git/git-receive-pack`
+//! (403). Every other path answers 404 `NO_SUCH_ROUTE`.
 use crate::shim::asagent::{self, flag, AgentCmd, AgentProc, AgentProcError};
 use crate::shim::health::ShimState;
 use crate::wire::workspace::{
@@ -41,6 +45,16 @@ pub fn router(state: Arc<ShimState>) -> Router {
     if state.serves_workspace() {
         let not_allowed = crate::shim::health::method_not_allowed;
         routes = routes.route(SEED_ROUTE, get(get_seed).put(put_seed).fallback(not_allowed)).route(CODEOUT_ROUTE, post(post_codeout).fallback(not_allowed));
+    }
+    // S9: git smart-HTTP, as its cap is named (`ShimState::caps`). Every method reaches the
+    // handlers, which take §1.3's checks in their order (a receive-pack query before a 405).
+    if state.serves_workspace() && crate::shim::gitcgi::SERVED {
+        use crate::shim::gitcgi;
+        use crate::wire::workspace::{GIT_INFO_REFS_ROUTE, GIT_RECEIVE_PACK_ROUTE, GIT_UPLOAD_PACK_ROUTE};
+        routes = routes
+            .route(GIT_INFO_REFS_ROUTE, axum::routing::any(gitcgi::info_refs))
+            .route(GIT_UPLOAD_PACK_ROUTE, axum::routing::any(gitcgi::upload_pack))
+            .route(GIT_RECEIVE_PACK_ROUTE, axum::routing::any(gitcgi::receive_pack));
     }
     // The last layer runs first: the guard, then the bearer.
     routes

@@ -16,12 +16,12 @@
 //!   [`CodeoutRequest`] (at most [`CODEOUT_REQUEST_MAX`]) and answers a
 //!   [`CodeoutManifest`] line, then the pack, or 204 when nothing is new;
 //! * the app port ([`APP_PORT`], `app_bearer`): `GET /transcript?rel=`
-//!   answers a [`TranscriptStat`]; `PUT /transcript?rel=` takes the file
-//!   (at most [`TRANSCRIPT_MAX`]) and answers a [`TranscriptReply`]; `GET
-//!   /settings?path=` answers a [`SettingsCapture`].
+//!   answers a [`TranscriptStat`]; `GET /settings?path=` answers a
+//!   [`SettingsCapture`]. (S8's `PUT /transcript`, the Mac's mirror sent up
+//!   at a resume, went at the S3 cut-over: S9 restores a chat from S3.)
 //!
-//! Statuses: 201 (cloned, updated or replaced; a transcript written), 200
-//! (up to date, unchanged, a state, a stat, a capture, a code-out pack), 204
+//! Statuses: 201 (cloned, updated or replaced), 200 (up to date, a state, a
+//! stat, a capture, a code-out pack), 204
 //! (nothing new to code out). A refusal is a [`WsRefusal`] body with its
 //! code's status ([`refusal_status`]: 400, 409, 413, 422, 500, 503 or 504);
 //! a body without `Content-Length` is 411 `bad_request`.
@@ -33,8 +33,20 @@
 //! (UTF-8, absolute, NFC: [`vm_path_of`], [`vm_path_check`]): the VM never
 //! normalises one, it refuses it. A ref or an object id is checked before
 //! any git run sees it ([`is_ref_name`], [`branch_check`], [`ObjectFormat`]).
+//!
+//! S9 (frozen in S9 phase 0; plans/s9-contracts.md §1) adds, each served
+//! only by a shim that names its capability: git smart-HTTP on the code
+//! port (`CAP_GIT_HTTP_V1`: [`GIT_INFO_REFS_ROUTE`] and
+//! [`GIT_UPLOAD_PACK_ROUTE`], upload-pack only, [`GIT_RECEIVE_PACK_ROUTE`]
+//! 403), and the transcript store's transfers on the app port
+//! (`CAP_TRANSCRIPT_S3_V1`): the extended stat ([`StatQuery`]),
+//! [`TranscriptPush`], [`TranscriptPull`], [`ViewQuery`] and
+//! [`TranscriptTail`], their presigned URLs `wire::s3::PresignedUrl`s whose
+//! keys must fit the bytes they move. A helper whose reply can pass
+//! [`HEAD_LINE_MAX`] answers a [`JsonPayloadReply`] head, then the reply.
 use crate::wire::mirror::mirror_key;
 use crate::wire::redact::scrub;
+use crate::wire::s3::{is_account_id, proxy_check, PresignedUrl, S3Key, PULL_PARTS_MAX, PUSH_MAX, SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT, SIGNED_HEADERS_TAIL};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -54,10 +66,55 @@ pub const APP_PORT: u16 = 8080;
 pub const SEED_ROUTE: &str = "/seed";
 /// `POST` on [`CODE_PORT`].
 pub const CODEOUT_ROUTE: &str = "/codeout";
-/// `GET` (the stat) and `PUT` (the upload) on [`APP_PORT`].
+/// `GET` (the stat; S9's extended one too) on [`APP_PORT`].
 pub const TRANSCRIPT_ROUTE: &str = "/transcript";
 /// `GET` on [`APP_PORT`].
 pub const SETTINGS_ROUTE: &str = "/settings";
+
+/// S9: the VM's one repository on [`CODE_PORT`] (`CAP_GIT_HTTP_V1`), its routes literal.
+pub const GIT_REPO_PREFIX: &str = "/workspace.git";
+/// `GET` with exactly [`GIT_UPLOAD_PACK_QUERY`]: the advertisement.
+pub const GIT_INFO_REFS_ROUTE: &str = "/workspace.git/info/refs";
+/// `POST`: one upload-pack request (no query).
+pub const GIT_UPLOAD_PACK_ROUTE: &str = "/workspace.git/git-upload-pack";
+/// Any method: 403 [`GIT_RECEIVE_PACK_REFUSAL`], no helper started.
+pub const GIT_RECEIVE_PACK_ROUTE: &str = "/workspace.git/git-receive-pack";
+/// S9: `POST` on [`APP_PORT`] (`CAP_TRANSCRIPT_S3_V1`): a [`TranscriptPush`].
+pub const TRANSCRIPT_PUSH_ROUTE: &str = "/transcript/push";
+/// `POST`: a [`TranscriptPull`].
+pub const TRANSCRIPT_PULL_ROUTE: &str = "/transcript/pull";
+/// `GET` with a [`ViewQuery`]: a `wire::view::TranscriptViewReply`.
+pub const TRANSCRIPT_VIEW_ROUTE: &str = "/transcript/view";
+/// `POST`: a [`TranscriptTail`].
+pub const TRANSCRIPT_TAIL_ROUTE: &str = "/transcript/tail";
+
+/// The one query of [`GIT_INFO_REFS_ROUTE`].
+pub const GIT_UPLOAD_PACK_QUERY: &str = "service=git-upload-pack";
+/// receive-pack's: 403.
+pub const GIT_RECEIVE_PACK_QUERY: &str = "service=git-receive-pack";
+/// The CGI's `PATH_INFO` of each route (never taken from the URL).
+pub const GIT_PATH_INFO_REFS: &str = "/info/refs";
+pub const GIT_PATH_INFO_UPLOAD_PACK: &str = "/git-upload-pack";
+/// The advertisement's, a request's and a result's `Content-Type`.
+pub const GIT_ADVERTISEMENT_TYPE: &str = "application/x-git-upload-pack-advertisement";
+pub const GIT_UPLOAD_PACK_REQUEST_TYPE: &str = "application/x-git-upload-pack-request";
+pub const GIT_UPLOAD_PACK_RESULT_TYPE: &str = "application/x-git-upload-pack-result";
+/// The `Content-Encoding`s a request may carry (none, or one of these).
+pub const GIT_CONTENT_ENCODINGS: [&str; 2] = ["gzip", "x-gzip"];
+/// The `Git-Protocol` values a request may carry (none, or one of these).
+pub const GIT_PROTOCOLS: [&str; 3] = ["version=0", "version=1", "version=2"];
+/// What the Mac's client asks (M5).
+pub const GIT_PROTOCOL_V2: &str = "version=2";
+/// The CGI's headers the root shim passes on (lowercase; compared ignoring ASCII case): no other.
+pub const GIT_CGI_HEADERS: [&str; 4] = ["content-type", "cache-control", "expires", "pragma"];
+/// The CGI's environment beside `GitRun::vm`'s own: an allowlist (never a bearer, a cookie or an `x-aws-*` header).
+pub const GIT_CGI_ENV: [&str; 10] = ["GIT_PROJECT_ROOT", "GIT_HTTP_EXPORT_ALL", "PATH_INFO", "REQUEST_METHOD", "QUERY_STRING", "CONTENT_TYPE", "CONTENT_LENGTH", "HTTP_CONTENT_ENCODING", "HTTP_GIT_PROTOCOL", "REMOTE_ADDR"];
+/// `-c` overrides on http-backend's command line (they beat the agent's repository config).
+pub const GIT_CGI_OVERRIDES: [&str; 3] = ["http.receivepack=false", "http.getanyfile=false", "http.uploadpack=true"];
+/// What both ports answer (404) for a path no route serves.
+pub const NO_SUCH_ROUTE: &str = "ai-env: no such route\n";
+/// The 403 of receive-pack, in either form.
+pub const GIT_RECEIVE_PACK_REFUSAL: &str = "ai-env: receive-pack is refused: the VM's repository is never written through the code port\n";
 
 const MIB: u64 = 1024 * 1024;
 /// The largest `PUT /seed` body the shim takes, its manifest line included
@@ -67,9 +124,6 @@ const MIB: u64 = 1024 * 1024;
 pub const SEED_BODY_MAX: u64 = 1024 * MIB;
 /// The largest `POST /codeout` body (a [`CodeoutRequest`]).
 pub const CODEOUT_REQUEST_MAX: usize = 64 * 1024;
-/// The largest transcript file `PUT /transcript` takes: the S2 seeder's cap
-/// (`seed::MAX_SEED_BYTES`, `remote::TRANSCRIPT_MAX`).
-pub const TRANSCRIPT_MAX: u64 = 64 * MIB;
 /// The largest settings file a capture carries the text of.
 pub const SETTINGS_FILE_MAX: usize = 256 * 1024;
 /// The most object ids a [`CodeoutRequest`] names as the Mac's (and the
@@ -91,6 +145,29 @@ pub const SEGMENT_MAX: usize = 255;
 pub const REL_MAX: usize = 4096;
 /// The longest full ref name a manifest may carry.
 pub const REF_NAME_MAX: usize = 1024;
+/// S9: an upload-pack request body (ours are 15 KiB at most).
+pub const GIT_REQUEST_MAX: u64 = MIB;
+/// One CGI response body.
+pub const GIT_RESPONSE_MAX: u64 = 1024 * MIB;
+/// The CGI's header block.
+pub const GIT_CGI_HEAD_MAX: usize = 16 * 1024;
+/// CGI runs at once (the next is 409 `busy` at once).
+pub const GIT_CGI_MAX: usize = 2;
+/// A push, pull, or tail body: a pull's `PULL_PARTS_MAX` parts of at most
+/// `PRESIGNED_URL_MAX` bytes each, their JSON and a rel fit.
+pub const TRANSFER_REQUEST_MAX: usize = 640 * 1024;
+/// Push, pull and tail runs at once.
+pub const TRANSFERS_MAX: usize = 4;
+/// The parts of one pull, summed.
+pub const PULL_MAX: u64 = PUSH_MAX;
+/// The files an extended stat lists.
+pub const SUBTREE_FILES_MAX: usize = 256;
+/// Their bytes, hashed.
+pub const SUBTREE_BYTES_MAX: u64 = 256 * MIB;
+/// A helper's JSON payload ([`JsonPayloadReply`]), the Mac's `dataplane::MAX_JSON`: a view's reply
+/// (`VIEW_FILE_MAX` of text escaped at most 6 bytes per byte, plus its capped fields: under 1.6 MiB),
+/// a subtree stat (`SUBTREE_FILES_MAX` rels of at most `REL_MAX` bytes: under 1.1 MiB).
+pub const JSON_PAYLOAD_MAX: usize = 2 * 1024 * 1024;
 
 /// What the agent's helper may take per operation in the VM (plan §6): the
 /// shim ends its process group past it (504 `timeout`). The Mac's own wait
@@ -108,13 +185,25 @@ pub mod budget {
     pub const CODEOUT: Duration = Duration::from_secs(120);
     /// The `/suspend` hook's snapshot (after `freeze()`, before the sockets close).
     pub const SUSPEND_SNAPSHOT: Duration = Duration::from_secs(8);
-    /// `GET` and `PUT /transcript`.
+    /// `GET /transcript` (S8's stat and S9's extended one).
     pub const TRANSCRIPT: Duration = Duration::from_secs(60);
     /// `GET /settings`.
     pub const SETTINGS: Duration = Duration::from_secs(10);
     /// How long a request waits for the workspace (one seed, code-out or
     /// snapshot at a time) before it is refused with 409 `busy`.
     pub const BUSY_WAIT: Duration = Duration::from_secs(30);
+    /// S9: `GET` info/refs, the whole stream.
+    pub const GIT_ADVERTISE: Duration = Duration::from_secs(30);
+    /// `POST` git-upload-pack, the whole stream.
+    pub const GIT_UPLOAD_PACK: Duration = Duration::from_secs(600);
+    /// A push, plus `asagent::transfer(len)`.
+    pub const TRANSCRIPT_PUSH: Duration = Duration::from_secs(60);
+    /// A pull, plus `asagent::transfer(sum of the parts)`.
+    pub const TRANSCRIPT_PULL: Duration = Duration::from_secs(60);
+    /// The view.
+    pub const TRANSCRIPT_VIEW: Duration = Duration::from_secs(30);
+    /// One tail push at `/suspend` or `/terminate`.
+    pub const TRANSCRIPT_TAIL: Duration = Duration::from_secs(8);
 }
 
 // ---- refusals ----------------------------------------------------------------------------
@@ -152,14 +241,15 @@ pub mod refusal {
     pub const TOO_LARGE: &str = "too_large";
     /// 409: a code-out or a snapshot of a VM never seeded.
     pub const NOT_SEEDED: &str = "not_seeded";
-    /// 409: the VM's transcript is longer than the Mac's: the VM's copy wins.
-    pub const VM_LONGER: &str = "vm_longer";
     /// 500: git failed in the VM (the message holds its last stderr lines, scrubbed).
     pub const GIT_FAILED: &str = "git_failed";
     /// 504: the helper outlived its budget; its process group was ended.
     pub const TIMEOUT: &str = "timeout";
     /// 503: the shim is stopping (a suspend, a terminate): nothing new starts.
     pub const DRAINING: &str = "draining";
+    /// 500 (S9): the transfer to or from S3 did not happen (curl reported no
+    /// HTTP status: the proxy, a connection; or a helper failed).
+    pub const TRANSFER_FAILED: &str = "transfer_failed";
     /// Every code above.
     pub const ALL: [&str; 19] = [
         BAD_REQUEST,
@@ -177,10 +267,10 @@ pub mod refusal {
         BAD_REFS,
         TOO_LARGE,
         NOT_SEEDED,
-        VM_LONGER,
         GIT_FAILED,
         TIMEOUT,
         DRAINING,
+        TRANSFER_FAILED,
     ];
 }
 
@@ -194,9 +284,10 @@ pub fn refusal_status(code: &str) -> u16 {
     use refusal::*;
     match code {
         BAD_REQUEST => 400,
-        SYMLINK_COMPONENT | PATH_OCCUPIED | NOT_CREATABLE | OTHER_WORKSPACE | DIRTY | DIVERGED | CHANGED | NOT_PRISTINE | BUSY | NOT_SEEDED | VM_LONGER => 409,
+        SYMLINK_COMPONENT | PATH_OCCUPIED | NOT_CREATABLE | OTHER_WORKSPACE | DIRTY | DIVERGED | CHANGED | NOT_PRISTINE | BUSY | NOT_SEEDED => 409,
         TOO_LARGE => 413,
         BAD_PACK | MISSING_PREREQUISITES | BAD_REFS => 422,
+        TRANSFER_FAILED => 500,
         DRAINING => 503,
         TIMEOUT => 504,
         _ => 500,
@@ -224,8 +315,8 @@ pub struct WsRefusal {
     /// can report what the VM keeps without a second `GET /seed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<SeedState>,
-    /// A size the refusal is about: the VM's transcript (`vm_longer`), the
-    /// pack a code-out would have sent (`too_large`).
+    /// A size the refusal is about: the body or the pack over its cap
+    /// (`too_large`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
 }
@@ -510,7 +601,7 @@ impl PathQuery {
     }
 }
 
-/// `?rel=`: `GET` and `PUT /transcript`.
+/// `?rel=`: `GET /transcript` (S8's stat).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelQuery {
     /// The transcript's path under the projects directory ([`transcript_rel_check`]).
@@ -938,8 +1029,12 @@ impl CodeoutManifest {
 
 // ---- transcripts ---------------------------------------------------------------------------
 
-/// `GET /transcript?rel=`: the VM's copy, as the agent's projects directory holds it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `GET /transcript?rel=`: the VM's copy, as the agent's projects directory
+/// holds it. S9's extended stat ([`StatQuery`]) adds the fields after
+/// `mtime`, each left out when not asked for, so S8's documents read and
+/// write as before; with `from` no whole-file sha256 is computed. The
+/// default is an absent file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptStat {
     /// A regular file is there (a symlink is 409 `symlink_component`).
     pub present: bool,
@@ -952,47 +1047,373 @@ pub struct TranscriptStat {
     /// Its mtime (RFC 3339 UTC), when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime: Option<String>,
+    /// The file's inode, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ino: Option<u64>,
+    /// With `from` at most `size`: sha256 of `[from, size)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_sha256: Option<String>,
+    /// With `from`: sha256 of `[max(0, size - FP_SPAN), size)`, the fingerprint the Mac records when it commits `size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_fp: Option<String>,
+    /// With `fp`: whether the VM's `[max(0, from - FP_SPAN), from)` hashes to it (false when `from` is past `size`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp_ok: Option<bool>,
+    /// With `subtree`: the subtree's regular files, by rel (symlinks skipped).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtree: Vec<SubtreeFile>,
 }
 
-/// What a `PUT /transcript` did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TranscriptWrite {
-    /// Written (0700 directories, a 0600 temp file, fsync, the length
-    /// checked, renamed into place): 201.
-    Written,
-    /// The VM's copy had the same bytes: 200.
-    Unchanged,
-}
+// ---- S9: the transcript store's transfers (G5 serves them, G4 asks) ------------------------
 
-impl TranscriptWrite {
-    /// The audit's word.
-    #[must_use]
-    pub fn word(self) -> &'static str {
-        match self {
-            TranscriptWrite::Written => "written",
-            TranscriptWrite::Unchanged => "unchanged",
-        }
-    }
-
-    /// 201 for a write, 200 for none.
-    #[must_use]
-    pub fn status(self) -> u16 {
-        match self {
-            TranscriptWrite::Written => 201,
-            TranscriptWrite::Unchanged => 200,
-        }
-    }
-}
-
-/// The `PUT /transcript` answer (a longer VM copy is 409 `vm_longer` with its size).
+/// `GET /transcript?rel=&from=&fp=&subtree=` (S9): the stat a sync and a restore ask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TranscriptReply {
-    pub outcome: TranscriptWrite,
-    /// The VM's copy's size now.
+pub struct StatQuery {
+    /// [`transcript_rel_check`]'s rel.
+    pub rel: String,
+    /// The length S3 holds: `delta_sha256` covers `[from, size)`, `end_fp` the `FP_SPAN` bytes before `size`;
+    /// no whole-file sha256 is computed. `None`: S8's stat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<u64>,
+    /// The manifest's fingerprint at `from` (lowercase hex sha256 of `[max(0, from - FP_SPAN), from)`): `fp_ok`.
+    /// Only with `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
+    /// Also list the `<slug>/<uuid>/` subtree's regular files (the rel must be `<slug>/<uuid>.jsonl`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub subtree: bool,
+}
+
+impl StatQuery {
+    /// The query's rules: the rel; `fp` only with `from`, 64 lowercase hex;
+    /// `subtree` only for a `<slug>/<uuid>.jsonl` rel.
+    pub fn check(&self) -> Result<(), String> {
+        transcript_rel_check(&self.rel).map_err(|e| format!("the transcript's rel {e}"))?;
+        match (&self.from, &self.fp) {
+            (None, Some(_)) => return Err("names a fingerprint without from".into()),
+            (_, Some(fp)) if !is_sha256_hex(fp) => return Err("names a fingerprint that is not 64 lowercase hex digits".into()),
+            _ => {}
+        }
+        if self.subtree && !is_main_rel(&self.rel) {
+            return Err("asks for a subtree of a rel that is not <slug>/<uuid>.jsonl".into());
+        }
+        Ok(())
+    }
+
+    /// The query's pairs: the rel, then `from`, `fp` and `subtree` (`true`) when set, in that order.
+    #[must_use]
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![("rel", self.rel.clone())];
+        if let Some(from) = self.from {
+            out.push(("from", from.to_string()));
+        }
+        if let Some(fp) = &self.fp {
+            out.push(("fp", fp.clone()));
+        }
+        if self.subtree {
+            out.push(("subtree", "true".to_string()));
+        }
+        out
+    }
+}
+
+/// One regular file of a session's subtree (`TranscriptStat::subtree`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtreeFile {
+    /// Its rel (`<slug>/<uuid>/<sub…>`, [`transcript_rel_check`]'s).
+    pub rel: String,
     pub size: u64,
-    /// sha256 of the VM's copy now (the Mac compares it with what it sent).
+    /// sha256 of its bytes, lowercase hex: its key is `v1/<sid>/vm/f/<sha256>`.
     pub sha256: String,
+}
+
+/// `POST /transcript/push`: `len` bytes of the VM's copy from `from`, piped helper to curl to S3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPush {
+    pub rel: String,
+    pub from: u64,
+    /// 1 to `wire::s3::PUSH_MAX`.
+    pub len: u64,
+    /// sha256 of those bytes (lowercase hex), the stat's `delta_sha256`: the signed checksum's.
+    pub sha256: String,
+    /// A PUT signed for exactly `len`, `x-amz-checksum-sha256` of `sha256`, `If-None-Match: *` and `owner`
+    /// (`X-Amz-SignedHeaders` exactly `SIGNED_HEADERS_PUT`).
+    pub url: PresignedUrl,
+    /// `x-amz-expected-bucket-owner`: 12 digits.
+    pub owner: String,
+    /// squid, `http://<RFC 1918 IPv4>:<port>` (`wire::s3::proxy_check`); `None` in the lab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+impl TranscriptPush {
+    /// The body's rules: the rel (the main transcript, or one file of its
+    /// subtree), `len` 1 to `PUSH_MAX`, a sha256, the owner, the proxy, and
+    /// the URL a PUT of exactly these bytes: `SIGNED_HEADERS_PUT`, no query
+    /// but the signature's, and a key that fits them: a `Segment` at `from`
+    /// or a `Base` from 0 of the rel's session for the main transcript, the
+    /// `File` of this sha256 from 0 for a subtree file.
+    pub fn check(&self) -> Result<(), String> {
+        let session = transfer_rel(&self.rel)?;
+        if !(1..=PUSH_MAX).contains(&self.len) {
+            return Err(format!("pushes {} bytes (1 to {PUSH_MAX})", self.len));
+        }
+        if !is_sha256_hex(&self.sha256) {
+            return Err("names a sha256 that is not 64 lowercase hex digits".into());
+        }
+        owner_and_proxy(&self.owner, self.proxy.as_deref())?;
+        let key = transfer_url(&self.url, SIGNED_HEADERS_PUT, false, "push")?;
+        let fits = match &key {
+            S3Key::Segment { offset, .. } => is_main_rel(&self.rel) && *offset == self.from,
+            S3Key::Base { .. } => is_main_rel(&self.rel) && self.from == 0,
+            S3Key::File { sha256, .. } => !is_main_rel(&self.rel) && *sha256 == self.sha256 && self.from == 0,
+            _ => false,
+        };
+        if !fits || key.session() != Some(session) {
+            return Err("pushes to a key that does not fit its bytes (a segment at from, a base from 0, a subtree file by its sha256, of the rel's session)".into());
+        }
+        Ok(())
+    }
+}
+
+/// The `POST /transcript/push` answer (200 whenever curl reported an HTTP status, whatever `s3_status` is).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPushReply {
+    /// S3's HTTP status: 200 stored, 412 the key holds an object already, 400 `BadDigest`, 403 …
+    pub s3_status: u16,
+    /// S3's `<Code>` on an error (at most 64 characters of `[A-Za-z0-9]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_code: Option<String>,
+    /// `x-amz-version-id` of a 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// What the shim streamed, and its sha256.
+    pub len: u64,
+    pub sha256: String,
+}
+
+/// `POST /transcript/pull`: the VM's copy rebuilt from `parts` in order, each checked, then renamed into place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPull {
+    pub rel: String,
+    /// 1 to `wire::s3::PULL_PARTS_MAX`.
+    pub parts: Vec<PullPart>,
+    /// sha256 of the whole file, when the Mac knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+impl TranscriptPull {
+    /// The body's rules: the rel (either kind); 1 to `PULL_PARTS_MAX` parts
+    /// of at most `PULL_MAX` bytes in all, each URL a GET
+    /// (`SIGNED_HEADERS_GET`, no query but the signature's and a
+    /// `versionId`) of a `Mac`, `Base`, `Segment`, `Tail` or `File` key of
+    /// the rel's session (a `Tail` only in a pull of the main transcript:
+    /// a tail is never another file's, [`TranscriptTail`]), each part's
+    /// sha256 64 lowercase hex (only a tail's may be unknown); the whole
+    /// file's sha256, the owner, the proxy.
+    pub fn check(&self) -> Result<(), String> {
+        let session = transfer_rel(&self.rel)?;
+        if self.parts.is_empty() || self.parts.len() > PULL_PARTS_MAX {
+            return Err(format!("pulls {} parts (1 to {PULL_PARTS_MAX})", self.parts.len()));
+        }
+        let total = self.parts.iter().try_fold(0u64, |sum, p| sum.checked_add(p.len));
+        if total.is_none_or(|t| t > PULL_MAX) {
+            return Err(format!("pulls more than {PULL_MAX} bytes in all"));
+        }
+        if self.sha256.as_deref().is_some_and(|s| !is_sha256_hex(s)) {
+            return Err("names a sha256 that is not 64 lowercase hex digits".into());
+        }
+        owner_and_proxy(&self.owner, self.proxy.as_deref())?;
+        for (i, part) in self.parts.iter().enumerate() {
+            let key = transfer_url(&part.url, SIGNED_HEADERS_GET, true, "pull part")?;
+            if matches!(key, S3Key::EgressCheck { .. } | S3Key::OutsideProbe { .. }) || key.session() != Some(session) {
+                return Err(format!("pulls a part (number {i}) of a key that is not of the rel's session"));
+            }
+            if matches!(key, S3Key::Tail { .. }) && !is_main_rel(&self.rel) {
+                return Err(format!("pulls a tail (part number {i}) into a rel that is not <slug>/<uuid>.jsonl: a tail is only ever the session's main transcript"));
+            }
+            match (&part.sha256, &key) {
+                (Some(s), _) if !is_sha256_hex(s) => return Err(format!("names a part (number {i}) whose sha256 is not 64 lowercase hex digits")),
+                (None, S3Key::Tail { .. }) | (Some(_), _) => {}
+                (None, _) => return Err(format!("names a part (number {i}) without its sha256 that is no tail")),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One part of a pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullPart {
+    /// A GET (`X-Amz-SignedHeaders` exactly `SIGNED_HEADERS_GET`) by `versionId` when the Mac knows it; a `Tail` part
+    /// (found by listing) and a `File` part whose version a 412 left unknown read the current version.
+    pub url: PresignedUrl,
+    pub len: u64,
+    /// `None` only for a tail object, which the Mac never saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// The `POST /transcript/pull` answer: 201 written, 200 not (a part's status, length or sha256 did not match).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPullReply {
+    pub written: bool,
+    /// The VM's copy's size now (the old one's when nothing was written).
+    pub size: u64,
+    /// sha256 of the file written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// One per part tried, in order; the first bad part ends the pull.
+    pub parts: Vec<PullPartReport>,
+}
+
+/// What one part of a pull brought.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullPartReport {
+    pub s3_status: u16,
+    pub len: u64,
+    pub sha256: String,
+    pub ok: bool,
+}
+
+/// `GET /transcript/view?rel=&n=`: `n` 1 to `wire::view::VIEW_MESSAGES_MAX`, the rel a `<slug>/<uuid>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewQuery {
+    pub rel: String,
+    pub n: u32,
+}
+
+impl ViewQuery {
+    /// The query's rules: a `<slug>/<uuid>.jsonl` rel, `n` from 1 to `VIEW_MESSAGES_MAX`.
+    pub fn check(&self) -> Result<(), String> {
+        transcript_rel_check(&self.rel).map_err(|e| format!("the transcript's rel {e}"))?;
+        if !is_main_rel(&self.rel) {
+            return Err("asks for the view of a rel that is not <slug>/<uuid>.jsonl".into());
+        }
+        if !(1..=crate::wire::view::VIEW_MESSAGES_MAX).contains(&self.n) {
+            return Err(format!("asks for {} messages (1 to {})", self.n, crate::wire::view::VIEW_MESSAGES_MAX));
+        }
+        Ok(())
+    }
+
+    /// The query's pairs: the rel, then `n`.
+    #[must_use]
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        vec![("rel", self.rel.clone()), ("n", self.n.to_string())]
+    }
+}
+
+/// `POST /transcript/tail` (S9 §1.4): held by the shim for `/suspend` and
+/// `/terminate`. Only ever the session's main transcript (`<slug>/<uuid>.jsonl`):
+/// its key names no file, so another file's tail would read back as the main
+/// transcript's at a restore. A subtree file reaches S3 whole at the next
+/// sync (`v1/<sid>/vm/f/<sha256>`); one changed after the last sync and
+/// before `/suspend` or `/terminate` is lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptTail {
+    /// The session's main transcript: `<slug>/<uuid>.jsonl`.
+    pub rel: String,
+    /// The committed length: the tail is `[from, size)` at the hook.
+    pub from: u64,
+    /// A PUT of `v1/<sid>/vm/g<gen>/t/<from:016x>` (`X-Amz-SignedHeaders` exactly `SIGNED_HEADERS_TAIL`), `TAIL_EXPIRY`.
+    pub url: PresignedUrl,
+    pub owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Unix seconds: dropped then.
+    pub expires_at: u64,
+}
+
+impl TranscriptTail {
+    /// The body's rules: the rel (the session's main transcript only), the
+    /// owner, the proxy, and a URL that PUTs (`SIGNED_HEADERS_TAIL`, no
+    /// query but the signature's) the `Tail` at `from` of the rel's session.
+    pub fn check(&self) -> Result<(), String> {
+        let session = transfer_rel(&self.rel)?;
+        if !is_main_rel(&self.rel) {
+            return Err("names a rel that is not <slug>/<uuid>.jsonl: a tail is only ever the session's main transcript (its key names no file)".into());
+        }
+        owner_and_proxy(&self.owner, self.proxy.as_deref())?;
+        let key = transfer_url(&self.url, SIGNED_HEADERS_TAIL, false, "tail")?;
+        if !matches!(&key, S3Key::Tail { offset, .. } if *offset == self.from) || key.session() != Some(session) {
+            return Err("puts its tail to a key that is not the tail at from of the rel's session".into());
+        }
+        Ok(())
+    }
+}
+
+/// The `transcript-read` op's head reply: the file's size and inode; `len` bytes follow the head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptReadReply {
+    pub size: u64,
+    pub ino: u64,
+}
+
+/// The `transcript-write` op's head reply, written after the `commit` line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptWriteReply {
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// The `git-cgi` op's head reply, before the CGI's raw output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCgiReply {
+    pub object_format: ObjectFormat,
+    pub git_version: String,
+}
+
+/// The head `reply` of an op whose own reply can pass [`HEAD_LINE_MAX`] (`transcript-view`; `transcript-stat --subtree`):
+/// that reply follows the head as exactly `len` bytes (at most [`JSON_PAYLOAD_MAX`]) of its compact JSON, whose sha256
+/// (lowercase hex) this is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonPayloadReply {
+    pub sha256: String,
+}
+
+/// 64 lowercase hex digits (a sha256).
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Is `rel` (one [`transcript_rel_check`] passed) a session's main transcript, `<slug>/<uuid>.jsonl`?
+fn is_main_rel(rel: &str) -> bool {
+    rel.split('/').count() == 2
+}
+
+/// A transfer's rel ([`transcript_rel_check`]'s, either kind) and the session it is of.
+fn transfer_rel(rel: &str) -> Result<&str, String> {
+    transcript_rel_check(rel).map_err(|e| format!("the transcript's rel {e}"))?;
+    let second = rel.split('/').nth(1).unwrap_or_default();
+    Ok(second.strip_suffix(".jsonl").unwrap_or(second))
+}
+
+/// The bucket owner (12 digits) and the proxy (`wire::s3::proxy_check`) a transfer names.
+fn owner_and_proxy(owner: &str, proxy: Option<&str>) -> Result<(), String> {
+    if !is_account_id(owner) {
+        return Err("names a bucket owner that is not 12 digits".into());
+    }
+    if let Some(p) = proxy {
+        proxy_check(p).map_err(|e| format!("the proxy {e}"))?;
+    }
+    Ok(())
+}
+
+/// The key a transfer's URL names, once the URL is narrowed for the VM: an
+/// object's key, `signed` exactly its signed headers, and no query
+/// parameter but the signature's (and a `versionId` when `version` allows one).
+fn transfer_url(url: &PresignedUrl, signed: &str, version: bool, what: &str) -> Result<S3Key, String> {
+    if url.signed_headers() != signed {
+        return Err(format!("has a {what} URL signed over other headers than {signed}"));
+    }
+    if let Some(extra) = url.param_names().into_iter().find(|n| !n.starts_with("X-Amz-") && !(version && *n == "versionId")) {
+        return Err(format!("has a {what} URL carrying {extra}, which a {what} never signs"));
+    }
+    S3Key::parse(url.key()).ok_or_else(|| format!("has a {what} URL that names no object of the store"))
 }
 
 // ---- settings (T8.7) ---------------------------------------------------------------------
@@ -1110,8 +1531,8 @@ pub struct HelperHead<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     /// The op's reply ([`SeedState`], [`SeedReply`], [`CodeoutManifest`],
-    /// [`SnapshotReply`], [`TranscriptStat`], [`TranscriptReply`],
-    /// [`SettingsCapture`]).
+    /// [`SnapshotReply`], [`TranscriptStat`], [`SettingsCapture`]; S9's [`TranscriptReadReply`],
+    /// [`TranscriptWriteReply`], [`GitCgiReply`], [`JsonPayloadReply`]).
     #[serde(default = "Option::default", skip_serializing_if = "Option::is_none")]
     pub reply: Option<T>,
     /// The bytes of payload after the line.
@@ -1534,15 +1955,14 @@ mod tests {
         }
         let by_status = |s: u16| refusal::ALL.iter().copied().filter(|c| refusal_status(c) == s).collect::<Vec<_>>();
         assert_eq!(by_status(400), ["bad_request"]);
-        assert_eq!(by_status(409), ["symlink_component", "path_occupied", "not_creatable", "other_workspace", "dirty", "diverged", "changed", "not_pristine", "busy", "not_seeded", "vm_longer"]);
+        assert_eq!(by_status(409), ["symlink_component", "path_occupied", "not_creatable", "other_workspace", "dirty", "diverged", "changed", "not_pristine", "busy", "not_seeded"]);
         assert_eq!(by_status(413), ["too_large"]);
         assert_eq!(by_status(422), ["bad_pack", "missing_prerequisites", "bad_refs"]);
-        assert_eq!(by_status(500), ["git_failed"]);
+        assert_eq!(by_status(500), ["git_failed", "transfer_failed"]);
         assert_eq!(by_status(503), ["draining"]);
         assert_eq!(by_status(504), ["timeout"]);
         assert_eq!((refusal_status("from_the_future"), known_refusal("from_the_future")), (500, None));
         assert_eq!((SeedApplied::Cloned.status(), SeedApplied::Replaced.status(), SeedApplied::UpToDate.status()), (201, 201, 200));
-        assert_eq!((TranscriptWrite::Written.status(), TranscriptWrite::Unchanged.status()), (201, 200));
     }
 
     #[test]
@@ -1556,7 +1976,7 @@ mod tests {
         assert_eq!(r.status(), 500);
         let dirty = WsRefusal::new(refusal::DIRTY, "the checkout has changes").with_state(SeedState { tip: Some(H.into()), ..SeedState::default() });
         assert_eq!((dirty.status(), dirty.state.as_ref().and_then(|s| s.tip.as_deref())), (409, Some(H)));
-        assert_eq!(WsRefusal::new(refusal::VM_LONGER, "longer").with_size(7).size, Some(7));
+        assert_eq!(WsRefusal::new(refusal::TOO_LARGE, "over its cap").with_size(7).size, Some(7));
         assert_eq!(serde_json::to_string(&WsRefusal::new("busy", "held")).unwrap(), r#"{"code":"busy","message":"held"}"#, "no state, no size: left out");
     }
 
@@ -1672,11 +2092,36 @@ mod tests {
 
     #[test]
     fn the_limits_and_budgets_are_the_plans() {
-        assert_eq!((SEED_BODY_MAX, CODEOUT_REQUEST_MAX, TRANSCRIPT_MAX), (1 << 30, 64 << 10, 64 << 20));
+        assert_eq!((SEED_BODY_MAX, CODEOUT_REQUEST_MAX), (1 << 30, 64 << 10));
         assert_eq!((SETTINGS_FILE_MAX, HAVES_MAX, HEAD_LINE_MAX, VM_PATH_MAX), (256 << 10, 256, 64 << 10, 4096));
         assert_eq!((CODE_PORT, APP_PORT), (9418, 8080));
         let secs = [budget::SEED_STATE, budget::SEED_CLONE, budget::SEED_UPDATE, budget::CODEOUT, budget::SUSPEND_SNAPSHOT, budget::TRANSCRIPT, budget::SETTINGS, budget::BUSY_WAIT].map(|d| d.as_secs());
         assert_eq!(secs, [30, 600, 180, 120, 8, 60, 10, 30], "plan §6's budgets");
+    }
+
+    /// S9 (plans/s9-contracts.md §1.5): the git routes' and the transfers'
+    /// caps and budgets, and what they are sized for: a pull's URLs fit its
+    /// body, a view's and a subtree stat's JSON fit the payload.
+    #[test]
+    fn the_s9_limits_and_budgets_are_the_plans() {
+        use crate::wire::s3::{PRESIGNED_URL_MAX, PULL_PARTS_MAX};
+        use crate::wire::view::{VIEW_FILE_MAX, VIEW_ID_MAX, VIEW_MESSAGES_MAX, VIEW_META_MAX, VIEW_TITLE_MAX};
+        assert_eq!((GIT_REQUEST_MAX, GIT_RESPONSE_MAX, GIT_CGI_HEAD_MAX, GIT_CGI_MAX), (1 << 20, 1 << 30, 16 << 10, 2));
+        assert_eq!((TRANSFER_REQUEST_MAX, TRANSFERS_MAX, PULL_MAX, SUBTREE_FILES_MAX, SUBTREE_BYTES_MAX, JSON_PAYLOAD_MAX), (640 << 10, 4, 4 << 30, 256, 256 << 20, 2 << 20));
+        let secs = [budget::GIT_ADVERTISE, budget::GIT_UPLOAD_PACK, budget::TRANSCRIPT_PUSH, budget::TRANSCRIPT_PULL, budget::TRANSCRIPT_VIEW, budget::TRANSCRIPT_TAIL].map(|d| d.as_secs());
+        assert_eq!(secs, [30, 600, 60, 60, 30, 8]);
+        assert_eq!(budget::TRANSCRIPT.as_secs(), 60, "the extended stat keeps S8's");
+        // A pull of every part at the longest URL, with its JSON and a rel, fits one body.
+        const { assert!(PULL_PARTS_MAX * (PRESIGNED_URL_MAX + 256) + REL_MAX + 1024 <= TRANSFER_REQUEST_MAX) };
+        // A view: its text escaped at most 6 bytes per byte, plus every capped field of every message.
+        const { assert!(VIEW_FILE_MAX * 6 + VIEW_MESSAGES_MAX as usize * (2 * VIEW_ID_MAX * 6 + 256) + (VIEW_TITLE_MAX * 4 + 2 * VIEW_META_MAX) * 6 + 1024 < 1_700_000) };
+        const { assert!(1_700_000 <= JSON_PAYLOAD_MAX) };
+        // A subtree stat: every file's rel, size and sha256.
+        const { assert!(SUBTREE_FILES_MAX * (REL_MAX + 64 + 64) < 1_200_000 && 1_200_000 <= JSON_PAYLOAD_MAX) };
+        assert!(GIT_UPLOAD_PACK_ROUTE.starts_with(GIT_REPO_PREFIX) && GIT_INFO_REFS_ROUTE == format!("{GIT_REPO_PREFIX}{GIT_PATH_INFO_REFS}"));
+        assert_eq!(GIT_UPLOAD_PACK_ROUTE, format!("{GIT_REPO_PREFIX}{GIT_PATH_INFO_UPLOAD_PACK}"));
+        assert!(NO_SUCH_ROUTE.ends_with('\n') && GIT_RECEIVE_PACK_REFUSAL.starts_with("ai-env: receive-pack is refused"));
+        assert!(GIT_PROTOCOLS.contains(&GIT_PROTOCOL_V2) && GIT_CGI_HEADERS.iter().all(|h| h.bytes().all(|b| !b.is_ascii_uppercase())));
     }
 
     /// `tests/fixtures/wire/codeport-golden.json`: one document per wire
@@ -1692,7 +2137,7 @@ mod tests {
         type RoundTrip = fn(&str) -> String;
         let text = include_str!("../../tests/fixtures/wire/codeport-golden.json");
         let all: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).unwrap();
-        let cases: [(&str, RoundTrip); 25] = [
+        let cases: [(&str, RoundTrip); 38] = [
             ("path_query", again::<PathQuery>),
             ("rel_query", again::<RelQuery>),
             ("seed_query_clone", again::<SeedQuery>),
@@ -1708,16 +2153,30 @@ mod tests {
             ("codeout_manifest_detached_skipped", again::<CodeoutManifest>),
             ("transcript_stat_absent", again::<TranscriptStat>),
             ("transcript_stat_present", again::<TranscriptStat>),
-            ("transcript_reply_written", again::<TranscriptReply>),
             ("settings_capture", again::<SettingsCapture>),
             ("refusal_symlink_component", again::<WsRefusal>),
             ("refusal_dirty", again::<WsRefusal>),
-            ("refusal_vm_longer", again::<WsRefusal>),
             ("helper_head_seed_state", again::<HelperHead<SeedState>>),
             ("helper_head_codeout", again::<HelperHead<CodeoutManifest>>),
             ("helper_head_refused", again::<HelperHead<SeedReply>>),
             ("snapshot_reply", again::<SnapshotReply>),
             ("workspace_view", again::<WorkspaceView>),
+            // S9 (plans/s9-contracts.md §1.9).
+            ("stat_query_from", again::<StatQuery>),
+            ("transcript_stat_from", again::<TranscriptStat>),
+            ("transcript_push", again::<TranscriptPush>),
+            ("transcript_push_reply", again::<TranscriptPushReply>),
+            ("transcript_pull", again::<TranscriptPull>),
+            ("transcript_pull_reply_written", again::<TranscriptPullReply>),
+            ("transcript_pull_reply_bad_part", again::<TranscriptPullReply>),
+            ("view_query", again::<ViewQuery>),
+            ("transcript_view_reply", again::<crate::wire::view::TranscriptViewReply>),
+            ("transcript_tail", again::<TranscriptTail>),
+            ("refusal_transfer_failed", again::<WsRefusal>),
+            ("helper_head_transcript_read", again::<HelperHead<TranscriptReadReply>>),
+            ("helper_head_transcript_write", again::<HelperHead<TranscriptWriteReply>>),
+            ("helper_head_git_cgi", again::<HelperHead<GitCgiReply>>),
+            ("helper_head_json_payload", again::<HelperHead<JsonPayloadReply>>),
         ];
         let names: BTreeSet<&str> = cases.iter().map(|(n, _)| *n).collect();
         assert_eq!(all.keys().map(String::as_str).collect::<BTreeSet<_>>(), names, "one case per document");
@@ -1739,7 +2198,7 @@ mod tests {
             assert_eq!(serde_json::from_str::<CodeoutManifest>(doc(name)).unwrap().check(), Ok(()), "{name}");
         }
         assert_eq!(serde_json::from_str::<SettingsCapture>(doc("settings_capture")).unwrap().check(), Ok(()));
-        for name in ["refusal_symlink_component", "refusal_dirty", "refusal_vm_longer"] {
+        for name in ["refusal_symlink_component", "refusal_dirty"] {
             let r: WsRefusal = serde_json::from_str(doc(name)).unwrap();
             assert_eq!((known_refusal(&r.code).is_some(), r.status()), (true, 409), "{name}");
         }
@@ -1747,5 +2206,143 @@ mod tests {
         assert_eq!(in_head.check(), Ok(()));
         let unseeded: SeedState = serde_json::from_str(doc("seed_state_unseeded")).unwrap();
         assert_eq!(unseeded, SeedState::default());
+        // S9: every request passes its check; the new refusal is a 500; the payload head names its payload.
+        assert_eq!(serde_json::from_str::<StatQuery>(doc("stat_query_from")).unwrap().check(), Ok(()));
+        assert_eq!(serde_json::from_str::<TranscriptPush>(doc("transcript_push")).unwrap().check(), Ok(()));
+        assert_eq!(serde_json::from_str::<TranscriptPull>(doc("transcript_pull")).unwrap().check(), Ok(()));
+        assert_eq!(serde_json::from_str::<ViewQuery>(doc("view_query")).unwrap().check(), Ok(()));
+        assert_eq!(serde_json::from_str::<TranscriptTail>(doc("transcript_tail")).unwrap().check(), Ok(()));
+        let view: crate::wire::view::TranscriptViewReply = serde_json::from_str(doc("transcript_view_reply")).unwrap();
+        assert_eq!(view.check(10), Ok(()));
+        let r: WsRefusal = serde_json::from_str(doc("refusal_transfer_failed")).unwrap();
+        assert_eq!((known_refusal(&r.code), r.status()), (Some(refusal::TRANSFER_FAILED), 500));
+        let payload = doc("transcript_view_reply").as_bytes();
+        let head: HelperHead<JsonPayloadReply> = serde_json::from_str(doc("helper_head_json_payload")).unwrap();
+        assert_eq!((head.len, head.reply.map(|r| r.sha256)), (Some(payload.len() as u64), Some(sha256_hex(payload))), "the payload head names §6.1's example");
+        let stat: TranscriptStat = serde_json::from_str(doc("transcript_stat_from")).unwrap();
+        assert_eq!((stat.sha256, stat.end_fp.as_deref(), stat.subtree.len()), (None, Some(D_ALL), 1), "no whole-file sha256 with from");
+        let push: TranscriptPush = serde_json::from_str(doc("transcript_push")).unwrap();
+        assert!(!format!("{push:?}").contains("X-Amz-Signature"), "a URL is never printed");
+    }
+
+    /// The four digests of §1.9's documents: `[0, 48213)`, `[48213, 52000)`, the whole 52000 bytes, the subagent file.
+    const D_BASE: &str = "841075eede78b44b2d2862f4c38a643daf938671983e4ca0563a98a82ceddcd1";
+    const D_SEGMENT: &str = "b094ab054161cac4f8714d6855dc32bf0488f8eed1c4790aec8f054577f7c5c2";
+    const D_ALL: &str = "756ad326b9d0e363b1359566e1992e0bcdaa19c4939f0c7ad890dcfea3f9fd4a";
+    const D_FILE: &str = "d569b20cbdd570395fd77fa48b21cf76be5842248a2b7571ea17204e6b907e59";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// A presigned URL of the lab-free bucket for `key`, signed over
+    /// `signed`, `extra` query parameters first (built at run time).
+    fn presigned(key: &str, extra: &str, signed: &str) -> PresignedUrl {
+        let credential = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261017%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261017T101530Z";
+        let url = format!("https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/{key}?{extra}{credential}&X-Amz-Expires=300&X-Amz-SignedHeaders={}&X-Amz-Signature={}", signed.replace(';', "%3B"), "e".repeat(64));
+        PresignedUrl::new(url).unwrap()
+    }
+
+    /// Each transfer's URL must fit its bytes: a push of the main transcript
+    /// writes the segment at `from` or a base from 0, a subtree file its own
+    /// sha256's `File`; a tail the tail at `from`; a pull part a key of the
+    /// rel's session; never another session's, the Mac's own (a push) or the
+    /// egress check's; the op's signed headers exactly; no query beyond the
+    /// signature's but a pull part's `versionId`.
+    #[test]
+    fn transfer_requests_refuse_a_key_that_does_not_fit_their_bytes() {
+        let rel = format!("{SLUG}/{ID}.jsonl");
+        let sub = format!("{SLUG}/{ID}/subagents/agent-a1.jsonl");
+        let other = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+        let seg = format!("v1/{ID}/vm/g1/s/000000000000bc55");
+        let push = TranscriptPush { rel: rel.clone(), from: 48213, len: 3787, sha256: D_SEGMENT.into(), url: presigned(&seg, "", SIGNED_HEADERS_PUT), owner: "123456789012".into(), proxy: Some("http://10.42.0.10:3128".into()) };
+        assert_eq!(push.check(), Ok(()));
+        let base = TranscriptPush { from: 0, url: presigned(&format!("v1/{ID}/vm/g2/base"), "", SIGNED_HEADERS_PUT), ..push.clone() };
+        assert_eq!(base.check(), Ok(()));
+        let file = TranscriptPush { rel: sub.clone(), from: 0, sha256: D_FILE.into(), url: presigned(&format!("v1/{ID}/vm/f/{D_FILE}"), "", SIGNED_HEADERS_PUT), ..push.clone() };
+        assert_eq!(file.check(), Ok(()));
+        for (bad, why) in [
+            (TranscriptPush { from: 48212, ..push.clone() }, "does not fit"),
+            (TranscriptPush { from: 1, ..base.clone() }, "does not fit"),
+            (TranscriptPush { rel: sub.clone(), ..push.clone() }, "does not fit"),
+            (TranscriptPush { rel: rel.clone(), ..file.clone() }, "does not fit"),
+            (TranscriptPush { sha256: D_BASE.into(), ..file.clone() }, "does not fit"),
+            (TranscriptPush { url: presigned(&format!("v1/{other}/vm/g1/s/000000000000bc55"), "", SIGNED_HEADERS_PUT), ..push.clone() }, "does not fit"),
+            (TranscriptPush { url: presigned(&format!("v1/{ID}/mac/{D_SEGMENT}"), "", SIGNED_HEADERS_PUT), ..push.clone() }, "does not fit"),
+            (TranscriptPush { url: presigned(&format!("v1/{ID}/vm/g1/t/000000000000bc55"), "", SIGNED_HEADERS_PUT), ..push.clone() }, "does not fit"),
+            (TranscriptPush { url: presigned("v1/_egress-check/abcd1234", "", SIGNED_HEADERS_PUT), ..push.clone() }, "does not fit"),
+            (TranscriptPush { url: presigned("x/_egress-check/abcd1234", "", SIGNED_HEADERS_PUT), ..push.clone() }, "does not fit"),
+            (TranscriptPush { url: presigned("", "", SIGNED_HEADERS_PUT), ..push.clone() }, "names no object"),
+            (TranscriptPush { url: presigned(&seg, "", SIGNED_HEADERS_GET), ..push.clone() }, "signed over other headers"),
+            (TranscriptPush { url: presigned(&seg, "versionId=fv1&", SIGNED_HEADERS_PUT), ..push.clone() }, "carrying versionId"),
+            (TranscriptPush { url: presigned(&seg, "partNumber=1&uploadId=fu1&", SIGNED_HEADERS_PUT), ..push.clone() }, "carrying partNumber"),
+            (TranscriptPush { len: 0, ..push.clone() }, "pushes 0 bytes"),
+            (TranscriptPush { len: PUSH_MAX + 1, ..push.clone() }, "(1 to 4294967296)"),
+            (TranscriptPush { sha256: D_SEGMENT.to_uppercase(), ..push.clone() }, "sha256 that is not"),
+            (TranscriptPush { owner: "12345678901".into(), ..push.clone() }, "bucket owner"),
+            (TranscriptPush { proxy: Some("http://8.8.8.8:3128".into()), ..push.clone() }, "the proxy"),
+            (TranscriptPush { rel: format!("{SLUG}/x.jsonl"), ..push.clone() }, "the transcript's rel"),
+        ] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert!(!e.contains(&"e".repeat(64)), "never the signature: {e}");
+        }
+        let part = |key: &str, extra: &str, sha: Option<&str>| PullPart { url: presigned(key, extra, SIGNED_HEADERS_GET), len: 10, sha256: sha.map(str::to_string) };
+        let pull = TranscriptPull {
+            rel: rel.clone(),
+            parts: vec![part(&format!("v1/{ID}/mac/{D_BASE}"), "versionId=fv1&", Some(D_BASE)), part(&seg, "versionId=fv2&", Some(D_SEGMENT)), part(&format!("v1/{ID}/vm/g1/t/000000000000cb20"), "", None)],
+            sha256: Some(D_ALL.into()),
+            owner: "123456789012".into(),
+            proxy: None,
+        };
+        assert_eq!(pull.check(), Ok(()));
+        for (bad, why) in [
+            (TranscriptPull { parts: vec![part(&format!("v1/{other}/vm/g1/base"), "", Some(D_BASE))], ..pull.clone() }, "not of the rel's session"),
+            (TranscriptPull { parts: vec![part("v1/_egress-check/abcd1234", "", Some(D_BASE))], ..pull.clone() }, "not of the rel's session"),
+            (TranscriptPull { parts: vec![part(&seg, "", None)], ..pull.clone() }, "no tail"),
+            (TranscriptPull { parts: vec![part(&seg, "uploadId=fu1&", Some(D_SEGMENT))], ..pull.clone() }, "carrying uploadId"),
+            (TranscriptPull { parts: vec![PullPart { url: presigned(&seg, "", SIGNED_HEADERS_PUT), len: 1, sha256: Some(D_SEGMENT.into()) }], ..pull.clone() }, "signed over other headers"),
+            (TranscriptPull { parts: Vec::new(), ..pull.clone() }, "pulls 0 parts"),
+            (TranscriptPull { parts: vec![part(&seg, "", Some(D_SEGMENT)); PULL_PARTS_MAX + 1], ..pull.clone() }, "pulls 129 parts"),
+            (TranscriptPull { parts: vec![PullPart { len: PULL_MAX + 1, ..part(&seg, "", Some(D_SEGMENT)) }], ..pull.clone() }, "in all"),
+            (TranscriptPull { sha256: Some("x".into()), ..pull.clone() }, "sha256 that is not"),
+            // A tail is only ever the main transcript's (S9 §13, I2): never part of another file.
+            (TranscriptPull { rel: sub.clone(), parts: vec![part(&format!("v1/{ID}/vm/f/{D_FILE}"), "", Some(D_FILE)), part(&format!("v1/{ID}/vm/g1/t/0000000000001000"), "", None)], sha256: None, ..pull.clone() }, "a tail (part number 1) into a rel that is not"),
+        ] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        assert_eq!(TranscriptPull { rel: sub.clone(), parts: vec![part(&format!("v1/{ID}/vm/f/{D_FILE}"), "", Some(D_FILE))], sha256: Some(D_FILE.into()), ..pull.clone() }.check(), Ok(()), "a subtree file's own key");
+        let tail = TranscriptTail { rel: rel.clone(), from: 52000, url: presigned(&format!("v1/{ID}/vm/g1/t/000000000000cb20"), "", SIGNED_HEADERS_TAIL), owner: "123456789012".into(), proxy: None, expires_at: 1_792_235_730 };
+        assert_eq!(tail.check(), Ok(()));
+        for (bad, why) in [
+            (TranscriptTail { rel: sub.clone(), ..tail.clone() }, "a tail is only ever the session's main transcript"),
+            (TranscriptTail { rel: sub.clone(), from: 0, url: presigned(&format!("v1/{ID}/vm/g1/t/0000000000000000"), "", SIGNED_HEADERS_TAIL), ..tail.clone() }, "is not <slug>/<uuid>.jsonl"),
+            (TranscriptTail { from: 52001, ..tail.clone() }, "not the tail at from"),
+            (TranscriptTail { url: presigned(&seg, "", SIGNED_HEADERS_TAIL), ..tail.clone() }, "not the tail at from"),
+            (TranscriptTail { url: presigned(&format!("v1/{ID}/vm/g1/t/000000000000cb20"), "", SIGNED_HEADERS_PUT), ..tail.clone() }, "signed over other headers"),
+        ] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        let q = StatQuery { rel: rel.clone(), from: Some(48213), fp: Some(D_BASE.into()), subtree: true };
+        assert_eq!(q.check(), Ok(()));
+        assert_eq!(q.pairs(), vec![("rel", rel.clone()), ("from", "48213".to_string()), ("fp", D_BASE.to_string()), ("subtree", "true".to_string())]);
+        assert_eq!(StatQuery { rel: rel.clone(), from: None, fp: None, subtree: false }.pairs(), vec![("rel", rel.clone())]);
+        for (bad, why) in [
+            (StatQuery { from: None, ..q.clone() }, "without from"),
+            (StatQuery { fp: Some("ab".into()), ..q.clone() }, "64 lowercase hex"),
+            (StatQuery { rel: sub.clone(), ..q.clone() }, "subtree of a rel"),
+        ] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        let v = ViewQuery { rel: rel.clone(), n: 10 };
+        assert_eq!((v.check(), v.pairs()), (Ok(()), vec![("rel", rel.clone()), ("n", "10".to_string())]));
+        for (bad, why) in [(ViewQuery { n: 0, ..v.clone() }, "0 messages"), (ViewQuery { n: 51, ..v.clone() }, "51 messages"), (ViewQuery { rel: sub, ..v.clone() }, "the view of a rel")] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
     }
 }

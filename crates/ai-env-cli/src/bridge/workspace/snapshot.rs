@@ -38,7 +38,9 @@ pub const LARGEST_NAMED: usize = 5;
 /// `objects/info/alternates` reads the user's. Removed, with everything in
 /// it, when dropped; one a process left when it exited under it (no
 /// destructor runs at `process::exit`: the wrapper's close abandons a
-/// running fetch) goes when the next one is made (`sweep_tmp`).
+/// running fetch) goes when the next one is made (`sweep_tmp`), and the
+/// wrapper removes its own once its close's waits are over (S9:
+/// [`remove_own_scratch`]).
 #[derive(Debug)]
 pub struct Scratch {
     dir: tempfile::TempDir,
@@ -64,6 +66,29 @@ fn sweep_tmp(tmp: &Path) {
         match std::fs::remove_dir_all(entry.path()) {
             // Another process's sweep took it first.
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("the scratch directory {} of a process that is gone was not removed: {e}", entry.path().display()),
+            _ => {}
+        }
+    }
+}
+
+/// Remove this process's own scratch directories under `state/tmp/` (each
+/// `<prefix>-<pid>-*` directory of its pid: a code-out's, a seed's, any
+/// other's), as the wrapper exits (S9: after its close's waits,
+/// a fetch given up at `codeout::CLOSE_WAIT` leaves its scratch repository,
+/// whose alternates name the user's object store, and perhaps a pack never
+/// scanned, until another process's sweep). A run still at work in one
+/// fails, which nothing waits for any more. Best effort: a failure is logged.
+pub fn remove_own_scratch(paths: &Paths) {
+    let Ok(entries) = std::fs::read_dir(paths.tmp()) else { return };
+    let own = std::process::id();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let pid = name.to_str().and_then(|n| n.rsplit('-').nth(1)).and_then(|p| p.parse::<u32>().ok());
+        if pid != Some(own) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("this process's scratch directory {} was not removed: {e}", entry.path().display()),
             _ => {}
         }
     }
@@ -227,7 +252,15 @@ struct Untracked {
 /// ([`shown_path`]: a custom tripwire's match is never scrubbed).
 fn largest(set: &ScanSet, mut files: Vec<(String, u64)>) -> String {
     files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    files.iter().take(LARGEST_NAMED).map(|(p, s)| format!("{} ({})", crate::wire::redact::scrub(&shown_path(set, p)), human_bytes(*s))).collect::<Vec<_>>().join(", ")
+    files.iter().take(LARGEST_NAMED).map(|(p, s)| format!("{} ({})", noted(set, p), human_bytes(*s))).collect::<Vec<_>>().join(", ")
+}
+
+/// `path` as a note or a refusal names it: a path one of `set`'s rules
+/// matches is `a path name` ([`shown_path`]), and what is left is scrubbed
+/// (S9: a seed's notes of what it does not carry name their paths this way,
+/// as [`largest`] does).
+fn noted(set: &ScanSet, path: &str) -> String {
+    crate::wire::redact::scrub(&shown_path(set, path)).into_owned()
 }
 
 /// [`git_failed`] for a git run whose text names the user's files: when one
@@ -257,35 +290,35 @@ pub fn human_bytes(n: u64) -> String {
 /// The untracked, not ignored files of the worktree (`ls-files --others
 /// --exclude-standard` against `git`'s index), vetted: regular files and
 /// symlinks are kept; a nested repository (listed as `dir/`), a FIFO, a
-/// socket or a device is noted and left out. Then the caps: at most
-/// `max_untracked_files` files, none over `max_blob_bytes`, at most
-/// `max_wip_bytes` in all, else `wip_too_large` naming the largest (as
-/// `set`'s rules let them be shown, [`largest`]). A file it cannot stat
-/// fails, named the same way.
+/// socket or a device is noted and left out, its path named as `set`'s
+/// rules let it be shown ([`noted`]: the note reaches stderr). Then the
+/// caps: at most `max_untracked_files` files, none over `max_blob_bytes`, at
+/// most `max_wip_bytes` in all, else `wip_too_large` naming the largest (the
+/// same way, [`largest`]). A file it cannot stat fails, named the same way.
 fn untracked(ws: &WorkspaceRef, git: &GitRun, lim: &SeedLimits, set: &ScanSet, notes: &mut Vec<String>) -> Result<Vec<Untracked>, BridgeError> {
     let out = git.output(["ls-files", "-z", "--others", "--exclude-standard"]).map_err(git_failed("git ls-files of the untracked files"))?;
     let mut kept = Vec::new();
     for raw in out.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let Ok(path) = std::str::from_utf8(raw) else {
-            notes.push(format!("an untracked file whose name is not UTF-8 is not carried ({})", String::from_utf8_lossy(raw)));
+            notes.push(format!("an untracked file whose name is not UTF-8 is not carried ({})", noted(set, &String::from_utf8_lossy(raw))));
             continue;
         };
-        if let Some(dir) = path.strip_suffix('/') {
-            notes.push(format!("{dir}/ is a nested repository: not carried"));
+        if path.ends_with('/') {
+            notes.push(format!("{} is a nested repository: not carried", noted(set, path)));
             continue;
         }
         let meta = match std::fs::symlink_metadata(ws.root.join(path)) {
             Ok(m) => m,
             // Gone since it was listed: nothing to carry.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot stat {}: {e}", crate::wire::redact::scrub(&shown_path(set, path)))))),
+            Err(e) => return Err(BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot stat {}: {e}", noted(set, path))))),
         };
         let kind = meta.file_type();
         if kind.is_file() || kind.is_symlink() {
             kept.push(Untracked { path: path.to_string(), size: meta.size() });
         } else {
             let what = if kind.is_dir() { "a directory" } else { "not a regular file (a FIFO, a socket or a device)" };
-            notes.push(format!("{path} is {what}: not carried"));
+            notes.push(format!("{} is {what}: not carried", noted(set, path)));
         }
     }
     let all = || kept.iter().map(|u| (u.path.clone(), u.size)).collect::<Vec<_>>();
@@ -469,4 +502,39 @@ pub fn snapshot(ws: &WorkspaceRef, scratch: &Scratch, lim: &SeedLimits, set: &Sc
         added: added.into_iter().collect(),
         notes,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S9: as the wrapper exits, its own scratch directories under
+    /// `state/tmp/` go with what is in them (a fetch's, a seed's, any other
+    /// prefix's); another process's (pid 1 runs), a file named
+    /// as one of this pid's and a name without a pid stay; with no
+    /// `state/tmp/` there is nothing to do.
+    #[test]
+    fn a_process_removes_its_own_scratch_directories_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let tmp = paths.tmp();
+        let own = std::process::id();
+        let mine = [format!("fetch-{own}-a1b2c3"), format!("seed-{own}-d4e5f6"), format!("transcript-{own}-g7h8i9")];
+        let theirs = ["fetch-1-j0k1l2".to_string(), format!("codeout-{}-m3n4o5", own + 1)];
+        for name in mine.iter().chain(&theirs) {
+            std::fs::create_dir_all(tmp.join(name).join("repo.git/objects/pack")).unwrap();
+            std::fs::write(tmp.join(name).join("repo.git/objects/pack/pack-x.pack"), b"PACK").unwrap();
+        }
+        let stray = format!("stray-{own}-p6q7r8");
+        std::fs::write(tmp.join(&stray), b"a file, not a scratch directory").unwrap();
+        std::fs::create_dir_all(tmp.join("no-pid-here")).unwrap();
+        remove_own_scratch(&paths);
+        let mut left: Vec<String> = std::fs::read_dir(&tmp).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        let mut want: Vec<String> = theirs.to_vec();
+        want.extend([stray, "no-pid-here".to_string()]);
+        want.sort();
+        assert_eq!(left, want);
+        remove_own_scratch(&Paths::from_root_and_env(dir.path().join("none"), None));
+    }
 }

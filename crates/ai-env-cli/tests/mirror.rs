@@ -12,10 +12,12 @@
 //! S8 (plans/s8-design-tests.md §2.2): four of the five run on both links
 //! (`on_links!`), the remote half the wrapper in remote mode against the
 //! rig's in-process shim (`tests/common/remote.rs`), whose CLI's frames name
-//! the Mac's `~/.claude` (Design A). On the remote link T2.2 also runs a
-//! session: the Mac's mirror is the VM's own transcript, byte for byte
-//! (T8.4), and the writer, confined to the session's project, refuses the
-//! frames of any other.
+//! the Mac's `~/.claude` (Design A). Since S9's S3 cut-over a remote chat's
+//! transcript is kept in S3, never on this Mac: on the remote link no frame
+//! is written anywhere (`AI_ENV_BRIDGE_MIRROR_ROOT` included), each one is
+//! dropped and counted (`mirror_dropped:<n>`), and none reaches the host; on
+//! that link T2.2 also runs a session, whose transcript stays on the VM's
+//! disk while the Mac keeps at most the chat's view.
 mod common;
 
 use ai_env_cli::bridge::mirror::{MirrorCfg, Writer};
@@ -62,13 +64,13 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
 on_links!(
     /// T2.2: the writer lays the frames' entries down byte for byte, in
     /// order, confined to its root (3 rejected shapes, nothing written for
-    /// them). On the remote link the same, then through a session
-    /// ([`remote_mirror_is_the_vms_transcript`]).
+    /// them). On the remote link the same, then through a session, which
+    /// mirrors nothing ([`remote_frames_are_dropped_and_counted`]).
     t2_2_writer_byte_equality_and_confinement,
     |link| {
         writer_byte_equality_and_confinement();
         if link.is_remote() {
-            remote_mirror_is_the_vms_transcript(link);
+            remote_frames_are_dropped_and_counted(link);
         }
     }
 );
@@ -134,14 +136,16 @@ fn writer_byte_equality_and_confinement() {
     }
 }
 
-/// T2.2 through a remote session (T8.4): the VM's CLI writes its own
-/// transcript and mirrors it frame by frame (`FAKE_WRITE_TRANSCRIPT`, two
-/// turns, a last frame after the EOF), into the Mac's projects dir with no
-/// mirror root: the Mac's copy is the VM's file, byte for byte, 0600 in
-/// 0700 dirs. Frames whose path is another project's, `..` out of the root
-/// or of a shape no transcript has are refused, and nothing is written for
-/// them: the writer is confined to the session's own project.
-fn remote_mirror_is_the_vms_transcript(link: Link) {
+/// T2.2 through a remote session after S9's S3 cut-over: the VM's CLI
+/// writes its own transcript (`FAKE_WRITE_TRANSCRIPT`, two turns, a last
+/// entry after the EOF) and prints mirror frames anyway: the last one and
+/// three of other shapes (another project, `..` out of the root, a shape no
+/// transcript has). Its argv carries no `--session-mirror`. Every frame is
+/// dropped and counted (`mirror:0/0`, `mirror_dropped:4`), none reaches the
+/// host, nothing lands beside the projects root, and the Mac's projects dir
+/// holds no line of the VM's transcript: at most the chat's view (each line
+/// the view's mark), which the turns' syncs write.
+fn remote_frames_are_dropped_and_counted(link: Link) {
     let p = Harness::prepare();
     let sid = fake_fixed_sid();
     let (slug, projects) = (p.slug(), p.mac_projects());
@@ -164,16 +168,18 @@ fn remote_mirror_is_the_vms_transcript(link: Link) {
     let transcript = h.transcript();
     assert_eq!(status.code(), Some(0), "{transcript}");
     assert!(!h.out_lines().iter().any(|l| l.contains("transcript_mirror")), "a mirror frame reached the host\n{transcript}");
-    let mac = projects.join(&slug).join(format!("{sid}.jsonl"));
+    assert!(!h.argv_log().iter().flatten().any(|a| a == "--session-mirror"), "{:?}", h.argv_log());
     let vm = h.vm_projects().join(&slug).join(format!("{sid}.jsonl"));
-    let (mac_text, vm_text) = (std::fs::read(&mac).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", mac.display())), std::fs::read(&vm).unwrap_or_else(|e| panic!("{}: {e}", vm.display())));
-    assert_eq!(mac_text, vm_text, "the Mac's mirror is the VM's transcript, byte for byte");
-    assert_eq!(String::from_utf8_lossy(&mac_text).lines().count(), 5, "two turns of two entries, then the last frame's summary");
-    assert_eq!(files_under(&projects), vec![mac.clone()], "nothing written for a refused frame");
+    let vm_text = String::from_utf8(std::fs::read(&vm).unwrap_or_else(|e| panic!("{}: {e}", vm.display()))).unwrap();
+    assert!(vm_text.lines().last().is_some_and(|l| l.contains(r#""type":"summary""#)), "the VM's transcript holds both turns and the last entry: {vm_text}");
+    for f in files_under(&projects) {
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.lines().all(|l| l.starts_with(ai_env_cli::wire::view::VIEW_MARK_PREFIX)), "{} is no view: {text}", f.display());
+        assert!(vm_text.lines().all(|l| !text.contains(l)), "a line of the VM's transcript on the Mac, in {}", f.display());
+    }
     assert!(!escaped(&projects), "nothing landed beside the projects root");
-    assert_eq!(mode(&mac), 0o600, "{}", mac.display());
-    assert_eq!(mode(&projects.join(&slug)), 0o700);
-    assert!(note_has(&h.end_note(), "mirror:3/3"), "three frames mirrored, three refused: {}", h.end_note());
+    let note = h.end_note();
+    assert!(note_has(&note, "mirror:0/0") && note_has(&note, "mirror_dropped:4"), "every frame dropped and counted: {note}");
     h.assert_remote_end(link);
 }
 
@@ -197,8 +203,11 @@ fn frames_file(p: &common::Prepared, sid: &str) -> (PathBuf, Vec<&'static str>, 
 }
 
 on_links!(
-    /// Mirror frames are written where `AI_ENV_BRIDGE_MIRROR_ROOT` says and
-    /// never reach the host; the noise line between them is forwarded verbatim.
+    /// Mirror frames never reach the host; the noise line between them is
+    /// forwarded verbatim. A local child's are written where
+    /// `AI_ENV_BRIDGE_MIRROR_ROOT` says; a remote session's (S9: its
+    /// transcript is kept in S3) nowhere, the root included: dropped and
+    /// counted.
     frames_are_never_forwarded,
     |link| {
         let p = Harness::prepare();
@@ -218,19 +227,25 @@ on_links!(
         assert_eq!(out.iter().filter(|l| *l == noise).count(), 1, "the noise line is forwarded verbatim\n{transcript}");
         let at = out.iter().position(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| is_init(&v))).expect("init");
         assert_eq!(out.get(at + 1).map(String::as_str), Some(noise), "nothing but the noise follows the init\n{transcript}");
-        let mirrored = mirror.join(&slug).join(format!("{sid}.jsonl"));
-        assert_eq!(std::fs::read_to_string(&mirrored).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", mirrored.display())), joined(&entries));
         assert!(!h.prepared.mac_projects().exists(), "the wrapper wrote nothing under the Mac's projects root");
         let note = h.end_note();
-        assert!(note_has(&note, "mirror:2/0"), "{note}");
-        assert!(h.wrapper_log().contains("mirror writer enabled:"), "{}", h.wrapper_log());
+        if link.is_remote() {
+            assert!(!mirror.exists(), "a remote session writes nothing, its mirror root included: {:?}", files_under(&mirror));
+            assert!(note_has(&note, "mirror:0/0") && note_has(&note, "mirror_dropped:2"), "{note}");
+            assert!(h.wrapper_log().contains("mirror writer disabled: a remote chat's transcript is kept in S3"), "{}", h.wrapper_log());
+        } else {
+            let mirrored = mirror.join(&slug).join(format!("{sid}.jsonl"));
+            assert_eq!(std::fs::read_to_string(&mirrored).unwrap_or_else(|e| panic!("{}: {e}\n{transcript}", mirrored.display())), joined(&entries));
+            assert!(note_has(&note, "mirror:2/0"), "{note}");
+            assert!(h.wrapper_log().contains("mirror writer enabled:"), "{}", h.wrapper_log());
+        }
         h.assert_remote_end(link);
     }
 );
 
 /// Local only: a local child writes its own transcript, so without a mirror
-/// root there is nothing to mirror. A remote child's writer is always on,
-/// confined to the session's project (`t2_2_writer_byte_equality_and_confinement::remote`).
+/// root there is nothing to mirror. A remote child never has a writer (S9:
+/// `t2_2_writer_byte_equality_and_confinement::remote`).
 #[test]
 fn writer_disabled_without_mirror_root_in_local_child() {
     let p = Harness::prepare();
@@ -271,7 +286,8 @@ fn run_frames(link: Link, p: common::Prepared, frames: &str) -> (PathBuf, Harnes
 on_links!(
     /// A subagent frame carrying one transcript entry and one `agent_metadata`
     /// entry: the `.jsonl` gets only the transcript line, the `.meta.json`
-    /// companion the metadata without its `type` (0600).
+    /// companion the metadata without its `type` (0600). A remote session
+    /// writes neither (S9): the frame dropped and counted.
     agent_metadata_frame_writes_the_meta_json,
     |link| {
         let p = Harness::prepare();
@@ -282,6 +298,10 @@ on_links!(
         let fp = serde_json::to_string(&format!("{}/{slug}/{sid}/subagents/agent-a1.jsonl", p.mac_projects().display())).unwrap();
         let frames = format!("{{\"type\":\"transcript_mirror\",\"filePath\":{fp},\"entries\":[{entry},{meta}]}}\n{{\"type\":\"stream_event\",\"event\":{{\"type\":\"ping\"}}}}\n");
         let (mirror, h) = run_frames(link, p, &frames);
+        if link.is_remote() {
+            assert!(!mirror.exists() && note_has(&h.end_note(), "mirror_dropped:1"), "{}", h.end_note());
+            return;
+        }
         let dir = mirror.join(&slug).join(&sid).join("subagents");
         let jsonl = dir.join("agent-a1.jsonl");
         let meta_json = dir.join("agent-a1.meta.json");
@@ -301,7 +321,8 @@ on_links!(
 
 on_links!(
     /// The stdout serializer escapes U+2028/U+2029 (` `, ` `); the CLI's
-    /// file line holds the raw characters, and so must the mirror.
+    /// file line holds the raw characters, and so must the mirror. A remote
+    /// session writes none (S9): the frame dropped and counted.
     line_separator_escapes_are_unescaped,
     |link| {
         let p = Harness::prepare();
@@ -311,6 +332,10 @@ on_links!(
         let fp = serde_json::to_string(&format!("{}/{slug}/{sid}.jsonl", p.mac_projects().display())).unwrap();
         let frames = format!("{{\"type\":\"transcript_mirror\",\"filePath\":{fp},\"entries\":[{entry}]}}\n{{\"type\":\"stream_event\",\"event\":{{\"type\":\"ping\"}}}}\n");
         let (mirror, h) = run_frames(link, p, &frames);
+        if link.is_remote() {
+            assert!(!mirror.exists() && note_has(&h.end_note(), "mirror_dropped:1"), "{}", h.end_note());
+            return;
+        }
         let file = mirror.join(&slug).join(format!("{sid}.jsonl"));
         let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}\n{}", file.display(), h.transcript()));
         let want = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a\u{2028}b\u{2029}c \\\\u2028 stays\"}}\n";
@@ -374,20 +399,25 @@ fn t2_1_captured_frames_match_real_file() {
     if w.rejected > 0 || w.errors > 0 {
         println!("FAIL: {} frame(s) rejected, {} append error(s)", w.rejected, w.errors);
     }
-    // Every mirrored .jsonl equals the real file, byte for byte.
+    // Every mirrored .jsonl equals the real file, byte for byte, but the lines no mirror frame carries (S9:
+    // 2.1.302's api-request records, `common::mirrored`), which are printed.
     let written: Vec<PathBuf> = files_under(dest.path()).into_iter().filter(|p| is_ext(p, "jsonl")).collect();
     equal &= !written.is_empty();
     for f in &written {
         let rel = f.strip_prefix(dest.path()).unwrap();
         let mirrored = std::fs::read(f).unwrap();
-        let real = std::fs::read(projects.join(rel));
-        let ok = real.as_ref().is_ok_and(|r| *r == mirrored);
-        let real_len = real.as_ref().map_or_else(|e| format!("unreadable ({e})"), |r| format!("{} bytes", r.len()));
+        let real = std::fs::read(projects.join(rel)).map(|r| (common::mirrored(&r), r));
+        let ok = real.as_ref().is_ok_and(|(carried, _)| *carried == mirrored);
+        let real_len = real.as_ref().map_or_else(|e| format!("unreadable ({e})"), |(carried, r)| format!("{} bytes ({} carried by frames)", r.len(), carried.len()));
         println!("{}: mirrored {} bytes, real {real_len}, equal {ok}", rel.display(), mirrored.len());
-        if !ok {
-            if let Ok(r) = &real {
-                let at = r.iter().zip(&mirrored).position(|(a, b)| a != b).unwrap_or_else(|| r.len().min(mirrored.len()));
-                println!("  first difference at byte {at}");
+        if let Ok((carried, r)) = &real {
+            for line in r.split_inclusive(|b| *b == b'\n').filter(|l| ai_env_cli::wire::mirror::is_unmirrored(l)) {
+                let shown = String::from_utf8_lossy(line);
+                println!("  dropped (no frame carries it): {}", shown.trim_end().chars().take(160).collect::<String>());
+            }
+            if !ok {
+                let at = carried.iter().zip(&mirrored).position(|(a, b)| a != b).unwrap_or_else(|| carried.len().min(mirrored.len()));
+                println!("  first difference at byte {at} (of the lines frames carry)");
             }
         }
         equal &= ok;

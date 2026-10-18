@@ -16,6 +16,13 @@
 // operator identities too): the guard refuses all three; `make deploy`'s replacement guard covers the VPC, subnets, SGs and
 // connector, and check-plan refuses replacing or deleting the deployer's identity. The proxy configuration lives in
 // SSM Parameter Store, never in user-data (a user-data change replaces the instance).
+//
+// S9 (plans/s9-contracts.md §7.1, §7.7): the S3 gateway endpoint ai-env-s3 on the proxy's route table only (never the
+// VM table: squid stays the only way out of the VMs), its policy policies.ts s3EndpointPolicy; the `allow` parameter
+// carries the transcripts bucket's virtual-hosted name after allow.txt (egress-spec.ts allowValue). The guard checks the
+// endpoint and the transcripts bucket's resources (transcripts.ts) input by input, their policies against policies.ts
+// for the stack's account. The scratch:endpoint-table and scratch:endpoint-policy markers are edited by `make
+// preview-scratch NEGATIVE=endpoint-on-vm-table|endpoint-policy-widen` in a scratch copy.
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -25,13 +32,15 @@ import * as awsnative from "@pulumi/aws-native";
 import {
     AMI_PARAMETER, DOCUMENT_ROLES, DocumentRole, EgressConfig, EgressSpec, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY,
     ImageNames, NET, NaclRuleSpec, PARAMETER_MAX_BYTES, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, ProxyParameter, RouteSpec, RuleSpec, SgKey,
-    VM_SG_DESCRIPTION, checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, inInventory, ruleName, ruleOwner,
-    stackInventory,
+    VM_SG_DESCRIPTION, allowValue, checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, inInventory, ruleName,
+    ruleOwner, stackInventory,
 } from "./egress-spec";
 import {
-    CONNECTOR_OPERATOR_POLICY_ARN, Names, POLICY_DESCRIPTIONS, REGION, RUNTIME_USER_NAME, SSM_INSTANCE_POLICY_ARN, USER_POLICY_ATTACHMENTS, attachmentName, operatorRolePolicy,
-    operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy,
+    CONNECTOR_OPERATOR_POLICY_ARN, Names, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RUNTIME_USER_NAME, S3_ENDPOINT_SERVICE, SSM_INSTANCE_POLICY_ARN, TRANSCRIPTS_RESOURCE,
+    USER_POLICY_ATTACHMENTS, attachmentName, canonicalPolicyText, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy, s3EndpointPolicy,
+    transcriptsBucketName, transcriptsBucketPolicy,
 } from "./policies";
+import { TRANSCRIPTS_LIFECYCLE } from "./transcripts";
 
 /** The operator role must be assumable before CreateNetworkConnector (IAM is eventually consistent; image.ts waits 15 s). */
 const CONNECTOR_IAM_PROPAGATION_MS = 30_000;
@@ -147,10 +156,23 @@ const T = {
     fwConfig: "aws:route53/resolverFirewallConfig:ResolverFirewallConfig",
     queryLog: "aws:route53/resolverQueryLogConfig:ResolverQueryLogConfig",
     queryLogAssociation: "aws:route53/resolverQueryLogConfigAssociation:ResolverQueryLogConfigAssociation",
+    // S9: the S3 gateway endpoint and the transcripts bucket's resources (transcripts.ts).
+    endpoint: "aws:ec2/vpcEndpoint:VpcEndpoint",
+    bucket: "aws:s3/bucket:Bucket",
+    versioning: "aws:s3/bucketVersioning:BucketVersioning",
+    encryption: "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration",
+    ownership: "aws:s3/bucketOwnershipControls:BucketOwnershipControls",
+    publicAccess: "aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock",
+    lifecycle: "aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration",
+    bucketPolicy: "aws:s3/bucketPolicy:BucketPolicy",
 } as const;
 
-/** Ids the guard compares references against (tracked right after each resource is created). */
-type IdKey = "vpc" | "dhcp" | "igw" | "nacl" | "fw-list" | "fw-group" | "query-log" | `subnet:${"proxy" | "vms"}` | `rt:${"proxy" | "vms"}` | `sg:${SgKey}`;
+/**
+ * Ids the guard compares references against (tracked right after each resource is created). S9 adds the stack's
+ * account (the policies the guard compares are built for it), the S3 gateway endpoint and the transcripts bucket.
+ */
+type IdKey = "vpc" | "dhcp" | "igw" | "nacl" | "fw-list" | "fw-group" | "query-log" | `subnet:${"proxy" | "vms"}` | `rt:${"proxy" | "vms"}` | `sg:${SgKey}`
+    | "account" | "s3-endpoint" | "transcripts";
 
 export interface EgressGuard {
     /** Records a resource's id for the guard's reference checks (call right after creating the resource). */
@@ -281,6 +303,26 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             const n = (counts.get(key) ?? 0) + 1;
             counts.set(key, n);
             if (n > max) bad(`${key}: more than ${max} (the spec has exactly ${max})`);
+        };
+        // S9: a resource policy that must be policies.ts's document for the stack's account (the bucket's: and the S3
+        // gateway endpoint's id), compared in canonical form once known. Unknown (a preview of a new dependency) is
+        // check-plan's to hold by URN; known while the endpoint's id is not, it was not built from that endpoint.
+        const wait = pulumi.runtime.isDryRun() ? 5_000 : 600_000;
+        const policyIs = (actual: unknown, build: (acct: string, endpoint: string | undefined) => PolicyDocument, needsEndpoint: boolean) => {
+            if (actual === UNKNOWN) return;
+            if (typeof actual !== "string") { bad("policy must be the policy document's JSON text"); return; }
+            waits.push(Promise.all([within(ids.get("account"), wait), needsEndpoint ? within(ids.get("s3-endpoint"), wait) : Promise.resolve(undefined)]).then(([acct, endpoint]) => {
+                if (acct === undefined) { bad("policy: the stack's account is unknown, so the document cannot be compared"); return; }
+                if (needsEndpoint && endpoint === undefined) { bad("policy is known while the S3 gateway endpoint's id is not: it is not built from that endpoint"); return; }
+                let got: string;
+                try {
+                    got = canonicalPolicyText(actual);
+                } catch {
+                    bad("policy is not JSON");
+                    return;
+                }
+                if (got !== canonicalPolicyText(build(acct, endpoint))) bad("policy is not policies.ts's document for the stack");
+            }));
         };
 
         switch (type) {
@@ -549,8 +591,68 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             ref("resolverQueryLogConfigId", "query-log", props.resolverQueryLogConfigId);
             ref("resourceId", "vpc", props.resourceId);
             break;
+        // S9: the S3 gateway endpoint: Gateway, S3 of the region, exactly the proxy's route table, policies.ts's policy.
+        case T.endpoint: {
+            only("vpcId", "serviceName", "vpcEndpointType", "routeTableIds", "policy", "tags", "region");
+            ref("vpcId", "vpc", props.vpcId);
+            eq("serviceName", S3_ENDPOINT_SERVICE);
+            eq("vpcEndpointType", "Gateway");
+            const tables = props.routeTableIds;
+            if (!Array.isArray(tables) || tables.length !== 1) bad("routeTableIds must be exactly the proxy's route table (never the VM table: squid stays the only way out)");
+            else ref("routeTableIds[0]", "rt:proxy", tables[0]);
+            policyIs(props.policy, (acct) => s3EndpointPolicy({ accountId: acct, transcriptsBucket: transcriptsBucketName(acct) }), false);
+            break;
+        }
+        // S9: the transcripts bucket (the artifacts bucket, auto-named, stays S3's unchecked one) and its settings.
+        case T.bucket:
+            if (name !== TRANSCRIPTS_RESOURCE) break;
+            only("bucket", "forceDestroy", "tags", "region");
+            eq("forceDestroy", true);
+            if (props.bucket !== UNKNOWN) {
+                waits.push(within(ids.get("account"), wait).then((acct) => {
+                    if (acct === undefined || props.bucket !== transcriptsBucketName(acct)) bad(`bucket must be ${acct === undefined ? "ai-env-transcripts-<the stack's account>" : transcriptsBucketName(acct)}, got ${show(props.bucket)}`);
+                }));
+            }
+            break;
+        case T.versioning: {
+            only("bucket", "versioningConfiguration", "region");
+            ref("bucket", "transcripts", props.bucket);
+            const v = (props.versioningConfiguration ?? {}) as Props;
+            if (v.status !== "Enabled" || isSet(v.mfaDelete)) bad(`versioningConfiguration must be exactly { status: "Enabled" }, got ${show(props.versioningConfiguration)}`);
+            break;
+        }
+        case T.encryption: {
+            only("bucket", "rules", "region");
+            ref("bucket", "transcripts", props.bucket);
+            const rules = props.rules;
+            const rule = Array.isArray(rules) && rules.length === 1 ? (rules[0] as Props) : undefined;
+            const sse = (rule?.applyServerSideEncryptionByDefault ?? {}) as Props;
+            if (rule === undefined || sse.sseAlgorithm !== "AES256" || isSet(sse.kmsMasterKeyId) || rule.bucketKeyEnabled === true) bad(`rules must be exactly one SSE-S3 (AES256) rule, got ${show(rules)}`);
+            break;
+        }
+        case T.ownership:
+            only("bucket", "rule", "region");
+            ref("bucket", "transcripts", props.bucket);
+            if (((props.rule ?? {}) as Props).objectOwnership !== "BucketOwnerEnforced") bad(`rule must be { objectOwnership: "BucketOwnerEnforced" }, got ${show(props.rule)}`);
+            break;
+        case T.publicAccess:
+            if (name !== TRANSCRIPTS_RESOURCE) break;
+            only("bucket", "blockPublicAcls", "blockPublicPolicy", "ignorePublicAcls", "restrictPublicBuckets", "region");
+            ref("bucket", "transcripts", props.bucket);
+            for (const k of ["blockPublicAcls", "blockPublicPolicy", "ignorePublicAcls", "restrictPublicBuckets"]) eq(k, true);
+            break;
+        case T.lifecycle:
+            only("bucket", "rules", "region");
+            ref("bucket", "transcripts", props.bucket);
+            if (canonicalPolicyText(props.rules ?? null) !== canonicalPolicyText(TRANSCRIPTS_LIFECYCLE)) bad(`rules must be exactly transcripts.ts TRANSCRIPTS_LIFECYCLE, got ${show(props.rules)}`);
+            break;
+        case T.bucketPolicy:
+            only("bucket", "policy", "region");
+            ref("bucket", "transcripts", props.bucket);
+            policyIs(props.policy, (acct, endpoint) => transcriptsBucketPolicy({ accountId: acct, transcriptsBucket: transcriptsBucketName(acct), s3EndpointId: endpoint }), true);
+            break;
         default:
-            // In the inventory, but without checks here: S3's bucket, its public access block and the zip object.
+            // In the inventory, but without checks here: S3's artifacts bucket, its public access block and the zip object.
             break;
         }
         await Promise.all(waits);
@@ -598,9 +700,16 @@ export interface Egress {
     connector: awsnative.lambda.NetworkConnector;
     /** S8 operators: the proxy's SSM Command documents by role (reload, status, patch). */
     documents: Record<DocumentRole, aws.ssm.Document>;
-    /** Lowercase hex SHA-256 of the exact `squid.conf` and `allow` values the program writes (`ai-env egress status` compares the live ones). */
+    /**
+     * Lowercase hex SHA-256 of the exact `squid.conf` and `allow` values the program writes (`ai-env egress status`
+     * compares the live ones); `allow`'s an Output since S9 (it carries the transcripts bucket's host, the account's).
+     */
     squidConfSha256: string;
-    allowSha256: string;
+    allowSha256: pulumi.Output<string>;
+    /** S9: the S3 gateway endpoint, its policy's JSON as written, and the proxy's route table it sits on. */
+    s3Endpoint: aws.ec2.VpcEndpoint;
+    s3EndpointPolicy: pulumi.Output<string>;
+    proxyRouteTable: aws.ec2.RouteTable;
 }
 
 /** The initial value of a parameter `ai-env egress` owns (an SSM parameter cannot be empty; `#` lines are comments). */
@@ -618,10 +727,14 @@ const OWNED_IGNORE = ["allowedPattern", "arn", "dataType", "description", "insec
 
 /**
  * The egress resources, every one with the Pulumi name the inventory lists. The scratch:* markers are edited by
- * `make preview-scratch NEGATIVE=dns-support-on-in-none-mode|miswired|dns-firewall-qtype|iam-widen|document-widen` in a
- * scratch copy. `docs` are the proxy's documents as index.ts read and asserted them (readProxyDocuments).
+ * `make preview-scratch NEGATIVE=dns-support-on-in-none-mode|miswired|dns-firewall-qtype|iam-widen|document-widen|
+ * endpoint-on-vm-table|endpoint-policy-widen` in a scratch copy. `docs` are the proxy's documents as index.ts read and
+ * asserted them (readProxyDocuments). `accountId` is the stack's account (S9: the transcripts bucket's name, the S3
+ * endpoint's policy and the allow value are built from it alone, so a preview knows them).
  */
-export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi.Output<Names>, docs: ProxyDocuments, tags: Record<string, string>, providers: EgressProviders): Egress {
+export function createEgress(
+    spec: EgressSpec, guard: EgressGuard, names: pulumi.Output<Names>, accountId: pulumi.Output<string>, docs: ProxyDocuments, tags: Record<string, string>, providers: EgressProviders,
+): Egress {
     const cfg = spec.cfg;
     const opts = { provider: providers.aws };
     const named = (name: string) => ({ ...tags, Name: name });
@@ -652,13 +765,28 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
     // Inline, explicit route lists. `pulumi up` does not refresh, so a route (or NACL entry, or default-SG rule) added
     // out of band persists and no preview shows it, the plan check's included (it sees the program's inputs only).
     // The drift check is `ai-env egress status`, which `make deploy` runs at the end.
+    // The association, and the route table itself (S9: the S3 gateway endpoint sits on the proxy's).
     const table = (t: "proxy" | "vms", s: aws.ec2.Subnet) => {
         const rt = spec.routeTables[t];
         const r = new aws.ec2.RouteTable(rt.name, { vpcId: vpc.id, routes: rt.routes.map((x) => ({ cidrBlock: x.cidr, gatewayId: igw.id })), tags: named(rt.name) }, opts);
         guard.track(`rt:${t}`, r.id);
-        return new aws.ec2.RouteTableAssociation(rt.name, { subnetId: s.id, routeTableId: r.id }, opts);
+        return { table: r, association: new aws.ec2.RouteTableAssociation(rt.name, { subnetId: s.id, routeTableId: r.id }, opts) };
     };
     const [proxyRoutes, vmRoutes] = [table("proxy", proxySubnet), table("vms", vmSubnet)]; // scratch:assoc
+
+    // S9: the S3 gateway endpoint, on the proxy's route table only. The proxy reaches S3 through it from now on (its
+    // dnf, the AL2023 repositories its policy allows); the VMs reach S3 only through squid, which serves our bucket's
+    // virtual-hosted name alone, and the endpoint's policy admits nothing but the runtime user's `v1/*` of that bucket.
+    const s3EndpointPolicyJson = accountId.apply((acct) => JSON.stringify(s3EndpointPolicy({ accountId: acct, transcriptsBucket: transcriptsBucketName(acct) })));
+    const s3Endpoint = new aws.ec2.VpcEndpoint(NET.s3Endpoint, {
+        vpcId: vpc.id,
+        serviceName: S3_ENDPOINT_SERVICE,
+        vpcEndpointType: "Gateway",
+        routeTableIds: [proxyRoutes.table.id], // scratch:endpoint-table
+        policy: s3EndpointPolicyJson, // scratch:endpoint-policy
+        tags: named(NET.s3Endpoint),
+    }, opts);
+    guard.track("s3-endpoint", s3Endpoint.id);
 
     // The VM subnet's own network ACL: a second, stateless layer under the VM security group.
     const naclRule = (r: NaclRuleSpec) => ({ ruleNo: r.ruleNo, protocol: r.protocol, action: r.action, cidrBlock: r.cidr, fromPort: r.fromPort, toPort: r.toPort });
@@ -692,7 +820,14 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
 
     // ---- the proxy: log group, parameters, role, profile, instance ----
     const logGroup = new aws.cloudwatch.LogGroup(NET.logGroup, { name: cfg.logGroup, retentionInDays: cfg.logRetentionDays, tags }, opts);
-    const values: Record<ProxyParameter, string> = { "squid.conf": files.squidConf, allow: files.allow, ...OWNED_INITIAL };
+    // S9: allow.txt plus the transcripts bucket's host (egress-spec.ts allowValue), from the account: a preview knows it.
+    const allow = accountId.apply((acct) => {
+        const v = allowValue(files.allow, transcriptsBucketName(acct));
+        const bytes = Buffer.byteLength(v, "utf-8");
+        if (bytes > PARAMETER_MAX_BYTES) throw new Error(`the allow parameter (infra/proxy/allow.txt and the transcripts bucket's host) is ${bytes} bytes, over the ${PARAMETER_MAX_BYTES}-byte standard parameter`);
+        return v;
+    });
+    const values: Record<ProxyParameter, pulumi.Input<string>> = { "squid.conf": files.squidConf, allow, ...OWNED_INITIAL };
     const parameters = {} as Record<ProxyParameter, aws.ssm.Parameter>;
     for (const p of PROXY_PARAMETERS) {
         const owned = p === "extras" || p === "suspended";
@@ -742,7 +877,7 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
         // The fixed private IP cannot be held by two instances.
         deleteBeforeReplace: true,
         // Boot fetches packages (route), the parameters and ships logs: all of it must exist first.
-        dependsOn: [proxyRoutes, dhcpAssociation, ...rules.proxy, logGroup, ...Object.values(parameters), proxyPolicy, proxySsm],
+        dependsOn: [proxyRoutes.association, dhcpAssociation, ...rules.proxy, logGroup, ...Object.values(parameters), proxyPolicy, proxySsm],
     });
 
     // ---- the connector and its operator role ----
@@ -806,12 +941,12 @@ export function createEgress(spec: EgressSpec, guard: EgressGuard, names: pulumi
         deleteBeforeReplace: true,
         // The ENIs come up in a subnet that already has its route table, NACL, rule and DNS settings, and through an
         // operator role whose Deny exists.
-        dependsOn: [vmRoutes, naclAssociation, dhcpAssociation, ...rules.vm, ...dnsFirewall, operatorDeny],
+        dependsOn: [vmRoutes.association, naclAssociation, dhcpAssociation, ...rules.vm, ...dnsFirewall, operatorDeny],
     });
 
     const sha256 = (value: string) => crypto.createHash("sha256").update(value, "utf-8").digest("hex");
     return {
         vpc, vmSubnet, vmSecurityGroup: sgs.vm, proxySecurityGroup: sgs.proxy, instance, logGroup, parameters, proxyRole, operatorRole, connector, documents,
-        squidConfSha256: sha256(values["squid.conf"]), allowSha256: sha256(values.allow),
+        squidConfSha256: sha256(files.squidConf), allowSha256: allow.apply(sha256), s3Endpoint, s3EndpointPolicy: s3EndpointPolicyJson, proxyRouteTable: proxyRoutes.table,
     };
 }

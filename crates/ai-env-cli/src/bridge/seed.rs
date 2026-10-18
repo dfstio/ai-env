@@ -116,7 +116,7 @@ fn seed_local_capped(src_dir: &Path, session_id: &str, dst_projects: &Path, dst_
     let plan = plan(src_dir, session_id)?;
     let total = plan.total_bytes();
     if total > cap {
-        return Err(BridgeError::Config(format!("transcript too large to seed: {total} bytes")));
+        return Err(BridgeError::TranscriptTooLarge { session: session_id.to_string(), bytes: total });
     }
     let mut report = SeedReport { source: Some(src_dir.to_path_buf()), skipped_symlinks: plan.skipped_symlinks, ..SeedReport::default() };
     if plan.jsonl.is_none() && plan.subtree.is_none() {
@@ -158,13 +158,21 @@ fn seed_local_capped(src_dir: &Path, session_id: &str, dst_projects: &Path, dst_
 /// to seed`). A name that is not UTF-8 is left out (no transcript rel can
 /// name it), logged; nothing missing is an empty list.
 pub fn transcript_files(src_dir: &Path, session_id: &str) -> Result<Vec<(String, u64)>, BridgeError> {
+    transcript_files_capped(src_dir, session_id, MAX_SEED_BYTES)
+}
+
+/// [`transcript_files`] with the cap given (S9: `session stage` takes a chat
+/// of any size up to what one multipart upload carries; the reopen's inline
+/// upload `wire::s3::INLINE_MAX`). Over the cap: `TranscriptTooLarge`
+/// (`transcript too large to seed: <n> bytes`, exit 9).
+pub fn transcript_files_capped(src_dir: &Path, session_id: &str, cap: u64) -> Result<Vec<(String, u64)>, BridgeError> {
     if !is_uuid(session_id) {
         return Err(BridgeError::Config(format!("not a session id: {session_id:?}")));
     }
     let plan = plan(src_dir, session_id)?;
     let total = plan.total_bytes();
-    if total > MAX_SEED_BYTES {
-        return Err(BridgeError::Config(format!("transcript too large to seed: {total} bytes")));
+    if total > cap {
+        return Err(BridgeError::TranscriptTooLarge { session: session_id.to_string(), bytes: total });
     }
     let mut out = Vec::new();
     if let Some(len) = plan.jsonl {
@@ -425,6 +433,18 @@ mod tests {
         }
     }
 
+    /// S9: the session, the bytes and the text of a `TranscriptTooLarge`.
+    fn too_large(r: Result<SeedReport, BridgeError>) -> (String, u64, String) {
+        match r {
+            Err(e @ BridgeError::TranscriptTooLarge { .. }) => {
+                let text = e.to_string();
+                let BridgeError::TranscriptTooLarge { session, bytes } = e else { unreachable!() };
+                (session, bytes, text)
+            }
+            other => panic!("expected Err(TranscriptTooLarge), got {other:?}"),
+        }
+    }
+
     /// Every name below `dir`, relative, sorted (for leftover checks).
     fn tree(dir: &Path) -> Vec<String> {
         fn go(base: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -637,13 +657,13 @@ mod tests {
         let src = tmp.path().join("src");
         put(&src.join(format!("{ID}.jsonl")), &[b'x'; 20]);
         let dst_projects = tmp.path().join("dst");
-        assert_eq!(config_msg(seed_local_capped(&src, ID, &dst_projects, "p", 10)), "transcript too large to seed: 20 bytes");
+        assert_eq!(too_large(seed_local_capped(&src, ID, &dst_projects, "p", 10)), (ID.to_string(), 20, "transcript too large to seed: 20 bytes".to_string()));
         assert!(!dst_projects.exists(), "nothing created when over the cap");
         // The subtree counts toward the cap too: 6 + 6 > 10.
         let src2 = tmp.path().join("src2");
         put(&src2.join(format!("{ID}.jsonl")), b"abcdef");
         put(&src2.join(ID).join("subagents/a.jsonl"), b"ghijkl");
-        assert_eq!(config_msg(seed_local_capped(&src2, ID, &dst_projects, "p", 10)), "transcript too large to seed: 12 bytes");
+        assert_eq!(too_large(seed_local_capped(&src2, ID, &dst_projects, "p", 10)).2, "transcript too large to seed: 12 bytes");
         assert!(!dst_projects.exists());
         // Exactly at the cap is fine.
         let src3 = tmp.path().join("src3");
@@ -803,7 +823,10 @@ mod tests {
         let big = tmp.path().join("big");
         std::fs::create_dir_all(&big).unwrap();
         std::fs::File::create(big.join(format!("{ID}.jsonl"))).unwrap().set_len(MAX_SEED_BYTES + 1).unwrap();
-        assert_eq!(config_msg(transcript_files(&big, ID).map(|_| SeedReport::default())), format!("transcript too large to seed: {} bytes", MAX_SEED_BYTES + 1));
+        assert_eq!(too_large(transcript_files(&big, ID).map(|_| SeedReport::default())), (ID.to_string(), MAX_SEED_BYTES + 1, format!("transcript too large to seed: {} bytes", MAX_SEED_BYTES + 1)));
+        // S9: exit 9 (the policy group), the session named for `remote::Failure::TranscriptTooLarge`; a larger cap takes it.
+        assert_eq!(crate::errors::CliError::from(transcript_files(&big, ID).unwrap_err()).exit_code(), 9);
+        assert_eq!(transcript_files_capped(&big, ID, MAX_SEED_BYTES + 1).unwrap(), vec![(format!("{ID}.jsonl"), MAX_SEED_BYTES + 1)]);
         let linked = tmp.path().join("linked");
         std::fs::create_dir_all(&linked).unwrap();
         symlink(src.join(format!("{ID}.jsonl")), linked.join(format!("{ID}.jsonl"))).unwrap();

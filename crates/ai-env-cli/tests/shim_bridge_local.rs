@@ -15,11 +15,12 @@
 //! developer's `claude` or `aws`: the spawns are `cat`, `sh`, `seq`, `yes`,
 //! `head` and `sleep` from /usr/bin:/bin, and a `claude` script the test
 //! writes. Every wait is bounded.
-#[path = "common/fake_endpoint.rs"]
-mod fake_endpoint;
-#[path = "common/green_world.rs"]
-mod green_world;
+// S9: the whole harness (`common`; its fake endpoint and green world are those of S6 and S7 here) and T9.1.
+mod common;
+#[path = "shim_bridge_local/gitcgi_client.rs"]
+mod gitcgi_client;
 
+use common::{fake_endpoint, green_world};
 use ai_env_cli::bridge::agent::{run_spawn, spawn_channels, AgentEnv, AgentTarget, RemoteExit, RunPolicy, SpawnEvent, SpawnInput, SpawnSpec, Start};
 use ai_env_cli::bridge::api::{FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, VmInfo, FAKE_IMAGE_ARN};
 use ai_env_cli::bridge::config::{Paths, TransportCfg};
@@ -3298,7 +3299,8 @@ mod unseal_fixes {
             assert_token_nowhere(&w, &o, &token);
             let err = text(&o.stderr);
             assert_eq!(code(&o), 9, "{args:?}: {err}");
-            assert!(err.contains("no credential for a vpc VM of image version 2.0 (the active version state/infra.toml records;") && err.contains("make infra-status WRITE=1"), "{args:?}: {err}");
+            assert!(err.contains("no credential for a vpc VM of image version 2.0: no passing `ai-env egress check` is recorded for image version 2.0 with "), "{args:?}: {err}");
+            assert!(err.contains("(run `ai-env egress check`) (the active version state/infra.toml records; after a deploy, `make infra-status WRITE=1` records the new one) (nothing was unsealed or started)"), "{args:?}: {err}");
             let gate = w.audit("credential_gate").last().unwrap().clone();
             assert_eq!((gate["detail"]["half"].as_str(), gate["detail"]["image_version"].as_str(), gate["detail"]["condition"].as_str()), (Some("local"), Some("2.0"), Some("no_record")), "{args:?}");
         }
@@ -4762,7 +4764,7 @@ mod fix_wave_2_gate {
             v.records.insert(0, old);
         });
         let (err, gate) = local_refusal(&w, &["vm", "warm", ws.as_str()], &token);
-        assert!(err.contains("no credential for a vpc VM of image version 1.0 (state/infra.toml records no active version of this image: `make infra-status WRITE=1` records it): no dns-path verdict is recorded (run `ai-env lab run dns-path`)"), "{err}");
+        assert!(err.contains("no credential for a vpc VM of image version 1.0: no dns-path verdict is recorded (run `ai-env lab run dns-path`) (state/infra.toml records no active version of this image: `make infra-status WRITE=1` records it) (nothing was unsealed or started)"), "{err}");
         assert_eq!((gate["condition"].as_str(), gate["image_version"].as_str()), (Some("dns_path_missing"), Some("1.0")));
         std::fs::write(&probes, dns_rows).unwrap();
         edit_verified(&w, |v| {
@@ -4772,8 +4774,35 @@ mod fix_wave_2_gate {
             }
         });
         let (err, gate) = local_refusal(&w, &["vm", "warm", ws.as_str()], &token);
-        assert!(err.contains("no credential for a vpc VM of image version 1.0 (state/infra.toml records no active version of this image: `make infra-status WRITE=1` records it): the passing `ai-env egress check` was recorded ") && err.contains("more than 7 days ago"), "{err}");
+        assert!(err.contains("no credential for a vpc VM of image version 1.0: the passing `ai-env egress check` was recorded "), "{err}");
+        assert!(err.contains("more than 7 days ago (run `ai-env egress check`) (state/infra.toml records no active version of this image: `make infra-status WRITE=1` records it) (nothing was unsealed or started)"), "{err}");
         assert_eq!((gate["condition"].as_str(), gate["image_version"].as_str()), (Some("record_age"), Some("1.0")));
+    }
+
+    /// S9 (contracts §5.9, the lead's integration): a passing check recorded
+    /// before the transcript store's cases (`egress_rule` 0, as every record
+    /// written before S9 reads) admits no credential: `vm warm` and `vm smoke
+    /// --with-credential` refuse at the gate's local half, condition
+    /// `egress_rule`, naming `ai-env egress check`; the same record with the
+    /// current rule passes that half again (the next refusal is another
+    /// condition's). Exit 9, no Touch ID, no VM.
+    #[test]
+    fn a_pass_from_before_the_s3_cases_admits_no_credential() {
+        let token = setup_token("Gwt");
+        let w = World::platform(None);
+        w.seed_credentials(&token, "1.0");
+        let ws = project(&w);
+        edit_verified(&w, |v| v.records[0].egress_rule = 0);
+        for args in [vec!["vm", "warm", ws.as_str()], vec!["vm", "smoke", "--exec", "--with-credential", "--json"]] {
+            let (err, gate) = local_refusal(&w, &args, &token);
+            assert!(err.contains("no credential for a vpc VM of image version 1.0") && err.contains("before the transcript store's cases") && err.contains("run `ai-env egress check`"), "{args:?}: {err}");
+            assert_eq!((gate["condition"].as_str(), gate["image_version"].as_str(), gate["half"].as_str()), (Some("egress_rule"), Some("1.0"), Some("local")), "{args:?}");
+        }
+        edit_verified(&w, |v| v.records[0].egress_rule = ai_env_cli::bridge::egress::EGRESS_RULE);
+        let probes = w.root.join("bridge").join("lab").join("probes.jsonl");
+        std::fs::remove_file(&probes).unwrap();
+        let (_, gate) = local_refusal(&w, &["vm", "warm", ws.as_str()], &token);
+        assert_eq!(gate["condition"].as_str(), Some("dns_path_missing"), "past the egress rule: {gate}");
     }
 
     /// The world's fake endpoint, but its `/health/detail` answers after

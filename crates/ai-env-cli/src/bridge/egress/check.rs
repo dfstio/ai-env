@@ -28,9 +28,10 @@
 //! revoked the connector after this check began. `--if-needed` starts
 //! nothing when the version a new VM runs (`[aws].image_version` resolved
 //! live, as RunMicrovm does) already has such a pass, bound to that build and
-//! to the connector's live facts, and judged by the current DNS rule
-//! (`egress::DNS_RULE`: a pass recorded before rule 1 never counts, and the
-//! check runs again, saying why) (`make claude-update`).
+//! to the connector's live facts, and judged by the current DNS and egress
+//! rules (`egress::DNS_RULE`, `egress::EGRESS_RULE`: a pass recorded before
+//! either never counts, and the check runs again, saying why) (`make
+//! claude-update`).
 //!
 //! **Allowlisted hosts.** github.com (`proxy-github`, [`ALLOWLISTABLE`]) is
 //! a host the proxy refuses until an operator allowlists it (`ai-env egress
@@ -61,10 +62,22 @@
 //! operator's account, a proxy that is not running, the backend, a refusal
 //! before RunMicrovm such as `[vm].max_concurrent`) revokes nothing.
 //!
+//! **The S3 cases** (S9, §7.7). Five cases of group `s3` probe the
+//! transcripts bucket (`state/infra.toml`'s, resolved before the check asks
+//! for its VM) through the proxy, judged on S3's status and `<Code>`, never
+//! its wording. `s3-own` and `s3-own-outside-prefix` use URLs the Mac
+//! presigns with the runtime key; the script reads them on its stdin, and the
+//! Mac types them only once the script, its terminal's echo off, asks
+//! ([`run_check_script`]). The two fronting cases count only when the Mac
+//! read [`FRONT_OBJECT_BUCKET`]'s object anonymously first ([`front_object`]);
+//! `s3-imds-role` signs with the check VM's own role credentials, and is
+//! recorded `no_role` only when that VM runs without an execution role
+//! ([`S3Facts`]).
+//!
 //! The script ([`render_script`]) is rendered on the Mac, the proxy exports
 //! of [`proxy_env`] included (the VM's `ai-env` has no `egress` command),
-//! and sent once through the scripted shell (`vm::shell::run_script`) after
-//! the VM's `/health` answered; it ends with `exit`. It drops aliases and
+//! and sent through the scripted shell ([`run_check_script`]) after the VM's
+//! `/health` answered; it ends with `exit`. It drops aliases and
 //! shell functions, calls `command curl -q` (no `.curlrc`) and `command dig
 //! -r` (no `.digrc`), and each case prints one marker line,
 //! `@@AIENV<nonce> <case> rc=… code=… size=… conn=… hc=… t403=… sq=…`
@@ -103,7 +116,7 @@
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::awscli;
 use crate::bridge::config::{is_rfc1918, BridgeConfig, Paths};
-use crate::bridge::egress::{dns_accepted, is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, DNS_RULE, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
+use crate::bridge::egress::{dns_accepted, is_aws_service_host, is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, DNS_RULE, EGRESS_RULE, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::identity;
 use crate::bridge::infra::read_infra_state;
@@ -115,6 +128,7 @@ use crate::bridge::vm::{health, run, shell};
 use crate::errors::{CliError, Result};
 use crate::outln;
 use crate::store::Keystore;
+use crate::wire::redact::Secret;
 use crate::wire::time::{rfc3339_utc, unix_now};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -179,6 +193,38 @@ enum Kind {
     /// Through the proxy, a plain-http request squid must refuse: HTTP 403
     /// with squid's `X-Squid-Error: ERR_ACCESS_DENIED`.
     Get403,
+    /// A presigned PUT then GET of our bucket's `v1/_egress-check/<nonce>`
+    /// through the proxy: both 200 (CONNECT 200). The GET's 200 proves the
+    /// proxy's S3 traffic goes through the gateway endpoint — the bucket
+    /// policy refuses reads outside it (§7.4). The URLs reach the script on
+    /// its stdin (`AIENV_U`), and curl's argv only inside the check's VM (its
+    /// own, or the `--shell` VM `--vm` names), which runs no agent.
+    S3Own,
+    /// Through the proxy to our bucket's host, a request the endpoint policy
+    /// or IAM must refuse with S3 status 403 and `<Code>` `AccessDenied` (its
+    /// code, never its wording): a fronting GET of a public object
+    /// ([`S3Req::Get`]: it counts only when the Mac read that object
+    /// anonymously first, [`S3Facts::front`]), or a presigned PUT outside the
+    /// `v1/` prefix ([`S3Req::Put`]). The tunnel must open first (CONNECT
+    /// 200): a 403 from the endpoint, not squid.
+    S3Denied(S3Req),
+    /// The check VM's own role credentials (AccessKeyId, SecretAccessKey and
+    /// Token from IMDSv2, never on an argv or printed) sign (`curl
+    /// --aws-sigv4`) a PUT of `v1/_egress-check/<nonce>` through the proxy:
+    /// the same 403 `AccessDenied` (the endpoint policy admits only the
+    /// runtime user). When IMDS gave no credentials (its `s3=` says `noimds`,
+    /// `norole` or `nocreds`): `recorded:no_role` if the check VM runs without
+    /// an execution role ([`S3Facts::has_role`]: nothing to try), else a
+    /// failure (the role was never tried).
+    S3ImdsRole,
+}
+
+/// Which request an [`Kind::S3Denied`] case makes (the marker field it
+/// reports its status in: `get` or `put`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3Req {
+    Get,
+    Put,
 }
 
 /// Who a DNS case asks.
@@ -220,16 +266,31 @@ pub struct Case {
 
 impl Case {
     fn proxied(&self) -> bool {
-        matches!(self.kind, Kind::Allowed | Kind::Connect403 | Kind::Get403)
+        matches!(self.kind, Kind::Allowed | Kind::Connect403 | Kind::Get403 | Kind::S3Own | Kind::S3Denied(_) | Kind::S3ImdsRole)
     }
 
     fn is_dns(&self) -> bool {
         matches!(self.kind, Kind::Dns(_))
     }
 
+    /// An S3 case (its marker reports [`S3_FIELDS`], not curl's or dig's).
+    fn is_s3(&self) -> bool {
+        matches!(self.kind, Kind::S3Own | Kind::S3Denied(_) | Kind::S3ImdsRole)
+    }
+
     /// Counted only when the run's `allowed` cases passed (non-vacuous).
     fn needs_allowed(&self) -> bool {
         matches!(self.kind, Kind::Direct | Kind::OtherPort | Kind::Dns(_))
+    }
+
+    /// A fronting case: counted only when the Mac read [`FRONT_OBJECT_BUCKET`]'s object anonymously ([`S3Facts::front`]).
+    fn fronts(&self) -> bool {
+        self.kind == Kind::S3Denied(S3Req::Get)
+    }
+
+    /// It asks the transcripts bucket (its host or a presigned URL), so only a full check renders it ([`render_cases`]).
+    fn needs_bucket(&self) -> bool {
+        self.is_s3() || self.args.contains("@B@")
     }
 }
 
@@ -237,14 +298,133 @@ impl Case {
 /// and after it.
 pub const ALLOWED_CASES: [&str; 2] = ["allowed", "allowed-last"];
 
+/// A public object in eu-central-1, neither ours nor the AL2023 repository's
+/// (§7.7). `s3-front-bucket` and `s3-front-path` ask for it through a tunnel
+/// to our bucket's host; readable anonymously from outside the VPC but
+/// refused through the endpoint proves the endpoint confines the tunnel. The
+/// Mac GETs it anonymously first ([`front_object`]); only a 200 (or 206 for
+/// the one byte it asks) lets the two fronting cases count: S3 refuses an
+/// anonymous GET of an object that is not public (private, requester-pays,
+/// or missing) with the same 403 `AccessDenied` on every path. The Copernicus
+/// DEM's open-data bucket answered an anonymous one-byte GET with 206,
+/// virtual-hosted and path-style, on 18 Oct 2026 (the first choice,
+/// `deutsche-boerse-xetra-pds`, had gone private: 403); B1 checks it again
+/// before the live check.
+pub const FRONT_OBJECT_BUCKET: &str = "copernicus-dem-30m";
+pub const FRONT_OBJECT_KEY: &str = "tileList.txt";
+
+/// How long the Mac's anonymous GET of the front object may take.
+pub const FRONT_OBJECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `https://<FRONT_OBJECT_BUCKET>.s3.eu-central-1.amazonaws.com/<FRONT_OBJECT_KEY>`: what the Mac GETs anonymously.
+#[must_use]
+pub fn front_object_url() -> String {
+    format!("https://{}/{FRONT_OBJECT_KEY}", crate::wire::s3::bucket_host(FRONT_OBJECT_BUCKET))
+}
+
+/// What the Mac's anonymous GET of the front object answered ([`front_object`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontObject {
+    /// S3's HTTP status: 200, or 206 for the one-byte range asked, is readable.
+    Status(u16),
+    /// No HTTP answer: why (at most 200 characters).
+    Unreachable(String),
+    /// Debug builds, under the file-backed fake ([`FAKE_SHELL_KNOB`] stands in
+    /// for the VM's shell): not asked, and counted as readable (a release
+    /// build never counts it).
+    Lab,
+}
+
+impl FrontObject {
+    /// Does it let the fronting cases count?
+    #[must_use]
+    pub fn readable(&self) -> bool {
+        match self {
+            FrontObject::Status(s) => matches!(s, 200 | 206),
+            FrontObject::Unreachable(_) => false,
+            FrontObject::Lab => cfg!(debug_assertions),
+        }
+    }
+
+    /// What it said, for the reasons and the report.
+    #[must_use]
+    pub fn said(&self) -> String {
+        match self {
+            FrontObject::Status(s) if self.readable() => format!("answered the Mac's anonymous GET with HTTP {s} (readable)"),
+            FrontObject::Status(s) => format!("answered the Mac's anonymous GET with HTTP {s}, not 200 or 206 (not readable)"),
+            FrontObject::Unreachable(e) => format!("could not be read from the Mac ({e})"),
+            FrontObject::Lab => "was not asked (lab: the shell's transcript is a file, AI_ENV_BRIDGE_LAB_FAKE_SHELL)".to_string(),
+        }
+    }
+}
+
+/// The Mac's anonymous GET of the front object ([`front_object_url`]):
+/// `Range: bytes=0-0`, through the one TLS client (no proxy, https only,
+/// redirects never followed), at most [`FRONT_OBJECT_TIMEOUT`]; never fails,
+/// whatever came back is the answer.
+pub async fn front_object() -> FrontObject {
+    let short = |e: &dyn std::fmt::Display| e.to_string().chars().take(200).collect::<String>();
+    let client = match crate::bridge::tls::reqwest_client() {
+        Ok(c) => c,
+        Err(e) => return FrontObject::Unreachable(short(&e)),
+    };
+    match client.get(front_object_url()).header("Range", "bytes=0-0").timeout(FRONT_OBJECT_TIMEOUT).send().await {
+        Ok(resp) => FrontObject::Status(resp.status().as_u16()),
+        Err(e) => FrontObject::Unreachable(short(&e)),
+    }
+}
+
+/// What the Mac knows that the S3 cases are judged by, besides their markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Facts {
+    /// The check VM runs with an execution role: its run plan's
+    /// (`[aws].execution_role_arn`), or its echo of one. Only without one is
+    /// `s3-imds-role` recorded `no_role` when IMDS gave no credentials.
+    pub has_role: bool,
+    /// The Mac's anonymous GET of the front object: only a readable one lets
+    /// `s3-front-bucket` and `s3-front-path` count.
+    pub front: FrontObject,
+}
+
+impl S3Facts {
+    /// What the offline judge ([`judge`]) assumes: a check VM with an
+    /// execution role, and the front object read (HTTP 200). The check itself
+    /// judges by what it found ([`judge_with`]).
+    #[must_use]
+    pub fn assumed() -> S3Facts {
+        S3Facts { has_role: true, front: FrontObject::Status(200) }
+    }
+
+    /// One line for the report.
+    #[must_use]
+    pub fn said(&self) -> String {
+        format!(
+            "s3: the front object {FRONT_OBJECT_BUCKET}/{FRONT_OBJECT_KEY} {}; the check VM runs {} execution role",
+            self.front.said(),
+            if self.has_role { "with an" } else { "without an" }
+        )
+    }
+}
+
+/// `s3.eu-central-1.amazonaws.com`: the regional S3 host (`s3-front-path`'s
+/// path-style `Host`, and `proxy-s3-other-host`'s CONNECT target).
+pub const S3_REGIONAL_HOST: &str = "s3.eu-central-1.amazonaws.com";
+
+/// How many presigned URLs the Mac sends on the script's stdin: `s3-own`'s
+/// PUT and GET, and `s3-own-outside-prefix`'s PUT (in `CASES` order).
+pub const URL_SLOTS: usize = 3;
+
 /// The cases, in script order. The proxy exports come right before the
-/// first case (`allowed`); `allowed-last` closes the run.
-pub const CASES: [Case; 27] = [
+/// first case (`allowed`); `allowed-last` closes the run. The seven S9 S3
+/// cases (§7.7): `s3-direct` after `direct-ipv6`, `proxy-s3-other-host` after
+/// `proxy-github`, and the five `s3`-group cases before `allowed-last`.
+pub const CASES: [Case; 34] = [
     Case { name: "allowed", group: "proxy", kind: Kind::Allowed, what: "api.anthropic.com through the proxy (first)", args: "https://api.anthropic.com/v1/models" },
     Case { name: "direct-name", group: "direct", kind: Kind::Direct, what: "api.anthropic.com without the proxy", args: "--noproxy '*' https://api.anthropic.com/v1/models" },
     Case { name: "direct-ipv4", group: "direct", kind: Kind::Direct, what: "1.1.1.1:443 without the proxy", args: "--noproxy '*' https://1.1.1.1/" },
     Case { name: "direct-http", group: "direct", kind: Kind::Direct, what: "1.1.1.1:80 without the proxy", args: "--noproxy '*' http://1.1.1.1/" },
     Case { name: "direct-ipv6", group: "direct", kind: Kind::Direct, what: "[2606:4700:4700::1111] without the proxy", args: "--noproxy '*' -g https://[2606:4700:4700::1111]/" },
+    Case { name: "s3-direct", group: "direct", kind: Kind::Direct, what: "our transcripts bucket's host without the proxy", args: "--noproxy '*' https://@B@/" },
     Case { name: "dns-public-udp", group: "dns", kind: Kind::Dns(DnsServer::Public), what: "dig @1.1.1.1", args: "1.1.1.1" },
     Case { name: "dns-public-tcp", group: "dns", kind: Kind::Dns(DnsServer::Public), what: "dig +tcp @1.1.1.1", args: "1.1.1.1 +tcp" },
     Case { name: "dns-public-port", group: "dns", kind: Kind::Dns(DnsServer::Public), what: "dig -p 443 @208.67.222.222 (UDP 443; OpenDNS answers there)", args: "208.67.222.222 -p 443" },
@@ -265,7 +445,16 @@ pub const CASES: [Case; 27] = [
     Case { name: "proxy-http-8080", group: "proxy", kind: Kind::Get403, what: "plain http to api.anthropic.com:8080 through the proxy", args: "http://api.anthropic.com:8080/" },
     Case { name: "proxy-connect-8443", group: "proxy", kind: Kind::Connect403, what: "CONNECT api.anthropic.com:8443 through the proxy", args: "https://api.anthropic.com:8443/" },
     Case { name: "proxy-github", group: "proxy", kind: Kind::Connect403, what: "github.com through the proxy", args: "https://github.com/" },
+    Case { name: "proxy-s3-other-host", group: "proxy", kind: Kind::Connect403, what: "CONNECT s3.eu-central-1.amazonaws.com (another S3 host) through the proxy", args: "https://@S3H@/" },
     Case { name: "denied", group: "proxy", kind: Kind::Connect403, what: "the run's nonce host through the proxy", args: "https://@H@/" },
+    // The five `s3`-group cases (§7.7), before `allowed-last`. `s3-own` and
+    // `s3-own-outside-prefix` carry a presigned URL read from stdin (their
+    // `args` is the helper mode); the fronting cases ask the public object.
+    Case { name: "s3-own", group: "s3", kind: Kind::S3Own, what: "a presigned PUT then GET of v1/_egress-check/<nonce> through the proxy", args: "own" },
+    Case { name: "s3-front-bucket", group: "s3", kind: Kind::S3Denied(S3Req::Get), what: "a public object fronted by our bucket's virtual-hosted name through the proxy", args: "frontv" },
+    Case { name: "s3-front-path", group: "s3", kind: Kind::S3Denied(S3Req::Get), what: "a public object fronted path-style (Host s3.eu-central-1.amazonaws.com) through the proxy", args: "frontp" },
+    Case { name: "s3-own-outside-prefix", group: "s3", kind: Kind::S3Denied(S3Req::Put), what: "a presigned PUT of x/_egress-check/<nonce> (outside the v1/ prefix) through the proxy", args: "outside" },
+    Case { name: "s3-imds-role", group: "s3", kind: Kind::S3ImdsRole, what: "the VM's execution-role credentials PUT v1/_egress-check/<nonce> through the proxy", args: "imds" },
     Case { name: "allowed-last", group: "proxy", kind: Kind::Allowed, what: "api.anthropic.com through the proxy (last)", args: "https://api.anthropic.com/v1/models" },
 ];
 
@@ -421,21 +610,189 @@ const HELPERS: [&str; 3] = [
     r#"aienv_r() { local i=0 c=0 t=$SECONDS; while [ $i -lt 30 ] && [ $((SECONDS-t)) -lt 60 ]; do i=$((i+1)); c=$(command curl -q -s -o /dev/null -w '%{num_connects}' --noproxy '*' --connect-timeout 2 --max-time 4 "http://$1/" 2>/dev/null </dev/null); [ "${c:-0}" = 0 ] || break; printf .; command sleep 2; done; [ "${c:-0}" = 0 ] && c=no || c=yes; printf '%s%s ready try=%s s=%s ok=%s\n' '@@' "$R" "$i" "$((SECONDS-t))" "$c"; }"#,
 ];
 
+/// The bucket and object the S3 cases (§7.7) need filled into the script:
+/// our transcripts bucket (its host and owner) and the public fronting
+/// object. The lab default ([`S3Probe::lab`]) names [`crate::bridge::s3::LAB_BUCKET`];
+/// a real check builds one from the resolved target (`gather`).
+#[derive(Debug, Clone)]
+pub struct S3Probe {
+    /// Our bucket's virtual-hosted host (`<bucket>.s3.eu-central-1.amazonaws.com`).
+    pub bucket_host: String,
+    /// The bucket's owner (12 digits): `x-amz-expected-bucket-owner`.
+    pub owner: String,
+}
+
+impl S3Probe {
+    /// The lab bucket's host and owner (the fakes' identity; debug and tests).
+    #[must_use]
+    pub fn lab() -> S3Probe {
+        S3Probe { bucket_host: crate::wire::s3::bucket_host(crate::bridge::s3::LAB_BUCKET), owner: crate::bridge::s3::LAB_OWNER.to_string() }
+    }
+
+    /// The probe of `target`: its bucket's virtual-hosted host and its owner.
+    #[must_use]
+    pub fn of(target: &crate::bridge::s3::S3Target) -> S3Probe {
+        S3Probe { bucket_host: crate::wire::s3::bucket_host(&target.bucket), owner: target.owner.clone() }
+    }
+}
+
+/// The S3 cases' shell helpers (§7.7), added only to a script that has an S3
+/// case. Each keeps the presigned URL (read into `AIENV_U`, never echoed) and
+/// the owner off the captured output; `aienv_s3do` leaves the HTTP code, the
+/// proxy's CONNECT answer and S3's `<Code>` in globals, and each case prints
+/// one marker with the `put`, `get`, `hc` and `s3` fields [`S3_FIELDS`] names.
+/// `aienv_s3cred` asks IMDSv2 (every request `-f`, its exit code checked) for
+/// a session token, the role it lists and that role's credentials, leaving
+/// them in globals and `aienv_cr` `ok`, else what was missing (`noimds`,
+/// `norole`, `nocreds`); `aienv_imds` sends the token in a config on a file
+/// descriptor, and `aienv_s3imds` the credentials (`user`, the
+/// `x-amz-security-token` header), so neither is ever on an argv, and clears
+/// them after its one PUT.
+const S3_HELPERS: [&str; 6] = [
+    r#"aienv_s3do() { local m=$1 u=$2 ct=$3 eh=$4 o c3='<Code>([A-Za-z]+)</Code>'; local -a a; a=(command curl -q -sS -X "$m" -w ' W=%{http_code},%{http_connect}=W' --connect-timeout 5 --max-time 10); [ "$ct" = - ] || a+=(--connect-to "$ct"); [ "$eh" = - ] || a+=(-H "$eh"); [ "$m" = PUT ] && a+=(-H 'Content-Length: 0' -H 'x-amz-checksum-sha256: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=' -H 'If-None-Match: *' -H 'Transfer-Encoding:' -H 'Expect:'); o=$("${a[@]}" "$u" 2>&1 </dev/null); aienv_code=000; aienv_hc=000; aienv_s3=-; [[ $o =~ W=([0-9]+),([0-9]+)=W ]] && { aienv_code=${BASH_REMATCH[1]}; aienv_hc=${BASH_REMATCH[2]}; }; [[ $o =~ $c3 ]] && aienv_s3=${BASH_REMATCH[1]}; }"#,
+    r#"aienv_s3own() { local n=$1 p g h; aienv_s3do PUT "$2" - "x-amz-expected-bucket-owner: $O"; p=$aienv_code; h=$aienv_hc; aienv_s3do GET "$3" - "x-amz-expected-bucket-owner: $O"; g=$aienv_code; [ "$h" = 000 ] && h=$aienv_hc; printf '%s%s %s rc=0 put=%s get=%s hc=%s s3=-\n' '@@' "$R" "$n" "$p" "$g" "$h"; }"#,
+    r#"aienv_s3deny() { local n=$1 u=$2 ct=$3 f=$4; if [ "$f" = put ]; then aienv_s3do PUT "$u" "$ct" "x-amz-expected-bucket-owner: $O"; printf '%s%s %s rc=0 put=%s get=000 hc=%s s3=%s\n' '@@' "$R" "$n" "$aienv_code" "$aienv_hc" "$aienv_s3"; else aienv_s3do GET "$u" "$ct" -; printf '%s%s %s rc=0 put=000 get=%s hc=%s s3=%s\n' '@@' "$R" "$n" "$aienv_code" "$aienv_hc" "$aienv_s3"; fi; }"#,
+    r#"aienv_imds() { command curl -q -sSf -K <(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$aienv_it") --noproxy '*' --max-time 5 "http://169.254.169.254/latest/meta-data/iam/security-credentials/$1" 2>/dev/null </dev/null; }"#,
+    r#"aienv_s3cred() { local r o v='^[A-Za-z0-9+=,.@_-]+$' x='"AccessKeyId"[[:space:]]*:[[:space:]]*"([^"]+)"' y='"SecretAccessKey"[[:space:]]*:[[:space:]]*"([^"]+)"' z='"Token"[[:space:]]*:[[:space:]]*"([^"]+)"'; aienv_ak=; aienv_sk=; aienv_tk=; aienv_cr=noimds; aienv_it=$(command curl -q -sSf -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' --noproxy '*' --max-time 5 http://169.254.169.254/latest/api/token 2>/dev/null </dev/null) && [ -n "$aienv_it" ] || return 0; aienv_cr=norole; r=$(aienv_imds) && [[ $r =~ $v ]] || return 0; aienv_cr=nocreds; o=$(aienv_imds "$r") || return 0; [[ $o =~ $x ]] && aienv_ak=${BASH_REMATCH[1]}; [[ $o =~ $y ]] && aienv_sk=${BASH_REMATCH[1]}; [[ $o =~ $z ]] && aienv_tk=${BASH_REMATCH[1]}; [ -n "$aienv_ak" ] && [ -n "$aienv_sk" ] && [ -n "$aienv_tk" ] && aienv_cr=ok; return 0; }"#,
+    r#"aienv_s3imds() { local n=$1 o code=000 hc=000 s3=- c3='<Code>([A-Za-z]+)</Code>'; aienv_s3cred; if [ "$aienv_cr" = ok ]; then o=$(command curl -q -sS -K <(printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' "$aienv_ak" "$aienv_sk" "$aienv_tk") -X PUT --aws-sigv4 'aws:amz:eu-central-1:s3' -H "x-amz-expected-bucket-owner: $O" -H 'x-amz-content-sha256: UNSIGNED-PAYLOAD' -H 'Content-Length: 0' -w ' W=%{http_code},%{http_connect}=W' --connect-timeout 5 --max-time 10 "$EC" 2>&1 </dev/null); [[ $o =~ W=([0-9]+),([0-9]+)=W ]] && { code=${BASH_REMATCH[1]}; hc=${BASH_REMATCH[2]}; }; [[ $o =~ $c3 ]] && s3=${BASH_REMATCH[1]}; else s3=$aienv_cr; fi; aienv_ak=; aienv_sk=; aienv_tk=; aienv_it=; printf '%s%s %s rc=0 put=%s get=000 hc=%s s3=%s\n' '@@' "$R" "$n" "$code" "$hc" "$s3"; }"#,
+];
+
+/// What `s3-imds-role`'s `s3=` says when IMDS gave the check VM no
+/// credentials to try (`aienv_s3cred`): no session token, no role listed, or
+/// a role without all three of AccessKeyId, SecretAccessKey and Token.
+const IMDS_GAVE_NOTHING: [&str; 3] = ["noimds", "norole", "nocreds"];
+
+/// The script line that reads the presigned URLs from stdin into `AIENV_U`:
+/// it saves the terminal's settings and turns its echo off, then prints the
+/// `urls` marker ([`urls_marker`], built at run time) — the Mac types the
+/// URLs only once it shows ([`run_check_script`]): a terminal echoes input
+/// as it receives it, so typed earlier they would be echoed into the output,
+/// or run as commands by a line still running — reads them silently (`read
+/// -rs`), and restores the settings. `@URLN@` is the count (`1 2 …`).
+const URL_READ_LOOP: &str = r#"aienv_t=$(command stty -g 2>/dev/null); command stty -echo 2>/dev/null; printf '%s%s urls\n' '@@' "$R"; AIENV_U=(); for aienv_i in @URLN@; do IFS= read -rs aienv_l; AIENV_U+=("$aienv_l"); done; aienv_l=; [ -n "$aienv_t" ] && command stty "$aienv_t" 2>/dev/null"#;
+
+/// How many presigned URLs `c` reads from stdin: `s3-own` (a PUT and a GET),
+/// `s3-own-outside-prefix` (a PUT); the others sign in the VM or ask a public
+/// object.
+fn url_slots_of(c: &Case) -> usize {
+    match c.name {
+        "s3-own" => 2,
+        "s3-own-outside-prefix" => 1,
+        _ => 0,
+    }
+}
+
+/// The script line for an S3 case (`c.is_s3()`): the tailored helper call
+/// (using the `B`/`FV`/`FP`/`EC` vars the script sets). `url_at` is the index
+/// of its first stdin URL in `AIENV_U`.
+fn s3_case_line(c: &Case, url_at: usize) -> String {
+    let fvh = crate::wire::s3::bucket_host(FRONT_OBJECT_BUCKET);
+    match c.name {
+        "s3-own" => format!(r#"aienv_s3own s3-own "${{AIENV_U[{url_at}]}}" "${{AIENV_U[{}]}}""#, url_at + 1),
+        "s3-front-bucket" => format!(r#"aienv_s3deny s3-front-bucket "$FV" "{fvh}:443:$B:443" get"#),
+        "s3-front-path" => format!(r#"aienv_s3deny s3-front-path "$FP" "{S3_REGIONAL_HOST}:443:$B:443" get"#),
+        "s3-own-outside-prefix" => format!(r#"aienv_s3deny s3-own-outside-prefix "${{AIENV_U[{url_at}]}}" - put"#),
+        "s3-imds-role" => "aienv_s3imds s3-imds-role".to_string(),
+        other => format!("aienv_s3own {other}"),
+    }
+}
+
+/// Where `script`'s URL read loop line is: its start, and the end of its line.
+fn url_loop(script: &str) -> Option<(usize, usize)> {
+    let prefix = &URL_READ_LOOP[..URL_READ_LOOP.find("@URLN@").unwrap_or(0)];
+    let at = script.find(prefix)?;
+    let end = script[at..].find('\n')? + at + 1;
+    Some((at, end))
+}
+
+/// How many presigned URLs `script` reads from its stdin: its read loop's
+/// count (0 without one).
+#[must_use]
+pub fn url_reads(script: &str) -> usize {
+    let Some((at, end)) = url_loop(script) else { return 0 };
+    let list = script[at..end].split_once("for aienv_i in ").and_then(|(_, rest)| rest.split_once(';')).map_or("", |(list, _)| list);
+    list.split_whitespace().count()
+}
+
+/// `(up to and including the URL read loop's line, the rest)` when the
+/// script reads URLs from stdin; `None` when it reads none (no S3 URL case:
+/// the dns-path probe, [`render_cases`]).
+#[must_use]
+pub fn split_url_reads(script: &str) -> Option<(&str, &str)> {
+    let (_, end) = url_loop(script)?;
+    Some((&script[..end], &script[end..]))
+}
+
+/// The marker a check script prints, once its terminal's echo is off, when it
+/// is about to read the presigned URLs ([`URL_READ_LOOP`]):
+/// `@@AIENV<nonce> urls`. The script builds it at run time, so its echo never
+/// shows it.
+#[must_use]
+pub fn urls_marker(nonce: &str) -> String {
+    format!("{MARK}{nonce} urls")
+}
+
+/// What the Mac types for a check `script`: the first part at once — the
+/// whole script, or up to and including its URL read loop's line — then,
+/// when it reads presigned URLs, `urls`, one per line, and the rest of the
+/// script, held as a [`Secret`] and typed only once the output shows
+/// [`urls_marker`] ([`run_check_script`]). `Err` unless `urls` holds exactly
+/// as many one-line URLs as the loop reads (none without one): one URL too
+/// few or too many would shift every read, and run a URL or a script line as
+/// the other.
+pub fn script_frames<'a>(script: &'a str, urls: &[&str]) -> std::result::Result<(&'a str, Option<Secret<String>>), String> {
+    let want = url_reads(script);
+    if urls.len() != want {
+        return Err(format!("the script reads {want} presigned URL{} from its stdin, not {}", if want == 1 { "" } else { "s" }, urls.len()));
+    }
+    if let Some(i) = urls.iter().position(|u| u.is_empty() || u.contains(['\n', '\r'])) {
+        return Err(format!("presigned URL {} is not one line", i + 1));
+    }
+    let Some((first, rest)) = split_url_reads(script) else { return Ok((script, None)) };
+    let mut then = String::with_capacity(urls.iter().map(|u| u.len() + 1).sum::<usize>() + rest.len());
+    for u in urls {
+        then.push_str(u);
+        then.push('\n');
+    }
+    then.push_str(rest);
+    Ok((first, Some(Secret::new(then))))
+}
+
 /// The script of `cases` for one run: no alias, no function named like a
 /// tool it calls, a fresh command hash, no history file, no `!` expansion;
-/// `R`, `N` and `S`; the helpers; one short line per case (the proxy exports and
-/// the wait for the proxy before the first proxied case); the `end` marker;
-/// `exit`. No tab, no `!`, under 4 KB (a terminal's line buffer).
-fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
+/// `R`, `N` and `S`; the helpers; the S3 probe's bucket and object (`B`, `O`,
+/// `FV`, `FP`, `EC`) and the URL read loop ([`URL_READ_LOOP`]) when an S3
+/// case needs one; one short line per case (the proxy exports and the wait
+/// for the proxy before the first proxied case); the `end` marker; `exit`.
+/// No tab, no `!`; each line under 1 KiB (a terminal's canonical buffer).
+fn render(nonce: &str, proxy_ip: &str, probe: &S3Probe, cases: &[&Case]) -> String {
     let fill = |args: &str| {
-        args.replace("@P@", proxy_ip).replace("@V@", &cidr_plus_two(VPC_CIDR).unwrap_or_default()).replace("@S@", &cidr_plus_two(VM_SUBNET_CIDR).unwrap_or_default()).replace("@H@", &denied_host(nonce))
+        args.replace("@P@", proxy_ip)
+            .replace("@V@", &cidr_plus_two(VPC_CIDR).unwrap_or_default())
+            .replace("@S@", &cidr_plus_two(VM_SUBNET_CIDR).unwrap_or_default())
+            .replace("@H@", &denied_host(nonce))
+            .replace("@B@", &probe.bucket_host)
+            .replace("@S3H@", S3_REGIONAL_HOST)
     };
     let mut lines = vec![
         r"\unalias -a; unset -f command curl dig printf 2>/dev/null; hash -r; unset HISTFILE; set +H".to_string(),
         format!(r#"R={MARK_BODY}{nonce}; N={name}; S=; while read -r k v x; do [ "$k" = nameserver ] && [ -z "$S" ] && S=$v; done 2>/dev/null </etc/resolv.conf"#, MARK_BODY = &MARK[2..], name = dns_name(nonce)),
     ];
     lines.extend(HELPERS.iter().map(|h| (*h).to_string()));
+    let url_slots: usize = cases.iter().map(|c| url_slots_of(c)).sum();
+    if cases.iter().any(|c| c.is_s3()) {
+        let fv = format!("https://{}/{FRONT_OBJECT_KEY}", crate::wire::s3::bucket_host(FRONT_OBJECT_BUCKET));
+        let fp = format!("https://{S3_REGIONAL_HOST}/{FRONT_OBJECT_BUCKET}/{FRONT_OBJECT_KEY}");
+        let ec = format!("https://{}/{}", probe.bucket_host, crate::wire::s3::S3Key::EgressCheck { nonce: nonce.to_string() }.render());
+        lines.push(format!("B='{}'; O='{}'; FV='{fv}'; FP='{fp}'; EC='{ec}'", probe.bucket_host, probe.owner));
+        lines.extend(S3_HELPERS.iter().map(|h| (*h).to_string()));
+        if url_slots > 0 {
+            let seq: Vec<String> = (1..=url_slots).map(|i| i.to_string()).collect();
+            lines.push(URL_READ_LOOP.replace("@URLN@", &seq.join(" ")));
+        }
+    }
     let mut exported = false;
+    let mut url_at = 0;
     for c in cases {
         if c.proxied() && !exported {
             let pairs: Vec<String> = proxy_env(proxy_ip, PROXY_PORT).into_iter().map(|(k, v)| format!("{k}='{v}'")).collect();
@@ -443,7 +800,12 @@ fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
             lines.push(format!("aienv_r {proxy_ip}:{PROXY_PORT}"));
             exported = true;
         }
-        lines.push(format!("{} {} {}", if c.is_dns() { "aienv_d" } else { "aienv_c" }, c.name, fill(c.args)));
+        if c.is_s3() {
+            lines.push(s3_case_line(c, url_at));
+            url_at += url_slots_of(c);
+        } else {
+            lines.push(format!("{} {} {}", if c.is_dns() { "aienv_d" } else { "aienv_c" }, c.name, fill(c.args)));
+        }
     }
     lines.push(r#"printf '%s%s end\n' '@@' "$R""#.to_string());
     lines.push("exit".to_string());
@@ -452,17 +814,33 @@ fn render(nonce: &str, proxy_ip: &str, cases: &[&Case]) -> String {
     s
 }
 
-/// The `ai-env egress check` script: every case of [`CASES`].
+/// The `ai-env egress check` script: every case of [`CASES`], for the lab
+/// probe (the tests, debug). A real check uses [`render_script_with`]. It
+/// reads presigned URLs from its stdin: run it with [`run_check_script`].
 #[must_use]
 pub fn render_script(nonce: &str, proxy_ip: &str) -> String {
-    render(nonce, proxy_ip, &CASES.iter().collect::<Vec<_>>())
+    render(nonce, proxy_ip, &S3Probe::lab(), &CASES.iter().collect::<Vec<_>>())
 }
 
-/// The script of the named cases only, in [`CASES`] order (unknown names
-/// are skipped): the dns-path probe's, and the live tests' partial runs.
+/// The `ai-env egress check` script for `probe` ([`S3Probe::of`] the resolved
+/// transcripts bucket): the S3 cases ask that bucket's host. It reads
+/// presigned URLs from its stdin: run it with [`run_check_script`].
+#[must_use]
+pub fn render_script_with(nonce: &str, proxy_ip: &str, probe: &S3Probe) -> String {
+    render(nonce, proxy_ip, probe, &CASES.iter().collect::<Vec<_>>())
+}
+
+/// The script of the named cases only, in [`CASES`] order, sent in one frame
+/// (`vm::shell::run_script`): the dns-path probe's, and the live tests'
+/// partial runs. Unknown names are skipped, and so is every case that asks
+/// the transcripts bucket (`Case::needs_bucket`: the `s3` group and
+/// `s3-direct`, §7.7): this script names no bucket and never reads presigned
+/// URLs from its stdin — a read loop with nothing behind it would swallow the
+/// script's next lines. Those cases run in a full check
+/// ([`render_script_with`], [`run_check_script`]).
 #[must_use]
 pub fn render_cases(nonce: &str, proxy_ip: &str, names: &[&str]) -> String {
-    render(nonce, proxy_ip, &CASES.iter().filter(|c| names.contains(&c.name)).collect::<Vec<_>>())
+    render(nonce, proxy_ip, &S3Probe::lab(), &CASES.iter().filter(|c| names.contains(&c.name) && !c.needs_bucket()).collect::<Vec<_>>())
 }
 
 /// The dns-path probe's script: [`DNS_PATH_CASES`].
@@ -510,6 +888,15 @@ pub struct CaseResult {
     /// dig: the header's `AUTHORITY:` count (`None`: no reply, or no header
     /// printed). A recursor's negative answer carries the zone's SOA here.
     pub authority: Option<u16>,
+    /// S3 case: the PUT's HTTP status (`s3-own`, `s3-own-outside-prefix`,
+    /// `s3-imds-role`; 0 for `000`, no HTTP answer; `None`: not reported).
+    pub put: Option<u16>,
+    /// S3 case: the GET's HTTP status (`s3-own`, the fronting cases).
+    pub get: Option<u16>,
+    /// S3 case: S3's `<Code>` of the judged response (`[A-Za-z]{1,64}`; for
+    /// `s3-imds-role` when IMDS gave the VM no credentials, what was missing:
+    /// `noimds`, `norole` or `nocreds`; `None` for `-`).
+    pub s3: Option<String>,
 }
 
 /// The script's wait for the proxy before its first case (`aienv_r`): the
@@ -522,12 +909,15 @@ pub struct Ready {
     pub ok: bool,
 }
 
-/// What a transcript said: the case markers, the wait for the proxy, and
-/// whether the script's `end` marker came (the script ran to its end).
+/// What a transcript said: the case markers, the wait for the proxy, whether
+/// the script asked for its presigned URLs (the `urls` marker,
+/// [`urls_marker`]), and whether its `end` marker came (the script ran to its
+/// end).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Markers {
     pub cases: Vec<CaseResult>,
     pub ready: Option<Ready>,
+    pub urls: bool,
     pub finished: bool,
 }
 
@@ -552,6 +942,7 @@ fn is_server(s: &str) -> bool {
 
 const CURL_FIELDS: [&str; 7] = ["rc", "code", "size", "conn", "hc", "t403", "sq"];
 const DIG_FIELDS: [&str; 7] = ["rc", "ns", "res", "st", "ra", "an", "au"];
+const S3_FIELDS: [&str; 5] = ["rc", "put", "get", "hc", "s3"];
 const READY_FIELDS: [&str; 3] = ["try", "s", "ok"];
 
 /// The marker lines of run `nonce` in `output` (the remote's transcript:
@@ -559,8 +950,8 @@ const READY_FIELDS: [&str; 3] = ["try", "s", "ok"];
 /// marker when it contains `@@AIENV`; the echoed script never does (its
 /// markers are built at run time). Each case may appear once; `Err` for a
 /// marker of another nonce, an unknown case, a case twice, a missing,
-/// repeated or malformed field, `end` or `ready` twice. Missing cases are
-/// [`judge`]'s to name.
+/// repeated or malformed field, `end`, `ready` or `urls` twice, `end` or
+/// `urls` with a field. Missing cases are [`judge`]'s to name.
 pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, String> {
     if !is_nonce(nonce) {
         return Err(format!("{:?} is not a run nonce", shown(nonce)));
@@ -595,11 +986,27 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
             m.ready = Some(parse_ready(words)?);
             continue;
         }
+        if name == "urls" {
+            if m.urls {
+                return Err("the urls marker twice".into());
+            }
+            if let Some(w) = words.next() {
+                return Err(format!("the urls marker carries {:?}", shown(w)));
+            }
+            m.urls = true;
+            continue;
+        }
         let spec = case(name).ok_or_else(|| format!("unknown case {:?}", shown(name)))?;
         if m.get(name).is_some() {
             return Err(format!("case {name} twice"));
         }
-        let fields: &[&str] = if spec.is_dns() { &DIG_FIELDS } else { &CURL_FIELDS };
+        let fields: &[&str] = if spec.is_dns() {
+            &DIG_FIELDS
+        } else if spec.is_s3() {
+            &S3_FIELDS
+        } else {
+            &CURL_FIELDS
+        };
         let mut r = CaseResult { name: name.to_string(), ..CaseResult::default() };
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let digits = |v: &str| !v.is_empty() && v.len() <= 10 && v.bytes().all(|c| c.is_ascii_digit());
@@ -620,10 +1027,17 @@ pub fn parse_markers(output: &str, nonce: &str) -> std::result::Result<Markers, 
             match key {
                 "rc" if v == "none" && spec.is_dns() => r.rc = None,
                 "rc" => r.rc = Some(v.parse().map_err(|_| bad())?),
-                "code" | "hc" => {
+                "code" | "hc" | "put" | "get" => {
                     let n: u16 = if v.len() == 3 && digits(v) { v.parse().map_err(|_| bad())? } else { return Err(bad()) };
-                    if key == "code" { r.code = Some(n) } else { r.hc = Some(n) }
+                    match key {
+                        "code" => r.code = Some(n),
+                        "hc" => r.hc = Some(n),
+                        "put" => r.put = Some(n),
+                        _ => r.get = Some(n),
+                    }
                 }
+                "s3" if v == "-" => r.s3 = None,
+                "s3" if (1..=64).contains(&v.len()) && v.bytes().all(|c| c.is_ascii_alphabetic()) => r.s3 = Some(v.to_string()),
                 "size" if digits(v) || v == "0" => r.size = Some(v.parse().map_err(|_| bad())?),
                 "conn" if v == "-" => r.conn = None,
                 "conn" if digits(v) => r.conn = Some(v.parse().map_err(|_| bad())?),
@@ -743,6 +1157,8 @@ pub struct Judgement {
     /// because the proxy's effective allowlist held them ([`judge_with`]; a
     /// case without a marker fails, and is not one).
     pub allowlisted: Vec<String>,
+    /// What the S3 cases were judged by besides their markers.
+    pub s3: S3Facts,
 }
 
 impl Judgement {
@@ -763,7 +1179,9 @@ impl Judgement {
     }
 
     /// One line: every case with its verdict (`imds=recorded:<HTTP code>`;
-    /// `proxy-github=recorded:allowlisted` while its host is allowlisted).
+    /// `proxy-github=recorded:allowlisted` while its host is allowlisted;
+    /// `s3-imds-role=recorded:no_role` when the check VM ran without an
+    /// execution role).
     #[must_use]
     pub fn summary(&self) -> String {
         let allowlisted = |name: &str| ALLOWLISTABLE.iter().any(|(c, h)| *c == name && self.allowlisted.iter().any(|a| a == h));
@@ -771,6 +1189,8 @@ impl Judgement {
             .iter()
             .map(|c| match (c.verdict, &c.result) {
                 (Verdict::Recorded, Some(_)) if allowlisted(c.name) => format!("{}=recorded:allowlisted", c.name),
+                // judge_case records s3-imds-role only for a VM without an execution role.
+                (Verdict::Recorded, Some(_)) if case(c.name).is_some_and(|k| k.kind == Kind::S3ImdsRole) => format!("{}=recorded:no_role", c.name),
                 (Verdict::Recorded, Some(r)) => format!("{}=recorded:{:03}", c.name, r.code.unwrap_or(0)),
                 (v, _) => format!("{}={}", c.name, v.as_str()),
             })
@@ -831,8 +1251,9 @@ fn allowed_passed(r: Option<&CaseResult>) -> bool {
     r.is_some_and(|r| r.code == Some(401) && r.hc == Some(200))
 }
 
-/// One case on its own (the non-vacuous rule is [`judge`]'s).
-fn judge_case(c: &Case, r: &CaseResult) -> (Verdict, String) {
+/// One case on its own, by `s3` where it needs it (the non-vacuous rule and
+/// the fronting cases' are [`judge_with`]'s).
+fn judge_case(c: &Case, r: &CaseResult, s3: &S3Facts) -> (Verdict, String) {
     let rc = r.rc.unwrap_or(-1);
     let code = r.code.unwrap_or(0);
     let hc = r.hc.unwrap_or(0);
@@ -891,6 +1312,71 @@ fn judge_case(c: &Case, r: &CaseResult) -> (Verdict, String) {
         Kind::Get403 if code == 403 && r.sq == Some(true) => (Verdict::Pass, "squid's 403 (X-Squid-Error ERR_ACCESS_DENIED)".into()),
         Kind::Get403 if code == 403 => (Verdict::Fail, "a 403 without squid's X-Squid-Error ERR_ACCESS_DENIED: not the proxy's refusal".into()),
         Kind::Get403 => (Verdict::Fail, format!("expected squid's 403 for a plain-http request: {}", curl_seen(r))),
+        Kind::S3Own => judge_s3_own(r),
+        Kind::S3Denied(req) => judge_s3_denied(r, req),
+        Kind::S3ImdsRole => match r.s3.as_deref().filter(|w| IMDS_GAVE_NOTHING.contains(w)) {
+            Some(w) if !s3.has_role => (
+                Verdict::Recorded,
+                format!("recorded:no_role: the check VM ran without an execution role ([aws].execution_role_arn unset), so there were no credentials to try (IMDS: {w})"),
+            ),
+            Some(w) => {
+                let what = match w {
+                    "noimds" => "no session token",
+                    "norole" => "no role",
+                    _ => "a role without all of AccessKeyId, SecretAccessKey and Token",
+                };
+                (Verdict::Fail, format!("the check VM runs with an execution role, but IMDS gave it {what} ({w}): the role's credentials were never tried against our bucket"))
+            }
+            None => judge_s3_denied(r, S3Req::Put),
+        },
+    }
+}
+
+/// What an S3 case saw, for the reasons (never the URL or the body).
+fn s3_seen(r: &CaseResult) -> String {
+    let hc = r.hc.unwrap_or(0);
+    let code = r.s3.as_deref().unwrap_or("-");
+    format!("CONNECT {hc:03}, put {:03}, get {:03}, <Code> {code}", r.put.unwrap_or(0), r.get.unwrap_or(0))
+}
+
+/// `s3-own`: the presigned PUT and GET of `v1/_egress-check/<nonce>` both 200
+/// through the proxy's tunnel (CONNECT 200). The GET's 200 is the proof that
+/// the proxy's S3 traffic goes through the endpoint.
+fn judge_s3_own(r: &CaseResult) -> (Verdict, String) {
+    let (put, get, hc) = (r.put.unwrap_or(0), r.get.unwrap_or(0), r.hc.unwrap_or(0));
+    if hc != 200 {
+        (Verdict::Fail, format!("the proxy did not open a tunnel to our bucket's host (CONNECT {hc:03}): {}", s3_seen(r)))
+    } else if put != 200 {
+        (Verdict::Fail, format!("the presigned PUT of v1/_egress-check/<nonce> did not store (HTTP {put:03}): {}", s3_seen(r)))
+    } else if get != 200 {
+        (Verdict::Fail, format!("OPEN or MISCONFIGURED: the GET of the object just stored did not return 200 (HTTP {get:03}): the proxy's S3 traffic is not confined to the endpoint, or the endpoint policy is wrong ({})", s3_seen(r)))
+    } else {
+        (Verdict::Pass, "stored and read it back through the proxy's tunnel (CONNECT 200): the proxy's S3 traffic goes through the endpoint".into())
+    }
+}
+
+/// An `S3Denied` request (`req` reports in `get` for a fronting GET, `put` for
+/// a PUT): the tunnel must open (CONNECT 200) and S3 must answer 403 with
+/// `<Code>` `AccessDenied` — the endpoint's refusal, judged on the status and
+/// the code, never the wording.
+fn judge_s3_denied(r: &CaseResult, req: S3Req) -> (Verdict, String) {
+    let hc = r.hc.unwrap_or(0);
+    let status = match req {
+        S3Req::Get => r.get,
+        S3Req::Put => r.put,
+    }
+    .unwrap_or(0);
+    let code = r.s3.as_deref().unwrap_or("-");
+    if hc != 200 {
+        (Verdict::Fail, format!("the proxy did not open a tunnel to our bucket's host (CONNECT {hc:03}): the case cannot show the endpoint refusing it ({})", s3_seen(r)))
+    } else if status == 403 && code == "AccessDenied" {
+        (Verdict::Pass, "the endpoint refused it: S3 403 AccessDenied through the proxy's tunnel (CONNECT 200)".into())
+    } else if (200..300).contains(&status) {
+        (Verdict::Fail, format!("OPEN: the endpoint served it (HTTP {status:03}): a request it must refuse went through ({})", s3_seen(r)))
+    } else if status == 403 {
+        (Verdict::Fail, format!("403 without <Code> AccessDenied ({code}): not the endpoint's refusal ({})", s3_seen(r)))
+    } else {
+        (Verdict::Fail, format!("expected S3 403 AccessDenied through the tunnel: {}", s3_seen(r)))
     }
 }
 
@@ -915,11 +1401,13 @@ fn dns_replies(m: &Markers) -> (Option<String>, Vec<DnsReply>) {
     (resolv, out)
 }
 
-/// [`judge_with`] with no host allowlisted: every case judged strictly (the
-/// bash-run tests, and wherever no effective allowlist was proved).
+/// [`judge_with`] with no host allowlisted and the S3 facts it assumes
+/// ([`S3Facts::assumed`]: an execution role, the front object read): the
+/// offline tests' judge (the bash-run tests). The check judges by what it
+/// proved.
 #[must_use]
 pub fn judge(m: &Markers) -> Judgement {
-    judge_with(m, &BTreeSet::new())
+    judge_with(m, &BTreeSet::new(), &S3Facts::assumed())
 }
 
 /// Judge every case of [`CASES`] (pure). A missing case fails; a direct,
@@ -930,10 +1418,14 @@ pub fn judge(m: &Markers) -> Judgement {
 /// whose host `allowlisted` holds (the proxy's effective allowlist as the
 /// network verification proved it, [`allowlisted_hosts`]) is recorded, not
 /// judged, whatever its marker says — a tunnel, or a refusal from before
-/// the host was added — and a missing marker still fails. `dns` is the
-/// run's dns-path verdict.
+/// the host was added — and a missing marker still fails. A fronting case
+/// that passed on its own still fails unless `s3.front` is readable (a 403
+/// for an object nobody may read anonymously proves nothing about the
+/// endpoint), and `s3-imds-role` is recorded `no_role` for want of
+/// credentials only when `s3.has_role` is false. `dns` is the run's dns-path
+/// verdict.
 #[must_use]
-pub fn judge_with(m: &Markers, allowlisted: &BTreeSet<String>) -> Judgement {
+pub fn judge_with(m: &Markers, allowlisted: &BTreeSet<String>, s3: &S3Facts) -> Judgement {
     let allowed_ok = ALLOWED_CASES.iter().all(|n| allowed_passed(m.get(n)));
     let cases: Vec<CaseVerdict> = CASES
         .iter()
@@ -945,13 +1437,21 @@ pub fn judge_with(m: &Markers, allowlisted: &BTreeSet<String>) -> Judgement {
                 let reason = format!("not judged: {host} is allowlisted on the proxy (its effective allowlist, as the network verification read it); curl saw {}, CONNECT {:03}; this check does not show squid refusing it", curl_seen(r), r.hc.unwrap_or(0));
                 return CaseVerdict { name: c.name, group: c.group, verdict: Verdict::Recorded, reason, result: Some(r.clone()) };
             }
-            let (mut verdict, mut reason) = judge_case(c, r);
+            let (mut verdict, mut reason) = judge_case(c, r, s3);
             if let Some(w) = m.ready.filter(|w| c.name == "allowed" && verdict == Verdict::Fail && !w.ok) {
                 reason = format!("{reason} — the script waited {} s ({} attempts) and never opened a connection to the proxy's port", w.secs, w.tries);
             }
             if verdict == Verdict::Pass && c.needs_allowed() && !allowed_ok {
                 verdict = Verdict::Fail;
                 reason = format!("{reason} — not counted: `allowed` and `allowed-last` did not both pass in this run, so this VM's networking proved nothing");
+            }
+            if verdict == Verdict::Pass && c.fronts() {
+                if s3.front.readable() {
+                    reason = format!("{reason}; the object it fronted {}", s3.front.said());
+                } else {
+                    verdict = Verdict::Fail;
+                    reason = format!("{reason} — not counted: the front object {FRONT_OBJECT_BUCKET}/{FRONT_OBJECT_KEY} {}: S3 refuses an object nobody may read anonymously with the same 403 AccessDenied on every path, so this proves nothing about the endpoint (B1 names a readable one)", s3.front.said());
+                }
             }
             CaseVerdict { name: c.name, group: c.group, verdict, reason, result: Some(r.clone()) }
         })
@@ -961,9 +1461,10 @@ pub fn judge_with(m: &Markers, allowlisted: &BTreeSet<String>) -> Judgement {
         Ok((v, _)) => v,
         Err(e) => format!("unknown ({e})"),
     };
-    // Only an allowlisted case is recorded with a host of ALLOWLISTABLE (judge_case records the IMDS cases alone).
+    // Only an allowlisted case is recorded with a host of ALLOWLISTABLE (judge_case records the IMDS cases and
+    // s3-imds-role's no_role alone).
     let allowlisted = cases.iter().filter(|c| c.verdict == Verdict::Recorded).filter_map(|c| allowlisted_case(c.name, allowlisted)).map(str::to_string).collect();
-    Judgement { cases, ready: m.ready, finished: m.finished, dns, allowlisted }
+    Judgement { cases, ready: m.ready, finished: m.finished, dns, allowlisted, s3: s3.clone() }
 }
 
 /// The dns-path probe's verdict and note from its transcript's markers: the
@@ -1018,8 +1519,9 @@ const ALLOWED_HOST: &str = "api.anthropic.com";
 /// The requests of a run the proxy had to refuse: (method, host, port) —
 /// all but those the allowlist lets through ([`allowlisted_request`]:
 /// CONNECT github.com:443 while `allowlisted` holds github.com). The nonce
-/// host, the IP literal, the other ports and plain http stay, whatever
-/// `allowlisted` says.
+/// host, the IP literal, the other ports, the other S3 host
+/// (`proxy-s3-other-host`, S9) and plain http stay, whatever `allowlisted`
+/// says.
 #[must_use]
 pub fn refused_requests(nonce: &str, allowlisted: &BTreeSet<String>) -> Vec<(&'static str, String, u16)> {
     let all = vec![
@@ -1027,6 +1529,7 @@ pub fn refused_requests(nonce: &str, allowlisted: &BTreeSet<String>) -> Vec<(&'s
         ("CONNECT", "1.1.1.1".to_string(), 443),
         ("CONNECT", "api.anthropic.com".to_string(), 8443),
         ("CONNECT", "github.com".to_string(), 443),
+        ("CONNECT", S3_REGIONAL_HOST.to_string(), 443),
         ("GET", "api.anthropic.com".to_string(), 8080),
     ];
     all.into_iter().filter(|(m, h, p)| !allowlisted_request(m, h, Some(*p), allowlisted)).collect()
@@ -1055,10 +1558,12 @@ pub enum SquidEvidence {
 /// this run's: every VM shares the connector's address, so a tunnel to a host
 /// an operator may allowlist for a while (github.com) that squid logged
 /// before the run's own refusal of that host is an earlier run's (see below).
-/// While `allowlisted` (the run's [`allowlisted_hosts`]) holds such a host,
-/// its CONNECT on 443 is neither required refused nor, tunnelled, a
-/// violation ([`allowlisted_request`]); a tunnel to it on another port
-/// still is.
+/// An AWS service host (the other S3 host) is never allowlisted (`ai-env
+/// egress allow` refuses one, S7 D2): a tunnel to it is a violation whenever
+/// squid logged it. While `allowlisted` (the run's [`allowlisted_hosts`])
+/// holds such a host, its CONNECT on 443 is neither required refused nor,
+/// tunnelled, a violation ([`allowlisted_request`]); a tunnel to it on
+/// another port still is.
 #[must_use]
 pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, tunnels: usize, allowlisted: &BTreeSet<String>) -> SquidEvidence {
     let at = |l: &SquidLine| l.ts.split('.').next().and_then(|s| s.parse::<u64>().ok());
@@ -1090,11 +1595,12 @@ pub fn squid_evidence(lines: &[SquidLine], nonce: &str, from_s: u64, to_s: u64, 
     // been tunnelled by an earlier run while it was allowed (`make test-egress` does it). Removing a host restarts
     // squid (reload.sh), which ends and logs every tunnel, so such a tunnel is logged before squid refuses the host
     // again: a tunnel to it counts unless squid logged it before this run's own refusal of the host — the run's
-    // CONNECT 403 from its client within one case's budget before its nonce line (the case just before; the earliest
-    // there, should another run's refusal fall in the slot too: a tunnel logged after it was open while squid refused
-    // the host). While no such refusal is in the log (CloudWatch may deliver it after the nonce line), the evidence is
-    // missing.
-    let allowlistable = |l: &SquidLine| l.port == Some(443) && is_valid_host(&l.host);
+    // CONNECT 403 from its client within one case's budget before its nonce line (the cases just before, each refused
+    // at once; the earliest there, should another run's refusal fall in the slot too: a tunnel logged after it was
+    // open while squid refused the host). While no such refusal is in the log (CloudWatch may deliver it after the
+    // nonce line), the evidence is missing. An AWS service host (the other S3 host, S9) is never allowlisted (S7 D2):
+    // a tunnel to it is a violation whenever it was logged.
+    let allowlistable = |l: &SquidLine| l.port == Some(443) && is_valid_host(&l.host) && !is_aws_service_host(&l.host);
     let slot_ms = u64::try_from(CASE_BUDGET.as_millis()).unwrap_or(u64::MAX);
     let run_refusal = |h: &str| {
         from.iter()
@@ -1326,6 +1832,8 @@ pub fn decide(ev: &Evidence, connector: &str, at: &str) -> Decision {
         allowlisted: ev.judgement.allowlisted.clone(),
         dns: ev.judgement.dns.clone(),
         dns_rule: DNS_RULE,
+        // S9: the seven §7.7 S3 cases run, so the pass is EGRESS_RULE-verified (passes recorded before S9, rule 0, stop counting: B1 runs the check again).
+        egress_rule: EGRESS_RULE,
         squid_log: ok_text(&ev.squid),
         network: ok_text(&ev.network),
         connector_facts: facts,
@@ -1380,7 +1888,9 @@ struct Early {
 /// for it with `connector`, judged by the current DNS rule (a pass judged by
 /// an earlier one does not count: its DNS evidence cannot be told from the
 /// new, so the full check runs, and stderr says why — every record written
-/// before rule 1 is such a pass); the pass is bound to this very build (its
+/// before rule 1 is such a pass) and by the current egress rule
+/// ([`EGRESS_RULE`]: a pass recorded before S9's S3 cases, rule 0, does not
+/// count either); the pass is bound to this very build (its
 /// `created_at` the version's `createdAt`, to the second) and to the
 /// connector's live facts (`get-network-connector`); and the pass is younger
 /// than [`MAX_RECORD_AGE_S`](crate::bridge::egress::MAX_RECORD_AGE_S), the age
@@ -1407,6 +1917,12 @@ fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(
         // Said, because the first `make claude-update` after an install that raised the rule starts a VM for a
         // version that has a recorded pass.
         eprintln!("egress check: the recorded pass of image version {version} was judged by an earlier DNS rule ({}, now {DNS_RULE}): checking again", rec.dns_rule);
+        return None;
+    }
+    if rec.egress_rule < EGRESS_RULE {
+        // Likewise for the cases a pass ran (S9: rule 1 adds the S3 cases, §7.7), so `--if-needed` never skips on a
+        // pass the credential gate stops taking once it compares the rule too.
+        eprintln!("egress check: the recorded pass of image version {version} was judged by an earlier egress rule ({}, now {EGRESS_RULE}): checking again", rec.egress_rule);
         return None;
     }
     if rec.image_created_at.is_none_or(|t| (t - created).abs() > 1) {
@@ -1563,7 +2079,7 @@ pub fn cmd_check(store: &Keystore, vm: Option<&str>, keep: bool, json: bool, if_
 /// — success, failure, Ctrl-C (then the VM is found through the rows of the
 /// plan's client token) — unless `--keep`; a VM whose egress gate did not
 /// pass is ended whatever `--keep` says.
-async fn run_check<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, target: &Target, fake: bool, keep: bool, connector: &str) -> std::result::Result<Evidence, Early> {
+async fn run_check<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, target: &Target, fake: bool, keep: bool, connector: &str) -> std::result::Result<Evidence, Early> {
     let mut guard = Guard { since: unix_now(), ..Guard::default() };
     let work = gather(ctx, api, ep, target, fake, connector, &mut guard);
     let outcome = tokio::select! {
@@ -1609,13 +2125,75 @@ fn early_failure(ctx: &Ctx, connector: &str, early: Early) -> CliError {
     crate::bridge::creds::with_note(early.error, &note)
 }
 
-/// Acquire the VM and wait for its `/health`, refuse the fake (unless its
-/// transcript knob stands in for the shell), run the script, read its
-/// markers, then the network verification (always, once a transcript
-/// exists), judge the markers by the effective allowlist it proved
-/// ([`judge_with`]), and squid's log (only when every case and the network
-/// passed).
-async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, target: &Target, fake: bool, connector: &str, guard: &mut Guard) -> Result<Evidence> {
+/// The three presigned URLs the S3 cases read from the shell's stdin, in the
+/// order the script reads them into `AIENV_U` (CASES order): `s3-own`'s PUT
+/// then GET of `v1/_egress-check/<nonce>`, and `s3-own-outside-prefix`'s PUT
+/// of `x/_egress-check/<nonce>` (IAM refuses the prefix). Each writes a
+/// zero-byte object, signed only by the runtime key; `x-amz-expected-bucket-owner`
+/// is signed in every one. They expire [`PRESIGN_EXPIRY`](crate::wire::s3::PRESIGN_EXPIRY)
+/// after the script starts: a run whose earlier cases take longer fails `s3-own`.
+pub async fn s3_probe_urls<A: crate::bridge::s3::S3Sign>(api: &A, target: &crate::bridge::s3::S3Target, nonce: &str) -> std::result::Result<Vec<crate::wire::s3::PresignedUrl>, BridgeError> {
+    use crate::bridge::s3::{presign, S3Method};
+    use crate::wire::s3::{S3Key, PRESIGN_EXPIRY};
+    /// sha256 of the empty body every probe PUT writes.
+    const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let own = S3Key::EgressCheck { nonce: nonce.to_string() }.render();
+    let outside = S3Key::OutsideProbe { nonce: nonce.to_string() }.render();
+    let put_h = presign::write_headers(0, EMPTY_SHA, true)?;
+    let reqs = [
+        presign::request(S3Method::Put, target, Some(own.clone()), vec![], put_h.clone(), PRESIGN_EXPIRY),
+        presign::request(S3Method::Get, target, Some(own), vec![], vec![], PRESIGN_EXPIRY),
+        presign::request(S3Method::Put, target, Some(outside), vec![], put_h, PRESIGN_EXPIRY),
+    ];
+    let mut out = Vec::with_capacity(reqs.len());
+    for r in &reqs {
+        out.push(api.presign(r).await?);
+    }
+    Ok(out)
+}
+
+/// Run a check `script` (of run `nonce`) on VM `id` through the platform
+/// shell and return what it printed, never printing or logging it. A script
+/// without a URL read loop ([`url_reads`] 0: [`render_cases`]) goes out at
+/// once (`vm::shell::run_script`). One with it — every full check
+/// ([`render_script_with`]) — needs `target` (`Config` without it): `api`
+/// presigns exactly the URLs the loop reads ([`s3_probe_urls`]), the script
+/// goes out up to and including the loop's line, and the URLs, one per line,
+/// then the rest of the script, only once the output shows [`urls_marker`]
+/// (`vm::shell::run_script_frames`): the script has turned its terminal's
+/// echo off by then and reads them silently, so they are never in the script
+/// text, the shell's argv or environment, or the returned output (§2.2's
+/// third `expose()`); `aienv_s3do` then hands each to curl as its URL
+/// argument, an argv inside the VM only, which runs no agent (the check's
+/// own VM, or the `--shell` VM `--vm` names, on which every spawn is
+/// refused). When the marker never shows, no URL is typed and the S3 cases
+/// have no result.
+pub async fn run_check_script<A: MicrovmApi + crate::bridge::s3::S3Sign>(api: &A, id: &str, script: &str, nonce: &str, target: Option<&crate::bridge::s3::S3Target>, budget: Duration, auth: ShellAuth) -> std::result::Result<String, BridgeError> {
+    if url_reads(script) == 0 {
+        return shell::run_script(api, id, script, budget, auth).await;
+    }
+    let target = target.ok_or_else(|| BridgeError::Config("egress check: the script reads presigned URLs, but no transcripts bucket was resolved (make infra-status WRITE=1)".into()))?;
+    let urls = s3_probe_urls(api, target, nonce).await?;
+    let exposed: Vec<&str> = urls.iter().map(crate::wire::s3::PresignedUrl::expose).collect();
+    let (first, then) = script_frames(script, &exposed).map_err(|e| BridgeError::Config(format!("egress check (internal): {e}")))?;
+    let marker = urls_marker(nonce);
+    let gated: Vec<shell::Gated<'_>> = then.iter().map(|t| shell::Gated { after: &marker, text: t.expose() }).collect();
+    shell::run_script_frames(api, id, first, &gated, budget, auth).await
+}
+
+/// Resolve the transcripts bucket before anything starts (a configuration
+/// failure revokes nothing), acquire the VM and wait for its `/health`,
+/// refuse the fake (unless its transcript knob stands in for the shell), GET
+/// the front object anonymously ([`front_object`]), run the script
+/// ([`run_check_script`]), read its markers, then the network verification
+/// (always, once a transcript exists), judge the markers by the effective
+/// allowlist it proved and the S3 facts ([`judge_with`]), and squid's log
+/// (only when every case and the network passed).
+async fn gather<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, target: &Target, fake: bool, connector: &str, guard: &mut Guard) -> Result<Evidence> {
+    // The transcripts bucket the S3 cases (§7.7) probe, resolved before the check asks for its VM: a state/infra.toml
+    // that records none (before the S9 deploy and `make infra-status WRITE=1`), or another, is a configuration failure,
+    // which revokes nothing. The file-backed fake runs no script.
+    let bucket = if fake { None } else { Some(crate::bridge::s3::S3Target::resolve(&ctx.paths, &ctx.knobs)?) };
     let (row, vm, own) = match target {
         Target::Existing(row) => ((**row).clone(), live_vm(ctx, api, row).await?, false),
         Target::Start(plan) => {
@@ -1625,16 +2203,29 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
         }
     };
     health::read_health(api, ep, &ctx.paths, &vm.id, health::Backoff::HEALTH.scaled(ctx.knobs.backoff_ms)).await?;
+    // The check VM's execution role, as its run plan gave it (the row) or the VM echoes it: without one, s3-imds-role
+    // has nothing to try; with one, IMDS must hand its credentials over.
+    let named = |r: Option<&str>| r.is_some_and(|r| !r.trim().is_empty());
+    let has_role = named(row.execution_role.as_deref()) || named(vm.execution_role_arn.as_deref());
     let started_s = unix_now();
-    let (nonce, output) = if fake {
-        fake_transcript("egress check")?
-    } else {
-        let nonce = new_nonce();
-        let script = render_script(&nonce, &proxy_ip(&ctx.cfg, &ctx.paths));
-        let budget = script_budget(CASES.len());
-        eprintln!("egress check: {} cases on {} through the platform shell (at most {} s)", CASES.len(), vm.id, budget.as_secs());
-        let output = shell::run_script(api, &vm.id, &script, budget, ShellAuth::Header).await?;
-        (nonce, output)
+    let (nonce, output, front) = match &bucket {
+        None => {
+            let (nonce, output) = fake_transcript("egress check")?;
+            (nonce, output, FrontObject::Lab)
+        }
+        Some(bucket) => {
+            let nonce = new_nonce();
+            // First, from the Mac: is the object the fronting cases ask readable by anyone (§7.7)?
+            let front = front_object().await;
+            eprintln!("egress check: the front object {} {}", front_object_url(), front.said());
+            // The script asks the bucket's host; the Mac presigns the URLs it reads from its stdin and types them only
+            // once it asks (run_check_script).
+            let script = render_script_with(&nonce, &proxy_ip(&ctx.cfg, &ctx.paths), &S3Probe::of(bucket));
+            let budget = script_budget(CASES.len());
+            eprintln!("egress check: {} cases on {} through the platform shell (at most {} s)", CASES.len(), vm.id, budget.as_secs());
+            let output = run_check_script(api, &vm.id, &script, &nonce, Some(bucket), budget, ShellAuth::Header).await?;
+            (nonce, output, front)
+        }
     };
     let ended_s = unix_now();
     let markers = parse_markers(&output, &nonce);
@@ -1643,9 +2234,10 @@ async fn gather<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, ta
     // Judged by what squid serves, read after the cases ran: a host removed in between fails closed (judged, and
     // OPEN); one added in between only keeps the record from claiming it refused. Not proved: every case strictly.
     let skip = allowlisted_hosts(&net.allowlist.unwrap_or_default());
+    let s3 = S3Facts { has_role, front };
     let (judgement, transcript) = match markers {
-        Ok(m) => (judge_with(&m, &skip), Ok(())),
-        Err(e) => (judge_with(&Markers::default(), &skip), Err(e)),
+        Ok(m) => (judge_with(&m, &skip, &s3), Ok(())),
+        Err(e) => (judge_with(&Markers::default(), &skip, &s3), Err(e)),
     };
     // Said once judged, never from `skip` alone: only a case with a result is recorded, not judged — an unreadable
     // transcript, or a script that died before the case, leaves it judged, and failing.
@@ -1918,13 +2510,20 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
                     "name": c.name, "group": c.group, "verdict": c.verdict.as_str(), "reason": c.reason, "rc": r.rc, "code": r.code, "size": r.size,
                     "connects": r.conn, "connect_code": r.hc, "t403": r.t403, "squid_error": r.sq, "ns": r.ns, "resolves": r.resolves,
                     "dns_status": r.status, "recursion_available": r.ra, "dns_answers": r.answers, "dns_authority": r.authority,
+                    "put": r.put, "get": r.get, "s3_code": r.s3,
                 })
             })
             .collect();
+        let s3 = &ev.judgement.s3;
+        let front = serde_json::json!({
+            "bucket": FRONT_OBJECT_BUCKET, "key": FRONT_OBJECT_KEY, "readable": s3.front.readable(),
+            "status": match s3.front { FrontObject::Status(st) => Some(st), _ => None }, "detail": s3.front.said(),
+        });
         let doc = serde_json::json!({
             "backend": ctx.backend_name(), "id": ev.id, "report_only": !ev.own, "image_arn": ev.row_image_arn, "image_version": ev.vm_image_version,
             "echoed_image_arn": ev.vm_image_arn, "row_image_version": ev.row_image_version, "connector": normalize_connector(connector),
             "denied_host": ev.denied_host, "finished": ev.judgement.finished, "transcript_error": ev.transcript.as_ref().err(), "cases": cases,
+            "front_object": front, "execution_role": s3.has_role,
             "ready": ev.judgement.ready.map(|w| serde_json::json!({"tries": w.tries, "secs": w.secs, "ok": w.ok})),
             "dns": ev.judgement.dns, "dns_name": ev.dns_name, "dns_accepted": dns_ok, "dns_acceptance": ctx.cfg.egress.dns_acceptance(),
             "allowlisted": ev.judgement.allowlisted,
@@ -1937,6 +2536,7 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
         outln!("egress check of {} (image version {}; connector {}){}", ev.id, ev.vm_image_version, normalize_connector(connector), if ev.own { "" } else { " — report only (--vm)" });
         outln!("note: {EVIDENCE_NOTE}");
         outln!("{}", ready_text(ev.judgement.ready));
+        outln!("{}", ev.judgement.s3.said());
         for c in &ev.judgement.cases {
             let tag = match c.verdict {
                 Verdict::Pass => "pass",
@@ -1991,18 +2591,28 @@ mod tests {
         format!("@@AIENV{NONCE} {name} rc=0 ns={ns} res=no st=NOERROR ra=yes an=0 au=0")
     }
 
-    /// Every case's marker in a closed, working VPC.
+    /// An S3 case marker (§7.7): `put`, `get`, `hc` and `s3` (the `<Code>`, or `-`).
+    fn s3line(name: &str, put: &str, get: &str, hc: &str, s3: &str) -> String {
+        format!("@@AIENV{NONCE} {name} rc=0 put={put} get={get} hc={hc} s3={s3}")
+    }
+
+    /// Every case's marker in a closed, working VPC: the S3 cases with a role
+    /// (s3-own stored and read back through the endpoint, the rest refused 403
+    /// AccessDenied, s3-direct not connected, proxy-s3-other-host CONNECT 403).
     fn passing() -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = CASES
             .iter()
             .map(|c| {
                 let line = match c.name {
                     "allowed" | "allowed-last" => curl(c.name, 0, "401", "1", "200", false, false),
-                    "direct-name" => curl(c.name, 6, "000", "0", "000", false, false),
+                    "direct-name" | "s3-direct" => curl(c.name, 6, "000", "0", "000", false, false),
                     "direct-ipv6" => curl(c.name, 7, "000", "0", "000", false, false),
                     "direct-ipv4" | "direct-http" | "proxy-other-port" => curl(c.name, 28, "000", "0", "000", false, false),
                     "imds" | "imds-v6" => curl(c.name, 0, "401", "1", "000", false, false),
                     "proxy-http-8080" => curl(c.name, 0, "403", "1", "000", false, true),
+                    "s3-own" => s3line(c.name, "200", "200", "200", "-"),
+                    "s3-front-bucket" | "s3-front-path" => s3line(c.name, "000", "403", "200", "AccessDenied"),
+                    "s3-own-outside-prefix" | "s3-imds-role" => s3line(c.name, "403", "000", "200", "AccessDenied"),
                     n if n.starts_with("proxy-") || n == "denied" => curl(c.name, 56, "000", "1", "403", true, false),
                     n if n.starts_with("dns-public") => dig(n, "9", if n == "dns-public-port" { "208.67.222.222" } else { "1.1.1.1" }, false),
                     n if n.starts_with("dns-platform6") => dig(n, "9", "fd00:ec2::253", false),
@@ -2032,6 +2642,16 @@ mod tests {
         judge(&parse_markers(&transcript(lines), NONCE).unwrap())
     }
 
+    /// [`judged`] by these S3 facts, nothing allowlisted.
+    fn judged_by(lines: &[(String, String)], s3: &S3Facts) -> Judgement {
+        judge_with(&parse_markers(&transcript(lines), NONCE).unwrap(), &BTreeSet::new(), s3)
+    }
+
+    /// The bounds of the script's two typed parts (bytes; 6182 and 2059 as rendered here): up to and including the URL
+    /// read loop, typed at once, and the rest, typed after the URLs (about 1.5 KB).
+    const PRE_MAX: usize = 6400;
+    const POST_MAX: usize = 2200;
+
     fn verdict_of<'a>(j: &'a Judgement, name: &str) -> &'a CaseVerdict {
         j.cases.iter().find(|c| c.name == name).unwrap()
     }
@@ -2043,7 +2663,12 @@ mod tests {
     #[test]
     fn the_script_is_small_plain_and_never_parses_as_markers() {
         let s = render_script(NONCE, PROXY_IP);
-        assert!(s.len() < 4096, "{} bytes: over a terminal's line buffer", s.len());
+        // Each line stays under a terminal's canonical buffer. The script is typed in two parts (run_check_script): up
+        // to and including its URL read loop at once, then — once it asks, its terminal's echo off — the presigned
+        // URLs (about 1.5 KB) and the rest. S5 measured the platform shell taking a 3.9 KB script at once; the first
+        // live check of S9 (B1) confirms it takes these.
+        let (pre, post) = split_url_reads(&s).expect("the script reads URLs from stdin");
+        assert!(pre.len() < PRE_MAX && post.len() < POST_MAX && s.len() < PRE_MAX + POST_MAX, "{} + {} bytes: too large", pre.len(), post.len());
         assert!(!s.contains('\t') && !s.contains('!'), "no tab (completion) and no ! (history expansion)");
         assert!(s.lines().all(|l| l.len() < 1024), "short lines");
         assert!(s.starts_with("\\unalias -a; unset -f command curl dig printf 2>/dev/null; hash -r; unset HISTFILE; set +H\n") && s.ends_with("\nexit\n"), "{s}");
@@ -2054,16 +2679,47 @@ mod tests {
         assert_eq!(s.matches("example.com A").count(), 1, "example.com is asked once, without the header: {s}");
         assert!(s.contains("[ $rc = 0 ] && { e=$(command dig -r +noall +answer +time=2 +tries=1 \"$@\" \"@$s\" example.com A 2>&1 </dev/null); q=$?; }; "), "only of a server that replied, its exit code kept: {s}");
         assert!(s.contains(&format!("done <<<\"$e\"$'\\n'\"$o\"; [ $q = 0 ] || t={DNS_NO_EXAMPLE}; printf ")), "example.com's output first, so the fresh name's status wins, unless example.com got no reply at all: {s}");
-        assert!(HELPERS[1].len() < 1024 && s.len() < 4096, "the helper is {} characters, the script {} bytes", HELPERS[1].len(), s.len());
+        assert!(HELPERS[1].len() < 1024, "the helper is {} characters", HELPERS[1].len());
+        assert!(S3_HELPERS.iter().all(|h| h.len() < 1024), "each S3 helper fits a line");
         assert_eq!(dns_name(NONCE), format!("d{NONCE}.example.com"));
         assert!(dns_name(NONCE) != denied_host(NONCE) && crate::bridge::egress::is_valid_host(&dns_name(NONCE)));
         assert!(!s.contains(MARK), "the echoed script carries no marker");
         assert_eq!(parse_markers(&s, NONCE).unwrap(), Markers::default(), "the echo of the script is not a marker");
         for c in &CASES {
             let line = s.lines().find(|l| l.split_whitespace().nth(1) == Some(c.name)).unwrap_or_else(|| panic!("{} has no line", c.name));
-            assert!(line.starts_with(if c.is_dns() { "aienv_d " } else { "aienv_c " }), "{line}");
+            let want = if c.is_dns() {
+                "aienv_d "
+            } else if c.is_s3() {
+                "aienv_s3"
+            } else {
+                "aienv_c "
+            };
+            assert!(line.starts_with(want), "{line}");
             assert!(!line.contains('@'), "every placeholder filled: {line}");
         }
+        // The S9 S3 cases (§7.7): their helper lines, with the lab bucket host filled and the presigned URLs read from
+        // stdin (never in the script text), the fronting object asked, and the regional host for proxy-s3-other-host.
+        assert!(s.contains(r#"aienv_s3own s3-own "${AIENV_U[0]}" "${AIENV_U[1]}""#), "{s}");
+        assert!(s.contains(r#"aienv_s3deny s3-own-outside-prefix "${AIENV_U[2]}" - put"#), "{s}");
+        assert!(s.contains("aienv_s3deny s3-front-bucket ") && s.contains("aienv_s3deny s3-front-path ") && s.contains("aienv_s3imds s3-imds-role\n"), "{s}");
+        assert!(s.contains("aienv_c s3-direct --noproxy '*' https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/\n"), "{s}");
+        assert!(s.contains("aienv_c proxy-s3-other-host https://s3.eu-central-1.amazonaws.com/\n"), "{s}");
+        // The URLs reach the script on its stdin: the read loop is there, and splits the script so the Mac can send the
+        // URLs after it; the loop reads exactly URL_SLOTS of them. It turns the terminal's echo off before it prints the
+        // `urls` marker the Mac waits for (built at run time, so the echo of the script never shows it), and restores the
+        // terminal's settings after.
+        let loop_line = pre.lines().last().unwrap();
+        assert!(loop_line.starts_with("aienv_t=$(command stty -g 2>/dev/null); command stty -echo 2>/dev/null; printf '%s%s urls\\n' '@@' \"$R\"; AIENV_U=(); for aienv_i in 1 2 3; do IFS= read -rs aienv_l; "), "{loop_line}");
+        assert!(loop_line.ends_with("; [ -n \"$aienv_t\" ] && command stty \"$aienv_t\" 2>/dev/null") && post.starts_with("export ") && pre.len() + post.len() == s.len(), "pre ends at the read loop, post is the rest: {loop_line}");
+        assert_eq!((URL_SLOTS, url_reads(&s)), (3, 3));
+        assert!(!s.contains(&urls_marker(NONCE)) && urls_marker(NONCE) == format!("@@AIENV{NONCE} urls"), "{s}");
+        // s3-imds-role: every IMDS request fails on an HTTP error (-f), and neither the IMDS token nor the role's
+        // credentials are ever on an argv: each goes in a curl config on a file descriptor; the signed PUT carries a length.
+        assert_eq!(s.matches("command curl -q -sSf ").count(), 2, "the token PUT and aienv_imds' GET: {s}");
+        assert!(s.contains("-K <(printf 'header = \"X-aws-ec2-metadata-token: %s\"\\n' \"$aienv_it\")"), "{s}");
+        assert!(s.contains("-K <(printf 'user = \"%s:%s\"\\nheader = \"x-amz-security-token: %s\"\\n' \"$aienv_ak\" \"$aienv_sk\" \"$aienv_tk\") -X PUT --aws-sigv4 'aws:amz:eu-central-1:s3' "), "{s}");
+        assert!(S3_HELPERS[5].contains("-H 'Content-Length: 0'") && !s.contains("-H \"X-aws-ec2-metadata-token") && !s.contains("-H \"x-amz-security-token") && !s.contains("--user"), "{s}");
+        assert!(S3_HELPERS[5].contains("aienv_ak=; aienv_sk=; aienv_tk=; aienv_it=; printf "), "the credentials are cleared once used");
         assert!(s.contains("aienv_d dns-vpc-udp 10.42.0.2\n") && s.contains("aienv_d dns-subnet-tcp 10.42.1.2 +tcp\n") && s.contains("aienv_d dns-platform6-udp fd00:ec2::253\n"), "{s}");
         assert!(s.contains("aienv_d dns-public-port 208.67.222.222 -p 443\n") && s.contains("aienv_c direct-http --noproxy '*' http://1.1.1.1/\n"), "{s}");
         assert!(s.contains(&format!("aienv_c denied https://n{NONCE}.example.com/\n")), "{s}");
@@ -2072,7 +2728,8 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         let export = lines.iter().position(|l| l.starts_with("export ")).unwrap();
         assert_eq!(lines[export], "export https_proxy='http://10.42.0.10:3128' HTTPS_PROXY='http://10.42.0.10:3128' http_proxy='http://10.42.0.10:3128' HTTP_PROXY='http://10.42.0.10:3128' no_proxy='localhost,127.0.0.1,::1' NO_PROXY='localhost,127.0.0.1,::1'");
-        assert!(lines[export + 1] == "aienv_r 10.42.0.10:3128" && lines[export + 2].starts_with("aienv_c allowed ") && lines[export - 1].starts_with("aienv_r() "), "{s}");
+        assert!(lines[export + 1] == "aienv_r 10.42.0.10:3128" && lines[export + 2].starts_with("aienv_c allowed "), "{s}");
+        assert!(s.contains("aienv_r() {"), "the wait helper is defined");
         assert_eq!(s.matches("aienv_r 10.42.0.10:3128\n").count(), 1, "one wait, right before the first case");
         assert!(s.contains("command sleep 2") && s.contains("--noproxy '*' --connect-timeout 2 --max-time 4 \"http://$1/\""), "a plain TCP connection to the proxy, without the proxy: {s}");
         assert_eq!(s.matches("export ").count(), 1);
@@ -2085,8 +2742,48 @@ mod tests {
         assert_eq!(names, want);
         assert_eq!((names.first(), names.last()), (Some(&"allowed"), Some(&"allowed-last")));
         assert!(d.len() < 4096 && d.ends_with("\nexit\n") && d.contains("export https_proxy="));
-        assert_eq!(script_budget(CASES.len()), Duration::from_secs(27 * 12 + 60 + 5 + 30), "the cases, the wait for the proxy, slack");
+        assert_eq!(script_budget(CASES.len()), Duration::from_secs(34 * 12 + 60 + 5 + 30), "the cases, the wait for the proxy, slack");
         assert!(d.contains("aienv_r 10.42.0.10:3128\naienv_c allowed "), "the dns-path script waits too: {d}");
+        // render_cases (one frame): every case named but those that ask the transcripts bucket — no read loop, no S3
+        // helper, no bucket; proxy-s3-other-host asks none and stays.
+        let all: Vec<&str> = CASES.iter().map(|c| c.name).collect();
+        let r = render_cases(NONCE, PROXY_IP, &all);
+        assert!(url_reads(&r) == 0 && split_url_reads(&r).is_none(), "{r}");
+        assert!(!r.contains("AIENV_U") && !r.contains("aienv_s3") && !r.contains(".s3.eu-central-1.amazonaws.com") && !r.contains("stty"), "{r}");
+        let rendered: Vec<&str> = r.lines().filter(|l| l.starts_with("aienv_c ") || l.starts_with("aienv_d ")).filter_map(|l| l.split_whitespace().nth(1)).collect();
+        let want: Vec<&str> = CASES.iter().filter(|c| !c.needs_bucket()).map(|c| c.name).collect();
+        assert_eq!(rendered, want);
+        assert_eq!(CASES.iter().filter(|c| c.needs_bucket()).map(|c| c.name).collect::<Vec<_>>(), ["s3-direct", "s3-own", "s3-front-bucket", "s3-front-path", "s3-own-outside-prefix", "s3-imds-role"]);
+        assert!(rendered.contains(&"proxy-s3-other-host") && r.len() < 4096, "{} bytes", r.len());
+    }
+
+    /// What the Mac types for a check script (`script_frames`): the script up to and including its read loop's line,
+    /// then — gated on the `urls` marker — exactly as many one-line URLs as the loop reads, then the rest; a script
+    /// without a loop is one part; any other count, or a URL that is not one line, is refused before anything is typed.
+    #[test]
+    fn script_frames_type_exactly_the_urls_the_loop_reads() {
+        let s = render_script(NONCE, PROXY_IP);
+        let urls = ["https://u1/a?x=1", "https://u2/b?x=2", "https://u3/c?x=3"];
+        let (first, then) = script_frames(&s, &urls).unwrap();
+        let then = then.expect("the URLs and the rest");
+        let (pre, post) = split_url_reads(&s).unwrap();
+        assert_eq!(first, pre);
+        assert_eq!(then.expose(), &format!("https://u1/a?x=1\nhttps://u2/b?x=2\nhttps://u3/c?x=3\n{post}"));
+        assert!(!first.contains("https://u") && format!("{then:?}").starts_with("[redacted"), "the URLs only in the gated part, which never prints");
+        for bad in [&urls[..2], &[urls[0], urls[1], urls[2], urls[0]][..], &[]] {
+            assert!(script_frames(&s, bad).unwrap_err().contains("reads 3 presigned URLs from its stdin, not"), "{}", bad.len());
+        }
+        for bad in [["https://u1/a", "https://u2/b\nexit", "https://u3/c"], ["https://u1/a", "", "https://u3/c"], ["https://u1/a", "https://u2/b\r", "https://u3/c"]] {
+            assert!(script_frames(&s, &bad).unwrap_err().contains("presigned URL 2 is not one line"), "{bad:?}");
+        }
+        // A script without a read loop (render_cases, the dns-path probe): one part, and no URL taken.
+        let d = render_dns_script(NONCE, PROXY_IP);
+        let (first, then) = script_frames(&d, &[]).unwrap();
+        assert!(first == d && then.is_none());
+        assert!(script_frames(&d, &urls[..1]).unwrap_err().contains("reads 0 presigned URLs from its stdin, not 1"));
+        // The marker the Mac waits for is parsed once, without fields.
+        let m = parse_markers(&format!("bash-5.2# x\r\n{}\r\n", urls_marker(NONCE)), NONCE).unwrap();
+        assert!(m.urls && m.cases.is_empty() && !m.finished, "{m:?}");
     }
 
     #[test]
@@ -2276,6 +2973,8 @@ mod tests {
             (format!("@@AIENV{NONCE} ready try=1 s=0 ok=sure"), "bad ok"),
             (format!("@@AIENV{NONCE} ready try=1 try=2 s=0 ok=yes"), "try twice"),
             (format!("@@AIENV{NONCE} ready junk"), "not key=value"),
+            (format!("@@AIENV{NONCE} urls\n@@AIENV{NONCE} urls"), "urls marker twice"),
+            (format!("@@AIENV{NONCE} urls 3"), "urls marker carries"),
         ];
         // The wait's keepalive dots before a marker are harmless.
         assert_eq!(parse_markers(&format!("...@@AIENV{NONCE} ready try=4 s=6 ok=yes"), NONCE).unwrap().ready, Some(Ready { tries: 4, secs: 6, ok: true }));
@@ -2297,6 +2996,106 @@ mod tests {
         assert_eq!(verdict_of(&j, "imds").verdict, Verdict::Recorded);
         assert!(j.summary().starts_with("allowed=pass direct-name=pass") && j.summary().contains("imds=recorded:401") && j.summary().ends_with("allowed-last=pass"), "{}", j.summary());
         assert!(j.failures().is_empty());
+    }
+
+    /// The seven S3 cases (§7.7) are judged on the status and the `<Code>`,
+    /// never the wording: `s3-own` stores then reads back through the proxy
+    /// (both 200, CONNECT 200); each `S3Denied` case needs the tunnel open
+    /// (CONNECT 200) and S3 403 `AccessDenied`; `s3-imds-role` records
+    /// `no_role` only when the check VM runs without an execution role.
+    #[test]
+    fn the_s3_cases_are_judged_on_status_and_code() {
+        let j = judged(&passing());
+        for n in ["s3-own", "s3-front-bucket", "s3-front-path", "s3-own-outside-prefix", "s3-imds-role", "proxy-s3-other-host", "s3-direct"] {
+            assert_eq!(verdict_of(&j, n).verdict, Verdict::Pass, "{n}: {}", verdict_of(&j, n).reason);
+        }
+        assert!(j.summary().contains(" s3-own=pass ") && j.summary().contains(" s3-imds-role=pass "), "{}", j.summary());
+        // s3-own fails if the read is refused: the proxy's S3 traffic is not confined to the endpoint.
+        let j = judged(&with("s3-own", s3line("s3-own", "200", "403", "200", "AccessDenied")));
+        assert_eq!(failing(&j), ["s3-own"], "{:?}", j.failures());
+        assert!(verdict_of(&j, "s3-own").reason.contains("did not return 200"), "{}", verdict_of(&j, "s3-own").reason);
+        let open = judged(&with("s3-own", s3line("s3-own", "000", "403", "000", "AccessDenied")));
+        assert!(verdict_of(&open, "s3-own").reason.contains("did not open a tunnel"), "{}", verdict_of(&open, "s3-own").reason);
+        // A denied case the endpoint SERVED is OPEN; a 403 without AccessDenied is not the endpoint's; a tunnel that
+        // never opened cannot show the refusal.
+        for (name, line, why) in [
+            ("s3-front-bucket", s3line("s3-front-bucket", "000", "200", "200", "-"), "OPEN"),
+            ("s3-own-outside-prefix", s3line("s3-own-outside-prefix", "403", "000", "200", "NoSuchKey"), "without <Code> AccessDenied"),
+            ("s3-front-path", s3line("s3-front-path", "000", "403", "403", "AccessDenied"), "did not open a tunnel"),
+        ] {
+            let j = judged(&with(name, line));
+            assert_eq!(failing(&j), [name], "{name}");
+            assert!(verdict_of(&j, name).reason.contains(why), "{name}: {}", verdict_of(&j, name).reason);
+        }
+        // s3-imds-role without credentials from IMDS: recorded:no_role only for a VM without an execution role (the
+        // next test has every case of it).
+        let lines = with("s3-imds-role", s3line("s3-imds-role", "000", "000", "000", "norole"));
+        let j = judged_by(&lines, &S3Facts { has_role: false, front: FrontObject::Status(200) });
+        assert!(j.passed() && verdict_of(&j, "s3-imds-role").verdict == Verdict::Recorded, "{:?}", j.failures());
+        assert!(j.summary().contains(" s3-imds-role=recorded:no_role "), "{}", j.summary());
+        assert_eq!(failing(&judged(&lines)), ["s3-imds-role"], "with a role, IMDS must hand its credentials over");
+    }
+
+    /// `s3-imds-role` when IMDS gave the VM no credentials (no session token, no role, a role without all three
+    /// values): recorded `no_role` only when the check VM runs without an execution role; with one, each fails, naming
+    /// what was missing. A PUT that was made is judged like any `S3Denied` PUT, role or not.
+    #[test]
+    fn the_imds_role_case_records_no_role_only_without_a_role() {
+        let none = S3Facts { has_role: false, front: FrontObject::Status(200) };
+        for (w, what) in [("noimds", "no session token"), ("norole", "no role"), ("nocreds", "a role without all of AccessKeyId, SecretAccessKey and Token")] {
+            let lines = with("s3-imds-role", s3line("s3-imds-role", "000", "000", "000", w));
+            let j = judged_by(&lines, &none);
+            assert!(j.passed(), "{w}: {:?}", j.failures());
+            let v = verdict_of(&j, "s3-imds-role");
+            assert!(v.verdict == Verdict::Recorded && v.reason.starts_with("recorded:no_role: the check VM ran without an execution role") && v.reason.ends_with(&format!("(IMDS: {w})")), "{w}: {v:?}");
+            assert!(j.summary().contains(" s3-imds-role=recorded:no_role "), "{}", j.summary());
+            let j = judged(&lines);
+            assert_eq!(failing(&j), ["s3-imds-role"], "{w}");
+            assert_eq!(verdict_of(&j, "s3-imds-role").reason, format!("the check VM runs with an execution role, but IMDS gave it {what} ({w}): the role's credentials were never tried against our bucket"));
+        }
+        assert_eq!(IMDS_GAVE_NOTHING, ["noimds", "norole", "nocreds"]);
+        // A PUT signed with what IMDS gave is judged either way: refused passes, served is OPEN.
+        for s3 in [&none, &S3Facts::assumed()] {
+            assert_eq!(verdict_of(&judged_by(&passing(), s3), "s3-imds-role").verdict, Verdict::Pass);
+            let open = judged_by(&with("s3-imds-role", s3line("s3-imds-role", "200", "000", "200", "-")), s3);
+            assert_eq!(failing(&open), ["s3-imds-role"]);
+            assert!(verdict_of(&open, "s3-imds-role").reason.starts_with("OPEN"), "{}", verdict_of(&open, "s3-imds-role").reason);
+            // Any other word is S3's <Code>: judged.
+            let other = judged_by(&with("s3-imds-role", s3line("s3-imds-role", "403", "000", "200", "InvalidToken")), s3);
+            assert!(failing(&other) == ["s3-imds-role"] && verdict_of(&other, "s3-imds-role").reason.contains("without <Code> AccessDenied"), "{:?}", other.failures());
+        }
+    }
+
+    /// The fronting cases count only when the Mac read the front object anonymously (§7.7): a 403 AccessDenied through
+    /// the tunnel for an object nobody may read proves nothing about the endpoint, so with the object unreadable —
+    /// another status, no answer — both fail even with passing markers; readable (200, or 206 for the byte asked),
+    /// they pass and say so. No other case depends on it.
+    #[test]
+    fn the_fronting_cases_count_only_when_the_front_object_is_readable() {
+        for front in [FrontObject::Status(403), FrontObject::Status(404), FrontObject::Status(301), FrontObject::Status(500), FrontObject::Unreachable("timed out".into())] {
+            let j = judged_by(&passing(), &S3Facts { has_role: true, front: front.clone() });
+            assert!(!j.passed() && failing(&j) == ["s3-front-bucket", "s3-front-path"], "{front:?}: {:?}", j.failures());
+            for n in ["s3-front-bucket", "s3-front-path"] {
+                let r = &verdict_of(&j, n).reason;
+                assert!(r.contains(" — not counted: the front object copernicus-dem-30m/tileList.txt ") && r.contains(&front.said()), "{n}: {r}");
+            }
+            assert!(!front.readable());
+        }
+        for (front, status) in [(FrontObject::Status(200), 200), (FrontObject::Status(206), 206)] {
+            let j = judged_by(&passing(), &S3Facts { has_role: true, front });
+            assert!(j.passed(), "{status}: {:?}", j.failures());
+            assert!(verdict_of(&j, "s3-front-path").reason.ends_with(&format!("; the object it fronted answered the Mac's anonymous GET with HTTP {status} (readable)")), "{}", verdict_of(&j, "s3-front-path").reason);
+        }
+        // An OPEN fronting case fails as OPEN, whatever the object.
+        let open = judged_by(&with("s3-front-bucket", s3line("s3-front-bucket", "000", "200", "200", "-")), &S3Facts { has_role: true, front: FrontObject::Status(403) });
+        assert!(verdict_of(&open, "s3-front-bucket").reason.starts_with("OPEN"), "{}", verdict_of(&open, "s3-front-bucket").reason);
+        // The lab's stand-in counts in a debug build only.
+        assert_eq!(FrontObject::Lab.readable(), cfg!(debug_assertions));
+        assert_eq!(front_object_url(), "https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com/tileList.txt");
+        assert_eq!(
+            S3Facts { has_role: false, front: FrontObject::Status(206) }.said(),
+            "s3: the front object copernicus-dem-30m/tileList.txt answered the Mac's anonymous GET with HTTP 206 (readable); the check VM runs without an execution role"
+        );
     }
 
     #[test]
@@ -2408,7 +3207,7 @@ mod tests {
         assert!(strict.allowlisted.is_empty() && strict.summary().contains(" proxy-github=fail "), "{}", strict.summary());
         // Allowlisted: recorded, and the run passes.
         let m = parse_markers(&transcript(&with("proxy-github", tunnel)), NONCE).unwrap();
-        let j = judge_with(&m, &github);
+        let j = judge_with(&m, &github, &S3Facts::assumed());
         assert!(j.passed(), "{:?}", j.failures());
         let v = verdict_of(&j, "proxy-github");
         assert_eq!((v.verdict, v.result.as_ref().and_then(|r| r.hc)), (Verdict::Recorded, Some(200)), "the marker is kept");
@@ -2417,21 +3216,21 @@ mod tests {
         assert!(j.summary().contains(" proxy-github=recorded:allowlisted ") && j.summary().contains(" imds=recorded:401 "), "{}", j.summary());
         assert_eq!(j.cases.iter().filter(|c| c.verdict == Verdict::Recorded).count(), 3, "imds, imds-v6, proxy-github");
         // A refusal (github.com added after its case ran) is recorded too: the record never claims it refused.
-        let j = judge_with(&parse_markers(&transcript(&passing()), NONCE).unwrap(), &github);
+        let j = judge_with(&parse_markers(&transcript(&passing()), NONCE).unwrap(), &github, &S3Facts::assumed());
         let v = verdict_of(&j, "proxy-github");
         assert!(j.passed() && v.verdict == Verdict::Recorded && v.reason.contains("curl saw no HTTP answer (rc 56: receive failure; 1 connect), CONNECT 403;"), "{v:?}");
         // A missing marker still fails, and nothing was recorded for the allowlist.
         let gone: Vec<(String, String)> = passing().into_iter().filter(|(k, _)| k != "proxy-github").collect();
-        let j = judge_with(&parse_markers(&transcript(&gone), NONCE).unwrap(), &github);
+        let j = judge_with(&parse_markers(&transcript(&gone), NONCE).unwrap(), &github, &S3Facts::assumed());
         assert_eq!(failing(&j), ["proxy-github"]);
         assert!(verdict_of(&j, "proxy-github").reason.contains("no result") && j.allowlisted.is_empty() && !j.summary().contains("allowlisted"), "{}", j.summary());
-        assert!(judge_with(&Markers::default(), &github).allowlisted.is_empty(), "an unreadable transcript records nothing");
+        assert!(judge_with(&Markers::default(), &github, &S3Facts::assumed()).allowlisted.is_empty(), "an unreadable transcript records nothing");
         // An allowlist of other hosts — the API host, the IP literal, the nonce host among them — changes nothing.
         let nonce_host = denied_host(NONCE);
         let others: BTreeSet<String> = ["api.anthropic.com", "1.1.1.1", nonce_host.as_str(), "example.org"].iter().map(|h| (*h).to_string()).collect();
         for lines in [passing(), with("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false))] {
             let m = parse_markers(&transcript(&lines), NONCE).unwrap();
-            assert_eq!(judge_with(&m, &others), judge(&m));
+            assert_eq!(judge_with(&m, &others, &S3Facts::assumed()), judge(&m));
         }
         // With github.com allowlisted (alone, or with every other host), any other case the proxy let through fails
         // exactly as it would strictly.
@@ -2444,7 +3243,7 @@ mod tests {
         ] {
             let m = parse_markers(&transcript(&with(name, line.clone())), NONCE).unwrap();
             for set in [&github, &both] {
-                let j = judge_with(&m, set);
+                let j = judge_with(&m, set, &S3Facts::assumed());
                 assert_eq!(failing(&j), [name], "{line}");
                 assert_eq!(verdict_of(&j, name), verdict_of(&judge(&m), name), "{line}");
                 assert!(verdict_of(&j, name).reason.starts_with("OPEN") || name == "proxy-http-8080", "{}", verdict_of(&j, name).reason);
@@ -2464,9 +3263,16 @@ mod tests {
         let nonce_host = denied_host(NONCE);
         assert_eq!(
             all,
-            [("CONNECT", nonce_host.clone(), 443), ("CONNECT", "1.1.1.1".to_string(), 443), ("CONNECT", "api.anthropic.com".to_string(), 8443), ("CONNECT", "github.com".to_string(), 443), ("GET", "api.anthropic.com".to_string(), 8080)]
+            [
+                ("CONNECT", nonce_host.clone(), 443),
+                ("CONNECT", "1.1.1.1".to_string(), 443),
+                ("CONNECT", "api.anthropic.com".to_string(), 8443),
+                ("CONNECT", "github.com".to_string(), 443),
+                ("CONNECT", "s3.eu-central-1.amazonaws.com".to_string(), 443),
+                ("GET", "api.anthropic.com".to_string(), 8080)
+            ]
         );
-        assert_eq!(refused_requests(NONCE, &set(&["api.anthropic.com", "1.1.1.1", nonce_host.as_str()])), all, "never the API host's other ports, the IP literal or the nonce host");
+        assert_eq!(refused_requests(NONCE, &set(&["api.anthropic.com", "1.1.1.1", nonce_host.as_str(), "s3.eu-central-1.amazonaws.com"])), all, "never the API host's other ports, the IP literal, the nonce host or the other S3 host");
         let without: Vec<(&str, String, u16)> = all.iter().filter(|(_, h, _)| h != "github.com").cloned().collect();
         assert_eq!(refused_requests(NONCE, &set(&["github.com"])), without);
         assert_eq!(refused_requests(NONCE, &set(&["github.com", "api.anthropic.com", "1.1.1.1", nonce_host.as_str()])), without);
@@ -2550,6 +3356,7 @@ mod tests {
             l("TCP_DENIED/403", "GET", "api.anthropic.com:8080"),
             l("TCP_DENIED/403", "CONNECT", "api.anthropic.com:8443"),
             l("TCP_DENIED/403", "CONNECT", "github.com:443"),
+            l("TCP_DENIED/403", "CONNECT", "s3.eu-central-1.amazonaws.com:443"),
             l("TCP_DENIED/403", "CONNECT", &format!("{host}:443")),
             l("TCP_TUNNEL/200", "CONNECT", "api.anthropic.com:443"),
         ]
@@ -2569,7 +3376,7 @@ mod tests {
         assert!(squid_lines(&serde_json::json!({})).is_err());
         assert_eq!(lines_of(&["some other line".to_string()]).len(), 0, "other lines are skipped");
         // Each required line missing: named, not complete (the poll keeps asking).
-        for (i, want) in [(0usize, "2 × TCP_TUNNEL/200"), (1, "CONNECT 1.1.1.1:443"), (2, "GET api.anthropic.com:8080"), (3, "api.anthropic.com:8443"), (4, "github.com:443")] {
+        for (i, want) in [(0usize, "2 × TCP_TUNNEL/200"), (1, "CONNECT 1.1.1.1:443"), (2, "GET api.anthropic.com:8080"), (3, "api.anthropic.com:8443"), (4, "github.com:443"), (5, "CONNECT s3.eu-central-1.amazonaws.com:443")] {
             let mut msgs = squid_run("10.42.1.17", t);
             msgs.remove(i);
             match ev(&msgs) {
@@ -2579,11 +3386,11 @@ mod tests {
         }
         // The run's nonce line missing, outside the window, or another client's lines only: missing.
         let mut no_nonce = squid_run("10.42.1.17", t);
-        no_nonce.remove(5);
+        no_nonce.remove(6);
         assert!(matches!(ev(&no_nonce), SquidEvidence::Missing(m) if m[0].contains(&denied_host(NONCE))));
         assert!(matches!(ev(&squid_run("10.42.1.17", t + 3600)), SquidEvidence::Missing(_)), "outside the window");
         let mut other_client = squid_run("10.42.1.17", t);
-        for l in &mut other_client[..5] {
+        for l in &mut other_client[..6] {
             *l = l.replace("10.42.1.17", "10.42.1.18");
         }
         assert!(matches!(ev(&other_client), SquidEvidence::Missing(_)), "the evidence must come from the run's client");
@@ -2592,7 +3399,7 @@ mod tests {
         tunnelled.push(format!("aienv {t}.500 9 10.42.1.17 TCP_TUNNEL/200 5000 CONNECT {}:443", denied_host(NONCE)));
         assert!(matches!(ev(&tunnelled), SquidEvidence::Violation(v) if v.contains("let the run's denied host through")));
         assert!(matches!(ev(&squid_run("10.42.0.99", t)), SquidEvidence::Violation(v) if v.contains("outside the VM subnet")));
-        for host in ["github.com:443", "github.com:8443", "1.1.1.1:443", "api.anthropic.com:8443", "api.anthropic.com:8080"] {
+        for host in ["github.com:443", "github.com:8443", "1.1.1.1:443", "api.anthropic.com:8443", "api.anthropic.com:8080", "s3.eu-central-1.amazonaws.com:443"] {
             let mut msgs = squid_run("10.42.1.17", t);
             msgs.push(format!("aienv {t}.900 9 10.42.1.17 TCP_TUNNEL/200 5000 CONNECT {host}"));
             assert!(matches!(ev(&msgs), SquidEvidence::Violation(v) if v.contains("tunnels to hosts this run was refused")), "{host}");
@@ -2604,10 +3411,11 @@ mod tests {
         // Zero tunnels is never a pass.
         let no_tunnels: Vec<String> = squid_run("10.42.1.17", t).into_iter().filter(|l| !l.contains("TCP_TUNNEL")).collect();
         assert!(matches!(ev(&no_tunnels), SquidEvidence::Missing(m) if m[0].contains("(0 found)")));
-        // Every CONNECT case the proxy must refuse, and the plain-http one, is a required squid line.
+        // Every CONNECT case the proxy must refuse, and the plain-http one, is a required squid line (proxy-s3-other-host,
+        // S9, too: squid's own log is the evidence from outside the VM).
         let refused = refused_requests(NONCE, &BTreeSet::new());
         for c in CASES.iter().filter(|c| matches!(c.kind, Kind::Connect403 | Kind::Get403)) {
-            let url = c.args.replace("@H@", &denied_host(NONCE));
+            let url = c.args.replace("@H@", &denied_host(NONCE)).replace("@S3H@", S3_REGIONAL_HOST);
             let (scheme, rest) = url.split_once("://").unwrap();
             let hostport = rest.trim_end_matches('/');
             let (h, p) = hostport.rsplit_once(':').map_or((hostport, if scheme == "https" { 443 } else { 80 }), |(h, p)| (h, p.parse::<u16>().unwrap()));
@@ -2659,8 +3467,9 @@ mod tests {
             assert!(matches!(ev(&msgs), SquidEvidence::Violation(v) if v.contains("github.com:443")), "{other}: {:?}", ev(&msgs));
         }
         // Tunnels squid must never open count whenever they were logged, as does github.com on another port and a
-        // tunnel tag with a suffix.
-        for dest in ["1.1.1.1:443", "api.anthropic.com:8443", "github.com:8443"] {
+        // tunnel tag with a suffix — and the other S3 host, which is never allowlisted (an AWS service host, S7 D2), even
+        // logged before the run refused it.
+        for dest in ["1.1.1.1:443", "api.anthropic.com:8443", "github.com:8443", "s3.eu-central-1.amazonaws.com:443"] {
             assert!(matches!(ev(&with(&[at(t - 50, 0, 900, "TCP_TUNNEL/200", dest)])), SquidEvidence::Violation(v) if v.contains(dest)), "{dest}");
         }
         assert!(matches!(ev(&with(&[at(t - 50, 0, 900, "TCP_TUNNEL_ABORTED/200", "1.1.1.1:443")])), SquidEvidence::Violation(_)));
@@ -2704,12 +3513,12 @@ mod tests {
             assert!(matches!(ev(&plus(&no_denial, &extra), &none), SquidEvidence::Missing(_)), "{extra:?}");
         }
         // Every other tunnel is still a violation: the IP literal, the API host's other port, github.com on another port.
-        for dest in ["1.1.1.1:443", "api.anthropic.com:8443", "github.com:8443", "github.com:80"] {
+        for dest in ["1.1.1.1:443", "api.anthropic.com:8443", "github.com:8443", "github.com:80", "s3.eu-central-1.amazonaws.com:443"] {
             assert!(matches!(ev(&plus(&no_denial, &[tunnel(t, dest)]), &github), SquidEvidence::Violation(v) if v.contains(dest)), "{dest}");
         }
         // Every other denial is still required.
         let nonce_denial = format!("CONNECT {}:443", denied_host(NONCE));
-        for gone in ["CONNECT api.anthropic.com:8443", "CONNECT 1.1.1.1:443", "GET api.anthropic.com:8080", nonce_denial.as_str()] {
+        for gone in ["CONNECT api.anthropic.com:8443", "CONNECT 1.1.1.1:443", "GET api.anthropic.com:8080", "CONNECT s3.eu-central-1.amazonaws.com:443", nonce_denial.as_str()] {
             let msgs: Vec<String> = no_denial.iter().filter(|l| !l.ends_with(gone)).cloned().collect();
             assert!(matches!(ev(&msgs, &github), SquidEvidence::Missing(m) if m.iter().any(|x| x.contains(gone))), "{gone}: {:?}", ev(&msgs, &github));
         }
@@ -2747,6 +3556,26 @@ mod tests {
 
     const CONN: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
 
+    /// The transcripts bucket is resolved before the check asks for its VM: a state/infra.toml that records none (before
+    /// the S9 deploy and `make infra-status WRITE=1`) stops the check with a configuration error before RunMicrovm, so
+    /// the failure revokes nothing (`early_failure` revokes only once the check asked for its VM).
+    #[tokio::test]
+    async fn the_bucket_is_resolved_before_the_check_asks_for_its_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx {
+            paths: Paths::from_root_and_env(dir.path().to_path_buf(), None),
+            cfg: BridgeConfig::parse(&format!("[aws]\nimage_arn = \"{}\"\negress_connector_arn = \"{CONN}\"\n", crate::bridge::api::FAKE_IMAGE_ARN)).unwrap(),
+            knobs: crate::bridge::lab::VmKnobs::default(),
+        };
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let mut guard = Guard::default();
+        let target = Target::Start(Box::new(check_plan(&ctx).unwrap()));
+        let e = gather(&ctx, &api, &api, &target, false, CONN, &mut guard).await.expect_err("no transcripts bucket recorded");
+        assert!(e.to_string().contains("make infra-status WRITE=1") && e.exit_code() == 1, "{e}");
+        assert!(!guard.asked && guard.ours.is_empty() && guard.ran.is_none(), "the check never asked for its VM");
+        assert!(api.calls().iter().all(|c| !matches!(c, crate::bridge::api::Call::Run { .. })), "{:?}", api.calls());
+    }
+
     #[test]
     fn decide_records_a_full_pass_of_its_own_vm_only() {
         let ev = evidence(&passing());
@@ -2756,7 +3585,7 @@ mod tests {
         assert_eq!((rec.image_arn.as_str(), rec.image_version.as_str(), rec.connector.as_str(), rec.vm_id.as_str()), (crate::bridge::api::FAKE_IMAGE_ARN, "1.0", CONN, ev.id.as_str()));
         assert_eq!((rec.dns.as_str(), rec.network.as_str(), rec.squid_log.as_str(), rec.at.as_str()), ("no-dns", "21 checks ok: connector, vm-route-table", "from 10.42.1.17: 2 tunnels", "2026-10-01T10:00:00Z"));
         assert!(rec.cases.contains("denied=pass"));
-        assert_eq!(rec.dns_rule, DNS_RULE, "judged by the current DNS rule");
+        assert_eq!((rec.dns_rule, rec.egress_rule), (DNS_RULE, EGRESS_RULE), "judged by the current DNS and egress rules (§13 P0-4: the S3 cases ran)");
         // The stub's empty reply is recorded as the run's verdict (the gate decides with the pin).
         let platform = decide(&evidence(&with("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253"))), CONN, "t");
         assert!(platform.passed, "{:?}", platform.failures);
@@ -2770,7 +3599,7 @@ mod tests {
         assert!(d.passed && d.record.is_none() && !d.revoke);
         // An allowlisted host's case was recorded, not judged: the record says so, in `allowlisted` and in its cases.
         let opened = parse_markers(&transcript(&with("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false))), NONCE).unwrap();
-        let allowlisted = decide(&Evidence { judgement: judge_with(&opened, &["github.com".to_string()].into()), ..ev.clone() }, CONN, "t").record.unwrap();
+        let allowlisted = decide(&Evidence { judgement: judge_with(&opened, &["github.com".to_string()].into(), &S3Facts::assumed()), ..ev.clone() }, CONN, "t").record.unwrap();
         assert_eq!(allowlisted.allowlisted, ["github.com"]);
         assert!(allowlisted.cases.contains(" proxy-github=recorded:allowlisted "), "{}", allowlisted.cases);
         assert!(rec.allowlisted.is_empty() && rec.cases.contains(" proxy-github=pass "), "nothing allowlisted, nothing said: {rec:?}");

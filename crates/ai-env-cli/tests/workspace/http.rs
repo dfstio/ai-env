@@ -172,7 +172,7 @@ async fn statuses_come_back_as_replies_their_verdicts_read() {
         answer(409, serde_json::to_vec(&dirty).unwrap()),
         Answer { status: 403, headers: vec![("x-aws-proxy-error", "UNAUTHORIZED".into())], body: Vec::new() },
         Answer { status: 429, headers: vec![("retry-after", "2".into())], body: Vec::new() },
-        answer(404, "ai-env: not implemented (S8/S9)\n"),
+        answer(404, ai_env_cli::wire::workspace::NO_SUCH_ROUTE),
         answer(503, serde_json::to_vec(&WsRefusal::new(refusal::DRAINING, "suspending")).unwrap()),
         answer(413, serde_json::to_vec(&WsRefusal::new(refusal::TOO_LARGE, "big").with_size(99)).unwrap()),
     ];

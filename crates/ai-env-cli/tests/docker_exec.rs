@@ -45,6 +45,15 @@
 //! (`common/green_world.rs`): the seed at the identical path, the `/suspend`
 //! snapshot, a planted symlink, the code-out round trip, the helper's git
 //! environment, and a session whose `initialize` the pinned claude answers.
+//!
+//! S9 (wave 2, G8) on the same rig: `box fetch --smart-http` runs the image's
+//! `git http-backend` as the agent with exactly its CGI environment;
+//! receive-pack is 403 before any helper; a transcript's push and pull leave
+//! through the egress proxy's address with curl as `ai-env-net` (the decoy
+//! refuses the CONNECT to the bucket's host), the body never chunked; the
+//! image's git is 2.46 or later and runs the helper's commands.
+#[path = "common/curl.rs"]
+mod curl;
 #[path = "common/docker_tunnel.rs"]
 mod docker_tunnel;
 #[path = "common/fake_endpoint.rs"]
@@ -728,7 +737,7 @@ impl World {
     /// Everything but the vpc row a credential needs (see [`Self::credentialed`]).
     /// Neither `creds` command prints a dummy.
     fn seed_credentials(&self, d: &Dummies) {
-        use ai_env_cli::bridge::egress::{ConnectorFacts, EgressVerified, VerifiedRecord, DNS_NONE, DNS_RULE};
+        use ai_env_cli::bridge::egress::{ConnectorFacts, EgressVerified, VerifiedRecord, DNS_NONE, DNS_RULE, EGRESS_RULE};
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(self.bin()).unwrap();
         std::fs::create_dir_all(self.root.join("tmp")).unwrap();
@@ -760,6 +769,7 @@ impl World {
             at: ai_env_cli::wire::time::rfc3339_utc(now - 3600),
             dns: DNS_NONE.into(),
             dns_rule: DNS_RULE,
+            egress_rule: EGRESS_RULE,
             connector_facts: ConnectorFacts::from_get(&connector_doc()).unwrap(),
             image_created_at: Some(BUILD),
             ..VerifiedRecord::default()
@@ -1158,11 +1168,20 @@ impl DockerRig {
     /// ([`DockerRig::decoy_requests`]); a packet that leaves it crosses
     /// `eth0` ([`DockerRig::tx_packets`]).
     fn behind_a_decoy_proxy() -> DockerRig {
+        DockerRig::behind_a_decoy_proxy_with(&[], &[])
+    }
+
+    /// [`DockerRig::behind_a_decoy_proxy`] with `docker_args` added to its
+    /// `docker run` and `flags` to the ENTRYPOINT's argv (S9: a mounted
+    /// fake as the shim's `--curl`).
+    fn behind_a_decoy_proxy_with(docker_args: &[&str], flags: &[&str]) -> DockerRig {
         use ai_env_cli::bridge::egress::{PROXY_IP, PROXY_PORT};
         let (net, last) = PROXY_IP.rsplit_once('.').expect("an IPv4 proxy address");
         let gateway = if last == "1" { format!("{net}.2") } else { format!("{net}.1") };
         let network = Network::internal(&format!("{net}.0/24"), &gateway);
-        let rig = DockerRig::build(Some(network), &["--ip", PROXY_IP], &[]);
+        let mut args = vec!["--ip", PROXY_IP];
+        args.extend_from_slice(docker_args);
+        let rig = DockerRig::build(Some(network), &args, flags);
         let port = PROXY_PORT.to_string();
         let started = docker(&["exec", "-d", "-u", "0", &rig.c.id, "gawk", "-v", &format!("out={DECOY_LOG}"), "-v", &format!("port={port}"), DECOY]);
         assert!(started.status.success(), "the decoy proxy: {}", text(&started.stderr));
@@ -1197,8 +1216,21 @@ impl DockerRig {
         let rig = DockerRig { endpoint, c, net, hooks, app, code, root, token: green_world::setup_token("Dk"), head, _tmp: tmp };
         let roots = [rig.work()];
         green_world::Green { root: &rig.root, fake: &fake, roots: &roots }.seed(&rig.token, IMAGE_VERSION, true, &|args| rig.ai_env(args));
-        // An S8 image's VM: its `/health` also names the workspace routes' capability.
-        rig.update_fake(|s| s.health_caps.push(ai_env_cli::wire::frame::CAP_WORKSPACE_V1.to_string()));
+        // An S9 image's VM: its `/health` also names the workspace routes' capability and the transcript store's (a
+        // session takes no VM without `transcript_s3_v1`).
+        rig.update_fake(|s| s.health_caps.extend([ai_env_cli::wire::frame::CAP_WORKSPACE_V1, ai_env_cli::wire::frame::CAP_TRANSCRIPT_S3_V1].map(str::to_string)));
+        // The documentation account's transcripts bucket, as `make infra-status WRITE=1` records it after the S9
+        // deploy: a remote session's P0 builds its transcript sync with it (nothing reaches S3 before a turn).
+        let state = ai_env_cli::bridge::infra::InfraState {
+            stack: "dev".into(),
+            region: "eu-central-1".into(),
+            account_id: Some("123456789012".into()),
+            transcripts_bucket: Some("ai-env-transcripts-123456789012".into()),
+            ..ai_env_cli::bridge::infra::InfraState::default()
+        };
+        let paths = Paths::from_root_and_env(rig.root.join("bridge"), None);
+        std::fs::create_dir_all(paths.infra_state().parent().expect("state/")).expect("the bridge's state dir");
+        std::fs::write(paths.infra_state(), toml::to_string(&state).expect("infra.toml")).expect("write state/infra.toml");
         rig
     }
 
@@ -1671,31 +1703,124 @@ fn l2_codeout_round_trip() {
     rig.assert_no_way_out();
 }
 
-/// The shim's git children in the real image: its `--git` is the phase-0
-/// fake git (mounted read-only; a logging passthrough to the image's git),
-/// whose knobs file also logs every name a call inherited (the fake logs
-/// git's own), and the shim's own environment carries two canaries. While
-/// a credentialed spawn lives (`vm exec --with-credential`: the shim holds
-/// the dummy token, the spawn read it on fd 3), a dirty seed, the agent's
-/// commit and a `box fetch --wip` (its snapshot and its pack) run every git
-/// of the helper's ops. Each git call started with no descriptor past
-/// stderr (never the token's fd 3), and with only GitRun's VM environment:
-/// `HOME`, `PATH`, `LC_ALL` and git's own names (the config, prompt and
-/// lock rules, an index copy, the snapshot's identity), no canary; none of
-/// them clones, fetches, pushes or names a remote.
-#[test]
-#[ignore = "Docker: make test-docker"]
-fn l2_the_shim_git_child_env_is_clean_and_has_no_fd_3() {
+/// The phase-0 fake git as the shim's `--git` (`/opt/fakegit/git`, its
+/// directory mounted read-only): a logging passthrough to the image's git
+/// that logs each call to [`VM_GIT_LOG`] with its uid and every name it
+/// started with (`FAKE_GIT_ENV_ALL`), never a value.
+const VM_GIT_LOG: &str = "/tmp/ai-env-s8-git.log";
+
+/// [`VM_GIT_LOG`]'s fake git in a 0755 tempdir: the tempdir (kept while the
+/// container lives) and the `-v` argument that mounts it at `/opt/fakegit`.
+fn fake_git() -> (tempfile::TempDir, String) {
     use std::os::unix::fs::PermissionsExt as _;
     let fake = tempfile::tempdir().expect("a tempdir for the fake git");
     std::fs::copy(FAKE_GIT, fake.path().join("git")).expect("copy the fake git");
     std::fs::set_permissions(fake.path().join("git"), std::fs::Permissions::from_mode(0o755)).expect("chmod the fake git");
-    let knobs = "env | sed -n 's/=.*//p' | LC_ALL=C sort | tr '\\n' ' ' >> /tmp/ai-env-s8-git-env.log; echo >> /tmp/ai-env-s8-git-env.log\n\
-                 export GIT_REAL='/usr/bin/git'\nexport GIT_ARGV_LOG='/tmp/ai-env-s8-git.log'\n";
+    let knobs = format!("export GIT_REAL='/usr/bin/git'\nexport GIT_ARGV_LOG='{VM_GIT_LOG}'\nexport FAKE_GIT_ENV_ALL='1'\n");
     std::fs::write(fake.path().join("git.knobs"), knobs).expect("write the fake git's knobs");
     std::fs::set_permissions(fake.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod the fake's directory");
     let mount = format!("{}:/opt/fakegit:ro", fake.path().display());
+    (fake, mount)
+}
+
+/// One git call [`fake_git`] logged: its uid, every name it started with
+/// (but the four its own shell adds), its descriptors from 3 (`-`: none),
+/// its arguments.
+struct VmGit {
+    uid: Option<u32>,
+    names: Vec<String>,
+    fds: String,
+    args: Vec<String>,
+}
+
+impl VmGit {
+    /// Its subcommand: the first argument past git's `-c NAME=VALUE` pairs.
+    fn sub(&self) -> Option<&str> {
+        self.args.iter().skip_while(|a| *a == "-c" || a.contains('=')).find(|a| !a.starts_with('-')).map(String::as_str)
+    }
+
+    /// A git that reaches a remote: a clone, fetch, push or remote command, or a URL.
+    fn reaches_out(&self) -> bool {
+        self.args.iter().any(|a| ["clone", "fetch", "push", "remote", "ls-remote"].contains(&a.as_str()) || a.contains("://"))
+    }
+}
+
+/// Every call [`fake_git`] logged in `c` so far, in order.
+fn vm_git_calls(c: &Container) -> Vec<VmGit> {
+    c.sh(&format!("cat {VM_GIT_LOG} 2>/dev/null; true"))
+        .lines()
+        .map(|l| {
+            let mut fields = l.split('\t').peekable();
+            let uid = fields.peek().and_then(|f| f.strip_prefix("uid=")).map(|u| u.parse().unwrap_or_else(|_| panic!("a uid: {l:?}")));
+            if uid.is_some() {
+                fields.next();
+            }
+            let names = fields.next().and_then(|f| f.strip_prefix("env=")).unwrap_or_else(|| panic!("an env field: {l:?}"));
+            let fds = fields.next().and_then(|f| f.strip_prefix("fds=")).unwrap_or_else(|| panic!("an fds field: {l:?}")).to_string();
+            let names = if names == "-" { Vec::new() } else { names.split(',').map(str::to_string).collect() };
+            VmGit { uid, names, fds, args: fields.map(str::to_string).collect() }
+        })
+        .collect()
+}
+
+/// What every git of the helper but http-backend starts with: `GitRun::vm`'s
+/// `HOME`, `PATH` and `LC_ALL`, and git's own names (the config, prompt and
+/// lock rules, an index copy, the snapshot's identity).
+const HELPER_GIT_NAMES: [&str; 11] = ["HOME", "PATH", "LC_ALL", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_INDEX_FILE", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"];
+
+/// What `git http-backend` starts with in the VM (S9 §3.3): exactly
+/// `GitRun::vm`'s five names and the CGI names its request sets
+/// (`wire::workspace::GIT_CGI_ENV`): a `POST` its `CONTENT_TYPE` and
+/// `CONTENT_LENGTH`, a `GET` neither; the Mac's client sends `Git-Protocol`
+/// and never a `Content-Encoding`. No lock rule, no bearer, no user.
+fn http_backend_names(post: bool) -> std::collections::BTreeSet<&'static str> {
+    use ai_env_cli::wire::workspace::GIT_CGI_ENV;
+    let mut names: std::collections::BTreeSet<&'static str> = ["HOME", "PATH", "LC_ALL", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT"].into();
+    names.extend(GIT_CGI_ENV.iter().copied().filter(|n| *n != "HTTP_CONTENT_ENCODING" && (post || !matches!(*n, "CONTENT_TYPE" | "CONTENT_LENGTH"))));
+    names
+}
+
+/// `call` started with exactly what it should: http-backend with
+/// [`http_backend_names`] for its request, any other git of the helper with
+/// [`HELPER_GIT_NAMES`] only and the config, prompt and lock rules among
+/// them; each as the agent, with no descriptor past stderr, reaching nothing.
+fn assert_vm_git_env(call: &VmGit) {
+    assert_eq!(call.uid.map(|u| u.to_string()).as_deref(), Some(AGENT_UID), "a git that is not the agent's: {:?}", call.args);
+    assert_eq!(call.fds, "-", "a git started with a descriptor past stderr: {:?}", call.args);
+    assert!(!call.reaches_out(), "no git reaches a remote: {:?}", call.args);
+    let names: std::collections::BTreeSet<&str> = call.names.iter().map(String::as_str).collect();
+    if call.sub() == Some("http-backend") {
+        let post = names.contains("CONTENT_LENGTH");
+        assert_eq!(names, http_backend_names(post), "http-backend's environment for a {}: {:?}", if post { "POST" } else { "GET" }, call.args);
+        return;
+    }
+    assert!(names.iter().all(|n| HELPER_GIT_NAMES.contains(n)), "names beyond GitRun's VM environment: {names:?} in {:?}", call.args);
+    for must in ["HOME", "PATH", "LC_ALL", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS"] {
+        assert!(names.contains(must), "{must} missing: {names:?} in {:?}", call.args);
+    }
+}
+
+/// The shim's git children in the real image: its `--git` is [`fake_git`]
+/// (every call logged with its uid and every name it started with), and the
+/// shim's own environment carries two canaries. While a credentialed spawn
+/// lives (`vm exec --with-credential`: the shim holds the dummy token, the
+/// spawn read it on fd 3), a dirty seed, the agent's commit, a `box fetch
+/// --wip` (its snapshot and its pack) and, S9, a `box fetch --smart-http`
+/// of the agent's next commit (the advertisement, `ls-refs` and `fetch`
+/// through `git http-backend`) run every git of the helper's ops. Each git
+/// call ran as the agent with no descriptor past stderr (never the token's
+/// fd 3), and with only GitRun's VM environment: `HOME`, `PATH`, `LC_ALL`
+/// and git's own names, the config, prompt and lock rules among them, no
+/// canary; http-backend's alone also with the CGI names its request sets
+/// and without the lock rule (S9 §3.3, [`http_backend_names`]). None of
+/// them clones, fetches, pushes or names a remote.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_shim_git_child_env_is_clean_and_has_no_fd_3() {
+    let (_fake, mount) = fake_git();
     let rig = DockerRig::new(&["-v", &mount, "-e", "GIT_AI_ENV_CANARY=1", "-e", "AI_ENV_CANARY=1"], &["--git", "/opt/fakegit/git"]);
+    // An S9 image's VM: its `/health` names the git routes' capability too, recorded when the VM runs.
+    rig.update_fake(|s| s.health_caps.push(ai_env_cli::wire::frame::CAP_GIT_HTTP_V1.to_string()));
     let work = rig.work();
     let vm = rig.vm_dir();
     dirty_the_mac(&work);
@@ -1710,57 +1835,41 @@ fn l2_the_shim_git_child_env_is_clean_and_has_no_fd_3() {
     rig.c.agent_git(&vm, &["commit", "-q", "-m", "the agent's commit"]);
     rig.c.agent_sh(&format!("printf 'from the VM, not committed yet\\n' > '{vm}/agent.txt'"));
     assert_eq!(rig.box_json(&["fetch", &vm, "--wip"])["report"]["ok"].as_bool(), Some(true));
+    rig.c.agent_git(&vm, &["commit", "-q", "-am", "the agent's next commit"]);
+    assert_eq!(rig.box_json(&["fetch", &vm, "--smart-http"])["report"]["ok"].as_bool(), Some(true));
     assert!(matches!(holder.child.try_wait(), Ok(None)), "the holder lived through the helper's runs:\n{}", holder.err_text());
-    // The calls: (git's own names, the descriptors from 3, the arguments).
-    let calls: Vec<(Vec<String>, String, Vec<String>)> = rig
-        .c
-        .sh("cat /tmp/ai-env-s8-git.log")
-        .lines()
-        .map(|l| {
-            let mut fields = l.split('\t');
-            let names = fields.next().and_then(|f| f.strip_prefix("env=")).unwrap_or_else(|| panic!("an env field: {l:?}"));
-            let fds = fields.next().and_then(|f| f.strip_prefix("fds=")).unwrap_or_else(|| panic!("an fds field: {l:?}")).to_string();
-            let names = if names == "-" { Vec::new() } else { names.split(',').map(str::to_string).collect() };
-            (names, fds, fields.map(str::to_string).collect())
-        })
-        .collect();
-    let subs: std::collections::BTreeSet<&str> = calls.iter().filter_map(|(_, _, args)| args.iter().skip_while(|a| *a == "-c" || a.contains('=')).find(|a| !a.starts_with('-')).map(String::as_str)).collect();
-    for sub in ["init", "index-pack", "update-ref", "reset", "read-tree", "commit-tree", "pack-objects"] {
+    let calls = vm_git_calls(&rig.c);
+    let subs: std::collections::BTreeSet<&str> = calls.iter().filter_map(VmGit::sub).collect();
+    for sub in ["init", "index-pack", "update-ref", "reset", "read-tree", "commit-tree", "pack-objects", "http-backend"] {
         assert!(subs.contains(sub), "the helper's {sub} ran through the shim's --git: {subs:?}");
     }
-    let git_names = ["GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_INDEX_FILE", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"];
-    for (names, fds, args) in &calls {
-        assert_eq!(fds, "-", "a git started with a descriptor past stderr: {args:?}");
-        assert!(names.iter().all(|n| git_names.contains(&n.as_str())), "git names beyond GitRun's: {names:?} in {args:?}");
-        for must in ["GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS"] {
-            assert!(names.iter().any(|n| n == must), "{must} missing: {names:?} in {args:?}");
-        }
-        assert!(!args.iter().any(|a| ["clone", "fetch", "push", "remote", "ls-remote"].contains(&a.as_str()) || a.contains("://")), "no git reaches a remote: {args:?}");
+    for call in &calls {
+        assert_vm_git_env(call);
+        assert!(!call.names.iter().any(|n| n.contains("CANARY")), "a canary of the shim's environment reached a git: {:?}", call.names);
     }
-    let shell = ["PWD", "SHLVL", "_", "OLDPWD"];
-    let inherited: Vec<String> = rig.c.sh("cat /tmp/ai-env-s8-git-env.log").lines().map(str::to_string).collect();
-    assert_eq!(inherited.len(), calls.len(), "one name list per call");
-    for names in &inherited {
-        let names: Vec<&str> = names.split_whitespace().collect();
-        assert!(names.iter().all(|n| ["HOME", "PATH", "LC_ALL"].contains(n) || git_names.contains(n) || shell.contains(n)), "a git inherited more than GitRun's VM environment: {names:?}");
-        assert!(["HOME", "PATH", "LC_ALL"].iter().all(|n| names.contains(n)), "{names:?}");
-    }
-    eprintln!("L2 git children: {} calls, {} subcommands, each with fds 0-2 and GitRun's environment alone", calls.len(), subs.len());
+    let backend = calls.iter().filter(|c| c.sub() == Some("http-backend")).count();
+    eprintln!("L2 git children: {} calls ({backend} http-backend), {} subcommands, each the agent's with fds 0-2 and its allowed environment", calls.len(), subs.len());
 }
 
-/// W3's open point 6: the image's git is 2.29 or later, the features the
-/// helper's seed takes (`init --initial-branch` 2.28, `--object-format`
-/// 2.29, `update-ref --stdin` transactions 2.27, `add
+/// W3's open point 6, and S9's floor: the image's git is 2.46 or later
+/// (F8: the helper's ref moves verify HEAD with `symref-verify`, 2.46),
+/// with the features the helper's seed takes (`init --initial-branch` 2.28,
+/// `--object-format` 2.29, `update-ref --stdin` transactions 2.27, `add
 /// --pathspec-from-file` 2.25), and it runs those commands, with GitRun's
 /// overrides, as the agent in a container of the image with no shim, no
 /// claude and no network: a clone made as the helper makes it, then a thin
 /// pack of a second commit indexed into it with `--fix-thin` and checked
-/// out two-way. The image's system config turns automatic maintenance off
+/// out two-way. S9 adds the snapshot's `update-index --add --remove -z
+/// --stdin` (W3 #10) over a listing that names a file removed since (it is
+/// dropped, not an error), and F8's verified move: one `update-ref --stdin`
+/// run holding the `symref-verify HEAD` transaction (`option no-deref`),
+/// then the move's own `start` … `commit` block, as `verified_transaction`
+/// sends them. The image's system config turns automatic maintenance off
 /// (`maintenance.auto false`, W6's finding 2): no commit of the agent's
 /// starts a background `gc --auto` that a helper's object write could meet.
 #[test]
 #[ignore = "Docker: make test-docker"]
-fn l2_the_images_git_is_2_29_or_later_and_runs_the_helpers_commands() {
+fn l2_the_images_git_is_2_46_or_later_and_runs_the_helpers_commands() {
     require_enabled();
     let image = local_image();
     assert!(docker(&["image", "inspect", &image]).status.success(), "{image} is missing: run make image-build-local");
@@ -1771,6 +1880,8 @@ fn l2_the_images_git_is_2_29_or_later_and_runs_the_helpers_commands() {
          g init --quiet --template= --initial-branch=main --object-format=sha1 mac; cd mac; \
          printf 'one\\n' > f; printf 'f\\0' | g --literal-pathspecs add --pathspec-from-file=- --pathspec-file-nul; \
          c1=$(g commit-tree -m one \"$(g write-tree)\"); printf 'start\\ncreate refs/heads/main %s\\nprepare\\ncommit\\n' \"$c1\" | g update-ref --stdin >/dev/null; \
+         printf 'gone\\n' > gone; printf 'f\\0gone\\0' > ../listed; rm gone; g update-index --add --remove -z --stdin < ../listed; test -z \"$(g ls-files gone)\"; \
+         printf 'start\\noption no-deref\\nsymref-verify HEAD refs/heads/main\\nprepare\\ncommit\\nstart\\nprepare\\ncommit\\n' | g update-ref --stdin >/dev/null; \
          printf 'two\\n' > f; g add f; c2=$(g commit-tree -p \"$c1\" -m two \"$(g write-tree)\"); \
          cd \"$d\"; g init --quiet --template= --initial-branch=main --object-format=sha1 vm; cd vm; \
          (cd ../mac && printf '%s\\n' \"$c1\" | g pack-objects --revs --stdout -q) | g index-pack --stdin >/dev/null; \
@@ -1788,7 +1899,7 @@ fn l2_the_images_git_is_2_29_or_later_and_runs_the_helpers_commands() {
     assert!(lines.contains(&"maintenance.auto=false"), "the image's system git config turns automatic maintenance off: {said}");
     let version = lines.first().and_then(|l| l.strip_prefix("git version ")).unwrap_or_else(|| panic!("a version line: {said}"));
     let parts: Vec<u32> = version.split(['.', ' ']).take(2).map(|p| p.parse().unwrap_or_else(|_| panic!("a version: {version}"))).collect();
-    assert!(parts.as_slice() >= [2, 29].as_slice(), "the image's git {version} is older than 2.29");
+    assert!(parts.as_slice() >= [2, 46].as_slice(), "the image's git {version} is older than 2.46 (F8: symref-verify)");
     eprintln!("L2 image git: {version}");
 }
 
@@ -1899,4 +2010,239 @@ fn l2_wrapper_remote_session_initializes_the_pinned_claude() {
     assert!(!logs.contains(&rig.token[13..]), "the token reached the container's log");
     let hosts: std::collections::BTreeSet<&str> = requests.iter().map(String::as_str).collect();
     eprintln!("L2 remote session: initialize answered in {answered:?}, EOF to exit {took:?}; proxy requests {} ({hosts:?}); {note}; container counters {counters:?}", requests.len());
+}
+
+// ---- S9 L2 (wave 2, G8): smart-HTTP, receive-pack, and the transcript's curl ----------------
+
+/// One request straight through `addr` (a [`Tunnel`] to one of the
+/// container's ports, as the routed endpoint forwards one), its `extra`
+/// header lines (each ending in CRLF) and `body` with its `Content-Length`,
+/// `Connection: close`: the status and the rest as it came (a chunked body
+/// with its framing).
+fn tunnel_request(addr: SocketAddr, method: &str, path: &str, extra: &str, body: &[u8]) -> (u16, String) {
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(10)).unwrap_or_else(|e| panic!("{method} {path}: connect: {e}"));
+    s.set_read_timeout(Some(LIMIT)).expect("a read timeout");
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    s.write_all(head.as_bytes()).and_then(|()| s.write_all(body)).unwrap_or_else(|e| panic!("{method} {path}: send: {e}"));
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap_or_else(|e| panic!("{method} {path}: read: {e}"));
+    let raw = text(&buf);
+    let (head, rest) = raw.split_once("\r\n\r\n").unwrap_or_else(|| panic!("{method} {path}: no answer: {raw:?}"));
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or_else(|| panic!("{method} {path}: no status: {head:?}"));
+    (status, rest.to_string())
+}
+
+impl DockerRig {
+    /// The `Authorization` line of the VM `id`'s session bearer (its row's token, which only the Mac holds).
+    fn bearer(&self, id: &str) -> String {
+        let row = ai_env_cli::bridge::vm::registry::read_row(&Paths::from_root_and_env(self.root.join("bridge"), None), id).expect("the VM's row").expect("the VM has a row");
+        format!("Authorization: Bearer {}\r\n", row.session_token.expect("the row's session token"))
+    }
+
+    /// [`DockerRig::new`] for an S9 image's VM: its `/health` names
+    /// `git_http_v1` and `transcript_s3_v1` too (recorded when the VM runs).
+    fn s9(docker_args: &[&str], flags: &[&str]) -> DockerRig {
+        let rig = DockerRig::new(docker_args, flags);
+        rig.s9_caps();
+        rig
+    }
+
+    fn s9_caps(&self) {
+        use ai_env_cli::wire::frame::{CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1};
+        self.update_fake(|s| s.health_caps.extend([CAP_GIT_HTTP_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()]));
+    }
+}
+
+/// S9 L3/L4 on the real image: `box fetch --smart-http` (the Mac's own
+/// client, through the routed endpoint and the code tunnel) brings the
+/// agent's commit into `refs/remotes/box/main`, and never the tag the agent
+/// made (no tag reaches the Mac); the Mac's branches, index and worktree are
+/// untouched. The VM ran `git http-backend` through the shim's `--git` (the
+/// fake, logging) as the agent, once per exchange: the advertisement's
+/// `GET`, then `ls-refs` and `fetch` as `POST`s, each with exactly
+/// `GitRun::vm`'s names and its request's CGI names, its argv carrying the
+/// three `http.*` overrides and no URL; every git of the fetch ran as the
+/// agent. The shim answered each `git-cgi` 200, the audit names the fetch
+/// `smart-http`, nothing under the agent's home is root's, and nothing in
+/// the container tried a way out.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_smart_http_fetch_runs_http_backend_as_the_agent() {
+    use ai_env_cli::wire::workspace::GIT_CGI_OVERRIDES;
+    let (_fake, mount) = fake_git();
+    let rig = DockerRig::s9(&["-v", &mount], &["--git", "/opt/fakegit/git"]);
+    let (work, vm) = (rig.work(), rig.vm_dir());
+    let id = rig.start_vm();
+    assert_eq!(rig.box_json(&["seed", &vm])["outcome"].as_str(), Some("seeded"));
+    rig.c.agent_sh(&format!("printf 'from the VM\\n' > '{vm}/agent.txt'"));
+    rig.c.agent_git(&vm, &["add", "-A"]);
+    rig.c.agent_git(&vm, &["commit", "-q", "-m", "the agent's commit"]);
+    rig.c.agent_git(&vm, &["tag", "v-agent"]);
+    let vm_commit = rig.c.agent_git(&vm, &["rev-parse", "HEAD"]);
+    let (before, mac) = (vm_git_calls(&rig.c).len(), mac_view(&work));
+    let fetched = rig.box_json(&["fetch", &vm, "--smart-http"]);
+    assert_eq!((fetched["vm"].as_str(), fetched["via"].as_str(), fetched["report"]["ok"].as_bool()), (Some(id.as_str()), Some("smart-http"), Some(true)), "{fetched}");
+    assert_eq!(mac_git(&work, &["rev-parse", "refs/remotes/box/main"]), vm_commit, "the agent's commit came: {fetched}");
+    assert_eq!(mac_git(&work, &["for-each-ref", "refs/tags", "refs/remotes/box/tags"]), "", "the VM's tag never reaches the Mac");
+    assert_eq!(mac_view(&work), mac, "the Mac's branches, index, worktree and stash untouched");
+    let calls: Vec<VmGit> = vm_git_calls(&rig.c).into_iter().skip(before).collect();
+    for call in &calls {
+        assert_vm_git_env(call);
+    }
+    let backend: Vec<&VmGit> = calls.iter().filter(|c| c.sub() == Some("http-backend")).collect();
+    let posts = backend.iter().filter(|c| c.names.iter().any(|n| n == "CONTENT_LENGTH")).count();
+    assert_eq!((backend.len() - posts, posts), (1, 2), "the advertisement's GET, then ls-refs and fetch: {:?}", backend.iter().map(|c| &c.names).collect::<Vec<_>>());
+    for call in &backend {
+        for o in GIT_CGI_OVERRIDES {
+            assert!(call.args.windows(2).any(|w| w[0] == "-c" && w[1] == o), "-c {o} on http-backend's command line: {:?}", call.args);
+        }
+    }
+    let logs = rig.c.wait_lines(10, "ai-env: workspace git-cgi status=200 ", 3);
+    assert_eq!(logs.lines().filter(|l| l.starts_with("ai-env: workspace git-cgi ")).count(), 3, "three answers, all 200: {logs}");
+    let fetches = rig.audit("codeout_fetch");
+    assert_eq!(fetches.last().map(|r| r["detail"]["via"].clone()), Some(serde_json::json!("smart-http")), "{fetches:?}");
+    let not_agents = rig.c.not_the_agents();
+    assert!(not_agents.is_empty(), "paths under {AGENT_HOME} that are not the agent's after the fetch: {not_agents:#?}");
+    let counters = rig.assert_no_way_out();
+    eprintln!("L2 smart-HTTP: {} git calls in the VM ({} http-backend); container counters {counters:?}", calls.len(), backend.len());
+}
+
+/// S9 L3 on the real image: on a seeded VM, receive-pack in each form (a
+/// `POST` of a push, a `GET` of it, and the advertisement asked for
+/// `service=git-receive-pack`) is 403 with `GIT_RECEIVE_PACK_REFUSAL`,
+/// before any helper: the VM ran no git for them (the fake's log), and the
+/// shim logged each `git-cgi` 403. Without the bearer the code port's bearer
+/// layer answers first (401). The upload-pack advertisement through the same
+/// tunnel then answers 200 with protocol v2: the routes are there.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_receive_pack_is_403() {
+    use ai_env_cli::wire::workspace::{GIT_INFO_REFS_ROUTE, GIT_RECEIVE_PACK_QUERY, GIT_RECEIVE_PACK_REFUSAL, GIT_RECEIVE_PACK_ROUTE, GIT_UPLOAD_PACK_QUERY};
+    let (_fake, mount) = fake_git();
+    let rig = DockerRig::s9(&["-v", &mount], &["--git", "/opt/fakegit/git"]);
+    let vm = rig.vm_dir();
+    let id = rig.start_vm();
+    assert_eq!(rig.box_json(&["seed", &vm])["outcome"].as_str(), Some("seeded"));
+    let bearer = rig.bearer(&id);
+    let (before, logged) = (vm_git_calls(&rig.c).len(), rig.c.logs().lines().filter(|l| l.starts_with("ai-env: workspace git-cgi ")).count());
+    // A push's first request: a flush, as git sends when it has nothing to say.
+    let push = [("POST", GIT_RECEIVE_PACK_ROUTE.to_string(), "Content-Type: application/x-git-receive-pack-request\r\n", &b"0000"[..]), ("GET", GIT_RECEIVE_PACK_ROUTE.to_string(), "", &b""[..]), ("GET", format!("{GIT_INFO_REFS_ROUTE}?{GIT_RECEIVE_PACK_QUERY}"), "", &b""[..])];
+    for (method, path, extra, body) in &push {
+        let (status, said) = tunnel_request(rig.code.addr, method, path, &format!("{bearer}{extra}"), body);
+        assert_eq!(status, 403, "{method} {path}: {said}");
+        assert!(said.ends_with(GIT_RECEIVE_PACK_REFUSAL), "{method} {path}: the refusal's text: {said:?}");
+    }
+    let (status, said) = tunnel_request(rig.code.addr, "POST", GIT_RECEIVE_PACK_ROUTE, "Content-Type: application/x-git-receive-pack-request\r\n", b"0000");
+    assert_eq!(status, 401, "no bearer: the bearer layer first: {said}");
+    assert_eq!(vm_git_calls(&rig.c).len(), before, "no helper, no git ran for receive-pack");
+    let logs = rig.c.wait_lines(10, "ai-env: workspace git-cgi status=403 ", 3);
+    assert_eq!(logs.lines().filter(|l| l.starts_with("ai-env: workspace git-cgi ")).count(), logged + 3, "three refusals, nothing else: {logs}");
+    let (status, said) = tunnel_request(rig.code.addr, "GET", &format!("{GIT_INFO_REFS_ROUTE}?{GIT_UPLOAD_PACK_QUERY}"), &format!("{bearer}Git-Protocol: version=2\r\n"), b"");
+    assert_eq!(status, 200, "upload-pack is served: {said}");
+    assert!(said.contains("version 2"), "a v2 advertisement: {said:?}");
+    assert!(vm_git_calls(&rig.c).iter().skip(before).any(|c| c.sub() == Some("http-backend")), "upload-pack ran http-backend");
+}
+
+/// Where the fake curl of [`l2_push_pull_through_decoy_proxy`] logs, in a
+/// directory only `ai-env-net` (999) enters: the calls' configurations hold
+/// the URLs.
+const CURL_DIR: &str = "/tmp/ai-env-s9-curl";
+
+/// A presigned URL of the store for `key` (S9 §1.8's shape; the signature
+/// `signature`, made at run time: nothing credential-shaped is written here),
+/// signed over `signed`, at `version` when given.
+fn store_url(key: &ai_env_cli::wire::s3::S3Key, signed: &str, version: Option<&str>, signature: &str) -> ai_env_cli::wire::s3::PresignedUrl {
+    let version = version.map(|v| format!("versionId={v}&")).unwrap_or_default();
+    let query = format!("{version}X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261018%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261018T080000Z&X-Amz-Expires=300&X-Amz-SignedHeaders={}&X-Amz-Signature={signature}", signed.replace(';', "%3B"));
+    let host = ai_env_cli::wire::s3::bucket_host("ai-env-transcripts-123456789012");
+    ai_env_cli::wire::s3::PresignedUrl::new(format!("https://{host}/{}?{query}", key.render())).expect("a presigned URL of the store")
+}
+
+/// S9 M2 on the real image, behind the egress proxy's address (the decoy),
+/// on a seeded VM (the seed through the endpoint posted its `/run`): a
+/// transcript's push and pull leave the VM through the proxy only, with
+/// the image's curl as `ai-env-net` (999) under the shim's `--curl`, the
+/// phase-0 fake curl standing in front of it (`S3CURL_REAL`: it logs the
+/// configuration fd 3 carried, then runs the real curl with it). The push's
+/// configuration is S9 §3.4's: a `PUT` of the transcript's bytes with their
+/// `Content-Length`, `Transfer-Encoding:` emptied (never chunked) and no
+/// `Expect`, the proxy the egress proxy's; curl's argv `-q -K /dev/fd/3` and
+/// nothing but fd 3 past stderr. The decoy took a `CONNECT` to the bucket's
+/// host and refused it: curl reported no HTTP status, so the push is 500
+/// `transfer_failed`. The pull (one part, by version) goes the same way: a
+/// `GET` with `fail`, refused at the proxy, 500 `transfer_failed`, and the
+/// VM's copy is kept (its bytes, no temp file beside it). The URLs'
+/// signatures reached no log of the shim's; nothing in the container tried
+/// another way out.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_push_pull_through_decoy_proxy() {
+    use ai_env_cli::bridge::egress::{PROXY_IP, PROXY_PORT};
+    use ai_env_cli::wire::s3::{bucket_host, S3Key, SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT};
+    use ai_env_cli::wire::workspace::{PullPart, TranscriptPull, TranscriptPush};
+    use sha2::Digest as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = tempfile::tempdir().expect("a tempdir for the fake curl");
+    std::fs::copy(curl::FAKE_CURL, fake.path().join("curl")).expect("copy the fake curl");
+    std::fs::set_permissions(fake.path().join("curl"), std::fs::Permissions::from_mode(0o755)).expect("chmod the fake curl");
+    std::fs::write(fake.path().join("curl.knobs"), format!("export S3CURL_LOG='{CURL_DIR}/curl.log'\nexport S3CURL_REAL='/usr/bin/curl'\n")).expect("write the fake curl's knobs");
+    std::fs::set_permissions(fake.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod the fake's directory");
+    let mount = format!("{}:/opt/fakecurl:ro", fake.path().display());
+    let rig = DockerRig::behind_a_decoy_proxy_with(&["-v", &mount], &["--curl", "/opt/fakecurl/curl"]);
+    rig.s9_caps();
+    rig.c.sh(&format!("mkdir -m 0700 {CURL_DIR} && chown 999:999 {CURL_DIR}"));
+    let id = rig.start_vm();
+    // The seed goes through the endpoint, which posts the VM's `/run` first: the shim then knows the session's bearer.
+    assert_eq!(rig.box_json(&["seed", &rig.vm_dir()])["outcome"].as_str(), Some("seeded"));
+    let bearer = format!("{}Content-Type: application/json\r\n", rig.bearer(&id));
+    // The agent's transcript.
+    let (session, slug) = ("0199d2a0-0000-7000-8000-00000000000a", "-Users-mike-w");
+    let rel = format!("{slug}/{session}.jsonl");
+    let file = format!("{AGENT_HOME}/.claude/projects/{rel}");
+    let body = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a turn\"}}\n";
+    rig.c.agent_sh(&format!("mkdir -p {AGENT_HOME}/.claude/projects/{slug} && printf '%s\\n' '{}' > '{file}'", body.trim_end()));
+    let sha = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+    let sign = |n: u8| hex::encode(sha2::Sha256::digest(format!("{id}-{n}").as_bytes()));
+    let (push_sig, pull_sig) = (sign(1), sign(2));
+    let (owner, proxy) = ("123456789012".to_string(), Some(format!("http://{PROXY_IP}:{PROXY_PORT}")));
+    let push = TranscriptPush { rel: rel.clone(), from: 0, len: body.len() as u64, sha256: sha.clone(), url: store_url(&S3Key::Base { session: session.into(), gen: 1 }, SIGNED_HEADERS_PUT, None, &push_sig), owner: owner.clone(), proxy: proxy.clone() };
+    let (status, said) = tunnel_request(rig.app.addr, "POST", "/transcript/push", &bearer, serde_json::to_string(&push).unwrap().as_bytes());
+    assert_eq!((status, serde_json::from_str::<serde_json::Value>(&said).ok().and_then(|v| v["code"].as_str().map(str::to_string)).as_deref()), (500, Some("transfer_failed")), "the push: {said}");
+    let part = PullPart { url: store_url(&S3Key::Segment { session: session.into(), gen: 1, offset: 0 }, SIGNED_HEADERS_GET, Some("fv1"), &pull_sig), len: 9, sha256: Some("0".repeat(64)) };
+    let pull = TranscriptPull { rel, parts: vec![part], sha256: None, owner, proxy };
+    let (status, said) = tunnel_request(rig.app.addr, "POST", "/transcript/pull", &bearer, serde_json::to_string(&pull).unwrap().as_bytes());
+    assert_eq!((status, serde_json::from_str::<serde_json::Value>(&said).ok().and_then(|v| v["code"].as_str().map(str::to_string)).as_deref()), (500, Some("transfer_failed")), "the pull: {said}");
+    assert_eq!(rig.c.agent_sh(&format!("cat '{file}'")), body.trim_end(), "the VM's copy is kept");
+    assert_eq!(rig.c.sh(&format!("ls -A {AGENT_HOME}/.claude/projects/{slug}")), format!("{session}.jsonl"), "no temp file beside it");
+    // The decoy: one CONNECT each, to the bucket's host.
+    let host = bucket_host("ai-env-transcripts-123456789012");
+    assert_eq!(rig.decoy_requests(), [format!("CONNECT {host}:443 HTTP/1.1"), format!("CONNECT {host}:443 HTTP/1.1")], "curl went to the bucket's host through the proxy alone");
+    // What curl was given: the fake's log, copied out (root reads the 0700 directory).
+    let copied = tempfile::tempdir().expect("a tempdir for the curl log");
+    std::fs::write(copied.path().join("curl.log"), rig.c.sh(&format!("cat {CURL_DIR}/curl.log"))).expect("copy the curl log");
+    let calls = curl::curl_calls(&copied.path().join("curl.log"));
+    assert_eq!(calls.len(), 2, "the push's curl, then the pull's");
+    let proxy_line = format!("http://{PROXY_IP}:{PROXY_PORT}");
+    for (call, method) in calls.iter().zip(["PUT", "GET"]) {
+        assert_eq!((call.uid, call.fds.as_slice(), call.args.as_slice()), (999, &[3][..], &["-q".to_string(), "-K".to_string(), "/dev/fd/3".to_string()][..]), "curl as ai-env-net, fd 3 alone, its argv");
+        assert_eq!((call.conf("request"), call.conf("proxy"), call.conf("proto")), (vec![method.to_string()], vec![proxy_line.clone()], vec!["=https".to_string()]), "{}", call.config);
+    }
+    let put = &calls[0];
+    // Each pinned alone: curl takes the first of a header given twice, so one more (a `Transfer-Encoding: chunked`) would count.
+    let headers = put.conf("header");
+    let named = |name: &str| headers.iter().filter(|h| h.to_ascii_lowercase().starts_with(name)).map(String::as_str).collect::<Vec<_>>();
+    let length = format!("Content-Length: {}", body.len());
+    assert_eq!((named("content-length:"), named("transfer-encoding:"), named("expect:")), (vec![length.as_str()], vec!["Transfer-Encoding:"], vec!["Expect:"]), "one length, never chunked, no Expect: {headers:?}");
+    assert!(!put.config.to_ascii_lowercase().contains("chunked"), "never chunked: {}", put.config);
+    assert_eq!(put.conf("upload-file"), ["-"], "the bytes from stdin");
+    assert!(calls[1].config.lines().any(|l| l == "fail") && calls[1].conf("upload-file").is_empty(), "the pull's GET: {}", calls[1].config);
+    for op in ["transcript-push", "transcript-pull"] {
+        rig.c.wait_lines(10, &format!("ai-env: workspace {op} status=500 code=transfer_failed "), 1);
+    }
+    let logs = rig.c.logs();
+    for sig in [&push_sig, &pull_sig] {
+        assert!(!logs.contains(sig.as_str()), "a URL's signature reached the shim's log");
+    }
+    let counters = rig.assert_no_way_out();
+    eprintln!("L2 transcript transfers: both refused at the decoy, curl as 999 through the proxy; container counters {counters:?}");
 }

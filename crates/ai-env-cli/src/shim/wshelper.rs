@@ -57,22 +57,32 @@
 //!   skipped with the reason); none when the tree and parents equal the
 //!   newest snapshot's or the checkout matches its head; the newest
 //!   [`WIP_KEEP`] kept;
-//! * `transcript-stat`, `transcript-put`: a transcript under `--projects`
-//!   (`transcript_rel_check`'s rel): written 0700 directories, a 0600 temp
-//!   file beside it, fsync, the length checked, renamed; a longer VM copy
-//!   (also one grown longer while the body came in) is 409 `vm_longer` with
-//!   its size, the same bytes 200 `unchanged`;
+//! * `transcript-stat`: a transcript under `--projects`
+//!   (`transcript_rel_check`'s rel): its presence, size, sha256 and mtime;
 //! * `settings`: the agent's `settings.json`, the workspace's
 //!   `.claude/settings.json` and `.claude/settings.local.json` (each at most
 //!   `SETTINGS_FILE_MAX` of text, with its sha256), and the `PROJECT_KEYS` of
 //!   the workspace's entry in the agent's `.claude/.claude.json`.
+//!
+//! S9 (plans/s9-contracts.md §3) adds, none of them using the inbox:
+//! `transcript-stat --from/--fp/--subtree` (the extended stat),
+//! `transcript-read` (a range of the transcript after the head, for a push),
+//! `transcript-write` (a pull's bytes, then the line `commit`, then the
+//! rename), `transcript-view` (the Mac's view, `wire::view::build_view`) and
+//! `git-cgi` (`git http-backend` for the seeded workspace, upload-pack only).
+//! An op whose reply can pass `HEAD_LINE_MAX` (the view, a subtree stat)
+//! answers through [`answer_payload`]: a `JsonPayloadReply` head, then the
+//! reply's JSON. S8's `transcript-put` (the Mac's mirror written into the
+//! VM) went at the S3 cut-over: `transcript-write` writes what a pull brings.
 use crate::errors::{CliError, Result};
 use crate::gitrun::{GitError, GitRun};
+use crate::wire::view::TranscriptViewReply;
 use crate::wire::workspace::{
     budget, head_line, read_head_line, refusal, transcript_rel_check, vm_path_check, CodeoutManifest, HelperHead, ObjectFormat, SeedApplied, SeedManifest, SeedMode, SeedQuery, SeedRecord, SeedReply, SeedState,
-    SettingsCapture, SettingsFile, SettingsScope, SnapshotReply, TranscriptReply, TranscriptStat, TranscriptWrite, WsRefusal, HAVES_MAX, HEADS_PREFIX, HEAD_LINE_MAX, PROJECT_KEYS, SEED_BODY_MAX, SEED_REF, SEED_WIP_REF,
-    SETTINGS_FILE_MAX, TRANSCRIPT_MAX, WIP_REF_PREFIX,
+    SettingsCapture, SettingsFile, SettingsScope, SnapshotReply, TranscriptStat, WsRefusal, HAVES_MAX, HEADS_PREFIX, HEAD_LINE_MAX, PROJECT_KEYS, SEED_BODY_MAX, SEED_REF, SEED_WIP_REF, SETTINGS_FILE_MAX,
+    WIP_REF_PREFIX,
 };
+use crate::wire::workspace::{GitCgiReply, JsonPayloadReply, TranscriptWriteReply, JSON_PAYLOAD_MAX};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,8 +93,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The ops, as their subcommands are spelled.
-pub const OPS: [&str; 7] = ["seed-state", "seed-apply", "codeout", "snapshot", "transcript-stat", "transcript-put", "settings"];
+/// The ops, as their subcommands are spelled (S8's `transcript-put` went at the S3 cut-over).
+pub const OPS: [&str; 10] = ["seed-state", "seed-apply", "codeout", "snapshot", "transcript-stat", "transcript-read", "transcript-write", "transcript-view", "settings", "git-cgi"];
 
 /// Where a body is staged, under the agent's `HOME`.
 pub const INBOX: &str = ".cache/ai-env/inbox";
@@ -186,7 +196,7 @@ pub enum ShimIoOp {
         #[arg(long, value_name = "S", default_value_t = 8)]
         budget_s: u64,
     },
-    /// Presence, size and sha256 of the transcript REL under PROJECTS (GET /transcript)
+    /// Presence, size and sha256 of the transcript REL under PROJECTS; with --from the delta's sha256 and the fingerprints a sync needs, with --subtree the session's files (GET /transcript)
     TranscriptStat {
         /// The agent's projects directory
         #[arg(long, value_name = "DIR")]
@@ -194,18 +204,57 @@ pub enum ShimIoOp {
         /// The transcript's path under it (slug/uuid.jsonl, or slug/uuid/…)
         #[arg(long)]
         rel: String,
+        /// The length S3 holds: hash [FROM, size) and the fingerprint at the end, never the whole file (S9)
+        #[arg(long, value_name = "N")]
+        from: Option<u64>,
+        /// The fingerprint at FROM the Mac recorded (64 hex), checked against the file (S9)
+        #[arg(long, value_name = "HEX", requires = "from")]
+        fp: Option<String>,
+        /// Also list the session's subtree, each file with its sha256 (S9)
+        #[arg(long)]
+        subtree: bool,
     },
-    /// Write the transcript REL under PROJECTS from stdin, N bytes (PUT /transcript)
-    TranscriptPut {
+    /// LEN bytes of the transcript REL under PROJECTS from FROM, after the head (POST /transcript/push)
+    TranscriptRead {
         /// The agent's projects directory
         #[arg(long, value_name = "DIR")]
         projects: PathBuf,
         /// The transcript's path under it (slug/uuid.jsonl, or slug/uuid/…)
         #[arg(long)]
         rel: String,
-        /// The body's length in bytes
+        /// The first byte
+        #[arg(long, value_name = "N")]
+        from: u64,
+        /// How many bytes
         #[arg(long, value_name = "N")]
         len: u64,
+    },
+    /// Write the transcript REL under PROJECTS from stdin: LEN bytes, then the line commit; renamed into place only then (POST /transcript/pull)
+    TranscriptWrite {
+        /// The agent's projects directory
+        #[arg(long, value_name = "DIR")]
+        projects: PathBuf,
+        /// The transcript's path under it (slug/uuid.jsonl, or slug/uuid/…)
+        #[arg(long)]
+        rel: String,
+        /// The file's length in bytes
+        #[arg(long, value_name = "N")]
+        len: u64,
+        /// The bytes' sha256 (64 hex), when known: anything else is refused
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
+    },
+    /// The last N messages of the transcript REL under PROJECTS, as the Mac's view takes them (GET /transcript/view)
+    TranscriptView {
+        /// The agent's projects directory
+        #[arg(long, value_name = "DIR")]
+        projects: PathBuf,
+        /// The transcript's path under it (slug/uuid.jsonl)
+        #[arg(long)]
+        rel: String,
+        /// How many messages
+        #[arg(long, value_name = "N")]
+        n: u32,
     },
     /// The agent's settings.json, the workspace's .claude/settings.json and settings.local.json, and the allowlisted keys of PATH's entry under projects in .claude.json (GET /settings)
     Settings {
@@ -213,6 +262,41 @@ pub enum ShimIoOp {
         #[arg(long)]
         path: String,
     },
+    /// git http-backend for the seeded workspace at PATH, upload-pack only: the head, then the CGI's output (the code port's git routes)
+    GitCgi(GitCgiArgs),
+}
+
+/// `git-cgi`'s flags (S9 §3.3): none of them secret (uid 1000 can read
+/// them); the router passes only the literal routes' values.
+#[derive(clap::Args, Debug, Clone)]
+pub struct GitCgiArgs {
+    /// The seeded workspace's path in the VM (absolute, NFC)
+    #[arg(long)]
+    pub path: String,
+    /// GET (the advertisement) or POST (an upload-pack request)
+    #[arg(long, value_parser = ["GET", "POST"])]
+    pub method: String,
+    /// The CGI's PATH_INFO: /info/refs or /git-upload-pack (never the URL's)
+    #[arg(long, value_parser = ["/info/refs", "/git-upload-pack"])]
+    pub path_info: String,
+    /// The request's query (GET: exactly service=git-upload-pack)
+    #[arg(long, value_name = "Q")]
+    pub query: Option<String>,
+    /// The request's Content-Type (POST)
+    #[arg(long, value_name = "T")]
+    pub content_type: Option<String>,
+    /// The request body's length (POST): exactly that many bytes come on stdin
+    #[arg(long, value_name = "N")]
+    pub content_length: Option<u64>,
+    /// The request's Content-Encoding
+    #[arg(long, value_parser = ["gzip", "x-gzip"])]
+    pub content_encoding: Option<String>,
+    /// The request's Git-Protocol header
+    #[arg(long, value_parser = ["version=0", "version=1", "version=2"])]
+    pub git_protocol: Option<String>,
+    /// The client's address (the CGI's REMOTE_ADDR)
+    #[arg(long, value_name = "A")]
+    pub remote_addr: String,
 }
 
 impl ShimIoOp {
@@ -225,8 +309,11 @@ impl ShimIoOp {
             ShimIoOp::Codeout { .. } => OPS[2],
             ShimIoOp::Snapshot { .. } => OPS[3],
             ShimIoOp::TranscriptStat { .. } => OPS[4],
-            ShimIoOp::TranscriptPut { .. } => OPS[5],
-            ShimIoOp::Settings { .. } => OPS[6],
+            ShimIoOp::TranscriptRead { .. } => OPS[5],
+            ShimIoOp::TranscriptWrite { .. } => OPS[6],
+            ShimIoOp::TranscriptView { .. } => OPS[7],
+            ShimIoOp::Settings { .. } => OPS[8],
+            ShimIoOp::GitCgi(_) => OPS[9],
         }
     }
 }
@@ -283,9 +370,14 @@ fn dispatch(ctx: &Ctx, op: &ShimIoOp, input: &mut dyn BufRead, out: &mut dyn Wri
             Err(stop) => refused::<CodeoutManifest>(out, stop),
         },
         ShimIoOp::Snapshot { path, budget_s } => answer(out, ctx.snapshot(path, Duration::from_secs(*budget_s))),
-        ShimIoOp::TranscriptStat { projects, rel } => answer(out, ctx.transcript_stat(projects, rel)),
-        ShimIoOp::TranscriptPut { projects, rel, len } => answer(out, ctx.transcript_put(projects, rel, *len, input)),
+        ShimIoOp::TranscriptStat { projects, rel, from: None, fp: None, subtree: false } => answer(out, ctx.transcript_stat(projects, rel)),
+        ShimIoOp::TranscriptStat { projects, rel, from, fp, subtree: true } => answer_payload(out, ctx.transcript_stat_from(projects, rel, *from, fp.as_deref(), true)),
+        ShimIoOp::TranscriptStat { projects, rel, from, fp, subtree: false } => answer(out, ctx.transcript_stat_from(projects, rel, *from, fp.as_deref(), false)),
+        ShimIoOp::TranscriptRead { projects, rel, from, len } => ctx.transcript_read(projects, rel, *from, *len, out),
+        ShimIoOp::TranscriptWrite { projects, rel, len, sha256 } => answer(out, ctx.transcript_write(projects, rel, *len, sha256.as_deref(), input)),
+        ShimIoOp::TranscriptView { projects, rel, n } => answer_payload(out, ctx.transcript_view(projects, rel, *n)),
         ShimIoOp::Settings { path } => answer(out, ctx.settings(path)),
+        ShimIoOp::GitCgi(a) => ctx.git_cgi(a, input, out),
     }
 }
 
@@ -299,6 +391,27 @@ fn answer<T: Serialize>(out: &mut dyn Write, step: Step<T>) -> Result<()> {
         Ok(reply) => emit(out, &HelperHead::ok(reply, None)),
         Err(stop) => refused::<T>(out, stop),
     }
+}
+
+/// [`answer`] for an op whose reply can pass `HEAD_LINE_MAX` (S9: the view,
+/// a subtree stat): the head is a [`JsonPayloadReply`] (the reply's compact
+/// JSON's sha256) with its `len`, then exactly those bytes, at most
+/// [`JSON_PAYLOAD_MAX`] (more is the helper's exit 1); a refusal is an
+/// ordinary refusal head.
+fn answer_payload<T: Serialize>(out: &mut dyn Write, step: Step<T>) -> Result<()> {
+    let reply = match step {
+        Ok(reply) => reply,
+        Err(stop) => return refused::<JsonPayloadReply>(out, stop),
+    };
+    let json = serde_json::to_vec(&reply).map_err(|e| CliError::Msg(format!("the reply does not serialise: {e}")))?;
+    if json.len() > JSON_PAYLOAD_MAX {
+        return Err(CliError::Msg(format!("the reply is {} bytes of JSON (at most {JSON_PAYLOAD_MAX})", json.len())));
+    }
+    let sha256 = hex::encode(Sha256::digest(&json));
+    emit(out, &HelperHead::ok(JsonPayloadReply { sha256 }, Some(json.len() as u64)))?;
+    out.write_all(&json)?;
+    out.flush()?;
+    Ok(())
 }
 
 fn refused<T: Serialize>(out: &mut dyn Write, stop: Stop) -> Result<()> {
@@ -724,12 +837,27 @@ impl Repo<'_> {
         Ok(if p.is_absolute() { p } else { self.dir.join(p) })
     }
 
-    /// A copy of the agent's index in the inbox (empty when it has none).
+    /// A copy of the agent's index in the inbox (empty when it has none),
+    /// with the index's own mtime (S9): git trusts an entry's cached stat
+    /// only when the file is older than the index, so a copy with a newer
+    /// mtime would take a file edited at the same size in the index's own
+    /// second for clean, and the snapshot would leave the edit out (the Mac's
+    /// copies keep the mtime too, `bridge::workspace::snapshot::copy_index`).
+    /// The mtime is read before the bytes: an index rewritten in between
+    /// leaves the copy older than its bytes, which only makes git re-read
+    /// more files.
     fn index_copy(&self) -> Step<tempfile::NamedTempFile> {
         let copy = self.ctx.staged("index-")?;
         let index = self.git_path("index")?;
+        let modified = std::fs::metadata(&index).and_then(|m| m.modified());
         match std::fs::read(&index) {
-            Ok(bytes) => std::fs::write(copy.path(), bytes)?,
+            Ok(bytes) => {
+                std::fs::write(copy.path(), bytes)?;
+                // An index made between the two reads had no mtime yet: the copy keeps its own.
+                if let Ok(at) = modified {
+                    copy.as_file().set_modified(at)?;
+                }
+            }
             // No index: an empty one (git reads a missing or empty file as none).
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -740,8 +868,10 @@ impl Repo<'_> {
     /// The snapshot trees ([`Trees`]), each built in a copy of the index:
     /// the tracked changes (`add -u`) and the untracked files that are not
     /// ignored, regular files and symlinks only (a nested repository, a fifo
-    /// or a socket stays out), within the snapshot caps. `Err(why)` when it
-    /// is skipped (over a cap, no commit checked out).
+    /// or a socket stays out), within the snapshot caps; an untracked file
+    /// gone since its listing (the agent removed it meanwhile) is left out,
+    /// never a failed snapshot (S9, W3 #10). `Err(why)` when it is skipped
+    /// (over a cap, no commit checked out).
     fn trees(&self) -> Step<std::result::Result<Trees, String>> {
         let Some(head) = self.commit("HEAD")? else { return Ok(Err("the checkout has no commit (HEAD)".into())) };
         let head_tree = self.tree_of(&head)?;
@@ -790,8 +920,10 @@ impl Repo<'_> {
                 list.extend_from_slice(p);
                 list.push(0);
             }
-            // The names as they are, never pathspec magic (`:!x`, `:(top)`, `:w`), as the Mac's snapshot takes them.
-            git().output_stdin(["--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul"], &list).map_err(git_stop("add"))?;
+            // The names as they are: update-index takes paths, never pathspec magic (`:!x`, `:(top)`, `:w`), as
+            // the Mac's snapshot takes them; `--remove` drops one gone since the listing from the copy (W3 #10),
+            // where `add` failed the whole snapshot on it.
+            git().output_stdin(["update-index", "--add", "--remove", "-z", "--stdin"], &list).map_err(git_stop("update-index"))?;
         }
         let worktree = text(&git().output(["write-tree"]).map_err(git_stop("write-tree"))?);
         Ok(Ok(Trees { head, head_tree, index, worktree }))
@@ -1040,6 +1172,33 @@ impl Repo<'_> {
     }
 }
 
+/// The oldest git a seed's update or replace takes (F8): `update-ref
+/// --stdin` learned `symref-verify` in 2.46 (the image has 2.50.1).
+const GIT_FLOOR: (u32, u32) = (2, 46);
+
+impl Ctx {
+    /// F8 (S9): the helper's git is [`GIT_FLOOR`] or later, so a move can
+    /// check that HEAD still names the branch its checks saw
+    /// ([`verified_transaction`]); an older one is a `git_failed` refusal
+    /// naming its version, before anything moves.
+    fn git_floor(&self) -> Step<()> {
+        let out = self.git_in(&self.home, Duration::from_secs(10)).output(["version"]).map_err(git_stop("version"))?;
+        let said = text(&out);
+        if git_version(&said).is_some_and(|v| v >= GIT_FLOOR) {
+            return Ok(());
+        }
+        refuse(refusal::GIT_FAILED, &format!("the VM's git is {said:?}: a seed's update or replace needs git {}.{} or later (update-ref's symref-verify)", GIT_FLOOR.0, GIT_FLOOR.1))
+    }
+}
+
+/// `(major, minor)` of a `git version` line (`git version 2.50.1`, `git
+/// version 2.54.0 (Apple Git-157)`); `None` for anything else.
+fn git_version(line: &str) -> Option<(u32, u32)> {
+    let v = line.strip_prefix("git version ")?.split_whitespace().next()?;
+    let mut parts = v.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
 /// One `update-ref --stdin` transaction of `lines` by `git` (all or nothing).
 fn transaction(git: &GitRun, lines: &[String]) -> std::result::Result<(), GitError> {
     let mut input = String::from("start\n");
@@ -1048,6 +1207,27 @@ fn transaction(git: &GitRun, lines: &[String]) -> std::result::Result<(), GitErr
         input.push('\n');
     }
     input.push_str("prepare\ncommit\n");
+    git.output_stdin(["update-ref", "--stdin"], input.as_bytes()).map(|_| ())
+}
+
+/// [`transaction`] of `lines`, after `verify`'s own transaction in the same
+/// `update-ref --stdin` run (F8: its `symref-verify HEAD …`): git's files
+/// backend refuses HEAD and its branch in one transaction ("multiple
+/// updates for 'HEAD' (including one via its referent …)"), so the check
+/// commits first, and when it fails git stops there: `lines` never run.
+fn verified_transaction(git: &GitRun, verify: &[String], lines: &[String]) -> std::result::Result<(), GitError> {
+    if verify.is_empty() {
+        return transaction(git, lines);
+    }
+    let mut input = String::new();
+    for block in [verify, lines] {
+        input.push_str("start\n");
+        for l in block {
+            input.push_str(l);
+            input.push('\n');
+        }
+        input.push_str("prepare\ncommit\n");
+    }
     git.output_stdin(["update-ref", "--stdin"], input.as_bytes()).map(|_| ())
 }
 
@@ -1268,8 +1448,13 @@ impl Ctx {
     /// The refs moved in one compare-and-swap transaction (against what the
     /// checks saw), then the checkout moved by a two-way merge, then the WIP
     /// applied; a failure after the transaction puts the refs back first,
-    /// then the checkout ([`Repo::restore_checkout`]).
+    /// then the checkout ([`Repo::restore_checkout`]). F8 (S9): git
+    /// [`GIT_FLOOR`] or later first, and a HEAD on a branch must still name
+    /// it (`symref-verify`, [`verified_transaction`]): an agent that switched
+    /// to another branch at the same commit while the pack came in keeps its
+    /// checkout (409 `changed`), where the move went on under its new HEAD.
     fn move_refs_and_tree(&self, repo: &Repo<'_>, q: &SeedQuery, m: &SeedManifest, record: &SeedRecord, tip: &str, old_detached: Option<&str>) -> Step<()> {
+        self.git_floor()?;
         let none = zero(m.object_format);
         let old_seed = repo.ref_target(SEED_REF)?;
         let old_wip = repo.ref_target(SEED_WIP_REF)?;
@@ -1341,7 +1526,17 @@ impl Ctx {
                 None => repo.tree_of(&record.head)?,
             },
         };
-        if let Err(e) = repo.refs(&forward) {
+        // The branch HEAD named at the checks (an update's, which the checks
+        // compared with the query's; a pristine replace's, the seed's): it must
+        // still. A detached HEAD has no name to verify (`symref-verify` with no
+        // target asks that HEAD not exist); its update is against the tip.
+        let head_branch = match (old_detached, q.mode) {
+            (Some(_), _) => None,
+            (None, SeedMode::Update) => q.branch.as_ref(),
+            (None, _) => record.branch.as_ref(),
+        };
+        let verify: Vec<String> = head_branch.map(|b| vec!["option no-deref".into(), format!("symref-verify HEAD {HEADS_PREFIX}{b}")]).unwrap_or_default();
+        if let Err(e) = verified_transaction(&repo.git(), &verify, &forward) {
             return Err(cut_or("update-ref", e, |e| Stop::refused(WsRefusal::new(refusal::CHANGED, &format!("the VM's refs moved meanwhile: {}", git_said(e))))));
         }
         // From here a failure rolls back with runs of their own (`Repo::undo`): they may use what the forward runs left.
@@ -1367,7 +1562,11 @@ impl Ctx {
             }
         }
         if q.mode != SeedMode::Update {
-            let refreshed = repo.git().output(["read-tree", &from]).and_then(|_| repo.git().output(["update-index", "-q", "--refresh"]));
+            // A one-way merge without `-u` (F8, as `Repo::restore_checkout`'s):
+            // an entry it keeps keeps its stat data, so the refresh hashes only
+            // what the seed's index and worktree differ in (a plain `read-tree`
+            // dropped it all: the whole checkout hashed again on every replace).
+            let refreshed = repo.git().output(["read-tree", "--reset", &from]).and_then(|_| repo.git().output(["update-index", "-q", "--refresh"]));
             if let Err(e) = refreshed {
                 undo_refs(repo);
                 let _ = repo.undo().output(["read-tree", "--reset", record.index_tree.as_deref().unwrap_or(&record.head)]);
@@ -1464,6 +1663,46 @@ fn compact_utc(secs: u64) -> String {
     crate::wire::time::rfc3339_utc(secs).chars().filter(|c| *c != '-' && *c != ':').collect()
 }
 
+/// The stand-in a code-out lists a credential-shaped VM ref under (F4): the
+/// ref's own namespace, then this and a number. The scrubber masks a
+/// `token=` value, so the Mac's screen (`codeout::credential_shaped`) takes
+/// the stand-in for what it stands for: hidden and counted, never fetched.
+const HIDDEN_STAND_IN: &str = "token=hidden-";
+
+/// F4 (S9): the refs of `m` whose name the scrubber masks part of (the
+/// setup-token's shape, an AWS key id, a `token=` value: the agent can name
+/// a branch or a snapshot after what it reads in the VM) never leave the VM
+/// by name. Each is listed under a stand-in ([`HIDDEN_STAND_IN`], numbered
+/// in name order) at its commit, and so are the branch checked out and the
+/// snapshot (`wip_ref`) when they are among them, so the Mac still counts
+/// them (`box fetch`'s note, the dry run's "a branch whose name looks like a
+/// credential") with no change to the wire. A tripwire, not a proof, as on
+/// the Mac, whose custom tripwires this side never sees.
+fn hide_credential_shaped(m: &mut CodeoutManifest) {
+    use crate::wire::redact::scrub;
+    let names: Vec<String> = m.refs.keys().filter(|n| scrub(n) != n.as_str()).cloned().collect();
+    // Every hidden ref out first: a stand-in may spell a hidden ref's own name.
+    let hidden: Vec<(String, String)> = names.into_iter().filter_map(|n| m.refs.remove(&n).map(|id| (n, id))).collect();
+    let mut stand_ins = BTreeMap::new();
+    for (i, (name, id)) in hidden.into_iter().enumerate() {
+        let space = if name.starts_with(WIP_REF_PREFIX) { WIP_REF_PREFIX } else { HEADS_PREFIX };
+        let stand_in = format!("{space}{HIDDEN_STAND_IN}{}", i + 1);
+        m.refs.insert(stand_in.clone(), id);
+        stand_ins.insert(name, stand_in);
+    }
+    if let Some(w) = m.wip_ref.take() {
+        m.wip_ref = Some(stand_ins.get(&w).cloned().unwrap_or(w));
+    }
+    if let Some(b) = m.branch.take() {
+        let hidden = scrub(&b) != b.as_str();
+        m.branch = Some(match stand_ins.get(&format!("{HEADS_PREFIX}{b}")) {
+            Some(s) => s.strip_prefix(HEADS_PREFIX).unwrap_or(s).to_string(),
+            None if hidden => format!("{HIDDEN_STAND_IN}{}", stand_ins.len() + 1),
+            None => b,
+        });
+    }
+}
+
 impl Ctx {
     /// The seeded workspace's repository, or 409 `not_seeded` when the path holds none.
     fn seeded_repo(&self, path: &str, budget: Duration) -> Step<Repo<'_>> {
@@ -1477,13 +1716,21 @@ impl Ctx {
 
     fn snapshot(&self, path: &str, budget: Duration) -> Step<SnapshotReply> {
         let repo = self.seeded_repo(path, budget)?;
-        let (wip_ref, wip_skipped) = self.take_snapshot(&repo)?;
+        let (wip_ref, wip_skipped) = self.take_snapshot(&repo, true)?;
         Ok(SnapshotReply { wip_ref, wip_skipped, ms: self.ms() })
     }
 
     /// Snapshot the uncommitted work (module doc): the `refs/wip/*` made or
     /// kept (`None` when the checkout matches its head), or why none was made.
-    fn take_snapshot(&self, repo: &Repo<'_>) -> Step<(Option<String>, Option<String>)> {
+    /// S9 (F4): `by_name` when the reply names it as it is (`/suspend`'s,
+    /// whose name the shim logs and keeps for its health): a snapshot kept
+    /// then never has a name the scrubber masks part of. The agent can make
+    /// such a ref at the checkout's tree and parents, and `zz-<token>-<n>`
+    /// sorts after every time: the newest of the other snapshots is the one
+    /// compared, and with none the helper makes its own. The code-out keeps
+    /// S8's choice, which its manifest names through a stand-in
+    /// ([`hide_credential_shaped`]) that the Mac hides.
+    fn take_snapshot(&self, repo: &Repo<'_>, by_name: bool) -> Step<(Option<String>, Option<String>)> {
         let trees = match repo.trees()? {
             Ok(t) => t,
             Err(why) => return Ok((None, Some(why))),
@@ -1495,8 +1742,9 @@ impl Ctx {
         let listed = repo.git().output(["for-each-ref", "--format=%(refname)", "refs/wip/"]).map_err(git_stop("for-each-ref"))?;
         let mut wips: Vec<(String, u64, String)> = String::from_utf8_lossy(&listed).lines().filter_map(|n| wip_key(n).map(|(t, k)| (t, k, n.to_string()))).collect();
         wips.sort();
-        // Unchanged since the newest snapshot: the same tree on the same parents.
-        if let Some((_, _, newest)) = wips.last() {
+        // Unchanged since the newest snapshot (with `by_name`, the newest whose name may leave the VM: F4): the same
+        // tree on the same parents.
+        if let Some((_, _, newest)) = wips.iter().rev().find(|(_, _, n)| !by_name || crate::wire::redact::scrub(n) == n.as_str()) {
             let shown = repo.git().output(["show", "-s", "--format=%T %P", newest]).map_err(git_stop("show"))?;
             let shown = text(&shown);
             let mut words = shown.split(' ');
@@ -1555,7 +1803,7 @@ impl Ctx {
         let repo = self.seeded_repo(path, budget::CODEOUT)?;
         // A snapshot that fails (an untracked file the agent cannot read, one
         // gone meanwhile) is skipped with why: the commits still come back.
-        let (wip_ref, wip_skipped) = match wip.then(|| self.take_snapshot(&repo)) {
+        let (wip_ref, wip_skipped) = match wip.then(|| self.take_snapshot(&repo, false)) {
             None => (None, None),
             Some(Ok(made)) => made,
             Some(Err(Stop::Refused(r))) if r.code != refusal::TIMEOUT => (None, Some(format!("the snapshot failed: {}", r.message))),
@@ -1584,6 +1832,8 @@ impl Ctx {
                 manifest.refs.remove(&name);
             }
         }
+        // F4 (S9): nor does a name that looks like a credential leave it (a stand-in in its place).
+        hide_credential_shaped(&mut manifest);
         if manifest.wip_ref.as_ref().is_some_and(|w| !manifest.refs.contains_key(w)) {
             manifest.wip_ref = None;
         }
@@ -1653,6 +1903,495 @@ impl Ctx {
     }
 }
 
+// ---- git smart-HTTP (G1) ----
+
+/// `git version`'s and the object format's runs: a moment's work each.
+const CGI_PROBE: Duration = Duration::from_secs(10);
+
+/// http-backend's arguments after `gitrun::OVERRIDES`: `GIT_CGI_OVERRIDES`
+/// on its command line, which beats the agent's repository config
+/// (receive-pack and the dumb files off, upload-pack on).
+fn cgi_args() -> Vec<&'static str> {
+    let mut args: Vec<&'static str> = crate::wire::workspace::GIT_CGI_OVERRIDES.iter().flat_map(|o| ["-c", *o]).collect();
+    args.push("http-backend");
+    args
+}
+
+/// §3.3's pairs, the only requests the code port's git routes make: `GET`
+/// of `/info/refs` with the query exactly `GIT_UPLOAD_PACK_QUERY` and no
+/// body; `POST` of `/git-upload-pack` of exactly
+/// `GIT_UPLOAD_PACK_REQUEST_TYPE` with its length (at most
+/// `GIT_REQUEST_MAX`) and no query; the client's address an IP address.
+/// Anything else is 400 `bad_request`, before any git run. The POST's length.
+fn cgi_check(a: &GitCgiArgs) -> Step<Option<u64>> {
+    use crate::wire::workspace::{GIT_PATH_INFO_REFS, GIT_PATH_INFO_UPLOAD_PACK, GIT_REQUEST_MAX, GIT_UPLOAD_PACK_QUERY, GIT_UPLOAD_PACK_REQUEST_TYPE};
+    if a.remote_addr.parse::<std::net::IpAddr>().is_err() {
+        return refuse(refusal::BAD_REQUEST, "the client's address is no IP address");
+    }
+    let body = (a.content_type.as_deref(), a.content_length, a.content_encoding.as_deref());
+    match (a.method.as_str(), a.path_info.as_str(), a.query.as_deref()) {
+        ("GET", GIT_PATH_INFO_REFS, Some(GIT_UPLOAD_PACK_QUERY)) if body == (None, None, None) => Ok(None),
+        ("POST", GIT_PATH_INFO_UPLOAD_PACK, None) if body.0 == Some(GIT_UPLOAD_PACK_REQUEST_TYPE) => match body.1 {
+            Some(len) if len <= GIT_REQUEST_MAX => Ok(Some(len)),
+            Some(len) => refuse(refusal::BAD_REQUEST, &format!("the request body is {len} bytes (at most {GIT_REQUEST_MAX})")),
+            None => refuse(refusal::BAD_REQUEST, "an upload-pack request names its body's length"),
+        },
+        _ => refuse(refusal::BAD_REQUEST, "not a request of the code port's git routes (GET /info/refs?service=git-upload-pack, or POST /git-upload-pack of an upload-pack request with its length)"),
+    }
+}
+
+/// The request's CGI environment beside `GitRun::vm`'s own (S9 §3.3): the
+/// `GIT_CGI_ENV` names this request sets, and no other: `PATH_INFO` the
+/// route's (never the URL's), `QUERY_STRING` the literal query of the `GET`
+/// and empty for the `POST`; never a bearer, a cookie, an `x-aws-*` header,
+/// a remote user or a config carrier. `project_root` is the walked
+/// `<path>/.git`. Called on a request [`cgi_check`] passed.
+pub(crate) fn cgi_env(a: &GitCgiArgs, project_root: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    use crate::wire::workspace::{GIT_UPLOAD_PACK_QUERY, GIT_UPLOAD_PACK_REQUEST_TYPE};
+    let post = a.method == "POST";
+    let mut env: Vec<(&'static str, std::ffi::OsString)> = vec![
+        ("GIT_PROJECT_ROOT", project_root.into()),
+        ("GIT_HTTP_EXPORT_ALL", "1".into()),
+        ("PATH_INFO", a.path_info.as_str().into()),
+        ("REQUEST_METHOD", a.method.as_str().into()),
+        ("QUERY_STRING", if post { "".into() } else { GIT_UPLOAD_PACK_QUERY.into() }),
+    ];
+    if post {
+        env.push(("CONTENT_TYPE", GIT_UPLOAD_PACK_REQUEST_TYPE.into()));
+        env.push(("CONTENT_LENGTH", a.content_length.unwrap_or(0).to_string().into()));
+    }
+    if let Some(e) = &a.content_encoding {
+        env.push(("HTTP_CONTENT_ENCODING", e.as_str().into()));
+    }
+    if let Some(p) = &a.git_protocol {
+        env.push(("HTTP_GIT_PROTOCOL", p.as_str().into()));
+    }
+    env.push(("REMOTE_ADDR", a.remote_addr.as_str().into()));
+    env
+}
+
+impl Ctx {
+    /// `git-cgi` (S9 §3.3): the request checked ([`cgi_check`]), the seeded
+    /// workspace walked (`seeded_repo`), a `POST`'s body read (exactly its
+    /// length), git's version and the repository's object format read, and
+    /// `git http-backend` started as the agent with [`cgi_env`] only; then
+    /// the head (`GitCgiReply`), the body piped into http-backend and its
+    /// output (the CGI's header block, then its body) copied out to its end.
+    /// A refusal before the head is its head; http-backend failing after it
+    /// is the helper's own failure (exit 1), which ends the root shim's
+    /// stream with an error. No inbox, no lock: the CGI only reads.
+    fn git_cgi(&self, a: &GitCgiArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()> {
+        let (child, body, reply) = match self.cgi_start(a, input) {
+            Ok(started) => started,
+            Err(stop) => return refused::<GitCgiReply>(out, stop),
+        };
+        emit(out, &HelperHead::ok(reply, None))?;
+        cgi_pipe(child, body, out)
+    }
+
+    /// Everything before `git-cgi`'s head, http-backend started last.
+    fn cgi_start(&self, a: &GitCgiArgs, input: &mut dyn BufRead) -> Step<(crate::gitrun::GitChild, Vec<u8>, GitCgiReply)> {
+        let len = cgi_check(a)?;
+        let repo = self.seeded_repo(&a.path, CGI_PROBE)?;
+        let mut body = Vec::new();
+        if let Some(len) = len {
+            input.take(len).read_to_end(&mut body)?;
+            if body.len() as u64 != len {
+                return refuse(refusal::BAD_REQUEST, &format!("the request body ended after {} of {len} bytes", body.len()));
+            }
+        }
+        let reply = self.cgi_reply(&repo)?;
+        let step = if len.is_some() { budget::GIT_UPLOAD_PACK } else { budget::GIT_ADVERTISE };
+        let env = cgi_env(a, &repo.dir.join(".git"));
+        let child = self.cgi_git(&repo.dir, step, &env).spawn_piped(cgi_args()).map_err(git_stop("http-backend"))?;
+        Ok((child, body, reply))
+    }
+
+    /// `git-cgi`'s head reply: git's version (the first word after `git
+    /// version `) and the repository's object format.
+    fn cgi_reply(&self, repo: &Repo<'_>) -> Step<GitCgiReply> {
+        let said = text(&repo.git().output(["version"]).map_err(git_stop("version"))?);
+        let version = said.strip_prefix("git version ").and_then(|v| v.split_whitespace().next()).filter(|v| v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)));
+        let Some(version) = version else { return refuse(refusal::GIT_FAILED, "git version printed no version") };
+        let format = text(&repo.git().output(["rev-parse", "--show-object-format"]).map_err(git_stop("rev-parse"))?);
+        let object_format = match format.as_str() {
+            "sha1" => ObjectFormat::Sha1,
+            "sha256" => ObjectFormat::Sha256,
+            _ => return refuse(refusal::GIT_FAILED, "the repository's object format is none this build knows"),
+        };
+        Ok(GitCgiReply { object_format, git_version: version.to_string() })
+    }
+
+    /// http-backend's run in `dir`: `GitRun::vm`'s environment and `env`
+    /// only (not `vm_git`'s optional-locks name: the CGI's environment is
+    /// exactly §3.3's), the shim's `--git`; it streams for what is left of
+    /// the run's budget but the margin of its exit, having nothing to roll back.
+    fn cgi_git(&self, dir: &Path, step: Duration, env: &[(&'static str, std::ffi::OsString)]) -> GitRun {
+        let git = GitRun::vm(dir, &self.home).with_program(&self.git).timeout(self.cut(step, UNDO_MARGIN));
+        env.iter().fold(git, |git, (name, value)| git.env(name, value))
+    }
+}
+
+/// `body` into http-backend (a thread of its own; then its stdin closed),
+/// its whole output to `out` ([`cgi_copy`]); `Err` (the helper's exit 1)
+/// when the copy or http-backend failed, or when http-backend exited 0
+/// with its header block and no body: its own die exits 0 once the head is
+/// out (a gzip request cut short or corrupt), and every answer the routes
+/// serve has a body (an advertisement, an ls-refs or a fetch result).
+fn cgi_pipe(mut child: crate::gitrun::GitChild, body: Vec<u8>, out: &mut dyn Write) -> Result<()> {
+    let stdin = child.take_stdin();
+    let feeder = std::thread::Builder::new().name("http-backend stdin".into()).spawn(move || {
+        if let Some(mut w) = stdin {
+            // A run that stops reading closes the pipe: its exit says why.
+            let _ = w.write_all(&body);
+        }
+    })?;
+    let copied = match child.take_stdout() {
+        Some(mut stdout) => cgi_copy(&mut stdout, out),
+        None => Err(io::Error::other("http-backend has no stdout")),
+    };
+    let _ = feeder.join();
+    let done = child.finish();
+    let answered = copied?;
+    done?;
+    if !answered {
+        return Err(CliError::Msg("http-backend wrote its head and no body: a request it could not read (its own die exits 0)".into()));
+    }
+    Ok(())
+}
+
+/// Where [`cgi_copy`] is in the CGI's output. Its header block ends at the
+/// first blank line, LF or CRLF, as the root shim's `parse_cgi_head` reads it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CgiAt {
+    /// At a line's start in the block.
+    LineStart,
+    /// After a CR at a line's start.
+    Cr,
+    /// Inside a line of the block.
+    Line,
+    /// Right after the block's blank line.
+    Blank,
+    /// Past a byte of the body.
+    Body,
+}
+
+impl CgiAt {
+    /// Where the output is once `b` followed.
+    fn after(self, b: u8) -> CgiAt {
+        match (self, b) {
+            (CgiAt::LineStart | CgiAt::Cr, b'\n') => CgiAt::Blank,
+            (CgiAt::LineStart, b'\r') => CgiAt::Cr,
+            (CgiAt::Line, b'\n') => CgiAt::LineStart,
+            (CgiAt::Blank | CgiAt::Body, _) => CgiAt::Body,
+            _ => CgiAt::Line,
+        }
+    }
+}
+
+/// `from` copied to `out` to its end, `out` flushed: whether a byte of a
+/// body followed the CGI's header block.
+fn cgi_copy(from: &mut dyn Read, out: &mut dyn Write) -> io::Result<bool> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut at = CgiAt::LineStart;
+    loop {
+        let k = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        out.write_all(&buf[..k])?;
+        if at != CgiAt::Body {
+            at = buf[..k].iter().fold(at, |at, b| at.after(*b));
+        }
+    }
+    out.flush()?;
+    Ok(at == CgiAt::Body)
+}
+
+/// `shim-io git-cgi` in this process with `input` for its stdin: what it
+/// printed and how it ended (the code port's unit tests drive the helper's
+/// side so, without its binary).
+#[cfg(test)]
+pub(crate) fn git_cgi_here(home: &Path, git: &Path, a: &GitCgiArgs, input: &[u8]) -> (Vec<u8>, Result<()>) {
+    let ctx = Ctx { home: home.to_path_buf(), fs_root: None, git: git.to_path_buf(), started: Instant::now(), budget: None };
+    let mut out = Vec::new();
+    let done = ctx.git_cgi(a, &mut io::Cursor::new(input.to_vec()), &mut out);
+    (out, done)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod git_cgi_tests {
+    use super::*;
+    use crate::wire::workspace::{parse_head, GIT_RECEIVE_PACK_QUERY, GIT_UPLOAD_PACK_QUERY, GIT_UPLOAD_PACK_REQUEST_TYPE};
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    /// The real git: the first in an absolute `PATH` entry, else `/usr/bin/git`.
+    fn real_git() -> PathBuf {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .filter(|d| d.is_absolute())
+            .map(|d| d.join("git"))
+            .chain(std::iter::once(PathBuf::from("/usr/bin/git")))
+            .find(|g| std::fs::metadata(g).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+            .expect("a git")
+    }
+
+    /// `git <args>` in `dir` with no user or system config, one author at one date: stdout.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = {
+            let _fork = crate::test_locks::forking();
+            Command::new(real_git())
+                .args(args)
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir)
+                .env("LC_ALL", "C")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .env("GIT_AUTHOR_DATE", "2026-10-12T08:00:00Z")
+                .env("GIT_COMMITTER_DATE", "2026-10-12T08:00:00Z")
+                .output()
+                .unwrap()
+        };
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        text(&out.stdout)
+    }
+
+    /// The agent's home `<tmp>/home` and its workspace `<home>/ws`, a
+    /// repository with one commit on `main` (as a seed leaves one).
+    struct Home {
+        _tmp: tempfile::TempDir,
+        ctx: Ctx,
+        ws: PathBuf,
+    }
+
+    fn home() -> Home {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap().join("home");
+        let ws = home.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        git(&ws, &["init", "-q", "-b", "main"]);
+        std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+        git(&ws, &["add", "-A"]);
+        git(&ws, &["commit", "-q", "-m", "c1"]);
+        let ctx = Ctx { home, fs_root: None, git: real_git(), started: Instant::now(), budget: None };
+        Home { _tmp: tmp, ctx, ws }
+    }
+
+    /// A `GET` of the advertisement for the workspace at `ws` (protocol v2).
+    fn get(ws: &Path) -> GitCgiArgs {
+        GitCgiArgs {
+            path: ws.to_str().unwrap().into(),
+            method: "GET".into(),
+            path_info: "/info/refs".into(),
+            query: Some(GIT_UPLOAD_PACK_QUERY.into()),
+            content_type: None,
+            content_length: None,
+            content_encoding: None,
+            git_protocol: Some("version=2".into()),
+            remote_addr: "10.0.0.1".into(),
+        }
+    }
+
+    /// A `POST` of `body` (an upload-pack request, protocol v2).
+    fn post(ws: &Path, body: &[u8]) -> GitCgiArgs {
+        GitCgiArgs { method: "POST".into(), path_info: "/git-upload-pack".into(), query: None, content_type: Some(GIT_UPLOAD_PACK_REQUEST_TYPE.into()), content_length: Some(body.len() as u64), ..get(ws) }
+    }
+
+    /// `git-cgi` through the dispatcher: its head, what followed it, and how it ended.
+    fn run(ctx: &Ctx, a: &GitCgiArgs, body: &[u8]) -> (HelperHead<GitCgiReply>, Vec<u8>, Result<()>) {
+        let mut out = Vec::new();
+        let done = dispatch(ctx, &ShimIoOp::GitCgi(a.clone()), &mut Cursor::new(body.to_vec()), &mut out);
+        let nl = out.iter().position(|b| *b == b'\n').unwrap_or_else(|| panic!("no head: {}", String::from_utf8_lossy(&out)));
+        (parse_head(&out[..nl]).unwrap(), out[nl + 1..].to_vec(), done)
+    }
+
+    /// What http-backend prints for a request of its own CGI environment in
+    /// the workspace (stdin closed), through the helper's own run with `args`.
+    fn backend(h: &Home, args: &[&str], method: &str, path_info: &str, query: &str) -> String {
+        let env: Vec<(&'static str, std::ffi::OsString)> = vec![
+            ("GIT_PROJECT_ROOT", h.ws.join(".git").into()),
+            ("GIT_HTTP_EXPORT_ALL", "1".into()),
+            ("PATH_INFO", path_info.into()),
+            ("REQUEST_METHOD", method.into()),
+            ("QUERY_STRING", query.into()),
+            ("REMOTE_ADDR", "127.0.0.1".into()),
+        ];
+        let mut child = h.ctx.cgi_git(&h.ws, Duration::from_secs(30), &env).spawn_piped(args).unwrap();
+        drop(child.take_stdin());
+        let mut out = Vec::new();
+        child.take_stdout().unwrap().read_to_end(&mut out).unwrap();
+        child.finish().unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The command line's overrides beat whatever the agent writes in its
+    /// repository's config: with `http.receivepack` and `http.getanyfile`
+    /// on there (which, plain, would serve a push's advertisement), the
+    /// helper's http-backend answers 403 to receive-pack in either form and
+    /// to the dumb files, and keeps upload-pack on although the config turns
+    /// it off; the op itself never asks for receive-pack (its check refuses
+    /// the query before any git run).
+    #[test]
+    fn git_cgi_receivepack_stays_off_whatever_the_repo_config_says() {
+        let h = home();
+        for (key, value) in [("http.receivepack", "true"), ("http.getanyfile", "true"), ("http.uploadpack", "false")] {
+            git(&h.ws, &["config", key, value]);
+        }
+        let plain = backend(&h, &["http-backend"], "GET", "/info/refs", GIT_RECEIVE_PACK_QUERY);
+        assert!(plain.contains("Content-Type: application/x-git-receive-pack-advertisement") && !plain.contains("Status:"), "the agent's config alone opens receive-pack: {plain}");
+        let args = cgi_args();
+        assert_eq!(args, ["-c", "http.receivepack=false", "-c", "http.getanyfile=false", "-c", "http.uploadpack=true", "http-backend"]);
+        for (method, path_info, query) in [("GET", "/info/refs", GIT_RECEIVE_PACK_QUERY), ("POST", "/git-receive-pack", ""), ("GET", "/HEAD", ""), ("GET", "/objects/info/packs", "")] {
+            let out = backend(&h, &args, method, path_info, query);
+            let head = out.split("\r\n\r\n").next().unwrap_or_default();
+            assert!(head.split("\r\n").any(|l| l == "Status: 403 Forbidden") && !out.contains("receive-pack-advertisement"), "{method} {path_info}: {out}");
+        }
+        let up = backend(&h, &args, "GET", "/info/refs", GIT_UPLOAD_PACK_QUERY);
+        assert!(up.contains("Content-Type: application/x-git-upload-pack-advertisement") && !up.contains("Status:"), "{up}");
+        let (head, cgi, done) = run(&h.ctx, &get(&h.ws), b"");
+        done.unwrap();
+        let cgi = String::from_utf8_lossy(&cgi);
+        assert!(head.ok && cgi.contains("application/x-git-upload-pack-advertisement") && cgi.contains("version 2") && !cgi.contains("Status:"), "{head:?} {cgi}");
+        let receive = GitCgiArgs { query: Some(GIT_RECEIVE_PACK_QUERY.into()), ..get(&h.ws) };
+        let (head, rest, done) = run(&h.ctx, &receive, b"");
+        done.unwrap();
+        assert!(head.code.as_deref() == Some(refusal::BAD_REQUEST) && rest.is_empty(), "{head:?}");
+    }
+
+    /// `git-cgi` never touches the inbox: what a seed or a code-out staged
+    /// there stays (the dispatcher clears it for the four ops that hold the
+    /// workspace only), and a run never makes it either.
+    #[test]
+    fn git_cgi_keeps_the_inbox() {
+        let h = home();
+        let inbox = h.ctx.home.join(INBOX);
+        std::fs::create_dir_all(&inbox).unwrap();
+        for name in ["seed-1a2b3c", "codeout-4d5e6f", "index-7a8b9c.lock"] {
+            std::fs::write(inbox.join(name), "staged by a run that holds the workspace").unwrap();
+        }
+        let ls_refs = b"0014command=ls-refs\n00010000";
+        for (a, body) in [(get(&h.ws), &b""[..]), (post(&h.ws, ls_refs), &ls_refs[..])] {
+            let (head, cgi, done) = run(&h.ctx, &a, body);
+            done.unwrap();
+            assert!(head.ok && !cgi.is_empty(), "{head:?}");
+            let mut left: Vec<String> = std::fs::read_dir(&inbox).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            left.sort();
+            assert_eq!(left, ["codeout-4d5e6f", "index-7a8b9c.lock", "seed-1a2b3c"], "{} kept the inbox", a.method);
+        }
+        std::fs::remove_dir_all(h.ctx.home.join(".cache")).unwrap();
+        let (head, _, done) = run(&h.ctx, &get(&h.ws), b"");
+        done.unwrap();
+        assert!(head.ok && !h.ctx.home.join(".cache").exists(), "no inbox made");
+    }
+
+    /// The op's answers: its head (the object format, git's version), then
+    /// the CGI's output to its end, a v2 or a v0 advertisement as asked and
+    /// an upload-pack result; http-backend failing after the head is the
+    /// helper's failure, and so is its exit 0 after a head and no body (its
+    /// own die, on a gzip request cut short). Its refusals come before any
+    /// git run or before the head: a path that holds no repository (or
+    /// nothing) 409 `not_seeded`, a symlinked one 409 `symlink_component`, a
+    /// request outside §3.3's pairs, a body shorter than its length or a
+    /// client address that is no address 400 `bad_request`.
+    #[test]
+    fn git_cgi_answers_its_head_then_the_cgi_output() {
+        let h = home();
+        let (head, cgi, done) = run(&h.ctx, &get(&h.ws), b"");
+        done.unwrap();
+        let reply = head.reply.clone().expect("a reply");
+        assert!(reply.object_format == ObjectFormat::Sha1 && reply.git_version.chars().next().is_some_and(|c| c.is_ascii_digit()), "{reply:?}");
+        let end = cgi.windows(4).position(|w| w == b"\r\n\r\n").expect("the CGI's header block") + 4;
+        assert!(cgi[end..].starts_with(b"000eversion 2\n"), "a v2 advertisement: {}", String::from_utf8_lossy(&cgi));
+        let (_, cgi, done) = run(&h.ctx, &GitCgiArgs { git_protocol: None, ..get(&h.ws) }, b"");
+        done.unwrap();
+        let end = cgi.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(cgi[end..].starts_with(b"001e# service=git-upload-pack\n0000"), "v0: {}", String::from_utf8_lossy(&cgi));
+        let head_id = git(&h.ws, &["rev-parse", "HEAD"]);
+        let ls_refs = b"0014command=ls-refs\n00010000";
+        let (_, cgi, done) = run(&h.ctx, &post(&h.ws, ls_refs), ls_refs);
+        done.unwrap();
+        let cgi = String::from_utf8_lossy(&cgi);
+        assert!(cgi.contains("Content-Type: application/x-git-upload-pack-result") && cgi.contains(&format!("{head_id} refs/heads/main")), "{cgi}");
+        let (head, cgi, done) = run(&h.ctx, &post(&h.ws, b"zzzz"), b"zzzz");
+        assert!(head.ok && done.is_err(), "a request upload-pack cannot read: the head, then the helper's failure: {}", String::from_utf8_lossy(&cgi));
+        // A gzip member cut inside its request: a final stored block that
+        // announces 110 bytes and holds the request's first 10.
+        let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 1];
+        gz.extend(110u16.to_le_bytes().into_iter().chain((!110u16).to_le_bytes()));
+        gz.extend_from_slice(&ls_refs[..10]);
+        let (head, cgi, done) = run(&h.ctx, &GitCgiArgs { content_encoding: Some("gzip".into()), ..post(&h.ws, &gz) }, &gz);
+        assert!(head.ok && done.is_err(), "a gzip request cut short: the head, then the helper's failure: {}", String::from_utf8_lossy(&cgi));
+        std::fs::create_dir_all(h.ctx.home.join("empty")).unwrap();
+        std::os::unix::fs::symlink(&h.ws, h.ctx.home.join("linked")).unwrap();
+        let at = |name: &str| GitCgiArgs { path: h.ctx.home.join(name).to_str().unwrap().into(), ..get(&h.ws) };
+        let cases = [
+            (at("empty"), &b""[..], refusal::NOT_SEEDED),
+            (at("nothing"), b"", refusal::NOT_SEEDED),
+            (at("linked"), b"", refusal::SYMLINK_COMPONENT),
+            (GitCgiArgs { content_type: Some(GIT_UPLOAD_PACK_REQUEST_TYPE.into()), ..get(&h.ws) }, b"", refusal::BAD_REQUEST),
+            (GitCgiArgs { query: None, ..get(&h.ws) }, b"", refusal::BAD_REQUEST),
+            (GitCgiArgs { path_info: "/git-upload-pack".into(), ..get(&h.ws) }, b"", refusal::BAD_REQUEST),
+            (GitCgiArgs { method: "POST".into(), ..get(&h.ws) }, b"", refusal::BAD_REQUEST),
+            (GitCgiArgs { query: Some(GIT_UPLOAD_PACK_QUERY.into()), ..post(&h.ws, ls_refs) }, &ls_refs[..], refusal::BAD_REQUEST),
+            (GitCgiArgs { content_length: None, ..post(&h.ws, ls_refs) }, &ls_refs[..], refusal::BAD_REQUEST),
+            (GitCgiArgs { content_length: Some(crate::wire::workspace::GIT_REQUEST_MAX + 1), ..post(&h.ws, ls_refs) }, &ls_refs[..], refusal::BAD_REQUEST),
+            (GitCgiArgs { content_type: Some("application/x-git-receive-pack-request".into()), ..post(&h.ws, ls_refs) }, &ls_refs[..], refusal::BAD_REQUEST),
+            (post(&h.ws, ls_refs), &ls_refs[..10], refusal::BAD_REQUEST),
+            (GitCgiArgs { remote_addr: "10.0.0.1; x".into(), ..get(&h.ws) }, b"", refusal::BAD_REQUEST),
+        ];
+        for (a, body, code) in cases {
+            let (head, rest, done) = run(&h.ctx, &a, body);
+            done.unwrap();
+            assert!(!head.ok && head.code.as_deref() == Some(code) && rest.is_empty(), "{a:?}: {head:?}");
+        }
+    }
+
+    /// The copy passes every byte on and sees a body exactly when a byte
+    /// follows the header block's first blank line (LF or CRLF, as the root
+    /// shim reads the block), the output whole or a byte per read.
+    #[test]
+    fn the_cgi_copy_sees_a_body_only_past_the_blank_line() {
+        /// A reader that gives one byte per read.
+        struct Trickle<'a>(&'a [u8]);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let (Some((first, rest)), Some(slot)) = (self.0.split_first(), buf.first_mut()) else { return Ok(0) };
+                *slot = *first;
+                self.0 = rest;
+                Ok(1)
+            }
+        }
+        let cases: [(&[u8], bool); 8] = [
+            (b"Content-Type: t\r\n\r\n0000", true),
+            (b"Content-Type: t\n\n0000", true),
+            (b"Content-Type: t\n\r\n0000", true),
+            (b"\r\n0000", true),
+            (b"Content-Type: t\r\n\r\n", false),
+            (b"Content-Type: t\r\r\n0000", false),
+            (b"Content-Type: t\r\n", false),
+            (b"", false),
+        ];
+        for (output, body) in cases {
+            for trickle in [false, true] {
+                let mut out = Vec::new();
+                let seen = if trickle { cgi_copy(&mut Trickle(output), &mut out) } else { cgi_copy(&mut Cursor::new(output), &mut out) };
+                assert_eq!((seen.unwrap(), out.as_slice()), (body, output), "{:?}, a byte per read: {trickle}", String::from_utf8_lossy(output));
+            }
+        }
+    }
+}
+
 // ---- transcripts ---------------------------------------------------------------------------
 
 /// A file under a directory reached by a walk: its open directory and its name.
@@ -1695,17 +2434,18 @@ impl InDir {
         Ok(AtName::File(file))
     }
 
-    /// Remove the temp files of puts ended before their own end (the shim's
-    /// TERM at a put's budget or at a stop: the helper has no handler, so no
-    /// drop of [`TempIn`] ran): the directory's regular files named as
-    /// [`TempIn`] names them, through its fd. Only a put calls it, under the
-    /// shim's transcripts lock, which a put's helper holds until it is
-    /// reaped: none of these is anyone's now.
+    /// Remove the temp files of writes ended before their own end (the
+    /// shim's TERM at a pull's budget or at a stop: the helper has no
+    /// handler, so no drop of [`TempIn`] ran): the directory's regular files
+    /// named as [`TempIn`] names them, through its fd. A pull's
+    /// `transcript-write` calls it under no lock another writer shares: a
+    /// temp file whose writer still lives holds its flock
+    /// ([`TempIn::create`]) and is left alone, whoever swept.
     fn sweep_temps(&self) {
         let Ok(entries) = std::fs::read_dir(&self.dir_path) else { return };
-        for name in entries.flatten().map(|e| e.file_name()).filter(|n| is_put_temp(n.as_bytes())) {
+        for name in entries.flatten().map(|e| e.file_name()).filter(|n| is_transcript_temp(n.as_bytes())) {
             let Ok(c) = cstr(&name) else { continue };
-            if kind_at(&self.dir, &c).is_ok_and(|k| k == libc::S_IFREG) {
+            if kind_at(&self.dir, &c).is_ok_and(|k| k == libc::S_IFREG) && !temp_in_use(&self.dir, &c) {
                 // SAFETY: a valid directory fd and a NUL-terminated name.
                 unsafe { libc::unlinkat(self.dir.as_raw_fd(), c.as_ptr(), 0) };
             }
@@ -1713,9 +2453,24 @@ impl InDir {
     }
 }
 
-/// A transcript put's temp file name, as [`TempIn`] makes it: `.ai-env-`, 16 lowercase hex digits, `.tmp`.
-fn is_put_temp(name: &[u8]) -> bool {
+/// A transcript write's temp file name, as [`TempIn`] makes it: `.ai-env-`, 16 lowercase hex digits, `.tmp`.
+fn is_transcript_temp(name: &[u8]) -> bool {
     name.len() == 28 && name.starts_with(b".ai-env-") && name.ends_with(b".tmp") && name[8..24].iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether a live writer holds the temp file `name` under `dir`: its
+/// [`TempIn`] keeps an exclusive flock on it until it ends (the lock goes
+/// with the writer's last descriptor, however it ended).
+fn temp_in_use(dir: &OwnedFd, name: &CStr) -> bool {
+    // SAFETY: a valid directory fd, a NUL-terminated name, plain flags.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: just opened, owned by nobody else.
+    let probe = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: a valid fd; the lock, when taken, goes with `probe`.
+    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
 }
 
 /// sha256 (lowercase hex) and the size of everything `r` gives.
@@ -1756,80 +2511,23 @@ impl Ctx {
     }
 
     fn transcript_stat(&self, projects: &Path, rel: &str) -> Step<TranscriptStat> {
-        let absent = TranscriptStat { present: false, size: 0, sha256: None, mtime: None };
+        let absent = TranscriptStat { present: false, size: 0, sha256: None, mtime: None, ..TranscriptStat::default() };
         let Some(at) = self.transcript_at(projects, rel, false)? else { return Ok(absent) };
         match at.open(self, "the transcript")? {
             AtName::Absent => Ok(absent),
             AtName::File(f) => {
                 let md = f.metadata()?;
                 let (sha, size) = digest(f)?;
-                Ok(TranscriptStat { present: true, size, sha256: Some(sha), mtime: mtime_of(&md) })
+                Ok(TranscriptStat { present: true, size, sha256: Some(sha), mtime: mtime_of(&md), ..TranscriptStat::default() })
             }
         }
-    }
-
-    /// `len` bytes of `input` as the transcript `rel` (module doc).
-    fn transcript_put(&self, projects: &Path, rel: &str, len: u64, input: &mut dyn BufRead) -> Step<TranscriptReply> {
-        if len > TRANSCRIPT_MAX {
-            return Err(Stop::refused(WsRefusal::new(refusal::TOO_LARGE, &format!("the transcript is {len} bytes (at most {TRANSCRIPT_MAX})")).with_size(len)));
-        }
-        let at = self.transcript_at(projects, rel, true)?.ok_or_else(|| Stop::Failed(CliError::Msg("the transcript's directory was not made".into())))?;
-        at.sweep_temps();
-        let current = match at.open(self, "the transcript")? {
-            AtName::Absent => None,
-            AtName::File(f) => Some(digest(f)?),
-        };
-        let tmp = TempIn::create(&at)?;
-        let mut file = std::fs::File::from(tmp.fd.try_clone()?);
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut got = 0u64;
-        let mut body = input.take(len);
-        loop {
-            let k = match body.read(&mut buf) {
-                Ok(0) => break,
-                Ok(k) => k,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            };
-            hasher.update(&buf[..k]);
-            file.write_all(&buf[..k])?;
-            got += k as u64;
-        }
-        if got != len {
-            return refuse(refusal::BAD_REQUEST, &format!("the transcript body ended after {got} of {len} bytes"));
-        }
-        let sha = hex::encode(hasher.finalize());
-        match &current {
-            Some((_, size)) if *size > len => {
-                return Err(Stop::refused(WsRefusal::new(refusal::VM_LONGER, &format!("the VM's copy is longer ({size} bytes, the upload {len}): the VM's copy wins")).with_size(*size)));
-            }
-            Some((vm_sha, size)) if *size == len && *vm_sha == sha => return Ok(TranscriptReply { outcome: TranscriptWrite::Unchanged, size: len, sha256: sha }),
-            _ => {}
-        }
-        file.sync_all()?;
-        let written = file.metadata()?.len();
-        if written != len {
-            return Err(Stop::Failed(CliError::Msg(format!("the transcript's temp file holds {written} of {len} bytes"))));
-        }
-        // The VM's claude may have written on while the body came in: a copy
-        // longer than the upload now still wins (a window of the rename's
-        // own remains: nothing locks the VM's claude out).
-        if let AtName::File(f) = at.open(self, "the transcript")? {
-            let now = f.metadata()?.len();
-            if now > len {
-                return Err(Stop::refused(WsRefusal::new(refusal::VM_LONGER, &format!("the VM's copy is longer ({now} bytes, the upload {len}): the VM's copy wins")).with_size(now)));
-            }
-        }
-        tmp.rename_over(&at)?;
-        Ok(TranscriptReply { outcome: TranscriptWrite::Written, size: len, sha256: sha })
     }
 }
 
 /// A 0600 temp file beside a transcript (`.ai-env-<random>.tmp`), created
-/// without following a symlink and removed unless renamed over it; one a
-/// helper ended by a signal left goes at the next put into its directory
-/// ([`InDir::sweep_temps`]).
+/// without following a symlink, flocked while it lives and removed unless
+/// renamed over it; one a helper ended by a signal left goes at the next
+/// write into its directory ([`InDir::sweep_temps`]).
 struct TempIn {
     dir: libc::c_int,
     name: CString,
@@ -1849,7 +2547,13 @@ impl TempIn {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: just opened, owned by nobody else.
-        Ok(TempIn { dir: at.dir.as_raw_fd(), name, fd: unsafe { OwnedFd::from_raw_fd(fd) }, renamed: false })
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // A sweep in the same directory leaves it alone while this writer
+        // lives (`temp_in_use`). One that met it in the instant before the
+        // lock removes it: the rename then fails, the write with it, whole.
+        // SAFETY: a valid fd we own.
+        unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        Ok(TempIn { dir: at.dir.as_raw_fd(), name, fd, renamed: false })
     }
 
     /// Rename over the transcript, then fsync the directory.
@@ -1873,6 +2577,653 @@ impl Drop for TempIn {
             // SAFETY: a valid directory fd and a NUL-terminated name.
             unsafe { libc::unlinkat(self.dir, self.name.as_ptr(), 0) };
         }
+    }
+}
+
+// S9 (plans/s9-contracts.md §3.2, G5): the transcript store's ops. None
+// uses the inbox or the workspace lock; the root shim pipes them to curl
+// (`shim::s3xfer`) and checks what crosses.
+
+/// The line a pull's root shim sends once every part checked
+/// (`shim::s3xfer`): only then does `transcript-write` rename into place.
+pub const COMMIT: &str = "commit";
+
+/// The `len` bytes of `f` from `start` to `sink`, a chunk at a time (pread:
+/// the file's offset never moves); a file that ends before them is an error.
+fn read_range(f: &std::fs::File, start: u64, len: u64, sink: &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut done = 0u64;
+    while done < len {
+        let want = usize::try_from(len - done).map_or(buf.len(), |left| left.min(buf.len()));
+        let k = match f.read_at(&mut buf[..want], start + done) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("the transcript ended at byte {} of {}", start + done, start + len))),
+            Ok(k) => k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        sink(&buf[..k])?;
+        done += k as u64;
+    }
+    Ok(())
+}
+
+/// sha256 (lowercase hex) of the `len` bytes of `f` from `start`.
+fn range_sha256(f: &std::fs::File, start: u64, len: u64) -> io::Result<String> {
+    let mut h = Sha256::new();
+    read_range(f, start, len, &mut |chunk| {
+        h.update(chunk);
+        Ok(())
+    })?;
+    Ok(hex::encode(h.finalize()))
+}
+
+/// A path segment of a session's subtree as a rel takes it: `[A-Za-z0-9._-]`,
+/// at most `SEGMENT_MAX` bytes, no leading `.`.
+fn subtree_segment(name: &str) -> bool {
+    !name.is_empty() && name.len() <= crate::wire::workspace::SEGMENT_MAX && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A stat query's refusal text (its own rel's message is already whole).
+fn stat_message(e: String) -> String {
+    if e.starts_with("the ") {
+        e
+    } else {
+        format!("the stat query {e}")
+    }
+}
+
+impl Ctx {
+    /// `transcript-stat` with `--from`, `--fp` or `--subtree` (S9 §1.7;
+    /// through [`answer_payload`] with `--subtree`, else [`answer`]): the
+    /// file's size, mtime and inode; with `from`, the sha256 of
+    /// `[from, size)` (when `from` is at most `size`) and of the `FP_SPAN`
+    /// bytes before `size`, and never the whole file's (without `from`,
+    /// S8's whole-file sha256); with `fp`, whether the `FP_SPAN` bytes
+    /// before `from` hash to it (false past `size`, or for an absent file);
+    /// with `subtree`, the session's files ([`Ctx::subtree`]). Without any
+    /// of them the arm runs S8's [`Ctx::transcript_stat`].
+    fn transcript_stat_from(&self, projects: &Path, rel: &str, from: Option<u64>, fp: Option<&str>, subtree: bool) -> Step<TranscriptStat> {
+        use crate::wire::s3::FP_SPAN;
+        use std::os::unix::fs::MetadataExt as _;
+        let q = crate::wire::workspace::StatQuery { rel: rel.to_string(), from, fp: fp.map(str::to_string), subtree };
+        if let Err(e) = q.check() {
+            return refuse(refusal::BAD_REQUEST, &stat_message(e));
+        }
+        let mut stat = TranscriptStat::default();
+        let file = match self.transcript_at(projects, rel, false)? {
+            Some(at) => match at.open(self, "the transcript")? {
+                AtName::File(f) => Some(f),
+                AtName::Absent => None,
+            },
+            None => None,
+        };
+        match &file {
+            Some(f) => {
+                let md = f.metadata()?;
+                let size = md.len();
+                (stat.present, stat.size, stat.mtime, stat.ino) = (true, size, mtime_of(&md), Some(md.ino()));
+                match from {
+                    None => stat.sha256 = Some(range_sha256(f, 0, size)?),
+                    Some(from) => {
+                        if from <= size {
+                            stat.delta_sha256 = Some(range_sha256(f, from, size - from)?);
+                        }
+                        let tail = size.min(FP_SPAN);
+                        stat.end_fp = Some(range_sha256(f, size - tail, tail)?);
+                        if let Some(fp) = fp {
+                            let span = from.min(FP_SPAN);
+                            stat.fp_ok = Some(from <= size && range_sha256(f, from - span, span)? == fp);
+                        }
+                    }
+                }
+            }
+            None => stat.fp_ok = fp.map(|_| false),
+        }
+        if subtree {
+            stat.subtree = self.subtree(projects, rel)?;
+        }
+        Ok(stat)
+    }
+
+    /// The subtree of `rel`'s session (`<slug>/<uuid>/` beside
+    /// `<slug>/<uuid>.jsonl`): every regular file whose rel
+    /// `transcript_rel_check` takes, by rel, with its size and sha256,
+    /// walked as the agent one component at a time (a symlink at any level,
+    /// `<uuid>` itself included, is skipped, never followed; a `<uuid>`
+    /// that is no directory, or one the agent cannot enter, is no subtree);
+    /// past `SUBTREE_FILES_MAX` files or `SUBTREE_BYTES_MAX` bytes, 413
+    /// `too_large`.
+    fn subtree(&self, projects: &Path, rel: &str) -> Step<Vec<crate::wire::workspace::SubtreeFile>> {
+        let base = rel.strip_suffix(".jsonl").unwrap_or(rel);
+        // The stat walked to `<slug>` first and refused a symlink, a non-directory or a directory the agent
+        // cannot enter on the way: one this walk meets is at `<uuid>` (or was put there since), skipped as at
+        // any level below (the lead, S9 integration: `not_creatable` is no code GET /transcript lists).
+        let top = match self.walk(&projects.join(base), false, "the session's subtree") {
+            Ok(top) => top,
+            Err(Stop::Refused(r)) if r.code == refusal::SYMLINK_COMPONENT || r.code == refusal::PATH_OCCUPIED || r.code == refusal::NOT_CREATABLE => None,
+            Err(stop) => return Err(stop),
+        };
+        let mut files = Vec::new();
+        if let Some(top) = top {
+            let mut bytes = 0u64;
+            Self::subtree_dir(&top.fd, &top.path, base, 0, &mut files, &mut bytes)?;
+        }
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        Ok(files)
+    }
+
+    /// One directory of a subtree ([`Ctx::subtree`]), `depth` below the session.
+    fn subtree_dir(dir: &OwnedFd, path: &Path, rel: &str, depth: usize, files: &mut Vec<crate::wire::workspace::SubtreeFile>, bytes: &mut u64) -> Step<()> {
+        use crate::wire::workspace::{SubtreeFile, SUBTREE_BYTES_MAX, SUBTREE_FILES_MAX, TRANSCRIPT_DIRS_MAX};
+        let Ok(entries) = std::fs::read_dir(path) else { return Ok(()) };
+        let mut names: Vec<std::ffi::OsString> = entries.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for name in names {
+            let Some(text) = name.to_str().filter(|t| subtree_segment(t)) else { continue };
+            let Ok(c) = cstr(&name) else { continue };
+            let child = format!("{rel}/{text}");
+            match kind_at(dir, &c) {
+                Ok(libc::S_IFDIR) if depth < TRANSCRIPT_DIRS_MAX => {
+                    let Ok(sub) = open_dir_at(dir, &c) else { continue };
+                    Self::subtree_dir(&sub, &path.join(&name), &child, depth + 1, files, bytes)?;
+                }
+                Ok(libc::S_IFREG) if transcript_rel_check(&child).is_ok() => {
+                    // SAFETY: a valid directory fd, a NUL-terminated name, plain flags.
+                    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+                    if fd < 0 {
+                        continue;
+                    }
+                    // SAFETY: just opened, owned by nobody else.
+                    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+                    let md = file.metadata()?;
+                    if !md.is_file() {
+                        continue;
+                    }
+                    if files.len() >= SUBTREE_FILES_MAX {
+                        return refuse(refusal::TOO_LARGE, &format!("the session's subtree holds more than {SUBTREE_FILES_MAX} files"));
+                    }
+                    *bytes += md.len();
+                    if *bytes > SUBTREE_BYTES_MAX {
+                        return Err(Stop::refused(WsRefusal::new(refusal::TOO_LARGE, &format!("the session's subtree holds more than {SUBTREE_BYTES_MAX} bytes")).with_size(*bytes)));
+                    }
+                    let sha256 = range_sha256(&file, 0, md.len())?;
+                    files.push(SubtreeFile { rel: child, size: md.len(), sha256 });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// `transcript-read` (a push's bytes): its own head
+    /// (`TranscriptReadReply`: the file's size and inode, `len` N), then
+    /// exactly N bytes of the file from `from`. A file that is absent or
+    /// shorter than `from + len` is 409 `changed` (with its size), one that
+    /// is no regular file 409 `path_occupied`, a symlink 409
+    /// `symlink_component`; a file cut short after the head is the helper's
+    /// failure (exit 1: the root shim's payload ends early).
+    fn transcript_read(&self, projects: &Path, rel: &str, from: u64, len: u64, out: &mut dyn Write) -> Result<()> {
+        use crate::wire::workspace::TranscriptReadReply;
+        use std::os::unix::fs::MetadataExt as _;
+        let opened = (|| -> Step<(std::fs::File, TranscriptReadReply)> {
+            let Some(end) = from.checked_add(len) else { return refuse(refusal::BAD_REQUEST, "--from and --len pass the largest offset") };
+            let file = match self.transcript_at(projects, rel, false)? {
+                Some(at) => match at.open(self, "the transcript")? {
+                    AtName::File(f) => Some(f),
+                    AtName::Absent => None,
+                },
+                None => None,
+            };
+            let Some(file) = file else { return Err(Stop::refused(WsRefusal::new(refusal::CHANGED, "the transcript is absent: nothing to read").with_size(0))) };
+            let md = file.metadata()?;
+            if end > md.len() {
+                return Err(Stop::refused(WsRefusal::new(refusal::CHANGED, &format!("the transcript is {} bytes, shorter than {from} + {len}", md.len())).with_size(md.len())));
+            }
+            Ok((file, TranscriptReadReply { size: md.len(), ino: md.ino() }))
+        })();
+        let (file, reply) = match opened {
+            Ok(o) => o,
+            Err(stop) => return refused::<TranscriptReadReply>(out, stop),
+        };
+        emit(out, &HelperHead::ok(reply, Some(len)))?;
+        read_range(&file, from, len, &mut |chunk| out.write_all(chunk))?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// `transcript-write` (a pull's bytes, §3.2, X10): the target checked
+    /// first (a symlink 409 `symlink_component`, no regular file 409
+    /// `path_occupied`; its directories made 0700); then exactly `len` bytes
+    /// of `input` into a 0600 temp file beside it ([`TempIn`], flocked, the
+    /// directory's leftovers swept first), then the line `commit`, then,
+    /// once `sha256` (when given) is the bytes', fsync and the rename over
+    /// it. Before the commit nothing is renamed: an input that ends early or
+    /// without the line is 500 `transfer_failed`, other bytes than `sha256`
+    /// 409 `changed`, each with the old copy's size; the temp file goes on
+    /// every refusal.
+    fn transcript_write(&self, projects: &Path, rel: &str, len: u64, sha256: Option<&str>, input: &mut dyn BufRead) -> Step<TranscriptWriteReply> {
+        if sha256.is_some_and(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            return refuse(refusal::BAD_REQUEST, "--sha256 is not 64 lowercase hex digits");
+        }
+        if len > crate::wire::workspace::PULL_MAX {
+            return refuse(refusal::BAD_REQUEST, &format!("--len is over {} bytes", crate::wire::workspace::PULL_MAX));
+        }
+        let at = self.transcript_at(projects, rel, true)?.ok_or_else(|| Stop::Failed(CliError::Msg("the transcript's directory was not made".into())))?;
+        let old = match at.open(self, "the transcript")? {
+            AtName::Absent => 0,
+            AtName::File(f) => f.metadata()?.len(),
+        };
+        at.sweep_temps();
+        let tmp = TempIn::create(&at)?;
+        let mut file = std::fs::File::from(tmp.fd.try_clone()?);
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut got = 0u64;
+        let mut body = (&mut *input).take(len);
+        loop {
+            let k = match body.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            hasher.update(&buf[..k]);
+            file.write_all(&buf[..k])?;
+            got += k as u64;
+        }
+        let failed = |why: String| Err(Stop::refused(WsRefusal::new(refusal::TRANSFER_FAILED, &why).with_size(old)));
+        if got != len {
+            return failed(format!("the transcript's bytes ended after {got} of {len}: nothing renamed"));
+        }
+        let mut line = Vec::new();
+        (&mut *input).take(COMMIT.len() as u64 + 1).read_until(b'\n', &mut line)?;
+        if line.strip_suffix(b"\n") != Some(COMMIT.as_bytes()) {
+            return failed(format!("no {COMMIT} line after the transcript's {len} bytes: nothing renamed"));
+        }
+        let sha = hex::encode(hasher.finalize());
+        if sha256.is_some_and(|want| want != sha) {
+            return Err(Stop::refused(WsRefusal::new(refusal::CHANGED, "the transcript's bytes are not the sha256 asked: nothing renamed").with_size(old)));
+        }
+        file.sync_all()?;
+        let written = file.metadata()?.len();
+        if written != len {
+            return Err(Stop::Failed(CliError::Msg(format!("the transcript's temp file holds {written} of {len} bytes"))));
+        }
+        tmp.rename_over(&at)?;
+        Ok(TranscriptWriteReply { size: len, sha256: sha })
+    }
+
+    /// `transcript-view` (through [`answer_payload`]): the last `n` messages
+    /// of the transcript as `wire::view::build_view` makes them from at most
+    /// `VIEW_TAIL_MAX` bytes of its end, the first line dropped when the
+    /// read starts past the file's first byte (it is partial); an absent
+    /// file answers `present: false`.
+    fn transcript_view(&self, projects: &Path, rel: &str, n: u32) -> Step<TranscriptViewReply> {
+        use crate::wire::view::{build_view, VIEW_TAIL_MAX, VIEW_V};
+        let q = crate::wire::workspace::ViewQuery { rel: rel.to_string(), n };
+        if let Err(e) = q.check() {
+            return refuse(refusal::BAD_REQUEST, &if e.starts_with("the ") { e } else { format!("the view query {e}") });
+        }
+        let absent = TranscriptViewReply { v: VIEW_V, present: false, title: None, version: None, git_branch: None, entries: Vec::new() };
+        let Some(at) = self.transcript_at(projects, rel, false)? else { return Ok(absent) };
+        let AtName::File(file) = at.open(self, "the transcript")? else { return Ok(absent) };
+        let size = file.metadata()?.len();
+        let start = size.saturating_sub(VIEW_TAIL_MAX);
+        let mut tail = Vec::with_capacity(usize::try_from(size - start).unwrap_or(0));
+        read_range(&file, start, size - start, &mut |chunk| {
+            tail.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        if start > 0 {
+            let first = tail.iter().position(|b| *b == b'\n').map_or(tail.len(), |nl| nl + 1);
+            tail.drain(..first);
+        }
+        build_view(&tail, n).map_err(|e| Stop::Failed(CliError::Msg(e)))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod transcript_s3_tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    const SLUG: &str = "-Users-mike-ws";
+    const ID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+    /// The agent's home `<tmp>/vm/home` under the fs root `<tmp>/vm`, its
+    /// projects directory and the session's transcript rel.
+    struct Home {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        ctx: Ctx,
+        projects: PathBuf,
+        rel: String,
+    }
+
+    fn home() -> Home {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("vm/home");
+        std::fs::create_dir_all(&home).unwrap();
+        let ctx = Ctx { home: home.clone(), fs_root: Some(root.join("vm")), git: PathBuf::from(crate::shim::health::GIT_DEFAULT), started: Instant::now(), budget: None };
+        Home { _tmp: tmp, root, ctx, projects: home.join(".claude/projects"), rel: format!("{SLUG}/{ID}.jsonl") }
+    }
+
+    impl Home {
+        fn file(&self) -> PathBuf {
+            self.projects.join(&self.rel)
+        }
+    }
+
+    fn put(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn refused<T: std::fmt::Debug>(step: Step<T>) -> WsRefusal {
+        match step {
+            Err(Stop::Refused(r)) => *r,
+            other => panic!("not a refusal: {other:?}"),
+        }
+    }
+
+    /// `n` bytes no two 64 KiB windows of which hash alike.
+    fn bytes(n: usize) -> Vec<u8> {
+        (0..n).map(|i| u8::try_from((i * 7 + i / 251) % 251).unwrap()).collect()
+    }
+
+    /// One head line and what follows it.
+    fn head_of(out: &[u8]) -> (serde_json::Value, &[u8]) {
+        let nl = out.iter().position(|b| *b == b'\n').expect("a head line");
+        (serde_json::from_slice(&out[..nl]).unwrap(), &out[nl + 1..])
+    }
+
+    /// The extended stat: no whole-file sha256 with `from`, the delta's,
+    /// the end's fingerprint and the inode; `fp_ok` true for the bytes the
+    /// Mac recorded, false for others, for an offset past the end and for an
+    /// absent file; the S8 sha256 without `from`; its query's refusals; a
+    /// symlinked transcript 409.
+    #[test]
+    fn the_extended_stat_hashes_the_delta_and_the_fingerprints() {
+        use crate::wire::s3::FP_SPAN;
+        let h = home();
+        let span = usize::try_from(FP_SPAN).unwrap();
+        let absent = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), Some(&sha(b"")), false).unwrap();
+        assert_eq!((absent.present, absent.size, absent.fp_ok, absent.delta_sha256), (false, 0, Some(false), None));
+        let body = bytes(100_000);
+        put(&h.file(), &body);
+        let from = 70_000usize;
+        let fp = sha(&body[from - span..from]);
+        let stat = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(from as u64), Some(&fp), false).unwrap();
+        let ino = std::fs::metadata(h.file()).unwrap().ino();
+        assert_eq!((stat.present, stat.size, stat.sha256.as_deref(), stat.ino), (true, 100_000, None, Some(ino)), "{stat:?}");
+        assert_eq!(stat.delta_sha256, Some(sha(&body[from..])));
+        assert_eq!(stat.end_fp, Some(sha(&body[body.len() - span..])));
+        assert_eq!((stat.fp_ok, stat.mtime.is_some(), stat.subtree.len()), (Some(true), true, 0));
+        assert_eq!(h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(from as u64), Some(&sha(b"other")), false).unwrap().fp_ok, Some(false));
+        let past = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(100_001), Some(&fp), false).unwrap();
+        assert_eq!((past.delta_sha256, past.fp_ok), (None, Some(false)), "from past the end: no delta, not ok");
+        let at_end = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(100_000), None, false).unwrap();
+        assert_eq!((at_end.delta_sha256, at_end.fp_ok), (Some(sha(b"")), None));
+        let start = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(10), Some(&sha(&body[..10])), false).unwrap();
+        assert_eq!(start.fp_ok, Some(true), "a fingerprint near the start covers what there is");
+        let whole = h.ctx.transcript_stat_from(&h.projects, &h.rel, None, None, true).unwrap();
+        assert_eq!((whole.sha256, whole.delta_sha256, whole.end_fp), (Some(sha(&body)), None, None), "S8's sha256 without from");
+        put(&h.file(), b"short\n");
+        assert_eq!(h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, false).unwrap().end_fp, Some(sha(b"short\n")), "a file under FP_SPAN: its whole bytes");
+        let queries = [
+            (None, Some(sha(b"")), false, h.rel.clone()),
+            (Some(0), Some("AB".repeat(32)), false, h.rel.clone()),
+            (Some(0), None, true, format!("{SLUG}/{ID}/subagents/a1.jsonl")),
+            (Some(0), None, false, format!("../{ID}.jsonl")),
+        ];
+        for (from, fp, subtree, rel) in queries {
+            let r = refused(h.ctx.transcript_stat_from(&h.projects, &rel, from, fp.as_deref(), subtree));
+            assert_eq!(r.code, refusal::BAD_REQUEST, "{from:?} {fp:?} {subtree} {rel}: {r:?}");
+        }
+        std::fs::remove_file(h.file()).unwrap();
+        std::os::unix::fs::symlink(h.root.join("elsewhere"), h.file()).unwrap();
+        assert_eq!(refused(h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, false)).code, refusal::SYMLINK_COMPONENT);
+    }
+
+    /// The subtree: the session's regular files whose rel the store takes,
+    /// sorted, each with its size and sha256; a file one level below the
+    /// session, a hidden one, one of another kind, a symlinked file and a
+    /// symlinked directory are not listed; past the file cap, 413. Through
+    /// `dispatch` it answers in the payload form. A `<uuid>` that is itself
+    /// a symlink (never followed) or no directory is no subtree: the stat
+    /// still answers, its subtree empty.
+    #[test]
+    fn the_subtree_lists_regular_files_by_rel_and_skips_links() {
+        let h = home();
+        put(&h.file(), b"{}\n");
+        let sub = h.projects.join(SLUG).join(ID);
+        put(&sub.join("subagents/agent-a1.jsonl"), b"{\"a\":1}\n");
+        put(&sub.join("subagents/agent-a1.meta.json"), b"{\"agentType\":\"x\"}");
+        put(&sub.join("subagents/deeper/agent-b2.jsonl"), b"{\"b\":2}\n");
+        put(&sub.join("one-level.jsonl"), b"not a rel the store takes");
+        put(&sub.join("subagents/.hidden.jsonl"), b"hidden");
+        put(&sub.join("subagents/notes.txt"), b"another kind");
+        std::os::unix::fs::symlink(sub.join("subagents/agent-a1.jsonl"), sub.join("subagents/link.jsonl")).unwrap();
+        let elsewhere = h.root.join("elsewhere");
+        put(&elsewhere.join("leak.jsonl"), b"outside");
+        std::os::unix::fs::symlink(&elsewhere, sub.join("linked")).unwrap();
+        let stat = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, true).unwrap();
+        let got: Vec<(String, u64, String)> = stat.subtree.iter().map(|f| (f.rel.clone(), f.size, f.sha256.clone())).collect();
+        let entry = |rel: &str, body: &[u8]| (format!("{SLUG}/{ID}/{rel}"), body.len() as u64, sha(body));
+        assert_eq!(got, [entry("subagents/agent-a1.jsonl", b"{\"a\":1}\n"), entry("subagents/agent-a1.meta.json", b"{\"agentType\":\"x\"}"), entry("subagents/deeper/agent-b2.jsonl", b"{\"b\":2}\n")]);
+        let mut out = Vec::new();
+        let op = ShimIoOp::TranscriptStat { projects: h.projects.clone(), rel: h.rel.clone(), from: Some(0), fp: None, subtree: true };
+        dispatch(&h.ctx, &op, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+        let (head, payload) = head_of(&out);
+        assert_eq!((head["ok"].as_bool(), head["len"].as_u64(), head["reply"]["sha256"].as_str()), (Some(true), Some(payload.len() as u64), Some(sha(payload).as_str())), "{head}");
+        assert_eq!(serde_json::from_slice::<TranscriptStat>(payload).unwrap(), stat, "the payload is the stat");
+        for i in 0..=crate::wire::workspace::SUBTREE_FILES_MAX {
+            put(&sub.join(format!("many/f{i:04}.jsonl")), b"x");
+        }
+        assert_eq!(refused(h.ctx.transcript_stat_from(&h.projects, &h.rel, None, None, true)).code, refusal::TOO_LARGE);
+        // `<uuid>` itself a symlink to a directory holding a session's files, then a file.
+        std::fs::remove_dir_all(&sub).unwrap();
+        let planted = h.root.join("planted");
+        put(&planted.join("subagents/agent-a1.jsonl"), b"{\"a\":1}\n");
+        std::os::unix::fs::symlink(&planted, &sub).unwrap();
+        let linked = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, true).unwrap();
+        assert_eq!((linked.present, linked.subtree.len()), (true, 0), "a linked subtree is skipped: {linked:?}");
+        let mut out = Vec::new();
+        dispatch(&h.ctx, &op, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+        let (head, payload) = head_of(&out);
+        assert_eq!(head["ok"].as_bool(), Some(true), "{head}");
+        assert_eq!(serde_json::from_slice::<TranscriptStat>(payload).unwrap(), linked, "through dispatch too");
+        std::fs::remove_file(&sub).unwrap();
+        put(&sub, b"not a directory");
+        let occupied = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, true).unwrap();
+        assert_eq!((occupied.present, occupied.subtree.len()), (true, 0), "a file at <uuid> is no subtree: {occupied:?}");
+    }
+
+    /// The lead (S9 integration, G5's open point): a `<uuid>` the agent made
+    /// unenterable (mode 000) is no subtree, as one deeper down is skipped:
+    /// the stat answers, its subtree empty, directly and through `dispatch`
+    /// (never 409 `not_creatable`, a code `GET /transcript` does not list);
+    /// an unenterable directory below it is skipped, its siblings listed.
+    #[test]
+    fn an_unenterable_subtree_is_no_subtree() {
+        /// Gives the directories back their 0700 when dropped (before the tempdir goes), a failed assert included.
+        struct Unlock(Vec<PathBuf>);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
+        let h = home();
+        put(&h.file(), b"{}\n");
+        let sub = h.projects.join(SLUG).join(ID);
+        put(&sub.join("subagents/agent-a1.jsonl"), b"{\"a\":1}\n");
+        put(&sub.join("locked/agent-b2.jsonl"), b"{\"b\":2}\n");
+        let _unlock = Unlock(vec![sub.clone(), sub.join("locked")]);
+        let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(&sub.join("locked"), 0o000);
+        if std::fs::read_dir(sub.join("locked")).is_ok() {
+            eprintln!("root enters a mode-000 directory: skipped");
+            return;
+        }
+        let stat = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, true).unwrap();
+        let rels: Vec<&str> = stat.subtree.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, [format!("{SLUG}/{ID}/subagents/agent-a1.jsonl")], "an unenterable directory below <uuid> is skipped");
+        mode(&sub, 0o000);
+        let locked = h.ctx.transcript_stat_from(&h.projects, &h.rel, Some(0), None, true).unwrap();
+        assert_eq!((locked.present, locked.size, locked.subtree.len()), (true, 3, 0), "an unenterable <uuid> is no subtree: {locked:?}");
+        let mut out = Vec::new();
+        let op = ShimIoOp::TranscriptStat { projects: h.projects.clone(), rel: h.rel.clone(), from: Some(0), fp: None, subtree: true };
+        dispatch(&h.ctx, &op, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+        let (head, payload) = head_of(&out);
+        assert_eq!(head["ok"].as_bool(), Some(true), "{head}");
+        assert_eq!(serde_json::from_slice::<TranscriptStat>(payload).unwrap(), locked, "through dispatch too");
+    }
+
+    /// `transcript-read`: its head (the size, the inode, `len`), then
+    /// exactly those bytes; absent or too short 409 `changed` with the size;
+    /// a symlink 409 `symlink_component`; no regular file 409 `path_occupied`;
+    /// the inbox untouched.
+    #[test]
+    fn transcript_read_answers_its_head_then_exactly_the_range() {
+        let h = home();
+        let read = |from: u64, len: u64| {
+            let mut out = Vec::new();
+            let op = ShimIoOp::TranscriptRead { projects: h.projects.clone(), rel: h.rel.clone(), from, len };
+            dispatch(&h.ctx, &op, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+            out
+        };
+        let out = read(0, 1);
+        let (head, rest) = head_of(&out);
+        assert_eq!((head["ok"].as_bool(), head["code"].as_str(), head["size"].as_u64(), rest.len()), (Some(false), Some("changed"), Some(0), 0), "{head}");
+        let body = bytes(200_000);
+        put(&h.file(), &body);
+        let out = read(150_000, 40_000);
+        let (head, rest) = head_of(&out);
+        assert_eq!((head["reply"]["size"].as_u64(), head["reply"]["ino"].as_u64(), head["len"].as_u64()), (Some(200_000), Some(std::fs::metadata(h.file()).unwrap().ino()), Some(40_000)), "{head}");
+        assert_eq!(rest, &body[150_000..190_000]);
+        let out = read(199_000, 1001);
+        let (head, rest) = head_of(&out);
+        assert_eq!((head["code"].as_str(), head["size"].as_u64(), rest.len()), (Some("changed"), Some(200_000), 0), "shorter than from + len");
+        std::fs::remove_file(h.file()).unwrap();
+        std::fs::create_dir(h.file()).unwrap();
+        assert_eq!(head_of(&read(0, 1)).0["code"].as_str(), Some("path_occupied"));
+        std::fs::remove_dir(h.file()).unwrap();
+        std::os::unix::fs::symlink(h.root.join("elsewhere"), h.file()).unwrap();
+        assert_eq!(head_of(&read(0, 1)).0["code"].as_str(), Some("symlink_component"));
+        assert!(!h.ctx.home.join(INBOX).exists(), "the S9 ops never make the inbox");
+    }
+
+    /// `transcript-write`: N bytes, then the line `commit`, then the rename
+    /// (0600 in 0700 directories); without the line, cut short, or with
+    /// other bytes than its sha256, nothing is renamed, the old copy and its
+    /// size kept, no temp file left; a symlinked target is refused before
+    /// a byte is read; the sweep removes an ended writer's temp file and
+    /// leaves a live one's (it holds its flock).
+    #[test]
+    fn transcript_write_renames_only_after_the_commit_line() {
+        let h = home();
+        let write = |input: Vec<u8>, len: u64, sum: Option<String>| {
+            let mut out = Vec::new();
+            let op = ShimIoOp::TranscriptWrite { projects: h.projects.clone(), rel: h.rel.clone(), len, sha256: sum };
+            let mut cursor = Cursor::new(input);
+            dispatch(&h.ctx, &op, &mut cursor, &mut out).unwrap();
+            (head_of(&out).0, cursor.position())
+        };
+        let temps = || -> Vec<String> {
+            let Ok(d) = std::fs::read_dir(h.projects.join(SLUG)) else { return Vec::new() };
+            d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tmp")).collect()
+        };
+        let body = b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n".to_vec();
+        let with_commit = |b: &[u8]| [b, &format!("{COMMIT}\n").into_bytes()].concat();
+        let (head, _) = write(with_commit(&body), body.len() as u64, Some(sha(&body)));
+        assert_eq!((head["ok"].as_bool(), head["reply"]["size"].as_u64(), head["reply"]["sha256"].as_str()), (Some(true), Some(body.len() as u64), Some(sha(&body).as_str())), "{head}");
+        assert_eq!(std::fs::read(h.file()).unwrap(), body);
+        assert_eq!(std::fs::metadata(h.file()).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(h.projects.join(SLUG)).unwrap().permissions().mode() & 0o777, 0o700);
+        let new = b"{\"type\":\"user\",\"n\":2}\n".to_vec();
+        for (input, sum, code) in [
+            (new.clone(), None, "transfer_failed"),
+            (new[..5].to_vec(), None, "transfer_failed"),
+            ([&new[..], b"comm"].concat(), None, "transfer_failed"),
+            ([&new[..], b"rollback\n"].concat(), None, "transfer_failed"),
+            (with_commit(&new), Some(sha(b"other bytes")), "changed"),
+        ] {
+            let (head, _) = write(input, new.len() as u64, sum);
+            assert_eq!((head["code"].as_str(), head["size"].as_u64()), (Some(code), Some(body.len() as u64)), "{head}");
+            assert_eq!(std::fs::read(h.file()).unwrap(), body, "nothing renamed: the old copy kept");
+            assert!(temps().is_empty(), "no temp file left: {:?}", temps());
+        }
+        let (head, _) = write(with_commit(&new), new.len() as u64, None);
+        assert_eq!(head["ok"].as_bool(), Some(true), "{head}");
+        assert_eq!(std::fs::read(h.file()).unwrap(), new);
+        // The sweep: an ended writer's temp file goes, a live one's (its flock held) stays.
+        let dir = h.projects.join(SLUG);
+        put(&dir.join(".ai-env-0123456789abcdef.tmp"), b"an ended write");
+        put(&dir.join(".ai-env-fedcba9876543210.tmp"), b"a live write");
+        let live = std::fs::File::open(dir.join(".ai-env-fedcba9876543210.tmp")).unwrap();
+        // SAFETY: a valid fd; the lock goes with `live`.
+        assert_eq!(unsafe { libc::flock(live.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let (head, _) = write(with_commit(&body), body.len() as u64, None);
+        assert_eq!(head["ok"].as_bool(), Some(true));
+        assert_eq!(temps(), [".ai-env-fedcba9876543210.tmp"], "the live one stays");
+        drop(live);
+        // A symlinked target: refused before any byte is read.
+        std::fs::remove_file(h.file()).unwrap();
+        std::os::unix::fs::symlink(h.root.join("elsewhere"), h.file()).unwrap();
+        let (head, read) = write(with_commit(&body), body.len() as u64, None);
+        assert_eq!((head["code"].as_str(), read), (Some("symlink_component"), 0), "{head}");
+        assert!(!h.root.join("elsewhere").exists(), "nothing written through the link");
+    }
+
+    /// `transcript-view` (the payload form): an absent file answers
+    /// `present: false`; the example tail answers §6.1's example; a file
+    /// longer than `VIEW_TAIL_MAX` loses the line its read starts in, even
+    /// one whose rest would parse (here an entry naming as its parent the
+    /// newest one's).
+    #[test]
+    fn transcript_view_builds_from_the_tail_and_drops_a_partial_first_line() {
+        use crate::wire::view::VIEW_TAIL_MAX;
+        let h = home();
+        let view = |n: u32| -> TranscriptViewReply {
+            let mut out = Vec::new();
+            let op = ShimIoOp::TranscriptView { projects: h.projects.clone(), rel: h.rel.clone(), n };
+            dispatch(&h.ctx, &op, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+            let (head, payload) = head_of(&out);
+            assert_eq!((head["len"].as_u64(), head["reply"]["sha256"].as_str()), (Some(payload.len() as u64), Some(sha(payload).as_str())), "{head}");
+            serde_json::from_slice(payload).unwrap()
+        };
+        assert_eq!(serde_json::to_string(&view(10)).unwrap(), r#"{"v":1,"present":false,"entries":[]}"#);
+        put(&h.file(), include_bytes!("../../tests/fixtures/view/tails/example.jsonl"));
+        let reply = view(10);
+        assert_eq!((reply.title.as_deref(), reply.entries.len(), reply.entries[1].blocks.len()), (Some("Fix the seed's shallow boundary"), 2, 3));
+        let mut out = Vec::new();
+        let op = ShimIoOp::TranscriptView { projects: h.projects.clone(), rel: h.rel.clone(), n: 0 };
+        dispatch(&h.ctx, &op, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+        assert_eq!(head_of(&out).0["code"].as_str(), Some("bad_request"), "n 0");
+        // The read starts at the hidden entry's `{`: its line's garbage start is before the read.
+        let user = |uuid: &str, parent: Option<&str>, text: &str, pad: usize| {
+            let parent = parent.map_or("null".to_string(), |p| format!("\"{p}\""));
+            format!(r#"{{"parentUuid":{parent},"isSidechain":false,"type":"user","message":{{"role":"user","content":"{text}"}},"uuid":"{uuid}","pad":"{}"}}"#, "x".repeat(pad))
+        };
+        let (hidden, kept) = ("0199a1b2-c3d4-7e5f-8a9b-000000000001", "0199a1b2-c3d4-7e5f-8a9b-000000000002");
+        let last = user(kept, Some(hidden), "kept", 0);
+        let bare = user(hidden, None, "hidden", 0).len();
+        let pad = usize::try_from(VIEW_TAIL_MAX).unwrap() - bare - 1 - last.len() - 1;
+        let text = format!("garbage{}\n{last}\n", user(hidden, None, "hidden", pad));
+        put(&h.file(), text.as_bytes());
+        let reply = view(10);
+        let shown: Vec<&str> = reply.entries.iter().flat_map(|e| e.blocks.iter().map(String::as_str)).collect();
+        assert_eq!(shown, ["kept"], "the partial first line is dropped");
     }
 }
 
@@ -2569,7 +3920,7 @@ mod tests {
             }
         };
         left(&["seed-1a2b3c", "index-4d5e6f", "index-4d5e6f.lock"]);
-        let op = ShimIoOp::TranscriptStat { projects: w.ctx.home.join(".claude/projects"), rel: format!("{SLUG}/{ID}.jsonl") };
+        let op = ShimIoOp::TranscriptStat { projects: w.ctx.home.join(".claude/projects"), rel: format!("{SLUG}/{ID}.jsonl"), from: None, fp: None, subtree: false };
         dispatch(&w.ctx, &op, &mut Cursor::new(Vec::new()), &mut Vec::new()).unwrap();
         assert!(!w.inbox_is_empty(), "a transcript op leaves the inbox alone");
         dispatch(&w.ctx, &ShimIoOp::SeedState { path: WS.into(), record: None }, &mut Cursor::new(Vec::new()), &mut Vec::new()).unwrap();
@@ -2612,39 +3963,45 @@ mod tests {
     const SLUG: &str = "-Users-mike-ws";
     const ID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 
-    /// A transcript: absent, then written (0600, 0700 directories), the same
-    /// bytes unchanged, a longer VM copy 409 `vm_longer` with its size, a
-    /// longer upload written; a traversal 400; a symlink 409; no temp file
-    /// left on any path.
+    /// `transcript-write` of `body` as `rel`: its bytes, then the commit line.
+    fn write_transcript(w: &World, projects: &Path, rel: &str, body: &[u8]) -> Step<TranscriptWriteReply> {
+        let input = [body, format!("{COMMIT}\n").as_bytes()].concat();
+        w.ctx.transcript_write(projects, rel, body.len() as u64, None, &mut Cursor::new(input))
+    }
+
+    /// A transcript as a pull writes it (S9; S8's put went at the cut-over):
+    /// absent, then written (0600, 0700 directories) and stated; another
+    /// write replaces it whatever its length (the VM's copy never outranks
+    /// what S3 holds: the Mac pulls only when the VM lacks the committed
+    /// prefix); a traversal 400; a symlinked directory or file 409; no temp
+    /// file left on any path.
     #[test]
-    fn transcripts_are_written_as_the_agent_and_the_longer_vm_copy_wins() {
+    fn transcripts_are_written_as_the_agent_and_stated() {
         let w = World::new();
         let projects = w.ctx.home.join(".claude/projects");
         let rel = format!("{SLUG}/{ID}.jsonl");
         assert!(!w.ctx.transcript_stat(&projects, &rel).unwrap().present);
-        let put = |body: &[u8]| w.ctx.transcript_put(&projects, &rel, body.len() as u64, &mut Cursor::new(body.to_vec()));
-        let one = put(b"{\"a\":1}\n").unwrap();
-        assert_eq!((one.outcome, one.size), (TranscriptWrite::Written, 8));
+        let one = write_transcript(&w, &projects, &rel, b"{\"a\":1}\n").unwrap();
+        assert_eq!(one.size, 8);
         let file = projects.join(&rel);
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::metadata(projects.join(SLUG)).unwrap().permissions().mode() & 0o777, 0o700);
         let stat = w.ctx.transcript_stat(&projects, &rel).unwrap();
         assert!(stat.present && stat.size == 8 && stat.sha256.as_deref() == Some(one.sha256.as_str()) && stat.mtime.is_some(), "{stat:?}");
-        assert_eq!(put(b"{\"a\":1}\n").unwrap().outcome, TranscriptWrite::Unchanged);
-        let r = refused(put(b"{}\n"));
-        assert!(r.code == refusal::VM_LONGER && r.size == Some(8), "{r:?}");
-        assert_eq!(std::fs::read(&file).unwrap(), b"{\"a\":1}\n", "the VM's copy wins");
-        assert_eq!(put(b"{\"a\":1}\n{\"b\":2}\n").unwrap().outcome, TranscriptWrite::Written);
-        let r = refused(w.ctx.transcript_put(&projects, &rel, 5, &mut Cursor::new(b"abc".to_vec())));
-        assert_eq!(r.code, refusal::BAD_REQUEST, "a short body: {r:?}");
+        assert_eq!(write_transcript(&w, &projects, &rel, b"{}\n").unwrap().size, 3, "a shorter pull replaces it");
+        assert_eq!(std::fs::read(&file).unwrap(), b"{}\n");
+        let r = refused(w.ctx.transcript_write(&projects, &rel, 5, None, &mut Cursor::new(b"abc".to_vec())));
+        assert_eq!(r.code, refusal::TRANSFER_FAILED, "a short input: {r:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"{}\n", "nothing renamed");
         for bad in [format!("../{ID}.jsonl"), format!("{SLUG}/../{ID}.jsonl"), format!("{SLUG}/{ID}/../../x/{ID}.jsonl")] {
             assert_eq!(refused(w.ctx.transcript_stat(&projects, &bad)).code, refusal::BAD_REQUEST, "{bad}");
+            assert_eq!(refused(write_transcript(&w, &projects, &bad, b"{}\n")).code, refusal::BAD_REQUEST, "{bad}");
         }
         let elsewhere = w.root().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, projects.join("-linked")).unwrap();
         let linked = format!("-linked/{ID}.jsonl");
-        assert_eq!(refused(w.ctx.transcript_put(&projects, &linked, 2, &mut Cursor::new(b"{}".to_vec()))).code, refusal::SYMLINK_COMPONENT);
+        assert_eq!(refused(write_transcript(&w, &projects, &linked, b"{}")).code, refusal::SYMLINK_COMPONENT);
         std::os::unix::fs::symlink(&file, projects.join(SLUG).join("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c.jsonl")).unwrap();
         assert_eq!(refused(w.ctx.transcript_stat(&projects, &format!("{SLUG}/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c.jsonl"))).code, refusal::SYMLINK_COMPONENT);
         assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none(), "nothing written through a link");
@@ -2652,7 +4009,7 @@ mod tests {
         assert!(names.iter().all(|n| !n.ends_with(".tmp")), "no temp file left: {names:?}");
         // A component as long as a name may be: its temp name is its own length.
         let long = format!("{SLUG}/{ID}/subagents/{}.jsonl", "a".repeat(crate::wire::workspace::SEGMENT_MAX - 6));
-        assert_eq!(w.ctx.transcript_put(&projects, &long, 3, &mut Cursor::new(b"{}\n".to_vec())).unwrap().outcome, TranscriptWrite::Written);
+        assert_eq!(write_transcript(&w, &projects, &long, b"{}\n").unwrap().size, 3);
     }
 
     /// The settings capture: the three files with their text and sha256, a
@@ -3057,55 +4414,24 @@ mod tests {
         assert!(st.clean && st.pristine, "{st:?}");
     }
 
-    /// The VM's claude writing on while an upload comes in: a copy longer
-    /// than the upload by the time it would be renamed over still wins (409
-    /// `vm_longer` with its size now, the VM's bytes kept, no temp file
-    /// left); one that grew but stays shorter is replaced (the longer wins).
+    /// A write a helper ended by a signal left its temp file (no drop ran):
+    /// the next write into that directory removes it; only names a write
+    /// makes, and only regular files (a look-alike name, a symlink, a longer
+    /// name stay).
     #[test]
-    fn a_vm_copy_grown_while_the_upload_came_in_still_wins() {
-        let w = World::new();
-        let projects = w.ctx.home.join(".claude/projects");
-        let rel = format!("{SLUG}/{ID}.jsonl");
-        let file = projects.join(&rel);
-        let first = b"{\"a\":1}\n";
-        let entry = b"{\"type\":\"assistant\",\"n\":2}\n";
-        let grown = [&first[..], &entry[..]].concat();
-        for upload in [b"{\"a\":1}\n{\"b\":2}\n".to_vec(), vec![b'x'; 64]] {
-            let _ = std::fs::remove_file(&file);
-            assert_eq!(w.ctx.transcript_put(&projects, &rel, first.len() as u64, &mut Cursor::new(first.to_vec())).unwrap().outcome, TranscriptWrite::Written);
-            let mut input = MidBody::new(&upload, 0, || std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(entry).unwrap());
-            let got = w.ctx.transcript_put(&projects, &rel, upload.len() as u64, &mut input);
-            if grown.len() > upload.len() {
-                let r = refused(got);
-                assert!(r.code == refusal::VM_LONGER && r.size == Some(grown.len() as u64), "{r:?}");
-                assert_eq!(std::fs::read(&file).unwrap(), grown, "the VM's copy wins");
-            } else {
-                assert_eq!(got.unwrap().outcome, TranscriptWrite::Written);
-                assert_eq!(std::fs::read(&file).unwrap(), upload, "a copy still shorter is replaced");
-            }
-            let names: Vec<String> = std::fs::read_dir(projects.join(SLUG)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-            assert!(names.iter().all(|n| !n.ends_with(".tmp")), "no temp file left: {names:?}");
-        }
-    }
-
-    /// A put a helper ended by a signal left its temp file (no drop ran):
-    /// the next put into that directory removes it; only names a put makes,
-    /// and only regular files (a look-alike name, a symlink, a longer name stay).
-    #[test]
-    fn the_next_put_sweeps_what_an_ended_put_left() {
+    fn the_next_write_sweeps_what_an_ended_write_left() {
         let w = World::new();
         let projects = w.ctx.home.join(".claude/projects");
         let dir = projects.join(SLUG);
         write(&dir.join(".ai-env-0123456789abcdef.tmp"), "half a transcript");
-        write(&dir.join(".ai-env-ABCDEF0123456789.tmp"), "not a put's");
-        write(&dir.join(".ai-env-0123456789abcdef.tmp.keep"), "not a put's");
+        write(&dir.join(".ai-env-ABCDEF0123456789.tmp"), "not a write's");
+        write(&dir.join(".ai-env-0123456789abcdef.tmp.keep"), "not a write's");
         std::os::unix::fs::symlink(dir.join(".ai-env-ABCDEF0123456789.tmp"), dir.join(".ai-env-fedcba9876543210.tmp")).unwrap();
-        let put = w.ctx.transcript_put(&projects, &format!("{SLUG}/{ID}.jsonl"), 3, &mut Cursor::new(b"{}\n".to_vec())).unwrap();
-        assert_eq!(put.outcome, TranscriptWrite::Written);
+        assert_eq!(write_transcript(&w, &projects, &format!("{SLUG}/{ID}.jsonl"), b"{}\n").unwrap().size, 3);
         let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         assert_eq!(left, [".ai-env-0123456789abcdef.tmp.keep", ".ai-env-ABCDEF0123456789.tmp", ".ai-env-fedcba9876543210.tmp", &format!("{ID}.jsonl")]);
-        assert!(is_put_temp(b".ai-env-0123456789abcdef.tmp") && !is_put_temp(b".ai-env-0123456789abcde.tmp") && !is_put_temp(format!("{ID}.jsonl").as_bytes()));
+        assert!(is_transcript_temp(b".ai-env-0123456789abcdef.tmp") && !is_transcript_temp(b".ai-env-0123456789abcde.tmp") && !is_transcript_temp(format!("{ID}.jsonl").as_bytes()));
     }
 
     /// The snapshot adds the vetted untracked files by name, never as
@@ -3129,5 +4455,307 @@ mod tests {
         assert_eq!(git(&ws, &["ls-tree", "--name-only", &wip]).lines().collect::<Vec<_>>(), [":!todo.txt", ":(exclude)notes.txt", ":w", "a.txt", "d", "plain.txt"]);
         let out = w.ctx.codeout(WS, true, 1 << 20, &mut Cursor::new(format!("[\"{}\"]", seed.head).into_bytes())).unwrap();
         assert!(out.manifest.wip_skipped.is_none() && out.manifest.wip_ref.as_deref() == Some(wip.as_str()), "{:?}", out.manifest);
+    }
+
+    /// S9 (§3.2): a reply that would pass `HEAD_LINE_MAX` goes after a small
+    /// head: `JsonPayloadReply` with the payload's sha256 and `len`, then
+    /// exactly `len` bytes of the reply's compact JSON; a refusal stays an
+    /// ordinary head; a reply over `JSON_PAYLOAD_MAX` is the helper's failure.
+    #[test]
+    fn a_payload_reply_is_a_small_head_then_its_json() {
+        let reply = TranscriptStat { present: true, size: 1, subtree: (0..200).map(|i| crate::wire::workspace::SubtreeFile { rel: format!("{SLUG}/{ID}/subagents/agent-{i:04}-{}.jsonl", "a".repeat(990)), size: 7, sha256: "0".repeat(64) }).collect(), ..TranscriptStat::default() };
+        let mut out = Vec::new();
+        answer_payload(&mut out, Ok(reply.clone())).unwrap();
+        let nl = out.iter().position(|b| *b == b'\n').expect("a head line");
+        assert!(nl < 1024, "a small head: {nl} bytes");
+        let head: HelperHead<JsonPayloadReply> = serde_json::from_slice(&out[..nl]).unwrap();
+        let (sums, len) = head.outcome().expect("a reply").expect("not a refusal");
+        let payload = &out[nl + 1..];
+        assert!(payload.len() > 200 << 10, "a 200 KiB reply: {}", payload.len());
+        assert_eq!(Some(payload.len() as u64), len);
+        assert_eq!(sums.sha256, hex::encode(Sha256::digest(payload)));
+        assert_eq!(serde_json::from_slice::<TranscriptStat>(payload).unwrap(), reply, "the payload is the reply");
+        let mut refused_out = Vec::new();
+        answer_payload::<TranscriptStat>(&mut refused_out, refuse(refusal::PATH_OCCUPIED, "not a regular file")).unwrap();
+        let head: HelperHead<JsonPayloadReply> = serde_json::from_slice(refused_out.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(head.outcome().map(|o| o.map(|_| ()).map_err(|r| r.code)), Some(Err(refusal::PATH_OCCUPIED.to_string())));
+        let huge = "x".repeat(JSON_PAYLOAD_MAX);
+        assert!(answer_payload(&mut Vec::new(), Ok(huge)).is_err(), "over the payload cap: the helper fails");
+    }
+
+    /// `script` as the helper's `--git`: a 0755 shell script in `w`'s root
+    /// named `name`, run once outside any budget (macOS assesses a new
+    /// executable's first exec).
+    fn git_script(w: &World, name: &str, script: &str) -> PathBuf {
+        let path = w.root().join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warmed = {
+            let _fork = crate::test_locks::forking();
+            Command::new(&path).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap()
+        };
+        assert!(warmed.code().is_some(), "{name} ran");
+        path
+    }
+
+    /// S9, W3 #10: an untracked file the agent removes while a snapshot
+    /// adds the untracked files (here at that very step, by the helper's
+    /// git) is left out of the snapshot, never a failed one (`add
+    /// --pathspec-from-file` failed it: "did not match any files"); the
+    /// other files ride as before.
+    #[test]
+    fn a_snapshot_drops_an_untracked_file_gone_since_its_listing() {
+        let w = World::new();
+        let (_, body) = clone_body(&w.mac(), Some("main"));
+        apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap();
+        let ws = w.ws();
+        write(&ws.join("a.txt"), "edited\n");
+        write(&ws.join("kept.txt"), "the agent's\n");
+        write(&ws.join("gone.txt"), "removed while the snapshot runs\n");
+        let script = format!("#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in --add|--pathspec-from-file=-) rm -f '{}' ;; esac\ndone\nexec '{}' \"$@\"\n", ws.join("gone.txt").display(), real_git().display());
+        let racing = git_script(&w, "racing-git", &script);
+        let ctx = Ctx { home: w.ctx.home.clone(), fs_root: w.ctx.fs_root.clone(), git: racing, started: Instant::now(), budget: None };
+        let snap = ctx.snapshot(WS, Duration::from_secs(30)).unwrap();
+        let wip = snap.wip_ref.clone().unwrap_or_else(|| panic!("a snapshot: {snap:?}"));
+        assert!(!ws.join("gone.txt").exists(), "the agent removed it as the snapshot added the untracked files");
+        assert_eq!(git(&ws, &["ls-tree", "--name-only", &wip]).lines().collect::<Vec<_>>(), ["a.txt", "d", "kept.txt"]);
+        assert_eq!((git(&ws, &["show", &format!("{wip}:a.txt")]), git(&ws, &["show", &format!("{wip}:kept.txt")])), ("edited".to_string(), "the agent's".to_string()));
+        assert_eq!(status(&ws), [" M a.txt", "?? kept.txt"], "the agent's index is never written");
+        assert!(w.inbox_is_empty());
+    }
+
+    /// S9, F4: a VM ref whose name the scrubber masks part of (the
+    /// setup-token's shape, built at run time: a branch, a snapshot ref, the
+    /// branch checked out) never leaves the VM by name. The code-out lists
+    /// each at its commit under a stand-in of its namespace, numbered in name
+    /// order, as it names the branch checked out; the Mac's scrubber masks
+    /// every stand-in, so its screen hides and counts them as before. The
+    /// helper's own snapshot and `main` pass as they are; the agent's snapshot
+    /// ref the helper takes for the newest goes as its stand-in (`/suspend`'s
+    /// snapshot takes none such: its reply names it as it is).
+    #[test]
+    fn a_codeout_lists_credential_shaped_ref_names_under_stand_ins() {
+        let w = World::new();
+        let (seed, body) = clone_body(&w.mac(), Some("main"));
+        apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap();
+        let ws = w.ws();
+        let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
+        let masked = |text: &str| text.replace(&token, "<TOKEN>");
+        let commit = agent_commit(&ws, &[("agent.txt", "the agent's\n")]);
+        git(&ws, &["branch", &format!("x-{token}")]);
+        git(&ws, &["update-ref", &format!("refs/wip/zz-{token}"), "HEAD"]);
+        git(&ws, &["checkout", "-q", "-b", &format!("y-{token}")]);
+        write(&ws.join("agent.txt"), "uncommitted\n");
+        let haves = format!("[\"{}\"]", seed.head);
+        let out = w.ctx.codeout(WS, true, 1 << 20, &mut Cursor::new(haves.clone().into_bytes())).unwrap();
+        let m = &out.manifest;
+        m.check().unwrap();
+        let json = serde_json::to_string(m).unwrap();
+        assert!(!json.contains(&token[7..]), "a name that looks like a credential left the VM: {}", masked(&json));
+        let snapshot = m.wip_ref.clone().expect("the helper's own snapshot");
+        assert!(wip_key(&snapshot).is_some_and(|(t, _)| t.starts_with("20")), "{snapshot}");
+        let listed: BTreeMap<String, String> = m.refs.iter().map(|(k, v)| (masked(k), v.clone())).collect();
+        let want: BTreeMap<String, String> = [
+            ("refs/heads/main".to_string(), commit.clone()),
+            ("refs/heads/token=hidden-1".to_string(), commit.clone()),
+            ("refs/heads/token=hidden-2".to_string(), commit.clone()),
+            (snapshot.clone(), m.refs[&snapshot].clone()),
+            ("refs/wip/token=hidden-3".to_string(), commit.clone()),
+        ]
+        .into();
+        assert_eq!(listed, want);
+        assert_eq!(m.branch.as_deref().map(masked).as_deref(), Some("token=hidden-2"), "the branch checked out, by its stand-in");
+        for name in m.refs.keys().filter(|n| n.contains(HIDDEN_STAND_IN)).chain(m.branch.as_ref()) {
+            assert_ne!(crate::wire::redact::scrub(name), name.as_str(), "the Mac's screen takes {name} for what it stands for");
+        }
+        assert!(out.pack.is_some(), "the commits still come back");
+        drop(out);
+        // The agent's own snapshot ref of the unchanged checkout, the newest by its name: the helper takes it.
+        let tree = git(&ws, &["rev-parse", &format!("{snapshot}^{{tree}}")]);
+        let theirs = git(&ws, &["commit-tree", &tree, "-p", "HEAD", "-m", "the agent's snapshot"]);
+        git(&ws, &["update-ref", &format!("refs/wip/zz-{token}-9"), &theirs]);
+        let again = w.ctx.codeout(WS, true, 1 << 20, &mut Cursor::new(haves.into_bytes())).unwrap();
+        let m = &again.manifest;
+        m.check().unwrap();
+        assert!(!serde_json::to_string(m).unwrap().contains(&token[7..]), "the snapshot taken goes by its stand-in");
+        assert_eq!((m.wip_ref.as_deref().map(masked).as_deref(), m.refs.get("refs/wip/token=hidden-4")), (Some("refs/wip/token=hidden-4"), Some(&theirs)));
+        assert_eq!(git(&ws, &["for-each-ref", "--format=%(refname)", "refs/wip/"]).lines().count(), 3, "the helper made no snapshot of its own");
+    }
+
+    /// S9, F4: `/suspend`'s snapshot never names an agent's `refs/wip/*`
+    /// whose name the scrubber masks part of (the setup-token's shape, built
+    /// at run time), though it sorts newest and holds the checkout's tree on
+    /// its parents: the reply leaves the VM by name (the shim logs it and
+    /// keeps it for its health). With no other snapshot of that state the
+    /// helper makes its own, which a second snapshot of the unchanged
+    /// checkout keeps.
+    #[test]
+    fn a_snapshot_never_keeps_a_credential_shaped_ref_name() {
+        let w = World::new();
+        let (_, body) = clone_body(&w.mac(), Some("main"));
+        apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap();
+        let ws = w.ws();
+        write(&ws.join("a.txt"), "edited\n");
+        write(&ws.join("new.txt"), "the agent's\n");
+        let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
+        // The checkout's state as the helper commits it: its worktree's tree on HEAD (the index is HEAD's).
+        let (theirs, index) = wip_of(&ws).expect("a dirty checkout");
+        assert_eq!(index, None);
+        git(&ws, &["update-ref", &format!("refs/wip/zz-{token}-9"), &theirs]);
+        let snap = w.ctx.snapshot(WS, Duration::from_secs(30)).unwrap();
+        let made = snap.wip_ref.clone().unwrap_or_else(|| panic!("a snapshot: {snap:?}"));
+        assert!(!made.contains(&token[7..]), "a name that looks like a credential left the VM: {}", made.replace(&token, "<TOKEN>"));
+        assert!(wip_key(&made).is_some_and(|(t, _)| t.starts_with("20")), "the helper's own: {made}");
+        assert_eq!(git(&ws, &["rev-parse", &format!("{made}^{{tree}}")]), git(&ws, &["rev-parse", &format!("{theirs}^{{tree}}")]));
+        let again = w.ctx.snapshot(WS, Duration::from_secs(30)).unwrap();
+        assert_eq!((again.wip_ref.as_deref(), again.wip_skipped), (Some(made.as_str()), None), "the checkout unchanged: the helper's own kept");
+        assert_eq!(git(&ws, &["for-each-ref", "--format=%(refname)", "refs/wip/"]).lines().count(), 2, "one snapshot made");
+        assert_eq!(status(&ws), [" M a.txt", "?? new.txt"], "the agent's index is never written");
+    }
+
+    /// S9, F8: `git version` against the floor: the image's, this Mac's
+    /// (Apple's suffix), a build's suffix; anything else is no version.
+    #[test]
+    fn git_versions_are_read_against_the_floor() {
+        for (line, want, passes) in [
+            ("git version 2.50.1", Some((2, 50)), true),
+            ("git version 2.54.0 (Apple Git-157)", Some((2, 54)), true),
+            ("git version 2.46.0.windows.1", Some((2, 46)), true),
+            ("git version 3.0.0", Some((3, 0)), true),
+            ("git version 2.45.2", Some((2, 45)), false),
+            ("git version 1.99.9", Some((1, 99)), false),
+            ("version 2.50.1", None, false),
+            ("git version two", None, false),
+        ] {
+            assert_eq!(git_version(line), want, "{line}");
+            assert_eq!(git_version(line).is_some_and(|v| v >= GIT_FLOOR), passes, "{line}");
+        }
+    }
+
+    /// S9, F8: a git older than [`GIT_FLOOR`] (it has no `symref-verify`)
+    /// refuses an update before anything moves: 500 `git_failed` naming its
+    /// version and the floor, the refs, the checkout and `.git/shallow` as
+    /// they were; with this Mac's git the same update goes in.
+    #[test]
+    fn a_move_refuses_a_git_older_than_its_floor() {
+        let w = World::new();
+        let mac = w.mac();
+        let (seed, body) = clone_body(&mac, Some("main"));
+        let record = apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap().1.record.unwrap();
+        let tip = seed.head.clone();
+        write(&mac.join("a.txt"), "four\n");
+        git(&mac, &["commit", "-q", "-am", "c3"]);
+        let (_, body) = update_of(&w, &seed, &tip);
+        let script = format!("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = version ]; then echo 'git version 2.45.2'; exit 0; fi\ndone\nexec '{}' \"$@\"\n", real_git().display());
+        let old = git_script(&w, "old-git", &script);
+        let ctx = Ctx { home: w.ctx.home.clone(), fs_root: w.ctx.fs_root.clone(), git: old, started: Instant::now(), budget: None };
+        let q = query(SeedMode::Update, Some("main"), Some(&tip));
+        let r = refused(ctx.seed_apply(&q, body.len() as u64, Some(&record), &mut Cursor::new(body.clone())));
+        assert!(r.code == refusal::GIT_FAILED && r.message.contains("git version 2.45.2") && r.message.contains("2.46 or later"), "{r:?}");
+        let ws = w.ws();
+        for name in ["HEAD", "refs/heads/main", SEED_REF] {
+            assert_eq!(git(&ws, &["rev-parse", name]), tip, "{name}");
+        }
+        assert!(status(&ws).is_empty(), "{:?}", status(&ws));
+        assert_eq!(std::fs::read_to_string(ws.join(".git/shallow")).unwrap(), format!("{tip}\n"), "the shallow file restored");
+        assert_eq!(apply(&w, &q, &body, Some(&record)).unwrap().0.outcome, SeedApplied::Updated, "a git at the floor or later");
+    }
+
+    /// S9, F8: an agent that checks out another branch at the same commit
+    /// while an update's or a replace's pack comes in (past every check)
+    /// keeps its checkout: HEAD no longer names the branch the checks saw,
+    /// so `symref-verify` fails before the move's transaction, 409
+    /// `changed`; nothing of the Mac's is written under the agent's HEAD,
+    /// `main`, the seed ref and `.git/shallow` stay at the tip.
+    #[test]
+    fn a_move_never_follows_a_head_switched_to_another_branch_meanwhile() {
+        for mode in [SeedMode::Update, SeedMode::Replace] {
+            let w = World::new();
+            let mac = w.mac();
+            let (seed, body) = clone_body(&mac, Some("main"));
+            let record = apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap().1.record.unwrap();
+            let tip = seed.head.clone();
+            write(&mac.join("a.txt"), "four\n");
+            git(&mac, &["commit", "-q", "-am", "c3"]);
+            let (m, body) = if mode == SeedMode::Update { update_of(&w, &seed, &tip) } else { clone_body(&mac, Some("main")) };
+            let ws = w.ws();
+            let mut input = MidBody::new(&body, head_line(&m).unwrap().len(), || {
+                git(&ws, &["checkout", "-q", "-b", "other"]);
+            });
+            let r = refused(w.ctx.seed_apply(&query(mode, Some("main"), Some(&tip)), body.len() as u64, Some(&record), &mut input));
+            assert!(r.code == refusal::CHANGED && r.message.contains("refs/heads/other"), "{mode:?}: {r:?}");
+            assert_eq!(git(&ws, &["symbolic-ref", "HEAD"]), "refs/heads/other", "{mode:?}: the agent's HEAD stays");
+            for name in ["HEAD", "refs/heads/main", "refs/heads/other", SEED_REF] {
+                assert_eq!(git(&ws, &["rev-parse", name]), tip, "{mode:?}: {name}");
+            }
+            assert!(status(&ws).is_empty(), "{mode:?}: nothing written under the agent's HEAD: {:?}", status(&ws));
+            assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "three\n", "{mode:?}");
+            assert_eq!(std::fs::read_to_string(ws.join(".git/shallow")).unwrap(), format!("{tip}\n"), "{mode:?}: the shallow file restored");
+            assert!(w.inbox_is_empty(), "{mode:?}");
+        }
+    }
+
+    /// S9, F8: a replace's forward step resets the index to the worktree
+    /// its seed left keeping the stat data of every entry it keeps (`read-tree
+    /// --reset`), so its refresh hashes none of the files the replace leaves
+    /// as they are (a VM clean filter logs every file git hashes; each file
+    /// older than the index, so none is racily clean): a plain `read-tree`
+    /// hashed the whole checkout again on every replace.
+    #[test]
+    fn a_replace_keeps_the_stat_data_of_the_files_it_leaves() {
+        let w = World::new();
+        let mac = w.mac();
+        for i in 0..20 {
+            write(&mac.join(format!("f{i:02}.txt")), &format!("file {i}\n"));
+        }
+        git(&mac, &["add", "-A"]);
+        git(&mac, &["commit", "-q", "-m", "files"]);
+        let (seed, body) = clone_body(&mac, Some("main"));
+        let record = apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap().1.record.unwrap();
+        write(&mac.join("a.txt"), "replaced\n");
+        git(&mac, &["commit", "-q", "-am", "c4"]);
+        let (_, body) = clone_body(&mac, Some("main"));
+        let ws = w.ws();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        for rel in (0..20).map(|i| format!("f{i:02}.txt")).chain(["a.txt".to_string(), "d/b.txt".to_string()]) {
+            std::fs::OpenOptions::new().write(true).open(ws.join(&rel)).unwrap().set_modified(old).unwrap();
+        }
+        git(&ws, &["update-index", "-q", "--refresh"]);
+        let log = w.root().join("hashed.log");
+        git(&ws, &["config", "filter.log.clean", &format!("echo %f >> '{}'; cat", log.display())]);
+        write(&ws.join(".git/info/attributes"), "* filter=log\n");
+        let (reply, state) = apply(&w, &query(SeedMode::Replace, Some("main"), Some(&seed.head)), &body, Some(&record)).unwrap();
+        assert_eq!(reply.outcome, SeedApplied::Replaced);
+        let hashed = std::fs::read_to_string(&log).unwrap_or_default();
+        let left: Vec<&str> = hashed.lines().filter(|l| l.starts_with('f')).collect();
+        assert!(left.is_empty(), "the replace hashed files it left as they were: {left:?}");
+        assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "replaced\n");
+        assert!(state.clean && state.pristine && status(&ws).is_empty(), "{state:?} {:?}", status(&ws));
+    }
+
+    /// S9: an edit at the same size in the index's own second rides in the
+    /// snapshot. The helper's copies of the index keep its mtime, so git
+    /// re-reads a file whose cached stat still matches; a copy written later
+    /// took that stat on trust, and the snapshot left the edit out. The
+    /// index, the file's entry and the edit all in one past second (an
+    /// agent's tool writing within its commit's second); the copies made now.
+    #[test]
+    fn a_same_size_edit_in_the_indexs_own_second_rides_in_the_snapshot() {
+        let w = World::new();
+        let (_, body) = clone_body(&w.mac(), Some("main"));
+        apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap();
+        let ws = w.ws();
+        let then = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let touch = |p: &Path| std::fs::OpenOptions::new().write(true).open(p).unwrap().set_modified(then).unwrap();
+        touch(&ws.join("a.txt"));
+        git(&ws, &["update-index", "-q", "--refresh"]);
+        touch(&ws.join(".git/index"));
+        // "three\n" to "seven\n": the same size, in the same inode, at the same mtime.
+        std::fs::write(ws.join("a.txt"), "seven\n").unwrap();
+        touch(&ws.join("a.txt"));
+        let snap = w.ctx.snapshot(WS, Duration::from_secs(30)).unwrap();
+        let wip = snap.wip_ref.clone().unwrap_or_else(|| panic!("the edit taken for clean: {snap:?}"));
+        assert_eq!(git(&ws, &["show", &format!("{wip}:a.txt")]), "seven");
+        assert_eq!(status(&ws), [" M a.txt"], "the agent's index is never written");
     }
 }

@@ -95,7 +95,14 @@
 #                             the CLI does; with --session-mirror one transcript_mirror frame
 #                             per turn carries the same two entries (filePath under
 #                             FAKE_CONFIG_DIR), so the Mac's mirror can be compared with that
-#                             file byte for byte
+#                             file byte for byte, but the api-request lines below, which no
+#                             mirror frame carries (S9: compare with `common::mirrored` of it)
+#   FAKE_API_REQUEST          1 (the default, as 2.1.302 writes): with FAKE_WRITE_TRANSCRIPT=1
+#                             each turn's user entry is followed, in the file only, by
+#                             {"type":"api-request","requestId":"req_fake_<turn>_<gen>",
+#                             "sessionId":"<sid>","timestamp":"2026-10-17T00:00:00.000Z"} and
+#                             {"type":"api-request-blob","requestId":"req_fake_<turn>_<gen>",
+#                             "blob":"ZmFrZQ=="}; 0: none (2.1.296 and earlier)
 #   FAKE_EDIT                 <rel>:<text>: each turn writes <text> and a newline over <rel>
 #                             under the real cwd (parents created) and leaves it uncommitted
 #   FAKE_COMMIT               <msg>: each turn, after FAKE_EDIT, commits in the real cwd
@@ -448,7 +455,14 @@ write_transcript() {
   last_entry=$au
   file=$(transcript)
   mkdir -p "${file%/*}"
-  printf '%s\n%s\n' "$ue" "$ae" >> "$file"
+  if [ "${FAKE_API_REQUEST:-1}" = "1" ]; then
+    rq="req_fake_${turns}_${gen}"
+    rr=$(printf '{"type":"api-request","requestId":"%s","sessionId":"%s","timestamp":"2026-10-17T00:00:00.000Z"}' "$rq" "$sid")
+    rb=$(printf '{"type":"api-request-blob","requestId":"%s","blob":"ZmFrZQ=="}' "$rq")
+    printf '%s\n%s\n%s\n%s\n' "$ue" "$rr" "$rb" "$ae" >> "$file"
+  else
+    printf '%s\n%s\n' "$ue" "$ae" >> "$file"
+  fi
   if [ "$session_mirror" = "1" ]; then
     printf '{"type":"transcript_mirror","filePath":"%s","entries":[%s,%s]}\n' "$(shown_transcript)" "$ue" "$ae"
   fi

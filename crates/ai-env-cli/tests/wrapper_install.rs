@@ -190,7 +190,7 @@ impl Home {
     fn command(&self, bin: &str, args: &[&str]) -> Command {
         let mut cmd = Command::new(bin);
         cmd.arg("wrapper").args(args).env("HOME", self.path()).env("AI_ENV_BRIDGE_DIR", self.bridge_dir());
-        cmd.env_remove("AI_ENV_DIR").env_remove("AI_ENV_BRIDGE_CONFIG").env_remove("AI_ENV_BRIDGE_LOCAL").env_remove("AI_ENV_BRIDGE_LAB_EXIT");
+        cmd.env_remove("AI_ENV_DIR").env_remove("AI_ENV_BRIDGE_CONFIG").env_remove("AI_ENV_BRIDGE_LOCAL").env_remove("AI_ENV_BRIDGE_LAB_EXIT").env_remove("CLAUDE_CONFIG_DIR");
         cmd
     }
 
@@ -203,7 +203,7 @@ impl Home {
     fn ai(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(ai_env());
         cmd.args(args).env("HOME", self.path()).env("AI_ENV_BRIDGE_DIR", self.bridge_dir());
-        cmd.env_remove("AI_ENV_DIR").env_remove("AI_ENV_BRIDGE_CONFIG").env_remove("AI_ENV_BRIDGE_LOCAL").env_remove("AI_ENV_BRIDGE_LAB_EXIT");
+        cmd.env_remove("AI_ENV_DIR").env_remove("AI_ENV_BRIDGE_CONFIG").env_remove("AI_ENV_BRIDGE_LOCAL").env_remove("AI_ENV_BRIDGE_LAB_EXIT").env_remove("CLAUDE_CONFIG_DIR");
         bounded::run_within(cmd, None, LIMIT, "ai-env")
     }
 
@@ -810,9 +810,9 @@ fn uninstall_reads_bridge_toml_as_the_wrapper_and_install_do() {
         ("[wrapper]\nmode = 1\n", Some("default"), vec![unreadable.clone(), undo.clone()], "default"),
         ("[wrapper]\nmode = \"bogus\"\n", Some("default"), vec![left_alone("[wrapper] mode = \"bogus\": remote"), undo.clone()], "default"),
         // A file that does not load: remote fails closed under its roots, passthrough runs on this Mac.
-        ("[wrapper]\nmode = \"remote\"\nnope = 1\n[workspaces]\nroots = [\"/w\"]\n", Some("default"), vec![remote.clone(), closed.clone(), undo.clone()], "default"),
-        ("[wrapper]\nmode = \"remote\"\nnope = 1\n", Some("default"), vec![remote.clone(), undo.clone()], "default"),
-        ("[wrapper]\nmode = \"passthrough\"\nnope = 1\n", Some("default"), vec![left_alone("[wrapper] mode = \"passthrough\""), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"remote\"\n[vm]\nnope = 1\n[workspaces]\nroots = [\"/w\"]\n", Some("default"), vec![remote.clone(), closed.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"remote\"\n[vm]\nnope = 1\n", Some("default"), vec![remote.clone(), undo.clone()], "default"),
+        ("[wrapper]\nmode = \"passthrough\"\n[vm]\nnope = 1\n", Some("default"), vec![left_alone("[wrapper] mode = \"passthrough\""), undo.clone()], "default"),
         // An initial_permission_mode install refuses: the undo names one it takes.
         (bogus, None, vec![remote.clone(), with_flag("default"), refused("unset")], "default"),
         (bogus, Some("bogus"), vec![remote.clone(), with_flag("default"), refused("\"bogus\"")], "default"),
@@ -913,8 +913,8 @@ fn uninstall_weighs_cursors_variables_as_status_does() {
     let elsewhere = home.path().join("elsewhere");
     let dir = |v: &str| format!("AI_ENV_BRIDGE_DIR={v:?}");
     let another = |vars: &str, how: &str| format!("bridge.toml is left alone, but the wrapper reads another bridge root ({vars} in {in_cursor}): {back}, {how}, for what Cursor starts after it (ai-env wrapper status shows the variables).");
-    let (remote, broken_remote) = ("[wrapper]\nmode = \"remote\"\n", "[wrapper]\nmode = \"remote\"\nnope = 1\n");
-    let (passthrough, broken_passthrough) = ("[wrapper]\nmode = \"passthrough\"\n", "[wrapper]\nmode = \"passthrough\"\nnope = 1\n");
+    let (remote, broken_remote) = ("[wrapper]\nmode = \"remote\"\n", "[wrapper]\nmode = \"remote\"\n[vm]\nnope = 1\n");
+    let (passthrough, broken_passthrough) = ("[wrapper]\nmode = \"passthrough\"\n", "[wrapper]\nmode = \"passthrough\"\n[vm]\nnope = 1\n");
     // The same two files that do not load, with a root to route on.
     let (rooted_remote, rooted_passthrough) = (format!("{broken_remote}[workspaces]\nroots = [\"/w\"]\n"), format!("{broken_passthrough}[workspaces]\nroots = [\"/w\"]\n"));
     let var = |name: &str, value: serde_json::Value| serde_json::json!({ "name": name, "value": value });
@@ -1004,7 +1004,7 @@ fn uninstall_never_prints_a_secret_looking_mode() {
     let line = |shown: &str| format!("bridge.toml is left alone ([wrapper] mode = {shown}: remote): ai-env wrapper install --write brings the wrapper back, in that mode, for what Cursor starts after it.");
     for (toml, shown) in [
         (format!("[wrapper]\nmode = \"{token}\"\n[workspaces]\nroots = [\"/w\"]\n"), masked.clone()),
-        (format!("[wrapper]\nmode = \"{token}\"\nnope = 1\n[workspaces]\nroots = [\"/w\"]\n"), masked.clone()),
+        (format!("[wrapper]\nmode = \"{token}\"\n[vm]\nnope = 1\n[workspaces]\nroots = [\"/w\"]\n"), masked.clone()),
         (format!("[wrapper]\nmode = \"{long}\"\n"), format!("{:?}", "m".repeat(64))),
     ] {
         std::fs::write(home.bridge_toml(), &toml).unwrap();
@@ -1262,7 +1262,7 @@ fn session_show_settings_diff_prints_the_rules() {
     assert_eq!((mode_of(&diff), mode_of(&home.captures_dir(SESSION))), (0o600, 0o700));
     let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&diff).unwrap()).unwrap();
     assert!(!written.to_string().contains(&token) && !written.to_string().contains("value-not-shown"), "{written}");
-    assert_eq!((written["v"].as_u64(), written["added"].as_array().map(Vec::len), written["vms"].as_array().map(Vec::len), written["vms"][0]["scopes"].as_array().map(Vec::len)), (Some(2), Some(4), Some(1), Some(3)), "{written}");
+    assert_eq!((written["v"].as_u64(), written["added"].as_array().map(Vec::len), written["vms"].as_array().map(Vec::len), written["vms"][0]["scopes"].as_array().map(Vec::len)), (Some(3), Some(4), Some(1), Some(3)), "{written}");
     assert_eq!((written["added"][2]["rule"].as_str(), written["vms"][0]["current"].as_bool()), (Some("Bash(git status)"), Some(true)), "by list, then rule: {written}");
     assert_eq!(written["vms"][0]["scopes"][2]["allow"]["added"][0], "Bash(git status)", "each VM's whole diff, added rules included: {written}");
     let out = home.ai(&["session", "show", SESSION, "--settings-diff", "--json"]);

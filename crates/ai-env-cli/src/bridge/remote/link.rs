@@ -75,10 +75,13 @@ use tokio::task::JoinHandle;
 /// this many lines are queued for the child, or [`PENDING_IN_BYTES`] (plan
 /// §2): a host EOF stays visible during a Touch ID or a cold boot, so the
 /// close ladder holds. Past either it stops reading; the init deadline
-/// bounds the wait.
+/// bounds the wait. Both caps count the pump's own queue alone: the link's
+/// input channel takes its `pump::CHANNEL_CAP` lines first, of any size, as
+/// it does in every state (S8's TIMING-4, refuted: as designed).
 pub const PENDING_IN_LINES: usize = 1024;
 /// The bytes queued for the child that stop the pump's host reads during a
-/// pending remote start.
+/// pending remote start: the pump's queue, the line that crosses the cap
+/// kept whole, beside what the link's channel holds.
 pub const PENDING_IN_BYTES: usize = 64 * 1024 * 1024;
 /// The stdin pieces (each at most `CHUNK_MAX`) queued toward a remote
 /// session; the session takes them while the shim's stdin window has room.
@@ -1024,7 +1027,7 @@ pub enum StartWhy {
     First,
     /// The resume miss's one retry: generation 1 reported `session_id`
     /// missing. Local: the scratch dir was re-seeded from the Mac. Remote:
-    /// the pipeline uploads the transcript first (§8), re-gates without a
+    /// the pipeline restores the transcript first (S9: from S3), re-gates without a
     /// prompt and respawns on the same VM. `init_answered` (S8 phase 4,
     /// added to C3): generation 1 answered the host's `initialize` before
     /// its miss, so Cursor's 60 s window is over and a remote retry has a
@@ -1471,7 +1474,7 @@ mod tests {
     fn end_with(dir: &std::path::Path, session: JoinHandle<Result<SpawnOutcome, BridgeError>>) -> PipelineEnd {
         let paths = Paths::from_root_and_env(dir.join("bridge"), None);
         let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: Secret::new("t".into()), vpc: true, shell: false };
-        let ctx = CodeoutCtx { api: Arc::new(FakeMicrovmApi::new()), dp: Arc::new(Unreached), tokens: Arc::new(Unreached), paths, cfg: Arc::new(BridgeConfig::default()), target, ws: SessionPlan::sample(dir).ws, capture_settings: false };
+        let ctx = CodeoutCtx { api: Arc::new(FakeMicrovmApi::new()), dp: Arc::new(Unreached), tokens: Arc::new(Unreached), paths, cfg: Arc::new(BridgeConfig::default()), target, ws: SessionPlan::sample(dir).ws, capture_settings: false, transcript: None };
         PipelineEnd {
             vm: "microvm-1".into(),
             vm_how: "reused",

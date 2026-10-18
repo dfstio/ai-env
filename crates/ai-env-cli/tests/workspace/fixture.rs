@@ -3,8 +3,10 @@
 //! repositories the real git builds at fixed dates, the state of a user's
 //! repository for the "never touched" checks, and a git-backed fake VM: a
 //! [`DataPlane`] that applies a seed's manifest and pack, answers `GET
-//! /seed`, snapshots and packs a code-out, and keeps transcripts, the way the
-//! shim's helper does, so what the Mac sends is proven applicable.
+//! /seed`, snapshots and packs a code-out, and keeps transcripts (S9: the
+//! extended stat, and a pull from the tests' S3 through the presigned URLs
+//! as curl sends them), the way the shim's helper does, so what the Mac
+//! sends is proven applicable.
 
 use crate::common::git_real;
 use ai_env_cli::bridge::agent::AgentTarget;
@@ -16,11 +18,10 @@ use ai_env_cli::bridge::workspace::{EnsureCtx, SeedLimits, SeedProgress, Workspa
 use ai_env_cli::wire::frame::CAP_WORKSPACE_V1;
 use ai_env_cli::wire::redact::Secret;
 use ai_env_cli::wire::workspace::{
-    head_line, parse_head, read_head_line, refusal, CodeoutManifest, CodeoutRequest, ObjectFormat, SeedApplied, SeedManifest, SeedMode, SeedQuery, SeedRecord, SeedReply, SeedState, SettingsCapture, TranscriptReply, TranscriptStat,
-    TranscriptWrite, WsRefusal, HEADS_PREFIX, SEED_REF, SEED_WIP_REF, WIP_REF_PREFIX,
+    head_line, parse_head, read_head_line, refusal, CodeoutManifest, CodeoutRequest, ObjectFormat, PullPartReport, SeedApplied, SeedManifest, SeedMode, SeedQuery, SeedRecord, SeedReply, SeedState, SettingsCapture, StatQuery,
+    TranscriptPull, TranscriptPullReply, TranscriptStat, WsRefusal, HEADS_PREFIX, SEED_REF, SEED_WIP_REF, WIP_REF_PREFIX,
 };
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
@@ -76,22 +77,16 @@ pub fn git_cmd(dir: &Path) -> Command {
     cmd
 }
 
-/// `git args` in `dir` with `stdin`: its output, whatever its exit.
+/// How long one fixture git run may take (S8 phase 4's F9: every wait
+/// bounded): past it the run is killed and its test fails naming it.
+pub const GIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `git args` in `dir` with `stdin` (`None`: /dev/null): its output,
+/// whatever its exit, within [`GIT_LIMIT`] (`common::bounded`).
 pub fn git_out(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     let mut cmd = git_cmd(dir);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    if let Some(bytes) = stdin {
-        let mut sink = child.stdin.take().unwrap();
-        let bytes = bytes.to_vec();
-        std::thread::spawn(move || {
-            let _ = sink.write_all(&bytes);
-        });
-    }
-    child.wait_with_output().unwrap()
+    cmd.args(args);
+    crate::common::bounded::run_within(cmd, stdin, GIT_LIMIT, &format!("git {args:?}"))
 }
 
 /// `git args` in `dir`: its stdout, trimmed; a failure panics with its stderr.
@@ -528,33 +523,84 @@ impl DataPlane for FakeVm {
         Ok(DpReply::ok(
             200,
             match std::fs::read(&p) {
-                Ok(b) => TranscriptStat { present: true, size: b.len() as u64, sha256: Some(sha256_hex(&b)), mtime: None },
-                Err(_) => TranscriptStat { present: false, size: 0, sha256: None, mtime: None },
+                Ok(b) => TranscriptStat { present: true, size: b.len() as u64, sha256: Some(sha256_hex(&b)), mtime: None, ..TranscriptStat::default() },
+                Err(_) => TranscriptStat { present: false, size: 0, sha256: None, mtime: None, ..TranscriptStat::default() },
             },
         ))
-    }
-
-    async fn put_transcript(&self, _: &AgentTarget, _: &AuthToken, rel: &str, body: &Path, len: u64) -> Result<DpReply<TranscriptReply>, BridgeError> {
-        self.call(format!("PUT /transcript {rel}"));
-        let bytes = std::fs::read(body).unwrap();
-        let sent = &bytes[..len as usize];
-        let p = self.projects.join(rel);
-        if let Ok(have) = std::fs::read(&p) {
-            if have.len() as u64 > len {
-                return Ok(DpReply::refused(WsRefusal::new(refusal::VM_LONGER, "the VM's copy is longer").with_size(have.len() as u64)));
-            }
-            if have == sent {
-                return Ok(DpReply::ok(200, TranscriptReply { outcome: TranscriptWrite::Unchanged, size: len, sha256: sha256_hex(sent) }));
-            }
-        }
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, sent).unwrap();
-        Ok(DpReply::ok(201, TranscriptReply { outcome: TranscriptWrite::Written, size: len, sha256: sha256_hex(sent) }))
     }
 
     async fn get_settings(&self, _: &AgentTarget, _: &AuthToken, _: &str) -> Result<DpReply<SettingsCapture>, BridgeError> {
         Err(BridgeError::Endpoint("the fake VM keeps no settings".into()))
     }
+
+    /// S9's extended stat of the projects directory's file, as the helper
+    /// answers it (the request checked as the shim checks it): its inode, and
+    /// with `from` the delta's sha256 and the fingerprints.
+    async fn transcript_stat_from(&self, _: &AgentTarget, _: &AuthToken, q: &StatQuery) -> Result<DpReply<TranscriptStat>, BridgeError> {
+        use std::os::unix::fs::MetadataExt as _;
+        q.check().map_err(BridgeError::Config)?;
+        self.call(format!("GET /transcript {} from={}", q.rel, q.from.map_or_else(|| "-".to_string(), |f| f.to_string())));
+        let p = self.projects.join(&q.rel);
+        let (Ok(bytes), Ok(md)) = (std::fs::read(&p), std::fs::metadata(&p)) else { return Ok(DpReply::ok(200, TranscriptStat::default())) };
+        let size = bytes.len() as u64;
+        let span = ai_env_cli::wire::s3::FP_SPAN;
+        let mut stat = TranscriptStat { present: true, size, ino: Some(md.ino()), ..TranscriptStat::default() };
+        if let Some(from) = q.from {
+            if from <= size {
+                stat.delta_sha256 = Some(sha256_hex(&bytes[from as usize..]));
+            }
+            stat.end_fp = Some(sha256_hex(&bytes[size.saturating_sub(span) as usize..]));
+            if let Some(fp) = &q.fp {
+                stat.fp_ok = Some(from <= size && sha256_hex(&bytes[from.saturating_sub(span) as usize..from as usize]) == *fp);
+            }
+        }
+        Ok(DpReply::ok(200, stat))
+    }
+
+    /// S9's pull, as the shim and its curl do it: each part a GET of its
+    /// presigned URL (the owner sent) from the tests' S3, its length and
+    /// sha256 checked; the file written (0700 directories) only when every
+    /// part passed: 201, else 200 with nothing written.
+    async fn transcript_pull(&self, _: &AgentTarget, _: &AuthToken, req: &TranscriptPull) -> Result<DpReply<TranscriptPullReply>, BridgeError> {
+        req.check().map_err(BridgeError::Config)?;
+        self.call(format!("POST /transcript/pull {} parts={}", req.rel, req.parts.len()));
+        let p = self.projects.join(&req.rel);
+        let old = std::fs::metadata(&p).map_or(0, |m| m.len());
+        let (mut out, mut reports) = (Vec::new(), Vec::new());
+        for part in &req.parts {
+            let (status, body) = lab_get(part.url.expose(), &req.owner);
+            let got = sha256_hex(&body);
+            let ok = status == 200 && body.len() as u64 == part.len && part.sha256.as_ref().is_none_or(|s| *s == got);
+            reports.push(PullPartReport { s3_status: status, len: body.len() as u64, sha256: got, ok });
+            if !ok {
+                return Ok(DpReply::ok(200, TranscriptPullReply { written: false, size: old, sha256: None, parts: reports }));
+            }
+            out.extend_from_slice(&body);
+        }
+        let digest = sha256_hex(&out);
+        if req.sha256.as_ref().is_some_and(|s| *s != digest) {
+            return Ok(DpReply::ok(200, TranscriptPullReply { written: false, size: old, sha256: None, parts: reports }));
+        }
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &out).unwrap();
+        Ok(DpReply::ok(201, TranscriptPullReply { written: true, size: out.len() as u64, sha256: Some(digest), parts: reports }))
+    }
+}
+
+/// One GET of a lab URL (`http://127.0.0.1:<port>/<bucket>/<key>?…`, the
+/// tests' S3, which answers one request per connection) with the bucket
+/// owner's header, as the VM's curl sends a pull's part: the status and the body.
+fn lab_get(url: &str, owner: &str) -> (u16, Vec<u8>) {
+    use std::io::{Read as _, Write as _};
+    let rest = url.strip_prefix("http://").expect("a lab URL");
+    let (host, path) = rest.split_at(rest.find('/').expect("a path"));
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nhost: {host}\r\nx-amz-expected-bucket-owner: {owner}\r\nconnection: close\r\n\r\n").unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).unwrap();
+    let end = resp.windows(4).position(|w| w == b"\r\n\r\n").expect("an answer's head");
+    let status = String::from_utf8_lossy(&resp[..end]).split(' ').nth(1).and_then(|c| c.parse().ok()).expect("a status");
+    (status, resp[end + 4..].to_vec())
 }
 
 /// sha256 of `bytes`, lowercase hex.

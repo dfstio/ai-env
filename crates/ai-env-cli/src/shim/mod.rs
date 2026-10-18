@@ -13,7 +13,9 @@
 //! process group is stopped before the servers end. S8 adds the agent's
 //! workspace helper (`wshelper`: the hidden `ai-env shim-io`), the runner
 //! that starts it as the agent (`asagent`, on `childproc`'s child setup, the
-//! spawns' too) and the workspace routes that use it (`code`, `health`).
+//! spawns' too) and the workspace routes that use it (`code`, `health`). S9
+//! adds git smart-HTTP on the code port (`gitcgi`) and the transcript
+//! store's transfers on the app port (`s3xfer`: curl as `ai-env-net`).
 //!
 //! Every log line goes through `errln!`: stderr is whatever PID 1 was
 //! given, and a reader that went away must not panic a hook (`eprintln!`
@@ -40,11 +42,13 @@ pub mod auth;
 pub mod childproc;
 pub mod code;
 pub mod credential;
+pub mod gitcgi;
 pub mod health;
 pub mod hooks;
 pub mod init;
 pub mod peer;
 pub mod replay;
+pub mod s3xfer;
 pub mod spawn;
 pub mod state;
 pub mod sys;
@@ -105,6 +109,9 @@ pub struct ShimArgs {
     /// The git the agent's workspace helper runs (S8; native tests point it at the Mac's)
     #[arg(long, value_name = "PATH", hide = true, default_value = health::GIT_DEFAULT)]
     pub git: PathBuf,
+    /// The curl the transcript transfers run as ai-env-net (S9; native tests point it at a fake)
+    #[arg(long, value_name = "PATH", hide = true, default_value = health::CURL_DEFAULT)]
+    pub curl: PathBuf,
     /// Worker role: the init that spawned us (exit when it dies)
     #[arg(long, value_name = "PID", hide = true)]
     pub init_pid: Option<u32>,
@@ -234,6 +241,9 @@ async fn serve(args: ShimArgs) -> Result<()> {
         // This very binary, resolved once at startup (the image's ENTRYPOINT passes neither flag).
         helper: args.helper.clone().or_else(|| std::env::current_exe().ok()),
         git: args.git.clone(),
+        curl: args.curl.clone(),
+        net_uid: health::NET_UID,
+        net_gid: health::NET_GID,
     };
     let probe = health::ProbeSpec::for_agent(args.uid, args.gid);
     let state = Arc::new(health::ShimState::with(args.claude.clone(), opts, probe, Arc::new(sys::RealSys)));

@@ -1461,8 +1461,124 @@ fn judge_none(items: &[Value], describe: impl Fn(&Value) -> (String, String), go
     }
 }
 
-fn judge_endpoints(doc: &Value) -> Judged {
-    judge_none(arr(doc, "VpcEndpoints"), |e| (format!("{} {}", text(e, "VpcEndpointId"), text(e, "ServiceName")), text(e, "State").to_string()), &["deleted", "rejected", "failed", "expired"], "VPC endpoints")
+/// What `state/infra.toml` records of the S9 transcript store (plans/s9-contracts.md
+/// §7.6): the bucket, its owner (the stack's account), the S3 gateway
+/// endpoint, the proxy's route table and the two policies' canonical hashes.
+struct S9Store<'a> {
+    bucket: Option<&'a str>,
+    owner: Option<&'a str>,
+    endpoint_id: Option<&'a str>,
+    route_table: Option<&'a str>,
+    endpoint_policy: Option<&'a str>,
+    bucket_policy: Option<&'a str>,
+}
+
+impl S9Store<'_> {
+    /// The store `state` records; `None` for a state written before the S9
+    /// deploy (none of the five keys): its network keeps S8's rules (no VPC
+    /// endpoint at all, no bucket row), until `make infra-status WRITE=1`
+    /// records the deploy's outputs.
+    fn of(state: &InfraState) -> Option<S9Store<'_>> {
+        let s = S9Store {
+            bucket: state.transcripts_bucket.as_deref(),
+            owner: state.account_id.as_deref(),
+            endpoint_id: state.s3_endpoint_id.as_deref(),
+            route_table: state.proxy_route_table_id.as_deref(),
+            endpoint_policy: state.s3_endpoint_policy_sha256.as_deref(),
+            bucket_policy: state.transcripts_bucket_policy_sha256.as_deref(),
+        };
+        [s.bucket, s.endpoint_id, s.route_table, s.endpoint_policy, s.bucket_policy].iter().any(Option::is_some).then_some(s)
+    }
+}
+
+/// The S3 gateway endpoint's service (eu-central-1).
+const S3_SERVICE: &str = "com.amazonaws.eu-central-1.s3";
+/// The states of an endpoint that is history, not a resource.
+const ENDPOINT_GONE: [&str; 4] = ["deleted", "rejected", "failed", "expired"];
+
+/// The VPC's endpoints. Before the S9 deploy (`store` none: S8's rule) none
+/// may exist. With the S9 store recorded, exactly one: an available Gateway
+/// endpoint of `com.amazonaws.eu-central-1.s3` with the recorded id, on
+/// exactly the recorded proxy route table (never the VM table: squid stays
+/// the only way out), its policy's canonical hash the recorded one
+/// (`infra::canonical_policy_sha256`); any other endpoint, or none, is
+/// drift. A store recorded without the endpoint's id, table or hash is
+/// unknown (`make infra-status WRITE=1`).
+fn judge_endpoints(doc: &Value, store: Option<&S9Store<'_>>) -> Judged {
+    let describe = |e: &Value| (format!("{} {}", text(e, "VpcEndpointId"), text(e, "ServiceName")), text(e, "State").to_string());
+    let Some(store) = store else {
+        return judge_none(arr(doc, "VpcEndpoints"), describe, &ENDPOINT_GONE, "VPC endpoints");
+    };
+    let (Some(id), Some(table), Some(hash)) = (store.endpoint_id, store.route_table, store.endpoint_policy.filter(|h| is_sha256_hex(h))) else {
+        return unknown(format!("state/infra.toml records the transcript store without s3_endpoint_id, proxy_route_table_id or a 64-hex s3_endpoint_policy_sha256: {HINT}"));
+    };
+    let live: Vec<&Value> = arr(doc, "VpcEndpoints").iter().filter(|e| !ENDPOINT_GONE.contains(&text(e, "State").to_ascii_lowercase().as_str())).collect();
+    let mut p: Vec<String> = live.iter().filter(|e| text(e, "VpcEndpointId") != id).map(|e| format!("{} {} ({}) is not the stack's S3 endpoint {id}", text(e, "VpcEndpointId"), text(e, "ServiceName"), text(e, "State"))).collect();
+    let Some(e) = live.iter().find(|e| text(e, "VpcEndpointId") == id) else {
+        p.push(format!("the S3 gateway endpoint {id} does not exist"));
+        return verdict(&p, String::new());
+    };
+    if text(e, "VpcEndpointType") != "Gateway" || text(e, "ServiceName") != S3_SERVICE {
+        p.push(format!("{id} is a {} endpoint of {}, not a Gateway endpoint of {S3_SERVICE}", text(e, "VpcEndpointType"), text(e, "ServiceName")));
+    }
+    if !text(e, "State").eq_ignore_ascii_case("available") {
+        p.push(format!("{id} is {}, not available", text(e, "State")));
+    }
+    let tables = strs(e.get("RouteTableIds"));
+    if tables != [table] {
+        p.push(format!("{id} is on the route tables {}, not exactly the proxy's [{table}] (the VM table never)", list(&tables)));
+    }
+    match e.get("PolicyDocument").and_then(Value::as_str).map(crate::bridge::infra::canonical_policy_sha256) {
+        Some(Ok(got)) if got == hash => {}
+        Some(Ok(got)) => p.push(format!("{id}'s policy is not the stack's (canonical sha256 {}…, recorded {}…)", &got[..12], &hash[..12])),
+        Some(Err(why)) => p.push(format!("{id}'s policy: {why}")),
+        None => p.push(format!("{id} carries no policy document")),
+    }
+    verdict(&p, format!("{id}: the one S3 gateway endpoint, on {table} only, its policy the stack's"))
+}
+
+/// The transcripts bucket (S9), from its five reads (`ops::bucket_reads`:
+/// versioning, encryption, ownership controls, public access block,
+/// policy): versioning enabled, exactly one default encryption rule of
+/// SSE-S3 (`AES256`), object ownership `BucketOwnerEnforced` only, the four
+/// public access blocks on, the bucket policy's canonical hash the recorded
+/// `transcripts_bucket_policy_sha256`. A read that failed is unknown.
+fn judge_bucket(bucket: &str, reads: [std::result::Result<Value, String>; 5], policy_hash: Option<&str>) -> Judged {
+    let mut docs = Vec::with_capacity(5);
+    for r in reads {
+        match r {
+            Ok(v) => docs.push(v),
+            Err(e) => return unknown(e),
+        }
+    }
+    let Some(hash) = policy_hash.filter(|h| is_sha256_hex(h)) else {
+        return unknown(format!("state/infra.toml records no 64-hex transcripts_bucket_policy_sha256: {HINT}"));
+    };
+    let mut p = Vec::new();
+    if text(&docs[0], "Status") != "Enabled" {
+        p.push(format!("versioning {:?}, not Enabled", text(&docs[0], "Status")));
+    }
+    let rules = docs[1].get("ServerSideEncryptionConfiguration").map(|c| arr(c, "Rules")).unwrap_or_default();
+    let sse: Vec<&str> = rules.iter().map(|r| r.get("ApplyServerSideEncryptionByDefault").map_or("", |d| text(d, "SSEAlgorithm"))).collect();
+    if sse != ["AES256"] || rules.iter().any(|r| r.get("ApplyServerSideEncryptionByDefault").is_some_and(|d| d.get("KMSMasterKeyID").is_some())) {
+        p.push(format!("default encryption {}, not exactly one SSE-S3 (AES256) rule", list(&sse.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())));
+    }
+    let ownership: Vec<String> = docs[2].get("OwnershipControls").map(|c| arr(c, "Rules")).unwrap_or_default().iter().map(|r| text(r, "ObjectOwnership").to_string()).collect();
+    if ownership != ["BucketOwnerEnforced"] {
+        p.push(format!("object ownership {}, not exactly [BucketOwnerEnforced]", list(&ownership)));
+    }
+    let block = docs[3].get("PublicAccessBlockConfiguration");
+    let off: Vec<&str> = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"].into_iter().filter(|k| block.and_then(|b| b.get(*k)).and_then(Value::as_bool) != Some(true)).collect();
+    if !off.is_empty() {
+        p.push(format!("the public access block leaves {} off", off.join(", ")));
+    }
+    match docs[4].get("Policy").and_then(Value::as_str).map(crate::bridge::infra::canonical_policy_sha256) {
+        Some(Ok(got)) if got == hash => {}
+        Some(Ok(got)) => p.push(format!("the bucket policy is not the stack's (canonical sha256 {}…, recorded {}…)", &got[..12], &hash[..12])),
+        Some(Err(why)) => p.push(format!("the bucket policy: {why}")),
+        None => p.push("no bucket policy".into()),
+    }
+    verdict(&p, format!("{bucket}: versioned, SSE-S3, owner-enforced, public access blocked, its policy the stack's"))
 }
 
 fn judge_nat(doc: &Value) -> Judged {
@@ -1542,8 +1658,13 @@ fn judge_proxy_config(st: &BTreeMap<String, String>) -> Judged {
 
 /// The four parameters exist and parse; with a status line, each
 /// `sha256_<param>` the proxy printed (64 hex digits) equals the hash of
-/// the value SSM holds.
-fn judge_parameters(st: Option<&BTreeMap<String, String>>, values: &BTreeMap<String, Param>, missing: &[String]) -> Judged {
+/// the value SSM holds. S7 D2: no AWS service host in `allow` or `extras`,
+/// but in `allow` exactly the recorded transcripts bucket's host
+/// (`wire::s3::bucket_host` of `bucket`, S9: the one AWS host squid serves,
+/// confined by the gateway endpoint's policy); that host in `extras`, or
+/// without a recorded bucket, stays drift.
+fn judge_parameters(st: Option<&BTreeMap<String, String>>, values: &BTreeMap<String, Param>, missing: &[String], bucket: Option<&str>) -> Judged {
+    let exempt = bucket.filter(|b| crate::wire::s3::is_bucket_name(b)).map(crate::wire::s3::bucket_host);
     let mut p = Vec::new();
     if !missing.is_empty() {
         p.push(format!("missing {}", missing.join(", ")));
@@ -1566,7 +1687,7 @@ fn judge_parameters(st: Option<&BTreeMap<String, String>>, values: &BTreeMap<Str
         // S7 D2: `egress allow` refuses an AWS service host, so one in a list the proxy serves was put there another
         // way (the shipped base allowlist, or SSM by hand). A suspended one is already denied, so it is no drift.
         let aws: Vec<String> = match param {
-            "allow" => parse_hosts(v).unwrap_or_default().into_iter().filter(|h| is_aws_service_host(h)).collect(),
+            "allow" => parse_hosts(v).unwrap_or_default().into_iter().filter(|h| is_aws_service_host(h) && exempt.as_deref() != Some(h.as_str())).collect(),
             "extras" => parse_extras(v).unwrap_or_default().into_iter().map(|e| e.host).filter(|h| is_aws_service_host(h)).collect(),
             _ => Vec::new(),
         };
@@ -1597,8 +1718,8 @@ fn judge_parameters(st: Option<&BTreeMap<String, String>>, values: &BTreeMap<Str
 /// these values for its `--status`) and `st` says squid serves them
 /// ([`serving`]: active, they parse, `applied=yes` — squid runs exactly
 /// them); else `None`, and `egress check` judges every case strictly.
-fn judge_served_parameters(st: &BTreeMap<String, String>, values: &BTreeMap<String, Param>, missing: &[String]) -> (Judged, Option<BTreeSet<String>>) {
-    let judged = judge_parameters(Some(st), values, missing);
+fn judge_served_parameters(st: &BTreeMap<String, String>, values: &BTreeMap<String, Param>, missing: &[String], bucket: Option<&str>) -> (Judged, Option<BTreeSet<String>>) {
+    let judged = judge_parameters(Some(st), values, missing, bucket);
     let served = (judged.0 == Verdict::Ok && serving(st)).then(|| effective_of(values)).flatten();
     (judged, served)
 }
@@ -1766,7 +1887,17 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
         Some(Err(why)) => r.push("dhcp-options", (Verdict::Drift, why)),
         None => r.push("dhcp-options", unknown("the VPC could not be read")),
     }
-    r.call("vpc-endpoints", ops::vpc_endpoints(vpc), |doc| judge_endpoints(&doc));
+    // S9: once state/infra.toml records the transcript store, its endpoint is expected and its bucket gets a row.
+    let store = S9Store::of(&ctx.state);
+    r.call("vpc-endpoints", ops::vpc_endpoints(vpc), |doc| judge_endpoints(&doc, store.as_ref()));
+    if let Some(s) = &store {
+        let judged = match (s.bucket.filter(|b| crate::wire::s3::is_bucket_name(b)), s.owner.filter(|o| crate::wire::s3::is_account_id(o))) {
+            (Some(bucket), Some(owner)) => judge_bucket(bucket, ops::bucket_reads(bucket, owner), s.bucket_policy),
+            _ => unknown(format!("state/infra.toml records the transcript store without a transcripts bucket (ai-env-transcripts-<acct>) or its account_id: {HINT}")),
+        };
+        r.push("transcripts-bucket", judged);
+    }
+    let bucket = store.as_ref().and_then(|s| s.bucket);
     r.call("vpc-peering", ops::peering_connections(), |doc| judge_peering(&doc, vpc));
     r.call("nat-gateways", ops::nat_gateways(vpc), |doc| judge_nat(&doc));
     let state = match ops::instance(instance) {
@@ -1815,7 +1946,7 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
                             r.push("proxy-config", judge_proxy_config(&st));
                             match params.clone() {
                                 Ok((values, missing)) => {
-                                    let (judged, served) = judge_served_parameters(&st, &values, &missing);
+                                    let (judged, served) = judge_served_parameters(&st, &values, &missing, bucket);
                                     r.allowlist = served;
                                     r.push("parameters", judged);
                                 }
@@ -1853,7 +1984,7 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
         for check in ["proxy-ssm", "squid-rpm", "proxy-config"] {
             r.push(check, (v, why.clone()));
         }
-        r.call("parameters", params.clone(), |(values, missing)| judge_parameters(None, &values, &missing));
+        r.call("parameters", params.clone(), |(values, missing)| judge_parameters(None, &values, &missing, bucket));
     }
     r.call("stack-params", params, |(values, _)| judge_stack_params(&values, &ctx.state));
     Ok((instance.to_string(), r))
@@ -2025,8 +2156,8 @@ mod tests {
         assert_eq!(judge_dhcp(&dhcp(json!([{"Value": "1.1.1.1"}, {"Value": "9.9.9.9"}])), "dopt-1").0, Verdict::Ok);
         assert_eq!(judge_dhcp(&dhcp(json!([{"Value": "AmazonProvidedDNS"}])), "dopt-1").0, Verdict::Drift);
         assert_eq!(judge_dhcp(&dhcp(json!([{"Value": "1.1.1.1"}, {"Value": "9.9.9.9"}, {"Value": "8.8.8.8"}])), "dopt-1").0, Verdict::Drift);
-        assert_eq!(judge_endpoints(&json!({"VpcEndpoints": [{"VpcEndpointId": "vpce-1", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "deleted"}]})).0, Verdict::Ok);
-        assert!(judge_endpoints(&json!({"VpcEndpoints": [{"VpcEndpointId": "vpce-1", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "available"}]})).1.contains("vpce-1 com.amazonaws.eu-central-1.s3 (available)"));
+        assert_eq!(judge_endpoints(&json!({"VpcEndpoints": [{"VpcEndpointId": "vpce-1", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "deleted"}]}), None).0, Verdict::Ok);
+        assert!(judge_endpoints(&json!({"VpcEndpoints": [{"VpcEndpointId": "vpce-1", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "available"}]}), None).1.contains("vpce-1 com.amazonaws.eu-central-1.s3 (available)"));
         assert_eq!(judge_nat(&json!({"NatGateways": [{"NatGatewayId": "nat-1", "State": "available"}]})).0, Verdict::Drift);
         let peer = json!({"VpcPeeringConnections": [{"VpcPeeringConnectionId": "pcx-1", "AccepterVpcInfo": {"VpcId": "vpc-0123456789abcdef0"}, "RequesterVpcInfo": {"VpcId": "vpc-9"}, "Status": {"Code": "active"}}, {"VpcPeeringConnectionId": "pcx-2", "AccepterVpcInfo": {"VpcId": "vpc-7"}, "RequesterVpcInfo": {"VpcId": "vpc-8"}, "Status": {"Code": "active"}}]});
         let (v, d) = judge_peering(&peer, "vpc-0123456789abcdef0");
@@ -2152,7 +2283,7 @@ mod tests {
         let st = parse_reload_status(&line).unwrap();
         assert_eq!(judge_proxy_config(&st).0, Verdict::Ok);
         assert!(serving(&st));
-        assert_eq!(judge_parameters(Some(&st), &vals, &[]).0, Verdict::Ok);
+        assert_eq!(judge_parameters(Some(&st), &vals, &[], None).0, Verdict::Ok);
         let old = parse_reload_status(&status_of(&vals, " applied=no")).unwrap();
         assert!(judge_proxy_config(&old).1.contains("the proxy serves an older config: ai-env egress reload"));
         assert!(!serving(&old));
@@ -2163,32 +2294,32 @@ mod tests {
         assert!(d.contains("squid is inactive") && d.contains("squid -k parse"), "{d}");
         let mut changed = vals.clone();
         changed.insert(param_name("extras"), param(&format!("{}github.com\tai-env\n", super::super::EXTRAS_HEADER)));
-        let (v, d) = judge_parameters(Some(&st), &changed, &[]);
+        let (v, d) = judge_parameters(Some(&st), &changed, &[], None);
         assert!(v == Verdict::Drift && d.starts_with("extras: the proxy reads sha256"), "{d}");
         // Odd bytes in a hash never panic: drift naming the key.
         for odd in ["zz", "é", &"A".repeat(64), &"0".repeat(63)] {
             let bad = parse_reload_status(&status_of(&vals, " applied=yes").replace(&format!("sha256_extras={}", value_sha256(super::super::EXTRAS_HEADER)), &format!("sha256_extras={odd}"))).unwrap();
-            let (v, d) = judge_parameters(Some(&bad), &vals, &[]);
+            let (v, d) = judge_parameters(Some(&bad), &vals, &[], None);
             assert!(v == Verdict::Drift && d.contains("sha256_extras is not 64 hex digits"), "{odd}: {d}");
         }
         let mut bad = vals.clone();
         bad.insert(param_name("allow"), param("1.2.3.4\n"));
-        assert!(judge_parameters(None, &bad, &[]).1.contains("allow: line 1"));
-        assert!(judge_parameters(None, &vals, &[param_name("suspended")]).1.contains("missing /ai-env/proxy/suspended"));
-        assert_eq!(judge_parameters(None, &vals, &[]).0, Verdict::Ok);
+        assert!(judge_parameters(None, &bad, &[], None).1.contains("allow: line 1"));
+        assert!(judge_parameters(None, &vals, &[param_name("suspended")], None).1.contains("missing /ai-env/proxy/suspended"));
+        assert_eq!(judge_parameters(None, &vals, &[], None).0, Verdict::Ok);
         // S7 D2: an AWS service host in a list the proxy serves is drift, with the remedy for the list it sits in. A
         // suspended one is already denied, so it is none.
         let mut base = vals.clone();
         base.insert(param_name("allow"), param("api.anthropic.com\nsts.amazonaws.com\n"));
-        let (v, d) = judge_parameters(None, &base, &[]);
+        let (v, d) = judge_parameters(None, &base, &[], None);
         assert!(v == Verdict::Drift && d.contains("allow: AWS service host(s) sts.amazonaws.com, where a VM's own IMDS credentials work (remove the line from infra/proxy/allow.txt and redeploy)"), "{d}");
         let mut extra = vals.clone();
         extra.insert(param_name("extras"), param(&format!("{}lambda.eu-central-1.amazonaws.com\tai-env\n", super::super::EXTRAS_HEADER)));
-        let (v, d) = judge_parameters(None, &extra, &[]);
+        let (v, d) = judge_parameters(None, &extra, &[], None);
         assert!(v == Verdict::Drift && d.contains("extras: AWS service host(s) lambda.eu-central-1.amazonaws.com, where a VM's own IMDS credentials work (ai-env egress allow <slug> <host> --remove)"), "{d}");
         let mut only_suspended = vals.clone();
         only_suspended.insert(param_name("suspended"), param(&format!("{}sts.amazonaws.com\n", super::super::SUSPENDED_HEADER)));
-        assert_eq!(judge_parameters(None, &only_suspended, &[]).0, Verdict::Ok, "a suspended AWS host is already denied");
+        assert_eq!(judge_parameters(None, &only_suspended, &[], None).0, Verdict::Ok, "a suspended AWS host is already denied");
     }
 
     /// `egress check` judges `proxy-github` by what squid serves: (allow ∪ extras) − suspended of the very values the
@@ -2197,12 +2328,12 @@ mod tests {
     #[test]
     fn the_served_allowlist_needs_the_parameters_row_ok_and_squid_serving_them() {
         let names = |l: Option<BTreeSet<String>>| l.map(|l| l.into_iter().collect::<Vec<_>>());
-        let served = |vals: &BTreeMap<String, Param>, line: &str, missing: &[String]| judge_served_parameters(&parse_reload_status(line).unwrap(), vals, missing);
+        let served = |vals: &BTreeMap<String, Param>, line: &str, missing: &[String]| judge_served_parameters(&parse_reload_status(line).unwrap(), vals, missing, None);
         let mut vals = values();
         vals.insert(param_name("extras"), param(&format!("{}github.com\tsome-ws\n", super::super::EXTRAS_HEADER)));
         let (judged, list) = served(&vals, &status_of(&vals, " applied=yes"), &[]);
         assert_eq!((judged.0, names(list)), (Verdict::Ok, Some(vec!["api.anthropic.com".to_string(), "github.com".to_string()])));
-        assert_eq!(judged.1, judge_parameters(Some(&parse_reload_status(&status_of(&vals, " applied=yes")).unwrap()), &vals, &[]).1, "the row itself is unchanged");
+        assert_eq!(judged.1, judge_parameters(Some(&parse_reload_status(&status_of(&vals, " applied=yes")).unwrap()), &vals, &[], None).1, "the row itself is unchanged");
         // A suspended host is not served, wherever it is listed.
         let mut suspended = vals.clone();
         suspended.insert(param_name("suspended"), param(&format!("{}github.com\napi.anthropic.com\n", super::super::SUSPENDED_HEADER)));
@@ -2355,5 +2486,162 @@ mod tests {
             allow_refusal("ws.2", "example.com", true),
             "egress allow --remove: /ai-env/proxy/extras widens what every vpc VM may reach and only ai-env-deployer writes it: run ai-env as deployer -- ai-env egress allow ws.2 example.com --remove (ai-env egress suspend example.com stops serving a host as ai-env-ops)"
         );
+    }
+
+    // ---- S9: the S3 gateway endpoint, the transcripts bucket, the bucket host's exemption ----
+
+    const BUCKET: &str = "ai-env-transcripts-123456789012";
+    const VPCE: &str = "vpce-0123456789abcdef0";
+    const PROXY_RTB: &str = "rtb-0a1b2c3d4e5f60002";
+    const VM_RTB: &str = "rtb-0a1b2c3d4e5f60003";
+    /// plans/s9-contracts.md §7.3's endpoint policy for the example account (the stack's literal JSON).
+    const ENDPOINT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"TranscriptsOfTheRuntimeUser","Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject"],"Resource":["arn:aws:s3:::ai-env-transcripts-123456789012/v1/*"],"Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/ai-env-runtime"},"StringEquals":{"s3:ResourceAccount":"123456789012"}}},{"Sid":"Al2023Repos","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::al2023-repos-eu-central-1-de612dc2/*"]}]}"#;
+
+    fn hash(doc: &str) -> String {
+        crate::bridge::infra::canonical_policy_sha256(doc).unwrap()
+    }
+
+    /// The state of an S9 stack: every key of the store recorded.
+    fn s9_state(endpoint_hash: &str) -> InfraState {
+        InfraState {
+            account_id: Some("123456789012".into()),
+            transcripts_bucket: Some(BUCKET.into()),
+            s3_endpoint_id: Some(VPCE.into()),
+            proxy_route_table_id: Some(PROXY_RTB.into()),
+            s3_endpoint_policy_sha256: Some(endpoint_hash.into()),
+            transcripts_bucket_policy_sha256: Some("b".repeat(64)),
+            ..InfraState::default()
+        }
+    }
+
+    /// The gateway endpoint as `describe-vpc-endpoints` lists it, AWS's normalised policy text included.
+    fn endpoint() -> Value {
+        let aws_text = serde_json::to_string_pretty(&serde_json::from_str::<Value>(&ENDPOINT_POLICY.replace(r#"["s3:GetObject"]"#, r#""s3:GetObject""#)).unwrap()).unwrap();
+        json!({"VpcEndpointId": VPCE, "VpcEndpointType": "Gateway", "VpcId": "vpc-0123456789abcdef0", "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "available", "PolicyDocument": aws_text, "RouteTableIds": [PROXY_RTB], "SubnetIds": [], "Groups": []})
+    }
+
+    /// `egress status`'s `vpc-endpoints` (S9): with the store recorded, exactly
+    /// one available Gateway S3 endpoint with the recorded id, on exactly the
+    /// proxy's route table, its policy's canonical hash the recorded one (AWS's
+    /// normalised text compares equal); a missing endpoint, a second one, the
+    /// VM table or another table beside the proxy's, a widened policy, an
+    /// Interface endpoint, another service and a pending state each drift; a
+    /// store recorded without the endpoint's id, table or hash is unknown. A
+    /// state written before the S9 deploy keeps S8's rule (no endpoint at all).
+    #[test]
+    fn judge_endpoints_holds_the_one_gateway_endpoint() {
+        let state = s9_state(&hash(ENDPOINT_POLICY));
+        let store = S9Store::of(&state);
+        let judge = |eps: Vec<Value>| judge_endpoints(&json!({"VpcEndpoints": eps}), store.as_ref());
+        let (v, d) = judge(vec![endpoint()]);
+        assert_eq!(v, Verdict::Ok, "{d}");
+        assert!(d.contains("the one S3 gateway endpoint"), "{d}");
+        let drift = |eps: Vec<Value>, want: &str| {
+            let (v, d) = judge(eps);
+            assert!(v == Verdict::Drift && d.contains(want), "{want}: {d}");
+        };
+        drift(vec![], "does not exist");
+        let mut gone = endpoint();
+        gone["State"] = json!("deleted");
+        drift(vec![gone], "does not exist");
+        let mut second = endpoint();
+        second["VpcEndpointId"] = json!("vpce-0fedcba9876543210");
+        drift(vec![endpoint(), second], "vpce-0fedcba9876543210 com.amazonaws.eu-central-1.s3 (available) is not the stack's S3 endpoint");
+        let mut vm_table = endpoint();
+        vm_table["RouteTableIds"] = json!([VM_RTB]);
+        drift(vec![vm_table], "not exactly the proxy's");
+        let mut both = endpoint();
+        both["RouteTableIds"] = json!([PROXY_RTB, VM_RTB]);
+        drift(vec![both], "not exactly the proxy's");
+        let mut widened = endpoint();
+        widened["PolicyDocument"] = json!(ENDPOINT_POLICY.replace("ai-env-transcripts-123456789012/v1/*", "*"));
+        drift(vec![widened], "policy is not the stack's");
+        let mut open = endpoint();
+        open["PolicyDocument"] = Value::Null;
+        drift(vec![open], "carries no policy document");
+        let mut interface = endpoint();
+        interface["VpcEndpointType"] = json!("Interface");
+        drift(vec![interface], "not a Gateway endpoint");
+        let mut other = endpoint();
+        other["ServiceName"] = json!("com.amazonaws.eu-central-1.dynamodb");
+        drift(vec![other], "not a Gateway endpoint of com.amazonaws.eu-central-1.s3");
+        let mut pending = endpoint();
+        pending["State"] = json!("pending");
+        drift(vec![pending], "is pending, not available");
+        // The recorded hash is the stack's; a state recording another one drifts on the very same endpoint.
+        let other_hash = s9_state(&"c".repeat(64));
+        assert_eq!(judge_endpoints(&json!({"VpcEndpoints": [endpoint()]}), S9Store::of(&other_hash).as_ref()).0, Verdict::Drift);
+        // The store half recorded: unknown, naming make infra-status WRITE=1.
+        let half = InfraState { s3_endpoint_id: None, ..s9_state(&hash(ENDPOINT_POLICY)) };
+        let (v, d) = judge_endpoints(&json!({"VpcEndpoints": [endpoint()]}), S9Store::of(&half).as_ref());
+        assert!(v == Verdict::Unknown && d.contains(HINT), "{d}");
+        // Before the S9 deploy: S8's rule.
+        assert!(S9Store::of(&InfraState::default()).is_none());
+        assert_eq!(judge_endpoints(&json!({"VpcEndpoints": []}), None).0, Verdict::Ok);
+        assert_eq!(judge_endpoints(&json!({"VpcEndpoints": [endpoint()]}), None).0, Verdict::Drift);
+    }
+
+    /// The transcripts bucket's row: versioning enabled, one SSE-S3 rule,
+    /// `BucketOwnerEnforced`, the four public access blocks, the bucket
+    /// policy's canonical hash the recorded one; each departure drifts, a
+    /// failed read is unknown, a state without the policy's hash unknown.
+    #[test]
+    fn judge_bucket_holds_its_settings_and_policy() {
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Sid":"DenyWithoutTls","Effect":"Deny","Principal":"*","Action":["s3:*"],"Resource":["arn:aws:s3:::ai-env-transcripts-123456789012","arn:aws:s3:::ai-env-transcripts-123456789012/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}"#;
+        let reads = || -> [std::result::Result<Value, String>; 5] {
+            [
+                Ok(json!({"Status": "Enabled"})),
+                Ok(json!({"ServerSideEncryptionConfiguration": {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}, "BucketKeyEnabled": false}]}})),
+                Ok(json!({"OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}})),
+                Ok(json!({"PublicAccessBlockConfiguration": {"BlockPublicAcls": true, "IgnorePublicAcls": true, "BlockPublicPolicy": true, "RestrictPublicBuckets": true}})),
+                Ok(json!({"Policy": policy})),
+            ]
+        };
+        let h = hash(policy);
+        let (v, d) = judge_bucket(BUCKET, reads(), Some(&h));
+        assert_eq!(v, Verdict::Ok, "{d}");
+        let drift = |i: usize, doc: Value, want: &str| {
+            let mut r = reads();
+            r[i] = Ok(doc);
+            let (v, d) = judge_bucket(BUCKET, r, Some(&h));
+            assert!(v == Verdict::Drift && d.contains(want), "{want}: {d}");
+        };
+        drift(0, json!({"Status": "Suspended"}), "versioning \"Suspended\"");
+        drift(0, json!({}), "versioning \"\"");
+        drift(1, json!({"ServerSideEncryptionConfiguration": {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "k"}}]}}), "not exactly one SSE-S3");
+        drift(2, json!({"OwnershipControls": {"Rules": [{"ObjectOwnership": "ObjectWriter"}]}}), "not exactly [BucketOwnerEnforced]");
+        drift(3, json!({"PublicAccessBlockConfiguration": {"BlockPublicAcls": true, "IgnorePublicAcls": true, "BlockPublicPolicy": false, "RestrictPublicBuckets": true}}), "leaves BlockPublicPolicy off");
+        drift(4, json!({"Policy": policy.replace("\"Deny\"", "\"Allow\"")}), "the bucket policy is not the stack's");
+        drift(4, json!({}), "no bucket policy");
+        let mut failed = reads();
+        failed[4] = Err("aws s3api get-bucket-policy: An error occurred (AccessDenied)".into());
+        assert_eq!(judge_bucket(BUCKET, failed, Some(&h)).0, Verdict::Unknown);
+        assert_eq!(judge_bucket(BUCKET, reads(), None).0, Verdict::Unknown, "no recorded hash: not verifiable");
+    }
+
+    /// S7 D2 with S9's one exception: exactly the recorded bucket's host may be
+    /// in `allow`; `sts.amazonaws.com` beside it, the bucket's host in
+    /// `extras`, another account's bucket host, and the host without a
+    /// recorded bucket all stay drift.
+    #[test]
+    fn judge_parameters_exempts_only_the_recorded_buckets_host() {
+        let host = crate::wire::s3::bucket_host(BUCKET);
+        let mut vals = values();
+        vals.insert(param_name("allow"), param(&format!("api.anthropic.com\n{host}\n")));
+        assert_eq!(judge_parameters(None, &vals, &[], Some(BUCKET)).0, Verdict::Ok, "the recorded bucket's host");
+        let (v, d) = judge_parameters(None, &vals, &[], None);
+        assert!(v == Verdict::Drift && d.contains(&format!("allow: AWS service host(s) {host}")), "no recorded bucket: {d}");
+        let mut sts = vals.clone();
+        sts.insert(param_name("allow"), param(&format!("api.anthropic.com\n{host}\nsts.amazonaws.com\n")));
+        let (v, d) = judge_parameters(None, &sts, &[], Some(BUCKET));
+        assert!(v == Verdict::Drift && d.contains("allow: AWS service host(s) sts.amazonaws.com,") && !d.contains(&host), "{d}");
+        let mut extras = values();
+        extras.insert(param_name("extras"), param(&format!("{}{host}\tai-env\n", super::super::EXTRAS_HEADER)));
+        let (v, d) = judge_parameters(None, &extras, &[], Some(BUCKET));
+        assert!(v == Verdict::Drift && d.contains(&format!("extras: AWS service host(s) {host}")), "{d}");
+        let mut another = values();
+        another.insert(param_name("allow"), param(&format!("{}\n", crate::wire::s3::bucket_host("ai-env-transcripts-999999999999"))));
+        assert_eq!(judge_parameters(None, &another, &[], Some(BUCKET)).0, Verdict::Drift, "another account's bucket");
+        assert_eq!(judge_parameters(None, &vals, &[], Some("not-a-transcripts-bucket")).0, Verdict::Drift, "a recorded name that is no transcripts bucket exempts nothing");
     }
 }

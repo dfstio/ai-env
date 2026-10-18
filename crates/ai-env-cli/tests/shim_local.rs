@@ -6,13 +6,19 @@
 //! and the WebSocket client is tokio-tungstenite over a plain TcpStream. No
 //! test runs the real `claude` (a fake answers `--version`), steps the clock
 //! or needs root.
+// S9: the fake curl (`tests/common/curl.rs`, self-contained: `mod common` needs the bridge) and G5's transfers.
+#[path = "common/curl.rs"]
+mod curl;
+#[path = "shim_local/transcript_s3.rs"]
+mod transcript_s3;
+
 use ai_env_cli::shim::health::{router, ProbeSpec, ShimOpts, ShimState};
 use ai_env_cli::shim::hooks::{self, HookPeer, HookSource, PREFIX};
 use ai_env_cli::shim::peer::{AgentGuard, Peer, DRAIN_MAX};
 use ai_env_cli::shim::sys::{ClockMode, SysOps};
 use ai_env_cli::wire::frame::{
     ClientInfo, CredentialErrCode, CredentialView, Deliver, ErrorCode, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, HelloErrCode, ResumePoint, ResumeStatus, Resumed, RunHookPayload, SpawnErrCode, SpawnId,
-    CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
+    CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1, CLOSE_GOING_AWAY, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, MAX_UNAUTHENTICATED, WS_MAX_MESSAGE,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -1781,7 +1787,7 @@ fn shim_help_lists_the_entrypoint_surface() {
         let block = flag_block(&text, head);
         assert!(block.contains(&format!("[default: {default}]")), "{head}: [default: {default}] missing from {block:?}");
     }
-    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes", "--helper", "--git"] {
+    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes", "--helper", "--git", "--curl"] {
         assert!(!text.contains(hidden), "{hidden} is a hidden test/role flag:\n{text}");
     }
 }
@@ -1825,9 +1831,11 @@ fn the_image_entrypoint_runs_the_agent_as_1000_1000() {
     assert!(matches!(a.agent_guard, None | Some(AgentGuard::On | AgentGuard::Log)), "the image never runs --agent-guard off: {:?}", a.agent_guard);
     assert!(!a.supervise && a.init_pid.is_none() && a.fs_root.is_none() && a.delay_run.is_none(), "PID 1 is init by its pid, not by a flag");
     assert_eq!(a.kill_after_s, 70);
-    // S8: the workspace helper is the shim's own binary and the image's git; the ENTRYPOINT names neither.
-    assert!(a.helper.is_none() && !argv.iter().any(|w| w == "--helper" || w == "--git"), "{argv:?}");
+    // S8: the workspace helper is the shim's own binary and the image's git; S9: and the image's curl; the
+    // ENTRYPOINT names none of them.
+    assert!(a.helper.is_none() && !argv.iter().any(|w| w == "--helper" || w == "--git" || w == "--curl"), "{argv:?}");
     assert_eq!(a.git, PathBuf::from("/usr/bin/git"));
+    assert_eq!(a.curl, PathBuf::from("/usr/bin/curl"));
 }
 
 #[test]
@@ -2373,8 +2381,7 @@ async fn binary_stops_drop_the_cached_credential_first() {
 // (D2's WIP commits, D7's shallow pack and its manifest line).
 
 use ai_env_cli::wire::workspace::{
-    head_line, CodeoutManifest, HelperHead, ObjectFormat, SeedManifest, SeedRecord, SeedReply, SeedState, SettingsCapture, TranscriptReply, TranscriptStat, WorkspaceView, WsRefusal, SEED_REF, SEED_WIP_REF,
-    TRANSCRIPT_MAX,
+    head_line, CodeoutManifest, HelperHead, ObjectFormat, SeedManifest, SeedRecord, SeedReply, SeedState, SettingsCapture, TranscriptStat, WorkspaceView, WsRefusal, SEED_REF, SEED_WIP_REF,
 };
 
 const VM_HOME: &str = "/Users/agent";
@@ -2684,10 +2691,25 @@ impl Vm {
     }
 }
 
+/// The caps of a shim that serves the workspace (S9): `credential_cache`,
+/// `workspace_v1`, then `git_http_v1` and `transcript_s3_v1` once their
+/// routes are served (`shim::gitcgi::SERVED`, `shim::s3xfer::SERVED`).
+fn shim_caps() -> Vec<&'static str> {
+    let mut caps = vec![CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1];
+    if ai_env_cli::shim::gitcgi::SERVED {
+        caps.push(CAP_GIT_HTTP_V1);
+    }
+    if ai_env_cli::shim::s3xfer::SERVED {
+        caps.push(CAP_TRANSCRIPT_S3_V1);
+    }
+    caps
+}
+
 /// The code port: 401 before `/run`, without the bearer or with a wrong
-/// one; behind it the workspace routes (S8) answer, and any other path is
-/// still 404 (S9's). A shim without a helper serves none of them: 404, as
-/// an older shim, and its caps do not name `workspace_v1`.
+/// one; behind it the workspace routes (S8) and, once their cap is named,
+/// S9's git routes answer, and any other path is 404 `NO_SUCH_ROUTE`. A
+/// shim without a helper serves none of them: 404, as an older shim, and
+/// its caps name neither `workspace_v1` nor `git_http_v1`.
 #[tokio::test]
 async fn code_port_answers_401_then_the_seed_routes_with_the_bearer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2696,7 +2718,7 @@ async fn code_port_answers_401_then_the_seed_routes_with_the_bearer() {
     let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(PathBuf::from(bin())), git: git_real().to_path_buf(), ..opts(None, HookSource::Log, 0) };
     let s = stack(o).await;
     let seed = format!("/seed?path={WS}");
-    let paths = [("GET", seed.as_str()), ("PUT", "/seed"), ("POST", "/codeout"), ("GET", "/bundle?since=x")];
+    let paths = [("GET", seed.as_str()), ("PUT", "/seed"), ("POST", "/codeout"), ("GET", "/bundle?since=x"), ("GET", GIT_ADVERTISE), ("POST", GIT_RECEIVE_PACK_ROUTE)];
     for (m, p) in paths {
         let (st, head, b) = http_with(s.code, m, p, &bearer_header(TOKEN), b"").await;
         assert_eq!(st, 401, "before /run, no commitment: {m} {p}: {b}");
@@ -2713,45 +2735,51 @@ async fn code_port_answers_401_then_the_seed_routes_with_the_bearer() {
     assert_eq!(serde_json::from_str::<SeedState>(&b).unwrap(), SeedState::default(), "never seeded");
     let (st, _, b) = http_with(s.code, "GET", "/seed?path=relative", &bearer_header(TOKEN), b"").await;
     assert!(st == 400 && b.contains("\"bad_request\""), "{st} {b}");
-    for p in ["/", "/bundle?since=x"] {
+    for p in ["/", "/bundle?since=x", "/workspace.git/HEAD"] {
         let (st, _, b) = http_with(s.code, "GET", p, &bearer_header(TOKEN), b"").await;
-        assert!(st == 404 && b.contains("not implemented (S8/S9)"), "{p}: {st} {b}");
+        assert!(st == 404 && b == NO_SUCH_ROUTE, "{p}: {st} {b}");
     }
     let (st, _, _) = http_with(s.code, "DELETE", &seed, &bearer_header(TOKEN), b"").await;
     assert_eq!(st, 405);
     let health: Health = serde_json::from_str(&http(s.app, "GET", "/health", b"", None).await.2).unwrap();
-    assert_eq!(health.caps, [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1]);
+    assert_eq!(health.caps, shim_caps());
     let (_, has, caps, _) = hello_view(s.app).await;
-    assert!(!has && caps == [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1], "{caps:?}");
+    assert!(!has && caps == shim_caps(), "{caps:?}");
     // No helper program: none of it.
     let old = Stack::log().await;
     old.run(true).await;
-    let (st, _, b) = http_with(old.code, "GET", &seed, &bearer_header(TOKEN), b"").await;
-    assert!(st == 404 && b.contains("not implemented (S8/S9)"), "{st} {b}");
+    for p in [seed.as_str(), GIT_ADVERTISE] {
+        let (st, _, b) = http_with(old.code, "GET", p, &bearer_header(TOKEN), b"").await;
+        assert!(st == 404 && b == NO_SUCH_ROUTE, "{p}: {st} {b}");
+    }
     assert_eq!(serde_json::from_str::<Health>(&http(old.app, "GET", "/health", b"", None).await.2).unwrap().caps, [CAP_CREDENTIAL_CACHE]);
     assert!(old.detail().await.0.workspace.is_none());
 }
 
 /// The app port: `/health` and `/agent` are public; `/health/detail` and
 /// every other path need the session bearer (401 without, and before any
-/// commitment exists); behind it the transcript route answers (S8), and an
-/// unknown path is 404.
+/// commitment exists); behind it the transcript route answers (S8's stat;
+/// S8's `PUT` went at the S3 cut-over: 405), and an unknown path is 404.
 #[tokio::test]
 async fn app_port_bearer() {
     let vm = Vm::new().await;
     let s = &vm.s;
     let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
-    let put = format!("/transcript?rel={rel}");
-    for (m, p, body) in [("PUT", put.as_str(), &b"{}"[..]), ("GET", "/health/detail", b""), ("POST", "/seed", b"x"), ("GET", "/settings?path=/Users/agent/ws", b"")] {
+    let stat = format!("/transcript?rel={rel}");
+    for (m, p, body) in [("GET", stat.as_str(), &b""[..]), ("PUT", stat.as_str(), b"{}"), ("GET", "/health/detail", b""), ("POST", "/seed", b"x"), ("GET", "/settings?path=/Users/agent/ws", b"")] {
         let (st, head, b) = http(s.app, m, p, body, Some("application/json")).await;
         assert_eq!(st, 401, "{m} {p}: {b}");
         assert!(b.contains("\"unauthorized\"") && head.to_ascii_lowercase().contains("www-authenticate: bearer"), "{head}{b}");
         assert_eq!(http_with(s.app, m, p, &bearer_header("not-the-token"), body).await.0, 401, "{m} {p}: a wrong token");
     }
-    let (st, _, b) = http_with(s.app, "PUT", &put, &bearer_header(TOKEN), b"{}\n").await;
-    assert_eq!(st, 201, "{b}");
+    let (st, _, b) = http_with(s.app, "GET", &stat, &bearer_header(TOKEN), b"").await;
+    assert_eq!(st, 200, "{b}");
+    assert!(!serde_json::from_str::<TranscriptStat>(&b).unwrap().present, "{b}");
+    let (st, _, b) = http_with(s.app, "PUT", &stat, &bearer_header(TOKEN), b"{}\n").await;
+    assert_eq!(st, 405, "S8's upload is gone: {b}");
+    assert!(!vm.disk(&format!("{VM_HOME}/.claude/projects/{rel}")).exists(), "nothing written");
     let (st, _, b) = http_with(s.app, "PUT", "/nope", &bearer_header(TOKEN), b"{}").await;
-    assert!(st == 404 && b.contains("not implemented (S8/S9)"), "{b}");
+    assert!(st == 404 && b == NO_SUCH_ROUTE, "{b}");
     let (d, body) = s.detail().await;
     for key in ["\"hook_source\":\"log\"", "\"agent_guard\":\"off\"", "\"listeners\":", "\"refused_peers\":", "\"hook_peers\":", "\"wire\":1", "\"workspace\":{"] {
         assert!(body.contains(key), "{key} in {body}");
@@ -3009,72 +3037,59 @@ async fn a_codeout_brings_back_a_vm_commit_and_the_uncommitted_edit() {
     assert!(vm.inbox_is_empty());
 }
 
-/// The app port's transcript route (§8): absent, written (201, 0600 by the
-/// agent), present with its size and sha256, the same bytes unchanged
-/// (200), a shorter upload 409 `vm_longer` with the VM's size; a traversal
-/// rel 400; no `Content-Length` 411; past `TRANSCRIPT_MAX` 413.
+/// The app port's transcript route after the S3 cut-over: `GET` states the
+/// agent's file (absent, then present with its size and sha256; a pull
+/// writes it, `tests/shim_local/transcript_s3.rs`); S8's `PUT` (the Mac's
+/// mirror sent up) is gone, 405 whatever its body, nothing written, the
+/// VM's copy unchanged; a traversal rel or none is 400.
 #[tokio::test]
-async fn transcripts_round_trip_on_the_app_port() {
-    use std::os::unix::fs::PermissionsExt;
+async fn the_transcript_route_states_and_takes_no_upload() {
+    use sha2::Digest as _;
     let vm = Vm::new().await;
     let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
     let path = format!("/transcript?rel={rel}");
     let (st, _, b) = vm.app("GET", &path, None).await;
     assert_eq!(st, 200);
     assert!(!serde_json::from_slice::<TranscriptStat>(&b).unwrap().present);
-    let text = b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n";
-    let (st, _, b) = vm.app("PUT", &path, Some(text)).await;
-    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
-    let reply: TranscriptReply = serde_json::from_slice(&b).unwrap();
-    assert_eq!(reply.size, text.len() as u64);
+    let (st, _, _) = vm.app("PUT", &path, Some(b"{\"type\":\"user\"}\n")).await;
+    assert_eq!(st, 405, "S8's upload is gone");
     let file = vm.disk(&format!("{VM_HOME}/.claude/projects/{rel}"));
-    assert_eq!(std::fs::read(&file).unwrap(), text);
-    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!file.exists(), "nothing written");
+    let text = b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n";
+    write_file(&file, std::str::from_utf8(text).unwrap());
     let stat: TranscriptStat = serde_json::from_slice(&vm.app("GET", &path, None).await.2).unwrap();
-    assert!(stat.present && stat.size == text.len() as u64 && stat.sha256.as_deref() == Some(reply.sha256.as_str()), "{stat:?}");
-    assert_eq!(vm.app("PUT", &path, Some(text)).await.0, 200, "the same bytes: unchanged");
-    let (st, _, b) = vm.app("PUT", &path, Some(b"{}\n")).await;
-    let r = refusal_of(&b);
-    assert!(st == 409 && r.code == "vm_longer" && r.size == Some(text.len() as u64), "{st} {r:?}");
+    let sha = hex::encode(sha2::Sha256::digest(text));
+    assert!(stat.present && stat.size == text.len() as u64 && stat.sha256.as_deref() == Some(sha.as_str()), "{stat:?}");
+    assert_eq!(vm.app("PUT", &path, Some(b"{}\n")).await.0, 405);
+    assert_eq!(std::fs::read(&file).unwrap(), text, "the VM's copy unchanged");
     for bad in [format!("/transcript?rel=../{S8_ID}.jsonl"), format!("/transcript?rel={S8_SLUG}/../{S8_ID}.jsonl"), "/transcript".to_string()] {
-        let (st, _, b) = vm.app("PUT", &bad, Some(b"{}\n")).await;
+        let (st, _, b) = vm.app("GET", &bad, None).await;
         assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"), "{bad}");
     }
-    let mut s = tokio::net::TcpStream::connect(vm.s.app).await.unwrap();
-    s.write_all(format!("PUT {path} HTTP/1.1\r\nHost: x\r\n{}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n", bearer_header(TOKEN)).as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await.unwrap();
-    assert_eq!(split_response(&buf).0, 411);
-    let mut s = tokio::net::TcpStream::connect(vm.s.app).await.unwrap();
-    s.write_all(format!("PUT {path} HTTP/1.1\r\nHost: x\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{{}}", bearer_header(TOKEN), TRANSCRIPT_MAX + 1).as_bytes()).await.unwrap();
-    s.shutdown().await.unwrap();
-    let mut buf = Vec::new();
-    let _ = s.read_to_end(&mut buf).await;
-    assert_eq!(split_response(&buf).0, 413);
 }
 
-/// A transcript put the helper does not end itself (the shim's TERM at the
-/// put's budget, or at a stop: the helper has no handler, no drop runs)
-/// leaves its 0600 temp file beside the transcript; the next put into that
-/// directory removes it (puts run one at a time), so none outlives it. The
-/// real helper, as the shim starts it.
+/// A transcript write (a pull's `transcript-write`) the helper does not
+/// end itself (the shim's TERM at the pull's budget, or at a stop: the
+/// helper has no handler, no drop runs) leaves its 0600 temp file beside
+/// the transcript; the next write into that directory removes it, so none
+/// outlives it. The real helper, as the shim starts it.
 #[test]
-fn a_put_ended_by_term_leaves_no_temp_file_past_the_next_put() {
+fn a_write_ended_by_term_leaves_no_temp_file_past_the_next_write() {
     use std::os::unix::process::ExitStatusExt;
     let tmp = tempfile::tempdir().unwrap();
     let home = std::fs::canonicalize(tmp.path()).unwrap();
     let projects = home.join(".claude/projects");
     let dir = projects.join(S8_SLUG);
     let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
-    let put = |len: usize| {
-        let args = [format!("--home={}", home.display()), "transcript-put".into(), format!("--projects={}", projects.display()), format!("--rel={rel}"), format!("--len={len}"), "--budget-ms=90000".into()];
+    let write = |len: usize| {
+        let args = [format!("--home={}", home.display()), "transcript-write".into(), format!("--projects={}", projects.display()), format!("--rel={rel}"), format!("--len={len}"), "--budget-ms=90000".into()];
         Command::new(bin()).env_clear().arg("shim-io").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
     };
     let temps = || -> Vec<(String, u64)> {
         let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
         entries.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().map_or(0, |m| m.len()))).filter(|(n, _)| n.starts_with(".ai-env-")).collect()
     };
-    let mut cut = put(1000);
+    let mut cut = write(1000);
     cut.stdin.as_mut().unwrap().write_all(&[b'x'; 25]).unwrap();
     let until = Instant::now() + Duration::from_secs(30);
     while !temps().iter().any(|(_, n)| *n == 25) {
@@ -3084,15 +3099,18 @@ fn a_put_ended_by_term_leaves_no_temp_file_past_the_next_put() {
     signal(cut.id(), nix::sys::signal::Signal::SIGTERM);
     assert_eq!(cut.wait().unwrap().signal(), Some(libc::SIGTERM));
     let left = temps();
-    assert!(left.len() == 1 && left[0].1 == 25, "the ended put left its temp file: {left:?}");
+    assert!(left.len() == 1 && left[0].1 == 25, "the ended write left its temp file: {left:?}");
     let text = b"{\"type\":\"user\"}\n";
-    let mut full = put(text.len());
-    full.stdin.take().unwrap().write_all(text).unwrap();
+    let mut full = write(text.len());
+    let mut stdin = full.stdin.take().unwrap();
+    stdin.write_all(text).unwrap();
+    stdin.write_all(b"commit\n").unwrap();
+    drop(stdin);
     let out = full.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let head = json(&out.stdout);
-    assert_eq!(head["reply"]["outcome"], "written", "{head}");
-    assert!(temps().is_empty(), "no temp file outlives the next put: {:?}", temps());
+    assert_eq!(head["reply"]["size"].as_u64(), Some(text.len() as u64), "{head}");
+    assert!(temps().is_empty(), "no temp file outlives the next write: {:?}", temps());
     assert_eq!(std::fs::read(dir.join(format!("{S8_ID}.jsonl"))).unwrap(), text);
 }
 
@@ -3194,23 +3212,18 @@ async fn a_held_workspace_answers_busy() {
     assert_eq!((st, refusal_of(&b).code.as_str()), (409, "busy"), "the body read, then refused");
     drop(held);
     assert_eq!(vm.seed(&format!("path={WS}&mode=clone&branch=main"), &body).await.0, 201);
-    // The transcripts' own lock is named as what it is.
-    let one = vm.s.state.workspace.transcripts.lock().await;
-    let (st, _, b) = vm.app("PUT", &format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"), Some(b"{}\n")).await;
-    let r = refusal_of(&b);
-    assert!(st == 409 && r.code == "busy" && r.message.starts_with("another transcript upload"), "{st} {r:?}");
-    drop(one);
 }
 
 /// The workspace routes' refusals read the request body first (at most
 /// `DRAIN_MAX` before the length is trusted), so the client gets the
-/// answer, not a reset.
+/// answer, not a reset; S8's `PUT /transcript`, gone at the S3 cut-over, is
+/// a 405 that reads it too.
 #[tokio::test]
 async fn workspace_refusals_read_the_body_first() {
     let vm = Vm::new().await;
     let body = vec![b'x'; DRAIN_MAX - 1024];
     let mut lost = Vec::new();
-    for (addr, path, want) in [(vm.s.code, "/seed?path=relative&mode=clone&branch=main", 400), (vm.s.app, "/transcript?rel=nope", 400), (vm.s.code, "/seed?path=/Users/agent/ws&mode=update&branch=main&expect=0123456789abcdef0123456789abcdef01234567", 409)] {
+    for (addr, path, want) in [(vm.s.code, "/seed?path=relative&mode=clone&branch=main", 400), (vm.s.app, "/transcript?rel=nope", 405), (vm.s.code, "/seed?path=/Users/agent/ws&mode=update&branch=main&expect=0123456789abcdef0123456789abcdef01234567", 409)] {
         for i in 0..5 {
             match try_http_with(addr, "PUT", path, &bearer_header(TOKEN), &body).await {
                 Ok((st, _, b)) => assert_eq!(st, want, "{path} #{i}: {b}"),
@@ -3322,7 +3335,10 @@ async fn a_helper_refusal_still_reads_the_rest_of_the_body() {
 
 /// A helper that cannot start (no such program) is a 500 `git_failed` the
 /// client of a body larger than the socket buffers still reads: the shim
-/// reads the body first (five rounds on each route, none lost).
+/// reads the body first (five rounds, none lost). The seed is the one route
+/// that takes such a body since the S3 cut-over took S8's `PUT
+/// /transcript`: S9's transfers take JSON of at most
+/// `TRANSFER_REQUEST_MAX`, read whole before any helper starts.
 #[tokio::test]
 async fn a_helper_that_cannot_start_still_reads_the_body() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3333,7 +3349,7 @@ async fn a_helper_that_cannot_start_still_reads_the_body() {
     s.run(true).await;
     let body = vec![b'x'; 8 << 20];
     let mut lost = Vec::new();
-    for (addr, path) in [(s.code, format!("/seed?path={WS}&mode=clone&branch=main")), (s.app, format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"))] {
+    for (addr, path) in [(s.code, format!("/seed?path={WS}&mode=clone&branch=main"))] {
         for i in 0..5 {
             match try_http_with(addr, "PUT", &path, &bearer_header(TOKEN), &body).await {
                 Ok((st, _, b)) => assert!(st == 500 && b.contains("\"git_failed\""), "{path} #{i}: {st} {b}"),
@@ -3344,11 +3360,10 @@ async fn a_helper_that_cannot_start_still_reads_the_body() {
     assert!(lost.is_empty(), "answers lost to a reset: {lost:#?}");
 }
 
-/// The transcript routes check a rel themselves, before the transcripts'
-/// lock and before any helper starts (the helper's own check is a second
-/// guard, `wshelper`'s): a traversal is 400 `bad_request` even from a shim
-/// whose helper cannot start, where a rel the route passes on is 500
-/// `git_failed` (phase 4's mutation check, M53).
+/// The transcript route checks a rel itself, before any helper starts (the
+/// helper's own check is a second guard, `wshelper`'s): a traversal is 400
+/// `bad_request` even from a shim whose helper cannot start, where a rel the
+/// route passes on is 500 `git_failed` (phase 4's mutation check, M53).
 #[tokio::test]
 async fn a_traversal_rel_is_refused_before_any_helper_starts() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3358,13 +3373,11 @@ async fn a_traversal_rel_is_refused_before_any_helper_starts() {
     let s = stack(o).await;
     s.run(true).await;
     for rel in [format!("../{S8_ID}.jsonl"), format!("{S8_SLUG}/../{S8_ID}.jsonl"), format!("{S8_SLUG}/{S8_ID}/../../x/{S8_ID}.jsonl")] {
-        for (method, body) in [("GET", None), ("PUT", Some(&b"{}\n"[..]))] {
-            let (st, _, b) = request(s.app, method, &format!("/transcript?rel={rel}"), "", body).await;
-            assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"), "{method} {rel}: the route's own refusal");
-        }
+        let (st, _, b) = request(s.app, "GET", &format!("/transcript?rel={rel}"), "", None).await;
+        assert_eq!((st, refusal_of(&b).code.as_str()), (400, "bad_request"), "{rel}: the route's own refusal");
     }
     // A rel the route passes on meets the missing helper: the 400s above were the route's.
-    let (st, _, b) = request(s.app, "PUT", &format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"), "", Some(b"{}\n")).await;
+    let (st, _, b) = request(s.app, "GET", &format!("/transcript?rel={S8_SLUG}/{S8_ID}.jsonl"), "", None).await;
     assert_eq!((st, refusal_of(&b).code.as_str()), (500, "git_failed"));
 }
 
@@ -3541,4 +3554,197 @@ async fn an_edit_the_new_wip_meets_is_never_discarded_either() {
     assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "three\n", "the update's own move put back");
     assert_eq!((git(&ws, &["rev-parse", "HEAD"]), git(&ws, &["rev-parse", SEED_REF])), (seed.head.clone(), seed.head.clone()), "the refs back");
     assert_eq!(git_status(&ws), [" M d/b.txt"]);
+}
+
+// ---- S9: git smart-HTTP on the code port (G1) ------------------------------------------------
+//
+// `shim::gitcgi`'s routes through the S8 section's in-process shim: its
+// helper this build's `ai-env shim-io git-cgi`, the real `git http-backend`
+// behind it (through tests/fakes/git.sh where a test reads the log), §1.3's
+// checks in their order. `shim::gitcgi`'s own tests drive the router with a
+// scripted helper.
+
+use ai_env_cli::wire::workspace::{GIT_RECEIVE_PACK_REFUSAL, GIT_RECEIVE_PACK_ROUTE, GIT_UPLOAD_PACK_ROUTE, NO_SUCH_ROUTE};
+
+/// The advertisement's literal route and query (S9 §1.2).
+const GIT_ADVERTISE: &str = "/workspace.git/info/refs?service=git-upload-pack";
+/// A v2 `ls-refs` request: its command, the delimiter, the flush.
+const LS_REFS: &[u8] = b"0014command=ls-refs\n00010000";
+const UPLOAD_PACK_TYPE: &str = "Content-Type: application/x-git-upload-pack-request\r\n";
+
+/// A chunked body's bytes, and whether it ended with its last chunk.
+fn dechunk(raw: &[u8]) -> (Vec<u8>, bool) {
+    let (mut rest, mut body) = (raw, Vec::new());
+    loop {
+        let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else { return (body, false) };
+        let size = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap().trim(), 16).unwrap();
+        rest = &rest[nl + 2..];
+        if size == 0 {
+            return (body, rest == b"\r\n");
+        }
+        if rest.len() < size + 2 {
+            return (body, false);
+        }
+        body.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
+}
+
+/// The fake git's log under `FAKE_GIT_ENV_ALL=1`: per call, its uid, every
+/// name it started with, its arguments.
+fn git_log_all(log: &Path) -> Vec<(u32, Vec<String>, Vec<String>)> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let mut f = l.split('\t');
+            let uid = f.next().and_then(|u| u.strip_prefix("uid=")).and_then(|u| u.parse().ok()).unwrap_or_else(|| panic!("no uid in {l}"));
+            let env = f.next().and_then(|e| e.strip_prefix("env=")).unwrap_or_else(|| panic!("no env in {l}"));
+            let _fds = f.next();
+            (uid, env.split(',').filter(|n| *n != "-").map(str::to_string).collect(), f.map(str::to_string).collect())
+        })
+        .collect()
+}
+
+/// On a seeded VM, an upload-pack `POST` whose body is chunked, or that
+/// names no length at all, is 411 `bad_request` before any helper starts
+/// (no git runs); the same request with its length is answered.
+#[tokio::test]
+async fn a_chunked_upload_pack_post_is_411() {
+    let vm = Vm::with_fake_git().await;
+    vm.clone_mac().await;
+    let log = vm.root.join("git.log");
+    let before = git_log(&log).len();
+    let bearer = bearer_header(TOKEN);
+    let chunked = format!("POST {GIT_UPLOAD_PACK_ROUTE} HTTP/1.1\r\nHost: x\r\n{bearer}{UPLOAD_PACK_TYPE}Git-Protocol: version=2\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n14\r\n0014command=ls-refs\n\r\n8\r\n00010000\r\n0\r\n\r\n");
+    let lengthless = format!("POST {GIT_UPLOAD_PACK_ROUTE} HTTP/1.1\r\nHost: x\r\n{bearer}{UPLOAD_PACK_TYPE}Git-Protocol: version=2\r\nConnection: close\r\n\r\n");
+    for raw in [chunked, lengthless] {
+        let mut s = tokio::net::TcpStream::connect(vm.s.code).await.unwrap();
+        s.write_all(raw.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), s.read_to_end(&mut buf)).await.expect("an answer within 20 s").unwrap();
+        let (st, _, b) = split_response(&buf);
+        assert_eq!((st, refusal_of(b.as_bytes()).code.as_str()), (411, "bad_request"), "{raw}");
+    }
+    assert_eq!(git_log(&log).len(), before, "no helper started: no git ran");
+    let (st, head, raw) = request(vm.s.code, "POST", GIT_UPLOAD_PACK_ROUTE, &format!("{UPLOAD_PACK_TYPE}Git-Protocol: version=2\r\n"), Some(LS_REFS)).await;
+    assert_eq!(st, 200, "{head}");
+    let (body, complete) = dechunk(&raw);
+    assert!(complete && String::from_utf8_lossy(&body).contains(" refs/heads/main"), "{}", String::from_utf8_lossy(&body));
+}
+
+/// On a VM never seeded both git routes are 409 `not_seeded` (a POST's
+/// body read first) and start no helper (no git runs); receive-pack is 403
+/// whatever the state; once seeded, the advertisement answers.
+#[tokio::test]
+async fn git_routes_on_an_unseeded_vm_are_409() {
+    let vm = Vm::with_fake_git().await;
+    let log = vm.root.join("git.log");
+    let v2 = "Git-Protocol: version=2\r\n".to_string();
+    for (method, path, extra, body) in [("GET", GIT_ADVERTISE, v2.clone(), None), ("POST", GIT_UPLOAD_PACK_ROUTE, format!("{UPLOAD_PACK_TYPE}{v2}"), Some(LS_REFS))] {
+        let (st, _, b) = request(vm.s.code, method, path, &extra, body).await;
+        assert_eq!((st, refusal_of(&b).code.as_str()), (409, "not_seeded"), "{method} {path}");
+    }
+    let receive = [("POST", GIT_RECEIVE_PACK_ROUTE), ("GET", "/workspace.git/info/refs?service=git-receive-pack")];
+    for (method, path) in receive {
+        let (st, _, b) = request(vm.s.code, method, path, "", Some(b"0000")).await;
+        assert_eq!((st, b.as_slice()), (403, GIT_RECEIVE_PACK_REFUSAL.as_bytes()), "{method} {path}");
+    }
+    assert!(git_log(&log).is_empty(), "no helper started: {:?}", git_log(&log));
+    vm.clone_mac().await;
+    let (st, head, raw) = request(vm.s.code, "GET", GIT_ADVERTISE, &v2, None).await;
+    assert_eq!(st, 200, "{head}");
+    let (body, complete) = dechunk(&raw);
+    assert!(complete && body.starts_with(b"000eversion 2\n"), "{}", String::from_utf8_lossy(&body));
+    for (method, path) in receive {
+        let (st, _, b) = request(vm.s.code, method, path, "", Some(b"0000")).await;
+        assert_eq!((st, b.as_slice()), (403, GIT_RECEIVE_PACK_REFUSAL.as_bytes()), "seeded: {method} {path}");
+    }
+}
+
+/// End to end through this build's helper and the real http-backend: the
+/// advertisement (v2 and v0) and an `ls-refs` answer 200, chunked, with the
+/// CGI's four headers only; a real git client clones the VM's workspace
+/// through the code port, the bearer its one credential (a header of its
+/// own); every http-backend run started with exactly `GitRun::vm`'s names
+/// and its request's CGI names, as the helper's uid, behind the CGI's
+/// overrides, and no git saw a bearer, a credential carrier or a URL.
+#[tokio::test]
+async fn a_real_git_clones_the_workspace_through_the_code_port() {
+    let vm = Vm::with_fake_git().await;
+    let knobs = vm.root.join("vm-git.knobs");
+    let all = std::fs::read_to_string(&knobs).unwrap() + "export FAKE_GIT_ENV_ALL='1'\n";
+    std::fs::write(&knobs, all).unwrap();
+    let seed = vm.clone_mac().await;
+    let v2 = "Git-Protocol: version=2\r\n";
+    let (st, head, raw) = request(vm.s.code, "GET", GIT_ADVERTISE, v2, None).await;
+    assert_eq!(st, 200, "{head}");
+    let head = head.to_ascii_lowercase();
+    for want in ["\r\ncontent-type: application/x-git-upload-pack-advertisement\r\n", "\r\ncache-control: no-cache", "\r\nexpires: ", "\r\npragma: no-cache\r\n", "\r\ntransfer-encoding: chunked\r\n"] {
+        assert!(head.contains(want), "{want:?} in {head}");
+    }
+    assert!(!head.contains("content-length"), "{head}");
+    let (body, complete) = dechunk(&raw);
+    assert!(complete && body.starts_with(b"000eversion 2\n"), "{}", String::from_utf8_lossy(&body));
+    let (st, _, raw) = request(vm.s.code, "GET", GIT_ADVERTISE, "", None).await;
+    assert!(st == 200 && dechunk(&raw).0.starts_with(b"001e# service=git-upload-pack\n0000"), "v0: {st} {}", String::from_utf8_lossy(&raw));
+    let (st, _, raw) = request(vm.s.code, "POST", GIT_UPLOAD_PACK_ROUTE, &format!("{UPLOAD_PACK_TYPE}{v2}"), Some(LS_REFS)).await;
+    let listed = String::from_utf8_lossy(&dechunk(&raw).0).into_owned();
+    assert!(st == 200 && listed.contains(&format!("{} refs/heads/main", seed.head)), "{st} {listed}");
+    let dest = vm.root.join("cloned");
+    let out = tokio::process::Command::new(git_real())
+        .args(["-c", &format!("http.extraHeader=Authorization: Bearer {TOKEN}"), "clone", "-q", &format!("http://{}/workspace.git", vm.s.code)])
+        .arg(&dest)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &vm.root)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "the clone: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(git(&dest, &["rev-parse", "HEAD"]), seed.head, "the VM's commit came out");
+    let calls = git_log_all(&vm.root.join("git.log"));
+    let backend: Vec<&(u32, Vec<String>, Vec<String>)> = calls.iter().filter(|(_, _, args)| args.last().map(String::as_str) == Some("http-backend")).collect();
+    assert!(backend.len() >= 6, "three requests here, three or more for the clone: {}", backend.len());
+    let overrides = ["-c", "http.receivepack=false", "-c", "http.getanyfile=false", "-c", "http.uploadpack=true", "http-backend"];
+    let (uid, _) = uid_gid();
+    for (u, names, args) in &backend {
+        let mut want = vec!["GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "HOME", "LC_ALL", "PATH", "GIT_HTTP_EXPORT_ALL", "GIT_PROJECT_ROOT", "PATH_INFO", "QUERY_STRING", "REMOTE_ADDR", "REQUEST_METHOD"];
+        if names.iter().any(|n| n == "CONTENT_LENGTH") {
+            want.extend(["CONTENT_LENGTH", "CONTENT_TYPE"]);
+        }
+        want.extend(["HTTP_GIT_PROTOCOL", "HTTP_CONTENT_ENCODING"].into_iter().filter(|o| names.iter().any(|n| n == o)));
+        want.sort_unstable();
+        assert_eq!(names, &want, "{args:?}");
+        assert_eq!(*u, uid, "the helper's uid");
+        assert_eq!(args[args.len() - overrides.len()..], overrides, "{args:?}");
+    }
+    assert!(backend.iter().any(|(_, n, _)| !n.iter().any(|x| x == "HTTP_GIT_PROTOCOL")) && backend.iter().any(|(_, n, _)| n.iter().any(|x| x == "CONTENT_LENGTH")), "a v0 GET and a POST among them");
+    for (_, names, args) in &calls {
+        let carrier = |n: &String| ["HTTP_AUTHORIZATION", "REMOTE_USER", "HTTP_COOKIE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"].contains(&n.as_str()) || n.starts_with("GIT_CONFIG_KEY_") || n.starts_with("GIT_CONFIG_VALUE_") || n.starts_with("HTTP_X_AWS");
+        assert!(!names.iter().any(carrier), "{names:?}");
+        assert!(!args.iter().any(|a| a.contains(TOKEN) || a.contains("Bearer") || a.contains("://")), "{args:?}");
+    }
+}
+
+/// A gzip upload-pack request cut inside its request passes every check of
+/// the route (gzip is an allowed encoding), and the real http-backend's own
+/// die exits 0 once its head is out: the helper fails such a run, so the
+/// 200's chunked body ends without its last chunk and never looks complete.
+#[tokio::test]
+async fn a_gzip_request_cut_short_never_looks_complete() {
+    let vm = Vm::new().await;
+    vm.clone_mac().await;
+    // A final stored block that announces 110 bytes and holds the request's first 10.
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 1];
+    gz.extend(110u16.to_le_bytes().into_iter().chain((!110u16).to_le_bytes()));
+    gz.extend_from_slice(&LS_REFS[..10]);
+    let (st, head, raw) = request(vm.s.code, "POST", GIT_UPLOAD_PACK_ROUTE, &format!("{UPLOAD_PACK_TYPE}Content-Encoding: gzip\r\nGit-Protocol: version=2\r\n"), Some(&gz)).await;
+    assert_eq!(st, 200, "{head}");
+    let (body, complete) = dechunk(&raw);
+    assert!(body.is_empty() && !complete, "{}", String::from_utf8_lossy(&raw));
 }

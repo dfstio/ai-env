@@ -12,7 +12,9 @@
 //! (`settings_capture`) and who speaks on stderr (`voice`). The S8
 //! operators: the AWS identity of every operator `aws` child and the `ai-env
 //! as` runner (`identity`), the concealed clipboard (`pasteboard`) and the
-//! deployer key's hand-over through it (`handover`).
+//! deployer key's hand-over through it (`handover`). S9: git smart-HTTP's
+//! client (`gitsmart`), `box review` and its pre-push hook (`review`), the
+//! transcript store in S3 (`s3`) and a remote chat's view on this Mac (`view`).
 //! Nothing here is compiled into the VM image.
 pub mod agent;
 pub mod api;
@@ -29,6 +31,7 @@ pub mod doctor;
 pub mod egress;
 pub mod errors;
 pub mod gates;
+pub mod gitsmart;
 pub mod handover;
 pub mod hoststate;
 pub mod identity;
@@ -42,7 +45,9 @@ pub mod probes;
 pub mod pump;
 pub mod registry;
 pub mod remote;
+pub mod review;
 pub mod route;
+pub mod s3;
 pub mod scan;
 pub mod seed;
 pub mod settings_capture;
@@ -52,6 +57,7 @@ pub mod signals;
 pub mod tls;
 pub mod transport;
 pub mod unseal;
+pub mod view;
 pub mod vm;
 pub mod voice;
 pub mod workspace;

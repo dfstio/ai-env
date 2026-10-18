@@ -446,6 +446,8 @@ async fn suspend(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response 
     state.spawns.credential().close(CredentialErrCode::Suspended, "suspend");
     state.spawns.freeze();
     crate::shim::asagent::suspend_snapshot(&state).await;
+    // S9: the transcript's tail past what S3 holds, once (`s3xfer::tail_push`).
+    crate::shim::s3xfer::tail_push(&state, "suspend").await;
     state.agents.close_all_with(CLOSE_GOING_AWAY, "suspend", Some(event(EventKind::HookSuspend))).await;
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
@@ -467,6 +469,8 @@ async fn terminate(State(state): State<Arc<ShimState>>, _body: Bytes) -> Respons
     if tokio::time::timeout(SHUTDOWN_WAIT, state.spawns.terminate()).await.is_err() {
         errln!("ai-env: stopping the spawns on terminate did not finish within {} s", SHUTDOWN_WAIT.as_secs());
     }
+    // S9: the transcript's tail, now that no claude writes it (`s3xfer::tail_push`).
+    crate::shim::s3xfer::tail_push(&state, "terminate").await;
     // Logged before the answer (the platform stops the VM soon after), with
     // the id of the accepted /run; bounded like resume's clock report.
     let id = state.run.view().microvm_id;

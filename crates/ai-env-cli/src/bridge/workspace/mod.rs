@@ -3,17 +3,19 @@
 //! a workspace that is not a git repository), `prepare` (the WIP snapshot and
 //! the scan's warm-up, local only) and `ensure_workspace` (the seed, D3's
 //! fast-forward or keep, through the data plane), plus the resume's
-//! transcript upload. The module is `workspace` because `bridge::seed` is S2's
-//! transcript seeder. Built in S8 wave 1 (W4).
+//! transcript restore (S9: from S3, `transcript::restore`). The module is
+//! `workspace` because `bridge::seed` is S2's transcript seeder. Built in S8
+//! wave 1 (W4).
 //!
 //! The API the remote session (W2), `vm warm` and `box` call was frozen in
 //! S8 phase 0: the types below, [`resolve`], [`prepare`] (and the wrapper's
-//! [`prepare_cancellable`]), [`ensure_workspace`] and [`ensure_transcript`].
+//! [`prepare_cancellable`]) and [`ensure_workspace`] (S8's
+//! `ensure_transcript`, the Mac's mirror sent up, went at the S3 cut-over).
 //! D3's decision is the pure [`decide`]. The Mac's own refusal and failure
 //! codes are [`code`]'s (the VM's are `wire::workspace::refusal`'s); the
 //! pieces are [`snapshot`] (the WIP), [`pack`] (the shallow transport),
 //! [`blobscan`] (the scans), [`rows`] (`state/workspaces/`) and
-//! [`transcript`] (the resume's upload). Every function keeps to the
+//! [`transcript`] (the resume's restore from S3). Every function keeps to the
 //! session's contract: nothing on stderr but through the voice, git and the
 //! scans off the runtime's thread (`blocking`), cancel-safe (a dropped
 //! future leaves nothing that breaks the next call: the scratch
@@ -72,10 +74,15 @@ pub mod code {
     /// the message names `ai-env vm warm` and `ai-env box seed`.
     pub const TOO_SLOW_FOR_INIT: &str = "too_slow_for_init";
     /// Failed: a phase-0 stub (`<what>: not built yet (<wave>)`; S8 wave 2
-    /// built the last one, the settings capture).
+    /// built the last one, the settings capture; S9's are
+    /// `bridge::errors::not_built`'s).
     pub const NOT_BUILT: &str = "not_built";
+    /// Failed (S9): a v0 advertisement answered `box fetch --smart-http`'s
+    /// v2 request (the endpoint dropped `Git-Protocol`): the message names
+    /// `ai-env lab run protocol-v2` and plain `box fetch`.
+    pub const PROTOCOL_DOWNGRADED: &str = "protocol_downgraded";
     /// Every code above.
-    pub const ALL: [&str; 7] = [NOT_A_GIT_REPO, OUTSIDE_ROOTS, UNSUPPORTED_REPO, FINDING, WIP_TOO_LARGE, TOO_SLOW_FOR_INIT, NOT_BUILT];
+    pub const ALL: [&str; 8] = [NOT_A_GIT_REPO, OUTSIDE_ROOTS, UNSUPPORTED_REPO, FINDING, WIP_TOO_LARGE, TOO_SLOW_FOR_INIT, NOT_BUILT, PROTOCOL_DOWNGRADED];
 }
 
 // ---- the workspace -----------------------------------------------------------------------
@@ -385,10 +392,17 @@ pub(crate) fn audit(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
 
 /// Nothing goes to a VM whose caps lack `workspace_v1` (L5).
 pub(crate) fn require_capability(caps: &[String], vm: &str) -> Result<(), BridgeError> {
-    if caps.iter().any(|c| c == CAP_WORKSPACE_V1) {
+    require_cap(caps, vm, CAP_WORKSPACE_V1)
+}
+
+/// [`require_capability`] for any capability (S9: `git_http_v1`,
+/// `transcript_s3_v1`): `NoCapability` (exit 7, `make deploy`) naming `cap`
+/// when `caps` lack it, before anything is sent.
+pub(crate) fn require_cap(caps: &[String], vm: &str, cap: &'static str) -> Result<(), BridgeError> {
+    if caps.iter().any(|c| c == cap) {
         Ok(())
     } else {
-        Err(BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, message: format!("{vm} names no {CAP_WORKSPACE_V1} in its caps") })
+        Err(BridgeError::NoCapability { cap, message: format!("{vm} names no {cap} in its caps") })
     }
 }
 
@@ -649,7 +663,7 @@ const _: fn() = || {
     send::<PreparedSeed>();
 };
 
-/// What [`ensure_workspace`] and [`ensure_transcript`] work with.
+/// What [`ensure_workspace`] and `transcript::restore` work with.
 pub struct EnsureCtx<'a, A, D, T> {
     /// GetMicrovm (a 502 or 503 asks whether the VM is gone).
     pub api: &'a A,
@@ -945,7 +959,7 @@ pub async fn ensure_workspace<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: 
         }
         let query = SeedQuery { path: ctx.ws.vm_root.clone(), mode, branch: prepared.branch.clone(), detached: prepared.branch.is_none(), expect: expect.clone() };
         (ctx.progress)(SeedProgress::Sending { sent: 0, total: body.len });
-        let x = Exchange { api: ctx.api, tokens: ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, route: "PUT /seed", deadline: ctx.deadline, idempotent: false };
+        let x = Exchange { api: ctx.api, tokens: ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, cap: CAP_WORKSPACE_V1, route: "PUT /seed", deadline: ctx.deadline, idempotent: false };
         let (path, len) = (body.path.clone(), body.len);
         let answer = exchange(&x, |t| {
             let (query, path) = (&query, &path);
@@ -988,7 +1002,7 @@ pub async fn ensure_workspace<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: 
 
 /// `GET /seed` of the workspace (a 200 with the VM's state, else its error).
 async fn seed_state<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &EnsureCtx<'_, A, D, T>) -> Result<SeedState, BridgeError> {
-    let x = Exchange { api: ctx.api, tokens: ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, route: "GET /seed", deadline: ctx.deadline, idempotent: true };
+    let x = Exchange { api: ctx.api, tokens: ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, cap: CAP_WORKSPACE_V1, route: "GET /seed", deadline: ctx.deadline, idempotent: true };
     match exchange(&x, |t| async move { ctx.dp.seed_state(ctx.target, &t, &ctx.ws.vm_root).await }).await {
         Ok((reply, Verdict::Done)) => reply.body.ok_or_else(|| BridgeError::Protocol("GET /seed answered without a state".into())),
         Ok((reply, _)) => Err(BridgeError::Protocol(format!("GET /seed answered HTTP {} where a state was due", reply.status))),
@@ -1066,58 +1080,32 @@ async fn record<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, event: rows::SeedEvent) {
     }
 }
 
-/// What [`ensure_transcript`] did.
+/// What a resume's restore did (`transcript::restore`, S9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptOutcome {
-    /// The Mac's mirror went up (`files`: the transcript and its subtree).
-    Uploaded { files: u32, bytes: u64 },
-    /// The VM's copy is the Mac's.
-    AlreadyThere,
-    /// The VM's copy is longer: it wins (409 `vm_longer`).
-    VmLonger { vm: u64, mac: u64 },
-    /// The Mac holds no copy of the session.
-    NoMacCopy,
+    /// Pulled from S3 into the VM (`parts`, `bytes`).
+    Restored { parts: u32, bytes: u64 },
+    /// The row's VM holds the committed prefix (`fp_ok`, its size at least the manifest's `committed`).
+    KeptOnVm,
+    /// A chat begun on the Mac went up (inline at this reopen, or by `session stage`) and was restored.
+    Staged { bytes: u64 },
+    /// No manifest and no Mac copy.
+    NothingToRestore,
 }
 
 impl TranscriptOutcome {
-    /// The census's `transcript:` word and the `transcript_put` audit row's.
+    /// The census's `transcript:` word: `restored`, `kept`, `staged`, `none`
+    /// (S8's `uploaded`, `already_there`, `vm_longer` and `no_mac_copy` went
+    /// at the S3 cut-over).
     #[must_use]
     pub fn word(&self) -> &'static str {
         match self {
-            TranscriptOutcome::Uploaded { .. } => "uploaded",
-            TranscriptOutcome::AlreadyThere => "already_there",
-            TranscriptOutcome::VmLonger { .. } => "vm_longer",
-            TranscriptOutcome::NoMacCopy => "no_mac_copy",
+            TranscriptOutcome::Restored { .. } => "restored",
+            TranscriptOutcome::KeptOnVm => "kept",
+            TranscriptOutcome::Staged { .. } => "staged",
+            TranscriptOutcome::NothingToRestore => "none",
         }
     }
-}
-
-/// Before a `--resume <session_id>` spawn (plan §8, in the workspace's
-/// branch of P3): the Mac's mirror of the session (`seed::candidates` under
-/// `mirror_root` for `slugs`, walked by the S2 seeder's rules: symlinks
-/// skipped, at most `seed::MAX_SUBTREE_DEPTH` levels, `remote::TRANSCRIPT_MAX`
-/// in all) goes to the VM's projects directory under `vm_slug` (the one the
-/// VM's claude reads: the slug of the workspace's VM cwd, or a
-/// `CLAUDE_CODE_PROJECT_DIR_NAME` the session forwards), each file stat'ed
-/// first and put only when the VM's copy is absent, shorter, or different at
-/// equal length. A file whose rel `wire::workspace::transcript_rel_check`
-/// refuses (one directly below `<uuid>/`, or one not `.jsonl` or `.json`) is
-/// skipped, never sent; the skips are logged with their count. A 409
-/// `vm_longer` is the VM's copy winning (`dataplane::Verdict::VmLonger`),
-/// never an error. As every data-plane call: nothing goes to a VM whose
-/// `ctx.caps` lack `workspace_v1`, a 502 or 503 asks `ctx.api`'s GetMicrovm,
-/// and the call is back by `ctx.deadline`. Every file and its name go
-/// through the seed's tripwires first (`transcript::scan_copy`: the
-/// built-ins plus `[review].tripwires`). A name's finding refuses before any
-/// request; a finding in a file the VM lacks, or holds shorter or
-/// different, refuses before the first `PUT` (a file the VM holds already is
-/// never sent, so what it holds is no finding). Either is
-/// `WorkspaceRefused { finding }` (exit 9, audited `seed_refused` with step
-/// `transcript` and the VM), and none of the transcript is sent. A `PUT`
-/// sends a private copy of exactly the bytes scanned
-/// (`state/tmp/transcript-<pid>-*`, removed with the upload).
-pub async fn ensure_transcript<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &EnsureCtx<'_, A, D, T>, mirror_root: &Path, slugs: &[&str], session_id: &str, vm_slug: &str) -> Result<TranscriptOutcome, BridgeError> {
-    transcript::ensure(ctx, mirror_root, slugs, session_id, vm_slug).await
 }
 
 // ---- the VM's capability -----------------------------------------------------------------
@@ -1138,9 +1126,16 @@ pub enum Capability {
 /// `row`'s [`Capability`], from `VmRow.caps` (L5).
 #[must_use]
 pub fn vm_capability(row: &VmRow) -> Capability {
+    vm_capability_of(row, CAP_WORKSPACE_V1)
+}
+
+/// Whether `row`'s caps name `cap` (S9: `transcript_s3_v1`, `git_http_v1`),
+/// as [`vm_capability`] tells `workspace_v1`.
+#[must_use]
+pub fn vm_capability_of(row: &VmRow, cap: &str) -> Capability {
     match &row.caps {
         None => Capability::Unknown,
-        Some(caps) if caps.iter().any(|c| c == CAP_WORKSPACE_V1) => Capability::Yes,
+        Some(caps) if caps.iter().any(|c| c == cap) => Capability::Yes,
         Some(_) => Capability::No,
     }
 }
@@ -1163,6 +1158,15 @@ mod tests {
         assert_eq!(vm_capability(&with(Some(&[CAP_CREDENTIAL_CACHE]))), Capability::No, "an S7 shim (image 7.0)");
         assert_eq!(vm_capability(&with(Some(&[CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1]))), Capability::Yes);
         assert_eq!(vm_capability(&with(Some(&["workspace_v2"]))), Capability::No, "only the exact cap");
+        // S9: any cap, through the same rule.
+        use crate::wire::frame::CAP_TRANSCRIPT_S3_V1;
+        assert_eq!(vm_capability_of(&with(Some(&[CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1])), CAP_TRANSCRIPT_S3_V1), Capability::No, "an S8 image");
+        assert_eq!(vm_capability_of(&with(Some(&[CAP_WORKSPACE_V1, CAP_TRANSCRIPT_S3_V1])), CAP_TRANSCRIPT_S3_V1), Capability::Yes);
+        assert_eq!(vm_capability_of(&with(None), CAP_TRANSCRIPT_S3_V1), Capability::Unknown);
+        let caps = vec![CAP_WORKSPACE_V1.to_string()];
+        assert!(require_cap(&caps, "microvm-1", CAP_WORKSPACE_V1).is_ok());
+        let e = require_cap(&caps, "microvm-1", CAP_TRANSCRIPT_S3_V1).unwrap_err();
+        assert!(matches!(&e, BridgeError::NoCapability { cap: CAP_TRANSCRIPT_S3_V1, .. }) && e.to_string().contains("microvm-1 names no transcript_s3_v1 in its caps") && e.to_string().contains("older than S9"), "{e}");
     }
 
     /// D3's `known` and the code-out's haves: a commit, or a tag of one, is
@@ -1200,13 +1204,12 @@ mod tests {
     }
 
     /// The wire's caps are the config's and the S2 seeder's: a seed body of
-    /// at most `[seed]`'s largest, a transcript of the seeder's cap at its
-    /// depth, a session id checked the registry's way.
+    /// at most `[seed]`'s largest, a transcript at the seeder's depth, a
+    /// session id checked the registry's way.
     #[test]
     fn the_wires_limits_are_the_configs_and_the_seeders() {
         use crate::wire::workspace as w;
         assert_eq!(w::SEED_BODY_MAX, u64::from(SeedCfg::MIB_MAX) * MIB);
-        assert_eq!(w::TRANSCRIPT_MAX, crate::bridge::seed::MAX_SEED_BYTES);
         assert_eq!(w::TRANSCRIPT_DIRS_MAX, crate::bridge::seed::MAX_SUBTREE_DEPTH);
         assert_eq!(w::HAVES_MAX, 256);
         for id in ["0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "0199A1B2-C3D4-7E5F-8A9B-0C1D2E3F4A5B", "not-a-uuid", ""] {
@@ -1224,8 +1227,8 @@ mod tests {
         ];
         assert_eq!(outcomes.iter().map(EnsureOutcome::word).collect::<Vec<_>>(), ["seeded", "updated", "up_to_date", "kept"]);
         assert_eq!([KeptReason::Dirty, KeptReason::Ahead, KeptReason::Diverged].map(KeptReason::word), ["dirty", "ahead", "diverged"]);
-        let uploads = [TranscriptOutcome::Uploaded { files: 1, bytes: 1 }, TranscriptOutcome::AlreadyThere, TranscriptOutcome::VmLonger { vm: 2, mac: 1 }, TranscriptOutcome::NoMacCopy];
-        assert_eq!(uploads.iter().map(TranscriptOutcome::word).collect::<Vec<_>>(), ["uploaded", "already_there", "vm_longer", "no_mac_copy"]);
+        let restores = [TranscriptOutcome::Restored { parts: 2, bytes: 52000 }, TranscriptOutcome::KeptOnVm, TranscriptOutcome::Staged { bytes: 1 }, TranscriptOutcome::NothingToRestore];
+        assert_eq!(restores.iter().map(TranscriptOutcome::word).collect::<Vec<_>>(), ["restored", "kept", "staged", "none"], "S9's words");
         let head = Head::Branch { name: "dev".into(), sha: "s".into() };
         assert_eq!((head.sha(), head.branch()), ("s", Some("dev")));
         assert_eq!((Head::Detached { sha: "d".into() }.branch(), Head::Detached { sha: "d".into() }.sha()), (None, "d"));
@@ -1244,9 +1247,9 @@ mod tests {
         }
     }
 
-    /// A VM without `workspace_v1` is sent nothing (exit 7, naming `make
-    /// deploy`), before any lock, scan or request; a missing workspace is
-    /// exit 1 before git runs.
+    /// A VM without `workspace_v1` is sent no seed, and one without
+    /// `transcript_s3_v1` no restore (exit 7, naming `make deploy`), before
+    /// any lock, scan or request; a missing workspace is exit 1 before git runs.
     #[tokio::test]
     async fn nothing_goes_to_a_vm_without_the_capability() {
         let cfg = BridgeConfig::default();
@@ -1258,8 +1261,12 @@ mod tests {
         let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: Secret::new("t".into()), vpc: true, shell: false };
         let caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
         let ctx = EnsureCtx { api: &api, dp: &Unreached, tokens: &Unreached, paths: &paths, cfg: &cfg, target: &target, caps: &caps, ws: &ws, lim: SeedLimits::wrapper(&cfg), deadline: None, progress: &|_: SeedProgress| {} };
-        for e in [ensure_workspace(&ctx, None, SeedWant::Auto).await.unwrap_err(), ensure_transcript(&ctx, Path::new("/nonexistent"), &["-w"], "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "-w").await.unwrap_err()] {
-            assert!(matches!(e, BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, .. }), "{e:?}");
+        let lab = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Lab(([127, 0, 0, 1], 9).into()) };
+        let sync = crate::bridge::s3::TranscriptSync { target: lab, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: "/nonexistent/projects".into(), proxy: None, view_messages: 10 };
+        let restore = transcript::restore(&ctx, &sync, Some(Path::new("/nonexistent/projects")), &["-w"], "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", &crate::wire::view::build_view);
+        let wanting = [(ensure_workspace(&ctx, None, SeedWant::Auto).await.unwrap_err(), CAP_WORKSPACE_V1), (restore.await.unwrap_err(), crate::wire::frame::CAP_TRANSCRIPT_S3_V1)];
+        for (e, cap) in wanting {
+            assert!(matches!(&e, BridgeError::NoCapability { cap: c, .. } if *c == cap), "{e:?}");
             let text = e.to_string();
             assert!(text.contains("microvm-1") && text.contains("make deploy"), "{text}");
             assert_eq!(CliError::from(e).exit_code(), 7);

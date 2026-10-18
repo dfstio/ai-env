@@ -15,7 +15,10 @@
 //! [`run_script`] sends one script through the same shell and returns what
 //! the remote printed, never printing or logging it ([`run_script_over`] is
 //! its dial-free half). Its callers refuse under the file-backed fake before
-//! any token or dial ([`fake_backend_refusal`]).
+//! any token or dial ([`fake_backend_refusal`]). S9: [`run_script_frames`]
+//! types more input only once the remote's output asks for it ([`Gated`]):
+//! the egress check's presigned URLs, which its script reads with the
+//! terminal's echo off.
 use crate::bridge::api::{MicrovmApi, VmState};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::transport::{dial_shell, ShellAuth};
@@ -220,16 +223,59 @@ pub async fn run_script_over<S>(ws: WebSocketStream<S>, script: &str, budget: Du
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    run_script_frames_over(ws, script, &[], budget).await
+}
+
+/// Input a scripted session types only once the remote asks for it: `text`
+/// goes out as one binary frame once the output collected so far (the
+/// [`SCRIPT_OUTPUT_MAX`] kept) contains `after` — an empty `after` at once —
+/// and never when it does not show before the budget passes or the remote
+/// closes. The egress check's script prints `after` (its `urls` marker, built
+/// at run time, so its echo never matches) once it has turned its terminal's
+/// echo off and is about to read the presigned URLs `text` holds: a terminal
+/// echoes input as it receives it, so typed before then they would be echoed
+/// into the output — or, read by a line still running, run as commands that
+/// print them. No `Debug`: `text` may hold secrets.
+#[derive(Clone, Copy)]
+pub struct Gated<'a> {
+    pub after: &'a str,
+    pub text: &'a str,
+}
+
+/// Like [`run_script_over`], with more input typed as the remote asks for it:
+/// `script` goes out as one binary frame at once, then each of `gated`, in
+/// order, once its `after` shows in the output that came after the previous
+/// part's ([`Gated`]); what was not sent when the session ends never is. The
+/// egress check sends its script, then the presigned URLs its script reads on
+/// stdin (`check::run_check_script`): never in the script text, the shell's
+/// argv or its environment (the script hands them to curl's argv in that VM,
+/// which runs no agent), typed only while the remote terminal's echo is off, and read
+/// with `read -rs`, so they never appear in the returned output (nor in a log
+/// or an audit row: §2.2's third `expose()`). The caller registers any secret
+/// in them with the scrubber beforehand.
+pub async fn run_script_frames_over<S>(ws: WebSocketStream<S>, script: &str, gated: &[Gated<'_>], budget: Duration) -> Result<String, BridgeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let lost = |e: &dyn std::fmt::Display| BridgeError::Transport(format!("shell script: {e}"));
     let (mut sink, mut stream) = ws.split();
     sink.send(Message::Binary(script.as_bytes().to_vec().into())).await.map_err(|e| lost(&e))?;
     let deadline = tokio::time::Instant::now() + budget;
     let mut out: Vec<u8> = Vec::new();
-    let mut keep = |bytes: &[u8]| {
-        let room = SCRIPT_OUTPUT_MAX.saturating_sub(out.len());
-        out.extend_from_slice(&bytes[..bytes.len().min(room)]);
-    };
+    // The next gated part, and where in `out` its `after` may start: past the previous part's, and past what an
+    // earlier search already ruled out.
+    let (mut next, mut from) = (0usize, 0usize);
     loop {
+        while let Some(g) = gated.get(next) {
+            let needle = g.after.as_bytes();
+            let Some(at) = find(&out[from..], needle) else {
+                from = from.max(out.len().saturating_sub(needle.len().saturating_sub(1)));
+                break;
+            };
+            sink.send(Message::Binary(g.text.as_bytes().to_vec().into())).await.map_err(|e| lost(&e))?;
+            from += at + needle.len();
+            next += 1;
+        }
         tokio::select! {
             () = tokio::time::sleep_until(deadline) => {
                 let _ = sink.send(Message::Close(None)).await;
@@ -237,10 +283,10 @@ where
             }
             msg = stream.next() => match msg {
                 None | Some(Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Binary(b))) => keep(&b),
+                Some(Ok(Message::Binary(b))) => keep(&mut out, &b),
                 Some(Ok(Message::Text(t))) => {
                     if session_init_id(&t).is_none() {
-                        keep(t.as_bytes());
+                        keep(&mut out, t.as_bytes());
                     }
                 }
                 Some(Ok(_)) => {}
@@ -252,12 +298,35 @@ where
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// `bytes` appended to a scripted session's output, up to [`SCRIPT_OUTPUT_MAX`] in all (the rest dropped).
+fn keep(out: &mut Vec<u8>, bytes: &[u8]) {
+    let room = SCRIPT_OUTPUT_MAX.saturating_sub(out.len());
+    out.extend_from_slice(&bytes[..bytes.len().min(room)]);
+}
+
+/// Where `needle` first occurs in `hay` (an empty needle at 0).
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// The scripted shell on VM `id`: `GetMicrovm` (it must be RUNNING), a
 /// shell token (the VM must have `SHELL_INGRESS`: a `ValidationException`
 /// gets the `vm run --shell` hint), the dial (`transport::dial_shell`), then
 /// [`run_script_over`]. Callers refuse the file-backed fake before this
 /// ([`fake_backend_refusal`]): it would dial the fake's endpoint name.
 pub async fn run_script<A: MicrovmApi>(api: &A, id: &str, script: &str, budget: Duration, auth: ShellAuth) -> Result<String, BridgeError> {
+    run_script_frames(api, id, script, &[], budget, auth).await
+}
+
+/// [`run_script`] with more input typed as the remote asks for it
+/// ([`run_script_frames_over`], [`Gated`]): the egress check's presigned URLs,
+/// typed only once its script has turned the terminal's echo off and is about
+/// to read them. Every other step is `run_script`'s (RUNNING, the shell token,
+/// the dial).
+pub async fn run_script_frames<A: MicrovmApi>(api: &A, id: &str, script: &str, gated: &[Gated<'_>], budget: Duration, auth: ShellAuth) -> Result<String, BridgeError> {
     let vm = api.get(id).await?;
     if vm.state.is_terminal() {
         return Err(BridgeError::Terminated(format!("{id} is {}", vm.state.as_str())));
@@ -274,7 +343,7 @@ pub async fn run_script<A: MicrovmApi>(api: &A, id: &str, script: &str, budget: 
     };
     crate::wire::redact::register_secret(token.value()?.expose());
     let ws = dial_shell(&vm.endpoint, token.value()?, auth).await?;
-    run_script_over(ws, script, budget).await
+    run_script_frames_over(ws, script, gated, budget).await
 }
 
 #[cfg(test)]
@@ -302,6 +371,21 @@ mod tests {
         let e = fake_backend_refusal("egress check");
         assert!(matches!(&e, BridgeError::Policy(m) if m.starts_with("egress check: the file-backed fake cannot carry a shell")), "{e}");
         assert_eq!(crate::errors::CliError::from(e).exit_code(), 9);
+    }
+
+    /// A gated part's `after` is found anywhere in the output, also across what came in two frames; an empty one at
+    /// once.
+    #[test]
+    fn find_locates_a_gate_and_an_empty_one_at_once() {
+        assert_eq!(find(b"bash-5.2# x\r\n@@AIENV0123 urls\r\n", b"@@AIENV0123 urls"), Some(13));
+        assert_eq!(find(b"@@AIENV0123 url", b"@@AIENV0123 urls"), None);
+        assert_eq!((find(b"", b""), find(b"abc", b"")), (Some(0), Some(0)));
+        assert_eq!(find(b"", b"x"), None);
+        let mut out = Vec::new();
+        keep(&mut out, &vec![b'x'; SCRIPT_OUTPUT_MAX - 2]);
+        keep(&mut out, b"GO");
+        keep(&mut out, b"GO");
+        assert_eq!((out.len(), find(&out, b"GOGO")), (SCRIPT_OUTPUT_MAX, None), "past the cap nothing is kept, nor found");
     }
 
     #[test]

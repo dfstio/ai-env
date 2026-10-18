@@ -515,6 +515,18 @@ async fn regate<A: MicrovmApi>(api: &A, paths: &Paths, listing: &[VmSummary], ro
 /// recorded in [`GcReport::errors`] and the others still run. Without
 /// `opts.yes` nothing is written.
 pub async fn gc<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths, image_arn: &str, opts: &GcOpts) -> Result<GcReport, BridgeError> {
+    gc_syncing(api, ep, paths, image_arn, opts, |_| async { Vec::new() }).await
+}
+
+/// [`gc`] with `sync_first` run before each VM it terminates (S9: the VM's
+/// sessions' transcripts to S3, `s3::commands::sync_before_terminate`), its
+/// warnings recorded in [`GcReport::errors`]; never a refusal of the
+/// termination.
+pub async fn gc_syncing<A: MicrovmApi, E: EndpointClient, F, Fut>(api: &A, ep: &E, paths: &Paths, image_arn: &str, opts: &GcOpts, sync_first: F) -> Result<GcReport, BridgeError>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Vec<String>>,
+{
     let Survey { listing, rows, unsurveyed } = survey_local(api, paths, image_arn).await?;
     let (healths, infos) = if opts.probe_health { probe_rowless(api, ep, &listing, &rows).await } else { Default::default() };
     let now = unix_now();
@@ -534,6 +546,7 @@ pub async fn gc<A: MicrovmApi, E: EndpointClient>(api: &A, ep: &E, paths: &Paths
             GcAction::Terminate if regated.contains(&id) => continue,
             GcAction::Terminate => {
                 let by = if item.class == GcClass::OrphanMine { "gc-orphan" } else { "gc-expired" };
+                report.errors.extend(sync_first(id.clone()).await);
                 terminate_and_record(api, paths, &id, by, None).await.map(|_| report.terminated += 1)
             }
             GcAction::MarkTerminated => match row_of(&item) {
@@ -737,5 +750,45 @@ mod tests {
         let item = |class| GcItem { class, id: None, stem: None, age_s: None, detail: String::new(), action: GcAction::Report };
         assert_eq!(hint_line(&[item(GcClass::RegistryLive), item(GcClass::Foreign)]), None);
         assert_eq!(hint_line(&[item(GcClass::PendingStale), item(GcClass::RegistryExpired), item(GcClass::PendingStale)]).unwrap(), "vm gc: 1 registry:expired, 2 pending:stale (run `ai-env vm gc`)");
+    }
+
+    /// S9: `vm gc --yes` runs `sync_first` (the VM's sessions' transcripts to
+    /// S3) right before each VM it terminates, and records its warnings in
+    /// the report, never refusing the termination; a dry run syncs nothing.
+    #[tokio::test]
+    async fn gc_syncs_each_vm_it_terminates_first() {
+        use crate::bridge::api::{FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, FAKE_IMAGE_ARN};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        let api = FakeMicrovmApi::new();
+        let created = crate::wire::time::rfc3339_utc(unix_now());
+        let payload = crate::bridge::vm::run::build_payload(&crate::bridge::vm::run::new_session_token(), &owner(), &created).unwrap();
+        let spec = RunSpec {
+            image_arn: FAKE_IMAGE_ARN.into(),
+            image_version: "1.0".into(),
+            execution_role_arn: None,
+            ingress_connectors: Vec::new(),
+            egress_connectors: Vec::new(),
+            idle: IdleSpec { max_idle_s: 300, suspended_s: 3600, auto_resume: true },
+            max_duration_s: 3600,
+            run_hook_payload: payload,
+            client_token: uuid::Uuid::now_v7().to_string(),
+        };
+        let vm = api.run(&spec).await.unwrap();
+        api.advance_all();
+        // Its gate passed (the egress re-gate leaves it alone), its wall about to pass: `registry:expired`, terminated.
+        let row = VmRow { id: vm.id.clone(), status: RowStatus::Running, client_token: spec.client_token.clone(), image_arn: FAKE_IMAGE_ARN.into(), created, wall_deadline: Some(unix_now() + 30), egress_gate: Some(GATE_PASSED.into()), ..VmRow::default() };
+        registry::write_row(&paths, &row).unwrap();
+        let synced = std::sync::Mutex::new(Vec::new());
+        let sync_first = |id: String| {
+            synced.lock().unwrap().push(id.clone());
+            async move { vec![format!("{id}: the transcript of a session was not synced before it ends")] }
+        };
+        let dry = gc_syncing(&api, &api, &paths, FAKE_IMAGE_ARN, &GcOpts { yes: false, include_orphans: None, probe_health: false }, sync_first).await.unwrap();
+        assert!(synced.lock().unwrap().is_empty() && dry.terminated == 0, "a dry run syncs nothing");
+        let report = gc_syncing(&api, &api, &paths, FAKE_IMAGE_ARN, &GcOpts { yes: true, include_orphans: None, probe_health: false }, sync_first).await.unwrap();
+        assert_eq!((synced.lock().unwrap().clone(), report.terminated), (vec![vm.id.clone()], 1));
+        assert_eq!(report.errors, [format!("{}: the transcript of a session was not synced before it ends", vm.id)], "the warning recorded, the termination done");
+        assert_eq!(registry::read_row(&paths, &vm.id).unwrap().unwrap().status, RowStatus::Terminated);
     }
 }

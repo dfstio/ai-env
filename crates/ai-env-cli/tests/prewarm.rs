@@ -156,7 +156,10 @@ impl World {
 
     /// The wrapper run as Cursor runs it for `args` in `cwd`: remote mode
     /// (unless `envs` says otherwise), the fake's knobs, a dummy token and
-    /// key in the environment, the developer's knobs removed.
+    /// key in the environment, the developer's knobs removed, and the four
+    /// logs the fakes read set under the world's root, as the harness's own
+    /// spawns set them (`Prepared::spawn`): a developer's exported
+    /// `ARGV_LOG` never reaches a fake here (S9; S8's X1 open point 4).
     fn wrapper(&self, args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(self.root.join("bin").join("ai-env-claude"));
         cmd.arg(self.root.join("claude")).args(args).current_dir(cwd);
@@ -165,6 +168,10 @@ impl World {
         }
         let token = format!("{}-{}-{}", "sk", "ant", "p".repeat(40));
         cmd.env("HOME", &self.root)
+            .env("ARGV_LOG", self.root.join("argv.log"))
+            .env("FAKE_STDIN_LOG", self.root.join("stdin.log"))
+            .env("FAKE_ENV_LOG", self.root.join("env.log"))
+            .env("FAKE_SPAWN_COUNT", self.root.join("spawn.count"))
             .env("AI_ENV_BRIDGE_DIR", self.root.join("bridge"))
             .env("PATH", format!("{}:/usr/bin:/bin", self.root.join("decoy").display()))
             .env("AI_ENV_BRIDGE_MODE", "remote")
@@ -748,4 +755,26 @@ fn a_hung_child_or_a_held_pipe_fails_at_its_bound() {
     // SAFETY: kill(2) of the sleep this test's shell left behind.
     unsafe { libc::kill(orphan, libc::SIGKILL) };
     assert!(said.as_deref().is_some_and(|s| s.starts_with("sh exited (") && s.ends_with("but its stdout stayed open: a process it left holds it")), "{said:?}");
+}
+
+// ---- S9 (G7): the fakes' logs --------------------------------------------------------------------
+
+/// S9 (S8's X1 open point 4): the wrapper here runs with the four logs the
+/// fakes read set under the world's root, as the harness's own spawns set
+/// them (`Prepared::spawn`), so a developer's exported `ARGV_LOG` (or
+/// another of them) never reaches this file's fake claude: under the kill
+/// switch the fake runs in the wrapper's place and logs its argv in the
+/// world's log.
+#[test]
+fn the_wrapper_sets_the_four_logs_the_fakes_read_under_its_root() {
+    let w = World::new(true, "");
+    let cmd = w.wrapper(&AUTH_STATUS, &w.root.join("work"), &[("AI_ENV_BRIDGE_LOCAL", "1")]);
+    let envs: BTreeMap<String, Option<PathBuf>> = cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(PathBuf::from))).collect();
+    for name in ["ARGV_LOG", "FAKE_STDIN_LOG", "FAKE_ENV_LOG", "FAKE_SPAWN_COUNT"] {
+        assert!(envs.get(name).and_then(Option::as_ref).is_some_and(|p| p.starts_with(&w.root)), "{name} is not set under the world's root: {envs:?}");
+    }
+    let o = common::bounded::run_within(cmd, None, LIMIT, "the wrapper under the kill switch");
+    assert_eq!((o.status.code(), text(&o.stdout)), (Some(0), "{\"loggedIn\":true}\n".to_string()), "{}", text(&o.stderr));
+    let argv = std::fs::read_to_string(w.root.join("argv.log")).unwrap_or_default();
+    assert_eq!(argv.lines().collect::<Vec<_>>(), AUTH_STATUS, "the fake claude logged its argv in the world's log");
 }

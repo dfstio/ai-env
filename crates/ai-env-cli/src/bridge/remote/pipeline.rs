@@ -10,20 +10,35 @@
 //! child generation ([`run`]), and what that call gives back
 //! ([`PipelineEnd`], or the `SpawnFailure` the link reports).
 //!
-//! - **P0** ([`precheck`], before the pump supervises anything): bridge.toml
-//!   for the remote path (that it loads, else exit 1 with its error's first
-//!   line; `Ctx::for_wrapper`, `[wrapper].mode`, `[seed]`);
-//!   the VM's `Choice` (`AI_ENV_BRIDGE_VM` pinned and checked here, before
-//!   any Touch ID; a `--resume`'s VM preferred, from its registry row; else
-//!   the workspace's); `workspace::resolve` (D6: a workspace that is no git
-//!   repository is exit 9 at once); the run plan (vpc egress, `workspace_v1`
-//!   required); the sealed token and the runtime key; the gate's local half;
-//!   the VM's argv (`claude`, the host's arguments `argv::sanitise`d, then
-//!   `--session-mirror`) and environment (`remote::env`, L4), the spawn frame
-//!   within its cap; the workspace's `.active` lock, shared, for the
-//!   process's life (taken at once: while a closing session holds it alone,
-//!   generation 1's pending start waits for it, where the host's EOF and the
-//!   signals reach the wait); T0, the census start.
+//! - **P0** ([`precheck`], before the pump supervises anything; no AWS call,
+//!   no Touch ID), in this order, its first refusal the failure:
+//!   bridge.toml for the remote path (that it loads, else exit 1 with its
+//!   error's first line; `[wrapper]`, `[seed]`, `Ctx::for_wrapper`); the
+//!   cwd; the VM's `Choice` (`AI_ENV_BRIDGE_VM` pinned and checked here; a
+//!   `--resume`'s VM preferred, from its registry row; else the
+//!   workspace's); `workspace::resolve` (D6: a workspace that is no git
+//!   repository is exit 9 at once); the run plan (vpc egress,
+//!   `workspace_v1` and S9's `transcript_s3_v1` required); the sealed token
+//!   (`sealed_token_plan`) and the runtime key (`runtime_key_sealed`); the
+//!   gate's local half (`provisional_gate`); the keystore; the VM's argv
+//!   (`claude`, the host's arguments `argv::sanitise`d, no
+//!   `--session-mirror`: S9 keeps a remote chat's transcript in S3, never on
+//!   this Mac) and environment (`remote::env`, L4); the spawn frame within
+//!   its cap; the workspace's `.active` lock, shared, for the process's life
+//!   (one try: while a closing session holds it alone, generation 1's
+//!   pending start waits for it, where the host's EOF and the signals reach
+//!   the wait); S9's transcript sync (`s3::TranscriptSync`: `[transcript]`,
+//!   the transcripts bucket, this Mac's projects directory), for every
+//!   session that keeps a transcript or resumes one, else exit 1; last, S9's
+//!   size refusals of a `--resume` (`transcript_too_large`): a chat begun
+//!   here over what a reopen carries inline (`Failure::TranscriptTooLarge`),
+//!   and one S3 holds whose committed parts are over what a reopen pulls
+//!   inline while no VM P2 could take can hold them: no pin, and
+//!   `[vm].reuse_per_workspace` off or no row of the workspace's VMs but
+//!   terminated ones, so P2 starts a new VM (`Failure::TranscriptPullTooLarge`,
+//!   R5-AWS-1). So a chat an earlier check refuses gets that check's exit
+//!   and line (the gate's 9, say). T0 is the census start, the start row's
+//!   time.
 //! - **P1**: `credential::backend_for_session` (the runtime key, and the
 //!   token with it when `combined.env` is current; `state/unseal.lock`, the
 //!   countdown as `ai-env-claude`, the budget ending 1 s before T0 + 50 s:
@@ -31,16 +46,20 @@
 //!   `workspace::prepare` (the WIP snapshot and the scans' warm-up, local)
 //!   on a blocking thread beside it, whose handle the plan keeps
 //!   ([`SessionPlan::take_closing`]: nothing cancels a blocking thread);
-//!   first on that thread, when the session names no VM of its own (no
-//!   registry row naming one, no pin), a `--resume`'s transcript through the
-//!   seed's tripwires (`workspace::transcript::scan_mac_copy`: a finding
-//!   starts no VM). A VM the session names may hold the chat already: P3's
-//!   upload refuses a finding only in a file it would send.
+//!   first on that thread, when P3 will send a `--resume`'s copy on this Mac
+//!   up inline (a chat begun here, an S8 mirror; never one S3 holds), that
+//!   copy through the seed's tripwires
+//!   (`workspace::transcript::scan_mac_copy`: a finding starts no VM).
 //! - **P2**: `vm::run::select_vm_detailed` with the plan's `Choice` (a VM
 //!   whose caps were never read gets one `/health`: a VM without
-//!   `workspace_v1` is exit 7 naming `make deploy`).
+//!   `workspace_v1` or `transcript_s3_v1` is exit 7 naming `make deploy`).
 //! - **P3**: `try_join!` of the workspace branch (`ensure_workspace`, then
-//!   a `--resume`'s transcript) and the credential branch
+//!   a `--resume`'s transcript restored from S3 with P0's sync,
+//!   `workspace::transcript::restore`: kept when the VM holds the committed
+//!   prefix, else pulled, at most `wire::s3::INLINE_MAX` in all within the
+//!   deadline: more is `Failure::TranscriptPullTooLarge` before any pull,
+//!   naming `ai-env session stage UUID --warm`, and the reuse switch first
+//!   when it is off: [`pull_cap`]) and the credential branch
 //!   (`credential::prepare_session`: the gate, then the token); the first
 //!   error drops the other (a tripwire closes a pending token dialog). Then
 //!   a re-gate without a prompt if the pass passed half its life.
@@ -50,7 +69,9 @@
 //!   `hello.idle_s` 90), the code-out trigger beside it (a `--resume`'s id
 //!   named to it at once: the settings' start capture runs in its task, best
 //!   effort, never inside the init deadline; a fresh session's comes with
-//!   its first `system/init`, through the pump). When the exit
+//!   its first `system/init`, through the pump; after each fetch the same
+//!   task syncs the session's transcript to S3 and rewrites its view on this
+//!   Mac). When the exit
 //!   arrives, the session task starts the closing suspend as a task of its
 //!   own and ends (L2, best effort: only with `[vm].suspend_on_close`, no
 //!   other holder of the workspace's `.active` lock and no live spawn on the
@@ -66,9 +87,11 @@
 //!
 //! A resume miss's retry ([`StartWhy::ResumeRetry`]) takes no Touch ID: it
 //! respawns on generation 1's VM with generation 1's backend, after the
-//! transcript's upload and a gate without a prompt, the token from the VM's
-//! cache, within T0 + 50 s while the host's `initialize` is unanswered (its
-//! answer is the host's first), else within its own 60 s ([`deadline_of`]).
+//! transcript's restore (no deadline of its own: any size, within the
+//! generation's bound) and a gate without a prompt, the token from the
+//! VM's cache, within T0 + 50 s while the host's `initialize` is unanswered
+//! (its answer is the host's first), else within its own 60 s
+//! ([`deadline_of`]).
 //! Nothing here prints an `ai-env:` line: notes and warnings go to
 //! the wrapper's log (`bridge::voice`); the one line Cursor sees is the
 //! pump's, from the `Failure`. Audit rows: `vm_select`,
@@ -136,7 +159,7 @@ pub struct SessionPlan {
     pub paths: Paths,
     pub cfg: BridgeConfig,
     /// The VM's argv: `claude`, the host's arguments `argv::sanitise`d by
-    /// `[wrapper] strip_add_dir` and `strip_debug`, then `--session-mirror`.
+    /// `[wrapper] strip_add_dir` and `strip_debug` (no `--session-mirror`).
     pub argv: Vec<String>,
     /// The spawn's environment before the proxy variables (L4, `remote::env`):
     /// the forwarded names and the wrapper's own.
@@ -145,7 +168,7 @@ pub struct SessionPlan {
     pub ws: WorkspaceRef,
     /// The census start (T0): P1–P4 are over by [`SessionPlan::init_deadline`].
     pub t0: Instant,
-    /// `--resume`'s session id, when it is a uuid (the transcript's upload, the VM preferred).
+    /// `--resume`'s session id, when it is a uuid (the transcript's restore, the VM preferred).
     pub resume: Option<String>,
     /// The code-out trigger captures the VM's settings into the session's
     /// quarantine (T8.7): never for `--no-session-persistence` (Cursor's
@@ -155,7 +178,7 @@ pub struct SessionPlan {
     /// The lab knobs (debug builds), read at P0.
     knobs: VmKnobs,
     /// SELECT_VM's plan: vpc egress, the workspace (its canonical cwd), the
-    /// `Choice`, `workspace_v1` required.
+    /// `Choice`, `workspace_v1` and `transcript_s3_v1` required.
     run: RunPlan,
     /// The sealed setup-token: its seal id and how it reaches the CLI.
     token: CredentialPlan,
@@ -172,12 +195,18 @@ pub struct SessionPlan {
     /// the closing suspend ([`SessionPlan::take_closing`]).
     closing: RefCell<Vec<JoinHandle<()>>>,
     /// `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` (debug builds, L8): generation 1
-    /// uploads no transcript, so a resume misses and the retry uploads it.
+    /// restores no transcript, so a resume misses and the retry restores it.
     skip_transcript: bool,
     /// The Mac's projects root and the slugs a session's transcript is
     /// looked for under (the cwd's, the registry row's).
     mac_projects: Option<PathBuf>,
     slugs: Vec<String>,
+    /// What the session's transcript syncs with (S9, built at P0:
+    /// [`transcript_sync_of`]): the code-out trigger's step after each fetch
+    /// ([`session_sync`]: never for `--no-session-persistence`) and a
+    /// `--resume`'s restore. `None` only for a session that neither keeps a
+    /// transcript nor resumes one.
+    transcript_sync: Option<crate::bridge::s3::TranscriptSync>,
     /// What generation 1 leaves for a resume miss's retry.
     held: RefCell<Option<Held>>,
     /// The highest generation started (a retry's start keeps a closing
@@ -275,10 +304,11 @@ impl SessionPlan {
             pad_payload_to: None,
             choice: Choice::Workspace,
             workspace_cap: true,
+            transcript_cap: true,
         };
         SessionPlan {
             paths: Paths::from_root_and_env(root.join("bridge"), None),
-            argv: vec!["claude".into(), "--output-format".into(), "stream-json".into(), "--session-mirror".into()],
+            argv: vec!["claude".into(), "--output-format".into(), "stream-json".into()],
             env: BTreeMap::from([("DISABLE_AUTOUPDATER".to_string(), "1".to_string())]),
             ws,
             t0: Instant::now(),
@@ -294,6 +324,7 @@ impl SessionPlan {
             skip_transcript: false,
             mac_projects: None,
             slugs: Vec::new(),
+            transcript_sync: None,
             held: RefCell::new(None),
             started: Cell::new(0),
             credential: Cell::new(None),
@@ -320,7 +351,7 @@ pub struct PipelineEnd {
     /// Each step's ms, in `remote::LEG_NAMES` order.
     pub legs: Vec<(&'static str, u64)>,
     /// What the workspace step did (`workspace::EnsureOutcome::word`), and a
-    /// resume's upload (`workspace::TranscriptOutcome::word`).
+    /// resume's restore (`workspace::TranscriptOutcome::word`).
     pub seed: &'static str,
     pub transcript: Option<&'static str>,
     /// The head the VM's checkout started from (the registry's `seeded_head`).
@@ -357,11 +388,16 @@ pub struct PipelineEnd {
 type Resolver<'a> = &'a dyn Fn(&BridgeConfig, &Path, Option<&str>) -> Result<WorkspaceRef, BridgeError>;
 
 /// P0, in the wrapper before the pump supervises anything (no AWS call, no
-/// Touch ID): bridge.toml for the remote path, the run plan (vpc egress, the
-/// `Choice`: `AI_ENV_BRIDGE_VM`'s pin, the resumed session's VM preferred, or
-/// the workspace's), `workspace::resolve` (D6), the sealed token's plan, the
-/// provisional gate, the VM's argv and environment, the shared lock on the
-/// workspace's `.active` (one try, no wait). `Err` is the failure the
+/// Touch ID), in this order: bridge.toml for the remote path and its
+/// checks, the cwd, the VM's `Choice` ([`choice_of`]: `AI_ENV_BRIDGE_VM`'s
+/// pin, the resumed session's VM preferred, or the workspace's),
+/// `workspace::resolve` (D6), the run plan (vpc egress, the caps), the
+/// sealed token's plan, the runtime key, the provisional gate, the keystore,
+/// the VM's argv, its environment, the spawn frame's size, the shared lock
+/// on the workspace's `.active` (one try, no wait), S9's transcript sync,
+/// then S9's size refusals of a `--resume` ([`transcript_too_large`]). The
+/// first refusal is the failure: a chat over a size cap that an earlier
+/// check refuses gets that check's exit and line. `Err` is the failure the
 /// wrapper exits with: the pump prints its line, writes the census end row
 /// and the `session_remote_failed` audit row.
 pub fn precheck(sess: &Session) -> Result<SessionPlan, Failure> {
@@ -399,6 +435,8 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     let mut run = RunPlan::from_cfg(cfg, &flags).map_err(precheck)?;
     run.choice = choice;
     run.workspace_cap = true;
+    // S9: a VM without the transcript store is never reused (its chat lives in S3).
+    run.transcript_cap = true;
     let token = sealed_token_plan(&ctx).map_err(|e| match e {
         CliError::AuthUnavailable(why) => Failure::NoToken { why },
         other => config(&other),
@@ -416,6 +454,12 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     let mac_projects = mac_config_dir(env).map(|d| d.join("projects"));
     let registry_slug = resume.as_deref().and_then(|id| crate::bridge::registry::read(&sess.paths, id).ok().flatten()).and_then(|r| r.slug);
     let slugs: Vec<String> = std::iter::once(ws.slug.clone()).chain(registry_slug).collect();
+    // S9: what the transcript syncs with, before any Touch ID: a session that keeps or resumes one never starts without it.
+    let keeps = !sess.session.no_session_persistence || resume.is_some();
+    let transcript_sync = transcript_sync_of(&sess.paths, cfg, &ctx.knobs, &ws, mac_projects.as_deref(), keeps).map_err(|e| config(&e))?;
+    // S9: a chat begun on this Mac over what a reopen carries inline goes through `session stage` first, and one S3
+    // holds that no VM P2 could take holds, over what a reopen pulls inline, through `session stage --warm` (no Touch ID).
+    transcript_too_large(&sess.paths, mac_projects.as_deref(), &slugs, resume.as_deref(), &run)?;
     let skip_transcript = cfg!(debug_assertions) && env(TRANSCRIPT_KNOB).is_some_and(|v| v == "skip");
     tracing::info!(argc = argv.len(), env = session_env.len(), choice = run.choice.word(), resume = resume.is_some(), skip_transcript, "remote session planned");
     Ok(SessionPlan {
@@ -437,17 +481,123 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
         skip_transcript,
         mac_projects,
         slugs,
+        transcript_sync,
         held: RefCell::new(None),
         started: Cell::new(0),
         credential: Cell::new(None),
     })
 }
 
+/// P0's transcript sync (S9): what the code-out trigger syncs the session's
+/// transcript with after each turn, and what a `--resume`'s restore pulls
+/// with (`s3::TranscriptSync::for_workspace`: `[transcript].view_messages`
+/// validated, the transcripts bucket state/infra.toml records, this Mac's
+/// projects directory for the view), built once, before any Touch ID, for
+/// every session that keeps a transcript or resumes one (`keeps`; `None`
+/// for `--no-session-persistence` alone). With S8's mirror gone that sync is
+/// all that takes a remote chat's transcript off its VM and its view to
+/// Cursor's picker (the shim's tail push at `/suspend` and `/terminate`
+/// needs the URL a sync hands it), so a session that cannot build it never
+/// starts: the error names the key, `make infra-status WRITE=1` or the
+/// missing projects directory, and P0 makes it exit 1.
+fn transcript_sync_of(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, ws: &WorkspaceRef, mac_projects: Option<&Path>, keeps: bool) -> Result<Option<crate::bridge::s3::TranscriptSync>, BridgeError> {
+    if !keeps {
+        return Ok(None);
+    }
+    let Some(projects) = mac_projects else {
+        return Err(BridgeError::Config("neither CLAUDE_CONFIG_DIR nor HOME is set: the chat's view has nowhere to go".into()));
+    };
+    crate::bridge::s3::TranscriptSync::for_workspace(paths, cfg, knobs, ws, projects).map(Some)
+}
+
+/// P0's size refusals (S9), from local state only, before any Touch ID. A
+/// `--resume` whose chat S3 does not hold (no manifest) and whose copy on
+/// this Mac (the first of `seed::candidates`, never a view) is over
+/// `wire::s3::INLINE_MAX` in all is `Failure::TranscriptTooLarge`, from the
+/// files' sizes only: naming `ai-env session stage UUID --warm` for a chat
+/// begun here, `ai-env session migrate-s9` and then that `--warm` for an S8
+/// mirror (`s3::manifest::origin_of`). At or under the cap P3 sends it up
+/// inline. One S3 holds (a manifest) goes to [`pull_too_large`].
+fn transcript_too_large(paths: &Paths, mac_projects: Option<&Path>, slugs: &[String], resume: Option<&str>, run: &RunPlan) -> Result<(), Failure> {
+    use crate::bridge::s3::manifest::{origin_of, read, ORIGIN_S8_MIRROR, ORIGIN_VM};
+    let Some(id) = resume else { return Ok(()) };
+    if let Some(m) = read(paths, id).ok().flatten() {
+        return pull_too_large(paths, &m, run);
+    }
+    let Some(projects) = mac_projects else { return Ok(()) };
+    let origin = origin_of(paths, id);
+    if origin == Some(ORIGIN_VM) {
+        return Ok(());
+    }
+    let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
+    let Some(dir) = crate::bridge::seed::candidates(projects, &refs, id).into_iter().next() else { return Ok(()) };
+    if crate::bridge::view::is_view_file(&dir.join(format!("{id}.jsonl"))) {
+        return Ok(());
+    }
+    match crate::bridge::seed::transcript_files_capped(&dir, id, crate::wire::s3::INLINE_MAX) {
+        Err(BridgeError::TranscriptTooLarge { session, bytes }) => Err(Failure::TranscriptTooLarge { session, bytes, s8_mirror: origin == Some(ORIGIN_S8_MIRROR) }),
+        // Anything else is P3's to say (it reads the same files again).
+        _ => Ok(()),
+    }
+}
+
+/// P0's half of the reopen's pull cap (S9, R5-AWS-1): a chat S3 holds whose
+/// committed parts alone (`m`'s, the least P3 would pull: a tail only adds)
+/// are over `wire::s3::INLINE_MAX` is `Failure::TranscriptPullTooLarge`
+/// when no VM P2 could take can hold them: no `AI_ENV_BRIDGE_VM` pin, and
+/// P2 sure to start a new VM, which holds nothing: with
+/// `[vm].reuse_per_workspace` off ([`reuse_off`]: the line asks for the
+/// switch first, since `session stage --warm` would warm yet another VM),
+/// or when no row of the workspace's VMs is anything but terminated. P3
+/// would refuse the pull anyway, after the Touch ID and the VM's start.
+/// Any other row (running, suspended, pending, unknown) may be a VM that
+/// holds the committed prefix (`session stage --warm` restores it there),
+/// as may a pinned VM: P3 decides, from the VM's stat and the tail S3
+/// lists, which P0 cannot have without an AWS call. The rows are
+/// SELECT_VM's own list (`vm_registry::list_rows`: a row it cannot read is
+/// one P2 never takes); a registry that cannot be listed refuses nothing.
+fn pull_too_large(paths: &Paths, m: &crate::bridge::s3::manifest::Manifest, run: &RunPlan) -> Result<(), Failure> {
+    let bytes: u64 = m.parts.iter().map(|p| p.len).sum();
+    if bytes <= crate::wire::s3::INLINE_MAX || matches!(run.choice, Choice::Pin(_)) {
+        return Ok(());
+    }
+    let refused = |off: bool| Err(Failure::TranscriptPullTooLarge { session: m.session.clone(), bytes, reuse_off: off });
+    if reuse_off(run) {
+        return refused(true);
+    }
+    let Some((canonical, _)) = &run.workspace else { return Ok(()) };
+    let key = run::workspace_key(canonical);
+    let Ok(rows) = vm_registry::list_rows(paths) else { return Ok(()) };
+    if rows.iter().any(|r| r.workspace.as_deref() == Some(key.as_str()) && r.status != RowStatus::Terminated) {
+        return Ok(());
+    }
+    refused(false)
+}
+
+/// Whether P2 starts a new VM for `run` whatever the rows say:
+/// `[vm].reuse_per_workspace` off (SELECT_VM then reuses no VM, the resumed
+/// session's included) and no pin (a pinned VM is taken whatever the switch
+/// says).
+fn reuse_off(run: &RunPlan) -> bool {
+    !run.reuse && !matches!(run.choice, Choice::Pin(_))
+}
+
+/// P3's pull cap as Cursor sees it: with [`reuse_off`] the line asks for
+/// the switch first, as P0's does (a last tail can take a chat past the cap
+/// that P0 let through).
+fn pull_cap(run: &RunPlan, mut f: Failed) -> Failed {
+    if let Failure::TranscriptPullTooLarge { reuse_off: off, .. } = &mut f.failure {
+        *off = reuse_off(run);
+    }
+    f
+}
+
 /// The VM SELECT_VM takes (plan §1): `AI_ENV_BRIDGE_VM` pins one, checked
 /// here, before any Touch ID: a VM id (else 2), a row (else 8), not
 /// terminated (else 8), vpc egress and no `--shell` (else 9), an image with
-/// `workspace_v1` as last read (else 7, `make deploy`). Else a `--resume`'s
-/// VM (its registry row's `microvm_id`) is preferred; else the workspace's.
+/// `workspace_v1` and S9's `transcript_s3_v1` as last read (else 7, `make
+/// deploy`). Else a `--resume`'s VM (its registry row's `microvm_id`) is
+/// preferred; else the workspace's.
 fn choice_of(ctx: &Ctx, resume: Option<&str>, env: &dyn Fn(&str) -> Option<OsString>) -> Result<Choice, Failure> {
     if let Some(raw) = env(PIN_KNOB).filter(|v| !v.is_empty()) {
         let id = raw.to_string_lossy().into_owned();
@@ -463,7 +613,10 @@ fn choice_of(ctx: &Ctx, resume: Option<&str>, env: &dyn Fn(&str) -> Option<OsStr
             return Err(Failure::Refused { what: format!("the pinned VM {id} ({PIN_KNOB}) runs {} egress{shell}: a session needs vpc egress without --shell; unset {PIN_KNOB}, or pin another", row.egress) });
         }
         if vm_capability(&row) == Capability::No {
-            return Err(Failure::OldImage { vm: id });
+            return Err(Failure::OldImage { vm: id, cap: CAP_WORKSPACE_V1 });
+        }
+        if workspace::vm_capability_of(&row, crate::wire::frame::CAP_TRANSCRIPT_S3_V1) == Capability::No {
+            return Err(Failure::OldImage { vm: id, cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1 });
         }
         return Ok(Choice::Pin(id));
     }
@@ -489,10 +642,11 @@ fn runtime_key_sealed(ctx: &Ctx) -> Result<(), Failure> {
 
 /// The VM's argv: `claude` (the shim runs its own), then the host's
 /// arguments as `argv::sanitise` makes them (`--add-dir` and the debug flags
-/// stripped as `[wrapper]` says, one `--session-mirror` last), within
-/// `ARGV_MAX_BYTES` (else exit 9).
+/// stripped as `[wrapper]` says; no `--session-mirror`: S9 keeps a remote
+/// chat's transcript in S3, never on this Mac), within `ARGV_MAX_BYTES`
+/// (else exit 9).
 fn vm_argv(cfg: &BridgeConfig, args: &[String]) -> Result<Vec<String>, Failure> {
-    let opts = SanitiseOpts { strip_add_dir: cfg.wrapper.strip_add_dir, strip_debug: cfg.wrapper.strip_debug };
+    let opts = SanitiseOpts { strip_add_dir: cfg.wrapper.strip_add_dir, strip_debug: cfg.wrapper.strip_debug, mirror: false };
     let sanitised = argv::sanitise(args, opts).map_err(|e| Failure::Refused { what: format!("the session's arguments: {e}") })?;
     let argv: Vec<String> = std::iter::once("claude".to_string()).chain(sanitised).collect();
     let size: usize = argv.iter().map(|a| a.len() + 1).sum();
@@ -629,7 +783,7 @@ impl Progress {
 }
 
 /// One child generation's P1–P4 (`gen` 1, or 2 for the resume miss's retry,
-/// which uploads the transcript first and respawns on the same VM), on the
+/// which restores the transcript first and respawns on the same VM), on the
 /// pump's `LocalSet`: the Touch ID, SELECT_VM, the workspace beside the gate
 /// and the token, then the spawn handed to its session task with `io`. All of
 /// it within [`deadline_of`]: `plan.init_deadline()`, but a retry's start +
@@ -712,14 +866,14 @@ async fn first(plan: &Rc<SessionPlan>, gen: u32, io: SpawnIo, progress: &Progres
     };
     let (paths, cfg, ws) = (plan.paths.clone(), plan.cfg.clone(), plan.ws.clone());
     // A `--resume`'s transcript goes through the seed's tripwires here, before the seed's own scans: a finding starts no
-    // VM and closes the dialog. Not when the session names its VM (its row's, a pin): that VM may hold the chat already
-    // (what its tools printed, mirrored here), which is never sent again, so P3's upload decides (`upload_transcript`).
-    let names_vm = matches!(plan.run.choice, Choice::Prefer(_) | Choice::Pin(_));
-    let transcript = plan.resume.clone().zip(plan.mac_projects.clone()).filter(|_| !names_vm).map(|(id, root)| (id, root, plan.slugs.clone(), crate::wire::slug::slug_of(&plan.ws.vm_cwd)));
+    // VM and closes the dialog. Only a chat whose copy on this Mac P3 will send up inline is scanned, one begun on this
+    // Mac or an S8 mirror (`s3::manifest::origin_of`); one S3 holds is never read on this Mac.
+    let scan_wanted = |id: &str| p1_scans(crate::bridge::s3::manifest::origin_of(&plan.paths, id));
+    let transcript = plan.resume.clone().zip(plan.mac_projects.clone()).filter(|(id, _)| scan_wanted(id)).map(|(id, root)| (id, root, plan.slugs.clone()));
     let (((backend, token), touch_ms), prepared) = unseal_beside(plan, unseal, move |cancel| {
-        if let Some((id, root, slugs, vm_slug)) = &transcript {
+        if let Some((id, root, slugs)) = &transcript {
             let slugs: Vec<&str> = slugs.iter().map(String::as_str).collect();
-            workspace::transcript::scan_mac_copy(&paths, &cfg, &ws, root, &slugs, id, vm_slug)?;
+            workspace::transcript::scan_mac_copy(&paths, &cfg, &ws, root, &slugs, id)?;
         }
         workspace::prepare_cancellable(&paths, &cfg, &ws, &lim, cancel)
     })
@@ -730,6 +884,14 @@ async fn first(plan: &Rc<SessionPlan>, gen: u32, io: SpawnIo, progress: &Progres
         Backend::Sdk(api, ep) => onwards(plan, gen, &ctx, Arc::clone(api), Arc::clone(ep), backend, token, prepared, legs, io, progress).await,
         Backend::Fake(f) => onwards(plan, gen, &ctx, Arc::new(f.clone()), Arc::new(f.clone()), backend, token, prepared, legs, io, progress).await,
     }
+}
+
+/// Whether P1 scans a `--resume`'s copy on this Mac (S9): when P3 will send
+/// that copy up inline, a chat begun here (`origin` none) or an S8 mirror
+/// (`s8_mirror`), never one S3 holds (`vm`, `mac`), whichever VM the
+/// session names.
+fn p1_scans(origin: Option<&str>) -> bool {
+    matches!(origin, None | Some(crate::bridge::s3::manifest::ORIGIN_S8_MIRROR))
 }
 
 /// P1's two halves at once (plan §3 item 2): `unseal`, the Touch ID, and
@@ -766,7 +928,7 @@ async fn unseal_beside<T, S: Send + 'static>(plan: &SessionPlan, unseal: impl st
 
 /// Generation 1's P2–P4 on `api` and `ep`.
 #[allow(clippy::too_many_arguments)]
-async fn onwards<A: MicrovmApi + 'static, E: EndpointClient + 'static>(
+async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(
     plan: &Rc<SessionPlan>,
     gen: u32,
     ctx: &Ctx,
@@ -813,10 +975,10 @@ async fn onwards<A: MicrovmApi + 'static, E: EndpointClient + 'static>(
         let outcome = workspace::ensure_workspace(&ectx, Some(prepared), SeedWant::Auto).await.map_err(|e| failed(StartStep::Workspace, e, at))?;
         let transcript = match &plan.resume {
             Some(_) if plan.skip_transcript => {
-                tracing::info!("{TRANSCRIPT_KNOB}=skip: no transcript is uploaded before the resume");
+                tracing::info!("{TRANSCRIPT_KNOB}=skip: no transcript is restored before the resume");
                 None
             }
-            Some(id) => Some(upload_transcript(plan, &ectx, id).await.map_err(|e| failed(StartStep::Workspace, e, at))?),
+            Some(id) => Some(restore_transcript(plan, &ectx, id).await.map_err(|e| pull_cap(&plan.run, failed(StartStep::Workspace, e, at)))?),
             None => None,
         };
         progress.workspace_done.set(true);
@@ -848,11 +1010,11 @@ async fn onwards<A: MicrovmApi + 'static, E: EndpointClient + 'static>(
 }
 
 /// The retry of a resume miss (plan §2): generation 1's VM, running again
-/// if a closing suspend raced it; the transcript up; the gate again with no
+/// if a closing suspend raced it; the transcript restored; the gate again with no
 /// prompt; the token from the VM's cache (no value in hand: a VM that lost
 /// it is exit 5, never a second Touch ID); the spawn.
 #[allow(clippy::too_many_arguments)]
-async fn retry<A: MicrovmApi + 'static, E: EndpointClient + 'static>(plan: &Rc<SessionPlan>, gen: u32, api: Arc<A>, ep: Arc<E>, held: Held, session_id: &str, io: SpawnIo, progress: &Progress) -> Result<PipelineEnd, Failed> {
+async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(plan: &Rc<SessionPlan>, gen: u32, api: Arc<A>, ep: Arc<E>, held: Held, session_id: &str, io: SpawnIo, progress: &Progress) -> Result<PipelineEnd, Failed> {
     let ctx = plan.ctx();
     let mut legs = Vec::new();
     progress.at(StartStep::SelectVm);
@@ -868,7 +1030,7 @@ async fn retry<A: MicrovmApi + 'static, E: EndpointClient + 'static>(plan: &Rc<S
     let caps = held.row.caps.clone().unwrap_or_default();
     let progress_log = |p: workspace::SeedProgress| tracing::info!("seed: {p:?}");
     let ectx = EnsureCtx { api: &*api, dp: &*dp, tokens: &*tokens, paths: &plan.paths, cfg: &plan.cfg, target: &target, caps: &caps, ws: &plan.ws, lim: SeedLimits::wrapper(&plan.cfg), deadline: None, progress: &progress_log };
-    let transcript = upload_transcript(plan, &ectx, session_id).await.map_err(|e| failed(StartStep::Workspace, e, at))?;
+    let transcript = restore_transcript(plan, &ectx, session_id).await.map_err(|e| failed(StartStep::Workspace, e, at))?;
     legs.push(("workspace", ms(t)));
     progress.workspace_done.set(true);
     progress.at(StartStep::Gate);
@@ -906,9 +1068,15 @@ async fn running<A: MicrovmApi>(api: &A, id: &str, poll: Poll) -> Result<VmInfo,
     }
 }
 
-/// The VM's caps for the workspace routes: its row's, or, never read (`vm
-/// run` reads no `/health`), one `/health` that records them. Without
-/// `workspace_v1` nothing is sent: exit 7 naming `make deploy` (L5).
+/// The VM's caps for the workspace routes and S9's transcript store: its
+/// row's, or, never read (`vm run` reads no `/health`), one `/health` that
+/// records them. Without `workspace_v1` nothing is sent: exit 7 naming
+/// `make deploy` (L5). Nor without `transcript_s3_v1` (S9): SELECT_VM skips
+/// a reuse candidate and refuses a pin whose recorded caps lack it, and here
+/// it refuses a VM it started, or a row whose caps were never read (an
+/// image that predates the store but holds an egress pass: a publish that
+/// failed after the S9 deploy, a rollback). A chat there would run with no
+/// sync and no view, its transcript kept on a VM no session reuses.
 async fn workspace_caps<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: VmRow) -> Result<(VmRow, Vec<String>), BridgeError> {
     let row = if vm_capability(&row) == Capability::Unknown {
         crate::bridge::vm::health::read_health(api, ep, &ctx.paths, &row.id, ctx.backoff()).await?;
@@ -918,6 +1086,9 @@ async fn workspace_caps<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
     };
     if vm_capability(&row) != Capability::Yes {
         return Err(BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, message: format!("{} (image version {}) does not serve the workspace routes", row.id, row.image_version) });
+    }
+    if workspace::vm_capability_of(&row, crate::wire::frame::CAP_TRANSCRIPT_S3_V1) != Capability::Yes {
+        return Err(BridgeError::NoCapability { cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1, message: format!("{} (image version {}) does not serve the transcript store", row.id, row.image_version) });
     }
     let caps = row.caps.clone().unwrap_or_default();
     Ok((row, caps))
@@ -932,17 +1103,23 @@ fn target_of(row: &VmRow, vm: &VmInfo) -> Result<AgentTarget, BridgeError> {
     AgentTarget::from_row(&row)
 }
 
-/// A `--resume`'s transcript to the VM (plan §8): the Mac's mirror of the
-/// session, to the projects dir the VM's claude reads (the slug of the
-/// workspace's VM path: a session never forwards the CLI's override,
-/// `remote::env::PROJECT_DIR_NAME`). No Mac config dir: nothing to send.
-async fn upload_transcript<A: MicrovmApi, D: DataPlane, T: TokenSource>(plan: &SessionPlan, ectx: &EnsureCtx<'_, A, D, T>, session_id: &str) -> Result<workspace::TranscriptOutcome, BridgeError> {
-    let Some(mac_projects) = &plan.mac_projects else {
-        return Ok(workspace::TranscriptOutcome::NoMacCopy);
-    };
-    let vm_slug = crate::wire::slug::slug_of(&plan.ws.vm_cwd);
+/// A `--resume`'s transcript into the VM (S9, plan §5): restored from S3
+/// (`workspace::transcript::restore`: kept on the VM when it holds the
+/// committed prefix, else pulled, at most `wire::s3::INLINE_MAX` under
+/// generation 1's deadline and any size under the retry's none; a chat
+/// begun on this Mac sent up inline first) into the projects dir the VM's
+/// claude reads (the slug of the workspace's VM path: a session never
+/// forwards the CLI's override,
+/// `remote::env::PROJECT_DIR_NAME`), with P0's `TranscriptSync`
+/// ([`SessionPlan::transcript_sync`], the view under its projects
+/// directory). Every `--resume` has one: P0 refused, before any Touch ID, a
+/// session that could not build it (exit 1).
+async fn restore_transcript<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(plan: &SessionPlan, ectx: &EnsureCtx<'_, A, D, T>, session_id: &str) -> Result<workspace::TranscriptOutcome, BridgeError> {
     let slugs: Vec<&str> = plan.slugs.iter().map(String::as_str).collect();
-    workspace::ensure_transcript(ectx, mac_projects, &slugs, session_id, &vm_slug).await
+    let Some(sync) = &plan.transcript_sync else {
+        return Err(BridgeError::Config("internal: no transcript sync for a --resume (P0 builds one for every resume)".into()));
+    };
+    workspace::transcript::restore(ectx, sync, Some(sync.mac_projects.as_path()), &slugs, session_id, &crate::wire::view::build_view).await
 }
 
 /// The head the VM's checkout started from, as the workspace step found it.
@@ -970,7 +1147,7 @@ struct Spawned {
 /// trigger beside it (its watch to the session task, for the closing
 /// suspend); audited `session_remote_start`.
 #[allow(clippy::too_many_arguments)]
-async fn spawn<A: MicrovmApi + 'static, E: EndpointClient + 'static, D: DataPlane + 'static, T: TokenSource + 'static>(
+async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static, D: DataPlane + 'static, T: TokenSource + 'static>(
     plan: &Rc<SessionPlan>,
     gen: u32,
     ctx: &Ctx,
@@ -991,7 +1168,8 @@ async fn spawn<A: MicrovmApi + 'static, E: EndpointClient + 'static, D: DataPlan
     agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Spawn, e, at))?;
     let spawn_id = SpawnId::new_v7();
     let spec = spawn_spec(plan, ctx, &row, &spawn_id);
-    let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::clone(&api), dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: plan.capture_settings });
+    let transcript = session_sync(plan);
+    let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::clone(&api), dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: plan.capture_settings, transcript });
     if let Some(id) = &plan.resume {
         // A resumed session's id is known before its init: the settings' start capture runs beside the spawn (T8.7).
         trigger.set_session(id);
@@ -1002,6 +1180,102 @@ async fn spawn<A: MicrovmApi + 'static, E: EndpointClient + 'static, D: DataPlan
     audit_event(&plan.paths, event::SESSION_REMOTE_START, &[("id", id.clone()), ("spawn", spawn_id.to_string()), ("gen", gen.to_string())]);
     tracing::info!(gen, vm = %id, spawn = %spawn_id, "the remote spawn went to its session");
     Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report })
+}
+
+/// What the code-out trigger syncs the session's transcript with (S9):
+/// P0's `TranscriptSync` ([`SessionPlan::transcript_sync`]), never for
+/// `--no-session-persistence`, which keeps no transcript. A session that
+/// keeps one always has it: P0 refused it otherwise, since that sync is all
+/// that takes the chat's transcript to S3 and its view to the picker.
+fn session_sync(plan: &SessionPlan) -> Option<crate::bridge::s3::TranscriptSync> {
+    plan.transcript_sync.clone().filter(|_| plan.capture_settings)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod g4_tests {
+    use super::*;
+    use crate::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_MAC};
+
+    const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    const SLUG: &str = "-Users-mike-w";
+
+    /// A bridge root and a projects directory under a tempdir.
+    fn world() -> (tempfile::TempDir, Paths, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        let projects = tmp.path().join("projects");
+        (tmp, paths, projects)
+    }
+
+    /// `<projects>/<SLUG>/<SID>.jsonl` of `len` bytes (sparse: only its size is read), its first bytes `head`.
+    fn chat(projects: &Path, len: u64, head: &[u8]) {
+        let dir = projects.join(SLUG);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = std::fs::File::create(dir.join(format!("{SID}.jsonl"))).unwrap();
+        std::io::Write::write_all(&mut &f, head).unwrap();
+        f.set_len(len).unwrap();
+    }
+
+    /// The sample's run plan (the workspace `/w`, its choice), its paths under `paths`' parent.
+    fn run_plan(paths: &Paths) -> RunPlan {
+        SessionPlan::sample(paths.root.parent().expect("the bridge root's parent")).run
+    }
+
+    fn too_large(paths: &Paths, projects: &Path) -> Result<(), Failure> {
+        transcript_too_large(paths, Some(projects), &[SLUG.to_string()], Some(SID), &run_plan(paths))
+    }
+
+    /// P0's refusal: a chat S3 does not hold whose copy here is over
+    /// `INLINE_MAX` is `TranscriptTooLarge` before any Touch ID, naming
+    /// `session stage` for a chat begun here and `session migrate-s9` for an
+    /// S8 mirror; at or under the cap, with a manifest, a view in place or no
+    /// `--resume` it passes (P3 sends it up inline, or restores it).
+    #[test]
+    fn transcript_too_large_names_the_way_before_any_touch_id() {
+        let (_tmp, paths, projects) = world();
+        let max = crate::wire::s3::INLINE_MAX;
+        chat(&projects, max, b"{\"type\":\"user\"}\n");
+        assert!(too_large(&paths, &projects).is_ok(), "at the cap: inline");
+        chat(&projects, max + 1, b"{\"type\":\"user\"}\n");
+        match too_large(&paths, &projects) {
+            Err(Failure::TranscriptTooLarge { session, bytes, s8_mirror: false }) => assert_eq!((session.as_str(), bytes), (SID, max + 1)),
+            other => panic!("expected TranscriptTooLarge for a Mac-begun chat, got {other:?}"),
+        }
+        assert!(transcript_too_large(&paths, Some(&projects), &[SLUG.to_string()], None, &run_plan(&paths)).is_ok(), "no --resume");
+        // An S8 mirror (a remote row without transcript_home) names migrate-s9.
+        let row = crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), ..crate::bridge::registry::SessionRow::default() };
+        crate::bridge::registry::write(&paths, &row).unwrap();
+        assert!(matches!(too_large(&paths, &projects), Err(Failure::TranscriptTooLarge { s8_mirror: true, .. })));
+        // A VM-begun chat (transcript_home s3) is S3's to restore.
+        let s3_row = crate::bridge::registry::SessionRow { transcript_home: Some(manifest::HOME_S3.into()), ..row };
+        crate::bridge::registry::write(&paths, &s3_row).unwrap();
+        assert!(too_large(&paths, &projects).is_ok());
+        let _ = std::fs::remove_file(crate::bridge::registry::path_for(&paths, SID).unwrap());
+        // A manifest: S3 holds it, whatever is here.
+        let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
+        let mut m = Manifest::new(SID, &target, ORIGIN_MAC, &format!("{SLUG}/{SID}.jsonl"), "2026-10-17T10:15:30.000Z");
+        m.parts.push(ManifestPart { key: format!("v1/{SID}/mac/{}", "a".repeat(64)), version_id: "fv1".into(), from: 0, len: 1, sha256: "a".repeat(64) });
+        m.committed = 1;
+        manifest::write(&paths, &m).unwrap();
+        assert!(too_large(&paths, &projects).is_ok(), "staged already");
+        std::fs::remove_file(paths.transcript_manifest(SID)).unwrap();
+        assert!(too_large(&paths, &projects).is_err());
+        // A view in place of the file is never a Mac copy.
+        chat(&projects, max + 1, crate::wire::view::VIEW_MARK_PREFIX.as_bytes());
+        assert!(too_large(&paths, &projects).is_ok(), "a view");
+    }
+
+    /// P1's scan of a `--resume`'s copy here: exactly the copies P3 sends
+    /// up inline, a chat begun here and an S8 mirror (whichever VM the
+    /// session names), never one S3 holds (`vm`, `mac` with a manifest).
+    #[test]
+    fn p1_scans_only_what_p3_sends_up_inline() {
+        use crate::bridge::s3::manifest::{ORIGIN_S8_MIRROR, ORIGIN_VM};
+        for (origin, want) in [(None, true), (Some(ORIGIN_S8_MIRROR), true), (Some(ORIGIN_VM), false), (Some(ORIGIN_MAC), false)] {
+            assert_eq!(p1_scans(origin), want, "origin {origin:?}");
+        }
+    }
 }
 
 /// P4's spawn frame: the plan's argv; the workspace's VM path as its cwd
@@ -1245,8 +1519,9 @@ mod tests {
 
     /// A green world for P0, all local: bridge.toml (the fake image at 1.0,
     /// the connector, one root), a passing egress check for 1.0 and a no-dns
-    /// row, the setup-token and the runtime key sealed (containers), a
-    /// keystore dir, a workspace under the root.
+    /// row, the setup-token and the runtime key sealed (containers), the
+    /// documentation account's transcripts bucket recorded (S9), a keystore
+    /// dir, a workspace under the root.
     struct World {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -1268,7 +1543,7 @@ mod tests {
                 crate::bridge::api::FAKE_IMAGE_ARN
             );
             let at = crate::wire::time::rfc3339_utc(crate::wire::time::unix_now() - 60);
-            let record = VerifiedRecord { image_arn: crate::bridge::api::FAKE_IMAGE_ARN.into(), image_version: "1.0".into(), connector: normalize_connector(CONNECTOR), at: at.clone(), dns: DNS_NONE.into(), dns_rule: DNS_RULE, ..VerifiedRecord::default() };
+            let record = VerifiedRecord { image_arn: crate::bridge::api::FAKE_IMAGE_ARN.into(), image_version: "1.0".into(), connector: normalize_connector(CONNECTOR), at: at.clone(), dns: DNS_NONE.into(), dns_rule: DNS_RULE, egress_rule: crate::bridge::egress::EGRESS_RULE, ..VerifiedRecord::default() };
             EgressVerified { records: vec![record], ..EgressVerified::default() }.save(&paths).unwrap();
             std::fs::create_dir_all(paths.probes().parent().unwrap()).unwrap();
             std::fs::write(paths.probes(), format!("{}\n", serde_json::json!({ "probe": "dns-path", "verdict": DNS_NONE, "ts": at }))).unwrap();
@@ -1277,6 +1552,16 @@ mod tests {
             let blob = |n: &str| format!("age-encryption.org/v1\n-> x {n}\n--- y\n");
             std::fs::write(paths.setup_token_env(), crate::container::write(blob("token").as_bytes())).unwrap();
             std::fs::write(paths.aws_env(), crate::container::write(blob("key").as_bytes())).unwrap();
+            // What `make infra-status WRITE=1` records after the S9 deploy: the session's transcript sync resolves it.
+            let state = crate::bridge::infra::InfraState {
+                stack: "dev".into(),
+                region: "eu-central-1".into(),
+                account_id: Some("123456789012".into()),
+                transcripts_bucket: Some("ai-env-transcripts-123456789012".into()),
+                ..crate::bridge::infra::InfraState::default()
+            };
+            std::fs::create_dir_all(paths.infra_state().parent().unwrap()).unwrap();
+            std::fs::write(paths.infra_state(), toml::to_string(&state).unwrap()).unwrap();
             std::fs::create_dir_all(root.join("keys")).unwrap();
             World { _dir: dir, root, work, paths, text }
         }
@@ -1354,24 +1639,24 @@ mod tests {
     }
 
     /// The prechecks pass in a green world: the VM's argv (`claude`, the
-    /// debug flags and `--add-dir` gone, one `--session-mirror` last), the
-    /// environment (the allowlist and the wrapper's names), the workspace's
-    /// choice and caps, T0, and the `.active` lock held for the plan's life.
+    /// debug flags and `--add-dir` gone, no `--session-mirror`: S9 keeps the
+    /// transcript in S3), the environment (the allowlist and the wrapper's
+    /// names), the workspace's choice and caps (S9's `transcript_s3_v1`
+    /// too), T0, and the `.active` lock held for the plan's life.
     #[test]
     fn the_prechecks_plan_the_session_and_hold_the_workspace_active() {
         let w = World::new("");
         let sess = w.session(&ARGS);
         let plan = precheck_with(&sess, &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}: {}", f.word(), f.line()));
         assert_eq!(plan.argv.first().map(String::as_str), Some("claude"));
-        assert_eq!(plan.argv.last().map(String::as_str), Some("--session-mirror"));
-        for gone in ["--debug", "--debug-to-stderr", "--add-dir", "/Users/someone/elsewhere"] {
+        for gone in ["--debug", "--debug-to-stderr", "--add-dir", "/Users/someone/elsewhere", "--session-mirror"] {
             assert!(!plan.argv.iter().any(|a| a == gone), "{gone} is stripped: {:?}", plan.argv);
         }
         assert!(plan.argv.iter().any(|a| a == "--replay-user-messages"), "the rest is kept");
         assert_eq!(plan.env.get("LANG").map(String::as_str), Some("C.UTF-8"));
         assert_eq!((plan.env.get("DISABLE_TELEMETRY").map(String::as_str), plan.env.get("DISABLE_ERROR_REPORTING").map(String::as_str)), (Some("1"), Some("1")));
         assert!(!plan.env.contains_key("HOME") && !plan.env.contains_key("AI_ENV_DIR"), "only the allowlist: {:?}", plan.env.keys());
-        assert_eq!((plan.run.choice.clone(), plan.run.workspace_cap, plan.run.egress, plan.run.purpose), (Choice::Workspace, true, Egress::Vpc, "session"));
+        assert_eq!((plan.run.choice.clone(), plan.run.workspace_cap, plan.run.transcript_cap, plan.run.egress, plan.run.purpose), (Choice::Workspace, true, true, Egress::Vpc, "session"));
         assert_eq!(plan.run.workspace.as_ref().map(|(p, _)| p.clone()), Some(w.work.clone()));
         assert!(plan.init_deadline() > Instant::now() + Duration::from_secs(45) && plan.init_deadline() <= Instant::now() + INIT_DEADLINE);
         assert_eq!(plan.resume, None);
@@ -1409,7 +1694,8 @@ mod tests {
             assert_eq!((f.word(), f.exit_code()), ("config", 1), "{extra}");
             assert!(f.line().contains(key) && f.line().ends_with("AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally"), "{}", f.line());
         }
-        // The pin: not an id (2), no row or terminated (8), not vpc or --shell (9), an image without workspace_v1 (7).
+        // The pin: not an id (2), no row or terminated (8), not vpc or --shell (9), an image without workspace_v1 or
+        // S9's transcript_s3_v1 (7).
         let f = check(&w, &[(PIN_KNOB, "../etc/passwd")], &a_git_repo);
         assert_eq!((f.clone(), f.exit_code()), (Failure::PinInvalid, 2));
         let f = check(&w, &[(PIN_KNOB, "microvm-unknown01")], &a_git_repo);
@@ -1427,6 +1713,10 @@ mod tests {
         let f = check(&w, &[(PIN_KNOB, "microvm-image7001")], &a_git_repo);
         assert_eq!((f.word(), f.exit_code()), ("old_image", 7));
         assert!(f.line().contains("make deploy"), "{}", f.line());
+        w.vm_row("microvm-image8001", |r| r.caps = Some(vec![crate::wire::frame::CAP_CREDENTIAL_CACHE.into(), CAP_WORKSPACE_V1.into()]));
+        let f = check(&w, &[(PIN_KNOB, "microvm-image8001")], &a_git_repo);
+        assert_eq!((f.word(), f.exit_code()), ("old_image", 7));
+        assert!(f.line().contains("older than S9 (no transcript_s3_v1)") && f.line().contains("make deploy"), "{}", f.line());
         // A configured name the rules refuse: exit 9 naming it, never its value.
         let token = format!("{}-{}-{}", "sk", "ant", "z".repeat(30));
         let f = check(&World::new("[wrapper]\nenv_extra = [\"GITHUB_TOKEN\"]\n"), &[("GITHUB_TOKEN", &token)], &a_git_repo);
@@ -1452,6 +1742,45 @@ mod tests {
         assert!(f.line().starts_with("refused before any Touch ID: no credential for a vpc VM of image version 1.0"), "{}", f.line());
         let audit = crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap();
         assert!(audit.iter().all(|r| r["event"] == "credential_gate" && r["detail"]["half"] == "local"), "only the gate's local refusal: {audit:?}");
+        assert!(!w.paths.unseal_lock().exists(), "no Touch ID was asked for");
+    }
+
+    /// S9 round 5 (R2): part B's first step, S9 installed over S8's
+    /// recorded egress pass, before the deploy and the new check. S8 wrote
+    /// its record without `egress_rule`, so it loads as 0 (serde's default),
+    /// and `state/infra.toml` records the active version: P0's provisional
+    /// gate refuses every chat (exit 9, `egress_rule`, before any Touch ID).
+    /// Cursor's one line keeps 160 characters of the refusal, so the reason
+    /// comes right after the version, before the note on where the version
+    /// came from: the line says why.
+    #[test]
+    fn p0_over_s8s_recorded_pass_says_why_in_cursors_line() {
+        use crate::bridge::egress::EgressVerified;
+        let mut w = World::new("");
+        w.text = w.text.replace("image_version = \"1.0\"", "image_version = \"active\"");
+        let s9 = std::fs::read_to_string(w.paths.egress_verified()).unwrap();
+        let s8: String = s9.lines().filter(|l| !l.starts_with("egress_rule")).map(|l| format!("{l}\n")).collect();
+        assert_ne!(s8, s9, "S9 writes the field; S8 did not");
+        std::fs::write(w.paths.egress_verified(), s8).unwrap();
+        assert_eq!(EgressVerified::load(&w.paths).unwrap().records[0].egress_rule, 0, "S8's record loads as rule 0");
+        let state = crate::bridge::infra::InfraState {
+            stack: "dev".into(),
+            region: "eu-central-1".into(),
+            image_arn: crate::bridge::api::FAKE_IMAGE_ARN.into(),
+            latest_active_image_version: Some("1.0".into()),
+            account_id: Some("123456789012".into()),
+            transcripts_bucket: Some("ai-env-transcripts-123456789012".into()),
+            ..crate::bridge::infra::InfraState::default()
+        };
+        std::fs::write(w.paths.infra_state(), toml::to_string(&state).unwrap()).unwrap();
+        let f = precheck_with(&w.session(&ARGS), &w.env(&[]), &a_git_repo).map(drop).unwrap_err();
+        assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{}", f.line());
+        let line = f.line();
+        let why = "refused before any Touch ID: no credential for a vpc VM of image version 1.0: the recorded `ai-env egress check` passed by an earlier rule, before the transcript store's cases";
+        assert!(line.starts_with(why) && line.ends_with('\u{2026}'), "the reason within the cut: {line}");
+        let audit = crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap();
+        let gate: Vec<_> = audit.iter().filter(|r| r["event"] == "credential_gate").map(|r| ["condition", "half", "image_version"].map(|k| r["detail"][k].as_str().unwrap_or_default().to_string())).collect();
+        assert_eq!(gate, [["egress_rule", "local", "1.0"].map(str::to_string)], "{audit:?}");
         assert!(!w.paths.unseal_lock().exists(), "no Touch ID was asked for");
     }
 
@@ -1483,7 +1812,7 @@ mod tests {
     #[test]
     fn the_choice_is_the_pin_then_the_resumed_sessions_vm_then_the_workspaces() {
         let w = World::new("");
-        w.vm_row("microvm-pinned001", |r| r.caps = Some(vec![CAP_WORKSPACE_V1.into()]));
+        w.vm_row("microvm-pinned001", |r| r.caps = Some(vec![CAP_WORKSPACE_V1.into(), crate::wire::frame::CAP_TRANSCRIPT_S3_V1.into()]));
         let plan = precheck_with(&w.session(&ARGS), &w.env(&[(PIN_KNOB, "microvm-pinned001")]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
         assert_eq!(plan.run.choice, Choice::Pin("microvm-pinned001".into()));
         drop(plan);
@@ -1500,6 +1829,234 @@ mod tests {
         let other = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
         let args: Vec<&str> = ARGS.iter().copied().chain(["--resume", other]).collect();
         assert_eq!(precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).unwrap().run.choice, Choice::Workspace, "no row: the workspace's");
+    }
+
+    /// S9 (review CUT-2): P0 builds the session's transcript sync, before any
+    /// Touch ID, for every session that keeps a transcript or resumes one:
+    /// the code-out trigger's sync after each turn and a `--resume`'s
+    /// restore both take it. With the mirror gone a chat without it would
+    /// reach neither S3 nor Cursor's picker, so such a session never starts:
+    /// exit 1 naming `[transcript].view_messages` (which `BridgeConfig::parse`
+    /// takes as it is), `make infra-status WRITE=1` (no transcripts bucket
+    /// recorded) or the missing projects directory. `--no-session-persistence`
+    /// alone keeps no transcript and needs none; resumed, it restores one.
+    #[test]
+    fn a_session_that_cannot_sync_its_transcript_never_starts() {
+        let untouched = |w: &World| crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists();
+        let refused = |w: &World, args: &[&str], env: &[(&str, &str)]| {
+            let f = precheck_with(&w.session(args), &w.env(env), &a_git_repo).map(drop).unwrap_err();
+            assert_eq!((f.word(), f.exit_code()), ("config", 1), "{}", f.line());
+            assert!(f.line().ends_with("; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally"), "{}", f.line());
+            assert!(untouched(w), "nothing audited, no Touch ID");
+            f.line()
+        };
+        let w = World::new("[transcript]\nview_messages = 0\n");
+        let line = refused(&w, &ARGS, &[]);
+        assert!(line.starts_with("config: [transcript].view_messages = 0 is outside 1..="), "{line}");
+        // Before the S9 deploy and `make infra-status WRITE=1`: no transcripts bucket recorded.
+        let w = World::new("");
+        std::fs::remove_file(w.paths.infra_state()).unwrap();
+        let line = refused(&w, &ARGS, &[]);
+        assert!(line.contains("infra.toml not found: make infra-status WRITE=1"), "{line}");
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let quiet: Vec<&str> = ARGS.iter().copied().chain(["--no-session-persistence"]).collect();
+        let plan = precheck_with(&w.session(&quiet), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert!(plan.transcript_sync.is_none() && session_sync(&plan).is_none(), "a query that keeps no transcript needs no sync");
+        drop(plan);
+        let quiet_resume: Vec<&str> = quiet.iter().copied().chain(["--resume", sid]).collect();
+        assert!(refused(&w, &quiet_resume, &[]).contains("make infra-status WRITE=1"), "resumed, it restores a transcript");
+        // No projects directory for the view: neither CLAUDE_CONFIG_DIR nor HOME.
+        let w = World::new("");
+        assert!(refused(&w, &ARGS, &[("HOME", "")]).contains("neither CLAUDE_CONFIG_DIR nor HOME is set"));
+        // A green world: the recorded bucket and its owner, the view under ~/.claude/projects.
+        let plan = precheck_with(&w.session(&ARGS), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        let sync = session_sync(&plan).expect("the trigger's sync");
+        assert_eq!((sync.target.bucket.as_str(), sync.target.owner.as_str()), ("ai-env-transcripts-123456789012", "123456789012"));
+        assert_eq!((sync.mac_projects, sync.view_messages), (w.root.join(".claude").join("projects"), crate::wire::view::VIEW_MESSAGES_DEFAULT));
+        drop(plan);
+        let plan = precheck_with(&w.session(&quiet_resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert!(plan.transcript_sync.is_some() && session_sync(&plan).is_none(), "the restore's sync, none after each turn");
+        drop(plan);
+        assert!(untouched(&w), "nothing audited, no Touch ID");
+    }
+
+    /// S9 (review CUT-4): P0 itself refuses a `--resume` of a chat S3 does
+    /// not hold whose copy on this Mac is over what a reopen carries inline
+    /// (`wire::s3::INLINE_MAX`), before any Touch ID: exit 9 naming `ai-env
+    /// session stage` for a chat begun here (it would otherwise fail at P3,
+    /// after the Touch ID and a VM start). At the cap it passes: P3 sends it
+    /// up inline.
+    #[test]
+    fn p0_refuses_an_unstaged_chat_over_what_a_reopen_carries_inline() {
+        let w = World::new("");
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let dir = w.root.join(".claude").join("projects").join(crate::wire::slug::project_dir_name(&w.work).unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sparse: P0 reads the files' sizes only.
+        let chat = std::fs::File::create(dir.join(format!("{sid}.jsonl"))).unwrap();
+        std::io::Write::write_all(&mut &chat, b"{\"type\":\"user\"}\n").unwrap();
+        let max = crate::wire::s3::INLINE_MAX;
+        chat.set_len(max + 1).unwrap();
+        let resume = format!("--resume={sid}");
+        let args: Vec<&str> = ARGS.iter().copied().chain([resume.as_str()]).collect();
+        let f = precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).map(drop).unwrap_err();
+        assert_eq!((f.word(), f.exit_code()), ("transcript_too_large", 9), "{}", f.line());
+        assert!(f.line().contains(&format!("run ai-env session stage {sid} --warm in a terminal")), "{}", f.line());
+        assert!(crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists(), "nothing audited, no Touch ID");
+        chat.set_len(max).unwrap();
+        let plan = precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!(plan.resume.as_deref(), Some(sid), "at the cap: P3 sends it up inline");
+    }
+
+    /// A manifest of `sid` under `w`'s bridge (a chat begun on a VM): S3
+    /// holds parts of `lens` bytes (generation 1's base, then segments),
+    /// committed their sum. Only the sizes are true: nothing is in any S3.
+    fn manifest_in_s3(w: &World, sid: &str, lens: &[u64]) {
+        use crate::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_VM};
+        use crate::wire::s3::S3Key;
+        let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
+        let mut m = Manifest::new(sid, &target, ORIGIN_VM, &format!("-w/{sid}.jsonl"), "2026-10-18T10:15:30.000Z");
+        let mut from = 0;
+        for (i, len) in lens.iter().enumerate() {
+            let key = if i == 0 { S3Key::Base { session: sid.into(), gen: 1 } } else { S3Key::Segment { session: sid.into(), gen: 1, offset: from } };
+            m.parts.push(ManifestPart { key: key.render(), version_id: format!("fv{}", i + 1), from, len: *len, sha256: "a".repeat(64) });
+            from += len;
+        }
+        (m.gen, m.committed, m.fp) = (1, from, "b".repeat(64));
+        manifest::write(&w.paths, &m).unwrap();
+    }
+
+    /// S9 R5-AWS-1, P0's half of the reopen's pull cap: a `--resume` of a
+    /// chat S3 holds whose committed parts alone are over what a reopen
+    /// pulls inline (`wire::s3::INLINE_MAX`) is refused before any Touch ID
+    /// when no VM P2 could take can hold them: no pin, and no VM row of the
+    /// workspace anything but terminated (one of another workspace is never
+    /// P2's), or `[vm].reuse_per_workspace` off whatever the rows (P2 starts
+    /// a new VM: the line asks for the switch first). Exit 9, the line
+    /// naming `ai-env session stage UUID --warm`, nothing audited, no
+    /// unseal. Parts at the cap, a row of the workspace that may be alive
+    /// (running, suspended, pending, unknown: a VM `session stage --warm`
+    /// restored it into) with reuse on, or a pin leave it to P3, which reads
+    /// the VM's copy and the tail.
+    #[test]
+    fn p0_refuses_a_chat_in_s3_over_what_a_reopen_pulls_when_no_vm_can_hold_it() {
+        let w = World::new("");
+        let untouched = |w: &World| crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists();
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let max = crate::wire::s3::INLINE_MAX;
+        let resume = format!("--resume={sid}");
+        let args: Vec<&str> = ARGS.iter().copied().chain([resume.as_str()]).collect();
+        let check = |env: &[(&str, &str)]| precheck_with(&w.session(&args), &w.env(env), &a_git_repo).map(drop);
+        manifest_in_s3(&w, sid, &[70 << 20]);
+        let f = check(&[]).unwrap_err();
+        assert_eq!((f.word(), f.exit_code()), ("transcript_pull_too_large", 9), "{}", f.line());
+        assert_eq!(f.line(), format!("the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline: run ai-env session stage {sid} --warm in a terminal, then reopen the chat"));
+        assert!(untouched(&w), "nothing audited, no Touch ID");
+        // The parts in all, one past the cap; a VM of the workspace that ended, one of another workspace alive.
+        manifest_in_s3(&w, sid, &[max - 10, 11]);
+        w.vm_row("microvm-ended0001", |r| r.status = RowStatus::Terminated);
+        w.vm_row("microvm-other0001", |r| r.workspace = Some("/Users/someone/elsewhere".into()));
+        assert_eq!(check(&[]).unwrap_err().word(), "transcript_pull_too_large");
+        // At the cap: P3 pulls it.
+        manifest_in_s3(&w, sid, &[max - 10, 10]);
+        check(&[]).unwrap_or_else(|f| panic!("at the cap: {}", f.line()));
+        // A VM of the workspace that may hold it: P3 decides.
+        manifest_in_s3(&w, sid, &[max + 1]);
+        for status in [RowStatus::Running, RowStatus::Suspended, RowStatus::Pending, RowStatus::Unknown] {
+            w.vm_row("microvm-alive0001", |r| r.status = status);
+            check(&[]).unwrap_or_else(|f| panic!("{status:?}: {}", f.line()));
+        }
+        w.vm_row("microvm-alive0001", |r| r.status = RowStatus::Terminated);
+        assert_eq!(check(&[]).unwrap_err().word(), "transcript_pull_too_large", "every row of the workspace ended");
+        // A pinned VM may hold it.
+        w.vm_row("microvm-pinned001", |r| {
+            r.workspace = Some("/Users/someone/elsewhere".into());
+            r.caps = Some(vec![CAP_WORKSPACE_V1.into(), crate::wire::frame::CAP_TRANSCRIPT_S3_V1.into()]);
+        });
+        check(&[(PIN_KNOB, "microvm-pinned001")]).unwrap_or_else(|f| panic!("pinned: {}", f.line()));
+        assert!(untouched(&w), "nothing audited, no Touch ID");
+        // Reuse off: P2 starts a new VM though one of the workspace runs, so the refusal is certain.
+        let off = World::new("[vm]\nreuse_per_workspace = false\n");
+        let check = |env: &[(&str, &str)]| precheck_with(&off.session(&args), &off.env(env), &a_git_repo).map(drop);
+        manifest_in_s3(&off, sid, &[70 << 20]);
+        off.vm_row("microvm-alive0001", |r| r.caps = Some(vec![CAP_WORKSPACE_V1.into(), crate::wire::frame::CAP_TRANSCRIPT_S3_V1.into()]));
+        let f = check(&[]).unwrap_err();
+        assert_eq!((f.word(), f.exit_code()), ("transcript_pull_too_large", 9), "{}", f.line());
+        assert_eq!(f.line(), format!("the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline, and [vm] reuse_per_workspace is off: set it to true, run ai-env session stage {sid} --warm in a terminal, then reopen the chat"));
+        assert!(untouched(&off), "nothing audited, no Touch ID");
+        // A pinned VM is taken whatever the switch says: P3 decides.
+        check(&[(PIN_KNOB, "microvm-alive0001")]).unwrap_or_else(|f| panic!("pinned, reuse off: {}", f.line()));
+        manifest_in_s3(&off, sid, &[max - 10, 10]);
+        check(&[]).unwrap_or_else(|f| panic!("at the cap, reuse off: {}", f.line()));
+        assert!(untouched(&off), "nothing audited, no Touch ID");
+    }
+
+    /// P0's order where it decides an outcome (the docs fixer's reading of
+    /// [`precheck_with`]): the size refusals come last, so a reopen of a
+    /// chat over a cap that an earlier check refuses gets that check's exit
+    /// and line. Over S9's two caps (a chat S3 holds, over what a reopen
+    /// pulls inline with no VM to hold it; a chat begun here, over what it
+    /// carries inline), each in turn: the pin (`choice_of`, 2), the
+    /// workspace (`resolve`, 9), the sealed token (5), the runtime key (5),
+    /// the gate's local half (9: it wins over the size refusal), the VM's
+    /// argv over its cap (9), a refused environment name (9), the transcript
+    /// sync (1); with every one of them green, the size refusal.
+    #[test]
+    fn p0s_earlier_checks_win_over_its_size_refusals() {
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let resume = format!("--resume={sid}");
+        let args: Vec<&str> = ARGS.iter().copied().chain([resume.as_str()]).collect();
+        let token = format!("{}-{}-{}", "sk", "ant", "z".repeat(30));
+        let not_a_repo = |_: &BridgeConfig, cwd: &Path, _: Option<&str>| -> Result<WorkspaceRef, BridgeError> { Err(BridgeError::WorkspaceRefused { code: workspace::code::NOT_A_GIT_REPO, message: format!("{} is not in a git repository", cwd.display()) }) };
+        for in_s3 in [true, false] {
+            let size_word = if in_s3 { "transcript_pull_too_large" } else { "transcript_too_large" };
+            let big = |w: &World| {
+                if in_s3 {
+                    manifest_in_s3(w, sid, &[70 << 20]);
+                } else {
+                    let dir = w.root.join(".claude").join("projects").join(crate::wire::slug::project_dir_name(&w.work).unwrap());
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let chat = std::fs::File::create(dir.join(format!("{sid}.jsonl"))).unwrap();
+                    std::io::Write::write_all(&mut &chat, b"{\"type\":\"user\"}\n").unwrap();
+                    chat.set_len(70 << 20).unwrap();
+                }
+            };
+            let refusal = |extra: &str, env: &[(&str, &str)], resolve: Resolver<'_>, setup: &dyn Fn(&World)| {
+                let w = World::new(extra);
+                big(&w);
+                setup(&w);
+                let f = precheck_with(&w.session(&args), &w.env(env), resolve).map(drop).unwrap_err();
+                assert!(!w.paths.unseal_lock().exists(), "no Touch ID was asked for");
+                f
+            };
+            let none = |_: &World| {};
+            let f = refusal("", &[(PIN_KNOB, "not a vm")], &a_git_repo, &none);
+            assert_eq!((f.word(), f.exit_code()), ("pin_invalid", 2), "{size_word}");
+            let f = refusal("", &[], &not_a_repo, &none);
+            assert_eq!((f.word(), f.exit_code()), ("not_git_repo", 9), "{size_word}");
+            let f = refusal("", &[], &a_git_repo, &|w| std::fs::remove_file(w.paths.setup_token_env()).unwrap());
+            assert_eq!((f.word(), f.exit_code()), ("no_token", 5), "{size_word}");
+            let f = refusal("", &[], &a_git_repo, &|w| std::fs::remove_file(w.paths.aws_env()).unwrap());
+            assert_eq!((f.word(), f.exit_code()), ("no_runtime_key", 5), "{size_word}");
+            let f = refusal("", &[], &a_git_repo, &|w| crate::bridge::egress::EgressVerified::default().save(&w.paths).unwrap());
+            assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{size_word}: {}", f.line());
+            assert!(f.line().starts_with("refused before any Touch ID: no credential for a vpc VM of image version 1.0"), "the gate's refusal wins over the size refusal: {}", f.line());
+            let w = World::new("");
+            big(&w);
+            let huge = "x".repeat(ARGV_MAX_BYTES);
+            let long: Vec<&str> = args.iter().copied().chain(["--append-system-prompt", huge.as_str()]).collect();
+            let f = precheck_with(&w.session(&long), &w.env(&[]), &a_git_repo).map(drop).unwrap_err();
+            assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{size_word}");
+            assert!(f.line().contains("the session's arguments are"), "the VM's argv over its cap: {}", f.line());
+            let f = refusal("[wrapper]\nenv_extra = [\"GITHUB_TOKEN\"]\n", &[("GITHUB_TOKEN", &token)], &a_git_repo, &none);
+            assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{size_word}");
+            assert!(f.line().contains("GITHUB_TOKEN"), "{}", f.line());
+            let f = refusal("", &[], &a_git_repo, &|w| std::fs::remove_file(w.paths.infra_state()).unwrap());
+            assert_eq!((f.word(), f.exit_code()), ("config", 1), "{size_word}: {}", f.line());
+            assert!(f.line().contains("make infra-status WRITE=1"), "{}", f.line());
+            let f = refusal("", &[], &a_git_repo, &none);
+            assert_eq!((f.word(), f.exit_code()), (size_word, 9), "{}", f.line());
+        }
     }
 
     /// L2: the closing suspend fires only with `suspend_on_close`, alone on
@@ -1549,7 +2106,7 @@ mod tests {
     fn trigger_of(plan: &SessionPlan) -> CodeoutTrigger {
         let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: crate::wire::redact::Secret::new("t".into()), vpc: true, shell: false };
         let (api, dp, tokens) = (Arc::new(crate::bridge::api::FakeMicrovmApi::new()), Arc::new(crate::bridge::dataplane::Unreached), Arc::new(crate::bridge::dataplane::Unreached));
-        CodeoutTrigger::spawn(CodeoutCtx { api, dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: false })
+        CodeoutTrigger::spawn(CodeoutCtx { api, dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: false, transcript: None })
     }
 
     /// The watch of a trigger closed with nothing run: done.
@@ -2096,7 +2653,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = SessionPlan::sample(dir.path());
         assert_eq!(plan.init_deadline() - plan.t0, Duration::from_secs(50));
-        assert_eq!(format!("{plan:?}"), "SessionPlan(argc=4, env=1, vm_cwd=/w, resume=false)");
+        assert_eq!(format!("{plan:?}"), "SessionPlan(argc=3, env=1, vm_cwd=/w, resume=false)");
         assert_eq!(plan.credential.get(), None);
     }
 }

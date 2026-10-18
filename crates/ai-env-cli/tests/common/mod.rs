@@ -33,6 +33,14 @@ pub mod green_world;
 /// The remote link's rig (S8).
 #[cfg(feature = "shim")]
 pub mod remote;
+/// S9's fake curl: its master, its install and its log (`common::FAKE_CURL`
+/// and the rest; a binary that uses none of them leaves the glob unused).
+pub mod curl;
+#[allow(unused_imports)]
+pub use curl::*;
+/// S9's loopback S3.
+#[cfg(feature = "bridge")]
+pub mod fake_s3;
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -76,13 +84,15 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// fake claude, the fake age or the fake git (S7's `local-scratch` login: the
 /// keystore, the token's descriptor and the unseal; S8's VM pin, its
 /// transcript knob and the knobs of the remote session's fakes; the S8
-/// operators' `ai-env as` marker and the pasteboard's osascript knob);
+/// operators' `ai-env as` marker and the pasteboard's osascript knob; S9's
+/// fake S3 address, the code token's minutes, the fake claude's api-request
+/// lines and the fake git's whole environment);
 /// removed from every harness run before the test's own `envs`. Every
 /// `AI_ENV_BRIDGE_*` knob the code reads is here but the bridge root, and
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 80] = [
+pub const REMOVED_ENV: [&str; 84] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -105,6 +115,9 @@ pub const REMOVED_ENV: [&str; 80] = [
     // S8 operators: the marker `ai-env as` leaves, and the pasteboard's osascript (debug builds).
     "AI_ENV_BRIDGE_AS",
     "AI_ENV_BRIDGE_LAB_OSASCRIPT",
+    // S9: the fake S3's address and the code token's minutes (debug builds).
+    "AI_ENV_BRIDGE_LAB_S3_ADDR",
+    "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
     "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -154,10 +167,13 @@ pub const REMOVED_ENV: [&str; 80] = [
     "FAKE_ENV_NAMES_LOG",
     "FAKE_VERSION",
     "FAKE_ENV_DUMP",
+    // S9: the fake claude's api-request lines, and the fake git's whole environment.
+    "FAKE_API_REQUEST",
     "GIT_ARGV_LOG",
     "GIT_REAL",
     "FAKE_GIT_FAIL",
     "FAKE_GIT_KEEP_PACK",
+    "FAKE_GIT_ENV_ALL",
     "FAKE_AGE_FAIL",
     "FAKE_AGE_DELAY_MS",
     "FAKE_AGE_HANG",
@@ -450,7 +466,11 @@ pub fn install_fake_git(dest: &Path, log: &Path, knobs: &[(&str, &str)]) {
 /// One call the fake git logged ([`git_calls`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitCall {
-    /// The `GIT_*` names set when it started (names only, never a value), sorted.
+    /// Who ran it (`id -u`): with `FAKE_GIT_ENV_ALL=1` only (S9).
+    pub uid: Option<u32>,
+    /// The `GIT_*` names set when it started (names only, never a value),
+    /// sorted; with `FAKE_GIT_ENV_ALL=1` every name but `PWD`, `OLDPWD`,
+    /// `SHLVL` and `_`.
     pub env: Vec<String>,
     /// The descriptors from 3 to 254 open when it started.
     pub fds: Vec<u32>,
@@ -512,12 +532,21 @@ pub fn git_calls(log: &Path) -> Vec<GitCall> {
         .unwrap_or_default()
         .lines()
         .map(|line| {
-            let mut fields = line.split('\t');
+            let mut fields = line.split('\t').peekable();
+            let uid = fields.next_if(|f| f.starts_with("uid=")).map(|f| f["uid=".len()..].parse().unwrap_or_else(|_| panic!("fake git log: a uid in {line:?}")));
             let env = list(fields.next().unwrap_or_default(), "env=", str::to_string);
             let fds = list(fields.next().unwrap_or_default(), "fds=", |n| n.parse().unwrap_or_else(|_| panic!("fake git log: fd {n:?}")));
-            GitCall { env, fds, args: fields.map(unescape).collect() }
+            GitCall { uid, env, fds, args: fields.map(unescape).collect() }
         })
         .collect()
+}
+
+/// `bytes` (a transcript) as its mirror frames carry it (S9): the lines,
+/// with their newlines, that `wire::mirror::is_unmirrored` does not take (a
+/// torn last line is kept).
+#[must_use]
+pub fn mirrored(bytes: &[u8]) -> Vec<u8> {
+    bytes.split_inclusive(|b| *b == b'\n').filter(|line| !ai_env_cli::wire::mirror::is_unmirrored(line)).flatten().copied().collect()
 }
 
 impl Prepared {

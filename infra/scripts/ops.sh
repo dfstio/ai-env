@@ -862,7 +862,8 @@ for (const d of j.diagnostics || []) if (d.severity === "error") process.stderr.
 }
 
 # infra_state_lag <outputs> <state/infra.toml>: the keys of the file whose value is not the stack output's (the egress
-# ids and hashes the ai-env egress commands read from it), space-separated; "-" when the file does not exist.
+# ids and hashes the ai-env egress commands read from it, S9's transcript store included: a deploy that only changes
+# the S3 endpoint's policy is lag, never drift), space-separated; "-" when the file does not exist.
 infra_state_lag() {
     printf '%s' "$1" | node -e '
 const fs = require("fs");
@@ -873,7 +874,9 @@ const rec = {};
 for (const l of text.split("\n")) { const m = /^([a-z0-9_]+) = "(.*)"$/.exec(l); if (m) rec[m[1]] = m[2]; }
 const keys = { proxyInstanceId: "proxy_instance_id", proxyPrivateIp: "proxy_private_ip", egressVpcId: "egress_vpc_id", vmSubnetId: "vm_subnet_id",
     vmEgressSecurityGroupId: "vm_egress_security_group_id", proxySecurityGroupId: "proxy_security_group_id", egressLogGroup: "egress_log_group",
-    dnsMode: "dns_mode", parameterPrefix: "parameter_prefix", squidConfSha256: "squid_conf_sha256", allowSha256: "allow_sha256" };
+    dnsMode: "dns_mode", parameterPrefix: "parameter_prefix", squidConfSha256: "squid_conf_sha256", allowSha256: "allow_sha256",
+    transcriptsBucket: "transcripts_bucket", s3EndpointId: "s3_endpoint_id", s3EndpointPolicySha256: "s3_endpoint_policy_sha256",
+    transcriptsBucketPolicySha256: "transcripts_bucket_policy_sha256", proxyRouteTableId: "proxy_route_table_id" };
 console.log(Object.keys(keys).filter((k) => String(out[k] ?? "") !== (rec[keys[k]] ?? "")).map((k) => keys[k]).join(" "));
 ' "$2"
 }
@@ -1158,10 +1161,11 @@ make_switch() (
 #      a run is done), `make proxy-start` too, and the end notes of a deploy, the proxy's with the state that run found;
 #   3. else, after the preconditions (a terminal for Pulumi's confirmation and the Touch ID; the stack's passphrase in
 #      the environment, or its sealed file PULUMI_SEALED to unseal (A39), as make deploy's preview runs
-#      --non-interactive; Docker answering; and, outside a runner that covers the deployer, a stack that exports its
-#      deployer: before the bootstrap there is no deployer key to ask for, and that deploy is the account root's, so
-#      the refusal names the pin and make test-docker when they are due, then make deploy as the root), so that nothing
-#      changes when they fail: `make claude-pin
+#      --non-interactive; Docker answering; infra/node_modules installed (make deploy's check-policies and plan check
+#      run its tsc: S9, asked before make test-docker spends its minutes); and, outside a runner that covers the
+#      deployer, a stack that exports its deployer: before the bootstrap there is no deployer key to ask for, and that
+#      deploy is the account root's, so the refusal names the pin and make test-docker when they are due, then make
+#      deploy as the root), so that nothing changes when they fail: `make claude-pin
 #      CLAUDE_VERSION=B` (when L != B), `make test-docker` (skipped when it already passed for the current zip of B:
 #      make deploy rebuilds the zip, and its P12 refuses one that differs), then the runner and the AWS identity of the
 #      run (below), the marker, `make deploy EXPECT_BUILD_FAILURE=` (Pulumi asks before it changes anything; the T3.4
@@ -1244,6 +1248,9 @@ cmd_claude_update() {
             unseal=1
         fi
         docker info >/dev/null 2>&1 || { echo "claude-update: Docker does not answer (docker info), and make test-docker needs it: start Docker, then make claude-update: nothing changed"; exit 1; }
+        # S9: make deploy's check-policies and plan check compile the Pulumi program's scripts with its tsc: without
+        # infra/node_modules the deploy fails there, after the pin, make test-docker and the deployer's paste.
+        test -x "$infra/node_modules/.bin/tsc" || { echo "claude-update: $infra/node_modules is missing (make deploy's check-policies and plan check run its tsc): make infra-install, then make claude-update: nothing changed"; exit 1; }
         steps="deploy status active proxy check"
         deploying=1
         read_proxy=1

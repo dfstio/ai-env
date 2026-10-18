@@ -32,7 +32,10 @@
 //! When: [`decide`] enables the writer iff the route is remote, the child's
 //! config dir differs from the Mac's, or `AI_ENV_BRIDGE_MIRROR_ROOT` is set —
 //! except that a LOCAL child whose projects root IS the destination never
-//! gets a second writer (no double append).
+//! gets a second writer (no double append). S9 (D9): a remote chat's
+//! transcript is kept in S3 ([`MirrorCfg::kept_in_s3`], the pump's choice for
+//! every remote child), so a remote child gets no writer at all: its frames
+//! are dropped and counted, and the Mac keeps only the chat's view.
 use crate::wire::mirror::{mirror_key, node_relative};
 use serde_json::value::RawValue;
 use std::borrow::Cow;
@@ -72,6 +75,15 @@ impl MirrorCfg {
             Some(p) => MirrorCfg { project: Some(p.to_string()), reason: format!("{} (project {p} only)", self.reason), ..self },
             None => MirrorCfg { enabled: false, project: None, reason: "mirror writer disabled: the remote child's own project is unknown (no slug of the cwd)".to_string(), ..self },
         }
+    }
+
+    /// This configuration with the writer off for a remote chat whose
+    /// transcript is kept in S3 (S9, D9): nothing of its frames is written
+    /// on this Mac; the pump drops and counts them
+    /// (`pump::MIRROR_DROPPED_PART`).
+    #[must_use]
+    pub fn kept_in_s3(self) -> MirrorCfg {
+        MirrorCfg { enabled: false, project: None, reason: "mirror writer disabled: a remote chat's transcript is kept in S3, never on this Mac (its frames are dropped and counted)".to_string(), ..self }
     }
 }
 
@@ -663,6 +675,18 @@ mod tests {
         let mut w = Writer::new(MirrorCfg { enabled: false, ..writer(&f).cfg.clone() });
         assert_eq!(w.append(Some(&fp(&f, &format!("{SLUG}/{SID}.jsonl"))), &[&raw("{}")]), Err(Reject::Disabled));
         assert_eq!((w.skipped, w.rejected), (1, 0));
+    }
+
+    /// S9 (D9): a remote chat kept in S3 has no writer, whatever its
+    /// project: a frame of its own creates nothing on this Mac.
+    #[test]
+    fn a_chat_kept_in_s3_mirrors_nothing() {
+        let f = fx();
+        let cfg = writer(&f).cfg.clone().confined_to(Some(SLUG)).kept_in_s3();
+        assert!(!cfg.enabled && cfg.project.is_none() && cfg.reason.contains("kept in S3"), "{cfg:?}");
+        let mut w = Writer::new(cfg);
+        assert_eq!(w.append(Some(&fp(&f, &format!("{SLUG}/{SID}.jsonl"))), &[&raw(r#"{"type":"user"}"#)]), Err(Reject::Disabled));
+        assert!(!f.dest.join(SLUG).exists(), "nothing created");
     }
 
     /// S8: a writer confined to the session's project (a remote child's)

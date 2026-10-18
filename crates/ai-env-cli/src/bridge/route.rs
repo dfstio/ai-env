@@ -62,38 +62,120 @@ pub struct Loaded {
 /// What a `bridge.toml` that exists but does not load (a TOML error, an
 /// unknown key, a wrong type, another `[aws].region`, a file that cannot be
 /// read) still says, read as plain TOML: the keys the wrapper routes on, so
-/// one bad line never turns a remote session into a run on the Mac (S8 L1).
+/// one bad line never turns a remote session into a run on the Mac (S8 L1;
+/// S9 F1: nor does a misspelt routing key or table).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Broken {
     /// `[wrapper].mode`: `Some(None)` when the file is TOML without it,
     /// `Some(Some(value))` when it is a string; `None` when it cannot be read
-    /// (the file is not TOML or cannot be read, or the value is no string).
+    /// (the file is not TOML or cannot be read, the value is no string, or,
+    /// F1, `[wrapper]` holds a key outside [`WRAPPER_KEYS`], a top-level
+    /// table's name is a near miss of `wrapper`, or `mode` stands at the top
+    /// level).
     pub mode: Option<Option<String>>,
     /// `[workspaces].roots` then each `[[workspace]].path`, as written;
     /// `None` when `[workspaces]` or `[[workspace]]` does not match its
-    /// schema (a misspelt or mistyped key), or the file is not TOML or
-    /// cannot be read.
+    /// schema (a misspelt or mistyped key), the file is not TOML or cannot
+    /// be read, or (F1) a top-level table's name is a near miss of either,
+    /// or `roots` or `path` stands at the top level.
     pub roots: Option<Vec<PathBuf>>,
+}
+
+/// The keys `[wrapper]` takes (`config::WrapperCfg`'s): any other one makes
+/// the mode a `bridge.toml` that does not load says unreadable (S9 F1,
+/// [`Broken::read`]): a misspelt `mode` (`mdoe`) never reads as no mode.
+pub const WRAPPER_KEYS: [&str; 7] = ["local_fallback", "strip_add_dir", "strip_debug", "env_forward", "env_extra", "initial_permission_mode", "mode"];
+
+/// The top-level tables the wrapper routes on: a table whose name is a near
+/// miss of one of them ([`near_miss`]) makes what that table says
+/// unreadable (S9 F1, [`Broken::read`]).
+pub const ROUTED_TABLES: [&str; 3] = ["wrapper", "workspaces", "workspace"];
+
+/// A name as [`near_miss`] compares it: lowercase, `-` as `_`, one trailing
+/// `s` dropped.
+fn normalised(name: &str) -> String {
+    let n = name.to_lowercase().replace('-', "_");
+    n.strip_suffix('s').map_or_else(|| n.clone(), str::to_string)
+}
+
+/// `a` turns into `b` by one edit: an insertion, a deletion, a substitution
+/// or two adjacent characters swapped (never by none: equal is not one edit).
+fn one_edit(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    // `long` with one character fewer is `short`.
+    let deletion = |long: &[char], short: &[char]| {
+        let i = long.iter().zip(short).take_while(|(x, y)| x == y).count();
+        long[i + 1..] == short[i..]
+    };
+    if a.len() == b.len() {
+        let diff: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        match diff.as_slice() {
+            [_] => true,
+            &[i, j] => j == i + 1 && a[i] == b[j] && a[j] == b[i],
+            _ => false,
+        }
+    } else if a.len() == b.len() + 1 {
+        deletion(&a, &b)
+    } else if b.len() == a.len() + 1 {
+        deletion(&b, &a)
+    } else {
+        false
+    }
+}
+
+/// The routed table (of [`ROUTED_TABLES`]) a top-level table named `name`
+/// misses (S9 F1): not one of them, but its [`normalised`] name equals one's,
+/// or is one edit from it ([`one_edit`]): `[Workspaces]`, `[wraper]`,
+/// `[worksapces]`, `[[worksapce]]`. Both forms are compared: the name as
+/// written (lowercase, `-` as `_`, no `s` dropped) one edit from a routed
+/// name as written is a near miss too, so `[workspaces1]` is one, though its
+/// normalised form, which keeps that `s`, is two edits from `workspace`.
+/// `None` for any other name.
+#[must_use]
+pub fn near_miss(name: &str) -> Option<&'static str> {
+    if ROUTED_TABLES.contains(&name) {
+        return None;
+    }
+    let (raw, n) = (name.to_lowercase().replace('-', "_"), normalised(name));
+    ROUTED_TABLES.into_iter().find(|t| {
+        let nt = normalised(t);
+        n == nt || one_edit(&n, &nt) || one_edit(&raw, t)
+    })
 }
 
 impl Broken {
     /// `text` (`None`: the file could not be read) read as plain TOML:
     /// `[wrapper].mode`, and `[workspaces]` and `[[workspace]]` each with its
-    /// own schema (`lenient_roots`); every other table and key ignored.
+    /// own schema (`lenient_roots`); every other table and key ignored, but
+    /// (S9 F1) what fails it closed: a `[wrapper]` key outside
+    /// [`WRAPPER_KEYS`], a top-level name that is a near miss of a routed
+    /// table ([`near_miss`], whatever its value: of `wrapper`, the mode is
+    /// unreadable; of `workspaces` or `workspace`, the roots), a top-level
+    /// `mode` (a forgotten `[wrapper]` header: the mode unreadable) or
+    /// `roots` or `path` (the roots unreadable). An unreadable mode counts
+    /// as remote ([`effective_mode_loaded`]) and unreadable roots hold every
+    /// cwd ([`decide_loaded`]), so P0 fails the session closed.
     #[must_use]
     pub fn read(text: Option<&str>) -> Broken {
         let Some(table) = text.and_then(|t| toml::from_str::<toml::Table>(t).ok()) else {
             return Broken { mode: None, roots: None };
         };
+        let missed = |routed: &[&str]| table.keys().any(|k| near_miss(k).is_some_and(|t| routed.contains(&t)));
         let mode = match table.get("wrapper") {
+            _ if table.contains_key("mode") || missed(&["wrapper"]) => None,
             None => Some(None),
-            Some(wrapper) => match wrapper.as_table().map(|w| w.get("mode")) {
-                Some(None) => Some(None),
-                Some(Some(toml::Value::String(mode))) => Some(Some(mode.clone())),
-                _ => None,
+            Some(wrapper) => match wrapper.as_table() {
+                Some(w) if w.keys().any(|k| !WRAPPER_KEYS.contains(&k.as_str())) => None,
+                Some(w) => match w.get("mode") {
+                    None => Some(None),
+                    Some(toml::Value::String(mode)) => Some(Some(mode.clone())),
+                    Some(_) => None,
+                },
+                None => None,
             },
         };
-        Broken { mode, roots: lenient_roots(&table) }
+        let unroutable = table.contains_key("roots") || table.contains_key("path") || missed(&["workspaces", "workspace"]);
+        Broken { mode, roots: if unroutable { None } else { lenient_roots(&table) } }
     }
 }
 
@@ -764,5 +846,117 @@ mod tests {
         assert_eq!(effective_mode_loaded(Some("garbage"), &unreadable), (Mode::Remote, Some("mode_invalid:garbage; mode_unreadable(config)".into())));
         assert_eq!(effective_mode_loaded(Some("remote"), &Loaded::default()), (Mode::Remote, Some("mode:remote".into())), "nothing broken");
         assert_eq!(effective_mode_loaded(None, &Loaded::default()), (Mode::Passthrough, None));
+    }
+
+    /// S9 F1: a bridge.toml that does not load because a routing key or
+    /// table is misspelt never runs a session on this Mac. A `[wrapper]` key
+    /// outside [`WRAPPER_KEYS`] (`mdoe`, or any other, a nested table
+    /// included), a near miss of `[wrapper]` (`[wraper]`, `[Wrapper]`,
+    /// `[wrappers]` beside it) or a header-less `mode` makes the mode
+    /// unreadable, taken as remote; a near miss of `[workspaces]` or
+    /// `[[workspace]]` (`[worksapces]`, `[Workspaces]`, `[[worksapce]]`,
+    /// `[workspace-s]`, `[workspaces1]`) or a header-less `roots` or `path`
+    /// makes the roots unreadable, which hold every cwd. Either way a
+    /// session goes to the pump, whose P0 fails it closed (exit 1), unless
+    /// the variable names another mode. An unknown key elsewhere, another
+    /// region or a wrong type of a known `[wrapper]` key keeps both
+    /// readable, and no table bridge.toml takes is a near miss; the two lists
+    /// are the config's own.
+    #[test]
+    fn an_unknown_wrapper_key_or_a_near_miss_table_fails_remote_closed() {
+        let r = roots();
+        let root = format!("{:?}", r.root);
+        let listed = format!("[workspaces]\nroots = [{root}]\n");
+        let session = session_argv();
+        // (what, the file, the mode it reads, whether it reads the roots)
+        let cases: Vec<(&str, String, Option<Option<&str>>, bool)> = vec![
+            ("[wraper]", format!("[wraper]\nmode = \"remote\"\n{listed}"), None, true),
+            ("[Wrapper]", format!("[Wrapper]\nmode = \"passthrough\"\n{listed}"), None, true),
+            ("[wrappers] beside [wrapper]", format!("[wrapper]\nmode = \"passthrough\"\n[wrappers]\nmode = \"x\"\n{listed}"), None, true),
+            ("a header-less mode", format!("mode = \"remote\"\n{listed}"), None, true),
+            ("a misspelt mode key", format!("[wrapper]\nmdoe = \"remote\"\n{listed}"), None, true),
+            ("an unknown [wrapper] key beside passthrough", format!("[wrapper]\nmode = \"passthrough\"\nnope = 1\n{listed}"), None, true),
+            ("a nested table in [wrapper]", format!("[wrapper]\nmode = \"passthrough\"\n[wrapper.extra]\nx = 1\n{listed}"), None, true),
+            ("[worksapces]", "[wrapper]\nmode = \"remote\"\n[worksapces]\nroots = [\"/elsewhere\"]\n".into(), Some(Some("remote")), false),
+            ("[Workspaces]", "[wrapper]\nmode = \"remote\"\n[Workspaces]\nroots = [\"/elsewhere\"]\n".into(), Some(Some("remote")), false),
+            ("[[worksapce]]", format!("[wrapper]\nmode = \"remote\"\n[[worksapce]]\npath = {root}\n"), Some(Some("remote")), false),
+            ("[workspace-s]", "[wrapper]\nmode = \"remote\"\n[workspace-s]\nroots = []\n".into(), Some(Some("remote")), false),
+            ("[workspaces1]", "[wrapper]\nmode = \"remote\"\n[workspaces1]\nroots = [\"/elsewhere\"]\n".into(), Some(Some("remote")), false),
+            ("a header-less roots", "roots = [\"/elsewhere\"]\n[wrapper]\nmode = \"remote\"\n".into(), Some(Some("remote")), false),
+            ("a header-less path", "path = \"/elsewhere\"\n[wrapper]\nmode = \"remote\"\n".into(), Some(Some("remote")), false),
+        ];
+        for (what, toml, mode, roots_read) in cases {
+            assert!(BridgeConfig::parse(&toml).is_err(), "{what}: the file does not load");
+            let broken = Broken::read(Some(&toml));
+            assert_eq!(broken.mode, mode.map(|m| m.map(str::to_string)), "{what}");
+            assert_eq!(broken.roots.is_some(), roots_read, "{what}: {broken:?}");
+            let loaded = Loaded { broken: Some(broken), note: Some("config: bridge.toml: x".into()), ..Loaded::default() };
+            let (got, note) = effective_mode_loaded(None, &loaded);
+            assert_eq!(got, Mode::Remote, "{what}: remote fails closed, never a silent local run");
+            assert_eq!(note.as_deref(), Some(if mode.is_none() { "mode_unreadable(config)" } else { "mode:remote(config)" }), "{what}");
+            let route = decide_loaded(&session, Some(&r.inside), &loaded, Mode::Remote);
+            assert!(matches!(route, Route::Remote(_)) && piped(Mode::Remote, &route, &session).is_some(), "{what}: under the root, to the pump (P0 fails it closed): {route:?}");
+            let elsewhere = decide_loaded(&session, Some(&r.sibling), &loaded, Mode::Remote);
+            assert_eq!(matches!(elsewhere, Route::Remote(_)), !roots_read, "{what}: roots it cannot read hold every cwd: {elsewhere:?}");
+            assert_eq!(effective_mode_loaded(Some("passthrough"), &loaded).0, Mode::Passthrough, "{what}: the variable still wins");
+        }
+        // Read from the file as the wrapper loads it: noted, its mode unreadable.
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().to_path_buf(), None);
+        std::fs::write(&paths.config, format!("[wraper]\nmode = \"remote\"\n{listed}")).unwrap();
+        let loaded = load_at(paths);
+        assert_eq!((loaded.cfg.is_none(), loaded.broken.as_ref().map(|b| b.mode.clone())), (true, Some(None)), "{loaded:?}");
+        assert_eq!(effective_mode_loaded(None, &loaded), (Mode::Remote, Some("mode_unreadable(config)".into())));
+        // No regression: what does not misspell a routing key or table leaves both readable.
+        let every_key = format!("[wrapper]\nlocal_fallback = true\nstrip_add_dir = true\nstrip_debug = \"yes\"\nenv_forward = []\nenv_extra = []\ninitial_permission_mode = \"default\"\nmode = \"remote\"\n{listed}");
+        for (what, toml) in [
+            ("an unknown key elsewhere", format!("[wrapper]\nmode = \"remote\"\n[vm]\nmax_idle = 300\n{listed}")),
+            ("another region", format!("[wrapper]\nmode = \"remote\"\n[aws]\nregion = \"eu-west-3\"\n{listed}")),
+            ("every key [wrapper] takes, one of the wrong type", every_key),
+            ("an unknown top-level key of another name", format!("nope = 1\n[wrapper]\nmode = \"remote\"\n{listed}")),
+        ] {
+            assert!(BridgeConfig::parse(&toml).is_err(), "{what}: the file does not load");
+            assert_eq!(Broken::read(Some(&toml)), Broken { mode: Some(Some("remote".into())), roots: Some(vec![r.root.clone()]) }, "{what}");
+        }
+        // The near misses themselves.
+        for (name, missed) in [
+            ("wraper", Some("wrapper")),
+            ("Wrapper", Some("wrapper")),
+            ("WRAPPERS", Some("wrapper")),
+            ("wrpaper", Some("wrapper")),
+            ("wrapperr", Some("wrapper")),
+            ("worksapces", Some("workspaces")),
+            ("Workspaces", Some("workspaces")),
+            ("worksapce", Some("workspaces")),
+            ("work-spaces", Some("workspaces")),
+            ("workspac", Some("workspaces")),
+            ("workspaces1", Some("workspaces")),
+            ("workspaces_", Some("workspaces")),
+            ("workspaces-", Some("workspaces")),
+            ("workspaces ", Some("workspaces")),
+            ("wrapper", None),
+            ("workspaces", None),
+            ("workspace", None),
+            ("wrapperxy", None),
+            ("vm", None),
+            ("aws", None),
+            ("transcript", None),
+            ("transport", None),
+            ("workspace_overrides", None),
+        ] {
+            assert_eq!(near_miss(name), missed, "{name}");
+        }
+        // WRAPPER_KEYS are the keys [wrapper] takes, ROUTED_TABLES among the tables bridge.toml takes, none of which is a near miss.
+        let expected = |toml: &str| -> Vec<String> {
+            let e = BridgeConfig::parse(toml).unwrap_err().to_string();
+            let list = e.split("expected one of ").nth(1).and_then(|l| l.lines().next()).unwrap_or_else(|| panic!("{e}")).to_string();
+            list.split(", ").map(|k| k.trim_matches('`').to_string()).collect()
+        };
+        assert_eq!(expected("[wrapper]\nzzz = 1\n"), WRAPPER_KEYS);
+        let tables = expected("zzz = 1\n");
+        assert!(ROUTED_TABLES.iter().all(|t| tables.iter().any(|k| k == t)), "{tables:?}");
+        for t in &tables {
+            assert_eq!(near_miss(t), None, "{t} is a table bridge.toml takes");
+        }
     }
 }

@@ -12,6 +12,13 @@
 //! caps and every scan of what a seed carries. The VM is the workspace's own
 //! (`vm run --workspace` or `vm warm` started it; `box` never starts one), or
 //! for `box fetch SESSION` the session's.
+//!
+//! S9 (G2): `box fetch --smart-http` reaches the VM through git smart-HTTP
+//! v2 (`codeout::fetch_smart_http`; the VM must name `git_http_v1`), into
+//! the same import; `box fetch --dry-run` mints its token without recording
+//! it in the VM's row, and reads no `/health` (its caps are the row's); a
+//! fetch says once per workspace that its repository has no ai-env pre-push
+//! hook.
 use crate::bridge::agent::AgentTarget;
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmState};
 use crate::bridge::codeout::{box_ref_of, credential_shaped, fetch, hidden_note, CodeoutCtx, FetchOpts, BOX_REFS};
@@ -32,14 +39,19 @@ use crate::store::Keystore;
 use crate::wire::workspace::{CodeoutRequest, CODE_PORT, SEED_BODY_MAX};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+// S9 (G2): `box fetch --smart-http`.
+use crate::bridge::codeout::{fetch_smart_http, Via};
+use crate::bridge::gitsmart::{manifest_of, Client};
 
 const MIB: u64 = 1024 * 1024;
 
-/// `ai-env box …`.
+/// `ai-env box …` (S9: `review`, `hook-install` and `fetch --smart-http`).
 pub fn main(store: &Keystore, cmd: BoxCmd) -> Result<()> {
     match cmd {
         BoxCmd::Seed { workspace, branch, no_wip, replace, dry_run, max_mib, json } => seed(store, &Seed { workspace, branch, no_wip, replace, dry_run, max_mib, json }),
-        BoxCmd::Fetch { target, wip, dry_run, max_mib, json } => fetch_cmd(store, target.as_deref(), wip, dry_run, max_mib, json),
+        BoxCmd::Fetch { target, wip, dry_run, max_mib, smart_http, json } => fetch_cmd(store, target.as_deref(), wip, dry_run, max_mib, smart_http, json),
+        BoxCmd::Review { rev, base, repo, json, pre_push } => crate::bridge::review::cmd_review(rev.as_deref(), &base, repo.as_deref(), json, pre_push.as_deref()),
+        BoxCmd::HookInstall { repo, dry_run, json } => crate::bridge::review::cmd_hook_install(repo.as_deref(), dry_run, json),
     }
 }
 
@@ -214,8 +226,11 @@ fn outcome_json(o: &EnsureOutcome) -> serde_json::Value {
     }
 }
 
-/// `box fetch [SESSION or WORKSPACE] [--wip] [--dry-run] [--max-mib N] [--json]`.
-fn fetch_cmd(store: &Keystore, target: Option<&str>, wip: bool, dry_run: bool, max_mib: Option<u32>, json: bool) -> Result<()> {
+/// `box fetch [SESSION or WORKSPACE] [--wip] [--dry-run] [--max-mib N] [--smart-http] [--json]`.
+/// A fetch (not a dry run) first notes, once per workspace, a repository
+/// without the ai-env pre-push hook ([`note_missing_hook`]), before any
+/// Touch ID.
+fn fetch_cmd(store: &Keystore, target: Option<&str>, wip: bool, dry_run: bool, max_mib: Option<u32>, smart_http: bool, json: bool) -> Result<()> {
     let ctx = Ctx::load()?;
     ctx.cfg.seed.validate()?;
     let (dir, vm) = match target.filter(|t| crate::bridge::registry::is_uuid(t)) {
@@ -228,34 +243,84 @@ fn fetch_cmd(store: &Keystore, target: Option<&str>, wip: bool, dry_run: bool, m
     };
     let ws = resolve(&ctx.cfg, &dir, None)?;
     let max_bytes = u64::from(max_mib.unwrap_or(ctx.cfg.seed.max_fetch_mib)) * MIB;
+    if !dry_run {
+        note_missing_hook(&ctx.paths, &ws);
+    }
+    let flags = Fetch { opts: FetchOpts { wip, max_bytes }, dry_run, via: if smart_http { Via::SmartHttp } else { Via::Codeout }, json };
     let rt = runtime()?;
     rt.block_on(async {
         match backend(store, &ctx).await? {
-            Backend::Sdk(api, ep) => fetch_on(&ctx, api, &*ep, &ws, vm.as_deref(), FetchOpts { wip, max_bytes }, dry_run, json).await,
-            Backend::Fake(f) => fetch_on(&ctx, Arc::new(f.clone()), &f, &ws, vm.as_deref(), FetchOpts { wip, max_bytes }, dry_run, json).await,
+            Backend::Sdk(api, ep) => fetch_on(&ctx, api, &*ep, &ws, vm.as_deref(), &flags).await,
+            Backend::Fake(f) => fetch_on(&ctx, Arc::new(f.clone()), &f, &ws, vm.as_deref(), &flags).await,
         }
     })
 }
 
-/// `box fetch` from the session's or the workspace's VM.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_on<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: Arc<A>, ep: &E, ws: &WorkspaceRef, vm: Option<&str>, opts: FetchOpts, dry_run: bool, json: bool) -> Result<()> {
+/// `box fetch`'s flags past its target.
+struct Fetch {
+    opts: FetchOpts,
+    dry_run: bool,
+    /// `POST /codeout`, or git smart-HTTP (`--smart-http`).
+    via: Via,
+    json: bool,
+}
+
+/// `box fetch`'s note, once per workspace (S9 §4.2, L7): the workspace's
+/// repository has no ai-env pre-push hook where git runs hooks
+/// (`review::hook_state` says missing), so a push from it is not reviewed.
+/// The workspace row's `hook_noted_at` records that it was said. A foreign
+/// hook is doctor's to name (it may chain the review), an unknown state
+/// says nothing. Best effort: a row that cannot be written costs a warning.
+fn note_missing_hook(paths: &Paths, ws: &WorkspaceRef) {
+    use crate::bridge::review::{hook_state, HookState};
+    use crate::bridge::workspace::rows;
+    if rows::row_of(paths, ws).ok().flatten().is_some_and(|row| row.hook_noted_at.is_some()) {
+        return;
+    }
+    if !matches!(hook_state(&ws.root), HookState::Missing(_)) {
+        return;
+    }
+    let root = ws.root.display();
+    voice::note(&format!("the workspace {root} has no ai-env pre-push hook: ai-env box hook-install {root} installs it"));
+    if let Err(e) = rows::update(paths, ws, |row| row.hook_noted_at = Some(crate::wire::time::unix_now())) {
+        voice::warn(&format!("the workspace row of {} was not written: {e}", ws.cwd.display()));
+    }
+}
+
+/// `box fetch` from the session's or the workspace's VM: its caps first
+/// (`workspace_v1`; with `--smart-http` also `git_http_v1`, exit 7 naming
+/// `make deploy` before any request of the fetch), then the dry run, or the
+/// fetch through the flags' way (`codeout::fetch`, `codeout::fetch_smart_http`).
+/// A dry run takes only the caps its row records: reading `/health` mints a
+/// recorded token and rewrites the row, so a row without them is refused
+/// (exit 1), nothing minted.
+async fn fetch_on<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: Arc<A>, ep: &E, ws: &WorkspaceRef, vm: Option<&str>, flags: &Fetch) -> Result<()> {
     let row = match vm {
         Some(id) => read_row(&ctx.paths, id)?.ok_or_else(|| BridgeError::VmNotFound(format!("{id} (the session's VM) has no row")))?,
         None => workspace_vm(&ctx.paths, &*api, ws).await?,
     };
+    if flags.dry_run && row.caps.is_none() {
+        return Err(BridgeError::Config(format!("{} has no capabilities on record, and reading its /health would write its row, which a dry run never does (ai-env vm health {} records them)", row.id, row.id)).into());
+    }
     let caps = caps_of(ctx, &*api, ep, &row).await?;
     crate::bridge::workspace::require_capability(&caps, &row.id)?;
+    if flags.via == Via::SmartHttp {
+        crate::bridge::workspace::require_cap(&caps, &row.id, crate::wire::frame::CAP_GIT_HTTP_V1)?;
+    }
     let target = AgentTarget::from_row(&row)?;
     let dp = HttpsEndpoint::new(&ctx.knobs)?;
     let tokens = MintingTokens::new(api.clone(), &ctx.paths, &row.id, false);
-    if dry_run {
-        return fetch_dry_run(ctx, &*api, &dp, &tokens, &target, ws, json).await;
+    if flags.dry_run {
+        // A dry run changes nothing on the Mac: not even its token's expiry in the VM's row.
+        return fetch_dry_run(ctx, &*api, &dp, &tokens.unrecorded(), &target, ws, flags).await;
     }
-    let cctx = CodeoutCtx { api: api.clone(), dp: Arc::new(dp), tokens: Arc::new(tokens), paths: ctx.paths.clone(), cfg: Arc::new(ctx.cfg.clone()), target, ws: ws.clone(), capture_settings: false };
-    let report = fetch(&cctx, opts).await?;
-    if json {
-        let v = serde_json::json!({ "backend": ctx.backend_name(), "vm": row.id, "report": report });
+    let cctx = CodeoutCtx { api: api.clone(), dp: Arc::new(dp), tokens: Arc::new(tokens), paths: ctx.paths.clone(), cfg: Arc::new(ctx.cfg.clone()), target, ws: ws.clone(), capture_settings: false, transcript: None };
+    let report = match flags.via {
+        Via::Codeout => fetch(&cctx, flags.opts).await?,
+        Via::SmartHttp => fetch_smart_http(&cctx, flags.opts).await?,
+    };
+    if flags.json {
+        let v = serde_json::json!({ "backend": ctx.backend_name(), "vm": row.id, "via": flags.via.word(), "report": report });
         outln!("{}", serde_json::to_string_pretty(&v).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))?);
     } else {
         if report.promoted.is_empty() && report.quarantined.is_empty() {
@@ -282,23 +347,50 @@ async fn fetch_on<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx, api: Ar
     Ok(())
 }
 
-/// `box fetch --dry-run`: the VM's refs (a code-out's manifest, read without
-/// its pack and without a snapshot) against `refs/remotes/box/*`. A name
-/// that looks like a credential (`codeout::credential_shaped`, the scans'
-/// rules), a ref's or the checked-out branch's, is never printed: such refs
-/// are only counted, as a fetch keeps them out.
-async fn fetch_dry_run<A: MicrovmApi>(ctx: &Ctx, api: &A, dp: &HttpsEndpoint, tokens: &MintingTokens<Arc<A>>, target: &AgentTarget, ws: &WorkspaceRef, json: bool) -> Result<()> {
+/// `box fetch --dry-run`: the VM's refs against `refs/remotes/box/*`, read
+/// the way the fetch would reach them, nothing transferred: a code-out's
+/// manifest without its pack and without a snapshot (`POST /codeout`), or
+/// with `--smart-http` the advertisement and `ls-refs` (`gitsmart`), never a
+/// `fetch` (so a ref naming a tree or a blob, which only the pack tells from
+/// a commit, is listed there). Its tokens are `unrecorded` ones (the VM's
+/// row stays as it was).
+async fn fetch_dry_run<A: MicrovmApi>(ctx: &Ctx, api: &A, dp: &HttpsEndpoint, tokens: &MintingTokens<Arc<A>>, target: &AgentTarget, ws: &WorkspaceRef, flags: &Fetch) -> Result<()> {
+    let manifest = match flags.via {
+        Via::Codeout => codeout_manifest(api, dp, tokens, target, ws).await?,
+        Via::SmartHttp => {
+            let crate::bridge::workspace::WsKind::Git { object_format, .. } = &ws.kind;
+            let client = Client { api, tokens, git: dp, target };
+            let advert = client.advertise(*object_format).await?;
+            Some(manifest_of(&client.ls_refs(&advert).await?, advert.object_format)?)
+        }
+    };
+    let Some(manifest) = manifest else {
+        outln!("{}: nothing to fetch", target.vm_id);
+        return Ok(());
+    };
+    print_dry_run(ctx, target, ws, &manifest, flags)
+}
+
+/// The VM's refs as `POST /codeout` gives them, read only to its manifest
+/// line (`HttpsEndpoint::codeout_refs`: no snapshot, the pack never read);
+/// `None` when the VM has nothing to fetch (204).
+async fn codeout_manifest<A: MicrovmApi>(api: &A, dp: &HttpsEndpoint, tokens: &MintingTokens<Arc<A>>, target: &AgentTarget, ws: &WorkspaceRef) -> Result<Option<crate::wire::workspace::CodeoutManifest>> {
     let req = CodeoutRequest { path: ws.vm_root.clone(), haves: Vec::new(), wip: false, max_bytes: SEED_BODY_MAX };
-    let x = Exchange { api, tokens, vm_id: &target.vm_id, port: CODE_PORT, route: "POST /codeout", deadline: None, idempotent: true };
+    let x = Exchange { api, tokens, vm_id: &target.vm_id, port: CODE_PORT, cap: crate::wire::frame::CAP_WORKSPACE_V1, route: "POST /codeout", deadline: None, idempotent: true };
     let (reply, verdict): (DpReply<crate::wire::workspace::CodeoutManifest>, Verdict) = exchange(&x, |t| {
         let req = &req;
         async move { dp.codeout_refs(target, &t, req).await }
     })
     .await?;
-    let Some(manifest) = reply.body.filter(|_| matches!(verdict, Verdict::Done)) else {
-        outln!("{}: nothing to fetch", target.vm_id);
-        return Ok(());
-    };
+    Ok(reply.body.filter(|_| matches!(verdict, Verdict::Done)))
+}
+
+/// What `box fetch --dry-run` prints of `manifest`: each VM ref and its box
+/// name, new, moving or up to date. A name that looks like a credential
+/// (`codeout::credential_shaped`, the scans' rules), a ref's or the
+/// checked-out branch's, is never printed: such refs are only counted, as a
+/// fetch keeps them out.
+fn print_dry_run(ctx: &Ctx, target: &AgentTarget, ws: &WorkspaceRef, manifest: &crate::wire::workspace::CodeoutManifest, flags: &Fetch) -> Result<()> {
     let rules = ScanSet::load(&ctx.paths, &ctx.cfg, ws)?.rules;
     let shown = |name: &str| !credential_shaped(name, &rules);
     let user = crate::gitrun::GitRun::mac(&ws.root);
@@ -320,8 +412,8 @@ async fn fetch_dry_run<A: MicrovmApi>(ctx: &Ctx, api: &A, dp: &HttpsEndpoint, to
     }
     // `null` when detached, or when the branch's name looks like a credential (its ref is then among `hidden`).
     let branch = manifest.branch.as_deref().filter(|b| shown(b));
-    if json {
-        let v = serde_json::json!({ "backend": ctx.backend_name(), "dry_run": true, "vm": target.vm_id, "head": manifest.head, "branch": branch, "refs": moves, "hidden": hidden });
+    if flags.json {
+        let v = serde_json::json!({ "backend": ctx.backend_name(), "dry_run": true, "via": flags.via.word(), "vm": target.vm_id, "head": manifest.head, "branch": branch, "refs": moves, "hidden": hidden });
         outln!("{}", serde_json::to_string_pretty(&v).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))?);
     } else {
         let on = match (manifest.branch.is_some(), branch) {
@@ -329,7 +421,11 @@ async fn fetch_dry_run<A: MicrovmApi>(ctx: &Ctx, api: &A, dp: &HttpsEndpoint, to
             (true, None) => " on a branch whose name looks like a credential".to_string(),
             (false, None) => String::new(),
         };
-        outln!("box fetch --dry-run: {} (HEAD {}{on})", target.vm_id, short(&manifest.head));
+        let command = match flags.via {
+            Via::Codeout => "box fetch --dry-run",
+            Via::SmartHttp => "box fetch --smart-http --dry-run",
+        };
+        outln!("{command}: {} (HEAD {}{on})", target.vm_id, short(&manifest.head));
         for m in &moves {
             let vm_ref = m["vm_ref"].as_str().unwrap_or_default();
             match m["box"].as_str() {
@@ -343,4 +439,54 @@ async fn fetch_dry_run<A: MicrovmApi>(ctx: &Ctx, api: &A, dp: &HttpsEndpoint, to
         outln!("nothing was fetched");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod g2_tests {
+    use super::*;
+    use crate::bridge::workspace::{Head, WsKind};
+    use crate::wire::workspace::ObjectFormat;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let o = std::process::Command::new("git").args(args).current_dir(dir).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// The workspace of `dir` (a repository there, its hooks where git runs
+    /// them by default: the repository's own `core.hooksPath` beats this
+    /// user's global one), its rows under `slug`.
+    fn workspace(dir: &Path, slug: &str, hook: Option<&str>) -> WorkspaceRef {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "core.hooksPath", ".git/hooks"]);
+        if let Some(body) = hook {
+            std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+            std::fs::write(dir.join(".git/hooks/pre-push"), body).unwrap();
+        }
+        let kind = WsKind::Git { git_dir: dir.join(".git"), common_dir: dir.join(".git"), object_format: ObjectFormat::Sha1 };
+        WorkspaceRef { cwd: dir.to_path_buf(), root: dir.to_path_buf(), vm_cwd: dir.display().to_string(), vm_root: dir.display().to_string(), slug: slug.into(), kind, head: Head::Detached { sha: "a".repeat(40) }, seed_branch: None }
+    }
+
+    /// S9: the missing-hook note is recorded once per workspace, and the
+    /// next fetch keeps the record as it was (it says nothing more); a
+    /// repository with ai-env's hook, or with a foreign one, is never noted,
+    /// and no row is written for it.
+    #[test]
+    fn the_missing_hook_note_is_recorded_once_and_for_a_missing_hook_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let paths = Paths::from_root_and_env(root.join("bridge"), None);
+        let noted = |ws: &WorkspaceRef| crate::bridge::workspace::rows::row_of(&paths, ws).unwrap().and_then(|r| r.hook_noted_at);
+        let missing = workspace(&root.join("missing"), "-missing", None);
+        note_missing_hook(&paths, &missing);
+        let at = noted(&missing).expect("noted, and recorded");
+        note_missing_hook(&paths, &missing);
+        assert_eq!(noted(&missing), Some(at), "once");
+        let ours = format!("#!/bin/sh\n{}\nexit 0\n", crate::bridge::review::PRE_PUSH_MARK);
+        for (name, hook) in [("ours", ours.as_str()), ("foreign", "#!/bin/sh\nexit 0\n")] {
+            let ws = workspace(&root.join(name), &format!("-{name}"), Some(hook));
+            note_missing_hook(&paths, &ws);
+            assert!(crate::bridge::workspace::rows::row_of(&paths, &ws).unwrap().is_none(), "{name}: no row written");
+        }
+    }
 }

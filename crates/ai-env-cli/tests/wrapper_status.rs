@@ -825,7 +825,7 @@ fn remote_without_a_root_fails_nothing_closed() {
     // A remote bridge.toml that does not load (or whose mode it cannot read), its roots read and none: the
     // file's [NO ] rows, its mode row saying the chats run on this Mac.
     home.write_settings(&serde_json::json!({ WRAPPER_SETTING: sibling() }).to_string());
-    for (toml, mode) in [("[wrapper]\nmode = \"remote\"\nnope = 1\n", "\"remote\""), ("[wrapper]\nmode = 1\n", "unreadable")] {
+    for (toml, mode) in [("[wrapper]\nmode = \"remote\"\n[vm]\nnope = 1\n", "\"remote\""), ("[wrapper]\nmode = 1\n", "unreadable")] {
         home.write_bridge_toml(toml);
         let out = home.status(&[]);
         let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
@@ -927,7 +927,7 @@ fn a_secret_looking_mode_is_never_printed_raw() {
             format!("  [NO ] bridge.toml [wrapper] mode {masked} (1 root), which names no mode: {not_now}  <- set [wrapper] mode to \"passthrough\" or \"remote\" in bridge.toml"),
         ),
         (
-            format!("[wrapper]\nmode = \"{token}\"\nnope = 1\n{roots}"),
+            format!("[wrapper]\nmode = \"{token}\"\n[vm]\nnope = 1\n{roots}"),
             "  [NO ] wrapper mode remote, but bridge.toml does not load: every Cursor chat under its roots (every chat, when the roots cannot be read) exits 1 naming the error  <- fix bridge.toml (the bridge.toml row above)".to_string(),
             format!("  [NO ] bridge.toml, which does not load, [wrapper] mode {masked} (1 root): {not_now}  <- fix bridge.toml (the bridge.toml row above)"),
         ),

@@ -1,8 +1,9 @@
 //! `ai-env-claude` — Cursor's `claudeCode.claudeProcessWrapper` target,
 //! exec'd as `<wrapper> <realBinary> <claude args…>`. `--version` and `--help`
 //! (alone) are its only other modes: neither reads anything or runs a binary
-//! (a `--help` taken as the real binary's path would reach the local fallback,
-//! which runs the Mac's claude). Every Local route (subcommands, `--version`, …) and, in
+//! (outside the kill switch, any other first argument that is empty, starts
+//! with `-` or is a bare name other than `claude` is exit 2 with the usage,
+//! S9 CUSTODY-4: `refuse_a_non_binary`). Every Local route (subcommands, `--version`, …) and, in
 //! passthrough mode, every route execs the real binary locally with argv
 //! verbatim, before any tokio runtime, SDK or TLS object exists. A
 //! stream-json session under `AI_ENV_BRIDGE_MODE=local-child|local-scratch`
@@ -27,6 +28,12 @@
 //! `auth status --json` in remote mode) → `census::record` (one stderr line
 //! on failure, never blocking; a remote session's is the pump's) → the lab
 //! exit knob (debug builds) → the piped branch (`route::piped`) → exec.
+//! S9 adds three refusals to that order (§6.4), each a function of its own:
+//! a local resume of a view inside the kill switch, before its raw exec
+//! (`refuse_a_view_raw`); a first argument that is no binary path right
+//! after `argv::split` (`refuse_a_non_binary`); and, after the prewarm, a
+//! local resume of a view on any route but the remote one (`view_refusal`:
+//! the census row notes `view_refused:<word>`, then exit 9).
 //! stderr lines are prefixed `ai-env-claude:` (the extension shows the last
 //! 2 KiB of stderr only on a non-zero exit; shared code speaks through
 //! `bridge::voice`, set to the wrapper's voice here: notes to the log, one
@@ -64,6 +71,47 @@ fn mcp_verb(args: &[String]) -> Option<&str> {
     }
 }
 
+/// S9 (§6.4, G5): in the kill switch's block, before the raw exec, a local
+/// resume of a view (`wire::view::local_view_target` of `argv[2..]`) is
+/// refused: `ai-env-claude: <LOCAL_RESUME_REFUSAL>` and exit 9, with no
+/// config, no census and no AWS (the first 4 KiB of one session file are
+/// all it reads).
+fn refuse_a_view_raw(argv: &[OsString]) {
+    let cwd = std::env::current_dir().ok();
+    let args = argv.get(2..).unwrap_or_default();
+    if ai_env_cli::wire::view::local_view_target(args, cwd.as_deref(), &|k: &str| std::env::var_os(k)).is_some() {
+        fail(9, ai_env_cli::wire::view::LOCAL_RESUME_REFUSAL);
+    }
+}
+
+/// S9 (§6.4, G6: CUSTODY-4): right after `argv::split`, a first argument
+/// that is no binary path (empty, starting with `-`, or a bare name other
+/// than `claude`: no `/` in it) is exit 2 with the usage, before any config
+/// read or census row: `help`, `-v` or `--help --verbose` never reaches the
+/// local fallback, which would run the Mac's claude. The argument is shown
+/// scrubbed, quoted (a control character escaped) and capped.
+fn refuse_a_non_binary(inv: &argv::Invocation) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let first = inv.real_binary.as_os_str();
+    let bare = !first.as_bytes().contains(&b'/');
+    if first.is_empty() || first.as_bytes().starts_with(b"-") || (bare && first != "claude") {
+        let shown: String = ai_env_cli::wire::redact::scrub(&first.to_string_lossy()).chars().take(64).collect();
+        fail(2, &format!("the first argument {shown:?} is no path to Cursor's claude  {USAGE}"));
+    }
+}
+
+/// S9 (§6.4, G5): the word of a refused local resume of a view
+/// (`wire::view::ViewHit::word`), `None` on the remote route (whose chat
+/// resumes from S3) or when the session file is no view: passthrough,
+/// sessions outside the roots and the local pump modes.
+fn view_refusal(args: &[String], cwd: Option<&Path>, remote: bool) -> Option<&'static str> {
+    if remote {
+        return None;
+    }
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    ai_env_cli::wire::view::local_view_target(&args, cwd, &|k: &str| std::env::var_os(k)).map(|(hit, _)| hit.word())
+}
+
 /// The first executable `claude` in an ABSOLUTE entry of the PATH the
 /// extension handed us — its login shell's PATH, taken literally: no Homebrew
 /// directory appended, and an empty or relative entry (`.`, a trailing `:`)
@@ -89,7 +137,10 @@ fn main() {
     // byte-for-byte, non-UTF-8 included.
     if std::env::var_os("AI_ENV_BRIDGE_LOCAL").is_some_and(|v| v == "1") {
         match argv.get(1) {
-            Some(real) => exec_local(Path::new(real), &argv[2..]),
+            Some(real) => {
+                refuse_a_view_raw(&argv);
+                exec_local(Path::new(real), &argv[2..])
+            }
             None => fail(2, &format!("{}  {USAGE}", ArgvError::MissingRealBinary)),
         }
     }
@@ -99,6 +150,7 @@ fn main() {
         Ok(i) => i,
         Err(e) => fail(2, &format!("{e}  {USAGE}")),
     };
+    refuse_a_non_binary(&inv);
     let loaded = route::load_for_wrapper();
     let cwd = std::env::current_dir().ok();
     // The mode: AI_ENV_BRIDGE_MODE when it names one, else [wrapper].mode (as far as a bridge.toml
@@ -160,6 +212,11 @@ fn main() {
     if let Some(p) = prewarm::maybe_prewarm(&loaded, mode, &inv.args, cwd.as_deref()) {
         notes.push(p.census_part());
     }
+    // S9: a local resume of a view is refused once its census row is written (below).
+    let view_hit = view_refusal(&inv.args, cwd.as_deref(), remote);
+    if let Some(word) = view_hit {
+        notes.push(format!("view_refused:{word}"));
+    }
 
     // The census: one redacted row, never blocking the exec. A piped session
     // appends a second row (the same row + end, exit) when it ends. A remote
@@ -175,6 +232,9 @@ fn main() {
             }
         }
         None => eprintln!("ai-env-claude: census: HOME is not set"),
+    }
+    if view_hit.is_some() {
+        fail(9, ai_env_cli::wire::view::LOCAL_RESUME_REFUSAL);
     }
 
     // Lab knob (debug builds only): raw message, no prefix, so Cursor's error

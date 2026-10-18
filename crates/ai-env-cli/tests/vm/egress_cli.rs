@@ -220,7 +220,9 @@ impl Eg {
     fn assert_pinned(&self) {
         for l in self.calls() {
             let service = l.split_whitespace().next().unwrap_or("");
-            let url = endpoint(service).unwrap_or_else(|| panic!("an unpinned service: {l}"));
+            // S9: the transcripts bucket's reads pin S3's endpoint themselves (`egress::ops::S3_URL`).
+            let url = if service == "s3api" { Some(ai_env_cli::bridge::egress::ops::S3_URL) } else { endpoint(service) };
+            let url = url.unwrap_or_else(|| panic!("an unpinned service: {l}"));
             assert!(l.contains(" --region eu-central-1 ") && l.contains(&format!(" --endpoint-url {url} ")), "not pinned: {l}");
         }
     }
@@ -330,7 +332,51 @@ impl Eg {
     fn proxy(&self, state: &str) {
         self.instance_state("ec2.describe-instances.json", state);
     }
+
+    /// The stack after the S9 deploy and `make infra-status WRITE=1`: the
+    /// transcript store recorded in `state/infra.toml` (the bucket, its
+    /// account, the gateway endpoint, the proxy's route table, the two
+    /// policies' canonical hashes), the endpoint on the proxy table (its
+    /// policy in AWS's normalised text), the bucket's five reads green, and
+    /// `allow` carrying the bucket's host as the stack renders it.
+    fn s9(&self) {
+        use ai_env_cli::bridge::infra::canonical_policy_sha256;
+        let allow = format!("{ALLOW}{BUCKET_HOST}\n");
+        self.set_param("allow", &allow);
+        self.write_state(|s| {
+            s.account_id = Some("123456789012".into());
+            s.allow_sha256 = Some(value_sha256(&allow));
+            s.transcripts_bucket = Some(BUCKET.into());
+            s.s3_endpoint_id = Some(VPCE.into());
+            s.proxy_route_table_id = Some(PROXY_RTB.into());
+            s.s3_endpoint_policy_sha256 = Some(canonical_policy_sha256(ENDPOINT_POLICY).unwrap());
+            s.transcripts_bucket_policy_sha256 = Some(canonical_policy_sha256(BUCKET_POLICY).unwrap());
+        });
+        let aws_text = serde_json::to_string_pretty(&serde_json::from_str::<Value>(ENDPOINT_POLICY).unwrap()).unwrap();
+        self.answer("ec2.describe-vpc-endpoints.json", &json!({"VpcEndpoints": [{
+            "VpcEndpointId": VPCE, "VpcEndpointType": "Gateway", "VpcId": VPC, "ServiceName": "com.amazonaws.eu-central-1.s3", "State": "available",
+            "PolicyDocument": aws_text, "RouteTableIds": [PROXY_RTB], "SubnetIds": [], "Groups": [], "PrivateDnsEnabled": false, "OwnerId": "123456789012"
+        }]}));
+        self.answer("s3api.get-bucket-versioning.json", &json!({"Status": "Enabled"}));
+        self.answer("s3api.get-bucket-encryption.json", &json!({"ServerSideEncryptionConfiguration": {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}, "BucketKeyEnabled": false}]}}));
+        self.answer("s3api.get-bucket-ownership-controls.json", &json!({"OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}}));
+        self.answer("s3api.get-public-access-block.json", &json!({"PublicAccessBlockConfiguration": {"BlockPublicAcls": true, "IgnorePublicAcls": true, "BlockPublicPolicy": true, "RestrictPublicBuckets": true}}));
+        self.answer("s3api.get-bucket-policy.json", &json!({"Policy": BUCKET_POLICY}));
+    }
 }
+
+// ---- S9: the transcript store's endpoint, bucket and allowlist host ----
+
+const BUCKET: &str = "ai-env-transcripts-123456789012";
+const BUCKET_HOST: &str = "ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com";
+const VPCE: &str = "vpce-0123456789abcdef0";
+/// The proxy subnet's route table in tests/fixtures/egress/ops; the VM subnet's is `…60003`.
+const PROXY_RTB: &str = "rtb-0a1b2c3d4e5f60002";
+const VM_RTB: &str = "rtb-0a1b2c3d4e5f60003";
+/// plans/s9-contracts.md §7.3 for the example account.
+const ENDPOINT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"TranscriptsOfTheRuntimeUser","Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject"],"Resource":["arn:aws:s3:::ai-env-transcripts-123456789012/v1/*"],"Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/ai-env-runtime"},"StringEquals":{"s3:ResourceAccount":"123456789012"}}},{"Sid":"Al2023Repos","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::al2023-repos-eu-central-1-de612dc2/*"]}]}"#;
+/// A bucket policy of §7.4's shape (its first statement).
+const BUCKET_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"DenyWithoutTls","Effect":"Deny","Principal":"*","Action":["s3:*"],"Resource":["arn:aws:s3:::ai-env-transcripts-123456789012","arn:aws:s3:::ai-env-transcripts-123456789012/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}"#;
 
 /// `stderr` has `line` as one whole line.
 fn has_line(o: &Output, line: &str) -> bool {
@@ -1420,4 +1466,99 @@ fn every_proxy_command_sends_a_fixed_document_never_a_shell_script() {
     let o = t.run(&["egress", "reload"]);
     assert_eq!(code(&o), 7, "{}", stderr(&o));
     assert!(stderr(&o).contains("AccessDeniedException") && stderr(&o).contains(" (only ai-env-ops and ai-env-deployer may send the proxy documents: run it under ai-env as ops --)"), "{}", stderr(&o));
+}
+
+/// An answer of the fake as it stands, changed by `f`.
+fn edit_answer(t: &Eg, name: &str, f: impl FnOnce(&mut Value)) {
+    let mut doc: Value = serde_json::from_str(&fs::read_to_string(t.answers.join(name)).unwrap()).unwrap();
+    f(&mut doc);
+    t.answer(name, &doc);
+}
+
+/// S9: once `state/infra.toml` records the transcript store, `egress status`
+/// expects its S3 gateway endpoint — the very endpoint S8's rule calls
+/// drift is ok on the proxy's route table, its policy the stack's (in AWS's
+/// normalised text) — and checks the bucket in a row of its own right after
+/// it, through five bucket reads, each pinned to S3's endpoint and naming
+/// the bucket's owner (never an object read). The endpoint on the VM table,
+/// with a widened policy or beside a second endpoint drifts; so does a
+/// bucket whose versioning was suspended.
+#[test]
+fn status_with_the_transcript_store_expects_its_endpoint_and_bucket() {
+    let t = Eg::new();
+    t.s9();
+    t.status_answer(" applied=yes");
+    let o = t.run(&["egress", "status"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let checks: Vec<String> = rows(&o)
+        .iter()
+        .map(|(s, c)| {
+            assert_eq!(s, "ok", "{}", stdout(&o));
+            c.clone()
+        })
+        .collect();
+    let mut want: Vec<&str> = GREEN_ROWS.to_vec();
+    want.insert(want.iter().position(|c| *c == "vpc-endpoints").unwrap() + 1, "transcripts-bucket");
+    assert_eq!(checks, want);
+    assert!(row(&o, "vpc-endpoints").contains(&format!("{VPCE}: the one S3 gateway endpoint, on {PROXY_RTB} only, its policy the stack's")), "{}", stdout(&o));
+    assert!(row(&o, "transcripts-bucket").contains(&format!("{BUCKET}: versioned, SSE-S3, owner-enforced, public access blocked, its policy the stack's")), "{}", stdout(&o));
+    assert!(row(&o, "parameters").starts_with("ok"), "the bucket's host in allow is the one exemption: {}", stdout(&o));
+    let calls = t.calls();
+    for op in ["get-bucket-versioning", "get-bucket-encryption", "get-bucket-ownership-controls", "get-public-access-block", "get-bucket-policy"] {
+        assert!(calls.iter().any(|l| l.starts_with(&format!("s3api {op} --bucket {BUCKET} --expected-bucket-owner 123456789012 "))), "{op}: {calls:?}");
+    }
+    assert!(!calls.iter().any(|l| l.contains("object")), "bucket reads only: {calls:?}");
+    let drift = |check: &str, detail: &str| {
+        let o = t.run(&["egress", "status"]);
+        assert_eq!(code(&o), 1, "{check}: {}\n{}", stdout(&o), stderr(&o));
+        let line = row(&o, check);
+        assert!(line.starts_with("DRIFT") && line.contains(detail), "{check}: {line}");
+    };
+    edit_answer(&t, "ec2.describe-vpc-endpoints.json", |d| d["VpcEndpoints"][0]["RouteTableIds"] = json!([VM_RTB]));
+    drift("vpc-endpoints", &format!("not exactly the proxy's [{PROXY_RTB}]"));
+    edit_answer(&t, "ec2.describe-vpc-endpoints.json", |d| {
+        d["VpcEndpoints"][0]["RouteTableIds"] = json!([PROXY_RTB]);
+        d["VpcEndpoints"][0]["PolicyDocument"] = json!(ENDPOINT_POLICY.replace("ai-env-transcripts-123456789012/v1/*", "*"));
+    });
+    drift("vpc-endpoints", "policy is not the stack's");
+    edit_answer(&t, "ec2.describe-vpc-endpoints.json", |d| {
+        d["VpcEndpoints"][0]["PolicyDocument"] = json!(ENDPOINT_POLICY);
+        let mut second = d["VpcEndpoints"][0].clone();
+        second["VpcEndpointId"] = json!("vpce-0fedcba9876543210");
+        d["VpcEndpoints"].as_array_mut().unwrap().push(second);
+    });
+    drift("vpc-endpoints", "vpce-0fedcba9876543210");
+    t.remove_answer("ec2.describe-vpc-endpoints.json");
+    t.restore("ec2.describe-vpc-endpoints.json");
+    drift("vpc-endpoints", &format!("the S3 gateway endpoint {VPCE} does not exist"));
+    t.s9();
+    t.answer("s3api.get-bucket-versioning.json", &json!({"Status": "Suspended"}));
+    drift("transcripts-bucket", "versioning \"Suspended\"");
+}
+
+/// S7 D2 with S9's one exception (`judge_parameters`): exactly the recorded
+/// transcripts bucket's host may be in `allow`. `sts.amazonaws.com` beside
+/// it, the bucket's host in `extras`, and the bucket's host while no bucket
+/// is recorded each drift, with S7 D2's text and fix.
+#[test]
+fn parameters_exempt_only_the_recorded_buckets_host() {
+    let t = Eg::new();
+    t.s9();
+    let param_row = |t: &Eg| {
+        t.status_answer(" applied=yes");
+        row(&t.run(&["egress", "status"]), "parameters")
+    };
+    assert!(param_row(&t).starts_with("ok"), "the recorded bucket's host");
+    t.set_param("allow", &format!("{ALLOW}{BUCKET_HOST}\nsts.amazonaws.com\n"));
+    let line = param_row(&t);
+    assert!(line.starts_with("DRIFT") && line.contains("allow: AWS service host(s) sts.amazonaws.com, where a VM's own IMDS credentials work (remove the line from infra/proxy/allow.txt and redeploy)") && !line.contains(BUCKET_HOST), "{line}");
+    t.set_param("allow", &format!("{ALLOW}{BUCKET_HOST}\n"));
+    t.set_param("extras", &format!("{EXTRAS_HEADER}{BUCKET_HOST}\tai-env\n"));
+    let line = param_row(&t);
+    assert!(line.starts_with("DRIFT") && line.contains(&format!("extras: AWS service host(s) {BUCKET_HOST}, where a VM's own IMDS credentials work (ai-env egress allow <slug> <host> --remove)")), "{line}");
+    t.set_param("extras", EXTRAS_HEADER);
+    // No bucket recorded (a state written before the S9 deploy): the host is an AWS host like any other.
+    t.write_state(|s| s.allow_sha256 = Some(value_sha256(&format!("{ALLOW}{BUCKET_HOST}\n"))));
+    let line = param_row(&t);
+    assert!(line.starts_with("DRIFT") && line.contains(&format!("allow: AWS service host(s) {BUCKET_HOST}")), "{line}");
 }

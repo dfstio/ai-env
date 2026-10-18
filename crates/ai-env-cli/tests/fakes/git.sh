@@ -9,7 +9,10 @@
 # paths only.
 #
 # Each call appends one line to GIT_ARGV_LOG, its fields separated by tabs:
-#   env=<the GIT_* names set when it started, sorted, comma-separated; - for none>
+#   uid=<id -u>, first, with FAKE_GIT_ENV_ALL=1 only
+#   env=<the GIT_* names set when it started, sorted, comma-separated; - for none;
+#        with FAKE_GIT_ENV_ALL=1 every name set when it started but the four
+#        the fake's own /bin/sh adds: PWD, OLDPWD, SHLVL and _>
 #   fds=<the descriptors 3 to 254 open when it started, comma-separated; - for none>
 #   then every argument, with % tab and newline written as %25 %09 %0A
 # Names only, never a value. Both are read before the knobs file below, so
@@ -31,6 +34,9 @@
 #                       <base-name>-<hash>.pack) lands there as
 #                       <subcommand>-<pid>.pack; such a call buffers the pack
 #                       whole before it goes on
+#   FAKE_GIT_ENV_ALL    1: the line starts with `uid=` and `env=` lists every
+#                       name, not only GIT_* (S9: the environment git
+#                       http-backend gets in the VM)
 #
 # The caller's environment cannot carry the knobs (GitRun strips GIT_* on the
 # Mac and clears it in the VM), so when a file `<this path>.knobs` sits beside
@@ -47,7 +53,9 @@ while [ "$n" -le 254 ]; do
   fi
   n=$((n + 1))
 done
-names=$(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p' | sort -u | tr '\n' ',' | sed 's/,$//')
+# Every name set at the start (names only, never a value), and the GIT_* among them.
+all=$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort -u)
+names=$(printf '%s\n' "$all" | sed -n '/^GIT_/p' | tr '\n' ',' | sed 's/,$//')
 
 case $0 in
   */*)
@@ -56,6 +64,12 @@ case $0 in
     fi
     ;;
 esac
+
+uid=""
+if [ "${FAKE_GIT_ENV_ALL:-}" = "1" ]; then
+  uid=$(id -u)
+  names=$(printf '%s\n' "$all" | grep -v -x -e PWD -e OLDPWD -e SHLVL -e _ | tr '\n' ',' | sed 's/,$//')
+fi
 
 # The subcommand: the first argument past git's global options (those that
 # take a value as the next argument skip it), and its position.
@@ -76,8 +90,9 @@ for a in "$@"; do
 done
 
 if [ -n "${GIT_ARGV_LOG:-}" ]; then
-  awk -v env="${names:--}" -v fds="${fds:--}" 'BEGIN {
+  awk -v uid="$uid" -v env="${names:--}" -v fds="${fds:--}" 'BEGIN {
     line = "env=" env "\tfds=" fds
+    if (uid != "") line = "uid=" uid "\t" line
     for (i = 1; i < ARGC; i++) {
       a = ARGV[i]
       gsub(/%/, "%25", a)

@@ -1,5 +1,6 @@
 //! S8 §13: the doc-test. The fenced `sh doc-test` blocks of the README's
-//! "Cursor in a MicroVM (stage S8)" section and of `skills/ai-env/SKILL.md`
+//! "Cursor in a MicroVM (stage S8)" section, of its S9 section ([`S9_SECTION`])
+//! and of `skills/ai-env/SKILL.md`
 //! run in their dry forms ([`DRY_FORMS`] is the specification) against a
 //! planted HOME: S7's green world (the sealed runtime key and setup-token,
 //! the egress record, the fake age), the file-backed fake API with one VM
@@ -18,14 +19,17 @@
 //! `vm warm --dry-run` among them, and no seal); its calls to the fake API
 //! (none, reads, or reads and a code-port token for `box fetch --dry-run`);
 //! the refused tools it ran (the doctor's probes only); and the HOME tree,
-//! which it changes only as a dry run may ([`allowed_change`], [`content`]).
-//! Afterwards the endpoint saw code-out reads only, and the fixture
-//! repository's refs, index, status and files are unchanged. Beside it: the
+//! which it changes only as a dry run may ([`allowed_change`], [`content`]),
+//! its audit log only by appending the rows its row names (S9: `box review`
+//! audits each review, [`audit_problems`]). Afterwards the endpoint saw
+//! code-out reads only, and the fixture repository's refs, index, status and
+//! files are unchanged (no pre-push hook written either). Beside it: the
 //! Commands block parses (`--help`), the VM's CLAUDE.md in the README is
 //! `image/claude/CLAUDE.md` byte for byte, every JSON block parses, every
-//! `ai-env` command of the two S8 sections is doc-tested, and the engine
-//! refuses what it must. In `make test` (the default and bridge worlds) and
-//! `make doc-test`. Built in S8 wave 2 (W9).
+//! `ai-env` command of the two S8 sections and of the S9 section is
+//! doc-tested, and the engine refuses what it must. In `make test` (the
+//! default and bridge worlds) and `make doc-test`. Built in S8 wave 2 (W9);
+//! the S9 section and its rows in S9 wave 2 (G9).
 //!
 //! A doc-test line is one `ai-env` command, optionally followed by two
 //! spaces and a `#` comment. Words split on whitespace, single and double
@@ -48,7 +52,7 @@ use ai_env_cli::bridge::config::Paths;
 use ai_env_cli::bridge::registry::{self, SessionRow};
 use ai_env_cli::bridge::settings_capture::{capture_path, CapturePhase};
 use ai_env_cli::bridge::vm::fake_file::FileFakeMicrovmApi;
-use ai_env_cli::wire::frame::CAP_WORKSPACE_V1;
+use ai_env_cli::wire::frame::{CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
 use ai_env_cli::wire::workspace::{head_line, CodeoutManifest, ObjectFormat, SeedManifest, SettingsCapture, SettingsFile, SettingsScope, CODE_PORT};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -64,6 +68,11 @@ use std::time::{Duration, Instant};
 const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 /// The README's S8 section, by its heading.
 const SECTION: &str = "### Cursor in a MicroVM (stage S8)";
+/// The README's S9 section, by its heading.
+const S9_SECTION: &str = "### Pushes reviewed, transcripts in S3 (stage S9)";
+/// The bridge's audit log, relative to the planted HOME: a documented command
+/// may only append to it, and only the rows its [`DryForm::audits`] names.
+const AUDIT_LOG: &str = "bridge/audit.jsonl";
 /// SKILL.md's MicroVM section, by its heading.
 const SKILL_SECTION: &str = "## MicroVM sessions (ai-env bridge)";
 /// The info string of a block the doc-test runs (GitHub reads its first word only, and highlights it as `sh`).
@@ -137,11 +146,18 @@ struct DryForm {
     api: Api,
     /// Whether it may run the refused tools ([`REFUSED_TOOLS`]): the doctor's probes.
     tools: bool,
+    /// The audit rows it may append to [`AUDIT_LOG`], by event (none unless [`DryForm::audited`] names them).
+    audits: &'static [&'static str],
 }
 
 impl DryForm {
     const fn new(cmd: &'static [&'static str], dry: Dry, codes: &'static [i32], says: &'static [&'static str], unseals: u8, api: Api, tools: bool) -> DryForm {
-        DryForm { cmd, dry, codes, says, unseals, api, tools }
+        DryForm { cmd, dry, codes, says, unseals, api, tools, audits: &[] }
+    }
+
+    /// The row, allowed to append these audit events (a read-only command that audits itself: `box review`).
+    const fn audited(self, events: &'static [&'static str]) -> DryForm {
+        DryForm { audits: events, ..self }
     }
 }
 
@@ -153,10 +169,16 @@ impl DryForm {
 /// one Touch ID each, the runtime key's unseal: `box fetch --dry-run` mints
 /// a code-port token to read the VM's refs, and `vm list` and `vm gc` list
 /// the VMs; `box seed --dry-run` and `vm warm --dry-run` reach neither AWS
-/// nor age. Not listed on purpose: `vm status` and `vm health` (they
-/// rewrite the VM's row), `vm terminate`, `vm exec`, `egress check` (no dry
-/// form).
-const DRY_FORMS: [DryForm; 16] = [
+/// nor age. S9's: `box review` is read-only as written (no AWS, no Touch ID;
+/// it audits each review, `box_review`), `box hook-install --dry-run` writes
+/// no hook, and `session gc --remote` and `session migrate-s9` without
+/// `--yes` list from the Mac's own files (no S3 read, no Touch ID). Not
+/// listed on purpose: `vm status` and `vm health` (they rewrite the VM's
+/// row), `vm terminate`, `vm exec`, `egress check`, `session stage`,
+/// `session sync` and `session forget` (no dry form). `box fetch
+/// --smart-http` stays out of the blocks: the stand-in endpoint answers a
+/// code-out's manifest and speaks no git smart-HTTP.
+const DRY_FORMS: [DryForm; 20] = [
     DryForm::new(&["wrapper", "install"], Dry::Drop("--write"), &[0], &["dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "uninstall"], Dry::Drop("--write"), &[0], &["nothing to remove", "dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "status"], Dry::AsIs, &[0], &["claudeCode.claudeProcessWrapper"], 0, Api::None, false),
@@ -173,6 +195,10 @@ const DRY_FORMS: [DryForm; 16] = [
     DryForm::new(&["wrapper", "census"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["vm", "list"], Dry::AsIs, &[0], &[], 1, Api::Reads, false),
     DryForm::new(&["lab", "list"], Dry::AsIs, &[0], &[], 0, Api::None, false),
+    DryForm::new(&["box", "review"], Dry::AsIs, &[0], &["box review: pass", "\"verdict\": \"pass\""], 0, Api::None, false).audited(&["box_review"]),
+    DryForm::new(&["box", "hook-install"], Dry::Add("--dry-run"), &[0], &["nothing was written", "\"would_install\""], 0, Api::None, false),
+    DryForm::new(&["session", "gc"], Dry::Drop("--yes"), &[0], &["nothing removed", "no S3 transcript", "\"dry_run\": true"], 0, Api::None, false),
+    DryForm::new(&["session", "migrate-s9"], Dry::Drop("--yes"), &[0], &["nothing migrated", "no S8 mirror", "\"dry_run\": true"], 0, Api::None, false),
 ];
 
 /// Flags that make a listed command act (a Touch ID, a probe row): refused on any line.
@@ -399,11 +425,14 @@ fn docs() -> (String, String) {
     (read("README.md"), read("skills/ai-env/SKILL.md"))
 }
 
-/// The doc-test lines of the README's S8 section, then of SKILL.md.
+/// The doc-test lines of the README's S8 section, then of its S9 section, then of SKILL.md.
 fn documented_lines() -> Vec<DocLine> {
     let (readme, skill) = docs();
-    let (first, text) = section(&readme, SECTION).unwrap_or_else(|| panic!("README.md has no {SECTION:?} section"));
-    let mut lines = doc_lines(text, "README.md", first);
+    let mut lines = Vec::new();
+    for heading in [SECTION, S9_SECTION] {
+        let (first, text) = section(&readme, heading).unwrap_or_else(|| panic!("README.md has no {heading:?} section"));
+        lines.extend(doc_lines(text, "README.md", first));
+    }
     lines.extend(doc_lines(&skill, "skills/ai-env/SKILL.md", 1));
     lines
 }
@@ -687,6 +716,27 @@ fn allowed_change(rel: &str) -> bool {
     under("bridge/logs") || under("bridge/state/scan-cache") || rel == "bridge/state/tmp" || (rel.starts_with("bridge/quarantine/") && rel.ends_with("/settings/diff.json"))
 }
 
+/// What a command did to the audit log, `before` and `after` its run, that
+/// its row does not allow: the log must only grow, by whole JSON rows whose
+/// `event` is one of `allowed` (none for most rows). Each problem in a line.
+fn audit_problems(allowed: &[&str], before: &[u8], after: &[u8]) -> Vec<String> {
+    let Some(added) = after.strip_prefix(before) else {
+        return vec!["rewrote the audit log (a row before its run changed or went)".to_string()];
+    };
+    if !added.is_empty() && !added.ends_with(b"\n") {
+        return vec!["left a torn row at the end of the audit log".to_string()];
+    }
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(added).lines() {
+        match serde_json::from_str::<Value>(line).ok().and_then(|v| v["event"].as_str().map(str::to_string)) {
+            Some(event) if allowed.contains(&event.as_str()) => {}
+            Some(event) => out.push(format!("appended the audit row {event} (the row allows {allowed:?})")),
+            None => out.push(format!("appended an audit line that is no row: {line}")),
+        }
+    }
+    out
+}
+
 /// What differs between two trees: each path whose entry was added,
 /// removed or changed, and what it was and became.
 fn changes(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -737,11 +787,13 @@ impl World {
             cmd.env("AI_ENV_PASTE_STDIN", "1");
             cmd
         });
-        // An S8 image's VM: its `/health` names the workspace routes' capability, which `vm health` records.
+        // An S9 image's VM: its `/health` names the workspace routes' capability, git smart-HTTP's and the
+        // transcript store's, which `vm health` records (once the S3 cut-over holds, SELECT_VM reuses no VM
+        // without `transcript_s3_v1`, and `vm warm --dry-run` reuses this one).
         FileFakeMicrovmApi::open(&fake)
             .and_then(|api| {
                 api.with(|s| {
-                    s.health_caps.push(CAP_WORKSPACE_V1.to_string());
+                    s.health_caps.extend([CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1].map(str::to_string));
                     Ok(())
                 })
             })
@@ -926,10 +978,11 @@ impl World {
 // ---- the tests ----------------------------------------------------------------------------
 
 /// The doc-test itself (the module doc): every `sh doc-test` line of the
-/// README's S8 section and of SKILL.md runs in its dry form in the planted
-/// world, asks for what its row allows and no more, and changes nothing a
-/// dry run may not change. Every failure is listed, each laid at the door
-/// of the line that caused it, the world's checks too, before the test fails.
+/// README's S8 and S9 sections and of SKILL.md runs in its dry form in the
+/// planted world, asks for what its row allows and no more, and changes
+/// nothing a dry run may not change. Every failure is listed, each laid at
+/// the door of the line that caused it, the world's checks too, before the
+/// test fails.
 #[test]
 fn readme_doc_test_blocks_run_in_their_dry_forms() {
     let lines = documented_lines();
@@ -938,6 +991,7 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
     let mut problems = Vec::new();
     // HOME before each command, so a change is laid at the door of the command that made it.
     let mut home = w.home_tree();
+    let audit_log = w.home.join(AUDIT_LOG);
     for line in &lines {
         let planned = match plan(&line.text, &|name| w.fill(name)) {
             Ok(p) => p,
@@ -948,6 +1002,7 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
         };
         let (form, ran) = (planned.form, format!("ai-env {}", planned.args.join(" ")));
         let (calls_at, age_at, tools_at) = (w.fake().calls.len(), log_lines(&w.age_log()).len(), log_lines(&w.tools_log()).len());
+        let audit_at = std::fs::read(&audit_log).unwrap_or_default();
         let out = w.run(&planned.args);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let code = out.status.code();
@@ -982,8 +1037,12 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
                 problems.push(format!("{}: `{ran}` ran the refused `{tool}` (only the doctor probes the tools)", line.at));
             }
         }
+        // The audit log: appended to only by the rows its row names (judged here, so the tree skips it).
+        for why in audit_problems(form.audits, &audit_at, &std::fs::read(&audit_log).unwrap_or_default()) {
+            problems.push(format!("{}: `{ran}` {why}", line.at));
+        }
         let after = w.home_tree();
-        for (path, change) in changes(&home, &after).into_iter().filter(|(path, _)| !allowed_change(path)) {
+        for (path, change) in changes(&home, &after).into_iter().filter(|(path, _)| !allowed_change(path) && path != AUDIT_LOG) {
             problems.push(format!("{}: `{ran}` changed HOME: {path}: {change}", line.at));
         }
         home = after;
@@ -1014,15 +1073,16 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
     assert!(problems.is_empty(), "{} problem(s) in the doc-test of {} documented commands:\n\n{}", problems.len(), lines.len(), problems.join("\n\n"));
 }
 
-/// Both S8 sections exist and doc-test their commands: the README's and
-/// SKILL.md's hold `sh doc-test` lines, and no plain `sh` block there holds
-/// an `ai-env` command, which would escape the doc-test (git and make
-/// commands sit in plain blocks).
+/// Both S8 sections and the README's S9 section exist and doc-test their
+/// commands: each holds `sh doc-test` lines, and no plain `sh` block there
+/// holds an `ai-env` command, which would escape the doc-test (git and make
+/// commands sit in plain blocks; S9's commands without a dry form, such as
+/// `session stage`, are named in the prose).
 #[test]
 fn the_s8_sections_doc_test_every_ai_env_command() {
     let (readme, skill) = docs();
     let mut escaped = Vec::new();
-    for (file, md, heading, at_least) in [("README.md", &readme, SECTION, 12), ("skills/ai-env/SKILL.md", &skill, SKILL_SECTION, 3)] {
+    for (file, md, heading, at_least) in [("README.md", &readme, SECTION, 12), ("README.md", &readme, S9_SECTION, 4), ("skills/ai-env/SKILL.md", &skill, SKILL_SECTION, 4)] {
         let (first, text) = section(md, heading).unwrap_or_else(|| panic!("{file} has no {heading:?} section"));
         let n = doc_lines(text, file, first).len();
         assert!(n >= at_least, "{file}'s {heading:?} holds {n} doc-test lines (at least {at_least})");
@@ -1194,6 +1254,32 @@ ai-env vm terminate ID --yes
     for c in "$`\\!".chars() {
         let why = plan(&format!("ai-env doctor \"x{c}y\""), &fill).expect_err("refused");
         assert!(why.contains(&format!("`{c}` inside double quotes")), "{c}: {why}");
+    }
+    // S9's rows: the review as written (its audit row allowed), the hook's dry run, the two lists without --yes;
+    // the store's commands that act have no dry form.
+    let s9 = |line: &str| plan(line, &fill).map(|p| (p.args.join(" "), p.form.audits)).unwrap_or_else(|e| panic!("{line}: {e}"));
+    assert_eq!(s9("ai-env box review main  # a comment"), ("box review main".to_string(), &["box_review"][..]));
+    assert_eq!(s9("ai-env box hook-install WORKSPACE"), ("box hook-install /w --dry-run".to_string(), &[][..]));
+    assert_eq!(s9("ai-env session gc --remote --yes"), ("session gc --remote".to_string(), &[][..]));
+    assert_eq!(s9("ai-env session migrate-s9 --yes"), ("session migrate-s9".to_string(), &[][..]));
+    for acting in ["ai-env session stage UUID --warm", "ai-env session sync UUID", "ai-env session forget UUID --purge"] {
+        let why = plan(acting, &fill).expect_err("no dry form");
+        assert!(why.contains("has no dry form"), "{acting}: {why}");
+    }
+    // The audit log: only appended to, by whole rows whose event the row allows.
+    let row = |event: &str| format!("{{\"v\":1,\"ts\":\"2026-10-18T08:00:00Z\",\"event\":\"{event}\",\"session_id\":null,\"pid\":1,\"detail\":{{}}}}\n");
+    let before = row("vm_run");
+    let grown = format!("{before}{}", row("box_review"));
+    assert!(audit_problems(&[], before.as_bytes(), before.as_bytes()).is_empty(), "nothing appended");
+    assert!(audit_problems(&["box_review"], before.as_bytes(), grown.as_bytes()).is_empty(), "an allowed row");
+    for (allowed, after, says) in [
+        (&[][..], grown.clone(), "appended the audit row box_review"),
+        (&["box_review"][..], row("box_review"), "rewrote the audit log"),
+        (&["box_review"][..], format!("{before}not a row\n"), "an audit line that is no row"),
+        (&["box_review"][..], format!("{before}{{\"event\":\"box_review\""), "a torn row"),
+    ] {
+        let why = audit_problems(allowed, before.as_bytes(), after.as_bytes());
+        assert!(why.len() == 1 && why[0].contains(says), "{says}: {why:?}");
     }
     // The planted world's own stderr lines pass unremarked, and nothing else does.
     for (said, own) in [

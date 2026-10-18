@@ -236,6 +236,8 @@ struct Shared {
     resumes: Mutex<u32>,
     /// Connections accepted (an attempt is recorded only once it is answered).
     accepted: Mutex<u32>,
+    /// Requests a `Held` action took, held now or let go since.
+    held: Mutex<u32>,
     /// The platform's hook client, when asked for ([`FakeEndpoint::start_platform`]).
     platform: Option<tokio::sync::Mutex<Platform>>,
     /// Every hook the platform's part posted, in order.
@@ -293,6 +295,7 @@ impl FakeEndpoint {
             released: tokio::sync::watch::channel(false).0,
             resumes: Mutex::new(0),
             accepted: Mutex::new(0),
+            held: Mutex::new(0),
             platform: hooks.map(|hooks| tokio::sync::Mutex::new(Platform { hooks, vms: BTreeMap::new(), replayed: 0 })),
             hooks: Mutex::new(Vec::new()),
             before_hook: Mutex::new(None),
@@ -375,6 +378,13 @@ impl FakeEndpoint {
     #[must_use]
     pub fn accepted(&self) -> u32 {
         *self.shared.accepted.lock().unwrap()
+    }
+
+    /// How many requests a `Held` action took (held now, or let go since):
+    /// unlike [`FakeEndpoint::accepted`], only the requests scripted to wait.
+    #[must_use]
+    pub fn held(&self) -> u32 {
+        *self.shared.held.lock().unwrap()
     }
 
     /// Every hook posted as the platform ([`FakeEndpoint::start_platform`]), in order.
@@ -647,6 +657,7 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
         Action::ForwardUntil { ref text } => cuts.until = Some(text.clone()),
         Action::Delay { by } => tokio::time::sleep(by).await,
         Action::Held => {
+            *shared.held.lock().unwrap() += 1;
             let _ = shared.released.subscribe().wait_for(|r| *r).await;
         }
         Action::CutRequestAfter { bytes } => cuts.request_bytes = Some(bytes),

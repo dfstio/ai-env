@@ -7,6 +7,10 @@
 //! `{project_key, session_id}`; 3 segments → none; 4 or more →
 //! `{project_key, session_id, subpath}` with `.jsonl` stripped from the last
 //! segment only.
+//!
+//! S9: [`is_unmirrored`] tells the lines a transcript holds that its mirror
+//! frames never carry (2.1.302's `api-request*` records).
+use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorKey {
@@ -73,6 +77,26 @@ pub fn mirror_key(projects_root: &str, file_path: &str) -> Option<MirrorKey> {
     None
 }
 
+/// Is `line` (one transcript line, its newline or not) a record the CLI
+/// writes to its transcript but never to a mirror frame: a top-level `type`
+/// that starts with `api-request` (2.1.302's `api-request` and
+/// `api-request-blob`)? A substring pre-check for `"api-request` first, then
+/// the top-level `type` alone is parsed; a line that does not parse (a torn
+/// last line) is kept: false.
+#[must_use]
+pub fn is_unmirrored(line: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\"api-request";
+    #[derive(Deserialize)]
+    struct Kind {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    if !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return false;
+    }
+    serde_json::from_slice::<Kind>(line).ok().and_then(|k| k.kind).is_some_and(|t| t.starts_with("api-request"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +139,29 @@ mod tests {
         assert_eq!(mirror_key(R, &format!("{R}/../projects/{P}/{S}.jsonl")), key(None));
         assert_eq!(mirror_key(R, &format!("{R}/{P}/{S}/x.jsonl")), None);
         assert_eq!(mirror_key(R, R), None);
+    }
+
+    /// 2.1.302's `api-request` records are the transcript's own; every other
+    /// line (an entry quoting the words, a nested `type`, a torn line) is mirrored.
+    #[test]
+    fn api_request_lines_are_unmirrored_and_a_torn_line_is_kept() {
+        for unmirrored in [
+            &br#"{"type":"api-request","requestId":"req_fake_1_1","sessionId":"s","timestamp":"2026-10-17T00:00:00.000Z"}"#[..],
+            br#"{"type":"api-request-blob","requestId":"req_fake_1_1","blob":"ZmFrZQ=="}"#,
+            b"{\"requestId\":\"r\",\"type\":\"api-request\"}\n",
+        ] {
+            assert!(is_unmirrored(unmirrored), "{}", String::from_utf8_lossy(unmirrored));
+        }
+        for kept in [
+            &br#"{"type":"user","message":{"role":"user","content":"what is an \"api-request\"?"}}"#[..],
+            br#"{"type":"assistant","message":{"content":[{"type":"api-request"}]}}"#,
+            br#"{"type":"api-request","requestId":"torn"#,
+            br#"{"type":"summary","summary":"x"}"#,
+            br#"{"kind":"api-request"}"#,
+            b"",
+            b"not json",
+        ] {
+            assert!(!is_unmirrored(kept), "{}", String::from_utf8_lossy(kept));
+        }
     }
 }

@@ -140,13 +140,18 @@ ai-env wrapper install [--write] [--permission-mode M] [--mode passthrough|remot
                                                           #   ai-env-claude; --mode also sets [wrapper].mode in bridge.toml (S8)
                                                           #   (dry run unless --write; backs up settings.json, and bridge.toml with --mode; bridge feature)
 ai-env wrapper status [--json]                            # is Cursor's wrapper set, which ai-env-claude, the effective mode and
-                                                          #   roots, a remote session's start checks, the extension Cursor last ran
-                                                          #   (read-only: no AWS, no Touch ID; exit 1 on a [NO ] row)
+                                                          #   roots, a remote session's start checks, the extension Cursor last ran and
+                                                          #   each open window's (read-only: no AWS, no Touch ID; exit 1 on a [NO ] row)
 ai-env wrapper uninstall [--write]                        # take claudeProcessWrapper out of Cursor's settings (dry run unless
-                                                          #   --write; backs up settings.json; initialPermissionMode and bridge.toml stay)
+                                                          #   --write; backs up settings.json; initialPermissionMode and bridge.toml stay;
+                                                          #   it warns first while remote chats keep only their view here, S9)
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env wrapper settings-sync UUID [--rule R]… [--all-safe] [--write] [--image-dir DIR]   # a remote chat's approved rules → the image (S8)
-ai-env session list [--json] | show UUID [--json] [--settings-diff] | forget UUID | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8)
+ai-env session list [--json] | show UUID [--json] [--settings-diff] | forget UUID [--purge] | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8)
+ai-env session stage UUID [--warm] [--json] | sync UUID [--json]   # a chat begun on this Mac into S3, its view left / a remote chat's
+                                                          #   transcript from its VM to S3 now (S9; one Touch ID each; --warm adds vm warm's and restores the chat into its VM)
+ai-env session gc --remote [--older-than DAYS] [--yes] [--json] | migrate-s9 [--yes] [--json]   # the S3 transcripts of chats closed over
+                                                          #   DAYS (90) ago / S8's mirrors into S3 (S9; without --yes: the list only)
 ai-env infra  scan DIR [--profile image|repo] [--json]    # secrets + unsafe-settings scan of an image tree; exit 9 on a finding
 ai-env infra  pin [--manifest FILE | --check-bundle | --bundle-version] [--lock FILE]  # image/claude.lock from a release manifest; lock vs Cursor bundle; the bundle's version
 ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi outputs + a live image read → bridge.toml [aws] + state/infra.toml
@@ -172,23 +177,30 @@ ai-env vm     warm WORKSPACE [--json] [--dry-run]          # start the workspace
 ai-env vm     attach ID --spawn UUID [--from-seq N]       # reattach to a running command (the newest client wins)
 ai-env vm     health ID --detail [--json]                  # /health/detail with the session bearer: guard, sockets, spawns, listeners
 ai-env box    seed [WORKSPACE] [--branch B] [--no-wip] [--replace] [--dry-run] [--max-mib N] [--json]   # the checkout into its VM at the same path (S8)
-ai-env box    fetch [UUID|WORKSPACE] [--wip] [--dry-run] [--max-mib N] [--json]   # the VM's commits and snapshots → refs/remotes/box/* (S8)
+ai-env box    fetch [UUID|WORKSPACE] [--wip|--smart-http] [--dry-run] [--max-mib N] [--json]   # the VM's commits and snapshots → refs/remotes/box/* (S8;
+                                                          #   --smart-http: git smart-HTTP v2 through the endpoint, S9)
+ai-env box    review REV [--base REV]… [--repo DIR] [--json]   # what a push of REV would carry, reviewed; exit 9 on a finding (S9; no AWS, no Touch ID)
+ai-env box    hook-install [REPO] [--dry-run] [--json]    # the pre-push hook that reviews every push (S9; never over another hook)
 ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]   # probes → lab/probes.jsonl
 ai-env egress status [--json] | env [--shell] | reload [--if-changed]   # S5 operator commands, as ai-env-ops (see Identities; bridge feature)
 ai-env egress allow SLUG HOST [--remove] | suspend HOST [--restore]    # per-workspace extras (global on the proxy; allow: the deployer only) / the kill switch
-ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a vpc VM: direct egress and DNS closed, the allowlist working → state/egress-verified.toml
+ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a vpc VM: direct egress and DNS closed, the allowlist working, S3 for
+                                                          #   the transcripts bucket alone (S9) → state/egress-verified.toml
 ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress), as ai-env-ops
 ai-env as     deployer|ops|root|ambient [--account ACCOUNT] -- CMD ARGS...   # run CMD as one AWS identity, the marker AI_ENV_BRIDGE_AS set (Identities)
 ai-env as     --check deployer|ops|root|ambient                # make's guard: exit 0 when this process already runs as it, else 9
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
-ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature)
+ai-env-claude <realBinary> <claude args…>                 # Cursor's claudeProcessWrapper target (bridge feature); a first argument
+                                                          #   that is empty, starts with - (but --version, -V, --help or -h alone: exit 0)
+                                                          #   or is a bare name but claude: its usage, exit 2 (S9)
 ```
 
 Exit codes: `0` ok (broken pipes too) · `1` error · `2` usage · `3` cancelled at the prompt (or a
 Ctrl-C during `lab run`, once the probe's VMs are ended) · `4` no key opens this file · `5` auth
 unavailable (plugin missing, no GUI session, AWS credentials unavailable) · `6` corrupt or plaintext
 file where a container was expected · `7` AWS/infra API failure · `8` MicroVM terminal or transport
-lost · `9` policy refusal (tripwire, egress gate, workspace outside the approved roots). `vm exec`
+lost · `9` policy refusal (tripwire, egress gate, workspace outside the approved roots, a review
+finding or a refused push, a local resume of a remote chat's view). `vm exec`
 exits with the remote command's own status (128 + N when a signal killed it; 127 when the VM has no
 such program, 126 when it cannot run it and 1 when the working directory cannot be made, each with an
 `ai-env: vm exec:` line); its own failures keep 7/8/9 (with a credential also 3, 4 and 5: see
@@ -241,7 +253,10 @@ Everything else — every subcommand, `--version`, and every session while neith
 
 - peels the child's `transcript_mirror` frames (never forwarded) and, when
   `AI_ENV_BRIDGE_MIRROR_ROOT` is set or the child uses another config dir, appends their entries
-  byte-for-byte under the same relative path (0600 files, 0700 directories, no symlinks);
+  byte-for-byte under the same relative path (0600 files, 0700 directories, no symlinks); claude
+  2.1.301 and later write their `api-request`, `api-request-shape` and `api-request-blob` records to
+  their own file only, never to a frame, so the copy lacks them (T2.5 compares the copy with
+  `grep -v '"type":"api-request'` of the real file, not the raw file);
 - records the extension's `initialize` and state requests (permission mode, `apply_flag_settings`,
   MCP servers, …) and replays them into a respawned child without the extension noticing;
 - `local-scratch` runs the child with its own `CLAUDE_CONFIG_DIR` under
@@ -281,7 +296,8 @@ its own, waits at most n ms, never forwards the answer, and records its class in
 `stock-ext-oauth` row's note) and `AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS=<n>` (the `local-scratch`
 unseal's budget in ms, in place of `[creds].unseal_timeout_s`; the same knob budgets a credentialed
 `vm` or `lab` command's unseals: see Credentials). All are compiled out of release builds, and the
-live make targets drop every lab knob (`LAB_UNSET`).
+live make targets drop every lab knob (`LAB_UNSET`); only `make test-aws SLOW=1` then sets one again,
+S9's `AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2`, for its test process (stage S9).
 
 ### The MicroVM image and its infrastructure (stage S3)
 
@@ -340,7 +356,9 @@ all three agree it runs `make infra-status WRITE=1`, checks that new VMs start t
 version (a rollback with `make image-deactivate`/`image-activate` stops it, and so does an
 `[aws].image_version` that pins another version or is written in a form the script does not read)
 and runs `ai-env egress check --if-needed`, which starts no VM once the version new VMs run has a
-pass bound to its build and to the connector's live facts. It never runs under `make -i`, `-k` or
+pass bound to its build and to the connector's live facts, at most 7 days old and judged by the
+current DNS and egress rules (a pass recorded before S9's S3 cases never counts: the check runs again
+and says why). It never runs under `make -i`, `-k` or
 `-p`, nor with `BREAKGLASS=1` on its command line (break-glass is `make deploy BREAKGLASS=1`, then
 the steps by hand). Otherwise it checks the preconditions first (a terminal, the stack's Pulumi
 passphrase in the environment or its sealed file to unseal, "The stack's passphrase" under
@@ -496,9 +514,11 @@ still get created).
   removal says `STILL ALLOWED on the proxy` and exits 7; an AWS service host (`amazonaws.com`,
   `amazonaws.com.cn`, the `.aws` domain) is refused with exit 9, and one already listed shows as drift in
   `egress status`: a VM reads its execution role's keys from IMDS, and those keys work at AWS endpoints
-  and nowhere else), `egress reload [--if-changed]`, `egress status` (connector, ENIs, routes, security groups,
-  NACL, VPC DNS and DHCP, no endpoints, NAT, peering or IPv6, the proxy serving exactly the parameters
-  the stack rendered; any drift is exit 1), `egress env` (no AWS call), `proxy stop|start|patch`.
+  and nowhere else; S9's transcripts bucket is the one AWS host the stack's own `allow` list holds, see
+  "S3 through the proxy"), `egress reload [--if-changed]`, `egress status` (connector, ENIs, routes,
+  security groups, NACL, VPC DNS and DHCP, no endpoint but S9's S3 gateway endpoint on the proxy's route
+  table, no NAT, peering or IPv6, the transcripts bucket's settings, the proxy serving exactly the
+  parameters the stack rendered; any drift is exit 1), `egress env` (no AWS call), `proxy stop|start|patch`.
   `egress allow` (adding or `--remove`) writes `extras`, which widens what every vpc VM may reach, so
   it needs the deployer: as ai-env-ops it is refused before any Touch ID or AWS call (exit 9, naming
   `ai-env as deployer -- ai-env egress allow SLUG HOST`), and IAM denies ai-env-ops that write anyway.
@@ -507,7 +527,8 @@ still get created).
   `(only ai-env-ops and ai-env-deployer may send the proxy documents: run it under ai-env as ops --)`.
 - **`egress check`** starts its own `--egress vpc --shell` VM and runs, through the platform shell,
   curl and dig cases: direct egress and DNS must be closed, the allowlist must answer (401 from the API)
-  and refuse the rest. The case markers are VM-reported, so a pass also needs the VM-independent
+  and refuse the rest; since S9, S3 must take our transcripts bucket alone (seven more cases, 34 in
+  all: "S3 through the proxy"). The case markers are VM-reported, so a pass also needs the VM-independent
   network verification of `egress status` and squid's own log lines (from CloudWatch) for the run's
   tunnels and denials. A pass is recorded in `state/egress-verified.toml` for that image version and
   connector and bound to the connector as the network verification judged it (its Id, network
@@ -524,7 +545,8 @@ still get created).
   result fails.
 - **Credentials (S7)** may enter a VM only through `egress::credential_gate`: a `vpc` VM whose live
   echo is exactly the connector, whose image version has a recorded passing check under the current DNS
-  rule, and whose DNS verdicts (the check's and the newest `dns-path`) are `no-dns` or `platform-dns:<ip>`
+  and egress rules (since S9 a pass recorded before its S3 cases does not count), and whose DNS
+  verdicts (the check's and the newest `dns-path`) are `no-dns` or `platform-dns:<ip>`
   of resolvers `[egress] accept_platform_dns = "<ip>"` names (a list for several). A platform reply counts
   only as an empty NOERROR (no answer, no authority section) to a fresh name `d<nonce>.example.com`, from a
   server that also answers example.com without an address. Any other platform reply (another status, an
@@ -819,14 +841,18 @@ allowlist, logged in with the sealed setup-token (S7). Cursor still starts `ai-e
 there: the sign-in it runs when you log in with no chat open, and the prompt-suggestion
 queries it runs only with `CLAUDE_PROACTIVE_SUGGESTIONS=true` in its own environment), the wrapper
 picks the workspace's VM, seeds the workspace into it at the identical absolute path
-(the image's agent is `/Users/mike`, as on the Mac), starts claude there with `--session-mirror` and
-relays its stream; the `initialize` answer carries the wrapper's own pid. Everything else
+(the image's agent is `/Users/mike`, as on the Mac), starts claude there and relays its stream (since
+S9 without `--session-mirror`: the transcript stays in the VM and in S3, and the Mac keeps a view of it,
+see stage S9); the `initialize` answer carries the wrapper's own pid. Everything else
 (`auth status`, `mcp add` and every other subcommand, `--version`, a session outside the roots) execs
 the bundled claude on the Mac, as in passthrough. Under the roots a remote session fails closed: an exit
 code and one `ai-env-claude:` line, never a silent run on the Mac. That holds even when bridge.toml does
 not load: the wrapper still reads its mode and roots as plain TOML, and a session under them exits 1
 with the error's first line (roots it cannot read, a misspelt `roots` or `path` key included, hold every
-session; a file that cannot be read or is not TOML at all fails every session unless
+session; since S9 (F1) so do a `roots` or `path` key outside any table and a table one typo from
+`[workspaces]` or `[[workspace]]`, such as `[worksapces]`, while an unknown `[wrapper]` key, a table one
+typo from `[wrapper]` (`[wraper]`) or a `mode` key outside any table leave the mode unreadable, which
+counts as remote; a file that cannot be read or is not TOML at all fails every session unless
 `AI_ENV_BRIDGE_MODE` names a mode other than `remote`; with no bridge.toml there are no roots). A
 workspace has one VM: the config probe and the chats share it, and a reopened chat goes back to the VM
 it ran on while that VM lives.
@@ -842,8 +868,11 @@ chats already open (it restarts them). `ai-env wrapper status` shows the result.
 (and each `[[workspace]] path`) decides which workspaces go remote: keep it narrow while you try it
 out. `ai-env doctor` shows the mode,
 whether the image new VMs run serves the workspace routes (`workspace_v1`: an image older than S8 needs
-`make deploy`) and the `[seed]` caps; `ai-env creds status` shows the sealed setup-token and whether
-`combined.env` is current.
+`make deploy`) and the `[seed]` caps, and since S9 each workspace's pre-push hook (stage S9) and a
+`[!! ]` for each open Cursor window still on another extension than the one installed
+(`a Cursor window runs extension V (host pid N, since T); W is installed  <- reload that window`, from
+the census: each live extension host's newest row); `ai-env creds status` shows the sealed setup-token
+and whether `combined.env` is current.
 
 ```sh doc-test
 ai-env wrapper install --write --mode remote   # Cursor's wrapper setting and [wrapper] mode = "remote" (backups first)
@@ -854,7 +883,9 @@ ai-env creds status                            # the sealed setup-token and comb
 
 **The kill switch.** `AI_ENV_BRIDGE_LOCAL=1` in `claudeCode.environmentVariables` (Cursor's user
 settings: a list of name and value pairs) makes the wrapper exec the bundled claude before it reads
-anything: plain Cursor on this Mac, no AWS call, no census, no Touch ID. It is the way out when remote
+anything: plain Cursor on this Mac, no AWS call, no census, no Touch ID. Since S9 it reads one thing
+first, the first 4 KiB of the chat file a `--resume` or `--continue` names, and refuses a remote chat's
+view (exit 9; stage S9). It is the way out when remote
 mode itself is broken. `AI_ENV_BRIDGE_MODE` in the same list overrides `[wrapper].mode` (`passthrough`
 or `remote`), and `ai-env wrapper install --write --mode passthrough` switches remote mode off in
 bridge.toml. VMs already running stay until they suspend, reach their wall or are terminated.
@@ -884,13 +915,16 @@ each config probe under the roots asks for a Touch ID, and `auth status`, which 
 start the prewarm (one more). A local chat goes remote whenever Cursor starts a process for it again:
 a window reload, a Cursor or extension-host restart, Reload Claude, closing and reopening its tab,
 opening it in a second window, a rewind or fork (a new session), or its process ending (the next
-action that needs one starts it again).
+action that needs one starts it again). Since S9 a remote chat's file on this Mac is only its view, and
+a reload with the setting out resumes every open chat on this Mac, past the wrapper: close the remote
+chats' tabs first (`wrapper uninstall` warns while such views exist; stage S9).
 `ai-env wrapper status` shows where the chats Cursor starts next will run: the setting and the
 `ai-env-claude` it names, the kill switch and `AI_ENV_BRIDGE_MODE` in Cursor's list, the effective
-mode, the roots, whether bridge.toml passes the checks a remote session runs at its start, and the
+mode, the roots, whether bridge.toml passes the checks a remote session runs at its start, the
 extension version Cursor last ran (from the census, which only the wrapper writes: after a change to
-Cursor's settings.json it names none until Cursor has started a process through the wrapper). It cannot
-see a chat that is already running.
+Cursor's settings.json it names none until Cursor has started a process through the wrapper), and since
+S9 the one each open Cursor window runs (a window keeps the extension it loaded until it is reloaded).
+It cannot see a chat that is already running.
 
 ```sh doc-test
 ai-env wrapper install --write --mode passthrough   # every chat on this Mac again
@@ -912,7 +946,11 @@ When Cursor opens a window it runs `auth status --json`; under the roots the wra
 `ai-env vm warm WORKSPACE --prewarm` detached, so the VM is running and seeded before the first chat.
 `[vm] prewarm_on_auth_status` is `"auto"` (the default: only when the workspace has no VM to reuse),
 `"always"` or `"never"`; the prewarm needs the `touchid-gui` probe's `prompted` (a detached process can
-show the dialog) and costs a Touch ID of its own. Fewer prompts: `prewarm_on_auth_status = "never"`, or
+show the dialog) and costs a Touch ID of its own. Every setting skips a working directory in no git work
+tree (`prewarm:skipped(not_git)` in the census), a pinned VM (`AI_ENV_BRIDGE_VM`: `pinned`) and
+`[vm] reuse_per_workspace = false` (`reuse_off`), and starts none within 120 s of the last one (`recent`);
+a prewarm refused at its prechecks (a workspace a session would refuse) logs `no prewarm: …` in
+`logs/ai-env.log`. Fewer prompts: `prewarm_on_auth_status = "never"`, or
 `[aws] credentials = "profile:NAME"`, which reads the runtime key from an AWS profile without a prompt
 (weaker custody: the key sits in a plain file); a session on a VM that holds the token already then asks
 for none. `vm warm` by hand takes the VM's start and the seed out of Cursor's window.
@@ -977,7 +1015,8 @@ its uncommitted files into a `refs/wip/*` ref, and the Mac imports the VM's bran
 `[seed] keep_wip_refs`). The fetched objects go through the tripwires, the settings rules and
 `max_blob_mib` again, and a ref with a finding lands in `refs/remotes/box-quarantine/*` instead. Your
 branches, index and working tree are never touched: review the refs with git and merge by hand, and
-never push a `box/*` ref (S9 adds `box review` and a pre-push hook). A failed fetch goes to the
+never push a `box/*` ref (S9's `box review` checks what a push carries, and its pre-push hook refuses
+a `box/*` ref; stage S9). A failed fetch goes to the
 wrapper's log and the chat carries on. `ai-env box fetch` does the same by hand, from the workspace's
 VM or a chat's (by its session id), a suspended one too; a ref with a finding is exit 9. The VM also
 snapshots its checkout when it is suspended, never when it is terminated (the disk goes with the VM).
@@ -991,17 +1030,18 @@ ai-env box fetch UUID --dry-run    # a chat's VM: the refs that would move, noth
 git branch -r --list 'box/*'              # what came back
 git log --oneline BRANCH..box/BRANCH      # the VM's commits on your branch
 git diff BRANCH...box/BRANCH              # their changes
-git merge --ff-only box/BRANCH            # take them (or cherry-pick), then push your branch as usual
+git merge --ff-only box/BRANCH            # take them (or cherry-pick), then push your branch as usual (S9's hook reviews it)
 ```
 
-**Picker and resume.** The VM's claude writes the transcript in the VM, and the wrapper mirrors it frame
-by frame into the Mac's `~/.claude/projects/` under the workspace's project name, so Cursor's picker
-lists the chat as before. Reopening it starts a session with `--resume`: the wrapper takes the VM the
-chat ran on while it lives; on a new VM (the old one terminated, or past its wall) it seeds the
-workspace and uploads the Mac's transcript before claude starts (audited `transcript_put`; when the VM's
-copy is longer, the VM keeps its own). What it would send, the transcript and its subagents' files,
-goes through the tripwires first (see Security): a finding is exit 9 and none of it is sent.
-`ai-env session show UUID` shows a chat's VM, spawn, seeded head and newest fetched snapshot.
+**Picker and resume.** The VM's claude writes the transcript in the VM. Since S9 it stays there and in
+S3, and the Mac's `~/.claude/projects/` holds only its view (the last 10 messages) under the workspace's
+project name, so Cursor's picker lists the chat as before (stage S9). Reopening it starts a session with
+`--resume`: the wrapper takes the VM the chat ran on while it lives, which keeps its copy; on a new VM
+(the old one terminated, or past its wall) it seeds the workspace and restores the transcript from S3
+before claude starts. A chat begun on this Mac goes up the first time it reopens remote, its transcript
+and its subagents' files through the tripwires first (see Security): a finding is exit 9 and none of it
+is sent. `ai-env session show UUID` shows a chat's VM, spawn, seeded head and newest fetched snapshot,
+and since S9 where its transcript is kept (`transcript_home`), where it began (`origin`) and its view.
 
 ```sh doc-test
 ai-env session list        # the chats the wrapper registered, newest first
@@ -1019,7 +1059,9 @@ there stays in the diff (settings-sync lists it as `already in the image` once p
 `ai-env session forget UUID` removes the captures.
 `ai-env session show UUID --settings-diff` shows the rules added in any of them (and in which VM),
 then each VM's other changes, per scope (allow, deny and ask rules removed, `defaultMode`, other keys
-by name only, `env` values masked), and writes it to `diff.json` there.
+by name only, `env` values masked), and writes it to `diff.json` there. Since S9 a turn's capture equal
+to its VM's newest one leaves `settings/checked.json` (when, and in which VM), so a chat that changed
+nothing reads `no change since the start capture (last checked T in VM ID)`.
 `ai-env wrapper settings-sync UUID --rule R` (repeatable, or `--all-safe`) shows how
 the rules would go into `image/claude/settings.json` and the settings policy; `--write` makes the change
 (backups first), scans the image again and rolls back unless it is clean. It never promotes a broad
@@ -1074,15 +1116,21 @@ make test-docker deploy   # the image with the rule (test-docker builds the zip 
   proxy variable or `CLAUDE_CODE_PROJECT_DIR_NAME` refuses the session (exit 9, the name named, never a
   value);
 - the scans are tripwires, not proofs: a secret in a shape no rule knows, in a tracked or untracked
-  file, goes to AWS; `box seed --dry-run` shows what a first seed would carry. A reopened chat's
-  transcript, with its subagents' files, goes through the same tripwires before the wrapper sends it
-  (a chat holds what its tools printed, on the Mac or, mirrored, on a VM): a file the VM lacks, or
-  holds shorter or different, that holds a finding is exit 9 naming `transcript:UUID.jsonl` (or the
+  file, goes to AWS; `box seed --dry-run` shows what a first seed would carry. A chat's transcript holds
+  what its tools printed: since S9 a remote chat's stays in the VM and in S3 (the Mac never receives it
+  and keeps only its masked view), and a chat begun on this Mac goes through the same tripwires, with
+  its subagents' files, before it is sent: a finding is exit 9 naming `transcript:UUID.jsonl` (or the
   subagent's file), the line and the rule, and none of it is sent; go on with that chat on the Mac
-  (`AI_ENV_BRIDGE_LOCAL=1`, the kill switch) or start a new one. A file the VM already holds is never
-  sent again, so a chat reopened on the VM it ran on goes on;
+  (`AI_ENV_BRIDGE_LOCAL=1`, the kill switch) or start a new one;
+- a VM ref whose name looks like a credential (the scrubber would change it, or a tripwire matches it)
+  never reaches your refs, logs or output: since S9 the VM's helper lists it under a stand-in, and the
+  Mac keeps it out and counts it without naming it (`N VM ref(s) skipped: a name that looks like a
+  credential (not shown)` in `box fetch`, `hidden` in the `codeout_fetch` row, a line in the wrapper's
+  log at most every ten minutes); a ref naming no commit (a tree, a blob or a tag) is kept out too and
+  counted in a line of its own (`N VM ref(s) skipped: an object that is no commit (a tree, a blob or a
+  tag; not shown)`), never named;
 - the VM has no `origin` and no push credential: nothing the agent writes reaches a remote before you
-  merge it and push it yourself.
+  merge it and push it yourself, and since S9 the pre-push hook reviews that push (stage S9).
 
 **Cost and clean-up.** An open chat keeps its VM running, and billed, for as long as it stays open (the
 session's keep-alive holds off the idle policy, up to the VM's wall, `[vm] max_duration_s`); S10 parks
@@ -1100,22 +1148,30 @@ ai-env vm gc --yes   # terminate expired VMs and clear stale rows (without --yes
 **Troubleshooting.** What Cursor shows, and what it means:
 
 - `Claude Code process exited with code N. stderr: …`: the end of the wrapper's stderr, whose last
-  line is `ai-env-claude: …` naming the fix. N is 1 (bridge.toml, the workspace's repository, or a
-  seed too large for Cursor's window: the line says which), 2 (`AI_ENV_BRIDGE_VM` is not a MicroVM
+  line is `ai-env-claude: …` naming the fix. N is 1 (bridge.toml, the workspace's repository, a
+  seed too large for Cursor's window, or since S9 a `state/infra.toml` that records no transcripts
+  bucket, `make infra-status WRITE=1`: the line says which), 2 (`AI_ENV_BRIDGE_VM` is not a MicroVM
   id), 3 (Touch ID dismissed), 4 or 6 (the keystore key, or a credentials file:
   `ai-env creds status`), 5 (no Touch ID in time, no sealed token or runtime key, or Anthropic refused
-  the token), 7 (AWS, or an image older than S8: `make deploy`), 8 (the VM is gone, or its connection
-  stayed lost: reopen the chat from the picker), 9 (a policy refusal: a scan finding, not a git
-  repository, `[vm] max_concurrent` (a closed chat's suspended VM counts until its suspended time or
-  its wall runs out: `ai-env vm terminate ID` frees a slot; `vm gc --yes` ends only expired VMs), the
-  credential gate, a refused environment name), 143 (stopped before the session started).
+  the token), 7 (AWS, or an image older than S8 or S9: the line names what it lacks, `make deploy`), 8
+  (the VM is gone, or its connection stayed lost: reopen the chat from the picker), 9 (a policy refusal:
+  a scan finding, not a git repository, `[vm] max_concurrent` (a closed chat's suspended VM counts until
+  its suspended time or its wall runs out: `ai-env vm terminate ID` frees a slot; `vm gc --yes` ends only
+  expired VMs), the credential gate, a refused environment name, and since S9 a transcript over the
+  64 MiB a reopen carries or pulls (run what the line names in a terminal:
+  `ai-env session stage UUID --warm`, after `ai-env session migrate-s9 --yes` for an S8 mirror, and
+  with `[vm] reuse_per_workspace` set to true first when it is off) or a local resume of a remote
+  chat's view), 143 (stopped before the session started).
 - `Subprocess initialization did not complete within 60000ms`: nothing answered `initialize` within
   60 s. The wrapper gives up at 50 s, with an exit and
   `did not start within Cursor's 60 s window (stuck at STEP)`, so this means it hung: the census end
   row's `legs` show the slow step, and `ai-env vm warm WORKSPACE` before the chat takes the VM's start
-  and the seed out of the window.
+  and the seed out of the window. An egress that refuses or cannot reach api.anthropic.com adds about
+  20 s to every chat's `initialize`, whatever the legs say (claude retries its managed-settings and
+  policy-limits fetches before it answers): `ai-env egress status`.
 - `Nothing to resume for session UUID on channel N; starting a new conversation` (Cursor's Output
-  panel): the Mac holds no transcript of that chat, so the mirror never wrote it: see
+  panel): the Mac holds no view of that chat (since S9 its file here is the view: none was written yet,
+  or `session gc --remote --yes` or `session forget --purge` removed it): see
   `ai-env session show UUID` and the wrapper's log.
 
 The census records each session twice. The start row notes `mode:remote(config)` (`mode:remote` when
@@ -1128,13 +1184,19 @@ the VM only with claude's spawn there, so a start that ended while connecting to
 source though nothing was sent, or cached though the VM had lost its copy (exit 5,
 `credential not on the VM`): `ai-env creds status` lists the VMs that may hold the token),
 `seed` (seeded, updated,
-up_to_date, kept), `transcript` (uploaded, already_there, vm_longer, no_mac_copy), `fetch` (the fetches
+up_to_date, kept), `transcript` (S9: kept on the VM, restored from S3, staged from this Mac, or none),
+`mirror_dropped:N` (S9: transcript frames a remote child sent anyway, dropped; only when N is above 0),
+`fetch` (the fetches
 that succeeded, of those asked for), `close_ms`, `link_drops`, `auth_timers` and `pid_rewrite`, and for
-a session that never started its `step`. Under `~/.config/ai-env/bridge/`, `logs/wrapper.log` holds the
+a session that never started its `step`; a start row refused for a view notes `view_refused:resume` or
+`view_refused:continue`. Under `~/.config/ai-env/bridge/`, `logs/wrapper.log` holds the
 wrapper's notes and warnings (Cursor never shows them), `logs/ai-env.log` the CLI's, and `audit.jsonl`
 the sessions' rows (`session_remote_start`, `session_remote_end`, `session_remote_failed` with its step
-and why, `vm_select`, `seed`, `seed_refused`, `transcript_put`, `codeout_fetch`, `box_fetch_finding`,
-`settings_capture`, `settings_sync`, `prewarm`, `auth_timers_unmeasured`; the S4 to S7 rows a session
+and why, `vm_select`, `seed`, `seed_refused`, `codeout_fetch` (S9: with `via`, `codeout` or
+`smart-http`), `box_fetch_finding`, `settings_capture`, `settings_sync`, `prewarm`,
+`auth_timers_unmeasured`, and S9's `transcript_push`, `transcript_pull`, `transcript_view`,
+`transcript_stage`, `transcript_gc`, `transcript_migrate`, `box_review`, `hook_install` and
+`drop_transport`; never a URL or a transcript byte; the S4 to S7 rows a session
 writes carry purpose `session` or `prewarm`). `AI_ENV_BRIDGE_VM=ID` in Cursor's environment pins its
 chats to one VM, checked before any Touch ID. `ai-env session drop-transport UUID` closes a running
 remote chat's connection from the wrapper's side, and the chat reattaches (part B's check of T8.6).
@@ -1158,12 +1220,246 @@ ai-env lab list                  # the probes, touchid-gui among them (the prewa
 - Never write credentials, tokens or keys to disk, into commits, or into command lines.
 ```
 
-Debug builds also honour `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip`: a resumed remote session uploads no
-transcript, so the CLI's resume miss, the wrapper's retry and its replay happen live (part B's duplicate
-probes). `AI_ENV_BRIDGE_LAB_AGENT_ADDR` (S6) now carries the workspace routes on 8080 and 9418 too. The
+Debug builds also honour `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip`: a resumed remote session's first start
+restores no transcript (since S9 from S3; the wrapper's retry always restores), so the CLI's resume
+miss, the wrapper's retry and its replay happen live (part B's duplicate probes).
+`AI_ENV_BRIDGE_LAB_AGENT_ADDR` (S6) now carries the workspace routes on 8080 and 9418 too. The
 wrapper's log records both: the transcript knob as `skip_transcript`, the agent address in the
-`LAB KNOBS ACTIVE` line the CLI prints on stderr. The live Makefile targets drop both, and release
-builds compile them out.
+`LAB KNOBS ACTIVE` line the CLI prints on stderr. S9 adds two: `AI_ENV_BRIDGE_LAB_S3_ADDR` (a loopback
+fake S3 at `ip:port`, with the fake API only) and `AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES` (1 to 15: the
+minutes of a code-port token, for the live re-mint test). The live Makefile targets drop them all, but
+`make test-aws SLOW=1` then sets `AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2` for its test process, which
+mints the re-mint test's tokens itself (the `vm`, `box` and `session` commands and the chats it runs
+drop every lab knob); release builds compile them out.
+
+### Pushes reviewed, transcripts in S3 (stage S9)
+
+**What changes.** What a VM did comes back as S8 brings it, and a review now stands between it and any
+push: `ai-env box review` checks what a push would carry, and a pre-push hook runs that review on every
+push from the checkout. A remote chat's transcript no longer comes to the Mac at all: claude writes it
+in the VM, the VM copies it to S3 after every turn, and the Mac keeps only a view of its last 10
+messages, which Cursor's history lists and reopens; a reopened chat is restored from S3 into whichever
+VM serves it, with its whole context (one over 64 MiB reopens only on a VM that holds it: the one it
+ran on, or the one `ai-env session stage UUID --warm` restored it into). S9's image serves both (its
+`/health` names `git_http_v1` and `transcript_s3_v1`): a remote session never reuses a VM of an older
+image, and one it cannot do without
+(a pinned VM, or one it started of an older image version) is exit 7 naming `make deploy`, as is
+`box fetch --smart-http` there. Until `ai-env egress check` passes again after S9's `make deploy` and
+`make infra-status WRITE=1`, a remote session stops earlier, at the credential gate: exit 9 before any
+Touch ID, since a pass recorded before S9's S3 cases no longer counts (a pinned VM whose recorded caps
+show an older image is exit 7 earlier still).
+
+**Review before a push.** `ai-env box review REV` reviews the commits a push of REV would carry: those
+REV holds and the bases lack (`--base REV`, repeatable; by default every remote-tracking ref but ai-env's
+`refs/remotes/box/*` and `box-quarantine/*`; with none at all, the whole history, which a note says). It
+runs the seed's tripwires over every object (blobs, commit messages, path names, a blob over
+`[seed] max_blob_mib`), then judges each change at the commit that made it: the repo settings rules (D8)
+on the settings files the range brings, and `allow-not-in-policy` for an allow entry that neither the
+merge base nor `settings-policy.txt` holds; the dotenv rule; and the Cargo rules, `cargo-lock-removed` (a
+commit deleting a `Cargo.lock`, a link put in its place, or a lock gone against the base or against the
+tip a forced push replaces), `cargo-lock-source` (a new `source =` that is not crates.io),
+`cargo-lock-checksum` (a checksum changed for an unchanged version) and `cargo-config-source` (a source
+replacement, a `[patch]`, a `paths` override or an `include` in cargo's configuration; the file an
+include names is reviewed as that configuration). A lock emptied of the packages its base pinned counts
+as removed, and a lock or a cargo configuration the review's TOML reader cannot read (cargo reads TOML
+1.1) is a finding at the file, as is a settings file it cannot read as JSON. A watched file behind a
+link (a `Cargo.lock`, `.cargo`, `.claude`, a settings file or a dotenv pointing elsewhere in the tree, a
+link the base already holds included) is reviewed where the link leads, under the watched name. Where
+git runs the pre-push hook from the work tree (`core.hooksPath` naming a directory of the checkout), any
+change on the way to it is a finding too (`pre-push-hook-changed`), and so is a change to a git
+configuration file the repository reads from its work tree (an `include.path` to a tracked
+`.gitconfig`), which can move `core.hooksPath`. git's replace refs (`refs/replace/*`) never stand in for
+what is reviewed: the review reads the objects a push sends. It prints the commits' subjects
+(control characters stripped; a subject that trips a rule is withheld, naming the rule), at most 20
+finding lines naming the file, the line and the rule, never the value, then `box review: pass` or
+`box review: findings` (exit 9). No AWS call, no Touch ID; `--json` prints one document, and each review
+is audited (`box_review`).
+
+**The pre-push hook.** `ai-env box hook-install [REPO]` writes a `pre-push` hook where git runs hooks
+(`core.hooksPath` honoured), mode 0755, naming this `ai-env` by its absolute path; `--dry-run` prints the
+path and the body and writes nothing. From then on every `git push` from that checkout first runs
+`ai-env box review --pre-push`: each pushed range is reviewed against the remote's old tip and that
+remote's tracking refs (not those when the remote has two or more push URLs: git moves them after the
+first), and only a pass lets the push go; a report the hook could not write (a closed pipe) never lets
+a finding through. Before it reviews anything it refuses (exit 9)
+a push of a ref under `refs/remotes/` or `refs/ai-env/` (a `box/*` ref, any `--mirror` push) and a push
+to a remote named `box` or `box-quarantine`. A push to a bare URL is reviewed against the tips it
+replaces only, and the URL (git passes it as the remote's name too, credentials and all) is never
+printed or audited. The hook fails closed: once the `ai-env` it names is gone, every push is refused
+until `ai-env box hook-install` writes it again. It never replaces another hook: `hook-install` then
+exits 1 and prints the two lines to put first in that hook, before any `exit` or read of its stdin (they
+read the pushed refs once and feed them to the review; the hook's own readers take them the same way,
+`printf '%s' "$ai_env_refs" | git lfs pre-push "$@"`); a hook of ours naming another `ai-env`, or no
+longer executable, is written again. A hook in the work tree, or a git configuration file
+there that can move it, gets a warning (a merged or checked-out commit can replace it, and committing
+such a change is itself a review finding).
+`ai-env doctor` has a row per workspace: `[ok ]` installed; `[!! ]` missing, another hook or not
+executable, each with its fix, or in the work tree (the warning above, with no fix to run).
+`box fetch` names a workspace without the hook once.
+The hook is a control, not a wall: `git push --no-verify`, a push from another clone and a hook git does
+not run all go out unreviewed, and the tripwires are tripwires, not proofs.
+
+```sh doc-test
+ai-env box review BRANCH            # what a push of BRANCH would carry: no AWS call, no Touch ID (exit 9 on a finding)
+ai-env box hook-install WORKSPACE   # the pre-push hook: every push from the checkout is reviewed first
+```
+
+**Fetching through git smart-HTTP.** `ai-env box fetch --smart-http` fetches over git's smart-HTTP
+protocol (version 2, upload-pack only) through the MicroVM endpoint, in place of `POST /codeout`. The
+client is ai-env's own, over its own HTTPS (TLS 1.3, Amazon roots, no proxy, no redirects, a refused
+token minted again once), so no token ever enters a git process; in the VM `git http-backend` runs as
+the agent behind two literal routes (the advertisement and upload-pack), and a push to the VM
+(receive-pack) is 403 before anything starts. It lists the VM's `HEAD`,
+branches, `refs/wip/*` and seed snapshot, and asks only for what the Mac lacks; what comes back goes
+through S8's import unchanged (the scans, `box/*` or `box-quarantine/*`, one transaction), no tag ever
+reaches the Mac, and a ref with a credential-shaped name or naming no commit is left out and counted. It
+is opt-in: the per-turn fetch stays on `/codeout`, and `--smart-http --wip` is exit 2 (the snapshot is
+`/codeout`'s). An answer in protocol v0 is exit 1 naming the `protocol-v2` probe
+(`ai-env lab run protocol-v2`; `chunked-put` records what the endpoint does with a chunked body).
+`--dry-run` lists the refs only, and neither dry run records a token on the VM's row.
+
+**Transcripts in S3, never on the Mac.** In remote mode the Mac no longer receives a chat's transcript:
+claude in the VM runs without `--session-mirror`, and a mirror frame that arrives anyway is dropped and
+counted. After each turn, beside the code-out, the wrapper syncs the chat: the VM pushes what its
+transcript gained, and its subagents' files, to S3 through URLs the Mac presigns for one object each
+(300 s, with the length, the sha256 and `If-None-Match: *` signed: every object is written once, checked,
+and never overwritten). The Mac records the parts in `state/transcripts/UUID/manifest.toml`, then writes
+the chat's view; it never reads an object back. No transcript URL is printed, logged or audited: each
+travels to the VM in a request body behind the session bearer, and there curl runs as uid 999
+(`ai-env-net`) with the URL on its fd 3, out of the agent's reach. `ai-env session sync UUID` syncs one
+chat now (one Touch ID). Before this Mac ends a running VM (`vm terminate`, `vm gc --yes`) it syncs the
+chats it holds (at most 60 s for them all; `[vm] auto_gc` does the same); a suspended one is ended as it
+is, never woken: what a turn added after the last sync went up at its `/suspend`, once (a line written
+after that push and before the next sync is lost: S10). What a turn adds after the last sync goes up from
+the VM itself at `/suspend` or `/terminate`, through a URL signed ahead for an hour, without the length
+or the sha256 it cannot know (the main transcript only: a subagent's file changed after the last sync is
+lost). That URL is handed as soon as the chat has its id and again before
+each turn, so a chat closed before its first sync still goes up whole; until that sync its view is a
+placeholder (`Remote chat`) that Cursor lists and reopens. A chat whose subagent and tool files pass 256
+files or 256 MiB is synced without them (said once); a file synced once is never dropped from S3 by a
+later sync.
+Reopening a chat restores it beside the seed: on the VM it ran on, which holds it (`transcript:kept`),
+else from S3 into the new VM (`restored`, at most 64 MiB: big chats below), every part checked before the file is renamed into place (a
+part that fails leaves the VM's copy as it was). Its subagents' files follow once claude has started,
+outside the reopen's time limit; one the VM holds newer than S3's copy is kept. The store is the bucket `ai-env-transcripts-ACCOUNT`
+(versioned, encrypted, public access blocked, TLS only, objects under `v1/UUID/`); old versions expire
+after 30 days and unfinished uploads after a day, but a current transcript stays until
+`session gc --remote --yes` or `session forget --purge` removes it, and `make destroy` deletes the
+bucket.
+
+**The view.** The chat's file under `~/.claude/projects/` is its view: the last 10 messages (a user
+prompt, or one assistant reply collapsed into one entry; `[transcript] view_messages`, 1 to 50), built in
+the VM from the transcript's tail. It carries text only: a tool call reads `[tool: NAME]`, an image
+`[image]`, and thinking, tool results, sidechains and subagents are left out. The Mac checks the VM's
+answer strictly (an unknown key refuses the whole view, and the old one stays), passes every block, the
+title and the branch through the session's tripwires (a block with a hit reads
+`[ai-env: masked, rule RULE]`; a title or a branch with one is left out), sets the session and the
+paths itself (an id or a time it cannot take is made anew), and writes the file atomically, keeping
+Cursor's own `custom-title` lines.
+Every line it writes starts with `{"aiEnvView":1,` (Cursor's `custom-title` lines, kept after them, do
+not), so the first line alone tells a view from a transcript. Cursor lists the chat from it and shows
+where it ended; the model, resumed in a VM, has it all.
+
+**A view never resumes on the Mac.** A `--resume` or `--continue` of a view exits 9 on every route but
+the remote one (passthrough, a session outside the roots, the local pump modes), and under the kill
+switch too, which reads the first 4 KiB of that one file and nothing else (no config, no census):
+`this chat's transcript is kept in S3; the file here is its view (the last messages only) and cannot be resumed on this Mac: reopen it with remote mode on, or start a new chat`.
+Two runs never pass through the wrapper and would load a view as if it were the chat: a terminal's
+`claude -c` or `claude --resume`, and Cursor's own claude while the wrapper is off. A window reload with
+the wrapper off (`wrapper uninstall --write`, the reload, `install --write`, as under "No wrapper at
+all") resumes every open chat on this Mac, so close the remote chats' tabs first;
+`ai-env wrapper uninstall` says so while views exist:
+`N remote chats keep only their view under DIR: with the wrapper off, Cursor resumes an open one on this Mac; close their tabs first`.
+
+**Chats begun on the Mac.** A chat begun on this Mac goes up the first time it reopens remote: its
+transcript and its subagents' files are scanned (a finding is exit 9 naming the file, the line and the
+rule, and nothing is sent), sent to S3 by the Mac (`transcript:staged`), then moved to
+`state/transcripts/UUID/origin/` and replaced by the view. A reopen carries up to 64 MiB inline; a larger
+chat is refused before any Touch ID, exit 9:
+`the chat's transcript is SIZE (over the 64 MiB a reopen carries inline): run ai-env session stage UUID --warm in a terminal, then reopen the chat`.
+`ai-env session stage UUID` stages a chat of up to 4 GiB (what a restore pulls) from a terminal (one
+Touch ID): scanned first, then a multipart upload (64 MiB parts, 8 at a time, a sha256 each) that
+resumes where a cut left it, never sending again an object S3 holds; `--warm` then runs `ai-env vm warm`
+on the chat's workspace (its own Touch ID), so the VM is up and seeded, and restores the chat from S3
+into that VM (no Touch ID of its own), where its reopen keeps it (below). Before anything is sent it
+refuses (exit 9) a chat whose transcript records a cwd outside `bridge.toml`'s roots or in no git
+repository, which could never reopen once its file is a view (and exit 1 when it records none); a chat
+that went on here after a cut stage is refused (exit 1)
+and left as it is, the message naming the way out. The original stays under `origin/` until
+`session forget UUID --purge`; there is no way back to a local chat, which would lose the VM's turns.
+
+**Big chats.** Inside Cursor's window a reopen pulls at most 64 MiB of a chat's transcript from S3, its
+parts and its last tail together: at the proxy's 4 to 16 MB/s a GiB takes minutes. A larger chat reopens
+from a VM that holds it already (`transcript:kept`); any other reopen of it is refused before any pull,
+exit 9:
+`the chat's transcript in S3 is SIZE, over the 64 MiB a reopen pulls inline: run ai-env session stage UUID --warm in a terminal, then reopen the chat`.
+The refusal comes before any Touch ID when what S3 committed is already over 64 MiB, no
+`AI_ENV_BRIDGE_VM` pin is set and the reopen would start a new VM, which holds nothing: no VM row of
+the chat's workspace is anything but terminated, or `[vm] reuse_per_workspace` is off (then the line
+says `…, and [vm] reuse_per_workspace is off: set it to true, run ai-env session stage UUID --warm …`).
+Otherwise it comes after the Touch ID, once the VM the reopen took shows it does not hold the chat (a
+last tail can take a chat past 64 MiB too).
+`ai-env session stage UUID --warm` makes such a chat ready: it warms the chat's workspace, then restores
+the chat from S3 into that VM with no time limit, whatever its size (a `transcript_pull` row with its
+bytes and ms; `--json` adds `restore`: the VM, the outcome, the bytes, the ms). Run again it pulls
+nothing (`kept`). A chat begun on a VM takes `--warm` too: S3 holds it already, so nothing is staged,
+and its registry row's cwd names the workspace. Reopen the chat while that VM lives (a suspended one is
+resumed): once it ends, by its wall or `vm terminate`, the copy goes with it and the chat needs
+`--warm` again. A reopen takes that VM only with `[vm] reuse_per_workspace` on and no
+`AI_ENV_BRIDGE_VM` pin to another VM.
+
+**S8's mirrors.** A remote chat from before S9 still has its mirror on this Mac.
+`ai-env session migrate-s9 --yes` moves each into S3 and leaves its view: synced from its VM while that
+runs S9's image (`transcript_s3_v1`), else uploaded from the scanned mirror, the view then built on the
+Mac. A gone VM's mirror with a
+finding is not uploaded: its view is built on the Mac (the hit masked), the mirror moves to `origin/`,
+and the exit is 9 at the end, naming `session forget UUID --purge`. Without `--yes` it lists them, with
+no AWS call and no Touch ID. A chat reopened before that goes up as one begun on this Mac when its
+mirror is at most 64 MiB; a larger one is refused, naming `ai-env session migrate-s9 --yes`, then
+`ai-env session stage UUID --warm` (once in S3 it is a big chat, above).
+
+**Clean-up.** `ai-env session gc --remote --yes` removes the S3 transcripts of chats closed more than 90
+days ago (`--older-than DAYS`), then their manifests and views; a Mac-begun chat's original stays. A
+chat whose upload or first sync was cut before its manifest counts too, by the age of what it left in
+`state/transcripts/`. Without `--yes` it lists them from this Mac's state (no AWS call, no Touch ID).
+`ai-env session forget UUID --purge` also deletes one chat's S3 objects, its manifest, its original
+under `state/transcripts/` and its view, after S8's checks (never while the chat runs).
+
+```sh doc-test
+ai-env session gc --remote --yes   # the S3 transcripts of chats closed over 90 days ago (without --yes: the list, no Touch ID)
+ai-env session migrate-s9 --yes    # S8's mirrored transcripts into S3, their views left (without --yes: the list)
+```
+
+**S3 through the proxy.** A VM reaches S3 as it reaches everything, through squid, whose allowlist now
+holds one AWS host, `ai-env-transcripts-ACCOUNT.s3.eu-central-1.amazonaws.com`, in the stack's own
+`allow` list (never an extra). On its own, a tunnel to that host could still reach any bucket: a request
+inside it may name another bucket, by its host or by its path (domain fronting), signed by any key the
+agent can get, such as the execution role's, which IMDS hands it. So S3 is reached through a gateway
+endpoint on the proxy's route table only (never the VMs'), whose policy admits our bucket's `v1/*` for
+the runtime user of our account alone (and the AL2023 repositories the proxy's own `dnf` reads), and the
+bucket's policy denies reads and the VM's writes from outside that endpoint, the Mac's writes through
+it, and every other principal. `ai-env egress allow` still refuses every AWS service host (exit 9).
+`egress status` checks the endpoint (exactly one, on the proxy's route table, its policy as deployed)
+and the bucket (versioning, encryption, ownership, the public access block, its policy), and takes the
+bucket's host in `allow` and no other AWS host. `egress check` adds seven cases (34 in all): our
+bucket's PUT and GET through the proxy must pass (the GET's 200 proves the endpoint, since the bucket
+refuses reads outside it), and these must be refused: a public object of another bucket asked through
+our host, by name and path-style; a key outside `v1/`; the VM's own IMDS credentials
+(`recorded:no_role` without an execution role); another S3 host; S3 without the proxy. Run it again
+after S9's deploy: its record notes the rule it was judged by (`egress_rule = 1`). A pass recorded
+before these cases (rule 0) counts neither for the credential gate nor for
+`ai-env egress check --if-needed`, which runs the check again and says why.
+
+**Also in S9.** `make test-cursor` needs `SINCE` (the step's start, taken with
+`date -u +%Y-%m-%dT%H:%M:%SZ` before it, or `SINCE=all`): without it, exit 2 before cargo. doctor and
+`wrapper status` name each open Cursor window still on another extension than the one installed, and
+`infra pin --check-bundle` notes it beside its verdict; a session's settings diff can say
+`no change since the start capture`; and F1 makes a mistyped bridge.toml fail remote mode closed (stage
+S8 has the details). `ai-env-claude` exits 2 with its usage for a first argument that is empty, starts
+with `-` (`--version`, `-V`, `--help` or `-h` alone still print and exit 0) or is a bare name other than
+`claude` (CUSTODY-4: `ai-env-claude help` never runs the Mac's
+claude), before any config read or census row; under the kill switch the first argument is still
+exec'd as it is.
 
 ### Identities: the deployer, ops and the runtime key
 
@@ -1189,7 +1485,8 @@ bootstrap and break-glass (below):
   per command outside a runner, none under `ai-env as`.
 - **The runtime principal**, `ai-env-runtime`, is unchanged: VMs and Cursor sessions, its key in
   `credentials/aws.env` (and `combined.env`), one Touch ID per credentialed `vm`, `box` or wrapper
-  command.
+  command. Since S9 it also signs the transcripts' S3 requests: objects under `v1/` of the transcripts
+  bucket of its own account only, and no other principal may read or write them.
 
 **The runner.** `ai-env as IDENTITY -- CMD ARGS...` replaces itself with the command, run as one
 identity (the command's exit status is the runner's): `deployer` (the key pasted, as above), `ops`
@@ -1555,6 +1852,16 @@ the diffs annoy you.
   entry only), ai-env-ops is refused
   `egress allow` before any AWS call, and every proxy command sends one of the stack's three
   documents, never `AWS-RunShellScript` (S8 operators).
+- A remote chat's transcript never reaches the Mac: the remote route runs claude without
+  `--session-mirror`, a mirror frame is dropped and counted, and the Mac writes only the view it
+  checked and masked. A transcript's presigned URL never reaches an argv, an environment, a log, an
+  audit row or the agent: curl in the VM reads it on fd 3 as uid 999 (S9); `egress check`'s own URLs,
+  for its `_egress-check` keys only, reach curl's argv in the check's VM (its own, or the `--shell` VM
+  `--vm` names), which runs no agent, and are never printed.
+- No token enters a git process: `box fetch --smart-http` speaks smart-HTTP with ai-env's own client,
+  and the VM's `git http-backend` runs as the agent with an allowlisted CGI environment and no
+  receive-pack. The pre-push hook refuses a push of `refs/remotes/*` or `refs/ai-env/*` and fails
+  closed without its binary (S9).
 
 ## Workspace
 

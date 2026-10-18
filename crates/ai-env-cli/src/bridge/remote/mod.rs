@@ -37,19 +37,17 @@ pub const REMOTE_EOF_DETACH_AFTER_MS: u64 = 1200;
 /// After host EOF: the wrapper ends no matter what, as the local pump's
 /// `EOF_HARD_STOP`, inside [`CLOSE_BUDGET_MS`].
 pub const REMOTE_HARD_STOP_MS: u64 = 1400;
-/// The largest transcript a resume uploads and the VM takes (plan §8): the
-/// S2 seeder's own cap (`seed::MAX_SEED_BYTES`), as the wire freezes it
-/// for both sides (`wire::workspace::TRANSCRIPT_MAX`).
-pub const TRANSCRIPT_MAX: u64 = crate::wire::workspace::TRANSCRIPT_MAX;
 /// From the census start (T0) the pre-spawn steps P1–P4 must be done within
 /// this: Cursor's initialize window less the fail-fast margin (`pump`'s
 /// `INITIALIZE_WINDOW` and `INIT_FAIL_FAST`, v6 §2.8 "fail fast at T−10 s").
 pub const INIT_DEADLINE: Duration = INITIALIZE_WINDOW.saturating_sub(INIT_FAIL_FAST);
 /// What [`session_grace`] adds past the VM's idle suspend and the socket's idle bound.
 pub const GRACE_MARGIN_S: u32 = 60;
-/// `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` (debug builds only, L8): a resume
-/// uploads no transcript, so the resume miss, the seed retry and the replay
-/// happen live (part B's dup probes). In `REMOVED_ENV` and `LAB_UNSET`.
+/// `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` (debug builds only, L8): a resume's
+/// generation 1 restores no transcript (S9: nothing pulled from S3, as S8's
+/// upload sent nothing), so the resume miss, the seed retry (which always
+/// restores) and the replay happen live (part B's dup probes). In
+/// `REMOVED_ENV` and `LAB_UNSET`.
 pub const TRANSCRIPT_KNOB: &str = "AI_ENV_BRIDGE_LAB_TRANSCRIPT";
 /// `AI_ENV_BRIDGE_VM=<microvm id>` (plan §1): the remote wrapper's VM,
 /// pinned (`Choice::Pin`), checked before any Touch ID ([`Failure::PinInvalid`],
@@ -93,7 +91,8 @@ pub mod census_part {
     pub const LEGS: &str = "legs";
     /// `seed:<word>`: what the workspace step did.
     pub const SEED: &str = "seed";
-    /// `transcript:<word>`: the resume's transcript upload.
+    /// `transcript:<word>`: the resume's transcript restore (S9:
+    /// `workspace::TranscriptOutcome::word`: `restored`, `kept`, `staged`, `none`).
     pub const TRANSCRIPT: &str = "transcript";
     /// `fetch:<ok>/<n>`: the per-result code-out fetches.
     pub const FETCH: &str = "fetch";
@@ -139,8 +138,6 @@ pub mod audit_event {
     pub const SEED: &str = "seed";
     /// A seed the scans or the VM refused.
     pub const SEED_REFUSED: &str = "seed_refused";
-    /// A resume's transcript upload.
-    pub const TRANSCRIPT_PUT: &str = "transcript_put";
     /// A code-out fetch into `refs/remotes/box/*`.
     pub const CODEOUT_FETCH: &str = "codeout_fetch";
     /// A fetched ref that went to `refs/remotes/box-quarantine/*`.
@@ -153,21 +150,49 @@ pub mod audit_event {
     pub const PREWARM: &str = "prewarm";
     /// The VM's claude is not the version `AUTH_TIMERS` measured (once per version).
     pub const AUTH_TIMERS_UNMEASURED: &str = "auth_timers_unmeasured";
-    /// Every event above.
-    pub const ALL: [&str; 13] = [
+    /// S9 (plans/s9-contracts.md §5.1): `box review`, the CLI's or the
+    /// pre-push hook's: `repo`, `mode`, `remote` (a remote's name, else the
+    /// literal `url`), `commits`, `findings`, `whole_history`, `verdict`, `ms`.
+    pub const BOX_REVIEW: &str = "box_review";
+    /// `box hook-install`: `repo`, `hook`, `outcome` (a dry run writes none).
+    pub const HOOK_INSTALL: &str = "hook_install";
+    /// `session drop-transport`: `session`, `wrapper_pid` (t8_6 chains it to the reconnects).
+    pub const DROP_TRANSPORT: &str = "drop_transport";
+    /// A transcript push to S3: `session`, `vm`, `kind`, `from`, `len`, `s3_status`, `version_id`, `ms`.
+    pub const TRANSCRIPT_PUSH: &str = "transcript_push";
+    /// A pull from S3 into the VM: `session`, `vm`, `parts`, `bytes`, `outcome`, `ms`.
+    pub const TRANSCRIPT_PULL: &str = "transcript_pull";
+    /// A view written on the Mac: `session`, `vm`, `messages`, `masked`, `bytes`, `outcome`.
+    pub const TRANSCRIPT_VIEW: &str = "transcript_view";
+    /// `session stage`: `session`, `bytes`, `parts`, `outcome`, `ms`.
+    pub const TRANSCRIPT_STAGE: &str = "transcript_stage";
+    /// `session gc --remote --yes`: `sessions`, `objects`, `older_than_days`.
+    pub const TRANSCRIPT_GC: &str = "transcript_gc";
+    /// `session migrate-s9`, per session: `session`, `from`, `outcome`, `bytes`.
+    pub const TRANSCRIPT_MIGRATE: &str = "transcript_migrate";
+    /// Every event above (never a URL, a query, a credential or a transcript byte in any detail).
+    pub const ALL: [&str; 21] = [
         SESSION_REMOTE_START,
         SESSION_REMOTE_END,
         SESSION_REMOTE_FAILED,
         VM_SELECT,
         SEED,
         SEED_REFUSED,
-        TRANSCRIPT_PUT,
         CODEOUT_FETCH,
         BOX_FETCH_FINDING,
         SETTINGS_CAPTURE,
         SETTINGS_SYNC,
         PREWARM,
         AUTH_TIMERS_UNMEASURED,
+        BOX_REVIEW,
+        HOOK_INSTALL,
+        DROP_TRANSPORT,
+        TRANSCRIPT_PUSH,
+        TRANSCRIPT_PULL,
+        TRANSCRIPT_VIEW,
+        TRANSCRIPT_STAGE,
+        TRANSCRIPT_GC,
+        TRANSCRIPT_MIGRATE,
     ];
 }
 
@@ -216,7 +241,7 @@ pub enum Failure {
     PinInvalid,
     /// P0, exit 8: the pinned VM has no row, or it was terminated.
     PinGone { vm: String },
-    /// P1, exit 3: the Touch ID dialog was dismissed.
+    /// P1, or P3's token dialog, exit 3: the Touch ID dialog was dismissed.
     TouchIdCancelled,
     /// P1 or P3's token dialog, exit 5: no Touch ID within `secs`.
     TouchIdTimeout { secs: u64 },
@@ -230,9 +255,26 @@ pub enum Failure {
     /// P3, exit 9: a tripwire or a settings widening in what the seed would
     /// carry (`finding`: the location, rule and key, never a value; its first
     /// line is shown, `workspace::code::FINDING`'s rule); at P1 or P3, a
-    /// tripwire in what a `--resume`'s transcript upload would send
-    /// (`transcript:REL`, a line of its own).
+    /// tripwire in what a `--resume`'s inline upload to S3 would send (a chat
+    /// begun on this Mac, an S8 mirror: `transcript:REL`, a line of its own).
     Finding { finding: String },
+    /// P0, exit 9 (S9): the chat's local transcript is over what a reopen
+    /// carries inline (`wire::s3::INLINE_MAX`) and not staged: `ai-env
+    /// session stage UUID --warm` sends it up first and restores it into the
+    /// workspace's VM (R5-AWS-1: staged, it is still over what a reopen
+    /// pulls inline); for an S8 remote chat's mirror (`s8_mirror`) `ai-env
+    /// session migrate-s9` first, then the same `--warm` (once in S3 it is
+    /// still over what a reopen pulls inline). Before any Touch ID.
+    TranscriptTooLarge { session: String, bytes: u64, s8_mirror: bool },
+    /// P0 or P3, exit 9 (S9, R5-AWS-1): the reopen would pull more of the
+    /// chat's transcript from S3 than it pulls inline within Cursor's window
+    /// (`wire::s3::INLINE_MAX` in all): `ai-env session stage UUID --warm`
+    /// restores it into the workspace's VM first, where the reopen then
+    /// keeps it. P0 refuses from local state alone, before any Touch ID; P3
+    /// before any pull. `reuse_off`: `[vm].reuse_per_workspace` is off and
+    /// no VM is pinned, so every reopen starts a new VM and `--warm` warms
+    /// yet another: the line asks for the switch first.
+    TranscriptPullTooLarge { session: String, bytes: u64, reuse_off: bool },
     /// P0 or P3, exit `code` (1, 7, 8 or 9; any other is taken as 1): the
     /// workspace step was refused or failed (`first_line` of the error):
     /// `resolve`'s unsupported repository or roots, the VM's refusal of the
@@ -244,8 +286,9 @@ pub enum Failure {
     /// Touch ID (its egress, its image, the connector) (`first_line`, which
     /// says what to run).
     GateRefused { first_line: String },
-    /// P4, exit 7: the VM's image predates S8 (no `workspace_v1`).
-    OldImage { vm: String },
+    /// P2 to P4, exit 7: the VM's image predates the stage that added `cap`
+    /// (`workspace_v1`: S8; S9's `transcript_s3_v1`, `git_http_v1`).
+    OldImage { vm: String, cap: &'static str },
     /// P4, exit 9: the VM runs `limit` commands already.
     SpawnLimit { vm: String, limit: u32 },
     /// P4, exit 8: the VM's shim refused the hello (`code`).
@@ -269,7 +312,7 @@ pub enum Failure {
 
 impl Failure {
     /// Every kind's [`Failure::word`].
-    pub const WORDS: [&'static str; 22] = [
+    pub const WORDS: [&'static str; 24] = [
         "config",
         "no_token",
         "no_runtime_key",
@@ -282,6 +325,8 @@ impl Failure {
         "max_concurrent",
         "select",
         "finding",
+        "transcript_too_large",
+        "transcript_pull_too_large",
         "workspace",
         "gate_refused",
         "old_image",
@@ -310,6 +355,8 @@ impl Failure {
             Failure::MaxConcurrent { .. } => "max_concurrent",
             Failure::Select { .. } => "select",
             Failure::Finding { .. } => "finding",
+            Failure::TranscriptTooLarge { .. } => "transcript_too_large",
+            Failure::TranscriptPullTooLarge { .. } => "transcript_pull_too_large",
             Failure::Workspace { .. } => "workspace",
             Failure::GateRefused { .. } => "gate_refused",
             Failure::OldImage { .. } => "old_image",
@@ -333,7 +380,7 @@ impl Failure {
             Failure::NoToken { .. } | Failure::NoRuntimeKey { .. } | Failure::TouchIdTimeout { .. } | Failure::TokenRefused => 5,
             Failure::OldImage { .. } => 7,
             Failure::PinGone { .. } | Failure::HelloRefused { .. } | Failure::LinkLost { .. } => 8,
-            Failure::NotGitRepo | Failure::Refused { .. } | Failure::MaxConcurrent { .. } | Failure::Finding { .. } | Failure::GateRefused { .. } | Failure::SpawnLimit { .. } => 9,
+            Failure::NotGitRepo | Failure::Refused { .. } | Failure::MaxConcurrent { .. } | Failure::Finding { .. } | Failure::TranscriptTooLarge { .. } | Failure::TranscriptPullTooLarge { .. } | Failure::GateRefused { .. } | Failure::SpawnLimit { .. } => 9,
             Failure::Select { code, .. } if matches!(code, 7..=9) => *code,
             Failure::Deadline { code, .. } if matches!(code, 5 | 7 | 8) => *code,
             Failure::Select { .. } | Failure::Deadline { .. } => 7,
@@ -350,7 +397,8 @@ impl Failure {
     /// the error first: a dismissed Touch ID (P1, or the token's at P3),
     /// `[vm].max_concurrent`, a scan finding (a tripwire, a settings widening,
     /// `workspace::code::FINDING`), a workspace that is no git repository
-    /// (`workspace::code::NOT_A_GIT_REPO`), a VM without `workspace_v1`, the
+    /// (`workspace::code::NOT_A_GIT_REPO`), a VM without `workspace_v1`, a
+    /// transcript over what a reopen carries or pulls inline (S9), the
     /// shim's spawn limit, a refused hello. Then by the step: P0's bridge.toml
     /// check is `Config`; a workspace refusal or failure at P0, or any error
     /// of exit 1, 7, 8 or 9 at P3's workspace step, `Workspace`; another P0
@@ -369,7 +417,9 @@ impl Failure {
             BridgeError::MaxConcurrent(running) => return Failure::MaxConcurrent { running: *running },
             BridgeError::Tripwire(m) | BridgeError::SettingsWidening(m) | BridgeError::WorkspaceRefused { code: ws::FINDING, message: m } => return Failure::Finding { finding: m.clone() },
             BridgeError::WorkspaceRefused { code: ws::NOT_A_GIT_REPO, .. } => return Failure::NotGitRepo,
-            BridgeError::NoCapability { .. } => return Failure::OldImage { vm: vm() },
+            BridgeError::NoCapability { cap, .. } => return Failure::OldImage { vm: vm(), cap },
+            BridgeError::TranscriptTooLarge { session, bytes } => return Failure::TranscriptTooLarge { session: session.clone(), bytes: *bytes, s8_mirror: false },
+            BridgeError::TranscriptPullTooLarge { session, bytes } => return Failure::TranscriptPullTooLarge { session: session.clone(), bytes: *bytes, reuse_off: false },
             BridgeError::SpawnRefused { code: "limit", .. } => return Failure::SpawnLimit { vm: vm(), limit: MAX_SPAWNS as u32 },
             BridgeError::HelloRefused { code, .. } => return Failure::HelloRefused { code: code.clone() },
             _ => {}
@@ -403,18 +453,40 @@ impl Failure {
             Failure::PinGone { vm } => format!("the pinned VM {} ({PIN_KNOB}) is gone or has no row: unset {PIN_KNOB}, or pin a VM ai-env vm list shows", part(vm, SHORT_MAX)),
             Failure::TouchIdCancelled => "Touch ID was cancelled: nothing was started; reopen the chat to try again".to_string(),
             Failure::TouchIdTimeout { secs } => format!("no Touch ID within {secs} s (Cursor's 60 s window): nothing was started; ai-env vm warm prepares the VM ahead"),
+            Failure::MaxConcurrent { running: 1 } => "1 VM already runs ([vm].max_concurrent, suspended ones included): ai-env vm list names them; ai-env vm terminate ID frees a slot, then reopen the chat".to_string(),
             Failure::MaxConcurrent { running } => format!("{running} VMs already run ([vm].max_concurrent, suspended ones included): ai-env vm list names them; ai-env vm terminate ID frees a slot, then reopen the chat"),
             Failure::Select { first_line, .. } => format!("{}; ai-env doctor checks the setup", part(first_line, PART_MAX)),
             Failure::Finding { finding } if finding.starts_with("transcript:") => format!("the chat's transcript would carry {}: none of it was sent; AI_ENV_BRIDGE_LOCAL=1 reopens the chat on this Mac, or start a new one", part(finding, FINDING_MAX)),
             // `box seed` lists an update's findings too (its history: after its Touch ID); the dry run plans a first seed only.
             Failure::Finding { finding } => format!("the seed would carry {}: remove or ignore it (repo settings: trust_repo_settings); ai-env box seed lists the findings", part(finding, FINDING_MAX)),
+            Failure::TranscriptTooLarge { session, bytes, s8_mirror } => {
+                let size = crate::bridge::workspace::snapshot::human_bytes(*bytes);
+                let inline = crate::wire::s3::INLINE_MAX >> 20;
+                if *s8_mirror {
+                    // Migrated, it is a chat S3 holds over what a reopen pulls inline: `--warm` after it.
+                    format!("the chat's transcript is {size} (over the {inline} MiB a reopen carries inline): run ai-env session migrate-s9 --yes, then ai-env session stage {} --warm, in a terminal, then reopen the chat", part(session, SHORT_MAX))
+                } else {
+                    // `--warm` too (R5-AWS-1): once staged, a chat over the cap reopens only from a VM that holds it.
+                    format!("the chat's transcript is {size} (over the {inline} MiB a reopen carries inline): run ai-env session stage {} --warm in a terminal, then reopen the chat", part(session, SHORT_MAX))
+                }
+            }
+            Failure::TranscriptPullTooLarge { session, bytes, reuse_off } => {
+                // With reuse off a reopen never takes the VM `--warm` warmed: the switch first.
+                let reuse = if *reuse_off { ", and [vm] reuse_per_workspace is off: set it to true," } else { ":" };
+                format!(
+                    "the chat's transcript in S3 is {}, over the {} MiB a reopen pulls inline{reuse} run ai-env session stage {} --warm in a terminal, then reopen the chat",
+                    crate::bridge::workspace::snapshot::human_bytes(*bytes),
+                    crate::wire::s3::INLINE_MAX >> 20,
+                    part(session, SHORT_MAX)
+                )
+            }
             Failure::Workspace { first_line, .. } => {
                 // A refusal names its own remedy (the VM's, say): it keeps the room the line has.
                 let fix = "; ai-env box seed --dry-run shows the plan";
                 format!("{}{fix}", part(first_line, LINE_MAX - PREFIX.len() - fix.len()))
             }
             Failure::GateRefused { first_line } => format!("{}; ai-env doctor checks the credential gate", part(first_line, PART_MAX)),
-            Failure::OldImage { vm } => format!("{} runs an image older than S8 (no workspace_v1): run make deploy, then reopen the chat", part(vm, SHORT_MAX)),
+            Failure::OldImage { vm, cap } => format!("{} runs an image older than {} (no {cap}): run make deploy, then reopen the chat", part(vm, SHORT_MAX), crate::wire::frame::cap_stage(cap)),
             Failure::SpawnLimit { vm, limit } => {
                 let vm = part(vm, SHORT_MAX);
                 format!("{vm} runs {limit} commands already: close a chat, or ai-env vm health {vm} --detail")
@@ -467,13 +539,6 @@ mod tests {
         const { assert!(REMOTE_EOF_DETACH_AFTER_MS > 1078, "S7 B11's slowest exit fits") };
         assert_eq!(u128::from(REMOTE_HARD_STOP_MS), crate::bridge::pump::EOF_HARD_STOP.as_millis(), "the local hard stop");
         const { assert!(REMOTE_EOF_DETACH_AFTER_MS < REMOTE_HARD_STOP_MS && REMOTE_HARD_STOP_MS < CLOSE_BUDGET_MS) };
-    }
-
-    /// Plan §8: the upload's cap is the S2 seeder's.
-    #[test]
-    fn transcript_max_is_the_s2_seeders_cap() {
-        assert_eq!(TRANSCRIPT_MAX, 64 * 1024 * 1024);
-        assert_eq!(TRANSCRIPT_MAX, crate::bridge::seed::MAX_SEED_BYTES);
     }
 
     /// v6 §2.8: fail fast at T−10 s of Cursor's 60 s window, so the pipeline's deadline is T0 + 50 s.
@@ -539,6 +604,8 @@ mod tests {
         }
         assert_eq!([EndReason::LinkLost, EndReason::CredentialRejected].map(EndReason::name), END_WORDS, "the reasons the pump gained (C3)");
         let earlier = [
+            // S8's resume upload, gone at S9's S3 cut-over: its name is never written again.
+            "transcript_put",
             "resume_seed_retry",
             "resume_seed_miss",
             "resume_seed_failed",
@@ -591,6 +658,10 @@ mod tests {
             Failure::Select { .. } => "ai-env doctor",
             Failure::Finding { finding } if finding.starts_with("transcript:") => "AI_ENV_BRIDGE_LOCAL=1 reopens the chat",
             Failure::Finding { .. } => "ai-env box seed lists the findings",
+            Failure::TranscriptTooLarge { s8_mirror: true, .. } => "run ai-env session migrate-s9 --yes, then ai-env session stage",
+            Failure::TranscriptTooLarge { .. } => "ai-env session stage",
+            Failure::TranscriptPullTooLarge { reuse_off: true, .. } => "[vm] reuse_per_workspace is off: set it to true, run ai-env session stage",
+            Failure::TranscriptPullTooLarge { .. } => "--warm in a terminal, then reopen the chat",
             Failure::Workspace { .. } => "ai-env box seed --dry-run shows the plan",
             Failure::GateRefused { .. } => "ai-env doctor checks the credential gate",
             Failure::OldImage { .. } => "make deploy",
@@ -623,18 +694,25 @@ mod tests {
             (Failure::TouchIdCancelled, 3),
             (Failure::TouchIdTimeout { secs: 47 }, 5),
             (Failure::MaxConcurrent { running: 3 }, 9),
+            (Failure::MaxConcurrent { running: 1 }, 9),
             (Failure::Select { code: 7, first_line: long.clone() }, 7),
             (Failure::Select { code: 8, first_line: "microvm not found: microvm-x".into() }, 8),
             (Failure::Select { code: 9, first_line: "egress mismatch".into() }, 9),
             (Failure::Select { code: 1, first_line: "busy".into() }, 7),
             (Failure::Finding { finding: format!("refs/heads/dev:cfg/prod.yaml line 3 rule aws-key {key_id}") }, 9),
             (Failure::Finding { finding: "transcript:0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl line 2: rule aws-access-key-id".into() }, 9),
+            (Failure::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1_870_000_000, s8_mirror: false }, 9),
+            (Failure::TranscriptTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: 70 << 20, s8_mirror: true }, 9),
+            (Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1 << 30, reuse_off: false }, 9),
+            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: 70 << 20, reuse_off: false }, 9),
+            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: u64::MAX, reuse_off: true }, 9),
             (Failure::Workspace { code: 9, first_line: format!("workspace refused (symlink_component): PUT /seed: {token}") }, 9),
             (Failure::Workspace { code: 1, first_line: long.clone() }, 1),
             (Failure::Workspace { code: 8, first_line: "microvm terminated: gone".into() }, 8),
             (Failure::Workspace { code: 5, first_line: "credentials unavailable".into() }, 1),
             (Failure::GateRefused { first_line: long.clone() }, 9),
-            (Failure::OldImage { vm: vm.clone() }, 7),
+            (Failure::OldImage { vm: vm.clone(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }, 7),
+            (Failure::OldImage { vm: vm.clone(), cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1 }, 7),
             (Failure::SpawnLimit { vm: vm.clone(), limit: 8 }, 9),
             (Failure::HelloRefused { code: format!("bad_token {token}") }, 8),
             (Failure::Deadline { code: 5, step: "touchid" }, 5),
@@ -663,6 +741,22 @@ mod tests {
         let config = Failure::Config { first_line: long }.line();
         assert!(config.starts_with("aws run_microvm: xxx") && config.contains("\u{2026}; AI_ENV_BRIDGE_LOCAL=1"), "{config}");
         assert_eq!(Failure::NotGitRepo.line(), "not a git repository: ai-env seeds git workspaces only; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally", "plan §1's text");
+        // S9: the old image names the stage its cap needs (workspace_v1's text unchanged); one VM is singular (F5).
+        assert_eq!(Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }.line(), "microvm-1 runs an image older than S8 (no workspace_v1): run make deploy, then reopen the chat");
+        assert_eq!(Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1 }.line(), "microvm-1 runs an image older than S9 (no transcript_s3_v1): run make deploy, then reopen the chat");
+        assert!(Failure::MaxConcurrent { running: 1 }.line().starts_with("1 VM already runs ("));
+        assert!(Failure::MaxConcurrent { running: 2 }.line().starts_with("2 VMs already run ("));
+        let big = Failure::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, s8_mirror: false };
+        assert_eq!(big.line(), "the chat's transcript is 70.0 MiB (over the 64 MiB a reopen carries inline): run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm in a terminal, then reopen the chat");
+        let mirror = Failure::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, s8_mirror: true };
+        // Migrated, a mirror over the cap is a chat S3 holds over what a reopen pulls inline: --warm after it.
+        assert!(mirror.line().ends_with("inline): run ai-env session migrate-s9 --yes, then ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm, in a terminal, then reopen the chat"), "{}", mirror.line());
+        // R5-AWS-1: a chat S3 holds, over what a reopen pulls within Cursor's window, names the --warm restore.
+        let pull = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: false };
+        assert_eq!(pull.line(), "the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline: run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm in a terminal, then reopen the chat");
+        // With reuse off every reopen starts a new VM, and --warm warms yet another: the switch first.
+        let off = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: true };
+        assert_eq!(off.line(), "the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline, and [vm] reuse_per_workspace is off: set it to true, run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm in a terminal, then reopen the chat");
     }
 
     /// Every quoted part at its longest still leaves the fix after it whole:
@@ -680,7 +774,11 @@ mod tests {
             (Failure::Finding { finding: format!("transcript:{long}") }, ": none of it was sent; AI_ENV_BRIDGE_LOCAL=1 reopens the chat on this Mac, or start a new one"),
             (Failure::Workspace { code: 9, first_line: long.clone() }, "; ai-env box seed --dry-run shows the plan"),
             (Failure::GateRefused { first_line: long.clone() }, "; ai-env doctor checks the credential gate"),
-            (Failure::OldImage { vm: long.clone() }, "run make deploy, then reopen the chat"),
+            (Failure::OldImage { vm: long.clone(), cap: crate::wire::frame::CAP_GIT_HTTP_V1 }, "run make deploy, then reopen the chat"),
+            (Failure::TranscriptTooLarge { session: long.clone(), bytes: u64::MAX, s8_mirror: false }, "in a terminal, then reopen the chat"),
+            (Failure::TranscriptTooLarge { session: long.clone(), bytes: u64::MAX, s8_mirror: true }, " --warm, in a terminal, then reopen the chat"),
+            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: false }, " --warm in a terminal, then reopen the chat"),
+            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: true }, " --warm in a terminal, then reopen the chat"),
             (Failure::SpawnLimit { vm: long.clone(), limit: 8 }, " --detail"),
             (Failure::HelloRefused { code: long.clone() }, "ai-env vm terminate it, then reopen the chat"),
             (Failure::LinkLost { vm: long.clone() }, ": reopen the chat from the picker"),
@@ -733,6 +831,9 @@ mod tests {
             (Workspace, BridgeError::Endpoint("connect refused".into()), "workspace", 7),
             (Workspace, BridgeError::CredentialsUnavailable("mint: expired".into()), "other", 5),
             (Workspace, BridgeError::NoCapability { cap: "workspace_v1", message: "GET /seed answered 404".into() }, "old_image", 7),
+            (SelectVm, BridgeError::NoCapability { cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1, message: "microvm-1 names no transcript_s3_v1".into() }, "old_image", 7),
+            (Precheck, BridgeError::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20 }, "transcript_too_large", 9),
+            (Workspace, BridgeError::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20 }, "transcript_pull_too_large", 9),
             (Gate, BridgeError::Policy("no credential for microvm-1: run ai-env egress check".into()), "gate_refused", 9),
             (Gate, BridgeError::Sdk { op: "get_microvm", message: "x".into() }, "other", 7),
             (Spawn, BridgeError::SpawnRefused { code: "limit", message: "8 spawns are running (at most 8)".into() }, "spawn_limit", 9),

@@ -95,7 +95,7 @@ impl Green<'_> {
     /// command from then on); else `--no-combined` (the token is a Touch ID
     /// of its own).
     pub fn seed(&self, token: &str, image_version: &str, combined: bool, sealed: &dyn Fn(&[&str]) -> Command) {
-        use ai_env_cli::bridge::egress::{ConnectorFacts, EgressVerified, VerifiedRecord, DNS_NONE, DNS_RULE};
+        use ai_env_cli::bridge::egress::{ConnectorFacts, EgressVerified, VerifiedRecord, DNS_NONE, DNS_RULE, EGRESS_RULE};
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(self.bin()).unwrap();
         for name in ["age", "age-keygen", "age-plugin-se"] {
@@ -129,6 +129,7 @@ impl Green<'_> {
             at: ai_env_cli::wire::time::rfc3339_utc(now - 3600),
             dns: DNS_NONE.into(),
             dns_rule: DNS_RULE,
+            egress_rule: EGRESS_RULE,
             connector_facts: ConnectorFacts::from_get(&connector_doc()).unwrap(),
             image_created_at: Some(BUILD),
             ..VerifiedRecord::default()

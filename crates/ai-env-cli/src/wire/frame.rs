@@ -83,14 +83,43 @@ pub const CAP_CREDENTIAL_CACHE: &str = "credential_cache";
 
 /// The capability a shim names in `hello_ok.caps` and `/health` (S8, L5)
 /// when it serves the workspace routes (`wire::workspace`): `GET`/`PUT
-/// /seed` and `POST /codeout` on the code port, `GET`/`PUT /transcript` and
-/// `GET /settings` on the app port. The Mac sends a workspace request only
+/// /seed` and `POST /codeout` on the code port, `GET /transcript` (S8's
+/// `PUT` went at S9's S3 cut-over) and `GET /settings` on the app port. The Mac sends a workspace request only
 /// to a shim that names it (an image-7.0 shim answers each with 404), and
 /// SELECT_VM never reuses a VM whose recorded caps lack it. Wire stays v1:
 /// caps are additive. A shim names it when it has a workspace helper to run
 /// (`ShimState::caps`: the image's binary); one without answers the routes
 /// with 404, as an older shim does.
 pub const CAP_WORKSPACE_V1: &str = "workspace_v1";
+
+/// The capability a shim names (S9, L5) when it serves git smart-HTTP on the
+/// code port (`wire::workspace::GIT_INFO_REFS_ROUTE`,
+/// `GIT_UPLOAD_PACK_ROUTE`): `box fetch --smart-http` checks it before any
+/// request (exit 7 naming `make deploy`). Named by a shim that serves the
+/// workspace routes, once its git routes are built (`shim::gitcgi::SERVED`).
+pub const CAP_GIT_HTTP_V1: &str = "git_http_v1";
+
+/// The capability a shim names (S9, M2) when it serves the transcript
+/// store's transfers on the app port (`POST /transcript/push`, `POST
+/// /transcript/pull`, `GET /transcript/view`, `POST /transcript/tail`) and
+/// the extended `GET /transcript`: the Mac checks it before any of them, and
+/// a remote session's SELECT_VM never reuses a VM whose recorded caps lack
+/// it (`shim::s3xfer::SERVED`).
+pub const CAP_TRANSCRIPT_S3_V1: &str = "transcript_s3_v1";
+
+/// The stage whose image first names `cap` (what `BridgeError::NoCapability`
+/// and `remote::Failure::OldImage` say an older image predates):
+/// `credential_cache` S7, `workspace_v1` S8, `git_http_v1` and
+/// `transcript_s3_v1` S9, any other `this ai-env`.
+#[must_use]
+pub fn cap_stage(cap: &str) -> &'static str {
+    match cap {
+        CAP_CREDENTIAL_CACHE => "S7",
+        CAP_WORKSPACE_V1 => "S8",
+        CAP_GIT_HTTP_V1 | CAP_TRANSCRIPT_S3_V1 => "S9",
+        _ => "this ai-env",
+    }
+}
 
 /// Longest `credential.tag` (an opaque, non-secret seal id the Mac chooses:
 /// `[A-Za-z0-9-]`).
@@ -1186,6 +1215,23 @@ mod tests {
         let json = serde_json::to_string(&with).unwrap();
         assert!(json.ends_with(",\"listeners_omitted\":0,\"workspace\":{\"busy\":\"codeout\",\"helpers\":1}}"), "{json}");
         assert_eq!(serde_json::from_str::<HealthDetail>(&json).unwrap(), with);
+    }
+
+    /// S9 (L5, M2): two caps beside S7's and S8's, each named by the stage
+    /// an older image predates; a health without them reads as before.
+    #[test]
+    fn the_s9_caps_are_additive_and_named_by_stage() {
+        assert_eq!((CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1), ("git_http_v1", "transcript_s3_v1"));
+        let caps = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1];
+        assert_eq!(caps.iter().collect::<std::collections::BTreeSet<_>>().len(), caps.len(), "unique");
+        assert_eq!(caps.map(cap_stage), ["S7", "S8", "S9", "S9"]);
+        assert_eq!(cap_stage("workspace_v2"), "this ai-env");
+        let old = Health { status: HealthStatus::Ok, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, owner: None, created: None, boot_nonce: None, run_hook_seen: true, uptime_s: 1, wire: Some(WIRE_VERSION), caps: vec![CAP_CREDENTIAL_CACHE.into(), CAP_WORKSPACE_V1.into()] };
+        let json = serde_json::to_string(&old).unwrap();
+        let mut caps = serde_json::from_str::<Health>(&json).unwrap().caps;
+        caps.extend([CAP_GIT_HTTP_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()]);
+        let new = Health { caps, ..old.clone() };
+        assert_eq!(serde_json::from_str::<Health>(&serde_json::to_string(&new).unwrap()).unwrap(), new, "the wire stays v1: the caps are a list");
     }
 
     /// S8 changes neither earlier golden conversation: both files are pinned

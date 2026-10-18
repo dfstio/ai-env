@@ -11,9 +11,11 @@
 //! `<name>::remote`, the wrapper in remote mode against the rig's in-process
 //! shim (`tests/common/remote.rs`), the fake as the VM's CLI. The same
 //! assertions hold on either link, with the remote link's own rules spelled
-//! out where they differ: the seed retry uploads the Mac's transcript to the
-//! VM instead of seeding a scratch dir (plan §8), the VM's argv carries no
-//! debug flag (`[wrapper] strip_debug`), and a signal detaches the CLI at
+//! out where they differ: the seed retry restores the transcript into the VM
+//! instead of seeding a scratch dir (S9: a chat begun on the Mac goes up to
+//! the tests' S3 first, its view left in its place), the VM's argv carries
+//! no debug flag (`[wrapper] strip_debug`) and no `--session-mirror` (S9: a
+//! remote chat's transcript is kept in S3), and a signal detaches the CLI at
 //! once (L2: its own exit code never comes back). A remote half also checks
 //! what only it can show: the census's `mode:remote`, nothing left on the VM.
 //! The four local-only tests say why, and name their remote analogue.
@@ -111,10 +113,12 @@ fn mkdir_0700(dir: &Path) {
 /// The argv a child generation gets for the host's session argv plus
 /// `extra`: the host's, then one `--session-mirror`; on the remote link
 /// without `--debug` and `--debug-to-stderr` (`[wrapper] strip_debug`'s
-/// default: the VM's CLI never debugs to Cursor's stderr).
+/// default: the VM's CLI never debugs to Cursor's stderr) and without
+/// `--session-mirror` (S9: the transcript is kept in S3, never mirrored).
 fn child_argv(link: Link, extra: &[&str]) -> Vec<String> {
     let debug = |a: &&str| link.is_remote() && matches!(*a, "--debug" | "--debug-to-stderr");
-    SESSION_ARGV.iter().filter(|a| !debug(a)).chain(extra).map(|a| (*a).to_string()).chain(std::iter::once("--session-mirror".to_string())).collect()
+    let mirror = (!link.is_remote()).then(|| "--session-mirror".to_string());
+    SESSION_ARGV.iter().filter(|a| !debug(a)).chain(extra).map(|a| (*a).to_string()).chain(mirror).collect()
 }
 
 /// The registry row's `mode` of a run on `link` in the local mode `local`.
@@ -129,16 +133,20 @@ fn row_mode(link: Link, local: &'static str) -> &'static str {
 on_links!(
     /// The seed retry: generation 1 misses its `--resume`, generation 2
     /// gets the host state replayed under fresh ids. On the remote link the
-    /// retry uploads the Mac's transcript to the VM (plan §8) where the local
-    /// one seeds the scratch dir: the copy the CLI resumed from is the Mac's,
-    /// byte for byte, either way. Generation 1 uploads nothing there
+    /// retry restores the transcript into the VM (S9: the chat began on the
+    /// Mac, so it goes up to the tests' S3 inline, then is pulled into the
+    /// VM, the Mac keeping its view) where the local one seeds the scratch
+    /// dir: the copy the CLI resumed from is the Mac's, byte for byte, either
+    /// way. Generation 1 restores nothing there
     /// (`AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip`, L8), so the VM's copy can only
-    /// be the retry's (`transcript:uploaded`).
+    /// be the retry's (`transcript:staged`).
     t2_3_resume_miss_respawns_with_replay,
     |link| {
         let p = Harness::prepare();
         let sid = uuid(0x5e55_0001);
         let (planted, planted_sub) = plant_source(&p, &sid);
+        // What was planted (on the remote link the view takes the file's place once the chat went up).
+        let (planted_bytes, planted_sub_bytes) = (std::fs::read(&planted).unwrap(), std::fs::read(&planted_sub).unwrap());
         let slug = p.slug();
         let marker = p.root.join("resume.marker");
         let resume = format!("--resume={sid}");
@@ -203,7 +211,7 @@ on_links!(
         assert_eq!(gen2[3], sent[3], "the outstanding user line is re-sent verbatim");
         assert!(h.stdin_log().iter().all(|(g, _)| *g <= 2), "no third generation");
 
-        // Both generations got the host's argv, --resume included, plus one --session-mirror.
+        // Both generations got the host's argv, --resume included, plus one --session-mirror (none on the remote link).
         let want = child_argv(link, &[&resume]);
         let argv = h.argv_log();
         assert_eq!(argv.len(), 2, "{argv:#?}");
@@ -217,20 +225,24 @@ on_links!(
         let d = &retries[0]["detail"];
         assert_eq!(d["session_id"], sid.as_str(), "{d}");
         if link.is_remote() {
-            assert_eq!(d["source"], "put_transcript", "the retry uploads the Mac's transcript to the VM: {d}");
+            assert_eq!(d["source"], "s3", "the retry restores the transcript from S3 into the VM: {d}");
         } else {
             assert_eq!(d["source"], path_str(&h.prepared.mac_projects().join(&slug)), "{d}");
             assert_eq!(d["files"], "2", "the transcript + one subagent file: {d}");
-            let total = std::fs::metadata(&planted).unwrap().len() + std::fs::metadata(&planted_sub).unwrap().len();
+            let total = planted_bytes.len() + planted_sub_bytes.len();
             assert_eq!(d["bytes"], total.to_string().as_str(), "{d}");
         }
         assert!(h.audit_events("resume_seed_miss").is_empty());
         let copy = if link.is_remote() { h.vm_projects().join(&slug) } else { h.scratch_dir(&sid).join("projects").join(&slug) };
-        assert_eq!(std::fs::read(copy.join(format!("{sid}.jsonl"))).expect("seeded transcript"), std::fs::read(&planted).unwrap(), "byte-equal seed");
-        assert_eq!(
-            std::fs::read(copy.join(&sid).join("subagents").join("agent-a1.jsonl")).expect("seeded subagent transcript"),
-            std::fs::read(&planted_sub).unwrap()
-        );
+        assert_eq!(std::fs::read(copy.join(format!("{sid}.jsonl"))).expect("seeded transcript"), planted_bytes, "byte-equal seed");
+        assert_eq!(std::fs::read(copy.join(&sid).join("subagents").join("agent-a1.jsonl")).expect("seeded subagent transcript"), planted_sub_bytes);
+        if link.is_remote() {
+            // S9: the Mac keeps the chat's view where the transcript was; the original went to origin/ and S3.
+            let view = std::fs::read(&planted).unwrap();
+            assert!(ai_env_cli::wire::view::is_view_head(&view), "the Mac keeps only the view: {}", String::from_utf8_lossy(&view));
+            let origin = h.bridge().join("state").join("transcripts").join(&sid).join("origin").join(format!("{sid}.jsonl"));
+            assert_eq!(std::fs::read(&origin).expect("the original in origin/"), planted_bytes);
+        }
 
         // The registry row: closed, one respawn, the state summary, no request body.
         let files = h.registry_files();
@@ -254,7 +266,7 @@ on_links!(
         let note = end["note"].as_str().unwrap_or_default();
         assert!(note_has(note, "respawns:1"), "{note}");
         if link.is_remote() {
-            assert!(note_has(note, "transcript:uploaded"), "the retry uploaded the transcript: {note}");
+            assert!(note_has(note, "transcript:staged"), "the retry sent the Mac-begun chat up and restored it: {note}");
         }
         assert_eq!(end["exit"], 0, "{end}");
         h.assert_remote_end(link);
@@ -386,8 +398,8 @@ on_links!(
 
 on_links!(
     /// A resume miss with no transcript on the Mac to seed (or, on the remote
-    /// link, to upload) from: the miss is the host's, and no generation 2 is
-    /// started for nothing.
+    /// link, none in S3 or on the Mac to restore) from: the miss is the
+    /// host's, and no generation 2 is started for nothing.
     resume_miss_without_source_propagates,
     |link| {
         let p = Harness::prepare();
@@ -404,7 +416,8 @@ on_links!(
         let misses = h.audit_events("resume_seed_miss");
         assert_eq!(misses.len(), 1, "{:#?}", h.audit_rows());
         assert_eq!(misses[0]["detail"]["session_id"], sid.as_str(), "{}", misses[0]);
-        assert_eq!(misses[0]["detail"]["reason"], "no local transcript", "{}", misses[0]);
+        let reason = if link.is_remote() { "nothing to restore" } else { "no local transcript" };
+        assert_eq!(misses[0]["detail"]["reason"], reason, "{}", misses[0]);
         assert!(h.audit_events("resume_seed_retry").is_empty());
         assert_eq!(h.spawn_count(), 1, "{transcript}");
         let line = format!("No conversation found with session ID: {sid}");
@@ -659,7 +672,7 @@ on_links!(
         let argv = h.argv_log();
         assert_eq!(argv.len(), 1);
         assert!(argv[0].iter().any(|a| a == "--no-session-persistence"), "{argv:#?}");
-        assert_eq!(argv[0].last().map(String::as_str), Some("--session-mirror"), "{argv:#?}");
+        assert_eq!(argv[0].iter().any(|a| a == "--session-mirror"), !link.is_remote(), "one --session-mirror, but on the remote link (S9): {argv:#?}");
         h.assert_remote_end(link);
     }
 );
@@ -776,9 +789,9 @@ fn scratch_dir_is_renamed_to_the_session_id() {
 
 /// The pre-spawn seed never overwrites a scratch transcript at least as long
 /// as the Mac's copy (it may hold entries the Mac copy lacks). Local only:
-/// on the remote link the VM's longer copy wins the upload, the shim's 409
-/// `vm_longer` (`tests/shim_local.rs`'s `transcripts_round_trip_on_the_app_port`,
-/// `tests/workspace.rs`'s `transcript::the_transcript_goes_up_only_when_the_vm_lacks_it`).
+/// on the remote link (S9) a VM that holds the committed prefix, longer or
+/// not, keeps its copy (`tests/workspace.rs`'s
+/// `transcript::the_transcript_is_restored_only_when_the_vm_lacks_it`).
 #[test]
 fn prespawn_seed_never_shrinks_the_scratch_copy() {
     let p = Harness::prepare();

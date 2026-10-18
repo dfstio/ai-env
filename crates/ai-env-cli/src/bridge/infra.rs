@@ -186,6 +186,18 @@ pub struct StackOutputs {
     pub proxy_status_document: Option<String>,
     #[serde(default, deserialize_with = "scalar")]
     pub proxy_patch_document: Option<String>,
+    // S9 (infra/transcripts.ts, infra/egress.ts): the transcripts bucket, the proxy's S3 gateway endpoint, the
+    // canonical hashes of their two policies and the proxy's route table, names, ids and hashes only (D17).
+    #[serde(default, deserialize_with = "scalar")]
+    pub transcripts_bucket: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub s3_endpoint_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub s3_endpoint_policy_sha256: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub transcripts_bucket_policy_sha256: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub proxy_route_table_id: Option<String>,
 }
 
 /// What to do when the outputs lack the two keys every successful deploy
@@ -553,6 +565,21 @@ pub struct InfraState {
     pub proxy_status_document: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_patch_document: Option<String>,
+    /// S9: the transcripts bucket (`ai-env-transcripts-<acct>`), the proxy's
+    /// S3 gateway endpoint and the canonical hashes of the endpoint's and the
+    /// bucket's policies, and the proxy's route table (outputs
+    /// `transcriptsBucket`, `s3EndpointId`, `s3EndpointPolicySha256`,
+    /// `transcriptsBucketPolicySha256`, `proxyRouteTableId`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcripts_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_endpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_endpoint_policy_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcripts_bucket_policy_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_route_table_id: Option<String>,
     /// The connector's Id, from the live read (the echo gate accepts the Id
     /// form only when `connector_arn` equals `[aws].egress_connector_arn`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -620,6 +647,11 @@ impl InfraState {
             proxy_reload_document: o.proxy_reload_document.clone(),
             proxy_status_document: o.proxy_status_document.clone(),
             proxy_patch_document: o.proxy_patch_document.clone(),
+            transcripts_bucket: o.transcripts_bucket.clone(),
+            s3_endpoint_id: o.s3_endpoint_id.clone(),
+            s3_endpoint_policy_sha256: o.s3_endpoint_policy_sha256.clone(),
+            transcripts_bucket_policy_sha256: o.transcripts_bucket_policy_sha256.clone(),
+            proxy_route_table_id: o.proxy_route_table_id.clone(),
             connector_id: None,
             connector_state: None,
             connector_state_source: None,
@@ -1690,9 +1722,116 @@ pub fn cmd_versions_diff(before: &Path, after: &Path, record_probe: bool) -> Res
     Ok(())
 }
 
+// ---- the canonical policy hash (S9) ------------------------------------------------------
+
+/// The canonical hash of a policy document (plans/s9-contracts.md §7.6, the
+/// same as `infra/policies.ts` `canonicalPolicySha256`): the JSON parsed;
+/// every object's keys sorted; an array of exactly one string written as
+/// that string; serialised without whitespace (strings escaped as JSON
+/// does); sha256, lowercase hex. AWS's normalised text of a document (keys
+/// reordered, `["x"]` turned into `"x"`) hashes as the document Pulumi
+/// sent, so `egress status` compares the live endpoint and bucket policies
+/// with the recorded `s3_endpoint_policy_sha256` and
+/// `transcripts_bucket_policy_sha256`. `Err` for text that is not JSON.
+pub fn canonical_policy_sha256(json: &str) -> std::result::Result<String, String> {
+    use sha2::{Digest, Sha256};
+    fn write(v: &serde_json::Value, out: &mut String) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                    out.push(':');
+                    write(&map[k], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(items) if items.len() == 1 && items[0].is_string() => write(&items[0], out),
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    let doc: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("not a JSON policy document: {e}"))?;
+    let mut text = String::new();
+    write(&doc, &mut text);
+    Ok(hex::encode(Sha256::digest(text.as_bytes())))
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod g4_tests {
+    use super::*;
+
+    /// plans/s9-contracts.md §7.3's endpoint policy for the example account.
+    const ENDPOINT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"TranscriptsOfTheRuntimeUser","Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject"],"Resource":["arn:aws:s3:::ai-env-transcripts-123456789012/v1/*"],"Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:user/ai-env-runtime"},"StringEquals":{"s3:ResourceAccount":"123456789012"}}},{"Sid":"Al2023Repos","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::al2023-repos-eu-central-1-de612dc2/*"]}]}"#;
+
+    /// The canonical hash is TypeScript's (`policies.ts`
+    /// `canonicalPolicySha256` of `s3EndpointPolicy` for 123456789012: the
+    /// same value is pinned against policies.ts itself, compiled and run, by
+    /// `tests/infra/image.rs`' `the_endpoint_policy_of_policies_ts_is_the_pinned_one`)
+    /// and AWS's normalised form of the same
+    /// document hashes alike: keys in another order, whitespace, a
+    /// one-element array as its string; another document hashes otherwise,
+    /// and text that is not JSON is an error.
+    #[test]
+    fn the_canonical_policy_hash_is_typescripts_and_survives_aws_normalising() {
+        let want = "0e80ca5ab63a4465e3921f4247d90b35f8c941fdd124370bad974db63765ec27";
+        assert_eq!(canonical_policy_sha256(ENDPOINT_POLICY).unwrap(), want);
+        let normalised = r#"{
+  "Statement" : [ { "Resource" : "arn:aws:s3:::ai-env-transcripts-123456789012/v1/*", "Condition" : { "StringEquals" : { "s3:ResourceAccount" : "123456789012" }, "ArnEquals" : { "aws:PrincipalArn" : "arn:aws:iam::123456789012:user/ai-env-runtime" } },
+      "Action" : [ "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject" ], "Principal" : "*", "Effect" : "Allow", "Sid" : "TranscriptsOfTheRuntimeUser" },
+    { "Sid" : "Al2023Repos", "Effect" : "Allow", "Principal" : "*", "Action" : "s3:GetObject", "Resource" : "arn:aws:s3:::al2023-repos-eu-central-1-de612dc2/*" } ],
+  "Version" : "2012-10-17"
+}"#;
+        assert_eq!(canonical_policy_sha256(normalised).unwrap(), want);
+        let widened = ENDPOINT_POLICY.replace("ai-env-transcripts-123456789012/v1/*", "*");
+        assert_ne!(canonical_policy_sha256(&widened).unwrap(), want);
+        assert_ne!(canonical_policy_sha256(&ENDPOINT_POLICY.replace("[\"s3:GetObject\"]", "[\"s3:GetObject\",\"s3:PutObject\"]")).unwrap(), want);
+        assert!(canonical_policy_sha256("not json").is_err());
+        assert_eq!(canonical_policy_sha256(r#"{"b":["x"],"a":[1],"c":["y","z"]}"#).unwrap(), hex::encode(<sha2::Sha256 as sha2::Digest>::digest(br#"{"a":[1],"b":"x","c":["y","z"]}"#)), "only a one-element array of strings collapses");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S9's five outputs reach state/infra.toml (names, ids and hashes
+    /// only), and a stack that has none yet reads and writes without them.
+    #[test]
+    fn the_s9_outputs_reach_the_infra_state() {
+        let base = serde_json::json!({"region": "eu-central-1", "imageArn": "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent"});
+        let mut with = base.clone();
+        let hash = "0".repeat(64);
+        for (k, v) in [("transcriptsBucket", "ai-env-transcripts-123456789012"), ("s3EndpointId", "vpce-0123456789abcdef0"), ("s3EndpointPolicySha256", hash.as_str()), ("transcriptsBucketPolicySha256", hash.as_str()), ("proxyRouteTableId", "rtb-0123456789abcdef0")] {
+            with[k] = serde_json::Value::String(v.to_string());
+        }
+        let o = parse_outputs(&with.to_string()).unwrap();
+        let st = InfraState::from_outputs(&o, "dev", "2026-10-18T00:00:00Z".into());
+        assert_eq!(
+            (st.transcripts_bucket.as_deref(), st.s3_endpoint_id.as_deref(), st.s3_endpoint_policy_sha256.as_deref(), st.transcripts_bucket_policy_sha256.as_deref(), st.proxy_route_table_id.as_deref()),
+            (Some("ai-env-transcripts-123456789012"), Some("vpce-0123456789abcdef0"), Some(hash.as_str()), Some(hash.as_str()), Some("rtb-0123456789abcdef0"))
+        );
+        let text = toml::to_string(&st).unwrap();
+        assert!(text.contains("transcripts_bucket = \"ai-env-transcripts-123456789012\"") && text.contains("proxy_route_table_id = "), "{text}");
+        assert_eq!(toml::from_str::<InfraState>(&text).unwrap(), st);
+        let old = InfraState::from_outputs(&parse_outputs(&base.to_string()).unwrap(), "dev", "2026-10-18T00:00:00Z".into());
+        assert!(old.transcripts_bucket.is_none() && !toml::to_string(&old).unwrap().contains("transcripts_bucket"), "left out while none");
+    }
 
     #[test]
     fn live_image_versions_parse_the_cli_shape() {

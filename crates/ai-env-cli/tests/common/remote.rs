@@ -10,13 +10,22 @@
 //!   shim's "under `--home`" rule, plan section 6) and the agent's
 //!   `CLAUDE_CONFIG_DIR` (`<tmp>/vm<tmp>/.claude`) is never the Mac's
 //!   `<tmp>/.claude`; `--claude` the fake (`<tmp>/vm-claude`); `--git` the
-//!   fake git (`<tmp>/vm-git`, its log `<tmp>/git-vm.log`) and `--helper` the
-//!   built `ai-env`;
+//!   fake git (`<tmp>/vm-git`, its log `<tmp>/git-vm.log`), `--helper` the
+//!   built `ai-env` and (S9) `--curl` the fake curl (`<tmp>/vm-curl`, its
+//!   log `<tmp>/curl-vm.log`);
+//! * (S9) the tests' S3 (`fake_s3`), held by the rig: every process's
+//!   `AI_ENV_BRIDGE_LAB_S3_ADDR` (the Mac's presigns reach it with the fake
+//!   API), and the VM's through the fake curl, which runs the real curl
+//!   ([`REAL_CURL`], `S3CURL_REAL`) unless a test gives it knobs of its own
+//!   (`RemoteRig::set_vm_curl_knobs`): since the S3 cut-over a remote
+//!   session's transcript goes to S3 after each turn and a resume pulls it
+//!   back, so the rig's VM moves real bytes to and from the tests' S3;
 //! * the routed fake endpoint in front of it (8080 to the app listener, 9418
 //!   to the code listener; the platform's hook client for the shim: a VM's
 //!   first request runs it there) and the file-backed fake API
 //!   (`<tmp>/fake.json`, `auto_advance`; its `/health` names the credential
-//!   cache and `workspace_v1`: the VM an S8 image runs). Every process's
+//!   cache, `workspace_v1`, `git_http_v1` and `transcript_s3_v1`: the VM an
+//!   S9 image runs, as the in-process shim serves them). Every process's
 //!   `/health/detail` goes through the endpoint to the shim
 //!   (`FakeState::health_detail_at`), so a closing suspend reads the VM's
 //!   live spawns and S7's `cached_on_vm` its credential cache, as from a real
@@ -55,13 +64,14 @@
 
 use super::fake_endpoint::FakeEndpoint;
 use super::green_world::{self, Green};
-use super::{fake_master, git_calls, install_fake_git, link_fake, write_knobs, GitCall, FAKE_V2, REMOVED_ENV, SESSION_ARGV};
+use super::fake_s3::FakeS3;
+use super::{curl_calls, fake_master, git_calls, install_fake_curl, install_fake_git, link_fake, write_knobs, CurlCall, GitCall, FAKE_V2, REMOVED_ENV, SESSION_ARGV};
 use ai_env_cli::bridge::api::{Call, FakeState};
 use ai_env_cli::bridge::vm::fake_file::FileFakeMicrovmApi;
 use ai_env_cli::shim::health::{BoundPorts, ProbeSpec, ShimOpts, ShimState};
 use ai_env_cli::shim::peer::Peer;
 use ai_env_cli::shim::sys::RealSys;
-use ai_env_cli::wire::frame::{SpawnStatus, CAP_WORKSPACE_V1};
+use ai_env_cli::wire::frame::{SpawnStatus, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
 use ai_env_cli::wire::workspace::{APP_PORT, CODE_PORT};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
@@ -79,6 +89,9 @@ pub const LIMIT: Duration = Duration::from_secs(60);
 pub const BACKOFF_MS: u64 = 100;
 /// The image version the green world's egress check is recorded for (the fake's one version).
 pub const IMAGE_VERSION: &str = "1.0";
+/// The real curl the VM's fake curl runs by default (`S3CURL_REAL`): the
+/// shim's transfers then reach the tests' S3 as the image's curl reaches S3.
+pub const REAL_CURL: &str = "/usr/bin/curl";
 /// The fixture repository's branch, its one commit's author (name, email), date and message.
 pub const FIXTURE_BRANCH: &str = "main";
 pub const FIXTURE_AUTHOR: (&str, &str) = ("ai-env fixture", "fixture@ai-env.invalid");
@@ -194,6 +207,8 @@ pub struct RemoteRig {
     pub code: SocketAddr,
     /// The routed endpoint in front of them, the platform's hook client for the shim.
     pub endpoint: FakeEndpoint,
+    /// The tests' S3 (S9): every process's `AI_ENV_BRIDGE_LAB_S3_ADDR`.
+    s3: FakeS3,
     token: String,
     head: String,
     /// The shim's routers and spawns run here; dropped last but for `lane`.
@@ -252,6 +267,7 @@ impl RemoteRig {
             gid,
             helper: Some(PathBuf::from(env!("CARGO_BIN_EXE_ai-env"))),
             git: root.join("vm-git"),
+            curl: root.join("vm-curl"),
             ..ShimOpts::default()
         };
         let shim = Arc::new(ShimState::with(root.join("vm-claude"), opts, ProbeSpec::default(), Arc::new(RealSys)));
@@ -265,21 +281,25 @@ impl RemoteRig {
         });
         shim.set_ports(BoundPorts { hooks: hooks.port(), app: app.port(), code: code.port() });
         let endpoint = FakeEndpoint::start_routed(&fake, &[(APP_PORT, app), (CODE_PORT, code)], Some(hooks));
-        let rig = RemoteRig { root: root.to_path_buf(), shim, hooks, app, code, endpoint, token: green_world::setup_token("Rr"), head, rt, lane };
+        let rig = RemoteRig { root: root.to_path_buf(), shim, hooks, app, code, endpoint, s3: FakeS3::start(), token: green_world::setup_token("Rr"), head, rt, lane };
         rig.set_vm_knobs(knobs);
         // Installs the VM's fake git (its knobs file with it), which the shim runs only once asked to.
         rig.set_vm_git_knobs(&[]);
+        // And the VM's fake curl (S9), which the transcript transfers run: the real curl behind it, to the tests' S3.
+        rig.set_vm_curl_knobs(&[("S3CURL_REAL", REAL_CURL)]);
         if let Err(e) = rig.rt.block_on(rig.shim.probe_once()) {
             panic!("the shim's probe of the fake claude: {e}");
         }
         let roots = [work];
         Green { root, fake: &fake, roots: &roots }.seed(&rig.token, IMAGE_VERSION, true, &|args| rig.ai_env(args));
-        // An S8 image's VM: its `/health` also names the workspace routes'
-        // capability, and its `/health/detail` is the shim's own (the VM's live
-        // spawns, its credential cache), through the endpoint.
+        // An S9 image's VM: its `/health` also names the workspace routes',
+        // git smart-HTTP's and the transcript store's capabilities (the S3
+        // cut-over: a session reuses no VM without `transcript_s3_v1`), and its
+        // `/health/detail` is the shim's own (the VM's live spawns, its
+        // credential cache), through the endpoint.
         let at = rig.endpoint.addr;
         rig.update_fake(|s| {
-            s.health_caps.push(CAP_WORKSPACE_V1.to_string());
+            s.health_caps.extend([CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1].map(str::to_string));
             s.health_detail_at = Some(at);
         });
         rig
@@ -405,6 +425,26 @@ impl RemoteRig {
         install_fake_git(&self.root.join("vm-git"), &self.root.join("git-vm.log"), knobs);
     }
 
+    /// The tests' S3 the rig holds (S9; `AI_ENV_BRIDGE_LAB_S3_ADDR` of its processes).
+    #[must_use]
+    pub fn s3(&self) -> &FakeS3 {
+        &self.s3
+    }
+
+    /// The VM's fake curl's knobs from now on (`S3CURL_REAL`, `S3CURL_FAIL`,
+    /// `S3CURL_STATUS`, …; S9): the shim runs it with an empty environment.
+    /// They replace the rig's default ([`REAL_CURL`]): a test that still wants
+    /// the real curl names it again.
+    pub fn set_vm_curl_knobs(&self, knobs: &[(&str, &str)]) {
+        install_fake_curl(&self.root.join("vm-curl"), &self.root.join("curl-vm.log"), knobs);
+    }
+
+    /// The calls the VM's fake curl logged (the shim's `--curl`; S9).
+    #[must_use]
+    pub fn vm_curl_calls(&self) -> Vec<CurlCall> {
+        curl_calls(&self.root.join("curl-vm.log"))
+    }
+
     /// The VM side's fake claude's knobs from now on (`<tmp>/vm-claude.knobs`):
     /// its logs (the local link's files), `FAKE_CWD` (the workspace's VM
     /// path), `FAKE_CONFIG_DIR` (the Mac's `~/.claude`), then `knobs` (a
@@ -428,9 +468,9 @@ impl RemoteRig {
     /// What every process of the rig gets: `HOME`, `PATH` (the fake age and
     /// the Mac's fake git first, then `/usr/bin:/bin`), the bridge and key
     /// dirs, no AWS profile, the fake API (its runtime key unsealed with the
-    /// fake age), the agent-address knob at the routed endpoint, the lab
-    /// knob at [`BACKOFF_MS`] and the fake age's log; what a developer's
-    /// shell may carry removed first.
+    /// fake age), the agent-address knob at the routed endpoint, the S3
+    /// knob at the tests' S3 (S9), the lab knob at [`BACKOFF_MS`] and the
+    /// fake age's log; what a developer's shell may carry removed first.
     fn environ(&self, cmd: &mut Command) {
         for k in REMOVED_ENV {
             cmd.env_remove(k);
@@ -450,6 +490,7 @@ impl RemoteRig {
             .env("AI_ENV_BRIDGE_LAB_FAKE_API", self.fake_path())
             .env("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1")
             .env("AI_ENV_BRIDGE_LAB_AGENT_ADDR", self.endpoint.addr.to_string())
+            .env("AI_ENV_BRIDGE_LAB_S3_ADDR", self.s3.addr().to_string())
             .env("AI_ENV_BRIDGE_LAB_BACKOFF_MS", BACKOFF_MS.to_string())
             .env("FAKE_AGE_LOG", self.root.join("age.log"));
     }
