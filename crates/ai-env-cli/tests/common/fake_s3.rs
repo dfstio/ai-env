@@ -30,7 +30,9 @@
 //! in order and `If-None-Match` honoured, abort) and ListObjectsV2
 //! (`?list-type=2&prefix=`, `max-keys` 1000 by default, a
 //! `continuation-token`) answer S3's XML. A script ([`FakeS3::script`])
-//! makes the next requests answer a status, cut their answer or wait.
+//! makes the next requests answer a status, cut their answer or wait; a
+//! part's script ([`FakeS3::script_part`]) does it to the next uploads of
+//! one part number only, whatever else is in flight.
 //! Every request is recorded ([`S3Request`]): never a signature's or a
 //! credential's value.
 #![allow(dead_code)]
@@ -73,6 +75,8 @@ pub struct S3Request {
     pub key: String,
     /// The query's parameter names, in order.
     pub query_names: Vec<String>,
+    /// An UploadPart's part number.
+    pub part: Option<u32>,
     /// `X-Amz-SignedHeaders`, split.
     pub signed_headers: Vec<String>,
     pub content_length: Option<u64>,
@@ -121,6 +125,8 @@ struct State {
     upload_ids: u64,
     requests: Vec<S3Request>,
     script: VecDeque<S3Action>,
+    /// Part number → what its next UploadParts do (taken before `script`).
+    part_script: BTreeMap<u32, VecDeque<S3Action>>,
 }
 
 impl State {
@@ -242,6 +248,14 @@ impl FakeS3 {
     /// Queue `actions` for the next requests, in order.
     pub fn script(&self, actions: Vec<S3Action>) {
         self.state().script.extend(actions);
+    }
+
+    /// Queue `actions` for the next UploadParts of part `number` (of any
+    /// upload), in order: one each, before [`FakeS3::script`]'s queue, which
+    /// such a request leaves alone; once they are taken, that part's
+    /// requests take the queue's again.
+    pub fn script_part(&self, number: u32, actions: Vec<S3Action>) {
+        self.state().part_script.entry(number).or_default().extend(actions);
     }
 
     /// A URL of this fake signed now with `LAB_KEY_ID` and `LAB_SECRET`, for
@@ -448,7 +462,14 @@ async fn read_body(stream: &mut TcpStream, req: &mut Req, first: Vec<u8>, len: u
 
 async fn serve(mut stream: TcpStream, shared: Shared) {
     let Some((mut req, first)) = read_head(&mut stream).await else { return };
-    let action = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).script.pop_front();
+    let part = if req.method == "PUT" { req.param("partNumber").and_then(|n| n.parse::<u32>().ok()) } else { None };
+    let action = {
+        let mut st = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match part.and_then(|n| st.part_script.get_mut(&n).and_then(VecDeque::pop_front)) {
+            Some(a) => Some(a),
+            None => st.script.pop_front(),
+        }
+    };
     if let Some(S3Action::Delay(d)) = &action {
         tokio::time::sleep(*d).await;
     }
@@ -461,6 +482,7 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
         method: req.method.clone(),
         key: key.clone(),
         query_names: params.iter().map(|(k, _)| k.clone()).collect(),
+        part,
         signed_headers: params.iter().find(|(k, _)| k == "X-Amz-SignedHeaders").map(|(_, v)| v.split(';').map(str::to_string).collect()).unwrap_or_default(),
         content_length,
         chunked,

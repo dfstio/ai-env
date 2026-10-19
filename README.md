@@ -1378,8 +1378,10 @@ rule, and nothing is sent), sent to S3 by the Mac (`transcript:staged`), then mo
 chat is refused before any Touch ID, exit 9:
 `the chat's transcript is SIZE (over the 64 MiB a reopen carries inline): run ai-env session stage UUID --warm in a terminal, then reopen the chat`.
 `ai-env session stage UUID` stages a chat of up to 4 GiB (what a restore pulls) from a terminal (one
-Touch ID): scanned first, then a multipart upload (64 MiB parts, 8 at a time, a sha256 each) that
-resumes where a cut left it, never sending again an object S3 holds; `--warm` then runs `ai-env vm warm`
+Touch ID): scanned first, then a multipart upload (64 MiB parts, 8 at a time, a sha256 each; a
+part's timeout allows for the 8 sharing an uplink of at least 1 MB/s, and a part that gets no answer,
+or S3's 500 or 503, goes again, 3 tries at most) that resumes where a cut left it, never sending again
+an object S3 holds; `--warm` then runs `ai-env vm warm`
 on the chat's workspace (its own Touch ID), so the VM is up and seeded, and restores the chat from S3
 into that VM (no Touch ID of its own), where its reopen keeps it (below). Before anything is sent it
 refuses (exit 9) a chat whose transcript records a cwd outside `bridge.toml`'s roots or in no git

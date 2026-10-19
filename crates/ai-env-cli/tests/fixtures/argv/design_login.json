@@ -1,6 +1,6 @@
 {
   "name": "design_login",
-  "ext_version": "2.1.278",
+  "ext_version": "2.1.303",
   "argv": ["design-login", "--json", "--status"],
   "route": "local",
   "reason": "subcommand:design-login"

@@ -3018,6 +3018,171 @@ fn manifest_parts(m: &toml::Table) -> Vec<(String, Option<String>)> {
     m.get("parts").and_then(toml::Value::as_array).map(|parts| parts.iter().filter_map(|p| Some((p.get("key")?.as_str()?.to_string(), p.get("version_id").and_then(toml::Value::as_str).map(str::to_string)))).collect()).unwrap_or_default()
 }
 
+/// Whether the manifest `m` of `session` lists a part of the VM's
+/// (`v1/<sid>/vm/…`, with a version id) that holds bytes past `after`.
+fn vm_part_past(m: &toml::Table, session: &str, after: u64) -> bool {
+    let prefix = format!("v1/{session}/vm/");
+    let num = |p: &toml::Value, k: &str| p.get(k).and_then(toml::Value::as_integer).and_then(|n| u64::try_from(n).ok());
+    m.get("parts").and_then(toml::Value::as_array).is_some_and(|parts| {
+        parts.iter().any(|p| {
+            p.get("key").and_then(toml::Value::as_str).is_some_and(|k| k.starts_with(&prefix))
+                && p.get("version_id").and_then(toml::Value::as_str).is_some_and(|v| !v.is_empty())
+                && num(p, "from").zip(num(p, "len")).is_some_and(|(from, len)| from.saturating_add(len) > after)
+        })
+    })
+}
+
+/// How long a turn's sync may take to commit after its result, the chat
+/// open: the code-out trigger hands a tail, fetches and captures the
+/// settings before it syncs.
+const LIVE_SYNC_LIMIT: Duration = Duration::from_secs(60);
+/// How often [`Chat::wait_for_sync`] reads the manifest.
+const LIVE_SYNC_POLL: Duration = Duration::from_millis(500);
+
+impl Chat {
+    /// After a turn's result, the chat left open: wait until the Mac's
+    /// manifest of its session (`chat.session`, the turn's `system/init`'s)
+    /// lists a part of the VM's (`v1/<sid>/vm/…`, with its version) that
+    /// holds bytes past `after`, what the manifest committed before the turn
+    /// (0 before any): the turn's own sync committed it. The code-out
+    /// trigger runs that sync after the result, and a close before the
+    /// trigger starts it starts none of it (these tests turn the closing
+    /// suspend's tail off). The manifest is read every [`LIVE_SYNC_POLL`] (a
+    /// file of the Mac's: no Touch ID) and the chat's lines meanwhile; how
+    /// long it took is printed. Past [`LIVE_SYNC_LIMIT`], or once the wrapper
+    /// exits, the test fails naming what is missing: the manifest, or such a
+    /// part. The manifest's committed length (the next turn's `after`).
+    fn wait_for_sync(&mut self, live: &Live, after: u64) -> u64 {
+        self.wait_for_sync_within(live, after, LIVE_SYNC_LIMIT)
+    }
+
+    /// [`Chat::wait_for_sync`] bounded by `limit` (offline: a bound already
+    /// passed fails at the first read).
+    fn wait_for_sync_within(&mut self, live: &Live, after: u64, limit: Duration) -> u64 {
+        let test = self.test;
+        let session = self.session.clone().unwrap_or_else(|| panic!("{test}: no session id after the turn"));
+        let path = live.paths.transcript_manifest(&session);
+        let t = Instant::now();
+        loop {
+            let missing = match std::fs::read_to_string(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("no manifest of {session} ({})", path.display()),
+                Err(e) => format!("the manifest of {session}: {}: {e}", path.display()),
+                Ok(text) => match toml::from_str::<toml::Table>(&text) {
+                    Err(e) => format!("the manifest of {session}: {}: {}", path.display(), no_account(&e.to_string())),
+                    Ok(m) => {
+                        let committed = m.get("committed").and_then(toml::Value::as_integer).and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+                        if vm_part_past(&m, &session, after) {
+                            eprintln!("{test}: the turn's sync committed {committed} bytes of {session} {} ms after its result (before it: {after})", t.elapsed().as_millis());
+                            return committed;
+                        }
+                        format!("no part of the VM's with a version past {after} bytes in the manifest of {session} ({committed} bytes committed; its parts: {:?})", manifest_parts(&m))
+                    }
+                },
+            };
+            assert!(t.elapsed() < limit, "{test}: {missing}, {limit:?} after the turn's result with the chat open: the turn's sync did not commit");
+            let until = Instant::now() + LIVE_SYNC_POLL;
+            while self.next(until).is_some() {}
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!("{test}: the wrapper exited ({status}) while the test waited for the turn's sync ({missing}); its stderr: {}", self.stderr_now());
+            }
+            // At the wrapper's EOF `next` returns at once: the rest of the interval is slept.
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
+/// Offline: [`Chat::wait_for_sync`] over a chat whose wrapper is `cat` (it
+/// stays open and says only what it is sent) and manifests the product's
+/// own writer (`s3::manifest::write`) puts down meanwhile. No manifest, or
+/// one whose only parts past `after` are the Mac's or have no version, is
+/// what the bound names; once a part of the VM's with its version ends
+/// past `after` (a segment, the next one at the committed length, then a
+/// new generation's base) the wait returns the committed length, the
+/// chat's lines read meanwhile; the wrapper's exit fails it at once.
+#[test]
+fn wait_for_sync_takes_only_a_part_of_the_vm_past_what_was_committed() {
+    use ai_env_cli::bridge::s3::manifest::{self, Manifest, ManifestPart};
+    use ai_env_cli::wire::s3::S3Key;
+    const TEST: &str = "wait_for_sync_takes_only_a_part_of_the_vm_past_what_was_committed";
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+    let live = Live { _dir: dir, paths, cfg: BridgeConfig::default(), creds: test_creds() };
+    let sid = uuid::Uuid::now_v7().to_string();
+    let target = ai_env_cli::bridge::s3::S3Target { bucket: "ai-env-transcripts-123456789012".into(), owner: "123456789012".into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Aws };
+    let part = |key: S3Key, version: &str, from: u64, len: u64| ManifestPart { key: key.render(), version_id: version.into(), from, len, sha256: "0".repeat(64) };
+    let (fp, at) = ("0".repeat(64), "2026-10-19T00:00:00.000Z");
+    // A chat begun on the Mac (its object: 0..100), then a segment of the VM's whose version S3 did not name.
+    let mut m = Manifest::new(&sid, &target, manifest::ORIGIN_MAC, &format!("-w/{sid}.jsonl"), at);
+    m.parts.push(part(S3Key::Mac { session: sid.clone(), sha256: "a".repeat(64) }, "m1", 0, 100));
+    m.committed = 100;
+    m.commit_segment(part(S3Key::Segment { session: sid.clone(), gen: 1, offset: 100 }, "", 100, 50), &fp, None, "microvm-1", at);
+    // The wrapper: `cat`, its lines read as `Chat::open` reads ai-env-claude's.
+    let mut child = std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("cat runs");
+    let (tx, lines) = std::sync::mpsc::channel();
+    let out = child.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(out).lines().map_while(std::result::Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut err = child.stderr.take().expect("piped stderr");
+    let stderr = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+        buf
+    });
+    let mut chat = Chat { test: TEST, stdin: child.stdin.take(), child, lines, stderr: Some(stderr), stdout: Vec::new(), session: Some(sid.clone()) };
+    // A wait whose bound has passed: what it names.
+    let fails = |chat: &mut Chat, after: u64| {
+        let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chat.wait_for_sync_within(&live, after, Duration::ZERO))).expect_err("a bound already passed fails the wait");
+        e.downcast_ref::<String>().cloned().unwrap_or_default()
+    };
+    let said = fails(&mut chat, 0);
+    assert!(said.contains(&format!("no manifest of {sid}")), "{said}");
+    manifest::write(&live.paths, &m).unwrap();
+    let said = fails(&mut chat, 0);
+    assert!(said.contains("no part of the VM's with a version past 0 bytes") && said.contains("150 bytes committed"), "{said}");
+    // The segment's version lands while the chat says a line.
+    let later = |m: Manifest| {
+        let paths = live.paths.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            manifest::write(&paths, &m).unwrap();
+        })
+    };
+    m.parts[1].version_id = "v2".into();
+    let t = Instant::now();
+    let writer = later(m.clone());
+    chat.send(&serde_json::json!({"type": "system", "subtype": "status", "said": "meanwhile"}));
+    assert_eq!(chat.wait_for_sync(&live, 0), 150);
+    assert!(t.elapsed() >= Duration::from_millis(600), "{:?}", t.elapsed());
+    writer.join().unwrap();
+    assert!(String::from_utf8_lossy(&chat.stdout).contains("\"said\":\"meanwhile\""), "the chat's line was read meanwhile");
+    // Past 150 only a newer part counts: here the next segment, at 150 and shorter than it (its end counts, not its length).
+    let said = fails(&mut chat, 150);
+    assert!(said.contains("past 150 bytes"), "{said}");
+    m.commit_segment(part(S3Key::Segment { session: sid.clone(), gen: 1, offset: 150 }, "v3", 150, 25), &fp, None, "microvm-1", at);
+    let writer = later(m.clone());
+    assert_eq!(chat.wait_for_sync(&live, 150), 175);
+    writer.join().unwrap();
+    // Past 175: a new generation's base, from 0.
+    let said = fails(&mut chat, 175);
+    assert!(said.contains("past 175 bytes"), "{said}");
+    m.commit_base(2, part(S3Key::Base { session: sid.clone(), gen: 2 }, "v4", 0, 200), &fp, None, "microvm-1", at);
+    let writer = later(m.clone());
+    assert_eq!(chat.wait_for_sync(&live, 175), 200);
+    writer.join().unwrap();
+    // The wrapper ends (its stdin closed): the wait fails at once, not at its bound.
+    chat.stdin = None;
+    let t = Instant::now();
+    let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chat.wait_for_sync(&live, 200))).expect_err("the wrapper's exit fails the wait");
+    let said = e.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(said.contains("the wrapper exited") && t.elapsed() < Duration::from_secs(5), "{said} ({:?})", t.elapsed());
+}
+
 /// A request of the Mac to the transcripts bucket with its own runtime key
 /// (outside the gateway endpoint): `method` on `key` (`version` when
 /// given), `headers` signed besides the owner's: S3's status and `<Code>`.
@@ -3047,19 +3212,24 @@ fn s3_target(live: &Live) -> ai_env_cli::bridge::s3::S3Target {
 /// The S3 transcripts of a test's chats, purged when the test ends, passed or
 /// failed: `session forget <sid> --purge` in the test's root (one Touch ID
 /// each) for every session it keeps transcript state of
-/// (`state/transcripts/<sid>/`). That deletes the objects under
-/// `v1/<sid>/`, which only the temporary root's manifests name (no later
-/// `session gc --remote` would find them), and the view. Made after
-/// [`SessionVms`] and before the chats: it runs once they closed, before
-/// their VMs are terminated. Interrupted, or when a purge fails, the prefix
-/// to delete by hand is printed.
+/// (`state/transcripts/<sid>/`) or whose row keeps its transcript in S3 (a
+/// chat whose sync never committed: no manifest, and S3 may hold its tail).
+/// That deletes the objects under `v1/<sid>/`, which only the temporary
+/// root's manifests name (no later `session gc --remote` would find them),
+/// and the view. Made before [`SessionVms`]: it runs once the chats closed
+/// and their VMs ended, so a tail a VM's `/terminate` pushed is purged with
+/// the rest. Interrupted, or when a purge fails, the prefix to delete by
+/// hand is printed.
 struct PurgeTranscripts<'a>(&'a Live);
 
 impl Drop for PurgeTranscripts<'_> {
     fn drop(&mut self) {
         let live = self.0;
         let mut sessions: Vec<String> = std::fs::read_dir(live.paths.transcripts()).map(|dir| dir.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| ai_env_cli::bridge::registry::is_uuid(n)).collect()).unwrap_or_default();
+        // A chat whose sync never committed has no directory there; its row names S3, a trace `forget --purge` takes.
+        sessions.extend(ai_env_cli::bridge::registry::list(&live.paths).unwrap_or_default().into_iter().filter(|r| r.transcript_home.is_some()).map(|r| r.session_id));
         sessions.sort();
+        sessions.dedup();
         for sid in sessions {
             let by_hand = format!("its objects under v1/{sid}/ in the transcripts bucket are left: delete them by hand");
             let said = if CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
@@ -3093,7 +3263,10 @@ fn assert_a_view(test: &str, live: &Live, session: &str) -> Vec<String> {
 }
 
 /// T9 S3 live (B6): a chat's turns land in S3, not on the Mac. Two turns of
-/// a chat in remote mode, then: the session row keeps its transcript in S3
+/// a chat in remote mode, the chat left open after each until that turn's
+/// own sync committed it ([`Chat::wait_for_sync`]; the first wait also
+/// keeps the first turn's sync from passing for the second's), then the
+/// close, and then: the session row keeps its transcript in S3
 /// (`transcript_home`, `origin` vm); the Mac's manifest lists parts of the
 /// VM's (`v1/<sid>/vm/…`, each with its version), and S3 lists them; the
 /// Mac's file is the view (its mark first, at most the configured messages);
@@ -3110,14 +3283,17 @@ fn live_s3_turn_lands_in_s3_not_on_mac() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
-    let _vms = SessionVms::new(&live);
     let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-s3-turn");
     let mut chat = Chat::open(TEST, &live, &ws, &[]);
     chat.initialize();
+    // What the manifest committed before each turn: 0 before the first.
+    let mut committed = 0;
     for n in 1..=2 {
         let turn = chat.turn(&format!("Reply with exactly OK {n}"));
         assert_eq!(turn.result["is_error"], false, "{TEST}: turn {n}: {}", turn.result);
+        committed = chat.wait_for_sync(&live, committed);
     }
     let (code, close) = chat.close();
     assert_closed_well(TEST, &live, &chat, code, close);
@@ -3165,8 +3341,8 @@ fn live_s3_reopen_new_vm_restores() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
-    let _vms = SessionVms::new(&live);
     let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-s3-reopen");
     let word = format!("harbour{}", uuid::Uuid::now_v7().simple().to_string().chars().rev().take(4).collect::<String>());
     let mut first = Chat::open(TEST, &live, &ws, &[]);
@@ -3266,8 +3442,8 @@ fn live_s3_gib_round_trip_timing() {
         ("max_duration_s", toml::Value::Integer(i64::try_from(wall.as_secs()).unwrap())),
         ("reuse_per_workspace", toml::Value::Boolean(true)),
     ]);
-    let _vms = SessionVms::new(&live);
     let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-s3-gib");
     let slug = ai_env_cli::wire::slug::project_dir_name(&ws).expect("the fixture's project directory name");
     let dir = mac_projects().join(&slug);
@@ -3398,12 +3574,13 @@ fn live_s3_gib_round_trip_timing() {
 }
 
 /// T9 S3 live (B6): the Mac cannot read the VM's objects, nor write one.
-/// After a chat's turn landed in S3, the Mac's own runtime key (outside the
-/// gateway endpoint) is refused a GET of each part (by its version and as
-/// the current one) and a PUT of the next generation's base: 403
-/// `AccessDenied` each, the bucket policy's denies. The chat's objects are
-/// purged at the end ([`PurgeTranscripts`]). Three Touch IDs: the chat's,
-/// the test process's runtime key, the purge.
+/// After a chat's turn landed in S3 (the chat left open until the turn's own
+/// sync committed it, [`Chat::wait_for_sync`]; then the close), the Mac's
+/// own runtime key (outside the gateway endpoint) is refused a GET of each
+/// part (by its version and as the current one) and a PUT of the next
+/// generation's base: 403 `AccessDenied` each, the bucket policy's denies.
+/// The chat's objects are purged at the end ([`PurgeTranscripts`]). Three
+/// Touch IDs: the chat's, the test process's runtime key, the purge.
 #[test]
 #[ignore = "live, S9's S3 store, starts a MicroVM and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
 fn live_s3_mac_cannot_read_vm_objects() {
@@ -3413,12 +3590,13 @@ fn live_s3_mac_cannot_read_vm_objects() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
-    let _vms = SessionVms::new(&live);
     let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-s3-mac-reads");
     let mut chat = Chat::open(TEST, &live, &ws, &[]);
     chat.initialize();
     chat.turn("Reply with exactly OK");
+    chat.wait_for_sync(&live, 0);
     let (code, close) = chat.close();
     assert_closed_well(TEST, &live, &chat, code, close);
     let session = chat.session.clone().expect("the chat's session id");

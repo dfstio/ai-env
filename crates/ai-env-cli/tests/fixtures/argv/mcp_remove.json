@@ -1,6 +1,6 @@
 {
   "name": "mcp_remove",
-  "ext_version": "2.1.278",
+  "ext_version": "2.1.303",
   "argv": ["mcp", "remove", "--scope", "user", "--", "github"],
   "route": "local",
   "reason": "subcommand:mcp"

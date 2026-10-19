@@ -3003,7 +3003,7 @@ mod tests {
         assert_eq!(texts.iter().filter(|(_, t)| t.starts_with("a Cursor window runs extension ")).cloned().collect::<Vec<_>>(), vec![older.clone()], "the window on the installed 2.1.302 adds no row: {texts:?}");
         assert_eq!(texts[0].0, Tag::Ok, "the installed bundle first: {texts:?}");
         assert_eq!(texts[1], older, "right after it: {texts:?}");
-        let drift = texts.iter().find(|(_, t)| t.contains("fixtures tagged")).expect("the fixtures are 2.1.278's");
+        let drift = texts.iter().find(|(_, t)| t.contains("fixtures tagged")).expect("the fixtures are not the installed 2.1.302's");
         assert_eq!(drift, &(Tag::Warn, format!("cursor extension 2.1.302 ≠ fixtures tagged {FIXTURE_EXT_VERSION}; a Cursor window runs 2.1.301  <- re-capture tests/fixtures/argv from `ai-env wrapper census`")));
         // No live window, or every one on the installed extension: no window row.
         for windows in [Vec::new(), vec![RunningExtension { host: 5102, ext: "2.1.302".into(), started: since, seen: (since + 120) * 1000 }]] {
@@ -3041,20 +3041,20 @@ mod tests {
     fn fixture_drift_row() {
         use crate::bridge::census::RunningExtension;
         let on = |ext: &str| RunningExtension { host: 4200, ext: ext.into(), started: 1, seen: 1000 };
-        assert_eq!(FIXTURE_EXT_VERSION, "2.1.278");
+        assert_eq!(FIXTURE_EXT_VERSION, "2.1.303");
         assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[]), None, "the fixtures match the installed bundle");
         assert_eq!(row_fixture_drift(None, &[]), None, "no bundle: nothing to drift from");
         assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[on(FIXTURE_EXT_VERSION)]), None, "a window on the fixtures' version");
         let (tag, t) = text(&row_fixture_drift(Some("2.1.290"), &[]).unwrap());
         assert_eq!(tag, Tag::Warn);
-        assert!(t.starts_with("cursor extension 2.1.290 ≠ fixtures tagged 2.1.278  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"), "{t}");
+        assert!(t.starts_with("cursor extension 2.1.290 ≠ fixtures tagged 2.1.303  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"), "{t}");
         assert_eq!(row_fixture_drift(Some("2.1.290"), &[on("2.1.290"), on(FIXTURE_EXT_VERSION)]), row_fixture_drift(Some("2.1.290"), &[]), "windows on the installed or the fixtures' version add nothing");
         let (_, t) = text(&row_fixture_drift(Some("2.1.290"), &[on("2.1.289"), on("2.1.288"), on("2.1.289")]).unwrap());
-        assert_eq!(t, "cursor extension 2.1.290 ≠ fixtures tagged 2.1.278; a Cursor window runs 2.1.288, 2.1.289  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
+        assert_eq!(t, "cursor extension 2.1.290 ≠ fixtures tagged 2.1.303; a Cursor window runs 2.1.288, 2.1.289  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
         let (tag, t) = text(&row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[on("2.1.277")]).unwrap());
-        assert_eq!((tag, t.as_str()), (Tag::Warn, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.278  <- reload that window (the installed bundle matches the fixtures)"));
+        assert_eq!((tag, t.as_str()), (Tag::Warn, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.303  <- reload that window (the installed bundle matches the fixtures)"));
         let (_, t) = text(&row_fixture_drift(None, &[on("2.1.277")]).unwrap());
-        assert_eq!(t, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.278  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
+        assert_eq!(t, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.303  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
     }
 
     #[test]

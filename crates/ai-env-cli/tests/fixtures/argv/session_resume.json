@@ -1,10 +1,10 @@
 {
   "name": "session_resume",
-  "ext_version": "2.1.278",
-  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--resume=8f3c1b2e-4d5a-7b6c-9d8e-0f1a2b3c4d5e", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
+  "ext_version": "2.1.303",
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=[redacted:len=5]", "--permission-prompt-tool=stdio", "--resume=123ce858-087d-4061-a4e0-dafc20958256", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
   "route": "remote",
   "session": {
-    "resume": "8f3c1b2e-4d5a-7b6c-9d8e-0f1a2b3c4d5e",
+    "resume": "123ce858-087d-4061-a4e0-dafc20958256",
     "thinking_disabled": false,
     "add_dirs": [],
     "permission_mode": "default",
@@ -14,5 +14,5 @@
     "continue": false,
     "debug": true
   },
-  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-prompt-tool", "stdio", "--resume=8f3c1b2e-4d5a-7b6c-9d8e-0f1a2b3c4d5e", "--setting-sources=user,project,local", "--permission-mode", "default", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]
+  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=[redacted:len=5]", "--permission-prompt-tool=stdio", "--resume=123ce858-087d-4061-a4e0-dafc20958256", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]
 }

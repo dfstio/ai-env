@@ -569,10 +569,12 @@ mod tests {
     #[test]
     fn build_row_on_the_session_fixture() {
         let args = fixture_argv(include_str!("../../tests/fixtures/argv/session.json"));
-        let route = classify(&args);
+        // The fixture is the census's form; the spawn carries the number.
+        let spawned: Vec<String> = args.iter().map(|a| if a == "--max-thinking-tokens=[redacted:len=5]" { "--max-thinking-tokens=31999".to_string() } else { a.clone() }).collect();
+        let route = classify(&spawned);
         assert!(matches!(route, Route::Remote(_)));
         let mut argv: Vec<OsString> = vec![OsString::from(WRAPPER), OsString::from(BUNDLED)];
-        argv.extend(args.iter().map(OsString::from));
+        argv.extend(spawned.iter().map(OsString::from));
         let cwd = Path::new("/Users/mike/Documents/DeFi/ai-env");
         let row = build_row(&argv, &route, Some(cwd), None);
 
@@ -589,7 +591,7 @@ mod tests {
         assert_eq!(row.ts, rfc3339_utc(row.start / 1000), "ts is derived from the same clock read as start");
         assert_eq!(row.argv[0], WRAPPER);
         assert_eq!(row.argv[1], BUNDLED);
-        assert_eq!(row.argv[2..], args[..], "nothing in a session argv needs redacting");
+        assert_eq!(row.argv[2..], args[..], "the row is the fixture: only the thinking budget is masked");
         assert_eq!(row.cwd.as_deref(), Some("/Users/mike/Documents/DeFi/ai-env"));
         assert!(row.note.is_none() && row.end.is_none() && row.exit.is_none());
 

@@ -1,6 +1,6 @@
 {
   "name": "version",
-  "ext_version": "2.1.278",
+  "ext_version": "2.1.303",
   "argv": ["--version"],
   "route": "local",
   "reason": "version"

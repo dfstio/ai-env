@@ -24,14 +24,14 @@ use ai_env_cli::bridge::s3::client::{Body, S3Client, Written};
 use ai_env_cli::bridge::s3::manifest::{self, Manifest};
 use ai_env_cli::bridge::s3::stage::{self as s3stage, MacChat};
 use ai_env_cli::bridge::s3::sync::{SyncCtx, SyncReport};
-use ai_env_cli::bridge::s3::{S3Endpoint, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
+use ai_env_cli::bridge::s3::{PresignReq, S3Endpoint, S3Sign, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
 use ai_env_cli::bridge::scan::Rules;
 use ai_env_cli::bridge::view::ViewOutcome;
 use ai_env_cli::bridge::workspace::transcript::digest_file;
 use ai_env_cli::bridge::workspace::{EnsureCtx, Head, SeedLimits, TranscriptOutcome, WorkspaceRef, WsKind};
 use ai_env_cli::wire::frame::CAP_TRANSCRIPT_S3_V1;
 use ai_env_cli::wire::redact::Secret;
-use ai_env_cli::wire::s3::{sha256_b64, S3Key, FP_SPAN, MULTIPART_PART};
+use ai_env_cli::wire::s3::{sha256_b64, PresignedUrl, S3Key, FP_SPAN, MULTIPART_PART};
 use ai_env_cli::wire::view::{TranscriptViewReply, VIEW_MARK_PREFIX};
 use ai_env_cli::wire::workspace::{
     CodeoutRequest, ObjectFormat, PullPartReport, SeedQuery, SeedReply, SeedState, SettingsCapture, StatQuery, SubtreeFile, TranscriptPull, TranscriptPullReply, TranscriptPush,
@@ -188,13 +188,14 @@ fn code_of(body: &[u8]) -> Option<String> {
 mod stage {
     use super::*;
 
-    /// A staging upload resumes after a cut: the first run's first part to
-    /// reach S3 is refused (500), so the upload fails with `stage.toml`
-    /// holding its upload id and the parts it saw land; a part S3 lists with
-    /// another size (one written there since) is sent again on the resume,
-    /// the parts S3 lists as they should be are not, the resume asks
-    /// ListParts before any UploadPart, never creates a second upload, and
-    /// the object S3 ends with is the chat's bytes, by its sha256 key.
+    /// A staging upload resumes after a cut: the first run's part 3 is
+    /// refused (500) at each of its three tries, so the upload fails with
+    /// `stage.toml` holding its upload id and the parts it saw land; a part
+    /// S3 lists with another size (one written there since) is sent again
+    /// on the resume, the parts S3 lists as they should be are not, the
+    /// resume asks ListParts before any UploadPart, never creates a second
+    /// upload, and the object S3 ends with is the chat's bytes, by its
+    /// sha256 key.
     #[test]
     fn multipart_resumes_after_cut() {
         let w = World::new(FakeS3::start());
@@ -207,11 +208,12 @@ mod stage {
         let d = digest_file(&Rules::defaults(), &path, bytes.len() as u64, part as u64).unwrap();
         assert_eq!(d.parts.len(), 5, "five parts");
         let key = S3Key::Mac { session: SID.into(), sha256: d.sha256.clone() }.render();
-        // Only what is always taken: the create (the first request), then whichever part reaches S3 first.
-        w.s3.script(vec![S3Action::Delay(std::time::Duration::ZERO), S3Action::Status { status: 500, code: "InternalError" }]);
+        // A 500 is tried again (client::PART_TRIES): part 3 gets one at each of its tries.
+        w.s3.script_part(3, vec![S3Action::Status { status: 500, code: "InternalError" }; 3]);
         let client = w.client();
         let first = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, part as u64));
         assert!(matches!(first, Err(BridgeError::S3 { status: 500, .. })), "the refused part fails the upload: {first:?}");
+        assert_eq!(w.s3.requests().iter().filter(|r| r.part == Some(3)).map(|r| r.status).collect::<Vec<_>>(), [500; 3], "three tries of part 3");
         let saved = s3stage::read_stage(&w.paths, SID).unwrap().expect("a stage file after the failure");
         assert_eq!((saved.key.as_str(), saved.part_len), (key.as_str(), part as u64));
         // The parts in flight when the failure ended the run land (or not) on the fake's own thread: wait until it is quiet.
@@ -255,6 +257,103 @@ mod stage {
         assert_eq!(w.s3.get(&key).as_deref(), Some(bytes.as_slice()), "S3 holds the chat's bytes");
         assert!(w.s3.objects().iter().any(|o| o.key == key && o.current && o.sha256 == d.sha256));
         assert_eq!(w.s3.requests().iter().filter(|r| r.method == "POST" && r.query_names.iter().any(|n| n == "uploads")).count(), 1, "one CreateMultipartUpload across both runs");
+    }
+
+    /// The fake API's presigner, keeping the part number of each UploadPart it presigned.
+    struct Counting {
+        api: FakeMicrovmApi,
+        parts: std::sync::Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl S3Sign for Counting {
+        async fn presign(&self, req: &PresignReq) -> Result<PresignedUrl, BridgeError> {
+            if let Some((_, n)) = req.query.iter().find(|(k, _)| k == "partNumber") {
+                self.parts.lock().unwrap().push(n.parse().unwrap());
+            }
+            self.api.presign(req).await
+        }
+    }
+
+    /// A chat of four 1 MiB parts (the last a few bytes) whose transcript
+    /// records the world's repository; its sha256 key.
+    fn four_parts(w: &World, repo: &Path) -> (Vec<u8>, String) {
+        let bytes = [cwd_line(repo), line("turn 0", 1 << 20), line("turn 1", 1 << 20), line("turn 2", 1 << 20)].concat();
+        w.plant(&format!("{SID}.jsonl"), &bytes);
+        let key = S3Key::Mac { session: SID.into(), sha256: sha(&bytes) }.render();
+        (bytes, key)
+    }
+
+    /// B6 (a): a part that gets no answer (its connection closed unanswered,
+    /// as a timeout or a reset leaves it) is sent again, presigned anew, and
+    /// so is one S3 answers 503 `SlowDown`; `session stage` completes and S3
+    /// holds the chat's bytes.
+    #[test]
+    fn a_part_with_no_answer_is_sent_again_and_the_stage_completes() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let (bytes, key) = four_parts(&w, &repo);
+        w.s3.script_part(2, vec![S3Action::CutAfter { bytes: 0 }]);
+        w.s3.script_part(3, vec![S3Action::Status { status: 503, code: "SlowDown" }]);
+        let presigned = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let signer = Counting { api: FakeMicrovmApi::new(), parts: presigned.clone() };
+        let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, move || async move { Ok(signer) })).unwrap();
+        assert_eq!((report.outcome, report.parts, report.key.as_str()), ("staged", 4, key.as_str()));
+        assert_eq!(w.s3.get(&key).as_deref(), Some(bytes.as_slice()), "S3 holds the chat's bytes");
+        let tries = |n: u32| w.s3.requests().iter().filter(|r| r.part == Some(n)).map(|r| r.status).collect::<Vec<_>>();
+        assert_eq!((tries(1), tries(2), tries(3), tries(4)), (vec![200], vec![0, 200], vec![503, 200], vec![200]), "{:?}", w.s3.requests());
+        let mut signed = presigned.lock().unwrap().clone();
+        signed.sort_unstable();
+        assert_eq!(signed, [1, 2, 2, 3, 3, 4], "each try presigned anew");
+    }
+
+    /// B6 (a): a part with no answer at each of its three tries ends the
+    /// stage, exit 7, naming the part, the tries and the cause (reqwest's
+    /// error and its source chain), never the URL (no scheme, address,
+    /// bucket or signature, nothing scrubbed out of it). The stage file
+    /// keeps the parts that landed, no manifest is written, the original
+    /// stays in place; a rerun resumes and sends that part alone.
+    #[test]
+    fn a_part_with_no_answer_at_every_try_ends_the_stage_naming_the_cause() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let (bytes, key) = four_parts(&w, &repo);
+        w.s3.script_part(2, vec![S3Action::CutAfter { bytes: 0 }; 3]);
+        let presigned = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let signer = Counting { api: FakeMicrovmApi::new(), parts: presigned.clone() };
+        let err = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, move || async move { Ok(signer) })).unwrap_err();
+        let text = err.to_string();
+        let head = format!("aws s3 upload part: part 2 of {key}: no answer in 3 tries: error sending request: ");
+        assert!(text.starts_with(&head) && text.len() > head.len(), "the cause after reqwest's own words: {text}");
+        for never in ["http", &w.s3.addr().to_string(), LAB_BUCKET, "X-Amz", "redacted"] {
+            assert!(!text.contains(never), "{never:?} in {text}");
+        }
+        assert_eq!(ai_env_cli::errors::CliError::from(err).exit_code(), 7);
+        assert_eq!(w.s3.requests().iter().filter(|r| r.part == Some(2)).map(|r| r.status).collect::<Vec<_>>(), [0; 3], "three tries, none answered");
+        assert_eq!(presigned.lock().unwrap().iter().filter(|n| **n == 2).count(), 3, "each try presigned anew");
+        let saved = s3stage::read_stage(&w.paths, SID).unwrap().expect("the stage file stays");
+        assert_eq!(saved.parts.iter().map(|p| p.number).collect::<Vec<_>>(), [1, 3, 4]);
+        assert!(w.manifest().is_none(), "no manifest");
+        assert_eq!(std::fs::read(w.view_path()).unwrap(), bytes, "the original stays in place");
+        // The rerun: part 2 alone, the upload completed.
+        let from = w.s3.requests().len();
+        let again = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap();
+        assert_eq!(again.outcome, "resumed");
+        assert_eq!(w.s3.requests()[from..].iter().filter_map(|r| r.part).collect::<Vec<_>>(), [2]);
+        assert_eq!(w.s3.get(&key).as_deref(), Some(bytes.as_slice()));
+    }
+
+    /// A part S3 answers 503 `SlowDown` and then not at all (two connections
+    /// closed unanswered) ends the stage, exit 7, naming both: no answer at
+    /// the last of its three tries, and the 503 before it (S3 did answer).
+    #[test]
+    fn a_part_answered_503_and_then_not_at_all_names_both() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let (_, key) = four_parts(&w, &repo);
+        w.s3.script_part(2, vec![S3Action::Status { status: 503, code: "SlowDown" }, S3Action::CutAfter { bytes: 0 }, S3Action::CutAfter { bytes: 0 }]);
+        let err = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap_err();
+        let text = err.to_string();
+        let head = format!("aws s3 upload part: part 2 of {key}: no answer at the last of 3 tries (S3 answered HTTP 503 (SlowDown) before): error sending request: ");
+        assert!(text.starts_with(&head) && text.len() > head.len(), "the 503, then the cause: {text}");
+        assert_eq!(ai_env_cli::errors::CliError::from(err).exit_code(), 7);
+        assert_eq!(w.s3.requests().iter().filter(|r| r.part == Some(2)).map(|r| r.status).collect::<Vec<_>>(), [503, 0, 0], "one answer, then two tries unanswered");
     }
 
     /// A chat whose subagent file trips a tripwire is refused before any

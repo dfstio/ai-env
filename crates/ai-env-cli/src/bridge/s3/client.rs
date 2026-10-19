@@ -10,9 +10,12 @@
 //! `tls::lab_http_client` under the lab's loopback S3. The Mac never sends a
 //! GetObject or a HeadObject: the bucket policy refuses reads outside the
 //! endpoint. S3's XML answers are read by a bounded hand-written reader
-//! ([`xml_values`]), never a new crate.
+//! ([`xml_values`]), never a new crate. A request's budget allows for the
+//! requests sent beside it ([`budget`]); an UploadPart or a PutObject that
+//! gets no answer, or S3's 500 or 503, goes again ([`PART_TRIES`]); a
+//! request with no answer names its cause, never its URL.
 use super::presign::{request, write_headers};
-use super::{S3Endpoint, S3Method, S3Sign, S3Target};
+use super::{PresignReq, S3Endpoint, S3Method, S3Sign, S3Target};
 use crate::bridge::errors::BridgeError;
 use crate::wire::s3::{PresignedUrl, PRESIGN_EXPIRY};
 use std::path::Path;
@@ -22,6 +25,14 @@ use std::time::Duration;
 pub const XML_MAX: usize = 8 << 20;
 /// One request's budget beyond its body (sent at 1 MB/s, `dataplane::MIN_RATE`).
 const REQUEST_BASE: Duration = Duration::from_secs(30);
+/// How many times the stage's bytes (an UploadPart; a PutObject, a file of
+/// one part) are sent at most: a try that got no HTTP answer (a timeout, a
+/// reset, a TLS error) or S3's 500 or 503 goes again, presigned anew. Safe:
+/// a part sent again replaces the one of its number, and a PutObject that
+/// landed already answers 412 (`If-None-Match: *`), which is `Exists`.
+pub const PART_TRIES: u32 = 3;
+/// The wait before a write's next try, times the tries so far.
+const RETRY_WAIT: Duration = Duration::from_millis(500);
 /// The chunk a file range is streamed in.
 const CHUNK: usize = 64 * 1024;
 /// The namespace S3's request documents carry.
@@ -84,6 +95,49 @@ fn transport(op: &'static str, e: &dyn std::fmt::Display) -> BridgeError {
     BridgeError::Sdk { op, message: crate::wire::redact::scrub(&e.to_string()).into_owned() }
 }
 
+/// The budget of a request of `bytes` sent while `shared` requests in all
+/// (itself included) share the uplink: [`REQUEST_BASE`], plus its bytes
+/// `shared` times over at `dataplane::MIN_RATE`, the slowest whole transfer
+/// a budget allows (its share of it). `shared` 1: a request alone.
+#[must_use]
+pub fn budget(bytes: u64, shared: usize) -> Duration {
+    let shared = u64::try_from(shared.max(1)).unwrap_or(u64::MAX);
+    REQUEST_BASE + Duration::from_secs(bytes.saturating_mul(shared).div_ceil(crate::bridge::dataplane::MIN_RATE))
+}
+
+/// What a try that got no HTTP answer says, scrubbed: reqwest's error
+/// without its URL, each cause of its chain after it (`error sending
+/// request: …: connection reset by peer`), and whether it timed out, and
+/// after how long: `after`, the time the try ran. That is its budget when
+/// reqwest's timer fired, less when the OS timed out first (a connect, a
+/// stalled send).
+fn cause(e: reqwest::Error, after: Duration) -> String {
+    let timed_out = e.is_timeout();
+    let e = e.without_url();
+    let mut text = e.to_string();
+    let mut next = std::error::Error::source(&e);
+    while let Some(c) = next {
+        let s = c.to_string();
+        if !s.is_empty() && !text.contains(&s) {
+            text.push_str(": ");
+            text.push_str(&s);
+        }
+        next = c.source();
+    }
+    if timed_out {
+        text.push_str(&format!(" (timed out after {} s)", after.as_secs()));
+    }
+    crate::wire::redact::scrub(&text).into_owned()
+}
+
+/// What one try of a request got.
+enum Tried {
+    /// An HTTP answer, read whole.
+    Answer(Reply),
+    /// None (a timeout, a reset, a TLS error, an answer cut short): its cause ([`cause`]).
+    NoAnswer(String),
+}
+
 impl<'a, S: S3Sign> S3Client<'a, S> {
     /// The client of `target`: HTTPS under the Amazon roots, or (debug
     /// builds) plain http to the lab's loopback S3.
@@ -104,41 +158,97 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
     /// Presign `method` on `key` with `query` and `headers` (the owner's
     /// added), send it with exactly those headers and `body`, and read the
     /// answer: its status, its `x-amz-version-id` and its body (at most
-    /// [`XML_MAX`]).
-    async fn send(&self, op: &'static str, method: S3Method, key: Option<&str>, query: Vec<(String, String)>, headers: Vec<(String, String)>, body: Body) -> Result<Reply, BridgeError> {
+    /// [`XML_MAX`]). Its budget is [`budget`] of its body with `shared`
+    /// requests in flight. With `tries` over 1, a try that got no HTTP
+    /// answer, or S3's 500 or 503, goes again while tries are left,
+    /// presigned anew, after [`RETRY_WAIT`] times the tries so far (logged);
+    /// no answer at the last try is the error (`Sdk`, exit 7), naming its
+    /// cause, how many tries and what S3 answered before (a 500 or 503),
+    /// never the URL.
+    #[allow(clippy::too_many_arguments)]
+    async fn send(&self, op: &'static str, method: S3Method, key: Option<&str>, query: Vec<(String, String)>, headers: Vec<(String, String)>, body: Body, shared: usize, tries: u32) -> Result<Reply, BridgeError> {
         let req = request(method, &self.target, key.map(str::to_string), query, headers, PRESIGN_EXPIRY);
-        let url: PresignedUrl = self.signer.presign(&req).await?;
-        let shown = url.shown();
-        let timeout = REQUEST_BASE + Duration::from_secs(body.len().div_ceil(crate::bridge::dataplane::MIN_RATE));
-        let method = reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(|e| transport(op, &e))?;
+        // What an error names: the key (and the part), never the URL.
+        let what = match (key, req.query.iter().find(|(n, _)| n == "partNumber")) {
+            (Some(k), Some((_, n))) => format!("part {n} of {k}"),
+            (Some(k), None) => k.to_string(),
+            (None, _) => "the bucket".to_string(),
+        };
+        let timeout = budget(body.len(), shared);
+        let mut tried = 0u32;
+        // S3's answers to the tries sent again (a 500 or 503): the error names them.
+        let mut answered: Vec<String> = Vec::new();
+        loop {
+            tried += 1;
+            let again = match self.try_send(op, &req, &body, timeout, &what).await? {
+                Tried::Answer(reply) if tried < tries && matches!(reply.status, 500 | 503) => {
+                    let said = format!("HTTP {}{}", reply.status, error_code(&reply.body).map_or_else(String::new, |c| format!(" ({c})")));
+                    answered.push(said.clone());
+                    said
+                }
+                Tried::Answer(reply) => return Ok(reply),
+                Tried::NoAnswer(cause) if tried < tries => format!("no answer ({cause})"),
+                Tried::NoAnswer(cause) => {
+                    let n = if tried == 1 {
+                        String::new()
+                    } else if answered.is_empty() {
+                        format!(" in {tried} tries")
+                    } else {
+                        format!(" at the last of {tried} tries (S3 answered {} before)", answered.join(", "))
+                    };
+                    return Err(BridgeError::Sdk { op, message: format!("{what}: no answer{n}: {cause}") });
+                }
+            };
+            tracing::warn!("{op}: {what}: {again}; sent again (try {} of {tries})", tried + 1);
+            tokio::time::sleep(RETRY_WAIT * tried).await;
+        }
+    }
+
+    /// One try of [`Self::send`], presigned now: the answer read whole, or
+    /// no answer and its cause (scrubbed while the URL is held). An error is
+    /// final: the presign, the file, an answer over [`XML_MAX`].
+    async fn try_send(&self, op: &'static str, req: &PresignReq, body: &Body, timeout: Duration, what: &str) -> Result<Tried, BridgeError> {
+        let url: PresignedUrl = self.signer.presign(req).await?;
+        let method = reqwest::Method::from_bytes(req.method.as_str().as_bytes()).map_err(|e| transport(op, &e))?;
         let mut rb = self.http.request(method, url.expose()).timeout(timeout);
         for (name, value) in &req.headers {
             rb = rb.header(name.as_str(), value.as_str());
         }
         rb = match body {
             Body::None => rb,
-            Body::Bytes(b) => rb.body(b),
-            Body::File { path, offset, len } => rb.body(file_range(&path, offset, len).await?),
+            Body::Bytes(b) => rb.body(b.clone()),
+            Body::File { path, offset, len } => rb.body(file_range(path, *offset, *len).await?),
         };
-        let mut resp = rb.send().await.map_err(|e| transport(op, &format!("{shown}: {e}")))?;
+        let sent = std::time::Instant::now();
+        let mut resp = match rb.send().await {
+            Ok(resp) => resp,
+            Err(e) => return Ok(Tried::NoAnswer(cause(e, sent.elapsed()))),
+        };
         let status = resp.status().as_u16();
         let version_id = resp.headers().get("x-amz-version-id").and_then(|v| v.to_str().ok()).map(str::to_string);
         let etag = resp.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_string);
         let mut text = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| transport(op, &format!("{shown}: {e}")))? {
-            if text.len() + chunk.len() > XML_MAX {
-                return Err(BridgeError::Sdk { op, message: format!("{shown}: the answer is larger than {} MiB", XML_MAX >> 20) });
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if text.len() + chunk.len() > XML_MAX {
+                        return Err(BridgeError::Sdk { op, message: format!("{what}: the answer is larger than {} MiB", XML_MAX >> 20) });
+                    }
+                    text.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => return Ok(Tried::NoAnswer(cause(e, sent.elapsed()))),
             }
-            text.extend_from_slice(&chunk);
         }
-        Ok(Reply { status, version_id, etag, body: String::from_utf8_lossy(&text).into_owned() })
+        Ok(Tried::Answer(Reply { status, version_id, etag, body: String::from_utf8_lossy(&text).into_owned() }))
     }
 
     /// PutObject of `body` (`len` bytes, `sha256` its digest) at `key`, new
     /// only (`If-None-Match: *`): stored with its version, or `Exists` (412).
+    /// Sent alone, up to [`PART_TRIES`] times.
     pub async fn put_object(&self, key: &str, body: Body, len: u64, sha256: &str) -> Result<Written, BridgeError> {
         const OP: &str = "s3 put";
-        let reply = self.send(OP, S3Method::Put, Some(key), Vec::new(), write_headers(len, sha256, true)?, body).await?;
+        let reply = self.send(OP, S3Method::Put, Some(key), Vec::new(), write_headers(len, sha256, true)?, body, 1, PART_TRIES).await?;
         match reply.status {
             200 => Ok(Written::Stored(reply.version_id.unwrap_or_default())),
             412 => Ok(Written::Exists),
@@ -150,7 +260,7 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
     pub async fn create_multipart(&self, key: &str) -> Result<String, BridgeError> {
         const OP: &str = "s3 create multipart upload";
         let headers = vec![("x-amz-checksum-algorithm".to_string(), "SHA256".to_string())];
-        let reply = self.send(OP, S3Method::Post, Some(key), vec![("uploads".into(), String::new())], headers, Body::None).await?;
+        let reply = self.send(OP, S3Method::Post, Some(key), vec![("uploads".into(), String::new())], headers, Body::None, 1, 1).await?;
         if reply.status != 200 || reply.has_error() {
             return Err(reply.error("create multipart upload", reply.status));
         }
@@ -158,11 +268,14 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
         id.ok_or_else(|| BridgeError::Sdk { op: OP, message: "the answer names no UploadId".into() })
     }
 
-    /// UploadPart `number` of `upload_id` (`len` bytes, `sha256` signed): its ETag.
-    pub async fn upload_part(&self, key: &str, upload_id: &str, number: u32, body: Body, len: u64, sha256: &str) -> Result<String, BridgeError> {
+    /// UploadPart `number` of `upload_id` (`len` bytes, `sha256` signed): its
+    /// ETag. `shared`: the parts sent at once, this one included (its
+    /// [`budget`] allows for them); up to [`PART_TRIES`] tries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_part(&self, key: &str, upload_id: &str, number: u32, body: Body, len: u64, sha256: &str, shared: usize) -> Result<String, BridgeError> {
         const OP: &str = "s3 upload part";
         let query = vec![("uploadId".to_string(), upload_id.to_string()), ("partNumber".to_string(), number.to_string())];
-        let reply = self.send(OP, S3Method::Put, Some(key), reorder(query), write_headers(len, sha256, false)?, body).await?;
+        let reply = self.send(OP, S3Method::Put, Some(key), reorder(query), write_headers(len, sha256, false)?, body, shared, PART_TRIES).await?;
         if reply.status != 200 {
             return Err(reply.error("upload part", reply.status));
         }
@@ -172,7 +285,7 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
     /// ListParts of `upload_id` (every page): `None` when S3 knows no such upload (404 `NoSuchUpload`).
     pub async fn list_parts(&self, key: &str, upload_id: &str) -> Result<Option<Vec<ListedPart>>, BridgeError> {
         const OP: &str = "s3 list parts";
-        let reply = self.send(OP, S3Method::Get, Some(key), vec![("uploadId".into(), upload_id.to_string())], Vec::new(), Body::None).await?;
+        let reply = self.send(OP, S3Method::Get, Some(key), vec![("uploadId".into(), upload_id.to_string())], Vec::new(), Body::None, 1, 1).await?;
         if reply.status == 404 {
             return Ok(None);
         }
@@ -201,7 +314,7 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
         }
         doc.push_str("</CompleteMultipartUpload>");
         let headers = vec![("if-none-match".to_string(), "*".to_string())];
-        let reply = self.send(OP, S3Method::Post, Some(key), vec![("uploadId".into(), upload_id.to_string())], headers, Body::Bytes(doc.into_bytes())).await?;
+        let reply = self.send(OP, S3Method::Post, Some(key), vec![("uploadId".into(), upload_id.to_string())], headers, Body::Bytes(doc.into_bytes()), 1, 1).await?;
         match reply.status {
             // S3 can answer 200 and then an error document (the completion failed after the head went out).
             200 if reply.has_error() => Err(reply.error("complete multipart upload", 200)),
@@ -214,7 +327,7 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
     /// AbortMultipartUpload of `upload_id` (a 404 is an upload already gone).
     pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<(), BridgeError> {
         const OP: &str = "s3 abort multipart upload";
-        let reply = self.send(OP, S3Method::Delete, Some(key), vec![("uploadId".into(), upload_id.to_string())], Vec::new(), Body::None).await?;
+        let reply = self.send(OP, S3Method::Delete, Some(key), vec![("uploadId".into(), upload_id.to_string())], Vec::new(), Body::None, 1, 1).await?;
         match reply.status {
             200 | 204 | 404 => Ok(()),
             s => Err(reply.error("abort multipart upload", s)),
@@ -231,7 +344,7 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
             if let Some(t) = &token {
                 query.push(("continuation-token".to_string(), t.clone()));
             }
-            let reply = self.send(OP, S3Method::Get, None, query, Vec::new(), Body::None).await?;
+            let reply = self.send(OP, S3Method::Get, None, query, Vec::new(), Body::None, 1, 1).await?;
             if reply.status != 200 || reply.has_error() {
                 return Err(reply.error("list", reply.status));
             }
@@ -255,7 +368,7 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
     /// expire after 30 days by the bucket's lifecycle).
     pub async fn delete(&self, key: &str) -> Result<(), BridgeError> {
         const OP: &str = "s3 delete";
-        let reply = self.send(OP, S3Method::Delete, Some(key), Vec::new(), Vec::new(), Body::None).await?;
+        let reply = self.send(OP, S3Method::Delete, Some(key), Vec::new(), Vec::new(), Body::None, 1, 1).await?;
         match reply.status {
             200 | 204 => Ok(()),
             s => Err(reply.error("delete", s)),
@@ -431,5 +544,66 @@ mod tests {
         assert_eq!(xml_unescape("&#65;&#x42;&bogus;&"), "AB&bogus;&");
         assert_eq!(xml_escape("\"a&b<\""), "&quot;a&amp;b&lt;&quot;");
         assert_eq!(reorder(vec![("partNumber".into(), "1".into()), ("uploadId".into(), "u".into())]).iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["uploadId", "partNumber"]);
+    }
+
+    /// B6 (a): eight 64 MiB parts at once share the Mac's uplink, so a
+    /// part's budget allows for all eight at `dataplane::MIN_RATE`: 30 s
+    /// plus 8 × 64 MiB at 1 MB/s, 567 s (it was 98 s, a part alone's, which
+    /// eight parts on a 5 MB/s uplink outlast). A request alone keeps its
+    /// budget; none in flight counts as one; it saturates, never overflows.
+    #[test]
+    fn a_parts_budget_allows_for_the_parts_beside_it() {
+        use crate::wire::s3::{MULTIPART_PARALLEL, MULTIPART_PART};
+        assert_eq!(budget(MULTIPART_PART, MULTIPART_PARALLEL), Duration::from_secs(567), "eight in flight");
+        let eight = MULTIPART_PART * MULTIPART_PARALLEL as u64;
+        assert!(budget(MULTIPART_PART, MULTIPART_PARALLEL) >= REQUEST_BASE + Duration::from_secs(eight / crate::bridge::dataplane::MIN_RATE), "the eight parts' bytes at MIN_RATE");
+        // The live uplink, near 5 MB/s: eight parts at once take 107 s, past a part alone's budget, within the shared one.
+        let live = Duration::from_secs(eight / 5_000_000);
+        assert!(budget(MULTIPART_PART, 1) < live && live < budget(MULTIPART_PART, MULTIPART_PARALLEL), "{live:?}");
+        assert_eq!(budget(MULTIPART_PART, 1), Duration::from_secs(98), "alone: as before");
+        assert_eq!((budget(0, 8), budget(1000, 0)), (REQUEST_BASE, budget(1000, 1)));
+        assert!(budget(u64::MAX, usize::MAX) > REQUEST_BASE);
+    }
+
+    /// A request that gets no answer names its cause, never its URL: a
+    /// timeout says it timed out and after how long (reqwest's own error,
+    /// from a loopback listener that takes the connection and never
+    /// answers); through `send`, one try of a request alone (a listing of a
+    /// listener that closes every connection unanswered) is `no answer: `
+    /// and the cause (exit 7), with nothing of the URL, its signature or the
+    /// address in it.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn no_answer_names_its_cause_never_the_url() {
+        use crate::bridge::s3::{LAB_BUCKET, LAB_OWNER};
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (s, _) = silent.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(s);
+        });
+        let http = crate::bridge::tls::lab_http_client(addr, &addr.ip().to_string()).unwrap();
+        let url = format!("http://{addr}/{LAB_BUCKET}/k?X-Amz-Signature={}", "5".repeat(64));
+        let e = http.get(&url).timeout(Duration::from_secs(1)).send().await.unwrap_err();
+        held.abort();
+        let text = cause(e, Duration::from_secs(1));
+        assert!(text.starts_with("error sending request: ") && text.ends_with(" (timed out after 1 s)"), "{text}");
+        assert!(!text.contains("http") && !text.contains(&addr.to_string()) && !text.contains("X-Amz") && !text.contains("redacted"), "{text}");
+        let closing = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closing.local_addr().unwrap();
+        let closer = tokio::spawn(async move {
+            while let Ok((s, _)) = closing.accept().await {
+                drop(s);
+            }
+        });
+        let signer = crate::bridge::api::FakeMicrovmApi::new();
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab(addr) };
+        let e = S3Client::new(&signer, &target).unwrap().list("v1/x/").await.unwrap_err();
+        closer.abort();
+        let text = e.to_string();
+        let rest = text.strip_prefix("aws s3 list: the bucket: no answer: error sending request: ").unwrap_or_else(|| panic!("{text}"));
+        assert!(!rest.is_empty() && !text.contains("http") && !text.contains(&addr.to_string()) && !text.contains("X-Amz") && !text.contains("redacted"), "{text}");
+        assert_eq!(crate::errors::CliError::from(e).exit_code(), 7);
     }
 }

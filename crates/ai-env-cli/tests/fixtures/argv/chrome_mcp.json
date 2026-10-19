@@ -1,6 +1,6 @@
 {
   "name": "chrome_mcp",
-  "ext_version": "2.1.278",
+  "ext_version": "2.1.303",
   "argv": ["--claude-in-chrome-mcp"],
   "route": "local",
   "reason": "chrome_mcp"

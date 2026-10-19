@@ -1,6 +1,6 @@
 {
   "name": "plugin_list",
-  "ext_version": "2.1.278",
+  "ext_version": "2.1.303",
   "argv": ["plugin", "list", "--json"],
   "route": "local",
   "reason": "subcommand:plugin"

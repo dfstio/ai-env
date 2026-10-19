@@ -10,8 +10,12 @@
 //! --replay-user-messages` (the extension's `extraArgs`), so `strip_debug`
 //! drops `--debug-to-stderr` too while `--replay-user-messages` passes
 //! through; `--session-mirror` is a hidden CLI flag the wrapper appends
-//! itself. `tests/fixtures/argv/*.json` are tagged with the extension version
-//! they were captured from (`FIXTURE_EXT_VERSION`). The 2.1.282 SDK builder
+//! itself. 2.1.301's SDK builder (2.1.303's too) joins each valued flag it
+//! adds as `--flag=value` (`--permission-mode=M`, `--add-dir=DIR`,
+//! `--thinking=disabled`, `--max-thinking-tokens=N`), all but `--mcp-config`
+//! and `--managed-settings`; both spellings are read.
+//! `tests/fixtures/argv/*.json` carry `FIXTURE_EXT_VERSION` (its doc names
+//! the 8 that keep 2.1.278's argv). The 2.1.282 SDK builder
 //! can also push `--managed-settings X`, `--plugin-dir-no-mcp X` and
 //! `--channels X` (space-separated values, listed in `VALUE_FLAGS`) and
 //! `--no-session-persistence` (a query whose transcript is never written —
@@ -53,8 +57,13 @@ pub fn split(argv: &[OsString]) -> Result<Invocation, ArgvError> {
 }
 
 /// The extension version `tests/fixtures/argv/*.json` were captured from;
-/// `ai-env doctor` warns when the installed bundle differs.
-pub const FIXTURE_EXT_VERSION: &str = "2.1.278";
+/// `ai-env doctor` warns when the installed bundle differs. S9's re-capture
+/// (19 Oct 2026) took 9 of the 17 from 2.1.303's census; the other 8 keep
+/// their 2.1.278 argv, tagged by hand: 2.1.303 makes `--version`, `--bare`,
+/// `--output-format json` and a session's Chrome `--mcp-config` no more, and
+/// `design-login`, `edit-permission-rules` and `--claude-in-chrome-mcp` only
+/// in flows the capture skipped.
+pub const FIXTURE_EXT_VERSION: &str = "2.1.303";
 
 /// Every fixture name under `tests/fixtures/argv/` (one source of truth:
 /// the in-crate KAT includes exactly these, `tests/route.rs` checks the
@@ -551,6 +560,36 @@ mod tests {
         assert!(takes_value("--plugin-dir-no-mcp"));
     }
 
+    /// Extension 2.1.303 (its SDK builder is 2.1.301's) joins each valued
+    /// flag it adds as `--flag=value`, after the fixed
+    /// `--output-format stream-json --verbose --input-format stream-json`;
+    /// `--mcp-config`, `--managed-settings` and a valued `extraArgs` entry
+    /// stay space-separated (joined when the value starts with `-`). A chat
+    /// starts with the panel's thinking budget, `--max-thinking-tokens=31999`
+    /// (thinking off, and the config probe: `--thinking=disabled`), and with
+    /// no `--model` or `--effort`: the panel sends them after init.
+    /// Every joined flag the router reads is read. The remote child keeps the
+    /// budget byte for byte (the fixtures' `[redacted:len=5]` is the census's
+    /// scrub of it) and loses `--add-dir=` and the debug flags.
+    #[test]
+    fn the_joined_forms_of_2_1_303() {
+        let id = "123ce858-087d-4061-a4e0-dafc20958256";
+        let resume = format!("--resume={id}");
+        let chat = v(&["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", &resume, "--setting-sources=user,project,local", "--permission-mode=acceptEdits", "--include-partial-messages", "--add-dir=/Users/mike/other", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"]);
+        let Route::Remote(s) = classify(&chat) else { panic!("not a session: {chat:?}") };
+        assert_eq!((s.resume.as_deref(), s.permission_mode.as_deref(), s.setting_sources.as_deref()), (Some(id), Some("acceptEdits"), Some("user,project,local")));
+        assert_eq!((s.add_dirs.clone(), s.model.as_deref(), s.thinking_disabled, s.debug), (v(&["/Users/mike/other"]), None, false, true));
+        let remote = sanitise(&chat, SanitiseOpts { mirror: false, ..SanitiseOpts::default() }).unwrap();
+        assert_eq!(remote, v(&["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", &resume, "--setting-sources=user,project,local", "--permission-mode=acceptEdits", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages"]));
+        // The probe's switch, and a model and an effort a launch may still name.
+        let probe = v(&["--output-format", "stream-json", "--thinking=disabled", "--model=claude-opus-5-5", "--effort=high"]);
+        let Route::Remote(p) = classify(&probe) else { panic!("not a session: {probe:?}") };
+        assert_eq!((p.thinking_disabled, p.model.as_deref()), (true, Some("claude-opus-5-5")));
+        assert_eq!(sanitise(&probe, SanitiseOpts::default()).unwrap(), probe.iter().cloned().chain(["--session-mirror".to_string()]).collect::<Vec<_>>());
+        // 2.1.278's spelling keeps its value too.
+        assert_eq!(sanitise(&v(&["--max-thinking-tokens", "31999", "-p"]), SanitiseOpts::default()).unwrap(), v(&["--max-thinking-tokens", "31999", "-p", "--session-mirror"]));
+    }
+
     #[test]
     fn sanitise_rejects_bare() {
         assert_eq!(sanitise(&v(&["--bare"]), SanitiseOpts::default()), Err(ArgvError::Rejected("--bare")));
@@ -589,6 +628,11 @@ mod tests {
             Just(v(&["--replay-user-messages"])),
             Just(v(&["--session-mirror"])),
             Just(v(&["--mcp-config", "{\"a\":\"--add-dir\"}"])),
+            // 2.1.303's joined forms.
+            Just(v(&["--permission-mode=default"])),
+            Just(v(&["--thinking=disabled"])),
+            Just(v(&["--max-thinking-tokens=31999"])),
+            Just(v(&["--model=claude-sonnet-4-5"])),
             // Unknown boolean flags and `--k=v` forms: the extension's spawn
             // argv is flags only (messages arrive on stdin), never positionals.
             "--[a-z][a-z0-9-]{0,10}".prop_map(|s| vec![s]),

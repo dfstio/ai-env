@@ -169,9 +169,12 @@ pub struct Uploaded {
 /// Upload `path` (its digest `d`) as `key` through `client`: one part is a
 /// PutObject; more are a multipart upload of `part_len` parts, at most
 /// `MULTIPART_PARALLEL` at once, each streamed from the file with its signed
-/// sha256, resumable through `stage.toml` (the parts S3 lists with the
-/// expected size and checksum are not sent again; an upload S3 no longer
-/// knows starts over), completed new-only, `stage.toml` removed after.
+/// sha256, its budget allowing for the parts in flight beside it
+/// (`client::budget`), resumable through `stage.toml` (the parts S3 lists
+/// with the expected size and checksum are not sent again; an upload S3 no
+/// longer knows starts over), completed new-only, `stage.toml` removed
+/// after. A part, or the PutObject, that gets no answer (or S3's 500 or
+/// 503) goes again, `client::PART_TRIES` tries in all.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_file<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, key: &str, path: &Path, d: &FileDigest, part_len: u64) -> Result<Uploaded, BridgeError> {
     use futures_util::StreamExt as _;
@@ -225,12 +228,14 @@ pub async fn upload_file<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid
     let done: std::collections::BTreeSet<u32> = stage.parts.iter().map(|p| p.number).collect();
     let upload_id = stage.upload_id.clone();
     let missing: Vec<u32> = (1..=count).filter(|n| !done.contains(n)).collect();
+    // The parts in flight share the uplink: each one's budget allows for all of them (`client::budget`).
+    let shared = MULTIPART_PARALLEL.min(missing.len());
     let sends = missing.into_iter().map(|n| {
         let (upload_id, sha) = (upload_id.clone(), d.parts[n as usize - 1].clone());
         let offset = u64::from(n - 1) * part_len;
         let len = part_len.min(d.len - offset);
         async move {
-            let etag = client.upload_part(key, &upload_id, n, Body::File { path: path.to_path_buf(), offset, len }, len, &sha).await?;
+            let etag = client.upload_part(key, &upload_id, n, Body::File { path: path.to_path_buf(), offset, len }, len, &sha, shared).await?;
             Ok::<StagePart, BridgeError>(StagePart { number: n, len, sha256: sha, etag })
         }
     });

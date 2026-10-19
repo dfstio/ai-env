@@ -1,6 +1,6 @@
 {
   "name": "mcp_add",
-  "ext_version": "2.1.278",
+  "ext_version": "2.1.303",
   "argv": ["mcp", "add", "--scope", "user", "--transport", "stdio", "--env", "GITHUB_TOKEN=[redacted:len=40]", "--", "github", "…"],
   "route": "local",
   "reason": "subcommand:mcp"
