@@ -117,8 +117,9 @@
 pub const RETRY_LIMIT: u32 = 3;
 /// The CLI's own auth timers, as the `oauth-t1` row measured them (S7 B11,
 /// 11 Oct 2026, claude 2.1.296; again S8 part B, 17 Oct 2026, claude
-/// 2.1.302: `plans/s8-measurements.md`), keyed to the claude version they
-/// name (`claude`, 2.1.302): a new one is measured again with
+/// 2.1.302: `plans/s8-measurements.md`; again S10 part B, 21 Oct 2026,
+/// claude 2.1.305: `plans/s10-measurements.md`), keyed to the claude version
+/// they name (`claude`, 2.1.305): a new one is measured again with
 /// `ai-env lab run oauth-t1` before they are trusted for it. S8's wrapper
 /// and S12's refresh relay read them: S8 is to compare `claude` with the
 /// version of the CLI it runs, a different version being unmeasured until
@@ -143,8 +144,17 @@ pub const RETRY_LIMIT: u32 = 3;
 /// bound; a null answer failed it 1.1 s after the ask, and 1.0 s after its
 /// stdin closed the CLI exited 1; the 401 wait of 5000 moved the ask to
 /// 5.96 s and the null answer's failed turn to 5.0 s after it; a valid
-/// answer brought the reply 2.3 s after the ask, and exit 0.
-pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
+/// answer brought the reply 2.3 s after the ask, and exit 0. Claude 2.1.305
+/// (Cursor's bundle, the same runs) gave the same timers: the ask 1.32-2.35 s
+/// after the spawn; with no answer the turn failed 30.1 s after the ask and
+/// no exit came before the 150 s bound; a null answer failed it 1.7 s after
+/// the ask, and 0.9 s after its stdin closed the CLI exited 1; the 401 wait
+/// of 5000 moved the ask to 6.35 s and the null answer's failed turn to
+/// 5.0 s after it. Its valid answer, unlike 2.1.302's, failed the turn too,
+/// 1.2 s after the ask, then exit 1: the code that asks, takes the answer
+/// and retries after a 401 is 2.1.302's (the two bundles compared), and no
+/// field here rests on that run.
+pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.305", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
 /// How long a turn whose model requests all fail without a refusal (an
 /// egress that blocks api.anthropic.com, an outage) may take before the CLI
 /// gives up by itself, measured on [`AUTH_FAIL_BUDGET_CLAUDE`]: S7 B10
@@ -154,8 +164,8 @@ pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.302", oauth_401_wa
 /// against it (plan L8); the wrapper does not enforce it.
 pub const AUTH_FAIL_BUDGET_MS: u64 = 200_000;
 /// The claude [`AUTH_FAIL_BUDGET_MS`] was measured on (S7 B10). Unlike
-/// [`AUTH_TIMERS`], it was not measured again for 2.1.302 (S8 part B ran no
-/// blocked turn on it).
+/// [`AUTH_TIMERS`], it was not measured again for 2.1.302 or 2.1.305 (S8's
+/// and S10's part B ran no blocked turn on them).
 pub const AUTH_FAIL_BUDGET_CLAUDE: &str = "2.1.296";
 /// Longest line inspected; a longer one is passed over, its head aside.
 pub const LINE_MAX: usize = 64 * 1024;
@@ -1097,11 +1107,11 @@ mod tests {
     }
 
     /// AUTH_TIMERS is what `oauth-t1` measured (S7 B11 on claude 2.1.296, S8
-    /// part B on 2.1.302): a changed value comes from a new measurement, for
-    /// the version it names.
+    /// part B on 2.1.302, S10 part B on 2.1.305): a changed value comes from
+    /// a new measurement, for the version it names.
     #[test]
     fn auth_timers_are_what_oauth_t1_measured() {
-        assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
+        assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.305", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
     }
 
     /// AUTH_FAIL_BUDGET_MS covers what S7 B10 measured on the same claude

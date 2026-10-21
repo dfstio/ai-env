@@ -31,7 +31,7 @@
 //!   sent: no Touch ID for it). It makes real requests to Anthropic; every
 //!   run has an empty config dir and HOME of its own. `authwatch::AUTH_TIMERS`
 //!   holds what its row measured (S7 B11 on claude 2.1.296, S8 part B on
-//!   2.1.302): a new claude
+//!   2.1.302, S10 part B on 2.1.305): a new claude
 //!   version is measured again here before the timers are trusted for it.
 use crate::age_cmd::{effective_path, AgeTool};
 use crate::bridge::config::{BridgeConfig, Paths};

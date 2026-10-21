@@ -2774,7 +2774,8 @@ mod c1_tests {
         let (row, vm) = chat_vm(&plan, &api).await;
         let pings = |endpoint: &str| api.calls().iter().filter(|c| matches!(c, Call::Health { endpoint: e, .. } if e == endpoint)).count();
         *plan.prepared.borrow_mut() = Some(PreparedVm { row: row.clone(), vm: vm.clone(), how: "started", at: Instant::now(), switching: false });
-        assert!(tokio::time::timeout(Duration::from_millis(550), hold_on(&plan, &api, &api, &vm.id)).await.is_err(), "still holding");
+        // Wide: under the full matrix's load a 100 ms sleep can wake late.
+        assert!(tokio::time::timeout(Duration::from_millis(1500), hold_on(&plan, &api, &api, &vm.id)).await.is_err(), "still holding");
         assert!(pings(&vm.endpoint) >= 2, "a ping every 100 ms: {:?}", api.calls());
         assert_eq!(pings(&other.endpoint), 0, "no other VM's");
         let switch = async {

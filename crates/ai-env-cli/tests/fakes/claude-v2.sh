@@ -10,7 +10,7 @@
 # by a system/init frame; a user line gets its isReplay echo (when it has a
 # uuid), one assistant frame (S10: a tool_use one before it, with its
 # tool_result, when the turn runs a tool) and one result frame. `--version`
-# alone prints `2.1.302 (Claude Code)` (AUTH_TIMERS' claude, what the shim's
+# alone prints `2.1.305 (Claude Code)` (AUTH_TIMERS' claude, what the shim's
 # probe reads) and exits before anything is logged or counted. v1 (claude.sh)
 # stays for the exec tests.
 #
@@ -131,7 +131,7 @@
 #   FAKE_ENV_NAMES_LOG        append "gen <n> CLAUDE_CODE_ENTRYPOINT=<v|unset> names=<every name
 #                             of the environment, sorted, comma-separated>": what the CLI was
 #                             started with (fresh-claude-json's spawn), no other value
-#   FAKE_VERSION              the version `--version` prints (default 2.1.302): another claude
+#   FAKE_VERSION              the version `--version` prints (default 2.1.305): another claude
 #                             than AUTH_TIMERS measured (S8: the shim's probe names it)
 #   FAKE_ENV_DUMP             append "--- gen <n>", then every exported variable the process
 #                             started with as NAME=value, sorted, but the knobs file's names
@@ -219,7 +219,7 @@ case $0 in
 esac
 
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
-  printf '%s (Claude Code)\n' "${FAKE_VERSION:-2.1.302}"
+  printf '%s (Claude Code)\n' "${FAKE_VERSION:-2.1.305}"
   exit 0
 fi
 
