@@ -437,7 +437,7 @@ where
     let ((outcome, source), restored) = tokio::try_join!(seed, restore)?;
     tracing::info!(vm = %vm.id, seed = outcome.word(), source, transcript = restored.word(), "session migrate: the chat is on its new VM");
     // The row: its VM, and a `vms` entry for the move.
-    let entry = registry::VmEntry { gen: 0, vm: vm.id.clone(), spawn: None, from: registry::now_rfc3339(), to: None, why: "migrate:command".to_string(), end: None, pid: std::process::id() };
+    let entry = registry::VmEntry { gen: 0, vm: vm.id.clone(), spawn: None, from: registry::now_rfc3339(), to: None, why: "migrate:command".to_string(), end: None, pid: std::process::id(), tag: None, account: None };
     if let Ok(Some(mut now)) = registry::read(&ctx.paths, sid) {
         now.microvm_id = Some(vm.id.clone());
         now.spawn_id = None;

@@ -48,6 +48,7 @@
 //! Nothing here awaits a send inside a `select!` arm: each direction keeps a
 //! queue and offers its head through a `reserve()`, as the supervisor does,
 //! so the two directions never block each other, the signals or the end.
+use crate::bridge::accounts::Seal;
 use crate::bridge::agent::{spawn_channels, Consumed, ConsumerIo, DeliveryReport, RemoteExit, SpawnEvent, SpawnInput, SpawnIo, SpawnOutcome};
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::authwatch::{AuthWatch, Stream as WatchStream, Verdict, AUTH_TIMERS, RETRY_LIMIT};
@@ -753,7 +754,7 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
             Ok(end) => end,
         },
     };
-    let PipelineEnd { vm, vm_how, legs, seed, transcript, seeded_head, credential, delivery, spawn_id, started_by, trigger, session, carried, moved, after_started } = end;
+    let PipelineEnd { vm, vm_how, legs, seed, transcript, seeded_head, credential, delivery, spawn_id, started_by, trigger, session, carried, moved, after_started, seal } = end;
     let handed = tokio::time::Instant::now();
     if moving.as_ref().is_some_and(|m| m.kind == MoveKind::Migrate) {
         // S10 §B: the switch is over; one that fell back to the old VM counts against `MIGRATE_PREP_TRIES`.
@@ -808,6 +809,8 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
         }
         // S10: what this generation's move did, for the pump's `session_move_end` at `Started`.
         s.snap.moved = moved;
+        // A1: the seal this generation runs on (the usage tap's and a refusal's), and its account in the census.
+        s.snap.set_seal(seal);
         // S10 §D: why a session never parks is its latest generation's (its own `ParkReport::Off`, if any, follows).
         s.snap.park.off = None;
         if let Some(old) = s.trigger.replace(trigger) {
@@ -1593,6 +1596,11 @@ pub struct MoveWhy {
     pub fresh_chat: bool,
     /// The host's `initialize` was answered (the move has a window of its own).
     pub init_answered: bool,
+    /// A1: the cut miss's one retry (the pump's `retry_cut`): the same move
+    /// again, so on its VM it keeps the seal the move ran on while the VM's
+    /// cache holds it (no Touch ID), as a resume miss's retry does, even
+    /// when the installed copy cannot be read now.
+    pub retry: bool,
 }
 
 impl MoveWhy {
@@ -1629,14 +1637,21 @@ pub struct MoveDone {
     /// after its old CLI stopped (its pipeline wrote `session_move_end`
     /// `stayed`; the pump writes no `done` and says the chat stayed).
     pub stayed: bool,
+    /// A1: the Claude account the moved generation runs as, when known, and
+    /// the one it ran as before when that was another (a `creds account
+    /// use` since): `session_move_end`'s `account` and `account_from`, and
+    /// the pump's `note_account`.
+    pub account: Option<String>,
+    pub account_from: Option<String>,
 }
 
 /// One `session_move_end` audit row (S10 §4.2), as the pump, the pipeline and
 /// the adapter write it: `session` (the row's session too), `gen`, `kind`,
 /// `outcome`, `from_vm`, `to_vm`, `how`, `seed`, `transcript`, `cut`,
 /// `touchid`, `ms`, then `step` and `code` for `failed` and `stayed`, then
-/// `request` (`session migrate`'s nonce) when one; a value not known is `-`.
-/// Ids, words and numbers only.
+/// `request` (`session migrate`'s nonce) when one, then (A1) `account` and
+/// `account_from` when known; a value not known is `-`. Ids, words and
+/// numbers only.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MoveEndRow<'a> {
     pub session: Option<&'a str>,
@@ -1654,6 +1669,10 @@ pub(crate) struct MoveEndRow<'a> {
     pub step_code: Option<(&'a str, i32)>,
     /// S10 §7.1: the `session migrate` request it answers.
     pub request: Option<&'a str>,
+    /// A1: the Claude account the chat runs as after the move, when known,
+    /// and the one it ran as before when that was another.
+    pub account: Option<&'a str>,
+    pub account_from: Option<&'a str>,
 }
 
 impl MoveEndRow<'_> {
@@ -1680,6 +1699,8 @@ impl MoveEndRow<'_> {
         if let Some(nonce) = self.request {
             pairs.push(("request", nonce.to_string()));
         }
+        pairs.extend(self.account.map(|a| ("account", a.to_string())));
+        pairs.extend(self.account_from.map(|a| ("account_from", a.to_string())));
         if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(audit_event::SESSION_MOVE_END, self.session, audit::detail(&pairs))) {
             tracing::warn!("audit {}: {e}", audit_event::SESSION_MOVE_END);
         }
@@ -2045,9 +2066,27 @@ pub struct RemoteSnapshot {
     /// S10: the VM `AI_ENV_BRIDGE_VM` pins (P0's `Choice::Pin`, `SessionPlan::pinned`): the pump never moves
     /// such a chat to another VM (its VM or nothing). Set once, by [`RemoteLinks::new`].
     pub pinned: Option<String>,
+    /// A1: the seal the live generation's token is of, and its account (`PipelineEnd.seal`): what the pump's
+    /// usage tap attributes a turn's usage to, and what a refusal records first.
+    pub seal: Option<Seal>,
+    /// A1: the Claude accounts the session's generations ran as, in order, each once in a row: the census's
+    /// `account` part.
+    pub accounts: Vec<String>,
 }
 
 impl RemoteSnapshot {
+    /// A1: a new generation's seal (`PipelineEnd::seal`), the live one from
+    /// now; its account, when known, joins `accounts` unless it is the
+    /// last there (a generation on the same account adds nothing).
+    pub(crate) fn set_seal(&mut self, seal: Option<Seal>) {
+        if let Some(account) = seal.as_ref().and_then(|s| s.account.clone()) {
+            if self.accounts.last() != Some(&account) {
+                self.accounts.push(account);
+            }
+        }
+        self.seal = seal;
+    }
+
     /// The census parts a remote link owns, each `name:value`, in
     /// `remote::census_part::ALL`'s order: `vm`, `vm_how`, `spawn`, `vm_pid`,
     /// `claude` and `legs` (`legs:touchid=<ms>,select=<ms>,…`) when known,
@@ -2059,6 +2098,7 @@ impl RemoteSnapshot {
     /// `park_refused`, `parked_s` (with parks), `unpark_ms` (the longest),
     /// `unpark_resumed` when above 0; `close_parked:1`; a reopen's carry,
     /// `carried:readdress` (its VM was gone) or `carried:migrate` (near its wall).
+    /// A1: `account:<a>[,<b>…]`, the accounts its generations ran as, once one is known.
     #[must_use]
     pub fn census_parts(&self) -> Vec<String> {
         let mut parts = Vec::new();
@@ -2091,6 +2131,7 @@ impl RemoteSnapshot {
         put(census_part::UNPARK_RESUMED, (p.unpark_resumed > 0).then(|| p.unpark_resumed.to_string()));
         put(census_part::CLOSE_PARKED, p.close_parked.then(|| "1".to_string()));
         put(census_part::CARRIED, self.carried.as_ref().map(|c| if c.left_s.is_some() { "migrate" } else { "readdress" }.to_string()));
+        put(census_part::ACCOUNT, (!self.accounts.is_empty()).then(|| self.accounts.join(",")));
         parts
     }
 }
@@ -2174,6 +2215,25 @@ mod tests {
             "park:0".into(),
         ];
         assert_eq!(full.census_parts(), want, "in census_part::ALL's order");
+    }
+
+    /// A1: each generation's seal is the live one; its account joins the
+    /// census's `account` list unless it is the last there (a respawn on the
+    /// same account adds none, a seal of no known account none), the list
+    /// last of the link's parts.
+    #[test]
+    fn the_generations_accounts_go_into_the_census_in_order() {
+        let seal = |tag: char, account: Option<&str>| Some(Seal { tag: tag.to_string().repeat(16), account: account.map(str::to_string) });
+        let mut snap = RemoteSnapshot::default();
+        snap.set_seal(seal('a', None));
+        assert!(snap.accounts.is_empty() && !snap.census_parts().iter().any(|p| p.starts_with("account:")), "a legacy tree names none");
+        for (tag, account) in [('a', Some("default")), ('a', Some("default")), ('b', Some("work")), ('b', Some("work")), ('a', Some("default"))] {
+            snap.set_seal(seal(tag, account));
+        }
+        assert_eq!(snap.seal, seal('a', Some("default")), "the live generation's");
+        assert_eq!(snap.census_parts().last().map(String::as_str), Some("account:default,work,default"));
+        snap.set_seal(None);
+        assert_eq!((snap.seal.as_ref(), snap.accounts.len()), (None, 3), "a test's pipeline hands none: the list stays");
     }
 
     /// A scripted factory (the shape the pump's contract tests take): the
@@ -2297,6 +2357,7 @@ mod tests {
             carried: None,
             moved: None,
             after_started: None,
+            seal: None,
         }
     }
 
@@ -3299,7 +3360,8 @@ mod tests {
             let snap = links.snapshot().unwrap();
             let p = &snap.park;
             assert_eq!((p.off, p.parks, p.refused, p.unparks, p.unpark_ms_max, p.unpark_resumed, p.close_parked), (None, 2, 1, 1, 1800, 1, true));
-            assert!(p.parked_ms >= 30, "{p:?}");
+            // The 30 ms the first park stayed open, less the link's lag in reading a report under load.
+            assert!(p.parked_ms >= 20, "{p:?}");
             let parts = snap.census_parts();
             let at = parts.iter().position(|p| p.starts_with("auth_timers:")).expect("auth_timers");
             let s10: Vec<&str> = parts[at + 1..].iter().map(String::as_str).filter(|p| !p.starts_with("parked_s:")).collect();
@@ -3363,7 +3425,9 @@ mod tests {
             let first = links.snapshot().unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             let later = links.snapshot().unwrap();
-            assert!(first.park.parked_ms >= 30 && later.park.parked_ms == first.park.parked_ms, "the park counts to its generation's end: {:?}, then {:?}", first.park, later.park);
+            // The 30 ms the park stayed open, less the link's lag in reading its report under load (a full run once
+            // read 29): counted to the generation's end, and no further.
+            assert!(first.park.parked_ms >= 20 && later.park.parked_ms == first.park.parked_ms, "the park counts to its generation's end: {:?}, then {:?}", first.park, later.park);
             assert!(later.census_parts().contains(&"park:1".to_string()), "{:?}", later.census_parts());
             let mut link = links.start(3, StartReq { why: StartWhy::First, credential: None }).unwrap();
             let _ = to_the_end(&mut link).await;
@@ -3560,7 +3624,7 @@ mod tests {
                 links.prepare_move(MigrateTrigger::Command { nonce: "n".into() });
                 // Generation 1 ends: no live link takes phase A's end.
                 let _ = to_the_end(&mut link).await;
-                let moved = |kind: MoveKind, cause: LossCause| MoveWhy { kind, cause: Some(cause), trigger: None, from_vm: "microvm-1".into(), from_spawn: None, session_id: None, outstanding: Vec::new(), leaf: None, fresh_chat: false, init_answered: true };
+                let moved = |kind: MoveKind, cause: LossCause| MoveWhy { kind, cause: Some(cause), trigger: None, from_vm: "microvm-1".into(), from_spawn: None, session_id: None, outstanding: Vec::new(), leaf: None, fresh_chat: false, init_answered: true, retry: false };
                 if readdress {
                     let mut link = links.start(2, StartReq { why: StartWhy::Move(moved(MoveKind::Readdress, LossCause::VmGone)), credential: None }).unwrap();
                     tokio::time::sleep(Duration::from_millis(20)).await;

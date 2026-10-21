@@ -147,6 +147,14 @@ pub struct VmEntry {
     pub end: Option<String>,
     /// S10: the wrapper process that ran it (gens restart at 1 in each process).
     pub pid: u32,
+    /// A1: the seal id of the Claude account token this generation was given
+    /// (`credential::seal_tag`), and that account's name when ai-env knew it
+    /// (`accounts::label`): what `creds account use` lists live chats by.
+    /// None in an older wrapper's entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl VmEntry {
@@ -1313,15 +1321,20 @@ mod tests {
         let old: toml::Value = toml::from_str("gen = 1\nvm = \"microvm-1\"\nspawn = \"s1\"\nfrom = \"2026-10-01T10:00:00Z\"\nto = \"2026-10-01T11:00:00Z\"\n").unwrap();
         assert_eq!(
             VmEntry::from_value(&old),
-            Some(VmEntry { gen: 1, vm: "microvm-1".into(), spawn: Some("s1".into()), from: "2026-10-01T10:00:00Z".into(), to: Some("2026-10-01T11:00:00Z".into()), why: String::new(), end: None, pid: 0 })
+            Some(VmEntry { gen: 1, vm: "microvm-1".into(), spawn: Some("s1".into()), from: "2026-10-01T10:00:00Z".into(), to: Some("2026-10-01T11:00:00Z".into()), why: String::new(), end: None, pid: 0, tag: None, account: None })
         );
-        let new = VmEntry { gen: 2, vm: "microvm-2".into(), spawn: None, from: "2026-10-20T10:00:00Z".into(), to: None, why: "readdress:vm_gone".into(), end: Some("moved".into()), pid: 4242 };
+        let new = VmEntry { gen: 2, vm: "microvm-2".into(), spawn: None, from: "2026-10-20T10:00:00Z".into(), to: None, why: "readdress:vm_gone".into(), end: Some("moved".into()), pid: 4242, tag: None, account: None };
         let value = toml::Value::try_from(&new).unwrap();
         assert_eq!(VmEntry::from_value(&value), Some(new.clone()));
         let text = toml::to_string(&value).unwrap();
         assert!(text.contains("why = \"readdress:vm_gone\"") && text.contains("pid = 4242") && !text.contains("spawn"), "{text}");
-        let plain = toml::to_string(&toml::Value::try_from(&VmEntry { why: String::new(), end: None, ..new }).unwrap()).unwrap();
-        assert!(!plain.contains("why") && !plain.contains("end"), "{plain}");
+        let plain = toml::to_string(&toml::Value::try_from(&VmEntry { why: String::new(), end: None, ..new.clone() }).unwrap()).unwrap();
+        assert!(!plain.contains("why") && !plain.contains("end") && !plain.contains("tag") && !plain.contains("account"), "{plain}");
+        // A1: the seal and the account a generation ran as, kept when known.
+        let sealed = VmEntry { tag: Some("a".repeat(16)), account: Some("work".into()), ..new };
+        let value = toml::Value::try_from(&sealed).unwrap();
+        assert_eq!(VmEntry::from_value(&value), Some(sealed));
+        assert!(toml::to_string(&value).unwrap().contains("account = \"work\""));
         assert_eq!(VmEntry::from_value(&toml::Value::String("microvm-1".into())), None);
         let bad: toml::Value = toml::from_str("gen = \"one\"\nvm = \"microvm-1\"\n").unwrap();
         assert_eq!(VmEntry::from_value(&bad), None);

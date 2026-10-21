@@ -50,3 +50,26 @@ ending with a newline. They hold no token. `src/bridge/authwatch.rs`'s tests
 read them: the reply's key order, by which the head rule reads a line over
 64 KiB, the answered result's order, the `rate_limit_event` line (nothing)
 and the `--output-format json --verbose` array, read message by message.
+
+`usage-limit-result-2.1.305.json` is claude 2.1.305's own result for a turn
+refused by the account's weekly limit, from S10 part B step B2 (21 Oct 2026:
+`make s8-smoke`, its first pass's chat).
+It is the line as captured, verbatim, its keys in the alphabetical order the
+capture wrote them (the CLI's own order puts `type` last): `api_error`
+`usage_limit_reached`, `api_error_status` 429, `is_error` true, and the
+CLI's text `You've hit your weekly limit · resets 10am (UTC)`. It names no
+`api_error_params`. Its ids (session, message, uuid) are that chat's; it
+holds no token. `src/wire/ratelimit.rs` and `src/bridge/authwatch.rs` read
+it (a usage limit, never a refusal), and `tests/fakes/claude-v2.sh`'s
+`FAKE_USAGE_LIMIT` prints its shape.
+
+`rate-limit-event-constructed-2.1.305.jsonl` is constructed, not captured:
+two `rate_limit_event` lines built from the `rate_limit_info` schema in
+claude 2.1.305's bundle (read as data), for the parsers until part B
+records a real one. The first is an `allowed_warning` with both unified
+windows (`five_hour` 23 %, `seven_day` 81 %) beside the top-level
+`rateLimitType`, `utilization`, `resetsAt`, `overageStatus`,
+`isUsingOverage` and `surpassedThreshold`; the second a `rejected` one
+(`seven_day`, `utilization` 1.02, `overageStatus` rejected) with no
+windows. Their times are unix seconds of 21-24 Oct 2026 and their ids made
+up. `src/wire/ratelimit.rs`'s tests read them.

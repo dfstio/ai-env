@@ -95,7 +95,10 @@ fn opened(env: &Env, container: &Path) -> String {
 /// dotenv line; the metadata records the kind prefix and length only; the
 /// audit row names the source; stderr is the reminder to clear the
 /// clipboard and history the token came through; a second seal keeps the
-/// first as a backup.
+/// first as a backup. A1: with no account and nothing sealed it is Claude
+/// account `default`'s (`credentials/accounts/default.env`, its notes
+/// naming it), installed by byte copy as `setup-token.env`; the backup is
+/// the account's, and no backup is left of the installed copy.
 #[test]
 fn setup_token_seals_without_the_token_anywhere_in_the_clear() {
     let env = Env::new(false);
@@ -105,27 +108,31 @@ fn setup_token_seals_without_the_token_anywhere_in_the_clear() {
     ok(&out);
     assert_unprinted(&out, random_part(&t), "the token");
     let path = token_env(&env);
+    let account = env.credentials().join("accounts").join("default.env");
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 4, "{}", shown(&text));
-    assert!(lines[0] == format!("sealed setup-token {PREFIX}… ({} chars) into {} (key {KEY})", t.len(), path.display()), "{}", shown(lines[0]));
-    assert!(lines[1] == format!("recorded setup-token-prefix={PREFIX} (expected recorded)"), "{}", shown(lines[1]));
-    assert!(lines[2].starts_with(&format!("  chars={}, sealed ", t.len())), "{}", shown(&text));
-    assert!(lines[3] == "combined.env not built: no runtime key is sealed yet (`make runtime-key` builds it)", "{}", shown(lines[3]));
+    assert_eq!(lines.len(), 5, "{}", shown(&text));
+    assert!(lines[0] == format!("sealed setup-token {PREFIX}… ({} chars) into {} (key {KEY}) as Claude account default", t.len(), account.display()), "{}", shown(lines[0]));
+    assert!(lines[1] == format!("installed as {}: Claude account default is the active one", path.display()), "{}", shown(lines[1]));
+    assert!(lines[2] == format!("recorded setup-token-prefix={PREFIX} (expected recorded)"), "{}", shown(lines[2]));
+    assert!(lines[3].starts_with(&format!("  chars={}, sealed ", t.len())), "{}", shown(&text));
+    assert!(lines[4] == "combined.env not built: no runtime key is sealed yet (`make runtime-key` builds it)", "{}", shown(lines[4]));
     let probe = std::fs::read_to_string(env.root().join("bridge").join("lab").join("probes.jsonl")).unwrap();
     let row: serde_json::Value = serde_json::from_str(probe.lines().last().unwrap()).unwrap();
     assert!((row["probe"].as_str(), row["stage"].as_str(), row["verdict"].as_str()) == (Some("setup-token-prefix"), Some("S7"), Some(PREFIX)), "{}", shown(&row.to_string()));
     assert!(stderr(&out) == STDIN_REMINDER, "{}", shown(&stderr(&out)));
     assert_eq!((mode(&path), mode(&env.credentials())), (0o600, 0o700));
+    assert_eq!((mode(&account), mode(account.parent().unwrap())), (0o600, 0o700));
     let text = fs::read_to_string(&path).unwrap();
+    assert!(text == fs::read_to_string(&account).unwrap(), "the installed copy is the account's bytes");
     assert_same(&env.open(&text), &format!("CLAUDE_CODE_OAUTH_TOKEN={t}\n"), "the sealed plaintext");
     let meta = container::meta(&text);
-    assert!((meta["kind"].as_str(), meta["prefix"].as_str(), meta["chars"].as_str()) == ("setup-token", PREFIX, t.len().to_string().as_str()), "{}", shown(&format!("{meta:?}")));
+    assert!((meta["kind"].as_str(), meta["prefix"].as_str(), meta["chars"].as_str(), meta["account"].as_str()) == ("setup-token", PREFIX, t.len().to_string().as_str(), "default"), "{}", shown(&format!("{meta:?}")));
     assert!(meta.contains_key("sealed"), "{}", shown(&format!("{meta:?}")));
     let rows = seal_rows(&env);
     assert_eq!(rows.len(), 1);
     assert!(audit_rows(&env).iter().any(|r| r["event"] == "lab_probe" && r["detail"]["probe"] == "setup-token-prefix"), "the probe row is audited");
-    for (k, v) in [("key", KEY), ("prefix", PREFIX), ("source", "stdin"), ("rotated", "false"), ("combined", "skipped")] {
+    for (k, v) in [("key", KEY), ("prefix", PREFIX), ("source", "stdin"), ("rotated", "false"), ("combined", "skipped"), ("account", "default"), ("installed", "true")] {
         assert!(rows[0]["detail"][k] == v, "{k}: {}", shown(&rows[0]["detail"][k].to_string()));
     }
     assert_nowhere(env.root(), random_part(&t), "the token");
@@ -134,8 +141,10 @@ fn setup_token_seals_without_the_token_anywhere_in_the_clear() {
     let out = seal(&env, &t2, &[]);
     ok(&out);
     assert_unprinted(&out, random_part(&t2), "the second token");
-    assert!(stdout(&out).contains("previous container kept as "), "{}", shown(&stdout(&out)));
-    let baks: Vec<PathBuf> = fs::read_dir(env.credentials()).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("setup-token.env.")).collect();
+    assert!(stdout(&out).contains("previous container kept as ") && stdout(&out).contains("Claude account default stays the active one"), "{}", shown(&stdout(&out)));
+    let named = |dir: &Path, prefix: &str| fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix)).collect::<Vec<PathBuf>>();
+    assert!(named(&env.credentials(), "setup-token.env.").is_empty(), "no backup of the installed copy: the account's backup holds those bytes");
+    let baks = named(account.parent().unwrap(), "default.env.");
     assert_eq!(baks.len(), 1, "{baks:?}");
     assert_eq!(mode(&baks[0]), 0o600);
     assert_same(&opened(&env, &path), &format!("CLAUDE_CODE_OAUTH_TOKEN={t2}\n"), "the second seal");
@@ -435,7 +444,10 @@ fn setup_token_reads_the_environment_or_a_hidden_paste() {
 /// `creds status` decrypts nothing (`--unseal` decrypts once); `creds
 /// forget` lists first, deletes only with `--yes` — the token, combined.env
 /// and their backups, never the runtime key — and names the VMs that
-/// received the token. No output holds the token.
+/// received the token. No output holds the token. A1: status names the
+/// installed copy's account and shows its row and its backups under
+/// `accounts/`; forget takes every account with it (`credentials/accounts/`
+/// emptied and gone, `state/accounts.toml`), counted in its audit row.
 #[test]
 fn status_needs_no_touch_id_and_forget_lists_before_it_deletes() {
     use ai_env_cli::bridge::vm::registry::{write_row, RowStatus, VmRow};
@@ -464,7 +476,10 @@ fn status_needs_no_touch_id_and_forget_lists_before_it_deletes() {
         format!("; recorded at sealing, not authenticated: {PREFIX}… ({} chars), sealed ", t2.len()),
         "(about 365 days left of its one-year life)".into(),
         "[ok ] combined.env: matches its sources".into(),
-        "[-  ] backups: setup-token.env x1".into(),
+        "; the installed copy of Claude account default\n".into(),
+        format!("[ok ] Claude account default (active): seal {}, {PREFIX}… ({} chars), sealed ", ai_env_cli::bridge::agent::credential::seal_tag(&token_env(&env)).unwrap(), t2.len()),
+        " days left); combined.env current\n".into(),
+        "[-  ] backups: accounts/default.env x1".into(),
         "[-  ] VMs that may hold the token: none".into(),
     ] {
         assert!(text.contains(&want), "{want:?} missing from:\n{}", shown(&text));
@@ -474,7 +489,8 @@ fn status_needs_no_touch_id_and_forget_lists_before_it_deletes() {
     ok(&out);
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!((v["setup_token_env"]["state"].as_str(), v["setup_token_env"]["recorded"]["prefix"].as_str()), (Some("sealed"), Some(PREFIX)));
-    assert_eq!((v["combined_env"]["state"].as_str(), v["backups"]["setup-token.env"].as_u64()), (Some("current"), Some(1)));
+    assert_eq!((v["combined_env"]["state"].as_str(), v["backups"]["setup-token.env"].as_u64(), v["backups"]["accounts/default.env"].as_u64()), (Some("current"), Some(0), Some(1)));
+    assert_eq!((v["accounts"]["active"].as_str(), v["accounts"]["store"].as_str(), v["accounts"]["accounts"][0]["combined"].as_str()), (Some("default"), Some("ok"), Some("current")));
     assert!(v["unseal"].is_null());
     outs.push(out);
     let out = run(&mut env.creds(&["status", "--unseal"]));
@@ -489,11 +505,14 @@ fn status_needs_no_touch_id_and_forget_lists_before_it_deletes() {
     let out = run(&mut env.creds(&["status"]));
     assert!(stdout(&out).contains(&format!("[!! ] {id} (running) received the token at ")), "{}", shown(&stdout(&out)));
 
-    let bak = fs::read_dir(env.credentials()).unwrap().flatten().map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with("setup-token.env.")).unwrap();
+    let accounts = env.credentials().join("accounts");
+    let bak = fs::read_dir(&accounts).unwrap().flatten().map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with("default.env.")).unwrap();
+    let store = env.root().join("bridge").join("state").join("accounts.toml");
+    let gone = [token_env(&env), combined(&env), accounts.join("default.env"), accounts.join("default.combined.env"), bak.clone(), store.clone()];
     let out = run(&mut env.creds(&["forget"]));
     ok(&out);
     let text = stdout(&out);
-    for p in [token_env(&env), combined(&env), bak.clone()] {
+    for p in &gone {
         assert!(text.contains(&format!("would delete {}", p.display())), "{}: {}", p.display(), shown(&text));
         assert!(p.exists(), "a dry run deletes nothing");
     }
@@ -501,11 +520,11 @@ fn status_needs_no_touch_id_and_forget_lists_before_it_deletes() {
     outs.push(out);
     let out = run(&mut env.creds(&["forget", "--yes"]));
     ok(&out);
-    assert!(stdout(&out).ends_with("deleted 3 file(s)\n"), "{}", shown(&stdout(&out)));
-    assert!(!token_env(&env).exists() && !combined(&env).exists() && !bak.exists());
+    assert!(stdout(&out).ends_with("deleted 6 file(s)\n"), "{}", shown(&stdout(&out)));
+    assert!(gone.iter().all(|p| !p.exists()) && !accounts.exists(), "every account's file, and the emptied directory");
     assert!(env.aws_env().exists(), "the runtime key is not the token");
     let last = audit_rows(&env).pop().unwrap();
-    assert_eq!((last["event"].as_str(), last["detail"]["files"].as_str(), last["detail"]["holders"].as_str()), (Some("creds_forget"), Some("3"), Some("1")));
+    assert_eq!((last["event"].as_str(), last["detail"]["files"].as_str(), last["detail"]["accounts"].as_str(), last["detail"]["holders"].as_str()), (Some("creds_forget"), Some("6"), Some("1"), Some("1")));
     outs.push(out);
     let out = run(&mut env.creds(&["status"]));
     assert!(stdout(&out).contains("[-  ] setup-token.env: absent") && stdout(&out).contains("combined.env: not needed (no setup-token is sealed)"), "{}", shown(&stdout(&out)));

@@ -15,8 +15,10 @@
 //! deployer key's hand-over through it (`handover`). S9: git smart-HTTP's
 //! client (`gitsmart`), `box review` and its pre-push hook (`review`), the
 //! transcript store in S3 (`s3`) and a remote chat's view on this Mac (`view`).
-//! S10: `session migrate` (`migrate`) and an idle chat's park (`park`).
+//! S10: `session migrate` (`migrate`) and an idle chat's park (`park`). S10
+//! addendum A1: several Claude accounts, one active (`accounts`).
 //! Nothing here is compiled into the VM image.
+pub mod accounts;
 pub mod agent;
 pub mod api;
 pub mod audit;

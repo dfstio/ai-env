@@ -1617,7 +1617,11 @@ fn cred_live() -> bool {
     false
 }
 
-/// [`live_world`] with the credential files and the gate's records copied too.
+/// [`live_world`] with the credential files and the gate's records copied
+/// too, and (A1) the Claude accounts' store, so the live rows name the
+/// account the installed token is: the tests run as the active account,
+/// which this says. Usage they observe is recorded in the copy, never in
+/// the real store.
 fn cred_world() -> Live {
     let live = live_world();
     let real = Paths::resolve().expect("the real bridge root");
@@ -1626,6 +1630,7 @@ fn cred_world() -> Live {
         (real.combined_env(), live.paths.combined_env()),
         (real.egress_verified(), live.paths.egress_verified()),
         (real.probes(), live.paths.probes()),
+        (real.accounts_state(), live.paths.accounts_state()),
     ] {
         if from.exists() {
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();
@@ -1633,6 +1638,10 @@ fn cred_world() -> Live {
         }
     }
     assert!(live.paths.setup_token_env().exists(), "no sealed setup-token: run `ai-env creds setup-token` first");
+    let tag = ai_env_cli::bridge::agent::credential::seal_tag(&live.paths.setup_token_env()).unwrap_or_default();
+    if let Some(name) = ai_env_cli::bridge::accounts::label(&live.paths, &tag) {
+        eprintln!("live credential tests run as Claude account {name}");
+    }
     live
 }
 

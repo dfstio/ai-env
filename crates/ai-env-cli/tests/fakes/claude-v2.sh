@@ -120,6 +120,25 @@
 #   FAKE_RATE_LIMIT_EVENT=1   each turn, between its assistant frame and its result, prints
 #                             {"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}
 #                             (tests/fixtures/claude/valid-stream-json-2.1.296.jsonl's line)
+# A1 (several Claude accounts: the usage a turn reports, plan section 7):
+#   FAKE_RATE_LIMIT_INFO      <json>: each turn prints, where FAKE_RATE_LIMIT_EVENT prints its line
+#                             (and in its place: this one wins),
+#                             {"type":"rate_limit_event","rate_limit_info":<json>,"uuid":<uuid>,
+#                             "session_id":<sid>}, <json> verbatim
+#   FAKE_USAGE_LIMIT          1 (every turn) or turn:<n> (that turn of each process): after its echo
+#                             the turn is refused for the account's usage limit: the event below when
+#                             set, then one result line of the shape of
+#                             tests/fixtures/claude/usage-limit-result-2.1.305.json (claude 2.1.305's,
+#                             its keys in that file's order), with this session's id, the user line's
+#                             uuid as user_message_uuid(s) and a uuid of its own; no assistant frame,
+#                             none of the turn's effects (FAKE_EDIT, the transcript, …)
+#   FAKE_USAGE_LIMIT_TEXT     that result's text (default the fixture's: You've hit your weekly limit
+#                             · resets 10am (UTC))
+#   FAKE_USAGE_LIMIT_PARAMS   <json>: that result also carries "api_error_params":{"rate_limit_info":
+#                             <json>} (after api_error_origin, as the keys sort)
+#   FAKE_USAGE_LIMIT_EVENT    <json>: a refused turn first prints {"type":"rate_limit_event",
+#                             "rate_limit_info":<json>,"uuid":<uuid>,"session_id":<sid>} (its status
+#                             rejected, say)
 #   FAKE_FINAL_MIRROR_MS      ms: that long after stdin EOF, one last transcript_mirror frame
 #                             (a summary entry, also appended to the transcript with
 #                             FAKE_WRITE_TRANSCRIPT=1)
@@ -774,9 +793,42 @@ turn_effects() {
   if [ "${FAKE_WRITE_TRANSCRIPT:-0}" = "1" ]; then
     write_transcript
   fi
-  if [ "${FAKE_RATE_LIMIT_EVENT:-0}" = "1" ]; then
+  if [ -n "${FAKE_RATE_LIMIT_INFO:-}" ]; then
+    rate_limit_event "$FAKE_RATE_LIMIT_INFO"
+  elif [ "${FAKE_RATE_LIMIT_EVENT:-0}" = "1" ]; then
     printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}'
   fi
+}
+
+# A1: a rate_limit_event line carrying $1 (a rate_limit_info object) verbatim, with an id of the turn's.
+rate_limit_event() {
+  printf '{"type":"rate_limit_event","rate_limit_info":%s,"uuid":"%s","session_id":"%s"}\n' "$1" "$(printf '%08x-0000-4000-9100-%012x' "$turns" "$gen")" "$sid"
+}
+
+# A1: FAKE_USAGE_LIMIT, whether this turn is refused for the account's usage limit.
+usage_limited_turn() {
+  case "${FAKE_USAGE_LIMIT:-}" in
+    1) return 0 ;;
+    turn:*) [ "$turns" -eq "${FAKE_USAGE_LIMIT#turn:}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# A1: the refused turn (FAKE_USAGE_LIMIT): FAKE_USAGE_LIMIT_EVENT's event, then the result of
+# tests/fixtures/claude/usage-limit-result-2.1.305.json's shape, its ids this turn's.
+usage_limit() {
+  if [ -n "${FAKE_USAGE_LIMIT_EVENT:-}" ]; then
+    rate_limit_event "$FAKE_USAGE_LIMIT_EVENT"
+  fi
+  limit_text="You've hit your weekly limit · resets 10am (UTC)"
+  if [ -n "${FAKE_USAGE_LIMIT_TEXT:-}" ]; then
+    limit_text=$FAKE_USAGE_LIMIT_TEXT
+  fi
+  params=""
+  if [ -n "${FAKE_USAGE_LIMIT_PARAMS:-}" ]; then
+    params=",\"api_error_params\":{\"rate_limit_info\":$FAKE_USAGE_LIMIT_PARAMS}"
+  fi
+  printf '{"api_error":"usage_limit_reached","api_error_origin":"first_party"%s,"api_error_status":429,"duration_api_ms":0,"duration_ms":1361,"fast_mode_disabled_reason":"unknown","fast_mode_state":"off","is_error":true,"modelUsage":{},"num_turns":1,"permission_denials":[],"queued_turn_count":0,"result":"%s","result_index":0,"safety_stops":0,"session_id":"%s","stop_reason":"stop_sequence","subagent_stats":{"by_type":{},"completed":0,"failed":0,"killed":{"parent":0,"system":0,"user":0},"max_depth":0,"refused":{"budget":0,"concurrency_limit":0,"depth_limit":0},"requested":{"background":0,"foreground":0,"unset":0},"spawned":0,"spawned_by_subagents":0,"started_in_background":0},"subtype":"success","terminal_reason":"api_error","total_cost_usd":0,"type":"result","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"fallback_credit":null,"inference_geo":"","input_tokens":0,"iterations":[],"output_tokens":0,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_fetch_requests":0,"web_search_requests":0},"service_tier":"standard","speed":"standard"},"user_message_uuid":"%s","user_message_uuids":["%s"],"uuid":"%s"}\n' "$params" "$(json_text "$limit_text")" "$sid" "$u" "$u" "$au"
 }
 
 # Every stdin line to FAKE_STDIN_LOG, as "<gen><TAB><line>".
@@ -942,6 +994,12 @@ on_user() {
   fi
   if [ -n "$u" ]; then
     printf '{"type":"user","message":{"role":"user","content":"echo"},"session_id":"%s","parent_tool_use_id":null,"uuid":"%s","isReplay":true}\n' "$sid" "$u"
+  fi
+  # A1: a turn refused for the account's usage limit ends here: no reply, no effects.
+  if usage_limited_turn; then
+    outcome=allow
+    usage_limit
+    return
   fi
   # S10: the turn's tool, FAKE_ASK's in its turn, else FAKE_TURN_MS's long Bash run.
   tool=""

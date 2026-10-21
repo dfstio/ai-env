@@ -3,7 +3,8 @@
 //! clones of the Claude extension's project-slug and transcript-mirror-key
 //! functions, and the S8 workspace data plane's types (`workspace`). S9 adds
 //! the transcript store's keys and presigned URLs (`s3`) and the remote
-//! chat's view on the Mac (`view`).
+//! chat's view on the Mac (`view`). S10 addendum A1: what a turn says of
+//! its account's usage limits (`ratelimit`).
 //! Everything here compiles in every feature set (serde and the tungstenite
 //! message type only — no sockets, no TLS, no AWS).
 pub mod argv;
@@ -14,6 +15,7 @@ pub mod managed;
 pub mod mirror;
 pub mod ndjson;
 pub mod pin;
+pub mod ratelimit;
 pub mod redact;
 pub mod s3;
 pub mod slug;

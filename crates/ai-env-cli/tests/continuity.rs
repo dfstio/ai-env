@@ -294,6 +294,99 @@ fn t10_1_a_terminated_vm_moves_once() {
     h.assert_vm_empty();
 }
 
+/// The first 8 hex digits of `token`'s sha256: what the fake's
+/// `FAKE_TOKEN_LOG` says of the token a CLI read.
+fn sha8(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))[..8].to_string()
+}
+
+/// The `FAKE_TOKEN_LOG` lines: each CLI's generation and the sha8 of the token it read on fd 3.
+fn tokens_read(log: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| (l.split(' ').nth(1).unwrap_or_default().to_string(), common::env_log_field(l, "sha8").unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// A1 (plans/s10-accounts-plan.md §3, its Verification): a chat on
+/// account `default` (the green world's token, adopted), then `work` made
+/// the active one (`accounts::install`, as `creds account use work` makes
+/// it): the running claude keeps `default`. The platform ends the VM, and
+/// the move re-plans: its one Touch ID unseals `work`'s installed copy (its
+/// `credential_unseal` names its seal and account), the moved CLI reads
+/// `work`'s token on fd 3 (`FAKE_TOKEN_LOG`'s sha8), and the records say
+/// so: `session_account` (`default` to `work`), `session_remote_start`'s
+/// account per generation, `session_move_end` `done` with
+/// `account=work, account_from=default`, the delivery's account, the row's
+/// `vms` entries, the census `account:default,work`; the chat gets the
+/// account's note right after the one that it goes on. A new chat after the
+/// switch runs as `work` from its start. No token is in the clear on this
+/// Mac.
+#[test]
+fn a1_a_move_after_a_switch_runs_as_the_active_account() {
+    let mut p = Harness::prepare();
+    let default = p.rig().token().to_string();
+    let work = p.rig().seal_account("work", "Wk");
+    let log = p.root.join("token.log");
+    let logged = log.display().to_string();
+    let mut h = p.spawn_on(Link::Remote, "", &[], &knobs(&[("FAKE_TOKEN_LOG", logged.as_str())]));
+    started(&mut h);
+    turn(&mut h, "one");
+    let sid = session_of(&mut h);
+    synced(&mut h, &sid, 1);
+    let rig = h.rig();
+    let vm1 = vms_started(&h)[0].clone();
+    let installed = ai_env_cli::bridge::accounts::install(&rig.paths(), "work").expect("work installed");
+    assert_eq!((installed.from.as_deref(), installed.combined), (Some("default"), ai_env_cli::bridge::accounts::CombinedInstall::Absent));
+    let work_tag = installed.tag.clone();
+    let decrypts = rig.decrypts();
+    platform_ends(rig, &vm1);
+    moves_with_the_next_message(&mut h, &vm1);
+    turn(&mut h, "two");
+    closed(&mut h);
+    let vms = vms_started(&h);
+    assert_eq!(vms.len(), 2, "{vms:?}");
+    assert_eq!(h.rig().decrypts() - decrypts, 1, "the move's one Touch ID");
+    assert_eq!(tokens_read(&log), [("1".to_string(), sha8(&default)), ("2".to_string(), sha8(&work))], "the moved CLI runs as work");
+    let rows = h.audit_rows();
+    let moved = index_of(&rows, "session_move", |d| d["gen"] == "2" && d["from_vm"] == vm1.as_str());
+    let start = index_of(&rows, "session_remote_start", |d| d["id"] == vms[1].as_str());
+    let unseals: Vec<&Value> = rows[moved..start].iter().filter(|r| r["event"] == "credential_unseal").map(|r| &r["detail"]).collect();
+    assert_eq!(unseals.len(), 1, "{unseals:#?}");
+    assert_eq!((unseals[0]["source"].as_str(), unseals[0]["tag"].as_str(), unseals[0]["account"].as_str()), (Some("setup-token"), Some(work_tag.as_str()), Some("work")));
+    let accounts: Vec<Option<String>> = h.audit_events("session_remote_start").iter().map(|r| r["detail"]["account"].as_str().map(str::to_string)).collect();
+    assert_eq!(accounts, [Some("default".to_string()), Some("work".to_string())]);
+    let switch = h.audit_events("session_account");
+    assert_eq!(switch.len(), 1, "{switch:#?}");
+    let d = &switch[0]["detail"];
+    assert_eq!(["gen", "kind", "from", "to", "to_tag"].map(|k| d[k].as_str().unwrap_or_default().to_string()), ["2", "readdress", "default", "work", work_tag.as_str()].map(str::to_string));
+    let done = h.audit_events("session_move_end");
+    assert_eq!(done.len(), 1, "{done:#?}");
+    assert_eq!((done[0]["detail"]["outcome"].as_str(), done[0]["detail"]["account"].as_str(), done[0]["detail"]["account_from"].as_str()), (Some("done"), Some("work"), Some("default")));
+    let delivered: Vec<Value> = h.audit_events("credential_deliver").into_iter().filter(|r| r["detail"]["id"] == vms[1].as_str()).collect();
+    assert_eq!(delivered.last().and_then(|r| r["detail"]["account"].as_str()), Some("work"));
+    let entries = vms_entries(&h);
+    assert_eq!(entries.iter().map(|v| v.get("account").and_then(toml::Value::as_str)).collect::<Vec<_>>(), [Some("default"), Some("work")]);
+    assert_eq!(part_of(&h.end_note(), "account").as_deref(), Some("default,work"), "{}", h.end_note());
+    let notes: Vec<String> = h.out_json().iter().filter(|v| v["subtype"] == "informational").filter_map(|v| v["content"].as_str().map(str::to_string)).collect();
+    let continues = notes.iter().position(|n| n == &ai_env_cli::bridge::remote::note_continues(&vms[1])).expect("the chat goes on");
+    assert_eq!(notes.get(continues + 1).map(String::as_str), Some(ai_env_cli::bridge::remote::note_account("work", "default").as_str()), "{notes:#?}");
+    // A new chat after the switch runs as work from its start.
+    let mut second = Harness::prepare().launch_wrapper(h.rig().wrapper(&[], &knobs(&[("FAKE_TOKEN_LOG", logged.as_str())])));
+    started(&mut second);
+    turn(&mut second, "three");
+    closed(&mut second);
+    assert_eq!(tokens_read(&log).last(), Some(&("3".to_string(), sha8(&work))), "a new chat reads work's token");
+    let starts = h.audit_events("session_remote_start");
+    assert_eq!(starts.last().and_then(|r| r["detail"]["account"].as_str()), Some("work"));
+    let needles = [default.clone(), default[13..].to_string(), work.clone(), work[13..].to_string()];
+    let (bridge, mac) = (h.bridge(), h.root().join(".claude"));
+    assert_eq!(holding(&[&bridge, &mac], &needles), Vec::<String>::new(), "a token in what the Mac keeps");
+    h.assert_vm_empty();
+}
+
 /// T10.1 twice: the VM the chat moved to is ended too, so a third VM
 /// starts: two RunMicrovm, two Touch IDs (one setup-token unseal per move,
 /// between its `session_move` and its VM's spawn), each move's seed and

@@ -102,7 +102,8 @@ use crate::bridge::registry::{self, SessionRow};
 use crate::bridge::remote::link::{CloseTimings, LinkFactory, LinkKind, LinkLoss, LocalLinks, MoveFailure, MoveReady, RemoteLinks, RemoteStarted, SpawnFailure, StartReq, StartStep, StartWhy, PENDING_IN_BYTES, PENDING_IN_LINES, STEP_PART};
 use crate::bridge::remote::{audit_event, census_part, pipeline, Failure};
 use crate::bridge::remote::link::{LossCause, MoveKind, MoveWhy, RemoteSnapshot};
-use crate::bridge::remote::{note_continues, note_move_at_next, note_moving, note_restart_at_next, note_restarting};
+use crate::bridge::remote::{note_account, note_continues, note_move_at_next, note_moving, note_restart_at_next, note_restarting};
+use crate::bridge::accounts::usage::{self, Observed, Recorded, Seen, UsageTap};
 use crate::bridge::park::QuietState;
 use crate::bridge::remote::link::{request_of, MigrateTrigger};
 use crate::bridge::remote::{note_migrating, note_stayed, StayedThen, MIGRATE_PREP_TRIES};
@@ -436,6 +437,11 @@ pub struct Outcome {
     pub dups: Option<DupCounts>,
     /// S10: the host's `keep_alive` lines dropped while parked.
     pub ka_dropped: u64,
+    /// A1: the `rate_limit_event` lines seen and those the usage tap wrote
+    /// (`census_part::RATE_LIMIT`), and the usage-limit results
+    /// (`census_part::USAGE_LIMITED`): a remote session's.
+    pub rate_limit: (u32, u32),
+    pub usage_limited: u32,
 }
 
 /// The end row's part counting a remote session's `system/init` ids that
@@ -458,8 +464,10 @@ pub const MIRROR_DROPPED_PART: &str = "mirror_dropped";
 /// knob; `init_id_refused:<n>` when n > 0; S10's `moves`, `move_ms` and `cut` once a move started,
 /// a remote session's `inits:<forwarded>/<swallowed>` and `echoes:<forwarded>/<swallowed>`,
 /// `ka_dropped:<n>` when n > 0; `step:<step>` for a failed remote start; a remote link's parts
-/// with `close_ms` before its `link_drops`, `remote::census_part::ALL`'s order; else
-/// `close_ms` after the rest; `pid_rewrite:<ok|failed>` once an `initialize` answer went).
+/// with `close_ms` before its `link_drops`, `remote::census_part::ALL`'s order (A1's `account` among
+/// them, last); else `close_ms` after the rest; A1's `rate_limit:<seen>/<written>` when either is
+/// above 0 and `usage_limited:<n>` when n > 0; `pid_rewrite:<ok|failed>` once an `initialize`
+/// answer went).
 #[must_use]
 pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
     let mut row = start.clone();
@@ -526,6 +534,14 @@ pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
     }
     if let Some(c) = close.filter(|_| !close_put) {
         parts.push(c);
+    }
+    // A1: what the usage tap saw and wrote, and the limits the chat hit.
+    let (seen, written) = out.rate_limit;
+    if seen > 0 || written > 0 {
+        parts.push(format!("{}:{seen}/{written}", census_part::RATE_LIMIT));
+    }
+    if out.usage_limited > 0 {
+        parts.push(format!("{}:{}", census_part::USAGE_LIMITED, out.usage_limited));
     }
     if let Some(word) = out.pid_rewrite {
         parts.push(format!("{}:{word}", census_part::PID_REWRITE));
@@ -1249,6 +1265,10 @@ struct Pump {
     /// S10 §B: host lines a switch held when it was called off (the old
     /// link lost meanwhile), taken as the host's next ones.
     held_host: VecDeque<Bytes>,
+    /// A1: what the chat's turns showed of its account's usage, pending for
+    /// `state/accounts.toml` (a remote session's: by the live generation's
+    /// seal, `RemoteSnapshot::seal`).
+    usage: UsageTap,
 }
 
 /// S10 §B: a migration as the pump runs it: what started it (the wall, or
@@ -1304,12 +1324,13 @@ struct Moving {
 /// start-up, S9's rule) with no miss by then, whichever comes first; else
 /// at that generation's end with nothing failed (the host closed, the link
 /// was lost again), or the wrapper's. A cut miss's retry on the same VM
-/// keeps the first generation's `how`, `seed`, `transcript` and `touchid`,
-/// its own `gen`, `cut` and `ms`; a miss writes `failed` in its place. A
-/// miss later than the grace, still before the CLI's first init (§2.9), is
-/// held all the same, after the `done`: a resume miss writes `failed` after
-/// it; a cut miss's retry on that VM writes no second `done` and no second
-/// note, one on another VM that VM's.
+/// keeps the first generation's `how`, `seed`, `transcript` and `touchid`
+/// (`asked` when the retry's was), its own `gen`, `cut`, `ms` and account;
+/// a miss writes `failed` in its place. A miss later than the grace, still
+/// before the CLI's first init (§2.9), is held all the same, after the
+/// `done`: a resume miss writes `failed` after it; a cut miss's retry on
+/// that VM writes no second `done` and no second note, one on another VM
+/// that VM's.
 #[derive(Debug, Clone)]
 struct MoveDoneRow {
     gen: u32,
@@ -1320,6 +1341,10 @@ struct MoveDoneRow {
     cut: Option<&'static str>,
     touchid: Option<&'static str>,
     ms: u64,
+    /// A1: the account the moved generation runs as (`MoveDone::account`),
+    /// and the one it ran as before when that was another.
+    account: Option<String>,
+    account_from: Option<String>,
 }
 
 /// S10 (L5): a lost link that moves with the next host line: the move it
@@ -1488,6 +1513,7 @@ impl Pump {
             fallbacks: 0,
             carried: None,
             held_host: VecDeque::new(),
+            usage: UsageTap::new(),
             sess,
             plan,
         }
@@ -1997,7 +2023,10 @@ impl Pump {
         let vm = snap.as_ref().and_then(|snap| snap.vm.clone()).unwrap_or_default();
         // S10 (§6.1): why it started (a move's, the kind that ran), this wrapper's pid; `end` comes with its end.
         let why = self.started_why(snap.as_ref());
-        self.vms.push(registry::VmEntry { gen: self.gen, vm, spawn: Some(s.spawn_id.to_string()), from: registry::now_rfc3339(), to: None, why, end: None, pid: std::process::id() });
+        // A1: the seal and the account the generation runs as (what `creds account use` lists live chats by).
+        let seal = snap.as_ref().and_then(|s| s.seal.clone());
+        let (tag, account) = seal.map_or((None, None), |s| (Some(s.tag), s.account));
+        self.vms.push(registry::VmEntry { gen: self.gen, vm, spawn: Some(s.spawn_id.to_string()), from: registry::now_rfc3339(), to: None, why, end: None, pid: std::process::id(), tag, account });
         if self.gen_move.is_some() {
             self.move_started(snap.as_ref());
         }
@@ -2034,16 +2063,23 @@ impl Pump {
     /// delivered setup-token. The session stops (`Signal(Term)` plus
     /// `detach{final}`) and is never started again; the wrapper exits 5 with
     /// D6's line, and the seal is recorded as refused, so no later session
-    /// unseals it. The seal is the one the VM's row names (the delivered
-    /// copy), else the sealed file's.
+    /// unseals it. The seal is the live generation's (A1: the snapshot's,
+    /// `PipelineEnd::seal`: after a `creds account use` the VM's row may name
+    /// another chat's delivery), else the one the VM's row names (the
+    /// delivered copy), else the sealed file's.
     fn on_rejected(&mut self, how: &'static str) {
         if self.finish.is_some() || self.finish_after_child.is_some() {
             return;
         }
         tracing::warn!(gen = self.gen, how, "Anthropic refused the delivered setup-token: stopping the session");
         self.final_line = Some(Failure::TokenRefused.line());
-        let vm = self.links.snapshot().and_then(|s| s.vm);
-        let tag = vm.as_deref().and_then(|vm| crate::bridge::vm::registry::read_row(&self.sess.paths, vm).ok().flatten()).and_then(|r| r.credential_tag).or_else(|| crate::bridge::agent::credential::seal_tag(&self.sess.paths.setup_token_env()));
+        let snap = self.links.snapshot();
+        let vm = snap.as_ref().and_then(|s| s.vm.clone());
+        let tag = snap
+            .and_then(|s| s.seal)
+            .map(|s| s.tag)
+            .or_else(|| vm.as_deref().and_then(|vm| crate::bridge::vm::registry::read_row(&self.sess.paths, vm).ok().flatten()).and_then(|r| r.credential_tag))
+            .or_else(|| crate::bridge::agent::credential::seal_tag(&self.sess.paths.setup_token_env()));
         match (&vm, &tag) {
             (Some(vm), Some(tag)) => crate::bridge::agent::credential::record_rejection(&self.sess.paths, vm, tag, how),
             _ => tracing::warn!("the refusal is not recorded: no VM or no seal known"),
@@ -2191,7 +2227,7 @@ impl Pump {
                 }
                 self.maybe_register();
             }
-            ChildFrame::Result { .. } if forwarded => {
+            ChildFrame::Result { is_error, .. } if forwarded => {
                 // S10: the turn is over: its last top-level assistant frame is the leaf a move cuts at. A turn with
                 // none (stopped before any reply) leaves none: an older leaf would cut away this turn's prompt and
                 // its interruption marker, so the cut is then the view's entry just before the next turn's line.
@@ -2205,10 +2241,99 @@ impl Pump {
                 self.touch_registry();
                 // S10 §B: the VM's wall near, a migration's phase A starts.
                 self.maybe_migrate();
+                // A1: a usage limit (then its note), or an answer after one.
+                self.on_turn_result(&line, *is_error);
             }
             ChildFrame::Assistant { uuid: Some(uuid), top_level: true } if forwarded => self.last_assistant = Some(uuid.to_string()),
+            // A1: forwarded as it came; what it says of the account's usage goes to the tap.
+            ChildFrame::RateLimit { info } if forwarded => self.on_rate_limit(info.map(RawValue::get)),
             _ => {}
         }
+    }
+
+    // -- A1: the account's usage, as the chat's turns show it (plan §5) --------------------------
+
+    /// The seal the live generation's token is of (`RemoteSnapshot::seal`):
+    /// what a turn's usage is attributed to. None on a local link.
+    fn usage_tag(&self) -> Option<String> {
+        self.links.snapshot().and_then(|s| s.seal).map(|s| s.tag)
+    }
+
+    /// A `rate_limit_event` (forwarded already): its info to the usage tap,
+    /// written now when due ([`UsageTap::offer`]).
+    fn on_rate_limit(&mut self, info: Option<&str>) {
+        let (Some(info), Some(tag)) = (info.and_then(crate::wire::ratelimit::parse_info), self.usage_tag()) else { return };
+        let now = Instant::now();
+        self.usage.offer(&tag, Observed { at: crate::wire::time::unix_now(), what: Seen::Info(info) }, now);
+        self.usage_flush(now, false);
+    }
+
+    /// A turn's result, forwarded (a held one too, when it is): a usage
+    /// limit (`wire::ratelimit::parse_limit_result`) is written at once,
+    /// audited `usage_limited` and followed by its note; the first answered
+    /// turn after a limit in this session clears it (the turns after it are
+    /// no news: `UsageTap::take_limited`).
+    fn on_turn_result(&mut self, line: &[u8], is_error: bool) {
+        let Some(tag) = self.usage_tag() else { return };
+        let (now, at) = (Instant::now(), crate::wire::time::unix_now());
+        match crate::wire::ratelimit::parse_limit_result(line) {
+            Some(hit) => {
+                self.usage.offer(&tag, Observed { at, what: Seen::Limited(hit.clone()) }, now);
+                self.usage_flush(now, false);
+                self.usage_limited(&tag, &hit);
+            }
+            None if !is_error && self.usage.take_limited(&tag) => {
+                self.usage.offer(&tag, Observed { at, what: Seen::Answered }, now);
+                self.usage_flush(now, false);
+            }
+            None => {}
+        }
+    }
+
+    /// A usage-limit result of seal `tag`: `usage_limited` (the account, or
+    /// `-` when no row names the seal), then, when an account holds it, the
+    /// note (`accounts::usage::note_usage_limit`: the account to go on with,
+    /// from the store as it reads now, and how). A store that cannot be read
+    /// gives no note (labels fail open: nothing is said that is not known).
+    fn usage_limited(&mut self, tag: &str, hit: &crate::wire::ratelimit::LimitHit) {
+        let state = crate::bridge::accounts::read(&self.sess.paths).ok().flatten();
+        let account = state.as_ref().and_then(|s| s.account.iter().find(|r| r.tag == tag && crate::bridge::accounts::valid_name(&r.name))).map(|r| r.name.clone());
+        let detail = [
+            ("account", account.clone().unwrap_or_else(|| "-".to_string())),
+            ("tag", tag.to_string()),
+            ("kind", hit.kind.clone().unwrap_or_else(|| "unknown".to_string())),
+            ("resets_at", hit.resets_at.map_or_else(|| "-".to_string(), |r| r.to_string())),
+            ("text", crate::bridge::remote::part(&hit.text, 160)),
+            ("gen", self.gen.to_string()),
+            ("source", usage::SOURCE_CHAT.to_string()),
+        ];
+        self.audit(audit_event::USAGE_LIMITED, &detail);
+        let (Some(state), Some(name)) = (state, account) else {
+            tracing::info!(tag, "a usage limit of a seal no account holds: no note");
+            return;
+        };
+        let now = crate::wire::time::unix_now();
+        let others = usage::others(&state, &name, now);
+        let note = usage::note_usage_limit(&name, hit, &others, self.out.session_id.as_deref(), now);
+        self.note(&note);
+    }
+
+    /// The tap's pending observations written when due at `now` (`closing`:
+    /// all of them, due or not, once), one try at the store's lock: the pump
+    /// never waits for it ([`usage::record_all`]). What a busy store refuses
+    /// at the close is lost, and the log says so.
+    fn usage_flush(&mut self, now: Instant, closing: bool) {
+        let taken = if closing { self.usage.take_pending() } else { self.usage.take_due(now).unwrap_or_default() };
+        if taken.is_empty() {
+            return;
+        }
+        let outcome = usage::record_all(&self.sess.paths, &taken, usage::SOURCE_CHAT, false);
+        match &outcome {
+            Recorded::Busy if closing => tracing::info!(n = taken.len(), "usage: the store's lock was held at the close: what the tap held is not recorded"),
+            Recorded::Failed(e) => tracing::warn!("usage: not recorded: {e}"),
+            other => tracing::debug!(?other, n = taken.len(), "usage: written"),
+        }
+        self.usage.after(taken, &outcome, now);
     }
 
     /// Forward the answer to the host's `initialize` with the wrapper's pid
@@ -2471,8 +2596,12 @@ impl Pump {
                     return;
                 }
                 // No retry: the host gets the error result after all.
-                let _ = self.state.on_child_frame(&claude::classify_child(&held), &held);
+                let frame = claude::classify_child(&held);
+                let is_error = matches!(frame, ChildFrame::Result { is_error: true, .. });
+                let _ = self.state.on_child_frame(&frame, &held);
                 self.forward(&held);
+                // A1: a turn's result all the same (a usage limit before the CLI's init, say).
+                self.on_turn_result(&held, is_error);
             }
         }
         if unresumed {
@@ -2806,6 +2935,7 @@ impl Pump {
             leaf: self.leaf.clone(),
             fresh_chat: self.fresh_chat(),
             init_answered: self.out.init_latency_ms.is_some(),
+            retry: false,
         };
         self.out.moves[move_slot(p.kind)] += 1;
         self.set_status("migrating");
@@ -2867,9 +2997,11 @@ impl Pump {
     /// [`Pump::move_resumed`]), so a miss writes `failed` alone and a cut
     /// miss's retry one `done`: this generation's values are kept for it (a
     /// retry on the same VM keeps the first generation's `how`, `seed`,
-    /// `transcript` and `touchid`). A retry after the move was written done
-    /// (its cut miss later than the grace) keeps none on that VM: its CLI
-    /// is past the move, so nothing more is written or said for it.
+    /// `transcript` and `touchid`, `asked` when the retry's was; A1: the
+    /// account the chat ran as before the move, unless the retry runs as it
+    /// again). A retry after the move was written done (its cut miss later
+    /// than the grace) keeps none on that VM: its CLI is past the move, so
+    /// nothing more is written or said for it.
     fn move_started(&mut self, snap: Option<&RemoteSnapshot>) {
         let Some(m) = self.moving.clone() else { return };
         let done = snap.and_then(|s| s.moved.clone());
@@ -2903,6 +3035,8 @@ impl Pump {
             cut: done.as_ref().map(|d| d.cut),
             touchid: done.as_ref().map(|d| d.touchid),
             ms,
+            account: done.as_ref().and_then(|d| d.account.clone()),
+            account_from: done.as_ref().and_then(|d| d.account_from.clone()),
         };
         if let Some(moving) = self.moving.as_mut() {
             if !m.retried {
@@ -2910,9 +3044,18 @@ impl Pump {
             }
             moving.done = match moving.done.take().filter(|_| m.retried) {
                 // The cut miss's retry is the same move: on its VM it keeps the first generation's checkout, transcript
-                // and token; on another (that VM was no longer running) that VM's, its Touch ID `asked` if either was.
-                Some(first) if first.to_vm == own.to_vm => Some(MoveDoneRow { gen: own.gen, cut: own.cut, ms: own.ms, ..first }),
-                Some(first) => Some(MoveDoneRow { touchid: if first.touchid == Some("asked") { first.touchid } else { own.touchid }, ..own }),
+                // and token (its Touch ID `asked` when the retry's was: the VM no longer held the move's seal); on
+                // another (that VM was no longer running) that VM's, its Touch ID `asked` if either was. A1: the
+                // account is the retry's, the one it ran as before the move's, unless the retry runs as that again.
+                Some(first) => {
+                    let account_from = first.account_from.clone().or_else(|| own.account_from.clone()).filter(|a| own.account.as_ref() != Some(a));
+                    if first.to_vm == own.to_vm {
+                        let touchid = if own.touchid == Some("asked") { own.touchid } else { first.touchid };
+                        Some(MoveDoneRow { gen: own.gen, cut: own.cut, ms: own.ms, touchid, account_from, account: own.account, ..first })
+                    } else {
+                        Some(MoveDoneRow { touchid: if first.touchid == Some("asked") { first.touchid } else { own.touchid }, account_from, ..own })
+                    }
+                }
                 // A cut miss later than the grace: the move is written done on this VM already (one row, one note).
                 None if m.retried && moving.written.as_ref().is_some_and(|w| w.to_vm == own.to_vm) => None,
                 None => Some(own),
@@ -2946,6 +3089,8 @@ impl Pump {
                 ms,
                 step_code: Some((step, code)),
                 request: request_of(m.why.trigger.as_ref()),
+                account: done.and_then(|d| d.account.as_deref()),
+                account_from: done.and_then(|d| d.account_from.as_deref()),
                 ..Default::default()
             };
             row.audit(&self.sess.paths);
@@ -2965,6 +3110,10 @@ impl Pump {
         let vm = snap.and_then(|s| s.vm.clone()).unwrap_or_else(|| m.why.from_vm.clone());
         tracing::warn!(gen = self.gen, vm = %vm, fallbacks = self.fallbacks, "the switch fell back to the old VM");
         self.note(&note_stayed(&vm, "the move to the new VM failed after the old claude stopped; it restarted here", then));
+        // A1: the fallback re-planned: a chat that now runs as another account says so.
+        if let Some((to, from)) = snap.and_then(|s| s.moved.as_ref()).and_then(|d| d.account.clone().zip(d.account_from.clone())) {
+            self.note(&note_account(&to, &from));
+        }
     }
 
     /// The current generation is a move's whose CLI has not shown yet that
@@ -2985,11 +3134,20 @@ impl Pump {
     fn move_resumed(&mut self) {
         self.move_resumed_by = None;
         if let Some(held) = self.held_miss.take() {
-            let _ = self.state.on_child_frame(&claude::classify_child(&held), &held);
+            let frame = claude::classify_child(&held);
+            let is_error = matches!(frame, ChildFrame::Result { is_error: true, .. });
+            let _ = self.state.on_child_frame(&frame, &held);
             self.forward(&held);
+            // A1: a held result is a turn's too: the usage tap reads it.
+            self.on_turn_result(&held, is_error);
         }
-        let Some(to_vm) = self.moving.as_ref().and_then(|m| m.done.as_ref()).map(|d| d.to_vm.clone()) else { return };
+        let Some(done) = self.moving.as_ref().and_then(|m| m.done.as_ref()) else { return };
+        let (to_vm, accounts) = (done.to_vm.clone(), done.account.clone().zip(done.account_from.clone()));
         self.note(&note_continues(&to_vm));
+        // A1: then, when the moved claude runs as another account (a `creds account use` since its last spawn), that.
+        if let Some((to, from)) = accounts {
+            self.note(&note_account(&to, &from));
+        }
         self.write_move_done();
     }
 
@@ -3015,6 +3173,8 @@ impl Pump {
             ms: d.ms,
             step_code: None,
             request: request_of(m.why.trigger.as_ref()),
+            account: d.account.as_deref(),
+            account_from: d.account_from.as_deref(),
         };
         row.audit(&self.sess.paths);
         m.written = Some(d);
@@ -3022,10 +3182,12 @@ impl Pump {
 
     /// The cut miss's one retry (§2.9): the moved generation's CLI found no
     /// message at its cut, before its init. Its VM again (the token is
-    /// cached there: no Touch ID), plain `--resume` (its `MoveWhy` names no
-    /// outstanding line, so its cut is `None`: `cut_before`), the host's
-    /// state replayed and every outstanding line sent again. `true` once
-    /// started (or its start failed: the finish is decided).
+    /// cached there: no Touch ID; A1: `MoveWhy::retry`, so the pipeline
+    /// keeps the seal the move ran on, whatever is installed now), plain
+    /// `--resume` (its `MoveWhy` names no outstanding line, so its cut is
+    /// `None`: `cut_before`), the host's state replayed and every
+    /// outstanding line sent again. `true` once started (or its start
+    /// failed: the finish is decided).
     fn retry_cut(&mut self) -> bool {
         let snap = self.links.snapshot();
         let Some(m) = self.moving.as_mut() else { return false };
@@ -3041,6 +3203,7 @@ impl Pump {
             leaf: None,
             fresh_chat: false,
             init_answered: self.out.init_latency_ms.is_some(),
+            retry: true,
         };
         tracing::info!(gen = self.gen, vm = %why.from_vm, "the moved CLI missed its cut: one retry on its VM, with no cut");
         if !self.spawn_next(StartWhy::Move(why)) {
@@ -3087,6 +3250,8 @@ impl Pump {
             ms,
             step_code: Some((StartStep::Spawn.name(), failure.exit_code())),
             request: request_of(m.why.trigger.as_ref()),
+            account: pending.as_ref().and_then(|d| d.account.as_deref()),
+            account_from: pending.as_ref().and_then(|d| d.account_from.as_deref()),
         };
         row.audit(&self.sess.paths);
         self.out.move_ms = Some(ms);
@@ -3362,6 +3527,7 @@ impl Pump {
             leaf: self.leaf.clone(),
             fresh_chat: false,
             init_answered: self.out.init_latency_ms.is_some(),
+            retry: false,
         };
         tracing::info!(gen = self.gen + 1, vm = %why.from_vm, held = held.len(), "the switch: the moved generation starts");
         self.moving = Some(Moving { why: why.clone(), ran: MoveKind::Migrate, at, resent: false, retried: false, done: None, written: None, fell_back: None });
@@ -3396,6 +3562,8 @@ impl Pump {
         }
         all.extend(self.credential_hold_until);
         all.extend(self.synthetic.as_ref().and_then(Synthetic::deadline));
+        // A1: the usage tap's throttled write.
+        all.extend(self.usage.due_at());
         if self.finish.is_some() {
             all.extend(self.finish_deadline);
         }
@@ -3472,6 +3640,8 @@ impl Pump {
             tracing::info!(wait_ms, "synthetic oauth_token_refresh: no answer within the wait");
             self.audit("synthetic_oauth", &[("class", "none".to_string()), ("ms", wait_ms.to_string())]);
         }
+        // A1: the usage tap's pending observations, once due.
+        self.usage_flush(now, false);
         if self.replay_deadline.is_some_and(|t| now >= t) {
             self.replay_deadline = None;
             if self.state.replaying() {
@@ -3507,6 +3677,9 @@ impl Pump {
             // S10: what the swallow rules did, the census's `inits` and `echoes`.
             out.dups = Some(self.state.counts());
         }
+        // A1: the usage tap's counts.
+        out.rate_limit = (self.usage.seen, self.usage.written);
+        out.usage_limited = self.usage.limited;
         out
     }
 
@@ -3677,6 +3850,8 @@ impl Pump {
         if let Err(e) = self.mirror.sync_all() {
             tracing::warn!("mirror fsync: {e}");
         }
+        // A1: what the usage tap still holds, written once with no wait (the close budget is untouched).
+        self.usage_flush(Instant::now(), true);
         let mut out = self.snapshot_outcome();
         out.code = Some(code);
         out.end = self.finish.map(|f| f.1);
@@ -4568,6 +4743,8 @@ mod tests {
             cut: None,
             dups: None,
             ka_dropped: 0,
+            rate_limit: (0, 0),
+            usage_limited: 0,
         };
         let row = end_row(&start_row(), &out, 9_000);
         assert_eq!((row.end, row.exit, row.pid, row.start), (Some(9_000), Some(3), 42, 1_000), "paired with the start row on (pid, start)");
@@ -4724,9 +4901,23 @@ mod tests {
         let quiet = end_row(&start_row(), &Outcome { dups: Some(DupCounts::default()), ..Outcome::default() }, 9_000).note.unwrap();
         assert!(quiet.ends_with("; oauth_refresh_answered:0; inits:0/0; echoes:0/0"), "{quiet}");
         let local = end_row(&start_row(), &Outcome::default(), 9_000).note.unwrap();
-        for part in ["moves:", "move_ms:", "cut:", "inits:", "echoes:", "ka_dropped:"] {
+        for part in ["moves:", "move_ms:", "cut:", "inits:", "echoes:", "ka_dropped:", "rate_limit:", "usage_limited:"] {
             assert!(!local.contains(part), "{part}: {local}");
         }
+    }
+
+    /// A1: the link's `account` part last of its own, then the pump's
+    /// `rate_limit` (either count above 0) and `usage_limited` (above 0),
+    /// `census_part::ALL`'s order, before `pid_rewrite`.
+    #[test]
+    fn end_row_writes_a1s_parts_after_the_links() {
+        let out = Outcome { remote: vec!["vm:microvm-2".into(), "link_drops:0".into(), "account:default,work".into()], rate_limit: (3, 2), usage_limited: 1, pid_rewrite: Some("ok"), close_ms: Some(40), ..Outcome::default() };
+        let note = end_row(&start_row(), &out, 9_000).note.unwrap();
+        assert!(note.ends_with("; vm:microvm-2; close_ms:40; link_drops:0; account:default,work; rate_limit:3/2; usage_limited:1; pid_rewrite:ok"), "{note}");
+        let seen_only = end_row(&start_row(), &Outcome { rate_limit: (2, 0), ..Outcome::default() }, 9_000).note.unwrap();
+        assert!(seen_only.ends_with("; rate_limit:2/0") && !seen_only.contains("usage_limited"), "{seen_only}");
+        let parts = [census_part::ACCOUNT, census_part::RATE_LIMIT, census_part::USAGE_LIMITED];
+        assert_eq!(census_part::ALL[census_part::ALL.len() - 3..], parts, "appended last, in this order");
     }
 
     /// The remote link's events reach a local pump as nothing but a log
@@ -6041,6 +6232,242 @@ mod tests {
             });
         }
 
+        /// A1: the seal recorded as refused is the live generation's (the
+        /// snapshot's), before the VM's row (which names the latest delivery
+        /// to that VM: after a `creds account use`, maybe another chat's
+        /// account) and the installed copy; the generation's `vms` entry
+        /// names that seal and its account.
+        #[test]
+        fn a_refusal_records_the_live_generations_seal_first() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                std::fs::create_dir_all(paths.credentials()).unwrap();
+                std::fs::write(paths.setup_token_env(), "the installed copy\n").unwrap();
+                let row = crate::bridge::vm::registry::VmRow { id: "microvm-1".into(), client_token: "ct".into(), credential_tag: Some("c".repeat(16)), ..Default::default() };
+                crate::bridge::vm::registry::write_row(&paths, &row).unwrap();
+                let live = crate::bridge::accounts::Seal { tag: "a".repeat(16), account: Some("work".into()) };
+                {
+                    let mut h = hand.borrow_mut();
+                    h.snap.vm = Some("microvm-1".into());
+                    h.snap.seal = Some(live.clone());
+                }
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.send(&user(1)).await;
+                assert!(far.next_input().await.is_some());
+                far.send(ChildEvent::Rejected { how: "text" }).await;
+                assert_eq!(far.next_signal().await, Some(Sig::Term));
+                far.send(ChildEvent::Detached).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 5);
+                for (tag, refused) in [(live.tag.clone(), true), ("c".repeat(16), false), (crate::bridge::agent::credential::seal_tag(&paths.setup_token_env()).unwrap(), false)] {
+                    assert_eq!(crate::bridge::agent::credential::read_rejection(&paths, &tag).unwrap().is_some(), refused, "{tag}");
+                }
+                pump.conclude(code);
+                let row = registry_row(&pump, SID);
+                assert_eq!((row.vms[0]["tag"].as_str(), row.vms[0]["account"].as_str()), (Some(live.tag.as_str()), Some("work")), "{:?}", row.vms);
+            });
+        }
+
+        /// The accounts' store as the usage tests find it: `default` (seal
+        /// a…a) active, `spare` (seal b…b) never seen; and the live
+        /// generation on `tag`.
+        fn accounts_and_seal(paths: &Paths, hand: &Rc<RefCell<Hand>>, tag: &str) {
+            use crate::bridge::accounts::{update, AccountRow, Seal};
+            update(paths, |s| {
+                s.active = Some("default".into());
+                s.account = vec![AccountRow { name: "default".into(), tag: "a".repeat(16), ..AccountRow::default() }, AccountRow { name: "spare".into(), tag: "b".repeat(16), ..AccountRow::default() }];
+            })
+            .unwrap();
+            let mut h = hand.borrow_mut();
+            h.snap.seal = Some(Seal { tag: tag.to_string(), account: Some("default".into()) });
+            h.snap.accounts = vec!["default".into()];
+        }
+
+        /// The record of `name` in the store now.
+        fn usage_of(paths: &Paths, name: &str) -> Option<crate::bridge::accounts::usage::UsageRecord> {
+            crate::bridge::accounts::read(paths).unwrap().unwrap().usage.get(name).map(crate::bridge::accounts::usage::read_record)
+        }
+
+        /// A1: a `rate_limit_event` reaches the host byte for byte and its
+        /// windows are recorded for the live generation's account at once
+        /// (the first thing seen), `source` `chat`; a second within the
+        /// minute with the same status waits, and the close writes it; a
+        /// status change is written at once. The census: the link's
+        /// `account`, then `rate_limit:<seen>/<written>`.
+        #[test]
+        fn a_rate_limit_event_passes_as_it_came_and_its_usage_is_recorded() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                accounts_and_seal(&paths, &hand, &"a".repeat(16));
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                let reset = crate::wire::time::unix_now() + 3600;
+                let event = |s: &str, u: f64| format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{s}","unifiedWindows":{{"five_hour":{{"utilization":{u},"resetsAt":{reset}}},"seven_day":{{"utilization":0.4,"resetsAt":{reset}}}}}}},"uuid":"e-{u}","session_id":"{SID}"}}"#);
+                let first = event("allowed", 0.1);
+                far.line(&first).await;
+                host.wait_for("the event", |v| v["uuid"] == "e-0.1").await;
+                assert!(host.raw().contains(&format!("{first}\n").into_bytes()), "byte for byte");
+                let rec = usage_of(&paths, "default").expect("written at once");
+                assert_eq!((rec.status.as_deref(), rec.source.as_deref(), rec.five_hour.map(|w| w.utilization)), (Some("allowed"), Some("chat"), Some(0.1)));
+                far.line(&event("allowed", 0.2)).await;
+                host.wait_for("the second", |v| v["uuid"] == "e-0.2").await;
+                assert_eq!(usage_of(&paths, "default").and_then(|r| r.five_hour).map(|w| w.utilization), Some(0.1), "throttled: within the minute, the same status");
+                far.line(&event("allowed_warning", 0.3)).await;
+                host.wait_for("the third", |v| v["uuid"] == "e-0.3").await;
+                let rec = usage_of(&paths, "default").unwrap();
+                assert_eq!((rec.status.as_deref(), rec.five_hour.map(|w| w.utilization)), (Some("allowed_warning"), Some(0.3)), "a status change: at once, the newer replacing the pending");
+                far.line(&event("allowed_warning", 0.5)).await;
+                host.wait_for("the fourth", |v| v["uuid"] == "e-0.5").await;
+                host.eof().await;
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                assert_eq!(usage_of(&paths, "default").and_then(|r| r.five_hour).map(|w| w.utilization), Some(0.5), "flushed at the close");
+                assert!(usage_of(&paths, "spare").is_none());
+                let note = end_note(&pump);
+                assert!(note.contains("; account:default; rate_limit:4/3; pid_rewrite:ok"), "{note}");
+            });
+        }
+
+        /// A1: a throttled observation is a deadline of the pump's own: past
+        /// the first write, an event of the same status waits for the minute
+        /// (`next_deadline` is the tap's due time, a minute after that
+        /// write), and `on_deadline` then writes it, with no turn or close to
+        /// carry it.
+        #[test]
+        fn a_throttled_observation_is_written_at_its_deadline() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (mut pump, hand, _host, _io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                accounts_and_seal(&paths, &hand, &"a".repeat(16));
+                let reset = crate::wire::time::unix_now() + 3600;
+                let info = |u: f64| format!(r#"{{"status":"allowed","unifiedWindows":{{"five_hour":{{"utilization":{u},"resetsAt":{reset}}}}}}}"#);
+                let five_hour = || usage_of(&paths, "default").and_then(|r| r.five_hour).map(|w| w.utilization);
+                let before = Instant::now();
+                pump.on_rate_limit(Some(info(0.1).as_str()));
+                let after = Instant::now();
+                assert_eq!((five_hour(), pump.next_deadline()), (Some(0.1), None), "the first: written at once, nothing due");
+                pump.on_rate_limit(Some(info(0.2).as_str()));
+                let every = crate::bridge::accounts::usage::USAGE_WRITE_EVERY;
+                let due = pump.next_deadline().expect("the throttled write is the pump's deadline");
+                assert!(due >= before + every && due <= after + every, "a minute after the first write");
+                pump.on_deadline(due - Duration::from_millis(1));
+                assert_eq!(five_hour(), Some(0.1), "not before it");
+                pump.on_deadline(due);
+                assert_eq!((five_hour(), pump.next_deadline()), (Some(0.2), None), "written at its deadline");
+                assert_eq!((pump.usage.seen, pump.usage.written), (2, 2));
+            });
+        }
+
+        /// A1: a seal no account holds (no row names it) writes nothing and
+        /// notes nothing, the store's bytes as they were; a usage limit of
+        /// it is still forwarded and audited (`account` `-`).
+        #[test]
+        fn an_unknown_seal_writes_nothing_and_notes_nothing() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                accounts_and_seal(&paths, &hand, &"f".repeat(16));
+                let before = std::fs::read(paths.accounts_state()).unwrap();
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                far.line(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#).await;
+                let limit = include_str!("../../tests/fixtures/claude/usage-limit-result-2.1.305.json").trim_end().to_string();
+                far.line(&limit).await;
+                host.wait_for("the limit", |v| v["api_error"] == "usage_limit_reached").await;
+                host.eof().await;
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                assert_eq!(std::fs::read(paths.accounts_state()).unwrap(), before, "byte for byte");
+                assert!(!host.json().iter().any(|v| v["subtype"] == "informational"), "no note");
+                let audit = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
+                let limited: Vec<_> = audit.iter().filter(|r| r["event"] == "usage_limited").collect();
+                assert_eq!((limited.len(), limited[0]["detail"]["account"].as_str()), (1, Some("-")), "{audit:?}");
+                assert!(end_note(&pump).contains("; rate_limit:1/0; usage_limited:1"), "{}", end_note(&pump));
+            });
+        }
+
+        /// A1: claude 2.1.305's usage-limit result (B2's) reaches the host
+        /// unchanged, then the exact note (the free account to go on with,
+        /// never seen, and `session migrate` of this chat); the limit is
+        /// recorded for the live account at once (kind, the CLI's text),
+        /// audited `usage_limited`; nothing is taken for a refusal (no
+        /// `creds.toml`); the wrapper exits 0 at the host's EOF; one note for
+        /// the one result; the first answered turn after it clears it, and
+        /// the turns after that are no news (a limit another writer recorded
+        /// since stays for their events to clear).
+        #[test]
+        fn a_usage_limit_result_is_forwarded_then_noted_and_recorded() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                accounts_and_seal(&paths, &hand, &"a".repeat(16));
+                let task = supervise(pump, io);
+                let mut far = far(&hand).await;
+                far.started().await;
+                handshake(&host, &mut far, SID).await;
+                host.send(&user(1)).await;
+                assert!(far.next_input().await.is_some());
+                let limit = include_str!("../../tests/fixtures/claude/usage-limit-result-2.1.305.json").trim_end().to_string();
+                far.line(&limit).await;
+                let note = host.wait_for("the note", |v| v["subtype"] == "informational").await;
+                let want = format!("ai-env: account default hit its weekly limit (it resets 10am (UTC)); to go on now with account spare (its limits are unknown: ai-env creds account check): ai-env creds account use spare, then reopen this chat or run ai-env session migrate {SID}");
+                assert_eq!(note["content"].as_str(), Some(want.as_str()));
+                let raw = host.raw();
+                let at = raw.iter().position(|l| *l == format!("{limit}\n").into_bytes()).expect("the result, unchanged");
+                assert!(String::from_utf8_lossy(&raw[at + 1]).contains("\"subtype\":\"informational\""), "the note right after the result");
+                let rec = usage_of(&paths, "default").expect("recorded at once");
+                let limited = rec.limited.clone().expect("limited");
+                assert_eq!((rec.status.as_deref(), limited.kind.as_str(), limited.text.as_str()), (Some("rejected"), "seven_day", "You've hit your weekly limit · resets 10am (UTC)"));
+                let audit = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
+                let rows: Vec<_> = audit.iter().filter(|r| r["event"] == "usage_limited").map(|r| r["detail"].clone()).collect();
+                assert_eq!(rows.len(), 1, "{audit:?}");
+                assert_eq!(["account", "tag", "kind", "resets_at", "source", "gen"].map(|k| rows[0][k].as_str().unwrap_or_default().to_string()), ["default", &"a".repeat(16), "seven_day", "-", "chat", "1"].map(str::to_string));
+                assert!(!paths.creds_state().exists(), "no refusal recorded");
+                host.send(&user(2)).await;
+                assert!(far.next_input().await.is_some());
+                far.line(&result_for(2)).await;
+                host.wait_for("the answer", |v| v["type"] == "result" && v["is_error"] == false).await;
+                assert_eq!(usage_of(&paths, "default").map(|r| (r.limited.is_none(), r.status)), Some((true, Some("allowed".into()))), "an answer after the limit clears it");
+                assert_eq!(notes(&host), std::slice::from_ref(&want), "one note for the one limit result");
+                // A limit recorded since by another writer (a check, another chat), older than the next turn: that
+                // turn's answer is no news, so it stays.
+                let earlier = crate::wire::time::unix_now() - 5;
+                crate::bridge::accounts::update(&paths, |s| {
+                    use crate::bridge::accounts::usage::{to_value, LimitedRecord, UsageRecord};
+                    let rec = UsageRecord { seen_at: Some(earlier), status: Some("rejected".into()), limited: Some(LimitedRecord { at: earlier, text: String::new(), kind: "seven_day".into(), resets_at: None }), ..UsageRecord::default() };
+                    s.usage.insert("default".into(), to_value(&rec));
+                })
+                .unwrap();
+                host.send(&user(3)).await;
+                assert!(far.next_input().await.is_some());
+                far.line(&result_for(3)).await;
+                host.wait_for("the third answer", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(3).as_str()).await;
+                host.eof().await;
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                assert!(usage_of(&paths, "default").is_some_and(|r| r.limited.is_some()), "the second answer after the limit wrote nothing");
+                assert!(end_note(&pump).contains("; usage_limited:1"), "{}", end_note(&pump));
+            });
+        }
+
         /// A remote session's registry row and census end row come from its
         /// link: the VM, the spawn, the last stdout seq handed over, the
         /// seeded head, one `vms` entry per generation; the census's remote
@@ -6358,7 +6785,7 @@ mod tests {
         fn a_failure_before_the_pump_is_recorded_with_its_code_and_step() {
             for (failure, code) in [
                 (Failure::NotGitRepo, 9),
-                (Failure::NoToken { why: "no setup-token is sealed".into() }, 5),
+                (Failure::NoToken { why: "no setup-token is sealed".into(), accounts: false }, 5),
                 (Failure::Other { code: 1, step: "precheck", first_line: "the session's pump cannot start: HOME is not set".into() }, 1),
             ] {
                 let d = tempfile::tempdir().unwrap();
@@ -6508,7 +6935,57 @@ mod tests {
         fn moved_to(hand: &Rc<RefCell<Hand>>, vm: &str, kind: MoveKind, cut: &'static str) {
             let mut h = hand.borrow_mut();
             h.snap.vm = Some(vm.into());
-            h.snap.moved = Some(crate::bridge::remote::link::MoveDone { kind, cut, touchid: "asked", seed: "box", stayed: false });
+            h.snap.moved = Some(crate::bridge::remote::link::MoveDone { kind, cut, touchid: "asked", seed: "box", stayed: false, account: None, account_from: None });
+        }
+
+        /// A1: a move whose generation runs as another Claude account (a
+        /// `creds account use` since the chat's last spawn: its pipeline
+        /// says so in `MoveDone`) says that after the note that the chat goes
+        /// on; `session_move_end` `done` names both accounts, and each
+        /// generation's `vms` entry its own.
+        #[test]
+        fn a_move_onto_another_account_says_so_after_it_continues() {
+            use crate::bridge::accounts::Seal;
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                {
+                    let mut h = hand.borrow_mut();
+                    h.snap.vm = Some("microvm-1".into());
+                    h.snap.seal = Some(Seal { tag: "a".repeat(16), account: Some("default".into()) });
+                }
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert_eq!(gen1.next_input().await, Some(user(1)));
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                {
+                    let mut h = hand.borrow_mut();
+                    h.snap.vm = Some("microvm-2".into());
+                    h.snap.seal = Some(Seal { tag: "b".repeat(16), account: Some("work".into()) });
+                    h.snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Readdress, cut: "none", touchid: "asked", seed: "box", stayed: false, account: Some("work".into()), account_from: Some("default".into()) });
+                }
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(gen2.next_input().await, Some(user(1)), "the line again");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                gen2.line(&init_frame(SID)).await;
+                host.wait_for("the account's note", |v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains("Claude account"))).await;
+                assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone), note_continues("microvm-2"), note_account("work", "default")]);
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!((ends.len(), ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["account"].as_str(), ends[0]["detail"]["account_from"].as_str()), (1, Some("done"), Some("work"), Some("default")), "{ends:?}");
+                let row = registry_row(&pump, SID);
+                let accounts: Vec<Option<&str>> = row.vms.iter().map(|v| v.get("account").and_then(toml::Value::as_str)).collect();
+                assert_eq!(accounts, [Some("default"), Some("work")], "{:?}", row.vms);
+            });
         }
 
         /// A mid-turn loss of a terminated VM moves the chat at once: the
@@ -6567,6 +7044,7 @@ mod tests {
                     leaf: Some("a-1".into()),
                     fresh_chat: false,
                     init_answered: true,
+                    retry: false,
                 };
                 assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::Move(want)]);
                 host.wait_for("the withdrawn prompt", |v| v["type"] == "control_cancel_request").await;
@@ -6668,6 +7146,7 @@ mod tests {
                     leaf: None,
                     fresh_chat: false,
                     init_answered: true,
+                    retry: false,
                 };
                 assert_eq!(hand.borrow().whys.last(), Some(&StartWhy::Move(moved(3, "microvm-1"))), "turn 2 forwarded no reply: no leaf");
                 // The moved CLI runs turn 3 again with no reply of its own; turn 4 is lost mid-turn.
@@ -6993,10 +7472,11 @@ mod tests {
                         leaf: None,
                         fresh_chat: false,
                         init_answered: true,
+                        retry: true,
                     };
                     assert_eq!(hand.borrow().whys.last(), Some(&StartWhy::Move(want)));
                     // The retry on the same VM: its own seed kept, its token the VM's copy.
-                    hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false });
+                    hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false, account: None, account_from: None });
                     gen3.started().await;
                     let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
                     assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
@@ -7022,6 +7502,73 @@ mod tests {
                     assert_eq!(got, ["done", "3", "readdress", "microvm-2", "none", "asked", "box"], "{d}");
                 });
             }
+        }
+
+        /// A1: a cut miss's retry on the same VM is its move again
+        /// (`MoveWhy::retry`): the move's one `session_move_end` `done` takes
+        /// the retry's Touch ID when it asked one (the VM held neither seal
+        /// any more) and the retry's account, and names the account the chat
+        /// ran as before the move only when that is another one: back on it,
+        /// no `account_from` and no note of an account change.
+        #[test]
+        fn a_cut_miss_retry_merges_its_touch_id_and_account_into_the_moves_row() {
+            use crate::bridge::accounts::Seal;
+            use crate::bridge::remote::link::MoveDone;
+            let miss = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No message found with message.uuid of: a-1"]}"#;
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let on = |hand: &Rc<RefCell<Hand>>, tag: char, account: &str| hand.borrow_mut().snap.seal = Some(Seal { tag: tag.to_string().repeat(16), account: Some(account.into()) });
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                on(&hand, 'a', "default");
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                for line in [assistant("a-1"), result_for(1)] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+                host.send(&user(2)).await;
+                assert!(gen1.next_input().await.is_some());
+                let spawn_gone = LinkLoss::of(&crate::bridge::errors::BridgeError::SpawnGone("the spawn is not on microvm-1".into()), "microvm-1", None);
+                gen1.send(ChildEvent::Lost(spawn_gone)).await;
+                // The respawn on its VM, which held work's token (`creds account use work` since): no Touch ID.
+                let mut gen2 = far(&hand).await;
+                on(&hand, 'b', "work");
+                hand.borrow_mut().snap.moved = Some(MoveDone { kind: MoveKind::Respawn, cut: "at", touchid: "cached", seed: "kept", stayed: false, account: Some("work".into()), account_from: Some("default".into()) });
+                gen2.started().await;
+                assert!(gen2.next_input().await.is_some_and(|l| l.contains("\"initialize\"")));
+                assert_eq!(gen2.next_input().await, Some(user(2)));
+                gen2.line(miss).await;
+                gen2.exit(1).await;
+                // Its retry: the VM held neither seal any more, so one Touch ID, for the installed one (default again).
+                let mut gen3 = far(&hand).await;
+                assert!(matches!(hand.borrow().whys.last(), Some(StartWhy::Move(m)) if m.retry && m.kind == MoveKind::Respawn), "{:?}", hand.borrow().whys);
+                on(&hand, 'a', "default");
+                hand.borrow_mut().snap.moved = Some(MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "asked", seed: "kept", stayed: false, account: Some("default".into()), account_from: Some("work".into()) });
+                gen3.started().await;
+                let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
+                gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
+                for line in [init_frame(SID), result_for(2)] {
+                    gen3.line(&line).await;
+                }
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                host.eof().await;
+                assert_eq!(gen3.next_input().await, None);
+                gen3.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                assert!(notes(&host).contains(&note_continues("microvm-1")) && !notes(&host).iter().any(|n| n.contains("Claude account")), "{:?}", notes(&host));
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.len(), 1, "the move's one end row: {ends:?}");
+                let d = &ends[0]["detail"];
+                assert_eq!((d["outcome"].as_str(), d["gen"].as_str(), d["touchid"].as_str(), d["account"].as_str(), d.get("account_from")), (Some("done"), Some("3"), Some("asked"), Some("default"), None), "{d}");
+            });
         }
 
         /// §2.9: a moved CLI's cut or resume miss before its first init is
@@ -7093,7 +7640,7 @@ mod tests {
                     let mut gen3 = far(&hand).await;
                     assert!(matches!(hand.borrow().whys.last(), Some(StartWhy::Move(m)) if m.kind == MoveKind::Respawn && m.from_vm == "microvm-2" && m.outstanding.is_empty()), "{:?}", hand.borrow().whys);
                     if retry_vm == "microvm-2" {
-                        hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false });
+                        hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false, account: None, account_from: None });
                     } else {
                         moved_to(&hand, retry_vm, MoveKind::Readdress, "none");
                     }
@@ -7396,7 +7943,7 @@ mod tests {
                     let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
                     hand.borrow_mut().snap.vm = Some("microvm-1".into());
                     let paths = pump.sess.paths.clone();
-                    let old = |n: usize| registry::VmEntry { gen: 1, vm: format!("microvm-old-{n}"), spawn: None, from: "2026-10-01T00:00:00Z".into(), to: Some("2026-10-01T01:00:00Z".into()), why: "first".into(), end: Some("close".into()), pid: 1 };
+                    let old = |n: usize| registry::VmEntry { gen: 1, vm: format!("microvm-old-{n}"), spawn: None, from: "2026-10-01T00:00:00Z".into(), to: Some("2026-10-01T01:00:00Z".into()), why: "first".into(), end: Some("close".into()), pid: 1, tag: None, account: None };
                     let row = SessionRow {
                         v: registry::REGISTRY_SCHEMA_V,
                         session_id: SID.into(),
@@ -7517,6 +8064,7 @@ mod tests {
                     leaf: None,
                     fresh_chat: false,
                     init_answered: true,
+                    retry: false,
                 };
                 assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::Move(want)]);
                 assert_eq!(registry::read(&Paths::from_root_and_env(d.path().join("bridge"), None), SID).unwrap().map(|r| r.status).as_deref(), Some("migrating"));
@@ -7647,7 +8195,7 @@ mod tests {
                     assert_eq!(gen.next_input().await, None, "the old CLI's EOF");
                     gen.exit(0).await;
                     gen = far(&hand).await;
-                    hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Migrate, cut: "none", touchid: "cached", seed: "kept", stayed: true });
+                    hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Migrate, cut: "none", touchid: "cached", seed: "kept", stayed: true, account: None, account_from: None });
                     gen.started().await;
                     let init: Value = serde_json::from_str(&gen.next_input().await.expect("the replayed initialize")).unwrap();
                     gen.line(&answer(init["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
@@ -7979,7 +8527,7 @@ mod tests {
                 let whys = hand.borrow().whys.clone();
                 assert!(matches!(&whys[..], [StartWhy::First, StartWhy::Move(a), StartWhy::Move(b)] if a == b && b.kind == MoveKind::Migrate && b.from_vm == "microvm-1"), "{whys:?}");
                 hand.borrow_mut().snap.vm = Some("microvm-1".into());
-                hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Migrate, cut: "none", touchid: "asked", seed: "kept", stayed: true });
+                hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Migrate, cut: "none", touchid: "asked", seed: "kept", stayed: true, account: None, account_from: None });
                 gen3.started().await;
                 let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
                 gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;

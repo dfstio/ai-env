@@ -869,7 +869,7 @@ pub enum CredsCmd {
         #[arg(long)]
         clipboard_check: bool,
     },
-    /// Seal the Claude setup-token (what `claude setup-token` prints) into credentials/setup-token.env; asks for it hidden
+    /// Seal the active Claude account's setup-token anew (what `claude setup-token` prints, logged in as that account) into credentials/accounts/NAME.env and install it as credentials/setup-token.env (default with no account); asks for it hidden
     SetupToken {
         /// Read one line from stdin (a pipe; a terminal is refused) instead of asking
         #[arg(long, conflicts_with = "from_env")]
@@ -884,7 +884,7 @@ pub enum CredsCmd {
         #[arg(long)]
         force: bool,
     },
-    /// What is sealed under credentials/, without Touch ID (unless --unseal)
+    /// What is sealed under credentials/, the Claude accounts among it, without Touch ID (unless --unseal)
     Status {
         /// One JSON document
         #[arg(long)]
@@ -893,7 +893,7 @@ pub enum CredsCmd {
         #[arg(long)]
         unseal: bool,
     },
-    /// Delete the sealed setup-token, combined.env and their backups (a dry run without --yes); with --ops only credentials/ops.env and its backups
+    /// Delete the sealed setup-token, combined.env, every Claude account and their backups (a dry run without --yes); with --ops only credentials/ops.env and its backups
     Forget {
         /// Delete (default: list what would be deleted)
         #[arg(long)]
@@ -902,14 +902,90 @@ pub enum CredsCmd {
         #[arg(long)]
         ops: bool,
     },
+    /// Claude accounts, each a sealed setup-token: add, use, list, forget, check; the active one is what new chats, moves and credentialed commands use
+    Account {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+}
+
+/// `ai-env creds account …` (A1): several Claude accounts, one active.
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum AccountCmd {
+    /// Seal a Claude account's setup-token (what `claude setup-token` prints, logged in as that account) into credentials/accounts/NAME.env, and its combined.env (one Touch ID); asks for it hidden
+    Add {
+        /// The account's name: 1-32 of a-z 0-9 _ -, the first a letter or a digit
+        name: String,
+        /// Read one line from stdin (a pipe; a terminal is refused) instead of asking
+        #[arg(long, conflicts_with = "from_env")]
+        stdin: bool,
+        /// Read CLAUDE_CODE_OAUTH_TOKEN from the environment instead of asking
+        #[arg(long)]
+        from_env: bool,
+        /// Make it the active account too (a first account always is)
+        #[arg(long = "use")]
+        activate: bool,
+        /// Seal even when the keystore key has no recovery recipient
+        #[arg(long)]
+        force: bool,
+        /// A note kept with it (free text, 1-120 characters, never a credential), shown only by `creds account list` and `creds status`
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// Rename a Claude account (no Touch ID): its sealed files, its row, its usage and note, the active mark; the seal is unchanged
+    Rename {
+        /// The account's name now
+        old: String,
+        /// Its new name: 1-32 of a-z 0-9 _ -, the first a letter or a digit
+        new: String,
+    },
+    /// Set a Claude account's note, or clear it with no TEXT (no Touch ID): free text, 1-120 characters, never a credential; only `creds account list` and `creds status` show it
+    Note {
+        /// The account's name
+        name: String,
+        /// The note (omit to clear it)
+        text: Option<String>,
+    },
+    /// Make NAME the account every new chat, move and credentialed command uses (no Touch ID); running chats keep theirs until their next start
+    Use {
+        /// The account's name (ai-env creds account list names them)
+        name: String,
+    },
+    /// The Claude accounts, the active one marked: no Touch ID
+    List {
+        /// One JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete one account's sealed token, its combined.env and backups (dry run without --yes)
+    Forget {
+        /// The account's name
+        name: String,
+        /// Delete (default: list what would be deleted)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// One tiny turn per account on this Mac's claude (one Touch ID each): its 5-hour and weekly usage, with their reset times
+    Check {
+        /// The accounts to check (default: every one, the active one first)
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// One JSON document (with each run's rate_limit_event and result lines, scrubbed)
+        #[arg(long)]
+        json: bool,
+        /// The model of the turn
+        #[arg(long, value_name = "M", default_value = "haiku")]
+        model: String,
+    },
 }
 
 /// The parse checks of the S8 operators' creds commands (`aws-set --user`,
-/// `aws-verify`, `deployer-key`, `forget --ops`).
+/// `aws-verify`, `deployer-key`, `forget --ops`) and A1's `creds account`.
 #[cfg(all(test, feature = "bridge"))]
 #[allow(clippy::items_after_test_module)]
 mod creds_cmd_tests {
-    use super::{Cli, Cmd, CredsCmd};
+    use super::{AccountCmd, Cli, Cmd, CredsCmd};
     use clap::{CommandFactory as _, Parser as _};
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -943,7 +1019,53 @@ mod creds_cmd_tests {
         // Listed in `creds --help`, each with its one-line about.
         let mut cli = Cli::command();
         let help = cli.find_subcommand_mut("creds").expect("creds").render_help().to_string();
-        for sub in ["aws-set", "aws-verify", "deployer-key", "setup-token", "status", "forget"] {
+        for sub in ["aws-set", "aws-verify", "deployer-key", "setup-token", "status", "forget", "account"] {
+            assert!(help.contains(sub), "{sub}: {help}");
+        }
+    }
+
+    fn account(args: &[&str]) -> AccountCmd {
+        match creds(&[&["account"][..], args].concat()) {
+            CredsCmd::Account { cmd } => cmd,
+            _ => panic!("{args:?}: not creds account"),
+        }
+    }
+
+    /// A1: `creds account add|use|list|forget|check` parse with their
+    /// flags (`--use` is the add's `activate`; check's names are optional,
+    /// its model haiku by default), bad forms refuse, and `creds account
+    /// --help` lists the seven.
+    #[test]
+    fn the_account_commands_parse() {
+        let AccountCmd::Add { name, stdin: true, from_env: false, activate: true, force: false, note: None } = account(&["add", "work", "--stdin", "--use"]) else { panic!("add --stdin --use") };
+        assert_eq!(name, "work");
+        let AccountCmd::Add { stdin: false, from_env: true, activate: false, force: true, .. } = account(&["add", "spare", "--from-env", "--force"]) else { panic!("add --from-env --force") };
+        let AccountCmd::Add { note: Some(note), .. } = account(&["add", "spare", "--note", "second seat"]) else { panic!("add --note") };
+        assert_eq!(note, "second seat");
+        let AccountCmd::Rename { old, new } = account(&["rename", "default", "dfst"]) else { panic!("rename") };
+        assert_eq!((old.as_str(), new.as_str()), ("default", "dfst"));
+        let AccountCmd::Note { name, text: Some(text) } = account(&["note", "dfst", "mk's seat"]) else { panic!("note NAME TEXT") };
+        assert_eq!((name.as_str(), text.as_str()), ("dfst", "mk's seat"));
+        let AccountCmd::Note { text: None, .. } = account(&["note", "dfst"]) else { panic!("note NAME") };
+        assert!(parse(&["account", "rename", "default"]).is_err(), "rename needs NEW");
+        let AccountCmd::Use { name } = account(&["use", "spare"]) else { panic!("use") };
+        assert_eq!(name, "spare");
+        let AccountCmd::List { json: true } = account(&["list", "--json"]) else { panic!("list --json") };
+        let AccountCmd::List { json: false } = account(&["list"]) else { panic!("list") };
+        let AccountCmd::Forget { name, yes: true } = account(&["forget", "old", "--yes"]) else { panic!("forget --yes") };
+        assert_eq!(name, "old");
+        let AccountCmd::Forget { yes: false, .. } = account(&["forget", "old"]) else { panic!("forget") };
+        let AccountCmd::Check { names, json: false, model } = account(&["check"]) else { panic!("check") };
+        assert!(names.is_empty() && model == "haiku", "{names:?} {model}");
+        let AccountCmd::Check { names, json: true, model } = account(&["check", "work", "spare", "--json", "--model", "sonnet"]) else { panic!("check NAME… --json --model") };
+        assert_eq!((names, model.as_str()), (vec!["work".to_string(), "spare".to_string()], "sonnet"));
+        for bad in [&["account", "add"][..], &["account", "add", "w", "--stdin", "--from-env"], &["account", "use"], &["account", "use", "a", "b"], &["account", "forget"], &["account", "list", "x"], &["account", "check", "--model"], &["account"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let mut cli = Cli::command();
+        let creds = cli.find_subcommand_mut("creds").expect("creds");
+        let help = creds.find_subcommand_mut("account").expect("account").render_help().to_string();
+        for sub in ["add", "rename", "note", "use", "list", "forget", "check"] {
             assert!(help.contains(sub), "{sub}: {help}");
         }
     }
@@ -1346,6 +1468,7 @@ pub fn run(cli: Cli) -> Result<()> {
             CredsCmd::Status { json, unseal } => crate::bridge::setup_token::cmd_status(&store, json, unseal),
             CredsCmd::Forget { yes, ops: false } => crate::bridge::setup_token::cmd_forget(yes),
             CredsCmd::Forget { yes, ops: true } => crate::bridge::setup_token::cmd_forget_ops(yes),
+            CredsCmd::Account { cmd } => crate::bridge::accounts::cmd::main(&store, cmd),
         },
         #[cfg(feature = "bridge")]
         Cmd::Vm { cmd } => crate::bridge::vm::cmd::main(&store, cmd),

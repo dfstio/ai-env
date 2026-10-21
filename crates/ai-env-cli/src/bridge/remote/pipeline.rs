@@ -98,7 +98,27 @@
 //! `session_remote_start`, `session_remote_failed` (P1–P4's; P0's is the
 //! pump's), `vm_suspend` (by `close`), and `auth_timers_unmeasured` once per
 //! claude version ([`audit_auth_timers`], for the link's `Started`).
-use crate::bridge::agent::credential::{self, CredentialPlan, CredentialSupply};
+//!
+//! S10 addendum A1 (several Claude accounts, one installed): each
+//! generation runs on a seal of its own ([`Current::seal`],
+//! `PipelineEnd::seal`), re-planned from the installed copy wherever it
+//! may unseal or take the VM's cache (`credential::read_installed`): P1
+//! adopts a `combined.env` of another seal than P0 read, P3 reads the
+//! installed copy when no token is in hand, a move reads it before M1 (a
+//! failure there is exit 5 with no Touch ID), a migration's phase A too,
+//! whose seal its switch keeps ([`PreparedVm::seal`]), and the switch's
+//! fallback reads it again. A resume miss's retry keeps generation 1's
+//! seal (it never asks for Touch ID), and a cut miss's retry the move's
+//! while its VM's cache holds it and no refusal names it, the installed
+//! copy read or not (`MoveWhy::retry`). P0 refuses a tree whose accounts
+//! have none active (`Failure::NoAccount`), and a refused token's line
+//! (`Failure::NoToken`) is, with accounts, its account's refusal whole. A
+//! generation whose seal differs from the one it replaces is audited
+//! `session_account`, once its spawn went out; the account goes into
+//! `session_remote_start` and a move's `session_move_end` (`account`, and
+//! `account_from` when the account's name changed).
+use crate::bridge::accounts::{self, Seal};
+use crate::bridge::agent::credential::{self, CredentialPlan, CredentialSupply, InstalledSeal};
 use crate::bridge::agent::exec::{agent_env, spawn_env};
 use crate::bridge::agent::{run_spawn_with, AgentTarget, Delivery, DeliveryParts, DeliveryReport, SpawnIo, SpawnOutcome, SpawnSpec, Start};
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
@@ -261,7 +281,8 @@ pub struct SessionPlan {
 
 /// S10 §B: a migration's prepared VM ([`prepare_move`]): its row (its caps
 /// read) and info, how SELECT_VM took it, since when it is held, and whether
-/// the switch took it (no release at `MOVE_HOLD` then).
+/// the switch took it (no release at `MOVE_HOLD` then); A1: the seal phase
+/// A delivered into its cache, which the switch keeps.
 #[derive(Debug, Clone)]
 struct PreparedVm {
     row: VmRow,
@@ -269,6 +290,7 @@ struct PreparedVm {
     how: &'static str,
     at: Instant,
     switching: bool,
+    seal: Seal,
 }
 
 /// S10: what a generation's pipeline leaves to run once its spawn started
@@ -288,7 +310,9 @@ impl std::fmt::Debug for AfterStarted {
 /// generation that reaches its spawn (generation 1's `onwards`, a resume
 /// miss's `retry`, a move's `move_gen`), so a retry and a move start from the
 /// VM the chat runs on now. The runtime key's backend, P1's, stays shared by
-/// every generation: no AWS call asks a Touch ID (D1).
+/// every generation: no AWS call asks a Touch ID (D1). A1: the seal the
+/// generation runs on (what a retry keeps, what a move's seal is compared
+/// with).
 #[derive(Clone)]
 struct Current {
     backend: Rc<Backend>,
@@ -297,6 +321,7 @@ struct Current {
     how: &'static str,
     seed: &'static str,
     seeded_head: Option<String>,
+    seal: Seal,
 }
 
 impl SessionPlan {
@@ -404,6 +429,20 @@ impl SessionPlan {
         self.release_prepared();
     }
 
+    /// A1: `session_account` when a generation (`gen`, of `kind`: `first`,
+    /// or a move's) runs on another seal than the one it replaces (`from`,
+    /// `to`): the accounts (`-` when not known) and their seal ids; nothing
+    /// when the seal is the same.
+    fn note_account(&self, session: Option<&str>, gen: u32, kind: &str, from: &Seal, to: &Seal) {
+        if from.tag == to.tag {
+            return;
+        }
+        let name = |s: &Seal| s.account.clone().unwrap_or_else(|| "-".to_string());
+        let pairs = [("session", session.unwrap_or("-").to_string()), ("gen", gen.to_string()), ("kind", kind.to_string()), ("from", name(from)), ("from_tag", from.tag.clone()), ("to", name(to)), ("to_tag", to.tag.clone())];
+        tracing::info!(gen, kind, from = %pairs[3].1, to = %pairs[5].1, "the generation runs as another Claude account");
+        audit_event(&self.paths, event::SESSION_ACCOUNT, &pairs);
+    }
+
     /// A plan for a workspace at `/w`, its paths under `root` (tests).
     #[cfg(test)]
     pub(crate) fn sample(root: &std::path::Path) -> SessionPlan {
@@ -457,7 +496,7 @@ impl SessionPlan {
             capture_settings: true,
             knobs: VmKnobs::default(),
             run,
-            token: CredentialPlan { deliver: Deliver::Fd, file: None, tag: "0".repeat(16) },
+            token: CredentialPlan { deliver: Deliver::Fd, file: None, tag: "0".repeat(16), account: None },
             store: Keystore::resolve(Some(root.join("keys"))).expect("a keystore root"),
             window_from: std::time::Instant::now(),
             active: RefCell::new(None),
@@ -541,6 +580,10 @@ pub struct PipelineEnd {
     pub moved: Option<MoveDone>,
     /// S10: what runs once the spawn started ([`AfterStarted`]); `None`: nothing.
     pub after_started: Option<AfterStarted>,
+    /// A1: the seal the generation's token is of, and its account (the
+    /// link's `RemoteSnapshot.seal`, which the usage tap and a refusal read);
+    /// `None`: no delivery (a test's own pipeline).
+    pub seal: Option<Seal>,
 }
 
 /// What the moved CLI resumes (S10 L2).
@@ -769,8 +812,12 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     run.workspace_cap = true;
     // S9: a VM without the transcript store is never reused (its chat lives in S3).
     run.transcript_cap = true;
+    // A1: accounts exist and none is installed: no account to spawn as (exit 5, its own fix).
+    if let Some(why) = accounts::spawn_problem(&ctx.paths) {
+        return Err(Failure::NoAccount { why });
+    }
     let token = sealed_token_plan(&ctx).map_err(|e| match e {
-        CliError::AuthUnavailable(why) => Failure::NoToken { why },
+        CliError::AuthUnavailable(why) => no_token(&ctx.paths, why),
         other => config(&other),
     })?;
     runtime_key_sealed(&ctx)?;
@@ -1128,6 +1175,7 @@ async fn hold_active_at_start(plan: &SessionPlan) {
 
 /// A generation's failure: the step it stopped at, what Cursor is shown,
 /// the VM once SELECT_VM chose one.
+#[derive(Clone)]
 struct Failed {
     step: StartStep,
     failure: Failure,
@@ -1146,6 +1194,31 @@ fn failed(step: StartStep, e: BridgeError, vm: Option<&str>) -> Failed {
 
 fn failed_cli(step: StartStep, e: CliError, vm: Option<&str>) -> Failed {
     failed(step, BridgeError::Cli(e), vm)
+}
+
+/// A1: a re-plan's read of the installed copy that failed (a move's before
+/// M1, a migration's phase A, a switch's fallback), before any Touch ID, as
+/// P0 says it: no Claude account active (`Failure::NoAccount`), else the
+/// token's own refusal (absent, not sealed, refused: [`no_token`]), exit 5;
+/// anything else as any error at the Touch ID's step.
+fn installed_failed(paths: &Paths, e: CliError) -> Failed {
+    let failure = match (accounts::spawn_problem(paths), e) {
+        (Some(why), _) => Failure::NoAccount { why },
+        (None, CliError::AuthUnavailable(why)) => no_token(paths, why),
+        (None, other) => return failed_cli(StartStep::TouchId, other, None),
+    };
+    Failed { step: StartStep::TouchId, failure, vm: None }
+}
+
+/// A1: `Failure::NoToken` of `why`, what kept the installed copy from a
+/// spawn (absent, not sealed, refused) at P0 or a re-plan. With Claude
+/// accounts (or a store of them that cannot be read) `why` names its own
+/// fix (`credential::refuse_rejected`'s account texts: seal the account
+/// anew, use another, repair the store), which Cursor's line keeps whole;
+/// in a tree with no account, today's line.
+fn no_token(paths: &Paths, why: String) -> Failure {
+    // `accounts::label` names a seal, any (this empty one too: `unknown`), unless no account exists.
+    Failure::NoToken { why, accounts: accounts::label(paths, "").is_some() }
 }
 
 /// The seconds an unseal's deadline names (`no Touch ID within N s, …`).
@@ -1398,7 +1471,7 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
     api: Arc<A>,
     ep: Arc<E>,
     backend: Rc<Backend>,
-    token: Option<(crate::bridge::setup_token::SetupToken, String)>,
+    token: Option<(crate::bridge::setup_token::SetupToken, Seal)>,
     prepared: PreparedSeed,
     mut legs: Vec<(&'static str, u64)>,
     io: SpawnIo,
@@ -1480,18 +1553,22 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
     reap(plan, ctx, &*api, &*ep, &row, &vm, plan.resume.as_deref()).await?;
     let seed = outcome.word();
     let seeded_head = seeded_head(&outcome);
-    let current = Current { backend, row: row.clone(), vm: vm.clone(), how, seed, seeded_head: seeded_head.clone() };
+    // A1: generation 1's seal is the one P1 or P3 delivered (a switch since P0 read its own is audited once the
+    // spawn went out, as a move's).
+    let seal = prepared.seal.clone();
+    let current = Current { backend, row: row.clone(), vm: vm.clone(), how, seed, seeded_head: seeded_head.clone(), seal: seal.clone() };
     // The code-out trigger's code-port tokens are the session's 5 minutes, never the seed's 15 (plan §10).
     let code_tokens = Arc::new(MintingTokens::new(Arc::clone(&api), &ctx.paths, &vm.id, false));
     let why = plan.carry.as_ref().map_or_else(|| "first".to_string(), carry_why);
-    let spawning = Spawning { argv: plan.argv.clone(), session: plan.resume.clone(), why };
+    let spawning = Spawning { argv: plan.argv.clone(), session: plan.resume.clone(), why, account: seal.account.clone() };
     let end = spawn(plan, gen, ctx, Arc::clone(&api), Arc::clone(&ep), dp, code_tokens, target, row, vm, prepared.delivery, io, progress, spawning).await?;
+    plan.note_account(plan.resume.as_deref(), gen, "first", &plan.token.seal(), &seal);
     *plan.current.borrow_mut() = Some(current);
     let transcript = transcript.map(|o| o.word());
     if let Some(c) = &plan.carry {
         // S10 §2.7: the carry's end, beside its `session_remote_start`.
         let (kind, _) = carry_words(c);
-        let row = MoveEndRow { session: plan.resume.as_deref(), gen, kind: Some(kind), outcome: "done", from_vm: &c.from_vm, to_vm: Some(&end.vm), how: Some(how), seed: Some(source), transcript, cut: Some(Cut::None.word()), touchid: Some("asked"), ms: ms(plan.t0), ..MoveEndRow::default() };
+        let row = MoveEndRow { session: plan.resume.as_deref(), gen, kind: Some(kind), outcome: "done", from_vm: &c.from_vm, to_vm: Some(&end.vm), how: Some(how), seed: Some(source), transcript, cut: Some(Cut::None.word()), touchid: Some("asked"), ms: ms(plan.t0), account: seal.account.as_deref(), ..MoveEndRow::default() };
         row.audit(&plan.paths);
     }
     // Once the spawn runs: generation 1's gc reconcile (L12), and the end of a VM a reopen carried the chat off near its wall.
@@ -1524,6 +1601,7 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
         carried: plan.carry.clone(),
         moved: None,
         after_started: Some(AfterStarted(Box::pin(after))),
+        seal: Some(seal),
     })
 }
 
@@ -1531,7 +1609,8 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
 /// (generation 1's), running again if a closing suspend raced it; the
 /// transcript restored; the gate again with no prompt; the token from the
 /// VM's cache (no value in hand: a VM that lost it is exit 5, never a second
-/// Touch ID); the spawn with P0's argv.
+/// Touch ID), under generation 1's seal (A1: `current.seal`, whatever is
+/// installed now); the spawn with P0's argv.
 #[allow(clippy::too_many_arguments)]
 async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(plan: &Rc<SessionPlan>, gen: u32, api: Arc<A>, ep: Arc<E>, current: Current, session_id: &str, io: SpawnIo, progress: &Progress) -> Result<PipelineEnd, Failed> {
     let ctx = plan.ctx();
@@ -1555,17 +1634,34 @@ async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     progress.at(StartStep::Gate);
     let t = Instant::now();
     let pass = credential::gate(&ctx.cfg, &ctx.paths, &*api, &current.row, &vm).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
-    let parts = DeliveryParts { name: crate::bridge::setup_token::TOKEN_VAR.to_string(), tag: plan.token.tag.clone(), deliver: plan.token.deliver, secret: None, one_shot: false };
-    let delivery = Delivery::new(&pass, &vm.id, crate::wire::time::unix_now(), parts).map_err(|e| failed(StartStep::Gate, e, at))?;
+    let parts = DeliveryParts { name: crate::bridge::setup_token::TOKEN_VAR.to_string(), tag: current.seal.tag.clone(), deliver: plan.token.deliver, secret: None, one_shot: false };
+    let delivery = Delivery::new(&pass, &vm.id, crate::wire::time::unix_now(), parts).map_err(|e| failed(StartStep::Gate, e, at))?.with_account(current.seal.account.clone());
     // This generation's token is the VM's own copy: the census says so, not generation 1's source.
     plan.credential.set(Some(credential::CACHED));
     legs.push(("gate", ms(t)));
     progress.gate_done.set(true);
-    let spawning = Spawning { argv: plan.argv.clone(), session: plan.resume.clone(), why: "retry".to_string() };
+    let spawning = Spawning { argv: plan.argv.clone(), session: plan.resume.clone(), why: "retry".to_string(), account: current.seal.account.clone() };
     let end = spawn(plan, gen, &ctx, api, ep, dp, tokens, target, current.row.clone(), vm.clone(), delivery, io, progress, spawning).await?;
-    let (how, seed, seeded_head) = (current.how, current.seed, current.seeded_head.clone());
+    let (how, seed, seeded_head, seal) = (current.how, current.seed, current.seeded_head.clone(), current.seal.clone());
     *plan.current.borrow_mut() = Some(Current { vm, ..current });
-    Ok(PipelineEnd { vm: end.vm, vm_how: how, legs, seed, transcript: Some(transcript.word()), seeded_head, credential: plan.credential.get(), delivery: Some(end.delivery), spawn_id: end.spawn_id, started_by: None, trigger: end.trigger, session: end.session, carried: None, moved: None, after_started: None })
+    Ok(PipelineEnd {
+        vm: end.vm,
+        vm_how: how,
+        legs,
+        seed,
+        transcript: Some(transcript.word()),
+        seeded_head,
+        credential: plan.credential.get(),
+        delivery: Some(end.delivery),
+        spawn_id: end.spawn_id,
+        started_by: None,
+        trigger: end.trigger,
+        session: end.session,
+        carried: None,
+        moved: None,
+        after_started: None,
+        seal: Some(seal),
+    })
 }
 
 /// `id` RUNNING: as GetMicrovm finds it, waited for while PENDING, resumed
@@ -1672,11 +1768,13 @@ struct Spawned {
 
 /// What a generation spawns (S10: its argv is its own): the CLI's argv,
 /// the session id its code-out trigger is named at once (a `--resume`'s,
-/// a move's), and the `vms[]` why `session_remote_start` records.
+/// a move's), the `vms[]` why `session_remote_start` records, and (A1) the
+/// Claude account it runs as, which that row names when known.
 struct Spawning {
     argv: Vec<String>,
     session: Option<String>,
     why: String,
+    account: Option<String>,
 }
 
 /// P4: the spawn (its id named now, the workspace's VM path as cwd, the
@@ -1706,7 +1804,7 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     // What the session task builds again: refused here, before anything is spawned.
     agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Spawn, e, at))?;
     let spawn_id = SpawnId::new_v7();
-    let Spawning { argv, session: session_id, why } = spawning;
+    let Spawning { argv, session: session_id, why, account } = spawning;
     let spec = spawn_spec(plan, ctx, &row, &spawn_id, argv);
     let transcript = session_sync(plan);
     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::clone(&api), dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: plan.capture_settings, transcript });
@@ -1724,7 +1822,9 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
             spawned_on.push(id.clone());
         }
     }
-    audit_event(&plan.paths, event::SESSION_REMOTE_START, &[("id", id.clone()), ("spawn", spawn_id.to_string()), ("gen", gen.to_string()), ("why", why)]);
+    let mut pairs = vec![("id", id.clone()), ("spawn", spawn_id.to_string()), ("gen", gen.to_string()), ("why", why)];
+    pairs.extend(account.map(|a| ("account", a)));
+    audit_event(&plan.paths, event::SESSION_REMOTE_START, &pairs);
     tracing::info!(gen, vm = %id, spawn = %spawn_id, "the remote spawn went to its session");
     Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report })
 }
@@ -1769,14 +1869,17 @@ fn scaled(ctx: &Ctx, d: Duration) -> Duration {
 /// running, whose gapped spawn did not stop, or of a fresh chat, runs as a
 /// `Readdress`), the VM and its row (its caps read), how it was taken
 /// (`started`, `reused`, `resumed`), and the token when M1 asked its Touch ID
-/// (`touchid` `asked`; `cached`: the VM's cache holds the seal).
+/// (`touchid` `asked`; `cached`: the VM's cache holds the seal); A1: the
+/// seal the move runs on (the installed copy it read before M1), of which
+/// the token is.
 struct MoveVm {
     kind: MoveKind,
     row: VmRow,
     vm: VmInfo,
     how: &'static str,
-    token: Option<(SetupToken, String)>,
+    token: Option<SetupToken>,
     touchid: &'static str,
+    seal: Seal,
 }
 
 /// A move's generation (S10 §2.7), beside `retry`: M1 ([`move_vm`]: the
@@ -1792,7 +1895,15 @@ struct MoveVm {
 /// client token covers its ambiguous retry). `until`: the move's deadline
 /// (its `MOVE_WINDOW`, or T0 + 50 s while the host's `initialize` is
 /// unanswered). M3 runs the reaper first ([`reap`]). A migration's switch
-/// is [`switch_gen`].
+/// is [`switch_gen`]. A1: before M1 the move reads the installed copy
+/// (`credential::read_installed`: the active account now; a failure is exit
+/// 5 with no Touch ID), whose seal M1 checks the VM's cache for and whose
+/// bytes its Touch ID unseals: a `creds account use` since the chat's last
+/// spawn takes effect here (`session_account`, `MoveDone::account_from`),
+/// but for a cut miss's retry, which keeps its move's seal while the VM
+/// holds it and no refusal names it, the installed copy read or not (an
+/// account forgotten since): only when it keeps none does the read's
+/// failure end it ([`move_vm`]).
 #[allow(clippy::too_many_arguments)]
 async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(
     plan: &Rc<SessionPlan>,
@@ -1810,10 +1921,19 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
     }
     let ctx = plan.ctx();
     let t = Instant::now();
+    // A1: the move's account, read before anything is asked (the active one now). A cut miss's retry goes on when
+    // the read fails: M1 keeps its move's seal if it can, and ends with the read's failure if not.
+    let installed = credential::read_installed(&ctx.paths).map_err(|e| installed_failed(&ctx.paths, e));
+    let installed = if why.retry { installed } else { Ok(installed?) };
     // The credential's budgets end by the move's deadline, on the clock the unseal measures it with.
     let until_std = until.into_std();
-    let unseal = || credential::unseal_for_move(&plan.store, &ctx, &plan.token, until_std);
-    let MoveVm { kind, row, vm, how, token, touchid } = move_vm(plan, &ctx, &*api, &*ep, &current, why, gen, progress, unseal).await?;
+    let (store, cx) = (&plan.store, &ctx);
+    let unseal = || {
+        // Never `Err`: M1 asks the Touch ID only with the installed copy read.
+        let read = installed.as_ref().map_err(|_| CliError::Msg("internal: the move's Touch ID was asked with no installed copy read".into()));
+        async move { credential::unseal_for_move(store, cx, read?, until_std).await }
+    };
+    let MoveVm { kind, row, vm, how, token, touchid, seal } = move_vm(plan, &ctx, &*api, &*ep, &current, why, gen, progress, installed.as_ref().map(|i| &i.seal), unseal).await?;
     let mut legs = vec![("select", ms(t))];
     let at = Some(vm.id.as_str());
     // M2: the carry seed, the restore then the cut, the gate.
@@ -1856,7 +1976,7 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
         Ok::<_, Failed>(both)
     };
     let credential_branch = async {
-        let prepared = credential::move_delivery(&ctx, &*api, &*ep, &row, &vm, &plan.token, token, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
+        let prepared = credential::move_delivery(&ctx, &*api, &*ep, &row, &vm, plan.token.deliver, &seal, token, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
         progress.gate_done.set(true);
         Ok::<_, Failed>(prepared)
     };
@@ -1873,10 +1993,11 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
     argv_fits(&argv).and_then(|()| spawn_frame_fits(&ctx, &argv, &plan.ws, &plan.env)).map_err(|failure| Failed { step: StartStep::Spawn, failure, vm: at.map(str::to_string) })?;
     tracing::info!(gen, kind = kind.word(), vm = %vm.id, cut = cut.word(), touchid, seed = source, "the move spawns");
     let code_tokens = Arc::new(MintingTokens::new(Arc::clone(&api), &ctx.paths, &vm.id, false));
-    let spawning = Spawning { argv, session: why.session_id.clone(), why: MoveWhy { kind, ..why.clone() }.vms_why() };
+    let spawning = Spawning { argv, session: why.session_id.clone(), why: MoveWhy { kind, ..why.clone() }.vms_why(), account: seal.account.clone() };
     let end = spawn(plan, gen, &ctx, api, ep, dp, code_tokens, target, row.clone(), vm.clone(), prepared.delivery, io, progress, spawning).await?;
-    *plan.current.borrow_mut() = Some(Current { backend: current.backend, row, vm, how, seed, seeded_head: seeded_head.clone() });
-    let moved = MoveDone { kind, cut: cut.word(), touchid, seed: source, stayed: false };
+    plan.note_account(why.session_id.as_deref(), gen, kind.word(), &current.seal, &seal);
+    let moved = MoveDone { kind, cut: cut.word(), touchid, seed: source, stayed: false, account: seal.account.clone(), account_from: account_from(&current.seal, &seal) };
+    *plan.current.borrow_mut() = Some(Current { backend: current.backend, row, vm, how, seed, seeded_head: seeded_head.clone(), seal: seal.clone() });
     Ok(PipelineEnd {
         vm: end.vm,
         vm_how: how,
@@ -1893,7 +2014,19 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
         carried: None,
         moved: Some(moved),
         after_started: None,
+        seal: Some(seal),
     })
+}
+
+/// A1: the account a generation ran as before (`from`), when it runs on
+/// another seal now (`to`) under another account's name, both known: a
+/// move's `MoveDone::account_from`. A new seal of the same account (`creds
+/// setup-token` re-sealed it) is no change, nor is one whose side reads
+/// `unknown` (which account that is, is not known); `session_account`
+/// still records the seal's change.
+fn account_from(from: &Seal, to: &Seal) -> Option<String> {
+    let known = |s: &Seal| s.account.clone().filter(|a| a != accounts::UNKNOWN);
+    known(from).filter(|a| from.tag != to.tag && known(to).is_some_and(|t| t != *a))
 }
 
 /// M1 of a move (S10 §2.7, §2.8): the VM it runs on, and its Touch ID.
@@ -1927,14 +2060,22 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
 /// unreachable one, once its terminate answered, so it no longer counts
 /// against `[vm].max_concurrent`), then the VM's caps. The first error ends
 /// the others (a dismissed dialog, a refused select); audited `vm_select`
-/// with the generation and the VMs avoided (comma-separated).
+/// with the generation and the VMs avoided (comma-separated). A1: `seal` is
+/// the move's (the installed copy `move_gen` read), whose seal the respawn
+/// looks for in the VM's cache, and whose bytes `unseal` decrypts. A cut
+/// miss's retry (`MoveWhy::retry`) is the same move again: its respawn
+/// looks for the seal that move ran on (`current.seal`) first, and keeps
+/// it when the VM holds it and no refusal names it (no Touch ID); else, as
+/// any move, `seal`. `seal` is `Err` for such a retry only, when the read
+/// failed (no account active, its seal refused): with no seal kept, that
+/// failure ends M1, before any Touch ID or SELECT_VM.
 #[allow(clippy::too_many_arguments)]
-async fn move_vm<A, E, U, Uf>(plan: &SessionPlan, ctx: &Ctx, api: &A, ep: &E, current: &Current, why: &MoveWhy, gen: u32, progress: &Progress, unseal: U) -> Result<MoveVm, Failed>
+async fn move_vm<A, E, U, Uf>(plan: &SessionPlan, ctx: &Ctx, api: &A, ep: &E, current: &Current, why: &MoveWhy, gen: u32, progress: &Progress, seal: Result<&Seal, &Failed>, unseal: U) -> Result<MoveVm, Failed>
 where
     A: MicrovmApi + crate::bridge::s3::S3Sign,
     E: EndpointClient,
     U: FnOnce() -> Uf,
-    Uf: std::future::Future<Output = crate::errors::Result<(SetupToken, String)>>,
+    Uf: std::future::Future<Output = crate::errors::Result<SetupToken>>,
 {
     let old = current.vm.id.clone();
     let mut kind = why.kind;
@@ -1964,7 +2105,15 @@ where
                 if stopped {
                     let how = if resumed { "resumed" } else { "reused" };
                     audit_event(&plan.paths, event::VM_SELECT, &[("id", vm.id.clone()), ("how", how.to_string()), ("choice", "respawn".to_string()), ("ms", ms(t).to_string()), ("gen", gen.to_string())]);
-                    let (token, touchid) = if credential::cached_on_vm(&ctx.paths, api, ep, &current.row, &vm, &plan.token.tag).await {
+                    // A1: a cut miss's retry keeps the seal its move ran on while the VM holds it and no refusal names it
+                    // (an unreadable refusal record counts as one), whatever is installed now, if anything.
+                    let kept = why.retry
+                        && !seal.is_ok_and(|s| s.tag == current.seal.tag)
+                        && matches!(credential::read_rejection(&ctx.paths, &current.seal.tag), Ok(None))
+                        && credential::cached_on_vm(&ctx.paths, api, ep, &current.row, &vm, &current.seal.tag).await;
+                    // Else the installed copy's, or, unread, as that read failed: before any Touch ID.
+                    let seal = if kept { &current.seal } else { seal.map_err(Failed::clone)? };
+                    let (token, touchid) = if kept || credential::cached_on_vm(&ctx.paths, api, ep, &current.row, &vm, &seal.tag).await {
                         (None, credential::CACHED)
                     } else {
                         progress.at(StartStep::TouchId);
@@ -1974,7 +2123,7 @@ where
                     };
                     progress.touchid.set(Some(touchid));
                     let row = vm_registry::read_row(&ctx.paths, &old).ok().flatten().unwrap_or_else(|| current.row.clone());
-                    return Ok(MoveVm { kind, row, vm, how, token, touchid });
+                    return Ok(MoveVm { kind, row, vm, how, token, touchid, seal: seal.clone() });
                 }
                 tracing::info!(vm = %old, "the gapped spawn did not stop: the respawn moves as a re-address");
             }
@@ -1987,6 +2136,8 @@ where
         // S10 §B: the chat leaves its VM: a pending migration ends now, its dialog before this move's own.
         plan.abandon_phase_a();
     }
+    // A1: a cut miss's retry with the installed copy unread and no seal kept on its VM ends as that read failed.
+    let seal = seal.map_err(Failed::clone)?;
     progress.kind.set(Some(kind));
     if let Choice::Pin(id) = &plan.run.choice {
         // AI_ENV_BRIDGE_VM: that VM or nothing, never a new one.
@@ -2099,7 +2250,7 @@ where
         Ok::<_, Failed>((row, vm, how))
     };
     let (token, (), (row, vm, how)) = tokio::try_join!(touch, old_vm, new_vm)?;
-    Ok(MoveVm { kind, row, vm, how, token: Some(token), touchid: "asked" })
+    Ok(MoveVm { kind, row, vm, how, token: Some(token), touchid: "asked", seal: seal.clone() })
 }
 
 /// M1's end of the chat's spawn on its old VM, running (`agent::stop_spawn`
@@ -2245,7 +2396,7 @@ mod c1_tests {
     /// A move of `kind` for `cause` off `from_vm`: the session [`SID`], its
     /// outstanding lines `outstanding`, the host's `initialize` answered.
     fn why(kind: MoveKind, cause: LossCause, from_vm: &str, outstanding: &[&str]) -> MoveWhy {
-        MoveWhy { kind, cause: Some(cause), trigger: None, from_vm: from_vm.into(), from_spawn: None, session_id: Some(SID.into()), outstanding: strings(outstanding), leaf: None, fresh_chat: false, init_answered: true }
+        MoveWhy { kind, cause: Some(cause), trigger: None, from_vm: from_vm.into(), from_spawn: None, session_id: Some(SID.into()), outstanding: strings(outstanding), leaf: None, fresh_chat: false, init_answered: true, retry: false }
     }
 
     /// The moved argv by the cut, every resume flag of P0's gone (each form,
@@ -2375,7 +2526,9 @@ mod c1_tests {
         let vm = api.with(|s| s.run(&spec)).unwrap();
         assert_eq!(vm.state, VmState::Pending);
         let row = VmRow { id: vm.id.clone(), status: RowStatus::Pending, client_token: spec.client_token.clone(), egress: "vpc".into(), ..VmRow::default() };
-        *plan.current.borrow_mut() = Some(Current { backend: Rc::new(Backend::Fake(api)), row, vm: vm.clone(), how: "started", seed: "cloned", seeded_head: None });
+        // A1: the move reads the installed copy before M1.
+        let seal = installed(&plan).seal;
+        *plan.current.borrow_mut() = Some(Current { backend: Rc::new(Backend::Fake(api)), row, vm: vm.clone(), how: "started", seed: "cloned", seeded_head: None, seal });
         let paths = plan.paths.clone();
         let (io, _consumer) = crate::bridge::agent::spawn_channels(1);
         let start = Instant::now();
@@ -2439,32 +2592,41 @@ mod c1_tests {
     }
 
     /// What the generation before the move left: `row` and `vm`, its
-    /// backend a file fake that M1 never calls (M1 takes the API it is given).
+    /// backend a file fake that M1 never calls (M1 takes the API it is given),
+    /// its seal P0's.
     fn current_on(dir: &Path, row: VmRow, vm: VmInfo) -> Current {
         let path = dir.join("backend.json");
         std::fs::write(&path, serde_json::to_string(&FakeState::new()).unwrap()).unwrap();
         let backend = Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap());
-        Current { backend: Rc::new(backend), row, vm, how: "started", seed: "cloned", seeded_head: None }
+        Current { backend: Rc::new(backend), row, vm, how: "started", seed: "cloned", seeded_head: None, seal: Seal { tag: "0".repeat(16), account: None } }
     }
 
-    /// A setup-token built at run time (no credential-shaped literal), sealed as `tag`.
-    fn unsealed(tag: &str) -> (SetupToken, String) {
-        (crate::bridge::setup_token::parse_token(&"t".repeat(40)).unwrap(), tag.to_string())
+    /// A setup-token built at run time (no credential-shaped literal).
+    fn unsealed() -> SetupToken {
+        crate::bridge::setup_token::parse_token(&"t".repeat(40)).unwrap()
+    }
+
+    /// A sealed setup-token (a container of an age-shaped blob: what is
+    /// sealed, never a value) installed under the plan's paths, as a move's
+    /// re-plan reads it.
+    fn installed(plan: &SessionPlan) -> InstalledSeal {
+        std::fs::create_dir_all(plan.paths.credentials()).unwrap();
+        std::fs::write(plan.paths.setup_token_env(), crate::container::write(b"age-encryption.org/v1\n-> x token\n--- y\n")).unwrap();
+        credential::read_installed(&plan.paths).expect("the installed copy")
     }
 
     /// M1 with a counting stand-in for `credential::unseal_for_move`: what it
     /// chose, how many Touch IDs it asked, and how many RunMicrovm calls the
-    /// fake had taken when the Touch ID was asked.
+    /// fake had taken when the Touch ID was asked. The move's seal is P0's.
     async fn m1<E: EndpointClient>(plan: &SessionPlan, api: &FakeMicrovmApi, ep: &E, current: &Current, why: &MoveWhy) -> (Result<MoveVm, Failed>, usize, Option<usize>) {
         let asked = Cell::new(0);
         let runs_then = Cell::new(None);
-        let tag = plan.token.tag.clone();
         let ctx = plan.ctx();
         let progress = Progress::default();
-        let moved = move_vm(plan, &ctx, api, ep, current, why, 2, &progress, || {
+        let moved = move_vm(plan, &ctx, api, ep, current, why, 2, &progress, Ok(&plan.token.seal()), || {
             asked.set(asked.get() + 1);
             runs_then.set(Some(runs(api)));
-            async move { Ok::<_, CliError>(unsealed(&tag)) }
+            async move { Ok::<_, CliError>(unsealed()) }
         })
         .await;
         (moved, asked.get(), runs_then.get())
@@ -2593,20 +2755,19 @@ mod c1_tests {
             });
             held_rx.await.expect("phase A holds its turn");
             plan.hold_phase_a(phase_a.abort_handle());
-            *plan.prepared.borrow_mut() = Some(PreparedVm { row: row.clone(), vm: vm.clone(), how: "started", at: Instant::now(), switching: false });
+            *plan.prepared.borrow_mut() = Some(PreparedVm { row: row.clone(), vm: vm.clone(), how: "started", at: Instant::now(), switching: false, seal: plan.token.seal() });
             let asked = Cell::new(0);
-            let tag = plan.token.tag.clone();
             let ctx = plan.ctx();
             let progress = Progress::default();
             let w = MoveWhy { fresh_chat: fresh, ..why(MoveKind::Respawn, LossCause::SpawnGone, &vm.id, &["u1"]) };
             let p = &plan;
-            let moved = move_vm(&plan, &ctx, &api, &api, &current, &w, 2, &progress, || {
+            let moved = move_vm(&plan, &ctx, &api, &api, &current, &w, 2, &progress, Ok(&plan.token.seal()), || {
                 asked.set(asked.get() + 1);
                 async move {
                     assert!(p.prepared.borrow().is_none(), "{case}: the prepared VM let go before the move's Touch ID");
                     let turn = credential::unseal_lock(&p.paths, Duration::from_secs(1)).await;
                     assert!(turn.is_ok(), "{case}: phase A's dialog let its turn go: {:?}", turn.err());
-                    Ok::<_, CliError>(unsealed(&tag))
+                    Ok::<_, CliError>(unsealed())
                 }
             })
             .await;
@@ -2667,6 +2828,224 @@ mod c1_tests {
             let s = selects(&plan);
             assert_eq!((s.len(), s[0]["choice"].as_str(), s[0]["gen"].as_str()), (1, Some("respawn"), Some("2")), "{s:?}");
         }
+    }
+
+    /// A1: a respawn after a `creds account use` re-plans: M1 looks for the
+    /// move's seal (the installed copy's, here work's) in the VM's cache,
+    /// never the one the chat ran on. Held there (another chat of the VM
+    /// got it, or a `vm warm`), no Touch ID; the cache holding the old seal
+    /// is a miss, and the one Touch ID is for the new seal's bytes. Either
+    /// way the move runs on the new seal.
+    #[tokio::test]
+    async fn a_respawn_after_a_switch_takes_the_new_seal_cached_or_with_one_touch_id() {
+        let work = Seal { tag: "b".repeat(16), account: Some("work".into()) };
+        for (held, want) in [(work.tag.clone(), (credential::CACHED, 0)), ("0".repeat(16), ("asked", 1))] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = plan_in(dir.path());
+            let api = fake();
+            let (row, vm) = chat_vm(&plan, &api).await;
+            let current = current_on(dir.path(), row, vm.clone());
+            assert_ne!(current.seal, work, "the chat ran on another seal");
+            let ep = Cache { fake: &api, tag: Some(held.clone()) };
+            let asked = Cell::new(0);
+            let (ctx, progress) = (plan.ctx(), Progress::default());
+            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why(MoveKind::Respawn, LossCause::SpawnGone, &vm.id, &["u1"]), 2, &progress, Ok(&work), || {
+                asked.set(asked.get() + 1);
+                async move { Ok::<_, CliError>(unsealed()) }
+            })
+            .await
+            .unwrap_or_else(|f| panic!("{held}: {:?}", f.failure));
+            assert_eq!((moved.touchid, asked.get()), want, "the cache holds {held}");
+            assert_eq!((moved.kind, moved.vm.id.as_str(), &moved.seal, moved.token.is_some()), (MoveKind::Respawn, vm.id.as_str(), &work, want.1 == 1));
+        }
+    }
+
+    /// A1: a cut miss's retry (`MoveWhy::retry`) is its move again: while
+    /// the VM's cache holds the seal that move ran on, it keeps that seal
+    /// with no Touch ID, whatever is installed now; a cache holding the
+    /// installed seal gives that one, still with none; one holding neither
+    /// is a miss, and the one Touch ID is for the installed seal, as any
+    /// move's.
+    #[tokio::test]
+    async fn a_cut_miss_retry_keeps_its_moves_seal_while_the_vm_holds_it() {
+        let work = Seal { tag: "b".repeat(16), account: Some("work".into()) };
+        for (held, keeps, want) in [("0".repeat(16), true, (credential::CACHED, 0)), (work.tag.clone(), false, (credential::CACHED, 0)), ("c".repeat(16), false, ("asked", 1))] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = plan_in(dir.path());
+            let api = fake();
+            let (row, vm) = chat_vm(&plan, &api).await;
+            let current = current_on(dir.path(), row, vm.clone());
+            let ep = Cache { fake: &api, tag: Some(held.clone()) };
+            let asked = Cell::new(0);
+            let (ctx, progress) = (plan.ctx(), Progress::default());
+            let again = MoveWhy { retry: true, ..why(MoveKind::Respawn, LossCause::SpawnGone, &vm.id, &[]) };
+            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &again, 3, &progress, Ok(&work), || {
+                asked.set(asked.get() + 1);
+                async move { Ok::<_, CliError>(unsealed()) }
+            })
+            .await
+            .unwrap_or_else(|f| panic!("{held}: {:?}", f.failure));
+            let seal = if keeps { &current.seal } else { &work };
+            assert_eq!((moved.touchid, asked.get()), want, "the cache holds {held}");
+            assert_eq!((moved.kind, &moved.seal, moved.token.is_some()), (MoveKind::Respawn, seal, want.1 == 1), "the cache holds {held}");
+        }
+    }
+
+    /// A1: a cut miss's retry whose read of the installed copy failed (here
+    /// no account active: the active one was forgotten since its move)
+    /// still keeps the seal its move ran on while the VM holds it, with no
+    /// Touch ID. A VM holding another seal, a refusal recorded for the
+    /// move's own seal, or a VM no longer running (a re-address) ends M1
+    /// with the read's failure, before any Touch ID or RunMicrovm. With the
+    /// copy read, a refused seal of the move is not kept either: the
+    /// installed one's, as any move's.
+    #[tokio::test]
+    async fn a_cut_miss_retry_keeps_its_moves_seal_with_no_installed_copy_else_fails_as_the_read() {
+        let work = Seal { tag: "b".repeat(16), account: Some("work".into()) };
+        let unread = || Failed { step: StartStep::TouchId, failure: Failure::NoAccount { why: accounts::NO_ACTIVE.into() }, vm: None };
+        for case in ["held", "another held", "refused", "not running", "refused, read"] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = plan_in(dir.path());
+            let api = fake();
+            let (row, vm) = chat_vm(&plan, &api).await;
+            let current = current_on(dir.path(), row, vm.clone());
+            let held = if case == "another held" { "c".repeat(16) } else { current.seal.tag.clone() };
+            if case.starts_with("refused") {
+                credential::record_rejection(&plan.paths, "microvm-earlier1", &current.seal.tag, "text");
+            }
+            if case == "not running" {
+                api.set_state(&vm.id, VmState::Terminated);
+            }
+            let ep = Cache { fake: &api, tag: Some(held) };
+            let asked = Cell::new(0);
+            let (ctx, progress) = (plan.ctx(), Progress::default());
+            let again = MoveWhy { retry: true, ..why(MoveKind::Respawn, LossCause::SpawnGone, &vm.id, &[]) };
+            let failed = unread();
+            let seal = if case == "refused, read" { Ok(&work) } else { Err(&failed) };
+            let runs_before = runs(&api);
+            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &again, 3, &progress, seal, || {
+                asked.set(asked.get() + 1);
+                async move { Ok::<_, CliError>(unsealed()) }
+            })
+            .await;
+            assert_eq!(runs(&api), runs_before, "{case}: no RunMicrovm");
+            if matches!(case, "held" | "refused, read") {
+                let moved = moved.unwrap_or_else(|f| panic!("{case}: {:?}", f.failure));
+                let want = if case == "held" { (&current.seal, credential::CACHED, 0) } else { (&work, "asked", 1) };
+                assert_eq!((moved.kind, &moved.seal, moved.touchid, asked.get()), (MoveKind::Respawn, want.0, want.1, want.2), "{case}");
+            } else {
+                let f = moved.err().unwrap_or_else(|| panic!("{case}: M1 went on"));
+                assert_eq!((f.step, f.failure, asked.get()), (StartStep::TouchId, unread().failure, 0), "{case}");
+            }
+        }
+    }
+
+    /// A1: so a cut miss's retry reaches M1 when the installed copy cannot
+    /// be read (the active account forgotten since its move, another left):
+    /// its respawn runs (`vm_select`), and with the VM holding no seal to
+    /// keep it ends as the read did (no account active: exit 5 at the
+    /// Touch ID's step, none asked). A move that is no retry ends before M1.
+    #[tokio::test]
+    async fn a_cut_miss_retry_reaches_m1_with_no_installed_copy() {
+        for retry in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = plan_in(dir.path());
+            let path = dir.path().join("fake.json");
+            std::fs::write(&path, serde_json::to_string(&FakeState::new()).unwrap()).unwrap();
+            let api = crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap();
+            let spec = run_spec(&crate::bridge::vm::run::new_session_token());
+            let vm = api
+                .with(|s| {
+                    let vm = s.run(&spec)?;
+                    s.advance_all();
+                    s.get(&vm.id)
+                })
+                .unwrap();
+            assert_eq!(vm.state, VmState::Running);
+            let row = VmRow { id: vm.id.clone(), status: RowStatus::Running, client_token: spec.client_token.clone(), egress: "vpc".into(), ..VmRow::default() };
+            let seal = Seal { tag: "b".repeat(16), account: Some("work".into()) };
+            *plan.current.borrow_mut() = Some(Current { backend: Rc::new(Backend::Fake(api)), row, vm: vm.clone(), how: "started", seed: "cloned", seeded_head: None, seal });
+            std::fs::create_dir_all(plan.paths.accounts_dir()).unwrap();
+            std::fs::write(plan.paths.account_env("spare"), crate::container::write(b"age-encryption.org/v1\n-> x spare\n--- y\n")).unwrap();
+            std::fs::remove_file(plan.paths.setup_token_env()).ok();
+            let paths = plan.paths.clone();
+            let (io, _consumer) = crate::bridge::agent::spawn_channels(1);
+            let again = MoveWhy { retry, ..why(MoveKind::Respawn, LossCause::SpawnGone, &vm.id, &[]) };
+            let f = run(Rc::new(plan), 3, StartWhy::Move(again), io).await.expect_err("no seal to keep");
+            let line = f.line.clone().unwrap_or_default();
+            assert_eq!((f.code, f.step), (5, StartStep::TouchId), "retry {retry}: {line}");
+            assert!(line.contains("restarting it there failed: no Claude account is active"), "retry {retry}: {line}");
+            let rows = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
+            let selects = rows.iter().filter(|r| r["event"] == "vm_select" && r["detail"]["choice"] == "respawn").count();
+            assert_eq!(selects, usize::from(retry), "retry {retry}: M1's respawn ran only for the retry: {rows:?}");
+            assert!(!rows.iter().any(|r| r["event"] == "credential_unseal"), "retry {retry}: no Touch ID");
+        }
+    }
+
+    /// A1: a move reads the installed copy before M1: with accounts and none
+    /// installed it fails as no account active, with a refused one as the
+    /// token's refusal: exit 5 either way, before any Touch ID or
+    /// RunMicrovm, audited `session_move_end` `failed` at the Touch ID's
+    /// step.
+    #[tokio::test]
+    async fn a_move_with_no_account_or_a_refused_one_fails_before_any_touch_id() {
+        for case in ["no account", "refused"] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = plan_in(dir.path());
+            let api = fake();
+            let (row, vm) = chat_vm(&plan, &api).await;
+            *plan.current.borrow_mut() = Some(current_on(dir.path(), row, vm.clone()));
+            let account = crate::container::write_annotated(b"age-encryption.org/v1\n-> x work\n--- y\n", &[("kind", "setup-token")]).unwrap();
+            std::fs::create_dir_all(plan.paths.accounts_dir()).unwrap();
+            std::fs::write(plan.paths.account_env("work"), &account).unwrap();
+            if case == "refused" {
+                std::fs::write(plan.paths.setup_token_env(), &account).unwrap();
+                credential::record_rejection(&plan.paths, "microvm-earlier1", &credential::tag_of(&account), "text");
+            }
+            let paths = plan.paths.clone();
+            let runs_before = runs(&api);
+            let (io, _consumer) = crate::bridge::agent::spawn_channels(1);
+            let f = run(Rc::new(plan), 2, StartWhy::Move(why(MoveKind::Readdress, LossCause::VmGone, &vm.id, &[])), io).await.expect_err("no move");
+            let line = f.line.clone().unwrap_or_default();
+            assert_eq!((f.code, f.step), (5, StartStep::TouchId), "{case}: {line}");
+            let words = if case == "refused" { "Claude account work's token was refused by Anthropic on " } else { "no Claude account is active" };
+            assert!(line.contains(words), "{case}: {line}");
+            assert_eq!(runs(&api), runs_before, "{case}: no RunMicrovm");
+            let rows = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
+            assert!(!rows.iter().any(|r| r["event"] == "credential_unseal"), "{case}: no Touch ID");
+            let ends: Vec<_> = rows.iter().filter(|r| r["event"] == "session_move_end").collect();
+            assert_eq!((ends.len(), ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["step"].as_str(), ends[0]["detail"]["code"].as_str()), (1, Some("failed"), Some("touchid"), Some("5")), "{case}");
+        }
+    }
+
+    /// A1: `session_account` once per change of seal, never for the same
+    /// seal; the accounts named (`-` when not known) with their seal ids; a
+    /// new seal of the same account too. A move's `account_from` only when
+    /// the account's name changed, both known: never for the same seal, a
+    /// new seal of the same account (`creds setup-token` re-sealed it), nor
+    /// a side not known (none, or `unknown`).
+    #[test]
+    fn the_session_account_row_is_written_when_the_seal_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let default = Seal { tag: "a".repeat(16), account: Some("default".into()) };
+        let work = Seal { tag: "b".repeat(16), account: Some("work".into()) };
+        let resealed = Seal { tag: "d".repeat(16), ..default.clone() };
+        plan.note_account(Some(SID), 1, "first", &default, &default.clone());
+        plan.note_account(Some(SID), 2, "readdress", &default, &work);
+        plan.note_account(None, 3, "migrate", &work, &Seal { tag: "c".repeat(16), account: None });
+        plan.note_account(Some(SID), 4, "respawn", &default, &resealed);
+        let rows: Vec<serde_json::Value> = crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == "session_account").map(|r| r["detail"].clone()).collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let fields = |d: &serde_json::Value| ["session", "gen", "kind", "from", "from_tag", "to", "to_tag"].map(|k| d[k].as_str().unwrap_or_default().to_string());
+        assert_eq!(fields(&rows[0]), [SID, "2", "readdress", "default", &"a".repeat(16), "work", &"b".repeat(16)].map(str::to_string));
+        assert_eq!(fields(&rows[1]), ["-", "3", "migrate", "work", &"b".repeat(16), "-", &"c".repeat(16)].map(str::to_string));
+        assert_eq!(fields(&rows[2]), [SID, "4", "respawn", "default", &"a".repeat(16), "default", &"d".repeat(16)].map(str::to_string));
+        assert_eq!((account_from(&default, &work), account_from(&default, &default), account_from(&Seal { account: None, ..default.clone() }, &work)), (Some("default".to_string()), None, None));
+        let unknown = Seal { tag: "e".repeat(16), account: Some(accounts::UNKNOWN.into()) };
+        let none = Seal { tag: "f".repeat(16), account: None };
+        assert_eq!(account_from(&default, &resealed), None, "the same account, sealed anew");
+        assert_eq!((account_from(&unknown, &work), account_from(&work, &unknown), account_from(&work, &none)), (None, None, None), "a side not known");
     }
 
     /// A pinned session never moves to another VM: the pump starts no
@@ -2773,7 +3152,7 @@ mod c1_tests {
         let (_, other) = chat_vm(&plan, &api).await;
         let (row, vm) = chat_vm(&plan, &api).await;
         let pings = |endpoint: &str| api.calls().iter().filter(|c| matches!(c, Call::Health { endpoint: e, .. } if e == endpoint)).count();
-        *plan.prepared.borrow_mut() = Some(PreparedVm { row: row.clone(), vm: vm.clone(), how: "started", at: Instant::now(), switching: false });
+        *plan.prepared.borrow_mut() = Some(PreparedVm { row: row.clone(), vm: vm.clone(), how: "started", at: Instant::now(), switching: false, seal: plan.token.seal() });
         // Wide: under the full matrix's load a 100 ms sleep can wake late.
         assert!(tokio::time::timeout(Duration::from_millis(1500), hold_on(&plan, &api, &api, &vm.id)).await.is_err(), "still holding");
         assert!(pings(&vm.endpoint) >= 2, "a ping every 100 ms: {:?}", api.calls());
@@ -2786,7 +3165,7 @@ mod c1_tests {
         let ((), at_switch) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(hold_on(&plan, &api, &api, &vm.id), switch) }).await.expect("the hold ends at the wake after the switch took the VM");
         assert_eq!(pings(&vm.endpoint), at_switch, "no ping once the switch took it");
         assert!(plan.prepared.borrow().is_some(), "the switch keeps it");
-        *plan.prepared.borrow_mut() = Some(PreparedVm { row, vm: vm.clone(), how: "started", at: Instant::now().checked_sub(MOVE_HOLD).expect("an uptime past MOVE_HOLD"), switching: false });
+        *plan.prepared.borrow_mut() = Some(PreparedVm { row, vm: vm.clone(), how: "started", at: Instant::now().checked_sub(MOVE_HOLD).expect("an uptime past MOVE_HOLD"), switching: false, seal: plan.token.seal() });
         let before = pings(&vm.endpoint);
         tokio::time::timeout(Duration::from_secs(10), hold_on(&plan, &api, &api, &vm.id)).await.expect("released at its first wake");
         assert!(plan.prepared.borrow().is_none(), "released at MOVE_HOLD");
@@ -3250,7 +3629,9 @@ const SWITCH_FALLBACK: Duration = Duration::from_secs(30);
 /// until the switch or `MOVE_HOLD`. A pinned session never migrates (refused
 /// before anything is asked). A failure's `again`: a dismissed or unanswered
 /// Touch ID (M4: asked again after the next turn); anything else ends wall
-/// migrations in this process.
+/// migrations in this process. A1: phase A re-plans (the installed copy read
+/// first, its seal the one delivered), and the prepared VM keeps that seal
+/// for its switch ([`PreparedVm::seal`]).
 pub async fn prepare_move(plan: Rc<SessionPlan>, trigger: MigrateTrigger) -> Result<MoveReady, MoveFailure> {
     let begun = Instant::now();
     if plan.pinned().is_some() {
@@ -3270,10 +3651,10 @@ pub async fn prepare_move(plan: Rc<SessionPlan>, trigger: MigrateTrigger) -> Res
         Backend::Fake(f) => tokio::time::timeout_at(until, prepare_on(&plan, &ctx, Arc::new(f.clone()), Arc::new(f.clone()), &current, until, &progress)).await,
     };
     let failed = match prepared {
-        Ok(Ok((row, vm, how))) => {
+        Ok(Ok((row, vm, how, seal))) => {
             let to_vm = vm.id.clone();
             tracing::info!(trigger = trigger.word(), vm = %to_vm, how, "a migration's VM is prepared");
-            *plan.prepared.borrow_mut() = Some(PreparedVm { row, vm, how, at: Instant::now(), switching: false });
+            *plan.prepared.borrow_mut() = Some(PreparedVm { row, vm, how, at: Instant::now(), switching: false, seal });
             tokio::task::spawn_local(hold_prepared(Rc::clone(&plan), backend, to_vm.clone()));
             return Ok(MoveReady { to_vm, how, ms: ms(begun) });
         }
@@ -3295,14 +3676,16 @@ fn move_failure(step: StartStep, failure: &Failure) -> MoveFailure {
     MoveFailure { step, code: failure.exit_code(), word: failure.word(), again }
 }
 
-/// [`prepare_move`]'s steps on `api` and `ep`: the Touch ID beside SELECT_VM,
-/// then the gate, the delivery and the token sent to the VM's cache;
-/// `progress` the step a deadline names.
-async fn prepare_on<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(plan: &SessionPlan, ctx: &Ctx, api: Arc<A>, ep: Arc<E>, current: &Current, until: Instant, progress: &Progress) -> Result<(VmRow, VmInfo, &'static str), Failed> {
+/// [`prepare_move`]'s steps on `api` and `ep`: the installed copy read (A1),
+/// the Touch ID for it beside SELECT_VM, then the gate, the delivery and the
+/// token sent to the VM's cache; `progress` the step a deadline names. The
+/// prepared VM, and the seal it now holds.
+async fn prepare_on<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(plan: &SessionPlan, ctx: &Ctx, api: Arc<A>, ep: Arc<E>, current: &Current, until: Instant, progress: &Progress) -> Result<(VmRow, VmInfo, &'static str, Seal), Failed> {
     let until_std = until.into_std();
     progress.at(StartStep::TouchId);
+    let installed = credential::read_installed(&ctx.paths).map_err(|e| installed_failed(&ctx.paths, e))?;
     let touch = async {
-        let token = credential::unseal_for_move(&plan.store, ctx, &plan.token, until_std).await.map_err(|e| failed_cli(StartStep::TouchId, e, None))?;
+        let token = credential::unseal_for_move(&plan.store, ctx, &installed, until_std).await.map_err(|e| failed_cli(StartStep::TouchId, e, None))?;
         progress.at(StartStep::SelectVm);
         Ok::<_, Failed>(token)
     };
@@ -3332,11 +3715,11 @@ async fn prepare_on<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
     let (token, (row, vm, how)) = tokio::try_join!(touch, select)?;
     let at = Some(vm.id.as_str());
     progress.at(StartStep::Gate);
-    let prepared = credential::move_delivery(ctx, &*api, &*ep, &row, &vm, &plan.token, Some(token), until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
+    let prepared = credential::move_delivery(ctx, &*api, &*ep, &row, &vm, plan.token.deliver, &installed.seal, Some(token), until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
     progress.at(StartStep::Token);
     let env = agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Token, e, at))?;
     credential::deliver_only(&env, prepared.delivery).await.map_err(|e| failed(StartStep::Token, e, at))?;
-    Ok((row, vm, how))
+    Ok((row, vm, how, installed.seal))
 }
 
 /// The prepared VM held for the switch (S10 §B, §14): a `GET /health` every
@@ -3388,6 +3771,8 @@ struct Arrived {
 /// Where a switch spawns ([`switch_vm`]): the prepared VM, or the old one it
 /// fell back to, with its delivery (and `how` it was taken); a fallback's
 /// `touchid`: `cached` (the old VM held the seal) or `asked` ([`stay_on`]).
+/// A1: the delivery's `Prepared::seal` is the generation's: phase A's on
+/// the prepared VM, the fallback's own re-plan on the old one.
 enum SwitchTo {
     New { row: VmRow, vm: VmInfo, how: &'static str, arrived: Arrived, prepared: credential::Prepared },
     Stayed { row: VmRow, vm: VmInfo, how: &'static str, prepared: credential::Prepared, touchid: &'static str },
@@ -3426,17 +3811,20 @@ async fn switch_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
     let (base, fallback) = switch_base(plan, current);
     let until_std = until.into_std();
     let sid = why.session_id.clone();
-    let unseal = || credential::unseal_for_move(&plan.store, &ctx, &plan.token, until_std);
+    // A1: a fallback re-plans as any respawn: the installed copy now, its seal cached on the old VM, else those bytes.
+    let read = || credential::read_installed(&ctx.paths);
+    let (store, ctx_ref) = (&plan.store, &ctx);
+    let unseal = move |installed: InstalledSeal| async move { credential::unseal_for_move(store, ctx_ref, &installed, until_std).await };
     let switched = if fallback {
         tracing::info!(gen, vm = %base.vm.id, "the switch's new VM never started the moved claude: it restarts on the VM it left");
-        let stayed = stay_on(plan, &ctx, &*api, &*ep, &base, until_std, progress, unseal).await;
+        let stayed = stay_on(plan, &ctx, &*api, &*ep, &base, until_std, progress, read, unseal).await;
         plan.moving.set(false);
         let (row, vm, how, prepared, touchid) = stayed?;
         SwitchTo::Stayed { row, vm, how, prepared, touchid }
     } else {
         let leave = || async { leave_vm(&ctx, &plan.ws, plan.transcript_sync.as_ref(), &api, &base.row, &base.vm, sid.as_deref()).await.map_err(|e| failed(StartStep::Workspace, e, Some(&base.vm.id))) };
         let arrive = |row: VmRow, vm: VmInfo| arrive_vm(plan, &ctx, &api, row, vm, base.vm.id.clone(), sid.clone(), until);
-        switch_vm(plan, &ctx, &*api, &*ep, &base, why, gen, until, progress, leave, arrive, unseal).await?
+        switch_vm(plan, &ctx, &*api, &*ep, &base, why, gen, until, progress, leave, arrive, read, unseal).await?
     };
     let (row, vm, how, seed, seeded_head, source, transcript, delivery, stayed, touchid) = match switched {
         SwitchTo::New { row, vm, how, arrived, prepared } => (row, vm, how, arrived.seed, arrived.seeded_head, arrived.source, arrived.transcript, prepared, false, "asked"),
@@ -3444,19 +3832,22 @@ async fn switch_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
     };
     let legs = vec![("workspace", ms(t))];
     plan.credential.set(Some(delivery.source));
+    let seal = delivery.seal.clone();
     let at = Some(vm.id.as_str());
     let target = target_of(&row, &vm).map_err(|e| failed(StartStep::Spawn, e, at))?;
     let (dp, _) = data_plane(&ctx, &api, &vm.id, false).map_err(|e| failed(StartStep::Spawn, e, at))?;
     let code_tokens = Arc::new(MintingTokens::new(Arc::clone(&api), &ctx.paths, &vm.id, false));
     tracing::info!(gen, vm = %vm.id, stayed, seed = source, "the switch spawns");
-    let spawning = Spawning { argv, session: why.session_id.clone(), why: why.vms_why() };
+    let spawning = Spawning { argv, session: why.session_id.clone(), why: why.vms_why(), account: seal.account.clone() };
     let end = spawn(plan, gen, &ctx, Arc::clone(&api), Arc::clone(&ep), dp, code_tokens, target, row.clone(), vm.clone(), delivery.delivery, io, progress, spawning).await?;
+    plan.note_account(why.session_id.as_deref(), gen, MoveKind::Migrate.word(), &base.seal, &seal);
+    let account_from = account_from(&base.seal, &seal);
     let (left_id, backend) = (base.vm.id.clone(), Rc::clone(&base.backend));
     if !stayed {
         *plan.left.borrow_mut() = Some(base);
     }
-    *plan.current.borrow_mut() = Some(Current { backend, row, vm, how, seed, seeded_head: seeded_head.clone() });
-    let moved = MoveDone { kind: MoveKind::Migrate, cut: Cut::None.word(), touchid, seed: source, stayed };
+    *plan.current.borrow_mut() = Some(Current { backend, row, vm, how, seed, seeded_head: seeded_head.clone(), seal: seal.clone() });
+    let moved = MoveDone { kind: MoveKind::Migrate, cut: Cut::None.word(), touchid, seed: source, stayed, account: seal.account.clone(), account_from };
     let after_started = (!stayed).then(|| {
         let (plan, ctx, to, sid) = (Rc::clone(plan), plan.ctx(), end.vm.clone(), why.session_id.clone());
         AfterStarted(Box::pin(async move {
@@ -3481,6 +3872,7 @@ async fn switch_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
         carried: None,
         moved: Some(moved),
         after_started,
+        seal: Some(seal),
     })
 }
 
@@ -3511,9 +3903,11 @@ fn switch_base(plan: &SessionPlan, current: Current) -> (Current, bool) {
 /// the old VM, `base` ([`stay_on`]: running again, its cached seal, else the
 /// move's second Touch ID, `unseal`), audited `session_move_end` `stayed`
 /// with the step and code of what failed. The closing suspend is held off
-/// no more either way.
+/// no more either way. A1: the delivery on the prepared VM is of phase A's
+/// seal ([`PreparedVm::seal`]: a `creds account use` after phase A applies
+/// from the next spawn); the fallback re-plans (`read`, then `unseal`).
 #[allow(clippy::too_many_arguments)]
-async fn switch_vm<A, E, L, Lf, R, Rf, U, Uf>(plan: &SessionPlan, ctx: &Ctx, api: &A, ep: &E, base: &Current, why: &MoveWhy, gen: u32, until: Instant, progress: &Progress, leave: L, arrive: R, unseal: U) -> Result<SwitchTo, Failed>
+async fn switch_vm<A, E, L, Lf, R, Rf, G, U, Uf>(plan: &SessionPlan, ctx: &Ctx, api: &A, ep: &E, base: &Current, why: &MoveWhy, gen: u32, until: Instant, progress: &Progress, leave: L, arrive: R, read: G, unseal: U) -> Result<SwitchTo, Failed>
 where
     A: MicrovmApi,
     E: EndpointClient,
@@ -3521,8 +3915,9 @@ where
     Lf: std::future::Future<Output = Result<(), Failed>>,
     R: FnOnce(VmRow, VmInfo) -> Rf,
     Rf: std::future::Future<Output = Result<Arrived, Failed>>,
-    U: FnOnce() -> Uf,
-    Uf: std::future::Future<Output = crate::errors::Result<(SetupToken, String)>>,
+    G: FnOnce() -> crate::errors::Result<InstalledSeal>,
+    U: FnOnce(InstalledSeal) -> Uf,
+    Uf: std::future::Future<Output = crate::errors::Result<SetupToken>>,
 {
     let begun = Instant::now();
     let until_std = until.into_std();
@@ -3539,7 +3934,7 @@ where
         target_of(&p.row, &p.vm).map_err(|e| failed(StartStep::Spawn, e, at))?;
         leave().await?;
         let delivery = async {
-            let prepared = credential::move_delivery(ctx, api, ep, &p.row, &p.vm, &plan.token, None, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
+            let prepared = credential::move_delivery(ctx, api, ep, &p.row, &p.vm, plan.token.deliver, &p.seal, None, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
             progress.gate_done.set(true);
             Ok::<_, Failed>(prepared)
         };
@@ -3561,9 +3956,10 @@ where
         }
     };
     tracing::warn!(gen, step = fell.step.name(), code = fell.failure.exit_code(), why = fell.failure.word(), vm = %base.vm.id, "the switch failed after the old CLI stopped: the chat respawns on its old VM");
-    let stayed = stay_on(plan, ctx, api, ep, base, until_std, progress, unseal).await;
+    let stayed = stay_on(plan, ctx, api, ep, base, until_std, progress, read, unseal).await;
     plan.moving.set(false);
     let (row, vm, how, prepared, touchid) = stayed?;
+    let account_from = account_from(&base.seal, &prepared.seal);
     let row_ = MoveEndRow {
         session: why.session_id.as_deref(),
         gen,
@@ -3578,6 +3974,8 @@ where
         ms: ms(begun),
         step_code: Some((fell.step.name(), fell.failure.exit_code())),
         request: request_of(why.trigger.as_ref()),
+        account: prepared.seal.account.as_deref(),
+        account_from: account_from.as_deref(),
         ..MoveEndRow::default()
     };
     row_.audit(&plan.paths);
@@ -3590,14 +3988,18 @@ where
 /// `/suspend` and `/resume` empties that cache (S7 D3), the move's second
 /// Touch ID (`unseal`: `credential::unseal_for_move`, `asked`), whose token
 /// the delivery carries; then the gate (`credential::move_delivery`) and
-/// `regate_if_stale`. Its `how` and its `touchid` word with it.
+/// `regate_if_stale`. Its `how` and its `touchid` word with it. A1: a
+/// respawn, so it re-plans: the installed copy read (`read`; a failure is
+/// exit 5 with no Touch ID), its seal looked for in the cache, its bytes
+/// unsealed (`unseal`); the delivery's `Prepared::seal` is that seal.
 #[allow(clippy::too_many_arguments)]
-async fn stay_on<A, E, U, Uf>(plan: &SessionPlan, ctx: &Ctx, api: &A, ep: &E, base: &Current, until_std: std::time::Instant, progress: &Progress, unseal: U) -> Result<(VmRow, VmInfo, &'static str, credential::Prepared, &'static str), Failed>
+async fn stay_on<A, E, G, U, Uf>(plan: &SessionPlan, ctx: &Ctx, api: &A, ep: &E, base: &Current, until_std: std::time::Instant, progress: &Progress, read: G, unseal: U) -> Result<(VmRow, VmInfo, &'static str, credential::Prepared, &'static str), Failed>
 where
     A: MicrovmApi,
     E: EndpointClient,
-    U: FnOnce() -> Uf,
-    Uf: std::future::Future<Output = crate::errors::Result<(SetupToken, String)>>,
+    G: FnOnce() -> crate::errors::Result<InstalledSeal>,
+    U: FnOnce(InstalledSeal) -> Uf,
+    Uf: std::future::Future<Output = crate::errors::Result<SetupToken>>,
 {
     let old = base.vm.id.as_str();
     let at = Some(old);
@@ -3605,15 +4007,17 @@ where
     *progress.vm.borrow_mut() = Some(old.to_string());
     let (vm, resumed) = running_resumed(api, old, ctx.poll(Poll::RESUMED)).await.map_err(|e| failed(StartStep::SelectVm, e, at))?;
     let row = vm_registry::read_row(&ctx.paths, old).ok().flatten().unwrap_or_else(|| base.row.clone());
-    let (token, touchid) = if credential::cached_on_vm(&ctx.paths, api, ep, &row, &vm, &plan.token.tag).await {
+    let installed = read().map_err(|e| installed_failed(&ctx.paths, e))?;
+    let seal = installed.seal.clone();
+    let (token, touchid) = if credential::cached_on_vm(&ctx.paths, api, ep, &row, &vm, &seal.tag).await {
         (None, credential::CACHED)
     } else {
         progress.at(StartStep::TouchId);
         progress.touchid.set(Some("asked"));
-        (Some(unseal().await.map_err(|e| failed_cli(StartStep::TouchId, e, None))?), "asked")
+        (Some(unseal(installed).await.map_err(|e| failed_cli(StartStep::TouchId, e, None))?), "asked")
     };
     progress.at(StartStep::Gate);
-    let mut prepared = credential::move_delivery(ctx, api, ep, &row, &vm, &plan.token, token, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
+    let mut prepared = credential::move_delivery(ctx, api, ep, &row, &vm, plan.token.deliver, &seal, token, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
     credential::regate_if_stale(ctx, api, &row, &vm, &mut prepared).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
     Ok((row, vm, if resumed { "resumed" } else { "reused" }, prepared, touchid))
 }
@@ -3993,7 +4397,7 @@ mod c3_tests {
 
     /// A migration's move, off `from`.
     fn migrating(from: &str) -> MoveWhy {
-        MoveWhy { kind: MoveKind::Migrate, cause: None, trigger: Some(MigrateTrigger::Command { nonce: "nonce-1".into() }), from_vm: from.into(), from_spawn: None, session_id: Some(SID.into()), outstanding: Vec::new(), leaf: None, fresh_chat: false, init_answered: true }
+        MoveWhy { kind: MoveKind::Migrate, cause: None, trigger: Some(MigrateTrigger::Command { nonce: "nonce-1".into() }), from_vm: from.into(), from_spawn: None, session_id: Some(SID.into()), outstanding: Vec::new(), leaf: None, fresh_chat: false, init_answered: true, retry: false }
     }
 
     /// What a switch's new VM gets in the tests: a seed and a restore that ran.
@@ -4010,10 +4414,10 @@ mod c3_tests {
         let path = dir.join("backend.json");
         std::fs::write(&path, serde_json::to_string(&crate::bridge::api::FakeState::new()).unwrap()).unwrap();
         let backend = Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap());
-        *plan.prepared.borrow_mut() = Some(PreparedVm { row: p_row, vm: p_vm.clone(), how: "started", at: Instant::now(), switching: false });
+        *plan.prepared.borrow_mut() = Some(PreparedVm { row: p_row, vm: p_vm.clone(), how: "started", at: Instant::now(), switching: false, seal: plan.token.seal() });
         assert!(plan.begin_switch());
         assert!(plan.moving.get(), "the closing suspend is held off");
-        (Current { backend: Rc::new(backend), row, vm, how: "reused", seed: "seeded", seeded_head: Some("a".repeat(40)) }, p_vm)
+        (Current { backend: Rc::new(backend), row, vm, how: "reused", seed: "seeded", seeded_head: Some("a".repeat(40)), seal: plan.token.seal() }, p_vm)
     }
 
     /// The audit rows of `event`.
@@ -4021,9 +4425,14 @@ mod c3_tests {
         crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == event).collect()
     }
 
-    /// A setup-token built at run time (no credential-shaped literal), sealed as `tag`.
-    fn unsealed(tag: &str) -> (SetupToken, String) {
-        (crate::bridge::setup_token::parse_token(&"t".repeat(40)).unwrap(), tag.to_string())
+    /// A setup-token built at run time (no credential-shaped literal).
+    fn unsealed() -> SetupToken {
+        crate::bridge::setup_token::parse_token(&"t".repeat(40)).unwrap()
+    }
+
+    /// A stand-in for the installed copy a re-plan reads: P0's seal (its text unused by the stand-in unseals).
+    fn stand_in(plan: &SessionPlan) -> InstalledSeal {
+        InstalledSeal { text: String::new(), seal: plan.token.seal() }
     }
 
     /// §B: anything that fails after the old CLI stopped falls back to a
@@ -4060,14 +4469,14 @@ mod c3_tests {
             let leave = || async { if case == "leave" { Err(fetch_failed()) } else { Ok(()) } };
             let arrive = |_: VmRow, _: VmInfo| async { if case == "arrive" { Err(Failed { step: StartStep::Workspace, failure: Failure::Workspace { code: 9, first_line: "the carry seed was refused".into() }, vm: None }) } else { Ok(arrived()) } };
             let asked = Cell::new(0);
-            let tag = plan.token.tag.clone();
-            let unseal = || {
+            let read = || Ok(stand_in(&plan));
+            let unseal = |_: InstalledSeal| {
                 asked.set(asked.get() + 1);
-                async move { Ok::<_, CliError>(unsealed(&tag)) }
+                async move { Ok::<_, CliError>(unsealed()) }
             };
             let until = Instant::now() + MOVE_WINDOW;
             let why = migrating(&current.vm.id);
-            let switched = switch_vm(&plan, &ctx, &api, &ep, &current, &why, 2, until, &progress, leave, arrive, unseal).await;
+            let switched = switch_vm(&plan, &ctx, &api, &ep, &current, &why, 2, until, &progress, leave, arrive, read, unseal).await;
             assert!(plan.prepared.borrow().is_none() && !plan.moving.get(), "{case}: the prepared VM let go, the closing suspend no longer held off");
             let Ok(SwitchTo::Stayed { row, vm, how, prepared: delivery, touchid }) = switched else { panic!("{case}: no fallback") };
             let (source, touch) = if case == "both" { ("setup-token", "asked") } else { (credential::CACHED, credential::CACHED) };
@@ -4135,7 +4544,7 @@ mod c3_tests {
         let (row, vm) = vm_of(&plan, &api).await;
         let path = dir.path().join("backend.json");
         std::fs::write(&path, serde_json::to_string(&crate::bridge::api::FakeState::new()).unwrap()).unwrap();
-        let current = Current { backend: Rc::new(Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap())), row, vm: vm.clone(), how: "started", seed: "cloned", seeded_head: None };
+        let current = Current { backend: Rc::new(Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap())), row, vm: vm.clone(), how: "started", seed: "cloned", seeded_head: None, seal: plan.token.seal() };
         let ep = Cache { fake: &api, tag: plan.token.tag.clone(), holding: vec![vm.endpoint.clone()] };
         let why = MoveWhy {
             kind: MoveKind::Respawn,
@@ -4148,15 +4557,15 @@ mod c3_tests {
             leaf: None,
             fresh_chat: false,
             init_answered: true,
+            retry: false,
         };
         let asked = Cell::new(0);
-        let tag = plan.token.tag.clone();
         let ctx = plan.ctx();
         let progress = Progress::default();
         let t = std::time::Instant::now();
-        let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why, 2, &progress, || {
+        let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why, 2, &progress, Ok(&plan.token.seal()), || {
             asked.set(asked.get() + 1);
-            async move { Ok::<_, CliError>(unsealed(&tag)) }
+            async move { Ok::<_, CliError>(unsealed()) }
         })
         .await;
         let moved = moved.unwrap_or_else(|f| panic!("M1: {:?}", f.failure));
@@ -4285,7 +4694,7 @@ mod c3_tests {
     fn current_of(dir: &Path, row: VmRow, vm: VmInfo) -> Current {
         let path = dir.join("backend.json");
         std::fs::write(&path, serde_json::to_string(&crate::bridge::api::FakeState::new()).unwrap()).unwrap();
-        Current { backend: Rc::new(Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap())), row, vm, how: "started", seed: "cloned", seeded_head: None }
+        Current { backend: Rc::new(Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap())), row, vm, how: "started", seed: "cloned", seeded_head: None, seal: Seal { tag: "0".repeat(16), account: None } }
     }
 
     /// §2.7: a fresh chat's `Gap` moves as a re-address (its VM holds the
@@ -4328,14 +4737,14 @@ mod c3_tests {
                 leaf: None,
                 fresh_chat: true,
                 init_answered: true,
+                retry: false,
             };
             let asked = Cell::new(0);
-            let tag = plan.token.tag.clone();
             let ctx = plan.ctx();
             let progress = Progress::default();
-            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why, 2, &progress, || {
+            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why, 2, &progress, Ok(&plan.token.seal()), || {
                 asked.set(asked.get() + 1);
-                async move { Ok::<_, CliError>(unsealed(&tag)) }
+                async move { Ok::<_, CliError>(unsealed()) }
             })
             .await;
             let moved = moved.unwrap_or_else(|f| panic!("{cause:?}: {:?}", f.failure));
@@ -4380,14 +4789,14 @@ mod c3_tests {
                 leaf: None,
                 fresh_chat: false,
                 init_answered: true,
+                retry: false,
             };
             let asked = Cell::new(0);
-            let tag = plan.token.tag.clone();
             let ctx = plan.ctx();
             let progress = Progress::default();
-            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why, 2, &progress, || {
+            let moved = move_vm(&plan, &ctx, &api, &ep, &current, &why, 2, &progress, Ok(&plan.token.seal()), || {
                 asked.set(asked.get() + 1);
-                async move { Ok::<_, CliError>(unsealed(&tag)) }
+                async move { Ok::<_, CliError>(unsealed()) }
             })
             .await;
             let moved = moved.unwrap_or_else(|f| panic!("{case}: {:?}", f.failure));
@@ -4539,11 +4948,12 @@ mod c3_tests {
         let began = crate::wire::time::unix_now();
         let why = migrating(&current.vm.id);
         let asked = Cell::new(0);
-        let unseal = || {
+        let read = || Err::<InstalledSeal, _>(CliError::Msg("never read".into()));
+        let unseal = |_: InstalledSeal| {
             asked.set(asked.get() + 1);
-            async { Err::<(SetupToken, String), _>(CliError::Msg("never asked".into())) }
+            async { Err::<SetupToken, _>(CliError::Msg("never asked".into())) }
         };
-        let switched = switch_vm(&plan, &ctx, &api, &ep, &current, &why, 2, Instant::now() + MOVE_WINDOW, &progress, leave, arrive, unseal).await;
+        let switched = switch_vm(&plan, &ctx, &api, &ep, &current, &why, 2, Instant::now() + MOVE_WINDOW, &progress, leave, arrive, read, unseal).await;
         assert_eq!(asked.get(), 0, "the switch never asks a Touch ID");
         let Ok(SwitchTo::New { row, vm, how, arrived, prepared: delivery }) = switched else { panic!("the switch fell back") };
         assert!(left.get(), "the old VM's work was taken first");
@@ -4555,6 +4965,52 @@ mod c3_tests {
         assert!(rows(&plan, "credential_unseal").is_empty(), "never an unseal");
         assert!(rows(&plan, "session_move_end").is_empty(), "the pump writes the switch's done, once its CLI resumed");
         assert!(plan.prepared.borrow().is_none() && !plan.moving.get());
+        assert_eq!(delivery.seal, plan.token.seal(), "phase A's seal");
+    }
+
+    /// A1: the switch delivers the seal phase A left in the prepared VM's
+    /// cache (`PreparedVm::seal`), whatever is installed now (a `creds
+    /// account use` after phase A applies from the next spawn); a fallback
+    /// re-plans as a respawn: the installed copy read then, its seal looked
+    /// for in the old VM's cache (a miss: one Touch ID for its bytes), its
+    /// `stayed` row naming the account and the one it ran as before.
+    #[tokio::test]
+    async fn the_switch_keeps_phase_as_seal_and_its_fallback_re_plans() {
+        let work = Seal { tag: "b".repeat(16), account: Some("work".into()) };
+        for case in ["switch", "fallback"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (plan, api) = gated(dir.path());
+            let (mut current, prepared) = switching(dir.path(), &plan, &api).await;
+            current.seal = Seal { account: Some("default".into()), ..plan.token.seal() };
+            plan.prepared.borrow_mut().as_mut().expect("prepared").seal = current.seal.clone();
+            // The prepared VM holds phase A's seal; the old VM no seal at all.
+            let ep = Cache { fake: &api, tag: plan.token.tag.clone(), holding: vec![prepared.endpoint.clone()] };
+            let (ctx, progress) = (plan.ctx(), Progress::default());
+            let leave = || async { if case == "fallback" { Err(Failed { step: StartStep::Workspace, failure: Failure::Workspace { code: 7, first_line: "the old VM's code-out failed".into() }, vm: None }) } else { Ok(()) } };
+            let arrive = |_: VmRow, _: VmInfo| async { Ok(arrived()) };
+            let (read_n, asked) = (Cell::new(0), Cell::new(0));
+            let read = || {
+                read_n.set(read_n.get() + 1);
+                Ok(InstalledSeal { text: String::new(), seal: work.clone() })
+            };
+            let unseal = |i: InstalledSeal| {
+                asked.set(asked.get() + 1);
+                assert_eq!(i.seal, work, "the bytes the re-plan read");
+                async move { Ok::<_, CliError>(unsealed()) }
+            };
+            let switched = switch_vm(&plan, &ctx, &api, &ep, &current, &migrating(&current.vm.id), 2, Instant::now() + MOVE_WINDOW, &progress, leave, arrive, read, unseal).await;
+            match (case, switched) {
+                ("switch", Ok(SwitchTo::New { prepared: delivery, .. })) => {
+                    assert_eq!((&delivery.seal, delivery.delivery.account(), read_n.get(), asked.get()), (&current.seal, Some("default"), 0, 0), "phase A's seal, nothing read or asked");
+                }
+                ("fallback", Ok(SwitchTo::Stayed { prepared: delivery, touchid, .. })) => {
+                    assert_eq!((&delivery.seal, delivery.delivery.tag(), touchid, read_n.get(), asked.get()), (&work, work.tag.as_str(), "asked", 1, 1), "re-planned");
+                    let ends = rows(&plan, "session_move_end");
+                    assert_eq!((ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["account"].as_str(), ends[0]["detail"]["account_from"].as_str()), (Some("stayed"), Some("work"), Some("default")));
+                }
+                (case, other) => panic!("{case}: {}", if other.is_ok() { "the other way" } else { "failed" }),
+            }
+        }
     }
 
     /// §2.7: a reopen's carry off its `--resume` row's VM, from that row
@@ -4837,6 +5293,34 @@ mod tests {
         let f = check(&w, &[], &a_git_repo);
         assert_eq!((f.word(), f.exit_code()), ("no_token", 5));
         assert!(f.line().ends_with(": run ai-env creds setup-token"), "{}", f.line());
+        // A1: accounts exist and none is installed: no account active (5, its own fix), before the token's check.
+        std::fs::create_dir_all(w.paths.accounts_dir()).unwrap();
+        std::fs::write(w.paths.account_env("work"), crate::container::write(b"age-encryption.org/v1\n-> x work\n--- y\n")).unwrap();
+        let f = check(&w, &[], &a_git_repo);
+        assert_eq!((f.word(), f.exit_code(), f.line()), ("no_account", 5, crate::bridge::accounts::NO_ACTIVE.to_string()));
+        // Installed and labelled: P0's plan names the account.
+        std::fs::copy(w.paths.account_env("work"), w.paths.setup_token_env()).unwrap();
+        let plan = precheck_with(&w.session(&ARGS), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!(plan.token.account.as_deref(), Some("work"));
+        drop(plan);
+        // The installed account's seal refused (5): its line is the refusal (seen on a VM of the live id's length),
+        // whole, its fix inside (seal it anew, or use another account), never `creds setup-token` after it; the
+        // longest name loses only the line's last words.
+        for name in ["work".to_string(), "w".repeat(crate::bridge::accounts::MAX_NAME)] {
+            let sealed = crate::container::write(format!("age-encryption.org/v1\n-> x {name}\n--- y\n").as_bytes());
+            std::fs::write(w.paths.account_env(&name), &sealed).unwrap();
+            std::fs::write(w.paths.setup_token_env(), &sealed).unwrap();
+            credential::record_rejection(&w.paths, "microvm-00000000-0000-4000-8000-000000000001", &credential::tag_of(&sealed), "text");
+            let said = credential::refuse_rejected(&w.paths, &credential::tag_of(&sealed)).unwrap_err().to_string();
+            let f = check(&w, &[], &a_git_repo);
+            let line = f.line();
+            assert_eq!((f.word(), f.exit_code()), ("no_token", 5), "{line}");
+            assert!(line.contains(&format!("then `ai-env creds account add {name}`, or `ai-env creds account use OTHER`")) && !line.contains("run ai-env creds setup-token"), "{line}");
+            assert!(format!("ai-env-claude: {line}").chars().count() <= crate::bridge::remote::LINE_MAX, "{line}");
+            if name == "work" {
+                assert_eq!(line, said, "whole");
+            }
+        }
         let w = World::new("");
         std::fs::remove_file(w.paths.aws_env()).unwrap();
         let f = check(&w, &[], &a_git_repo);

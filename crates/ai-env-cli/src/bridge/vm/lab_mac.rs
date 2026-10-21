@@ -392,8 +392,9 @@ fn run_once(claude: &Path, token: &str, reply: Reply, valid: Option<&str>, wait_
     Ok(seen)
 }
 
-/// The claude this Mac's Cursor runs (the bundled CLI), else PATH's.
-fn mac_claude() -> Option<PathBuf> {
+/// The claude this Mac's Cursor runs (the bundled CLI), else PATH's (A1:
+/// `creds account check` runs its turns on it too).
+pub(crate) fn mac_claude() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let ext = home.join(".cursor").join("extensions");
     let bundled = crate::bridge::doctor::pick_bundle(&crate::bridge::doctor::installed_extension_names(&ext)).map(|(_, dir)| ext.join(dir).join("resources").join("native-binary").join("claude")).filter(|p| p.is_file());

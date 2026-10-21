@@ -140,6 +140,13 @@ name = "infra"
 path = "tests/infra.rs"
 required-features = ["bridge"]
 
+# S10 addendum A1: `creds account check` through the real binary, against a fake Cursor bundle's claude
+# (tests/fakes/claude-usage.sh) and the fake age.
+[[test]]
+name = "accounts_check"
+path = "tests/accounts_check.rs"
+required-features = ["bridge"]
+
 # S4 MicroVM lifecycle in-process against the fakes; the areas live in tests/vm/*.rs.
 [[test]]
 name = "vm"

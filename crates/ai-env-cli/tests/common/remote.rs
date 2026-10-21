@@ -373,6 +373,50 @@ impl RemoteRig {
         self.root.join("bridge")
     }
 
+    /// A1: the rig's bridge root as ai-env's own `Paths`, which the
+    /// accounts' store API takes (`bridge::accounts`).
+    #[must_use]
+    pub fn paths(&self) -> ai_env_cli::bridge::config::Paths {
+        ai_env_cli::bridge::config::Paths::from_root_and_env(self.bridge(), None)
+    }
+
+    /// A1: Claude account `name` sealed as `creds account add NAME` seals
+    /// one, with no CLI: `CLAUDE_CODE_OAUTH_TOKEN=<token>` encrypted by the
+    /// rig's fake age to the keystore's recipients (no `age.log` line: no
+    /// decrypt counted), in a container noting `kind`, `chars` and
+    /// `account`, written as `credentials/accounts/<name>.env`. The store is
+    /// reconciled before (the green world's token adopted as `default`,
+    /// byte for byte) and after (the new account's row). Its token, built at
+    /// run time from `tail` (`green_world::setup_token`).
+    pub fn seal_account(&self, name: &str, tail: &str) -> String {
+        let paths = self.paths();
+        ai_env_cli::bridge::accounts::reconcile(&paths).unwrap_or_else(|e| panic!("reconcile: {e}"));
+        let token = green_world::setup_token(tail);
+        let recipients = self.root.join("keys").join("keys").join("ai-env-bridge").join("recipients.txt");
+        let mut age = Command::new(self.root.join("bin").join("age"))
+            .args(["-e", "-R"])
+            .arg(&recipients)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the fake age");
+        age.stdin.take().expect("its stdin").write_all(format!("CLAUDE_CODE_OAUTH_TOKEN={token}\n").as_bytes()).expect("the plaintext");
+        let out = age.wait_with_output().expect("the fake age's output");
+        assert!(out.status.success(), "age -e: {}", String::from_utf8_lossy(&out.stderr));
+        let chars = token.len().to_string();
+        let text = ai_env_cli::container::write_annotated(&out.stdout, &[("kind", "setup-token"), ("chars", &chars), ("account", name)]).expect("the container");
+        for dir in [paths.credentials(), paths.accounts_dir()] {
+            std::fs::create_dir_all(&dir).expect("the accounts' dir");
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("0700");
+        }
+        ai_env_cli::store::write_atomic(&paths.account_env(name), text.as_bytes()).expect("the account's file");
+        ai_env_cli::bridge::accounts::reconcile(&paths).unwrap_or_else(|e| panic!("reconcile: {e}"));
+        token
+    }
+
     #[must_use]
     pub fn fake_path(&self) -> PathBuf {
         self.root.join("fake.json")

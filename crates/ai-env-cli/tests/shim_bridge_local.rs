@@ -1633,7 +1633,8 @@ fn exec_with_credential_refuses_before_any_touch_id() {
     let o = run(w.cred_exec(&["--with-credential", "--", "true"]), None);
     assert_token_nowhere(&w, &o, &token);
     assert_eq!(code(&o), 5, "{}", text(&o.stderr));
-    assert!(text(&o.stderr).contains("ai-env creds setup-token"), "{}", text(&o.stderr));
+    // A1: the seed's `creds setup-token` made Claude account `default`, so an absent installed copy is "no account active".
+    assert!(text(&o.stderr).contains("ai-env creds account use NAME"), "{}", text(&o.stderr));
     assert_eq!(w.decrypts(), before, "no Touch ID for any refusal");
     assert!(!w.shim.spawns.credential().has());
 }
@@ -1741,7 +1742,7 @@ fn a_refused_token_stops_claude_with_exit_5_and_blocks_its_seal() {
     let o = run(w.cred_exec(&["--with-credential", "--", "claude", "-p", "hi"]), None);
     assert_token_nowhere(&w, &o, &token);
     assert_eq!(code(&o), 5, "{}", text(&o.stderr));
-    assert!(text(&o.stderr).contains("was refused by Anthropic") && text(&o.stderr).contains("ai-env creds setup-token"), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("Claude account default's token was refused by Anthropic") && text(&o.stderr).contains("ai-env creds account add default"), "{}", text(&o.stderr));
     assert_eq!(w.decrypts(), before, "a known-bad seal costs no Touch ID");
     assert_eq!(starts(&w), 1, "never started again");
 }
@@ -2214,7 +2215,9 @@ fn a_registry_row_that_cannot_be_read_is_never_taken_for_no_holder() {
     assert_token_nowhere(&w, &o, &token);
     let out = text(&o.stdout);
     assert!(code(&o) == 0 && !text(&o.stderr).contains(broken), "{}", text(&o.stderr));
-    assert!(out.contains(&format!("[!! ] {} (running) received the token at ", w.id)) && listed(&out), "{out}");
+    // A1: the VM's row records the seal it received, which status names by its Claude account.
+    let seal = ai_env_cli::bridge::agent::credential::seal_tag(&w.root.join("bridge").join("credentials").join("setup-token.env")).unwrap();
+    assert!(out.contains(&format!("[!! ] {} (running) received Claude account default's token (seal {seal}) at ", w.id)) && listed(&out), "{out}");
     let o = run(w.cmd(&["creds", "status", "--json"]), None);
     assert_token_nowhere(&w, &o, &token);
     assert!(code(&o) == 0 && !text(&o.stderr).contains(broken), "{}", text(&o.stderr));
@@ -2372,7 +2375,7 @@ esac
     let o = run(w.sealed_cmd(&["vm", "smoke", "--exec", "--with-credential", "--json"]), None);
     assert_token_nowhere(&w, &o, &token);
     assert_eq!(code(&o), 5, "{}", text(&o.stderr));
-    assert!(text(&o.stderr).contains("was refused by Anthropic") && text(&o.stderr).contains("ai-env creds setup-token"), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("Claude account default's token was refused by Anthropic") && text(&o.stderr).contains("ai-env creds account add default"), "{}", text(&o.stderr));
     assert_eq!((w.decrypts(), w.fake().vms.len()), (decrypts, vms), "refused before any Touch ID or VM");
 }
 
@@ -2852,7 +2855,7 @@ mod unseal_fixes {
         let fake = FileFakeMicrovmApi::open(&w.fake_path()).unwrap();
         let store = Keystore::resolve(Some(w.root.join("keys"))).unwrap();
         let tag = tag(&w);
-        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: tag.clone() };
+        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: tag.clone(), account: None };
         let ep = Held { fake: &fake, has: true, name: "CLAUDE_CODE_OAUTH_TOKEN", tag: &tag, caps: vec![CAP_CREDENTIAL_CACHE.to_string()] };
         let (before, gates) = (w.decrypts(), w.audit("credential_gate").len());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2947,8 +2950,8 @@ mod unseal_fixes {
         std::fs::remove_file(&state).unwrap();
         // No sealed token.
         std::fs::remove_file(w.root.join("bridge").join("credentials").join("setup-token.env")).unwrap();
-        refused(&warm, 5, "ai-env creds setup-token");
-        refused(&smoke, 5, "ai-env creds setup-token");
+        refused(&warm, 5, "no Claude account is active");
+        refused(&smoke, 5, "no Claude account is active");
         assert_eq!(w.decrypts(), before, "no Touch ID for any refusal");
         assert!(w.fake().vms.is_empty(), "no VM was started");
     }
@@ -3767,11 +3770,11 @@ fn lab_oauth_t1_never_replies_with_a_refused_seal() {
     let err = text(&o.stderr);
     assert_eq!(code(&o), 0, "{err}");
     assert_eq!(w.decrypts(), before, "a refused seal is never unsealed");
-    assert!(err.contains(&format!("the valid reply will be skipped: the sealed token (seal {tag}) was refused by Anthropic")), "{err}");
+    assert!(err.contains("the valid reply will be skipped: Claude account default's token was refused by Anthropic on 2026-10-08T09:00:00Z"), "{err} (seal {tag})");
     let row = probe_row(&w, "oauth-t1").expect("an oauth-t1 row");
     let note = row["note"].as_str().unwrap_or_default().to_string();
     assert_eq!(row["verdict"], "refresh-requested", "{note}");
-    assert!(note.contains("(2.1.290 (Claude Code))") && note.contains(&format!("valid: skipped (the sealed token (seal {tag}) was refused by Anthropic on 2026-10-08T09:00:00Z (microvm-refused)")), "{note}");
+    assert!(note.contains("(2.1.290 (Claude Code))") && note.contains("valid: skipped (Claude account default's token was refused by Anthropic on 2026-10-08T09:00:00Z"), "{note}");
     assert!(row.get("claude").is_none() && row.get("image_version").is_none() && row["ext"].is_null(), "nothing of the image: {row}");
     std::fs::remove_file(state.join("creds.toml")).unwrap();
     let o = run(w.sealed_cmd(&["lab", "run", "oauth-t1"]), None);
@@ -3936,6 +3939,7 @@ fn lab_credential_probes_refuse_a_stale_check_before_any_touch_id() {
 /// a module of their own: their helpers and imports stay theirs.
 mod integration_fixes {
     use super::*;
+    use ai_env_cli::bridge::accounts::Seal;
     use ai_env_cli::bridge::agent::credential::{prepare, seal_tag, CredentialPlan, CredentialSupply};
     use ai_env_cli::bridge::config::BridgeConfig;
     use ai_env_cli::bridge::lab::VmKnobs;
@@ -3957,7 +3961,7 @@ mod integration_fixes {
         let cfg = BridgeConfig::load(&paths).unwrap().unwrap();
         let fake = FileFakeMicrovmApi::open(&w.fake_path()).unwrap();
         let store = Keystore::resolve(Some(w.root.join("keys"))).unwrap();
-        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: seal_tag(&token_env(w)).unwrap() };
+        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: seal_tag(&token_env(w)).unwrap(), account: None };
         let vm = rt.block_on(fake.get(&w.id)).unwrap();
         (Ctx { paths, cfg, knobs: VmKnobs::default() }, fake, store, plan, vm)
     }
@@ -3977,7 +3981,7 @@ mod integration_fixes {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (ctx, fake, store, plan, vm) = prepared_world(&w, &rt);
         let row = w.row();
-        let in_hand = |recorded: &str| CredentialSupply { store: &store, token: Some((parse_token(&token).unwrap_or_else(|f| panic!("{}", f.message)), recorded.to_string())) };
+        let in_hand = |recorded: &str| CredentialSupply { store: &store, token: Some((parse_token(&token).unwrap_or_else(|f| panic!("{}", f.message)), Seal { tag: recorded.to_string(), account: None })) };
         let other = "0123456789abcdef";
         let e = rt.block_on(prepare(&ctx, &fake, &fake, &row, &vm, &plan, in_hand(other))).err().expect("a token recorded for another seal is refused");
         assert_eq!(e.exit_code(), 5, "{}", masked(&e.to_string(), &token));
@@ -4006,7 +4010,7 @@ mod integration_fixes {
         let row = w.row();
         let odd = format!("odd-shape-integration-{}", "Ic7".repeat(9));
         let masked_now = || !scrub(&format!("x {odd} y")).contains(&odd);
-        let supply = CredentialSupply { store: &store, token: Some((parse_token(&odd).unwrap_or_else(|f| panic!("{}", f.message)), plan.tag.clone())) };
+        let supply = CredentialSupply { store: &store, token: Some((parse_token(&odd).unwrap_or_else(|f| panic!("{}", f.message)), plan.seal())) };
         assert!(masked_now(), "the handle registered it");
         let prepared = rt.block_on(prepare(&ctx, &fake, &fake, &row, &vm, &plan, supply)).unwrap_or_else(|e| panic!("prepare: {}", e.exit_code()));
         assert!(prepared.delivery.holds_value());
@@ -4256,7 +4260,7 @@ mod fix_wave_2_gate {
         assert_output_clean(&o, &[&t1, &t2], &[&k2]);
         let err = text(&o.stderr);
         assert_eq!(code(&o), 0, "{err}");
-        assert!(err.contains("warning: combined.env not built (setup-token.env was sealed anew or removed while this command waited: none is built from what that replaced)"), "{err}");
+        assert!(err.contains("warning: combined.env not built (accounts/default.env was sealed anew or removed while this command waited: none is built from what that replaced)"), "{err}");
         assert!(!creds_dir(&w).join("combined.env").exists(), "no combined.env pairs t1 with t2's seal");
         assert_eq!(status_json(&w)["combined_env"]["state"], "absent");
         let o = run(w.cred_exec(&["--with-credential", "--", "/bin/sh", "-c", "cat <&3"]), None);
@@ -4373,7 +4377,7 @@ mod fix_wave_2_gate {
         assert_output_clean(&o, &[&t1, &t2], &[&k2]);
         let err = text(&o.stderr);
         assert_eq!(code(&o), 0, "{err}");
-        assert!(err.contains("warning: combined.env not built (setup-token.env was sealed anew or removed while this command waited") && err.contains("the combined.env there now, which another command built, matches its sources"), "{err}");
+        assert!(err.contains("warning: combined.env not built (accounts/default.env was sealed anew or removed while this command waited") && err.contains("the combined.env there now, which another command built, matches its sources"), "{err}");
         let kept = opened(&combined);
         assert!(kept.contains(&k2) && kept.contains(&t2) && !kept.contains(&t1), "combined.env holds k2 and t2 only ({} bytes)", kept.len());
         assert_eq!(status_json(&w)["combined_env"]["state"], "current");
@@ -4421,7 +4425,7 @@ mod fix_wave_2_gate {
         let state = status_json(&w)["combined_env"]["state"].as_str().unwrap_or("?").to_string();
         assert!(!opened(&combined).contains(&ta), "combined.env holds tA (it reads {state})");
         assert!(!combined.exists() && state == "absent", "no combined.env (it reads {state})");
-        assert!(err.contains("warning: combined.env not built (setup-token.env was sealed anew or removed while this command waited: none is built from what that replaced)"), "{err}");
+        assert!(err.contains("warning: combined.env not built (accounts/default.env was sealed anew or removed while this command waited: none is built from what that replaced)"), "{err}");
         for t in [&t0, &ta, &tb] {
             assert_token_off_disk(&w, t);
         }
@@ -4841,7 +4845,7 @@ mod fix_wave_2_gate {
         let cfg = BridgeConfig::load(&paths).unwrap().unwrap();
         let fake = FileFakeMicrovmApi::open(&w.fake_path()).unwrap();
         let store = Keystore::resolve(Some(w.root.join("keys"))).unwrap();
-        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: seal_tag(&creds_dir(w).join("setup-token.env")).unwrap() };
+        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: seal_tag(&creds_dir(w).join("setup-token.env")).unwrap(), account: None };
         let vm = rt.block_on(fake.get(&w.id)).unwrap();
         (Ctx { paths, cfg, knobs: VmKnobs::default() }, fake, store, plan, vm)
     }
@@ -5596,7 +5600,7 @@ fn b7s_stream_json_refusal_is_exit_5_through_vm_exec() {
     let o = run(w.cred_exec(&ask), None);
     assert_token_nowhere(&w, &o, &token);
     assert_eq!(code(&o), 5, "{}", text(&o.stderr));
-    assert!(text(&o.stderr).contains("was refused by Anthropic") && text(&o.stderr).contains("ai-env creds setup-token"), "{}", text(&o.stderr));
+    assert!(text(&o.stderr).contains("Claude account default's token was refused by Anthropic") && text(&o.stderr).contains("ai-env creds account add default"), "{}", text(&o.stderr));
     assert_eq!(w.decrypts(), before, "a known-bad seal costs no Touch ID");
     assert_eq!(starts(&w), 1, "never started again");
 }

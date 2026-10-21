@@ -28,12 +28,15 @@ const FIRST_EXEC_LIMIT: Duration = Duration::from_secs(120);
 /// The sibling: what it was started with, read back from its record.
 const FAKE_AI_ENV: &str = r#"#!/bin/sh
 # The prewarm test's sibling `ai-env`: records how it was started, holding
-# what it inherited (fd 3, the warm lock) for PREWARM_SLEEP seconds first.
+# what it inherited (fd 3, the warm lock) for PREWARM_SLEEP seconds first,
+# then for as long as "$PREWARM_LOG.hold" exists (600 looks at most).
 log="${PREWARM_LOG:?}"
 /usr/sbin/lsof -nP -a -p $$ -d 0-255 -F fn > "$log.lsof" 2>/dev/null
 ps -o pid=,pgid=,tty= -p $$ > "$log.ps" 2>/dev/null
 env | cut -d= -f1 > "$log.env"
 sleep "${PREWARM_SLEEP:-0}"
+n=0
+while [ -e "$log.hold" ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
 {
   printf 'argv0=%s\n' "$0"
   for a in "$@"; do printf 'arg=%s\n' "$a"; done
@@ -299,9 +302,13 @@ fn prewarm_spawns_the_sibling_detached_with_null_stdio_and_no_inherited_fds() {
     let work = w.root.join("work");
     let leaked = w.root.join("inherited-by-the-wrapper.txt");
     std::fs::write(&leaked, "open in the wrapper's parent\n").unwrap();
+    // The sibling holds the warm lock while its hold file exists, removed once the check below has looked: no
+    // sleep of its own for a loaded run's wrapper to outlast.
+    let hold = w.log().with_extension("log.hold");
+    std::fs::write(&hold, "").unwrap();
     // A shell parent opens the file on fd 7 (a redirection: no close-on-exec) and execs the wrapper with the
     // wrapper's own environment and cwd (`World::wrapper`).
-    let wrapper = w.wrapper(&AUTH_STATUS, &work, &[("PREWARM_SLEEP", "2")]);
+    let wrapper = w.wrapper(&AUTH_STATUS, &work, &[]);
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", "exec 7<\"$1\"; shift; exec \"$@\"", "sh"]).arg(&leaked).arg(wrapper.get_program()).args(wrapper.get_args());
     if let Some(dir) = wrapper.get_current_dir() {
@@ -322,7 +329,8 @@ fn prewarm_spawns_the_sibling_detached_with_null_stdio_and_no_inherited_fds() {
     let held = std::fs::File::open(&lock).unwrap();
     use std::os::fd::AsRawFd as _;
     // SAFETY: flock(2) on a descriptor this test owns, without waiting.
-    assert_ne!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "the prewarm holds the warm lock");
+    assert_ne!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "the prewarm holds the warm lock: {:?}", w.prewarm_note());
+    std::fs::remove_file(&hold).unwrap();
     let r = w.record();
     assert_eq!(r.argv0, w.root.join("bin").join("ai-env").display().to_string(), "the absolute sibling");
     assert_eq!(r.args, ["vm", "warm", work.to_str().unwrap(), "--prewarm"]);
@@ -576,6 +584,7 @@ fn a_pin_or_reuse_off_never_prewarms() {
 /// pass: `finished_at` is aged in place, the file's length kept.
 #[test]
 fn the_cool_down_holds_prewarm_after_prewarm() {
+    use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     let w = World::new(false, "");
     w.real_sibling();
@@ -585,16 +594,18 @@ fn the_cool_down_holds_prewarm_after_prewarm() {
         w.run(&AUTH_STATUS, &work, &[]);
         let note = w.prewarm_note().unwrap_or_default();
         assert!(note.starts_with("prewarm:spawned("), "round {round}: {note}");
-        // Its end: the lock free, the record finished.
+        // Its end: the lock free, the record finished, read under that lock as the wrapper reads it (the prewarm
+        // writes only while it holds it, its `finished_at=` line in several writes: read first, then found free,
+        // the bytes could end inside that line).
         let t = Instant::now();
         let record = loop {
-            let bytes = std::fs::read(&lock).unwrap_or_default();
+            let mut bytes = Vec::new();
             // SAFETY: flock(2) on a descriptor this test owns, without waiting; its close releases it.
-            let free = std::fs::File::open(&lock).is_ok_and(|f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0);
+            let free = std::fs::File::open(&lock).is_ok_and(|mut f| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 && f.read_to_end(&mut bytes).is_ok());
             if free && text(&bytes).contains("finished_at=") {
                 break bytes;
             }
-            assert!(t.elapsed() < LIMIT, "round {round}: the prewarm never ended: {:?}", text(&bytes));
+            assert!(t.elapsed() < LIMIT, "round {round}: the prewarm never ended: {:?}", text(&std::fs::read(&lock).unwrap_or_default()));
             std::thread::sleep(Duration::from_millis(25));
         };
         assert!(record.starts_with(b"pid=") && !record.contains(&0), "round {round}: the record from the first byte: {:?}", text(&record));

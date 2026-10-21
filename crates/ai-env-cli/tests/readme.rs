@@ -1207,8 +1207,11 @@ const STAYED_UNANSWERED: &str = "no Touch ID in time";
 /// the words of the other causes and of the wall's end (each quoted on its
 /// own), and the lines Cursor shows for a chat past its moves, for a failed
 /// move (the failure's own line in its middle shown as `…`) and for
-/// `[vm].max_concurrent` naming a parked VM. A text the code changes fails
-/// here before the docs drift from it.
+/// `[vm].max_concurrent` naming a parked VM; A1's notes, a chat that runs
+/// as another Claude account (`NEW`, `OLD`) and a usage limit (claude
+/// 2.1.305's, the fixture's: `NAME`, another account `OTHER`, the chat
+/// `UUID`). A text the code changes fails here before the docs drift from
+/// it.
 #[test]
 fn the_s10_section_quotes_the_wrappers_notes_and_lines() {
     let (readme, _) = docs();
@@ -1229,6 +1232,8 @@ fn the_s10_section_quotes_the_wrappers_notes_and_lines() {
         Failure::MovesExhausted { vm: vm.into(), moves: VmCfg::default().max_readdress }.line(),
         failed.replace(&inner.line(), "…"),
         Failure::MaxConcurrent { running: VmCfg::default().max_concurrent, parked: vec![vm.into()] }.line(),
+        remote::note_account("NEW", "OLD"),
+        usage_note(),
     ];
     let mut missing: Vec<String> = quotes.iter().filter(|q| !text.contains(&format!("`{}`", flat(q)))).cloned().collect();
     // Quoted as words of their own: what a note says inside its parentheses for the other causes, and the end of a stayed
@@ -1238,6 +1243,16 @@ fn the_s10_section_quotes_the_wrappers_notes_and_lines() {
     let words = [inside(&remote::note_moving(vm, LossCause::Unreachable)), inside(&remote::note_restarting(vm, LossCause::Gap)), stayed.rsplit_once("; ").map(|(_, end)| end.to_string()).unwrap_or_default()];
     missing.extend(words.into_iter().filter(|w| w.is_empty() || !text.contains(&format!("`{w}`"))));
     assert!(missing.is_empty(), "README.md's S10 section does not quote these as the wrapper writes them:\n{}", missing.join("\n"));
+}
+
+/// A1's usage-limit note as the README quotes it: claude 2.1.305's result
+/// (the fixture) for account `NAME`, with one other account, `OTHER`, free
+/// and seen, in the chat `UUID`.
+fn usage_note() -> String {
+    use ai_env_cli::bridge::accounts::usage::{note_usage_limit, Standing};
+    let hit = ai_env_cli::wire::ratelimit::parse_limit_result(include_str!("fixtures/claude/usage-limit-result-2.1.305.json").trim_end().as_bytes()).expect("a usage limit");
+    let other = Standing { name: "OTHER".into(), limited: false, weekly: Some(0.2), seen: true };
+    note_usage_limit("NAME", &hit, &[other], Some("UUID"), ai_env_cli::wire::time::unix_now())
 }
 
 /// The README's S10 section shows `[vm]`'s S10 keys as bridge.toml holds

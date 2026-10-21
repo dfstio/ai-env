@@ -108,7 +108,11 @@ opens: after a lost VM a dismissed one ends the chat (exit 3, none in time 5), w
 wall the chat stays where it is and asks again after the next turn. A restart of claude on the
 same VM asks none while that VM holds the token (one after a park), and an unpark asks none.
 `ai-env session migrate UUID` moves a chat to a new VM now and ends its old VM (one Touch ID):
-it is the user's to run, never yours.
+it is the user's to run, never yours. Which Claude account the chats run as is the user's choice
+too: `ai-env creds account use NAME` makes one active for new chats and moves (`ai-env creds
+account list` shows them, with no Touch ID; `ai-env creds account check` measures their usage, a
+Touch ID each), the user's to run, never yours; `ai-env creds account add` and `ai-env creds
+setup-token` read a token: never run them.
 
 Review with git (`git log --oneline BRANCH..box/BRANCH`) and merge by hand; never push a
 `box/*` or `box-quarantine/*` ref. `ai-env vm terminate ID` ends a VM (the next chat seeds a

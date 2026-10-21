@@ -546,6 +546,48 @@ fn the_fake_writes_its_transcript_and_mirrors_it_frame_for_frame() {
     assert_eq!(read(&file).lines().count(), 5);
 }
 
+/// A1: FAKE_USAGE_LIMIT refuses a turn as claude 2.1.305 does (S10 part
+/// B's B2): after the echo, FAKE_USAGE_LIMIT_EVENT's event, then one result
+/// line that is the fixture but for its ids (this session's, the user
+/// line's uuid as user_message_uuid(s), a uuid of its own), its keys in the
+/// fixture's order; no reply, no turn effects. `turn:<n>` refuses that turn
+/// alone; FAKE_USAGE_LIMIT_TEXT and FAKE_USAGE_LIMIT_PARAMS set the text and
+/// add the params. FAKE_RATE_LIMIT_INFO's info goes out verbatim in an
+/// answered turn's event, in place of FAKE_RATE_LIMIT_EVENT's line.
+#[test]
+fn the_fake_refuses_a_usage_limited_turn_as_claude_2_1_305_does() {
+    let f = Fake::new();
+    let (u1, u2) = (common::uuid(0x8811), common::uuid(0x8812));
+    let info = r#"{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.81,"unifiedWindows":{"seven_day":{"utilization":0.81,"resetsAt":1792663200}}}"#;
+    let knobs = [("FAKE_USAGE_LIMIT", "turn:2"), ("FAKE_USAGE_LIMIT_EVENT", r#"{"status":"rejected","rateLimitType":"seven_day"}"#), ("FAKE_RATE_LIMIT_INFO", info), ("FAKE_RATE_LIMIT_EVENT", "1"), ("FAKE_WRITE_TRANSCRIPT", "1")];
+    let (code, out, err) = f.run(&[], &knobs, &format!("{INIT}\n{}\n{}\n", user(&u1), user(&u2)));
+    assert_eq!(code, Some(0), "{err}");
+    let frames = json_lines(&out);
+    let kinds: Vec<&str> = frames.iter().map(|v| v["type"].as_str().unwrap_or_default()).collect();
+    assert_eq!(kinds, ["control_response", "system", "user", "assistant", "rate_limit_event", "result", "user", "rate_limit_event", "result"], "turn 1 answered, turn 2 refused");
+    let answered = out.iter().find(|l| l.contains("rate_limit_event")).unwrap();
+    assert!(answered.starts_with(&format!(r#"{{"type":"rate_limit_event","rate_limit_info":{info},"uuid":""#)), "the info verbatim: {answered}");
+    assert_eq!(frames[7]["rate_limit_info"]["status"], "rejected");
+    let sid = common::fake_fixed_sid();
+    let fixture = include_str!("fixtures/claude/usage-limit-result-2.1.305.json").trim_end();
+    let (theirs, ours): (Value, Value) = (serde_json::from_str(fixture).unwrap(), serde_json::from_str(&out[8]).unwrap());
+    assert_eq!((ours["session_id"].as_str(), ours["user_message_uuid"].as_str(), ours["user_message_uuids"][0].as_str()), (Some(sid.as_str()), Some(u2.as_str()), Some(u2.as_str())));
+    let ids = |v: &Value, k: &str| v[k].as_str().unwrap().to_string();
+    let same = out[8].replace(&sid, &ids(&theirs, "session_id")).replace(&u2, &ids(&theirs, "user_message_uuid")).replace(&ids(&ours, "uuid"), &ids(&theirs, "uuid"));
+    assert_eq!(same, fixture, "the fixture, byte for byte, but for its ids");
+    let transcript = read(&f.config().join("projects").join(f.slug()).join(format!("{sid}.jsonl")));
+    assert_eq!(transcript.lines().filter(|l| l.contains("\"type\":\"user\"")).count(), 1, "the refused turn wrote nothing");
+    // Every turn, its own text and the params.
+    let g = Fake::new();
+    let knobs = [("FAKE_USAGE_LIMIT", "1"), ("FAKE_USAGE_LIMIT_TEXT", "You've hit your session limit · resets 3pm (UTC)"), ("FAKE_USAGE_LIMIT_PARAMS", r#"{"rateLimitType":"five_hour","resetsAt":1792591200}"#)];
+    let (code, out, err) = g.run(&[], &knobs, &format!("{INIT}\n{}\n", user(&u1)));
+    assert_eq!(code, Some(0), "{err}");
+    let result: Value = serde_json::from_str(out.last().unwrap()).unwrap();
+    assert_eq!((result["result"].as_str(), result["api_error_params"]["rate_limit_info"]["rateLimitType"].as_str()), (Some("You've hit your session limit · resets 3pm (UTC)"), Some("five_hour")));
+    assert!(out.last().unwrap().starts_with(r#"{"api_error":"usage_limit_reached","api_error_origin":"first_party","api_error_params":{"rate_limit_info":"#), "{}", out.last().unwrap());
+    assert!(!out.iter().any(|l| l.contains("\"type\":\"assistant\"")), "no reply");
+}
+
 /// FAKE_RESUME_NEEDS_FILE: a --resume whose transcript is missing from the
 /// config dir is the CLI's miss (logged `resumed lines=missing`, exit 1
 /// before reading stdin); once the file is there the session resumes (logged
@@ -763,7 +805,7 @@ mod remote_link {
                     let api = FileFakeMicrovmApi::open(&fake).expect("the fake API");
                     let target = AgentTarget::from_row(&row).expect("the VM's target");
                     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::new(api), dp: Arc::new(NoDataPlane), tokens: Arc::new(NoDataPlane), paths, cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false, transcript: None });
-                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None })
+                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None, seal: None })
                 })
             }),
         )
@@ -1063,6 +1105,40 @@ fn a_resume_miss_retries_on_the_same_vm_with_its_transcript_and_no_second_touch_
     for part in ["transcript:staged", "credential:cached"] {
         assert!(note.split("; ").any(|p| p == part), "{part}: {note}");
     }
+}
+
+/// A1: a resume miss's retry keeps the first start's account, as it asks
+/// no Touch ID: `work` made the active account while the first CLI is up
+/// (between its answer to `initialize` and its miss) changes nothing for
+/// the retry, which takes the VM's copy of `default`'s token (both CLIs
+/// read it on fd 3); no `session_account`, both starts `default`.
+#[test]
+fn a1_a_resume_miss_retry_keeps_the_first_starts_account() {
+    let mut p = Harness::prepare();
+    let default = p.rig().token().to_string();
+    p.rig().seal_account("work", "Wk");
+    let sid = common::uuid(0x8836);
+    let earlier = format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#, common::uuid(0x8837));
+    p.plant_transcript(&sid, &[earlier.as_str()]);
+    let before = p.rig().decrypts();
+    let log = p.root.join("token.log").display().to_string();
+    let resume = format!("--resume={sid}");
+    let knobs = [("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_RESUME_FAIL_AFTER_ACK", "1"), ("FAKE_MISS_DELAY_MS", "1500"), ("AI_ENV_BRIDGE_LAB_TRANSCRIPT", "skip"), ("FAKE_TOKEN_LOG", log.as_str())];
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &knobs);
+    let init = h.send_initialize();
+    h.expect_out(|v| is_response_to(v, &init), T);
+    let installed = ai_env_cli::bridge::accounts::install(&h.rig().paths(), "work").expect("work installed");
+    assert_eq!(installed.from.as_deref(), Some("default"));
+    let u = h.send_user("after the miss");
+    h.expect_out(|v| is_result_for(v, &u), T);
+    closed(&mut h);
+    assert_eq!(h.rig().decrypts() - before, 1, "no second Touch ID (D1)");
+    let sha8 = &sha256_hex(&default)[..8];
+    let want: Vec<String> = (1..=2).map(|gen| format!("gen {gen} source=fd len={} sha8={sha8} fdvar=3 envvar=absent", default.len())).collect();
+    assert_eq!(read(&h.root().join("token.log")).lines().map(str::to_string).collect::<Vec<_>>(), want, "both CLIs read default's token");
+    let starts: Vec<(String, String)> = h.audit_events("session_remote_start").iter().map(|r| (r["detail"]["gen"].as_str().unwrap_or_default().to_string(), r["detail"]["account"].as_str().unwrap_or_default().to_string())).collect();
+    assert_eq!(starts, [("1".to_string(), "default".to_string()), ("2".to_string(), "default".to_string())]);
+    assert!(h.audit_events("session_account").is_empty(), "the retry keeps the first start's account");
 }
 
 /// D6: a workspace under the roots that is no git repository is refused at
@@ -2045,6 +2121,69 @@ fn a_session_on_a_vm_holding_the_token_sends_no_token() {
     let (one, two) = (end_note_of(&first, first.pid()), end_note_of(&first, second.pid()));
     assert_eq!(part_of(&one, "vm"), part_of(&two, "vm"));
     assert_eq!((part_of(&one, "credential").as_deref(), part_of(&two, "credential").as_deref()), (Some("combined"), Some("cached")), "the first sent combined.env's token; the second's CLI got the VM's copy:\n{one}\n{two}");
+}
+
+/// A1 (plans/s10-accounts-plan.md §5): a turn refused for the account's
+/// weekly limit (the fake as claude 2.1.305, `FAKE_USAGE_LIMIT=1`) reaches
+/// Cursor as the CLI printed it, then the exact note: account `default` (the
+/// green world's token, adopted) hit its weekly limit, and `spare` (sealed,
+/// never seen) is the account to go on with, and how. The limit is in
+/// `[usage.default]` (`source` `chat`, its kind, the CLI's text), audited
+/// `usage_limited`; nothing is recorded as refused; the wrapper exits 0 at
+/// the host's EOF; the census `account:default` and `usage_limited:1`.
+#[test]
+fn a1_a_usage_limited_turn_gets_its_note_and_its_record() {
+    use ai_env_cli::bridge::accounts::{self, usage};
+    let mut p = Harness::prepare();
+    p.rig().seal_account("spare", "Sp");
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &[("FAKE_USAGE_LIMIT", "1")]);
+    let init = started(&mut h);
+    let sid = init["session_id"].as_str().expect("the session id").to_string();
+    let u = h.send_user("one");
+    let note = h.expect_out(|v| v["subtype"] == "informational", T);
+    let want = format!("ai-env: account default hit its weekly limit (it resets 10am (UTC)); to go on now with account spare (its limits are unknown: ai-env creds account check): ai-env creds account use spare, then reopen this chat or run ai-env session migrate {sid}");
+    assert_eq!(note["content"].as_str(), Some(want.as_str()));
+    let out = h.out_json();
+    let result = out.iter().position(|v| is_result_for(v, &u)).expect("the refused turn's result");
+    assert_eq!((out[result]["api_error"].as_str(), out[result]["api_error_status"].as_u64()), (Some("usage_limit_reached"), Some(429)));
+    assert_eq!(out[result + 1]["content"].as_str(), Some(want.as_str()), "the note right after the result");
+    closed(&mut h);
+    let paths = h.rig().paths();
+    let state = accounts::read(&paths).unwrap().expect("the store");
+    let rec = usage::read_record(&state.usage["default"]);
+    let limited = rec.limited.clone().expect("limited");
+    assert_eq!((rec.source.as_deref(), rec.status.as_deref(), limited.kind.as_str(), limited.text.as_str()), (Some("chat"), Some("rejected"), "seven_day", "You've hit your weekly limit · resets 10am (UTC)"));
+    assert!(!state.usage.contains_key("spare"), "spare was never seen");
+    let audited = h.audit_events("usage_limited");
+    assert_eq!((audited.len(), audited[0]["detail"]["account"].as_str(), audited[0]["detail"]["kind"].as_str()), (1, Some("default"), Some("seven_day")), "{audited:#?}");
+    assert!(!paths.creds_state().exists() && h.audit_events("credential_rejected").is_empty(), "a usage limit is no refusal");
+    let note = h.end_note();
+    assert!(note.contains("; account:default; usage_limited:1"), "{note}");
+}
+
+/// A1: the windows a turn's `rate_limit_event` reports
+/// (`FAKE_RATE_LIMIT_INFO`) are recorded for the live generation's account
+/// (`default`), `source` `chat`, the line reaching Cursor as the CLI printed
+/// it; the census `rate_limit:1/1`.
+#[test]
+fn a1_a_rate_limit_event_records_the_accounts_windows() {
+    use ai_env_cli::bridge::accounts::{self, usage};
+    let mut p = Harness::prepare();
+    p.rig().seal_account("spare", "Sp");
+    let reset = ai_env_cli::wire::time::unix_now() + 3600;
+    let info = format!(r#"{{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.81,"resetsAt":{reset},"unifiedWindows":{{"five_hour":{{"utilization":0.23,"resetsAt":{reset}}},"seven_day":{{"utilization":0.81,"resetsAt":{reset}}}}},"isUsingOverage":false}}"#);
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &[("FAKE_RATE_LIMIT_INFO", info.as_str())]);
+    started(&mut h);
+    let u = h.send_user("one");
+    h.expect_out(|v| is_result_for(v, &u), T);
+    let event = h.out_lines().into_iter().find(|l| l.contains("rate_limit_event")).expect("the event");
+    assert!(event.starts_with(&format!(r#"{{"type":"rate_limit_event","rate_limit_info":{info},"#)), "as the CLI printed it: {event}");
+    closed(&mut h);
+    let state = accounts::read(&h.rig().paths()).unwrap().expect("the store");
+    let rec = usage::read_record(&state.usage["default"]);
+    assert_eq!((rec.source.as_deref(), rec.status.as_deref(), rec.warning.as_deref()), (Some("chat"), Some("allowed_warning"), Some("seven_day")));
+    assert_eq!((rec.five_hour.map(|w| (w.utilization, w.resets_at)), rec.seven_day.map(|w| (w.utilization, w.resets_at))), (Some((0.23, reset)), Some((0.81, reset))));
+    assert!(h.end_note().contains("; account:default; rate_limit:1/1"), "{}", h.end_note());
 }
 
 /// D1 and plan §3 (P1): the Touch ID and the workspace's preparation run at

@@ -92,7 +92,7 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 93] = [
+pub const REMOVED_ENV: [&str; 98] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -180,6 +180,12 @@ pub const REMOVED_ENV: [&str; 93] = [
     "FAKE_SUBTREE_LOG",
     "FAKE_TURN_MS",
     "FAKE_TURN_MARK",
+    // A1: the fake claude's usage of an account: its events, a refused turn.
+    "FAKE_RATE_LIMIT_INFO",
+    "FAKE_USAGE_LIMIT",
+    "FAKE_USAGE_LIMIT_TEXT",
+    "FAKE_USAGE_LIMIT_PARAMS",
+    "FAKE_USAGE_LIMIT_EVENT",
     "GIT_ARGV_LOG",
     "GIT_REAL",
     "FAKE_GIT_FAIL",

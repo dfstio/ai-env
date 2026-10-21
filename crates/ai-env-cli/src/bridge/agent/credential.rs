@@ -45,7 +45,22 @@
 //! half), `credential_unseal` (what, ms, outcome: `ok`, `exit N`, or
 //! `stopped` when the command's own stop dropped the unseal), and the
 //! session's `credential_deliver`. None carries a value.
+//!
+//! S10 addendum A1 (several Claude accounts, one installed: `accounts`):
+//! every token unseal and delivery names its seal and, when ai-env knows
+//! one, its account (labels fail open: an unreadable store reads
+//! `unknown`, never a refusal). The remote session re-plans from the
+//! installed copy ([`read_installed`]: read once, its seal, refused or not,
+//! then the VM's cache of that seal, or those very bytes unsealed:
+//! [`unseal_installed`]) at P1 ([`backend_for_session`]: a `combined.env`
+//! of another seal than P0 read is adopted before its dialog), P3
+//! ([`prepare_session`]) and every move ([`unseal_for_move`],
+//! [`move_delivery`] with the move's seal), so a switch (`creds account
+//! use`) takes effect at a chat's next spawn. One-shot commands (`vm
+//! exec`, `vm warm`, the smoke, lab probes) stay strict (M38): a seal other
+//! than the one [`check`] read ends them with exit 5, before any dialog.
 use super::{Delivery, DeliveryParts};
+use crate::bridge::accounts::{self, Seal};
 use crate::age_cmd::AgeTool;
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo};
 use crate::bridge::config::{BridgeConfig, CredentialsSource, Paths};
@@ -83,16 +98,72 @@ pub struct CredentialPlan {
     pub file: Option<PathBuf>,
     /// The seal id of the file the token comes from ([`seal_tag`]).
     pub tag: String,
+    /// A1: the Claude account that seal is, when ai-env knows one
+    /// (`accounts::label`, failing open); none in a tree with no account.
+    pub account: Option<String>,
+}
+
+impl CredentialPlan {
+    /// The plan's seal: its tag and account.
+    #[must_use]
+    pub fn seal(&self) -> Seal {
+        Seal { tag: self.tag.clone(), account: self.account.clone() }
+    }
 }
 
 /// What a credentialed command brings to [`prepare`]: the keystore for a
 /// second unseal, and the token when it came with the runtime key, with the
-/// seal id the `combined.env` it was decrypted from records for it
+/// seal the `combined.env` it was decrypted from records for it
 /// ([`backend_for_credential`]): [`prepare`] sends it only under the seal id
-/// [`check`] read.
+/// [`check`] read (the remote session's [`prepare_session`] adopts it).
 pub struct CredentialSupply<'a> {
     pub store: &'a Keystore,
-    pub token: Option<(SetupToken, String)>,
+    pub token: Option<(SetupToken, Seal)>,
+}
+
+/// The installed setup-token as one re-plan read it ([`read_installed`]):
+/// its sealed text, read once (a container: no secret), and its seal.
+/// What is unsealed from it is exactly these bytes ([`unseal_installed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSeal {
+    pub text: String,
+    pub seal: Seal,
+}
+
+/// A1's re-plan of the token: `credentials/setup-token.env`, the active
+/// account's installed copy, read once (never through a link, nor a file
+/// that is no ai-env container), its seal id, refused or not (exit 5 for a
+/// refused seal or an unreadable refusal record, before any Touch ID:
+/// [`refuse_rejected`]), and its account (`accounts::label`: a store that
+/// cannot be read labels it `unknown`, never a failure, L-2). Absent while
+/// accounts exist: "no Claude account is active" (`accounts::NO_ACTIVE`),
+/// exit 5; in a tree with no account, today's words.
+pub fn read_installed(paths: &Paths) -> Result<InstalledSeal> {
+    let path = paths.setup_token_env();
+    let hint = "seal it with `ai-env creds setup-token`";
+    match aws_env_state(&path) {
+        AwsEnvState::Sealed => {}
+        AwsEnvState::Absent => return Err(CliError::AuthUnavailable(accounts::spawn_problem(paths).unwrap_or_else(|| format!("{} does not exist: {hint}", path.display())))),
+        AwsEnvState::NotSealed(why) => return Err(CliError::AuthUnavailable(format!("{} {why}: {hint}", path.display()))),
+    }
+    let text = match crate::bridge::registry::read_regular_file(&path) {
+        Ok(Some(text)) if crate::container::detect(&text) => text,
+        Ok(Some(_)) => return Err(CliError::AuthUnavailable(format!("{} is not an ai-env container (plaintext?): {hint}", path.display()))),
+        _ => return Err(CliError::AuthUnavailable(format!("{} cannot be read: {hint}", path.display()))),
+    };
+    let tag = tag_of(&text);
+    refuse_rejected(paths, &tag)?;
+    let account = accounts::label(paths, &tag);
+    Ok(InstalledSeal { text, seal: Seal { tag, account } })
+}
+
+/// `seal T`, with `, Claude account NAME` when `seal` names one: what a
+/// message says inside its parentheses.
+fn seal_words(seal: &Seal) -> String {
+    match &seal.account {
+        Some(a) => format!("seal {}, Claude account {a}", seal.tag),
+        None => format!("seal {}", seal.tag),
+    }
 }
 
 /// The seal id of a sealed file: the first 16 hex digits of the sha256 of
@@ -168,18 +239,22 @@ pub fn check(cfg: &BridgeConfig, paths: &Paths, row: &VmRow, argv: &[String], fl
         audit_event(paths, "credential_gate", &[("id", row.id.clone()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "local".into())]);
         return Err(r.policy(&row.id).into());
     }
-    let (path, hint) = match &flags.file {
-        Some(f) => (f.clone(), "give a container that `ai-env creds setup-token` or `ai-env encrypt` made"),
-        None => (paths.setup_token_env(), "seal it with `ai-env creds setup-token`"),
+    let Some(path) = &flags.file else {
+        // A1: the installed copy, its account labelled (never failed by the store).
+        let installed = read_installed(paths)?;
+        return Ok(Some(CredentialPlan { deliver, file: None, tag: installed.seal.tag, account: installed.seal.account }));
     };
-    match aws_env_state(&path) {
+    let hint = "give a container that `ai-env creds setup-token` or `ai-env encrypt` made";
+    match aws_env_state(path) {
         AwsEnvState::Sealed => {}
         AwsEnvState::Absent => return Err(CliError::AuthUnavailable(format!("{} does not exist: {hint}", path.display()))),
         AwsEnvState::NotSealed(why) => return Err(CliError::AuthUnavailable(format!("{} {why}: {hint}", path.display()))),
     }
-    let tag = seal_tag(&path).ok_or_else(|| CliError::AuthUnavailable(format!("{} cannot be read: {hint}", path.display())))?;
+    let tag = seal_tag(path).ok_or_else(|| CliError::AuthUnavailable(format!("{} cannot be read: {hint}", path.display())))?;
     refuse_rejected(paths, &tag)?;
-    Ok(Some(CredentialPlan { deliver, file: flags.file.clone(), tag }))
+    // A best-effort label: an account's file (`credentials/accounts/X.env`) runs one command as X.
+    let account = accounts::label(paths, &tag);
+    Ok(Some(CredentialPlan { deliver, file: flags.file.clone(), tag, account }))
 }
 
 /// How the token reaches the command: `--deliver` when given, else what
@@ -246,20 +321,47 @@ pub fn read_rejection(paths: &Paths, tag: &str) -> std::result::Result<Option<Re
 /// A seal other than `setup-token.env`'s is a `--credential-file` container:
 /// only that container is refused. A store that cannot be read refuses too
 /// (exit 5, naming it): which seals were refused is then unknown.
+///
+/// A1 names the Claude account the seal is (`accounts::label`) when there
+/// are accounts: the installed one's ("seal a fresh one … logged in as that
+/// account, then `creds account add NAME`, or `creds account use OTHER`"),
+/// another account's file (the same, without `use`), or a seal no account
+/// holds (the installed one: `creds account use NAME` installs one; a
+/// `--credential-file` container: today's words). An installed seal whose
+/// account cannot be told, the store or `credentials/accounts/` unreadable
+/// (labels read `unknown` then, L-2), says that and the store's repair
+/// hint, not "no account holds it": `creds account use` and `list` would
+/// meet the same store. These account texts leave out the VM that saw the
+/// refusal, and a named account's seal id (`creds status` shows both), so
+/// that the wrapper's line in Cursor (`Failure::NoToken`, within
+/// `remote::LINE_MAX`) keeps a named account's fix whatever its name. With
+/// no account at all (a legacy tree) the texts are today's.
 pub fn refuse_rejected(paths: &Paths, tag: &str) -> Result<()> {
     let r = read_rejection(paths, tag).map_err(|e| CliError::AuthUnavailable(format!("{e}: which tokens Anthropic refused is unknown, so nothing is unsealed; repair it, or remove it to forget every recorded refusal")))?;
     let Some(r) = r else { return Ok(()) };
-    if seal_tag(&paths.setup_token_env()).as_deref() == Some(tag) {
-        Err(CliError::AuthUnavailable(format!(
-            "the sealed token (seal {tag}) was refused by Anthropic on {} ({}): seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`; nothing was unsealed",
-            r.at, r.vm
-        )))
-    } else {
-        Err(CliError::AuthUnavailable(format!(
-            "the token given with --credential-file (seal {tag}) was refused by Anthropic on {} ({}): give another container; the sealed setup-token is not affected; nothing was unsealed",
-            r.at, r.vm
-        )))
-    }
+    let installed = seal_tag(&paths.setup_token_env()).as_deref() == Some(tag);
+    let (at, vm) = (&r.at, &r.vm);
+    let said = match (accounts::label(paths, tag), installed) {
+        (Some(name), installed) if name != accounts::UNKNOWN => {
+            let other = if installed { ", or `ai-env creds account use OTHER`" } else { "" };
+            format!("Claude account {name}'s token was refused by Anthropic on {at}: seal a fresh one with `claude setup-token` (logged in as that account), then `ai-env creds account add {name}`{other}; nothing was unsealed")
+        }
+        (Some(_), true) => match accounts_unreadable(paths) {
+            Some(why) => format!("the installed token (seal {tag}) was refused by Anthropic on {at}; {why}; nothing was unsealed"),
+            None => format!("the installed token (seal {tag}), which no Claude account holds, was refused by Anthropic on {at}: `ai-env creds account use NAME` installs an account (`ai-env creds account list` names them); nothing was unsealed"),
+        },
+        (None, true) => format!("the sealed token (seal {tag}) was refused by Anthropic on {at} ({vm}): seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`; nothing was unsealed"),
+        (_, false) => format!("the token given with --credential-file (seal {tag}) was refused by Anthropic on {at} ({vm}): give another container; the sealed setup-token is not affected; nothing was unsealed"),
+    };
+    Err(CliError::AuthUnavailable(said))
+}
+
+/// A1: why which Claude account holds a seal cannot be told (labels read
+/// `unknown` then, L-2): `state/accounts.toml` cannot be read (with its
+/// repair hint, `accounts::unreadable`), or `credentials/accounts/` cannot;
+/// `None` when both can.
+fn accounts_unreadable(paths: &Paths) -> Option<String> {
+    accounts::read(paths).err().map(|why| accounts::unreadable(&why)).or_else(|| accounts::account_files(paths).err().map(|why| format!("{why}: Claude account names are unknown")))
 }
 
 /// Record that the token sealed as `tag` was refused on `vm_id`: the
@@ -479,14 +581,24 @@ pub async fn unseal_killable(store: &Keystore, ctx: &Ctx, path: &Path, what: &st
             return Err(sealed_anew(path, checked, &now, false));
         }
     }
-    let cont = crate::container::read(&text)?;
+    Ok((unseal_text_killable(store, ctx, &text, what, deadline, stopping).await?, text))
+}
+
+/// [`unseal_killable`]'s unseal of a sealed text already read (`text`, one
+/// container), with no read of its own (A1: what a re-plan read, tagged and
+/// refusal-checked, is what is decrypted): the same countdown, deadline,
+/// dialog lock and stops.
+pub async fn unseal_text_killable(store: &Keystore, ctx: &Ctx, text: &str, what: &str, deadline: &str, stopping: Stopping) -> Result<Zeroizing<Vec<u8>>> {
+    let key = ctx.cfg.creds.key.as_str();
+    validate_key_name(key).map_err(|e| CliError::Msg(format!("[creds].key: {e}")))?;
+    let cont = crate::container::read(text)?;
     let name = crate::select::resolve_for_decrypt(store, Some(key), &cont)?;
     let Stopping::ByDrop { until } = stopping else {
-        return unseal_own(store, ctx, &name, cont.data, what, deadline).await.map(|plain| (plain, text));
+        return unseal_own(store, ctx, &name, cont.data, what, deadline).await;
     };
     let age = Arc::new(AgeTool::probe()?);
     let dialog = Dialog { age, identity: store.identity_path(&name), data: cont.data, what, advice: deadline };
-    Ok((unseal_by_drop(&ctx.paths, dialog, budget(ctx), until).await?, text))
+    unseal_by_drop(&ctx.paths, dialog, budget(ctx), until).await
 }
 
 /// One Touch ID dialog to open: the decrypt of `data` with `identity`, what
@@ -613,6 +725,17 @@ impl<'a> UnsealRow<'a> {
         UnsealRow { paths, fields, started: Instant::now(), written: false }
     }
 
+    /// A1: the token's seal, and its account when known.
+    fn with_seal(mut self, seal: Option<&Seal>) -> UnsealRow<'a> {
+        if let Some(seal) = seal {
+            self.fields.push(("tag", seal.tag.clone()));
+            if let Some(account) = &seal.account {
+                self.fields.push(("account", account.clone()));
+            }
+        }
+        self
+    }
+
     /// The unseal ended: `ok`, or `exit N` for its own failure (a dismissed
     /// dialog, the deadline, a stop its own listeners took).
     fn end<T>(mut self, r: &Result<T>) {
@@ -642,22 +765,39 @@ impl Drop for UnsealRow<'_> {
 }
 
 /// [`unseal_killable`] of the token at `path`, audited `credential_unseal`
-/// ([`UnsealRow`]): the token and the seal id of the bytes it was decrypted
-/// from, which must be `checked` (a file sealed anew is refused before its
-/// dialog, audited `exit 5`). The setup-token is never unsealed for a VM
-/// whose shim, as last read, cannot hold it ([`cached_on_vm`] has just read
-/// it): exit 7 with no Touch ID, and no row. `--credential-file`'s one-shot
-/// delivery needs no cache, and comes only with `vm exec`, before anything
-/// started.
+/// ([`UnsealRow`], with the seal and its account): the token and the seal id
+/// of the bytes it was decrypted from, which must be `checked`'s (a file
+/// sealed anew is refused before its dialog, audited `exit 5`). The
+/// setup-token is never unsealed for a VM whose shim, as last read, cannot
+/// hold it ([`cached_on_vm`] has just read it): exit 7 with no Touch ID, and
+/// no row. `--credential-file`'s one-shot delivery needs no cache, and comes
+/// only with `vm exec`, before anything started.
 #[allow(clippy::too_many_arguments)]
-async fn unseal_token(store: &Keystore, ctx: &Ctx, path: &Path, what: &'static str, source: &str, vm_id: &str, checked: &str, stopping: Stopping) -> Result<(SetupToken, String)> {
+async fn unseal_token(store: &Keystore, ctx: &Ctx, path: &Path, what: &'static str, source: &str, vm_id: &str, checked: &Seal, stopping: Stopping) -> Result<(SetupToken, String)> {
     let one_shot = source == "file";
     if let Some(e) = crate::bridge::vm::registry::read_row(&ctx.paths, vm_id).ok().flatten().as_ref().and_then(cannot_hold).filter(|_| !one_shot) {
         return Err(e);
     }
     let deadline = if one_shot { "nothing was started; answer the dialog sooner or raise [creds].unseal_timeout_s" } else { "nothing was delivered; answer the dialog sooner or raise [creds].unseal_timeout_s" };
-    let row = UnsealRow::start(&ctx.paths, Some(vm_id), source);
-    let r = unseal_killable(store, ctx, path, what, "seal it with `ai-env creds setup-token`", deadline, Some(checked), stopping).await.and_then(|(plain, sealed)| Ok((parse_token_env(&plain)?, tag_of(&sealed))));
+    let row = UnsealRow::start(&ctx.paths, Some(vm_id), source).with_seal(Some(checked));
+    let r = unseal_killable(store, ctx, path, what, "seal it with `ai-env creds setup-token`", deadline, Some(&checked.tag), stopping).await.and_then(|(plain, sealed)| Ok((parse_token_env(&plain)?, tag_of(&sealed))));
+    row.end(&r);
+    r
+}
+
+/// A1: the installed setup-token as a re-plan read it (`installed`, read
+/// once by [`read_installed`]), unsealed with no second read: the token is
+/// of `installed.seal` (M38 by construction). Audited `credential_unseal`
+/// (source `setup-token`, the seal and its account; the VM's `id` once one
+/// is chosen). Never for a VM whose shim, as last read, cannot hold it (exit
+/// 7 with no Touch ID, and no row).
+pub async fn unseal_installed(store: &Keystore, ctx: &Ctx, installed: &InstalledSeal, vm_id: Option<&str>, stopping: Stopping) -> Result<SetupToken> {
+    if let Some(e) = vm_id.and_then(|id| crate::bridge::vm::registry::read_row(&ctx.paths, id).ok().flatten()).as_ref().and_then(cannot_hold) {
+        return Err(e);
+    }
+    let deadline = "nothing was delivered; answer the dialog sooner or raise [creds].unseal_timeout_s";
+    let row = UnsealRow::start(&ctx.paths, vm_id, "setup-token").with_seal(Some(&installed.seal));
+    let r = unseal_text_killable(store, ctx, &installed.text, "the setup token", deadline, stopping).await.and_then(|plain| Ok(parse_token_env(&plain)?));
     row.end(&r);
     r
 }
@@ -669,11 +809,14 @@ async fn unseal_token(store: &Keystore, ctx: &Ctx, path: &Path, what: &'static s
 /// `combined.env` one Touch ID unseals the key and the token together (D4);
 /// otherwise the key alone (a note says the token may cost a second Touch
 /// ID). Profile mode, and the fake API without its unseal knob, unseal
-/// nothing here ([`backend`]). The token comes with the seal id the text it
+/// nothing here ([`backend`]). The token comes with the seal the text it
 /// was decrypted from records for it ([`from_combined`]); a text that
 /// records none hands over no token (it is unsealed on its own if needed).
-pub async fn backend_for_credential(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan) -> Result<(Backend, Option<(SetupToken, String)>)> {
-    backend_with(store, ctx, plan, Stopping::Own).await
+/// Strict (M38): a `combined.env` that records another seal than [`check`]
+/// read (sealed anew, another account installed, since) is refused before
+/// its dialog, exit 5.
+pub async fn backend_for_credential(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan) -> Result<(Backend, Option<(SetupToken, Seal)>)> {
+    backend_with(store, ctx, plan, Stopping::Own, false).await
 }
 
 /// [`backend_for_credential`] for the remote session (S8 P1, D1: one Touch
@@ -681,30 +824,51 @@ pub async fn backend_for_credential(store: &Keystore, ctx: &Ctx, plan: &Credenti
 /// the token comes with the runtime key) under [`Stopping::ByDrop`], its
 /// budget ending before `until` (P1 passes the census start plus
 /// `remote::INIT_DEADLINE`: Cursor's initialize window would close);
-/// nothing on stderr but the countdown.
-pub async fn backend_for_session(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, until: Instant) -> Result<(Backend, Option<(SetupToken, String)>)> {
-    backend_with(store, ctx, plan, Stopping::ByDrop { until }).await
+/// nothing on stderr but the countdown. A1 re-plans: a `combined.env` that
+/// records another seal than P0 read (a `creds account use` since) is
+/// refusal-checked and adopted, with its account, before its dialog.
+pub async fn backend_for_session(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, until: Instant) -> Result<(Backend, Option<(SetupToken, Seal)>)> {
+    backend_with(store, ctx, plan, Stopping::ByDrop { until }, true).await
 }
 
 /// S10 (§2.8, M1): a move's Touch ID for the setup-token, the second of the
 /// wrapper's process (the runtime key is in memory): `setup-token.env`,
-/// never `combined.env`, sealed as `plan.tag` (a file sealed anew is
-/// refused before its dialog, exit 5), its budget `[creds].unseal_timeout_s`
-/// but ending a second before `until` ([`room_until`]), under
-/// [`Stopping::ByDrop`]; audited `credential_unseal` with `source`
-/// `setup-token` and no `id` (no VM is chosen yet). The token, and the seal
-/// id of the bytes it was decrypted from.
-pub async fn unseal_for_move(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, until: Instant) -> Result<(SetupToken, String)> {
-    let deadline = "nothing was delivered; answer the dialog sooner or raise [creds].unseal_timeout_s";
-    let row = UnsealRow::start(&ctx.paths, None, "setup-token");
-    let r = unseal_killable(store, ctx, &ctx.paths.setup_token_env(), "the setup token", "seal it with `ai-env creds setup-token`", deadline, Some(&plan.tag), Stopping::ByDrop { until })
-        .await
-        .and_then(|(plain, sealed)| Ok((parse_token_env(&plain)?, tag_of(&sealed))));
+/// never `combined.env`, its budget `[creds].unseal_timeout_s` but ending a
+/// second before `until` ([`room_until`]), under [`Stopping::ByDrop`];
+/// audited `credential_unseal` with `source` `setup-token` and no `id` (no
+/// VM is chosen yet). A1: the move re-plans: `installed` is the installed
+/// copy as the move read it at its start ([`read_installed`]), so a switch
+/// (`creds account use`) is taken here, and the token is of its seal
+/// ([`unseal_installed`]).
+pub async fn unseal_for_move(store: &Keystore, ctx: &Ctx, installed: &InstalledSeal, until: Instant) -> Result<SetupToken> {
+    unseal_installed(store, ctx, installed, None, Stopping::ByDrop { until }).await
+}
+
+/// A1: `creds account check`'s Touch ID for Claude account `name`'s token:
+/// `path` (`credentials/accounts/<name>.env`), whose bytes must be sealed as
+/// `checked`, the seal the check read before any Touch ID (bytes sealed anew
+/// since are refused before their dialog, exit 5), under
+/// [`Stopping::Own`]: the command's own listeners close the dialog on a
+/// stop (130 or 143), with the countdown, `[creds].unseal_timeout_s`'s
+/// deadline (exit 5) and the dialog's turn on `state/unseal.lock`. Audited
+/// `credential_unseal` with `source` `account`, the `account` and no `id`
+/// (no VM). The token, and the seal id of the bytes it was decrypted from.
+pub(crate) async fn unseal_account(store: &Keystore, ctx: &Ctx, name: &str, path: &Path, checked: &str) -> Result<(SetupToken, String)> {
+    let deadline = "nothing was checked; answer the dialog sooner or raise [creds].unseal_timeout_s";
+    let what = format!("Claude account {name}'s token");
+    let hint = format!("seal it with `ai-env creds account add {name}`");
+    let mut row = UnsealRow::start(&ctx.paths, None, "account");
+    row.fields.push(("account", name.to_string()));
+    let r = unseal_killable(store, ctx, path, &what, &hint, deadline, Some(checked), Stopping::Own).await.and_then(|(plain, sealed)| Ok((parse_token_env(&plain)?, tag_of(&sealed))));
     row.end(&r);
     r
 }
 
-async fn backend_with(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, stopping: Stopping) -> Result<(Backend, Option<(SetupToken, String)>)> {
+/// [`backend_for_credential`]'s and [`backend_for_session`]'s body (the
+/// module doc): `combined.env`'s text read once before its dialog, its
+/// token's seal the plan's, or (`replan`, the session) another one adopted
+/// if not refused, or (strict) refused, exit 5, with nothing unsealed.
+async fn backend_with(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, stopping: Stopping, replan: bool) -> Result<(Backend, Option<(SetupToken, Seal)>)> {
     let container = matches!(CredentialsSource::parse(&ctx.cfg.aws.credentials)?, CredentialsSource::Container);
     let real_unseal = ctx.knobs.fake_api.is_none() || ctx.knobs.fake_api_unseal;
     if !container || !real_unseal {
@@ -719,19 +883,38 @@ async fn backend_with(store: &Keystore, ctx: &Ctx, plan: &CredentialPlan, stoppi
                 false
             }
         };
-    if !combined {
+    // A1: its text, read once now: the seal it records for its token is judged before any dialog.
+    let text = combined.then(|| sealed_text(&ctx.paths.combined_env(), "rebuild it with `ai-env creds setup-token`")).transpose().unwrap_or_else(|e| {
+        voice::note(&format!("combined.env could not be read ({e}): the setup token is a second Touch ID if the VM does not hold it"));
+        None
+    });
+    let Some(text) = text else {
         let hint = "seal the runtime key with `make runtime-key` (or set [aws] credentials = \"profile:<name>\")";
         let (plain, _) = unseal_killable(store, ctx, &ctx.paths.aws_env(), "the runtime key", hint, FIRST_PROMPT_DEADLINE, None, stopping).await?;
         let (id, secret) = crate::bridge::vm::client::parse_runtime_env(&plain)?;
         drop(plain);
         return Ok((connected(ctx, &id, &secret).await?, None));
-    }
-    let row = UnsealRow::start(&ctx.paths, None, "combined");
-    let unsealed = unseal_killable(store, ctx, &ctx.paths.combined_env(), "the runtime key and the setup token", "rebuild it with `ai-env creds setup-token`", FIRST_PROMPT_DEADLINE, None, stopping).await;
+    };
+    let seal = match combined_token_tag(&text) {
+        None => None,
+        Some(tag) if tag == plan.tag => Some(plan.seal()),
+        // The session (A1): another account installed since P0 read it; its seal refused is exit 5, before the dialog.
+        Some(tag) if replan => {
+            refuse_rejected(&ctx.paths, &tag)?;
+            let account = accounts::label(&ctx.paths, &tag);
+            Some(Seal { tag, account })
+        }
+        // A one-shot command (M38): the token it would get is not the one `check` read.
+        Some(tag) => return Err(sealed_anew(&ctx.paths.setup_token_env(), &plan.tag, &tag, false)),
+    };
+    let row = UnsealRow::start(&ctx.paths, None, "combined").with_seal(seal.as_ref());
+    let unsealed = unseal_text_killable(store, ctx, &text, "the runtime key and the setup token", FIRST_PROMPT_DEADLINE, stopping).await;
     row.end(&unsealed);
-    let (plain, sealed) = unsealed?;
-    let ((id, secret), token) = from_combined(&plain, &sealed)?;
+    let plain = unsealed?;
+    let ((id, secret), token) = from_combined(&plain, &text)?;
     drop(plain);
+    // The tag `from_combined` read is the seal's: one text, read once.
+    let token = token.map(|(t, tag)| (t, Seal { account: seal.and_then(|s| s.account), tag }));
     Ok((connected(ctx, &id, &secret).await?, token))
 }
 
@@ -771,10 +954,12 @@ async fn connected(ctx: &Ctx, id: &str, secret: &str) -> Result<Backend> {
 
 /// A delivery ready for the session, and where its token came from:
 /// `combined` (with the runtime key), `setup-token` (unsealed now), `cached`
-/// (the VM holds it; nothing unsealed) or `file` (`--credential-file`).
+/// (the VM holds it; nothing unsealed) or `file` (`--credential-file`); and
+/// (A1) the seal it delivers, with its account: the generation's.
 pub struct Prepared {
     pub delivery: Delivery,
     pub source: &'static str,
+    pub seal: Seal,
 }
 
 /// The word for the VM's cached copy of the token (S7): [`Prepared`]'s
@@ -797,7 +982,7 @@ impl Prepared {
 /// The gate, the token (in hand, cached on the VM, or unsealed now) and the
 /// delivery bound to the pass (see the module doc).
 pub async fn prepare<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>) -> Result<Prepared> {
-    prepare_with(ctx, api, ep, row, vm, plan, supply, Stopping::Own).await
+    prepare_with(ctx, api, ep, row, vm, plan, supply, Stopping::Own, false).await
 }
 
 /// [`prepare`] for the remote session (S8 P3, beside the workspace step):
@@ -806,10 +991,14 @@ pub async fn prepare<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &
 /// before `until`: a second Touch ID only when `combined.env` is not current
 /// and the VM lacks it), the delivery bound to the pass. Once the workspace
 /// step joined, the session gates again without a prompt if the pass passed
-/// half its life ([`regate_if_stale`]).
+/// half its life ([`regate_if_stale`]). A1 re-plans: a token in hand is
+/// delivered under its own seal (P1 adopted it); with none, the installed
+/// copy is read now ([`read_installed`]), the VM's cache checked for its
+/// seal, else those bytes unsealed ([`unseal_installed`]); the delivery and
+/// [`Prepared::seal`] name that seal and its account.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_session<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>, until: Instant) -> Result<Prepared> {
-    prepare_with(ctx, api, ep, row, vm, plan, supply, Stopping::ByDrop { until }).await
+    prepare_with(ctx, api, ep, row, vm, plan, supply, Stopping::ByDrop { until }, true).await
 }
 
 /// S10 (§2.8): the gate and the delivery for a move's VM, as
@@ -818,50 +1007,67 @@ pub async fn prepare_session<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &
 /// VM's cache holds (the spawn then finds the seal cached and sends
 /// nothing; the value goes with the delivery); none, `cached` when the VM
 /// holds this seal ([`cached_on_vm`]), else `CredentialMissing` (exit 5).
-/// A token sealed otherwise than the one checked is refused (exit 5).
-/// `until`: the move's window's end; nothing here waits on a dialog.
+/// A1: `seal` is the move's (what its re-plan read, or what phase A left in
+/// a prepared VM's cache), and a token in hand is of it (the caller's
+/// guarantee: it was unsealed from those very bytes); the delivery and
+/// [`Prepared::seal`] name it and its account. `until`: the move's window's
+/// end; nothing here waits on a dialog.
 #[allow(clippy::too_many_arguments)]
-pub async fn move_delivery<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, token: Option<(SetupToken, String)>, until: Instant) -> Result<Prepared> {
+pub async fn move_delivery<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, deliver: Deliver, seal: &Seal, token: Option<SetupToken>, until: Instant) -> Result<Prepared> {
     tracing::debug!(vm = %row.id, left_ms = u64::try_from(until.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX), "a move's delivery");
     let mut pass = gate(&ctx.cfg, &ctx.paths, api, row, vm).await?;
     let source = match &token {
-        Some((_, tag)) if *tag != plan.tag => return Err(sealed_anew(&ctx.paths.setup_token_env(), &plan.tag, tag, true)),
         Some(_) => "setup-token",
-        None if cached_on_vm(&ctx.paths, api, ep, row, vm, &plan.tag).await => {
-            record_holder(&ctx.paths, &row.id, &plan.tag, Held::Seen);
+        None if cached_on_vm(&ctx.paths, api, ep, row, vm, &seal.tag).await => {
+            record_holder(&ctx.paths, &row.id, &seal.tag, Held::Seen);
             CACHED
         }
-        None => return Err(BridgeError::CredentialMissing(format!("{} does not hold the setup-token (seal {}): nothing was sent", row.id, plan.tag)).into()),
+        None => return Err(BridgeError::CredentialMissing(format!("{} does not hold the setup-token ({}): nothing was sent", row.id, seal_words(seal))).into()),
     };
     if !fresh_enough(&pass, &row.id, unix_now()) {
         pass = gate(&ctx.cfg, &ctx.paths, api, row, vm).await?;
     }
-    let token = token.map(|(t, _)| t);
-    let parts = DeliveryParts { name: TOKEN_VAR.to_string(), tag: plan.tag.clone(), deliver: plan.deliver, secret: token.as_ref().map(SetupToken::frame_secret), one_shot: false };
-    let mut delivery = Delivery::new(&pass, &row.id, unix_now(), parts)?;
+    let parts = DeliveryParts { name: TOKEN_VAR.to_string(), tag: seal.tag.clone(), deliver, secret: token.as_ref().map(SetupToken::frame_secret), one_shot: false };
+    let mut delivery = Delivery::new(&pass, &row.id, unix_now(), parts)?.with_account(seal.account.clone());
     if token.as_ref().is_some_and(|t| t.prefix().is_none()) {
         delivery.keep_masked();
     }
     drop(token);
-    Ok(Prepared { delivery, source })
+    Ok(Prepared { delivery, source, seal: seal.clone() })
 }
 
+/// [`prepare`]'s and [`prepare_session`]'s body: the gate, the token (a
+/// `--credential-file`'s, one in hand, the VM's cached copy, or unsealed
+/// now: strict, the setup-token [`check`] read; `replan` (the session, A1),
+/// the installed copy read now), then the delivery bound to the pass.
 #[allow(clippy::too_many_arguments)]
-async fn prepare_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>, stopping: Stopping) -> Result<Prepared> {
+async fn prepare_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, plan: &CredentialPlan, supply: CredentialSupply<'_>, stopping: Stopping, replan: bool) -> Result<Prepared> {
     let CredentialSupply { store, token } = supply;
     let mut pass = gate(&ctx.cfg, &ctx.paths, api, row, vm).await?;
-    // The token and the seal id of the bytes it was decrypted from; none when the VM holds this seal.
-    let (token, source) = if let Some(file) = &plan.file {
+    // The token and the seal of the bytes it was decrypted from; none when the VM holds that seal.
+    let (token, seal, source) = if let Some(file) = &plan.file {
         drop(token);
-        (Some(unseal_token(store, ctx, file, "the token in --credential-file", "file", &row.id, &plan.tag, stopping).await?), "file")
-    } else if let Some(t) = token {
-        (Some(t), "combined")
+        let (t, tag) = unseal_token(store, ctx, file, "the token in --credential-file", "file", &row.id, &plan.seal(), stopping).await?;
+        (Some(t), Seal { tag, account: plan.account.clone() }, "file")
+    } else if let Some((t, seal)) = token {
+        (Some(t), seal, "combined")
+    } else if replan {
+        // A1: the installed copy now, read once: the VM's cache of its seal, else those very bytes unsealed.
+        let installed = read_installed(&ctx.paths)?;
+        if cached_on_vm(&ctx.paths, api, ep, row, vm, &installed.seal.tag).await {
+            record_holder(&ctx.paths, &row.id, &installed.seal.tag, Held::Seen);
+            (None, installed.seal, CACHED)
+        } else {
+            let t = unseal_installed(store, ctx, &installed, Some(&row.id), stopping).await?;
+            (Some(t), installed.seal, "setup-token")
+        }
     } else if cached_on_vm(&ctx.paths, api, ep, row, vm, &plan.tag).await {
         // The VM holds this seal: its row names it, even if no delivery recorded it.
         record_holder(&ctx.paths, &row.id, &plan.tag, Held::Seen);
-        (None, CACHED)
+        (None, plan.seal(), CACHED)
     } else {
-        (Some(unseal_token(store, ctx, &ctx.paths.setup_token_env(), "the setup token", "setup-token", &row.id, &plan.tag, stopping).await?), "setup-token")
+        let (t, tag) = unseal_token(store, ctx, &ctx.paths.setup_token_env(), "the setup token", "setup-token", &row.id, &plan.seal(), stopping).await?;
+        (Some(t), Seal { tag, account: plan.account.clone() }, "setup-token")
     };
     // One rule (M38): the value goes out only under the seal id of the bytes
     // it was decrypted from, which must be the one `check` read. A file sealed
@@ -869,10 +1075,11 @@ async fn prepare_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: 
     // `combined.env` rebuilt from it) is refused, never delivered under the
     // old id, which the row, the cache and a rejection would then name. A
     // token unsealed here was held to that before its dialog (F16); a token
-    // in hand came with the runtime key, and is held to it now.
-    if let Some((_, tag)) = token.as_ref().filter(|(_, tag)| *tag != plan.tag) {
+    // in hand came with the runtime key, and is held to it now. A1's
+    // re-plan delivers each token under the seal of its own bytes instead.
+    if !replan && token.is_some() && seal.tag != plan.tag {
         let path = plan.file.clone().unwrap_or_else(|| ctx.paths.setup_token_env());
-        return Err(sealed_anew(&path, &plan.tag, tag, true));
+        return Err(sealed_anew(&path, &plan.tag, &seal.tag, true));
     }
     // An unseal past half the pass's life (a slow Touch ID): gated again,
     // with no new prompt, so the session's dial never starts on a pass about
@@ -880,9 +1087,8 @@ async fn prepare_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: 
     if !fresh_enough(&pass, &row.id, unix_now()) {
         pass = gate(&ctx.cfg, &ctx.paths, api, row, vm).await?;
     }
-    let token = token.map(|(t, _)| t);
-    let parts = DeliveryParts { name: TOKEN_VAR.to_string(), tag: plan.tag.clone(), deliver: plan.deliver, secret: token.as_ref().map(SetupToken::frame_secret), one_shot: plan.file.is_some() };
-    let mut delivery = Delivery::new(&pass, &row.id, unix_now(), parts)?;
+    let parts = DeliveryParts { name: TOKEN_VAR.to_string(), tag: seal.tag.clone(), deliver: plan.deliver, secret: token.as_ref().map(SetupToken::frame_secret), one_shot: plan.file.is_some() };
+    let mut delivery = Delivery::new(&pass, &row.id, unix_now(), parts)?.with_account(seal.account.clone());
     // A token of a shape the scrubber's rules do not mask whole is masked only
     // while a handle registered it (`parse_token`): the delivery's copy takes
     // that over before this handle goes, until the delivery drops it (M46).
@@ -890,7 +1096,7 @@ async fn prepare_with<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: 
         delivery.keep_masked();
     }
     drop(token);
-    Ok(Prepared { delivery, source })
+    Ok(Prepared { delivery, source, seal })
 }
 
 /// S8 P3b: once the workspace step joined (a slow seed), a delivery whose
@@ -969,7 +1175,12 @@ pub(crate) fn record_delivery(paths: &Paths, vm_id: &str, spawn: Option<&str>, d
     if let Some(s) = spawn {
         pairs.push(("spawn", s.to_string()));
     }
-    pairs.extend([("name", delivery.name().to_string()), ("tag", delivery.tag().to_string()), ("source", source.to_string()), ("deliver", deliver.to_string())]);
+    pairs.extend([("name", delivery.name().to_string()), ("tag", delivery.tag().to_string())]);
+    // A1: the Claude account the seal is, when the delivery names one.
+    if let Some(account) = delivery.account() {
+        pairs.push(("account", account.to_string()));
+    }
+    pairs.extend([("source", source.to_string()), ("deliver", deliver.to_string())]);
     audit_event(paths, "credential_deliver", &pairs);
 }
 
@@ -1257,6 +1468,146 @@ mod tests {
         assert_ne!(tag, tag_of(&built), "never combined.env's own seal");
         let ((kid, _), handed) = from_combined(plain.as_bytes(), &crate::container::write(blob)).unwrap();
         assert!(kid == id && handed.is_none(), "no seal recorded: the runtime key alone");
+    }
+
+    /// An age-shaped blob: what a container seals here, never a value.
+    const BLOB: &[u8] = b"age-encryption.org/v1\n-> x\n--- y\n";
+
+    /// A sealed setup-token container; `n` tells the bytes, so the seal id, apart.
+    fn sealed(n: &str) -> String {
+        crate::container::write_annotated(BLOB, &[("kind", "setup-token"), ("chars", n)]).unwrap()
+    }
+
+    fn put(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A1: the installed copy, read once: absent in a legacy tree is today's
+    /// words, absent while accounts exist is "no Claude account is active";
+    /// installed, its seal is the bytes' and its account the one whose file
+    /// holds them; a store that cannot be read labels it `unknown` and
+    /// fails nothing (L-2); a refused seal is exit 5 naming the account;
+    /// plaintext or a link in its place is exit 5.
+    #[test]
+    fn the_installed_copy_is_read_once_its_account_labelled() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let e = read_installed(&paths).unwrap_err();
+        assert_eq!((e.exit_code(), e.to_string()), (5, format!("{} does not exist: seal it with `ai-env creds setup-token`", paths.setup_token_env().display())));
+        let work = sealed("w");
+        put(&paths.account_env("work"), &work);
+        let e = read_installed(&paths).unwrap_err();
+        assert_eq!((e.exit_code(), e.to_string()), (5, accounts::NO_ACTIVE.to_string()));
+        put(&paths.setup_token_env(), &work);
+        assert_eq!(read_installed(&paths).unwrap(), InstalledSeal { text: work.clone(), seal: Seal { tag: tag_of(&work), account: Some("work".into()) } });
+        put(&paths.accounts_state(), "[[account\n");
+        assert_eq!(read_installed(&paths).unwrap().seal.account.as_deref(), Some(accounts::UNKNOWN), "labels fail open");
+        std::fs::remove_file(paths.accounts_state()).unwrap();
+        record_rejection(&paths, "microvm-1", &tag_of(&work), "text");
+        let e = read_installed(&paths).unwrap_err();
+        assert!(e.exit_code() == 5 && e.to_string().starts_with("Claude account work's token was refused by Anthropic on "), "{e}");
+        std::fs::remove_file(paths.creds_state()).unwrap();
+        put(&paths.setup_token_env(), &format!("{TOKEN_VAR}=placeholder\n"));
+        let e = read_installed(&paths).unwrap_err();
+        assert!(e.exit_code() == 5 && e.to_string().contains("plaintext"), "{e}");
+        std::fs::remove_file(paths.setup_token_env()).unwrap();
+        std::os::unix::fs::symlink(paths.account_env("work"), paths.setup_token_env()).unwrap();
+        let e = read_installed(&paths).unwrap_err();
+        assert!(e.exit_code() == 5 && e.to_string().contains("symlink"), "{e}");
+    }
+
+    /// A1: a refusal names the Claude account the seal is: the installed
+    /// one's (fresh token, `creds account add`, or `use` another), another
+    /// account's file (no `use`), the installed copy no account holds
+    /// (`use` installs one), a `--credential-file` container (today's words);
+    /// the installed copy while the store or `credentials/accounts/` cannot
+    /// be read: which account is not known (the repair hint). The account
+    /// texts name no VM, nor a named account's seal (Cursor's line holds
+    /// them whole); a `--credential-file` container's names both.
+    #[test]
+    fn a_refusal_names_the_account_its_seal_is() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let (work, spare, foreign, file) = (sealed("w"), sealed("s"), sealed("f"), sealed("x"));
+        put(&paths.account_env("work"), &work);
+        put(&paths.account_env("spare"), &spare);
+        put(&paths.setup_token_env(), &work);
+        for t in [&work, &spare, &foreign, &file] {
+            record_rejection(&paths, "microvm-1", &tag_of(t), "text");
+        }
+        let said = |t: &str| {
+            let at = read_rejection(&paths, &tag_of(t)).unwrap().unwrap().at;
+            (refuse_rejected(&paths, &tag_of(t)).unwrap_err().to_string(), at)
+        };
+        let (text, at) = said(&work);
+        assert_eq!(text, format!("Claude account work's token was refused by Anthropic on {at}: seal a fresh one with `claude setup-token` (logged in as that account), then `ai-env creds account add work`, or `ai-env creds account use OTHER`; nothing was unsealed"));
+        let (text, at) = said(&spare);
+        assert_eq!(text, format!("Claude account spare's token was refused by Anthropic on {at}: seal a fresh one with `claude setup-token` (logged in as that account), then `ai-env creds account add spare`; nothing was unsealed"));
+        let (text, at) = said(&file);
+        assert!(text.starts_with(&format!("the token given with --credential-file (seal {}) was refused by Anthropic on {at} (microvm-1): ", tag_of(&file))) && text.ends_with("give another container; the sealed setup-token is not affected; nothing was unsealed"), "{text}");
+        put(&paths.setup_token_env(), &foreign);
+        let (text, at) = said(&foreign);
+        assert_eq!(text, format!("the installed token (seal {}), which no Claude account holds, was refused by Anthropic on {at}: `ai-env creds account use NAME` installs an account (`ai-env creds account list` names them); nothing was unsealed", tag_of(&foreign)));
+        // A store that cannot be read labels every seal `unknown` (L-2): which account holds the installed one is
+        // not known, so the text gives the store's repair hint, never "no Claude account holds" it.
+        put(&paths.setup_token_env(), &work);
+        put(&paths.accounts_state(), "[[account\n");
+        let (text, at) = said(&work);
+        let why = accounts::read(&paths).unwrap_err();
+        assert_eq!(text, format!("the installed token (seal {}) was refused by Anthropic on {at}; {}; nothing was unsealed", tag_of(&work), accounts::unreadable(&why)));
+        // So does `credentials/accounts/` that cannot be read, naming it.
+        std::fs::remove_file(paths.accounts_state()).unwrap();
+        let aside = d.path().join("accounts-aside");
+        std::fs::rename(paths.accounts_dir(), &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, paths.accounts_dir()).unwrap();
+        let (text, _) = said(&work);
+        assert!(text.ends_with("is a symlink; refusing to use Claude accounts through it: Claude account names are unknown; nothing was unsealed") && !text.contains("no Claude account holds"), "{text}");
+    }
+
+    /// A1 at the runtime key's unseal: a current `combined.env` that records
+    /// another seal than the plan's (an account installed since P0 read the
+    /// copy) is judged before its dialog. A one-shot command (strict) is
+    /// refused as sealed anew, exit 5; the session re-plans, and a refused
+    /// seal is exit 5 naming the account. Neither asks for Touch ID: no
+    /// decrypt starts and no `credential_unseal` row is written.
+    #[test]
+    fn a_combined_of_another_seal_is_judged_before_its_dialog() {
+        use crate::bridge::setup_token::text_sha256;
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let aws = crate::container::write_annotated(BLOB, &[("kind", "aws")]).unwrap();
+        put(&paths.aws_env(), &aws);
+        let (a, b) = (sealed("a"), sealed("b"));
+        put(&paths.account_env("work"), &b);
+        put(&paths.setup_token_env(), &b);
+        put(&paths.combined_env(), &crate::container::write_annotated(BLOB, &[("kind", "combined"), ("aws_file_sha256", &text_sha256(&aws)), ("token_file_sha256", &text_sha256(&b))]).unwrap());
+        assert_eq!(combined_state(&paths), CombinedState::Current);
+        let plan = CredentialPlan { deliver: Deliver::Fd, file: None, tag: tag_of(&a), account: Some("default".into()) };
+        let ctx = Ctx { paths: paths.clone(), cfg: BridgeConfig::default(), knobs: crate::bridge::lab::VmKnobs::default() };
+        let store = Keystore::resolve(Some(d.path().join("keys"))).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let e = rt.block_on(backend_for_credential(&store, &ctx, &plan)).err().expect("strict: refused");
+        let says = format!("{} was sealed anew while this command ran (seal {} when it was checked, {} in what was about to be unsealed): nothing was unsealed, nothing was sent; run the command again", paths.setup_token_env().display(), tag_of(&a), tag_of(&b));
+        assert_eq!((e.exit_code(), e.to_string()), (5, says));
+        record_rejection(&paths, "microvm-1", &tag_of(&b), "text");
+        let e = rt.block_on(backend_for_session(&store, &ctx, &plan, Instant::now() + Duration::from_secs(30))).err().expect("the session: refused");
+        assert!(e.exit_code() == 5 && e.to_string().starts_with("Claude account work's token was refused by Anthropic on "), "{e}");
+        let rows = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
+        assert!(!rows.iter().any(|r| r["event"] == "credential_unseal"), "no dialog: {rows:?}");
+    }
+
+    /// A1: `credential_unseal` names the seal and its account (none in a
+    /// legacy tree: the field is left out).
+    #[test]
+    fn an_unseal_row_names_its_seal_and_account() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        UnsealRow::start(&paths, Some("microvm-1"), "setup-token").with_seal(Some(&Seal { tag: "a".repeat(16), account: Some("work".into()) })).end(&Ok::<(), CliError>(()));
+        UnsealRow::start(&paths, None, "combined").with_seal(Some(&Seal { tag: "b".repeat(16), account: None })).end(&Err::<(), _>(CliError::Cancelled));
+        let rows: Vec<serde_json::Value> = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == "credential_unseal").map(|r| r["detail"].clone()).collect();
+        assert_eq!((rows[0]["id"].as_str(), rows[0]["tag"].as_str(), rows[0]["account"].as_str(), rows[0]["outcome"].as_str()), (Some("microvm-1"), Some("aaaaaaaaaaaaaaaa"), Some("work"), Some("ok")));
+        assert_eq!((rows[1]["source"].as_str(), rows[1]["tag"].as_str(), rows[1].get("account")), (Some("combined"), Some("bbbbbbbbbbbbbbbb"), None));
     }
 
     #[test]

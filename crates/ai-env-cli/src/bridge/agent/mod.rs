@@ -218,6 +218,9 @@ pub struct Delivery {
     masked: bool,
     /// What the session did with it ([`Delivery::report`]).
     report: DeliveryReport,
+    /// A1: the Claude account the sealed token is ([`Delivery::with_account`]),
+    /// for its records and messages; none in a tree with no account.
+    account: Option<String>,
 }
 
 /// What became of a [`Delivery`] in its session (S8: the remote session's
@@ -258,7 +261,31 @@ impl Delivery {
         if parts.one_shot && parts.secret.is_none() {
             return Err(BridgeError::CredentialMissing("a one-spawn credential needs its value".into()));
         }
-        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false, report: DeliveryReport::default() })
+        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false, report: DeliveryReport::default(), account: None })
+    }
+
+    /// A1: the delivery names `account`, the Claude account its seal is
+    /// (`accounts::label`), in `credential_deliver` and in its messages
+    /// (`(seal T, Claude account work)`).
+    #[must_use]
+    pub fn with_account(mut self, account: Option<String>) -> Delivery {
+        self.account = account;
+        self
+    }
+
+    /// The Claude account the delivery names, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// `seal T`, with `, Claude account NAME` when the delivery names one:
+    /// what its messages say inside their parentheses.
+    fn seal_words(&self) -> String {
+        match &self.account {
+            Some(a) => format!("seal {}, Claude account {a}", self.parts.tag),
+            None => format!("seal {}", self.parts.tag),
+        }
     }
 
     /// What the session does with this delivery, to read after it took it
@@ -323,8 +350,9 @@ impl Delivery {
     /// checked. `then` says what was not done and what to run again.
     pub(crate) fn missing(&self, vm: &str, then: &str) -> BridgeError {
         BridgeError::CredentialMissing(format!(
-            "{vm} no longer holds {} (seal {}): its copy went after it was checked (a suspend, or another seal delivered, in between) and no value was in hand: {then}, which unseals the token",
-            self.parts.name, self.parts.tag
+            "{vm} no longer holds {} ({}): its copy went after it was checked (a suspend, or another seal delivered, in between) and no value was in hand: {then}, which unseals the token",
+            self.parts.name,
+            self.seal_words()
         ))
     }
 
@@ -385,7 +413,7 @@ impl Drop for Delivery {
 
 impl std::fmt::Debug for Delivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Delivery({}, {} tag={}, {:?}, value={}, one_shot={})", self.vm_id, self.parts.name, self.parts.tag, self.parts.deliver, if self.holds_value() { "held" } else { "none" }, self.parts.one_shot)
+        write!(f, "Delivery({}, {} tag={}, {:?}, value={}, one_shot={}, account={:?})", self.vm_id, self.parts.name, self.parts.tag, self.parts.deliver, if self.holds_value() { "held" } else { "none" }, self.parts.one_shot, self.account)
     }
 }
 
@@ -760,6 +788,25 @@ mod tests {
         let stale = GatePass::for_tests("microvm-1", now - crate::bridge::egress::GATE_PASS_MAX_AGE_S - 1);
         assert!(d.rebind(&stale, now).is_err(), "a pass too old");
         assert_eq!(d.pass.at_unix(), now, "kept on the pass it had");
+    }
+
+    /// A1: a delivery names the Claude account its seal is: its messages
+    /// keep their prefix and say it inside their parentheses; one with none
+    /// (a tree with no account) reads as before; `Debug` shows the name,
+    /// never a value.
+    #[test]
+    fn a_delivery_names_its_account_inside_its_parentheses() {
+        let now = 1_790_000_000;
+        let parts = || DeliveryParts { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), tag: "seal".into(), deliver: Deliver::Fd, secret: None, one_shot: false };
+        let plain = Delivery::new(&GatePass::for_tests("microvm-1", now), "microvm-1", now, parts()).unwrap();
+        assert_eq!(plain.account(), None);
+        let said = plain.missing("microvm-1", "nothing was sent").to_string();
+        assert!(said.contains("microvm-1 no longer holds CLAUDE_CODE_OAUTH_TOKEN (seal seal): its copy went"), "{said}");
+        let named = Delivery::new(&GatePass::for_tests("microvm-1", now), "microvm-1", now, parts()).unwrap().with_account(Some("work".into()));
+        assert_eq!(named.account(), Some("work"));
+        let said = named.missing("microvm-1", "nothing was sent").to_string();
+        assert!(said.contains("microvm-1 no longer holds CLAUDE_CODE_OAUTH_TOKEN (seal seal, Claude account work): its copy went"), "{said}");
+        assert!(format!("{named:?}").ends_with("account=Some(\"work\"))"), "{named:?}");
     }
 
     #[test]

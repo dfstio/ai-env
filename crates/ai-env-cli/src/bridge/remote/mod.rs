@@ -169,8 +169,16 @@ pub mod census_part {
     /// S10: `carried:readdress` (the `--resume` row's VM was gone) or `carried:migrate` (it was near its wall): a
     /// reopen's P0 to P4 carried the chat off that VM (`RemoteSnapshot.carried`, generation 1's), counted in `moves` too.
     pub const CARRIED: &str = "carried";
-    /// Every part: the end row's, then the start row's, then S10's (all the end row's).
-    pub const ALL: [&str; 27] = [
+    /// A1: `account:<name>[,<name>…]`: the Claude accounts the session's generations ran as, in order, each once
+    /// in a row (the link, `RemoteSnapshot.accounts`); none while no generation's account is known.
+    pub const ACCOUNT: &str = "account";
+    /// A1: `rate_limit:<seen>/<written>` when either is above 0: the `rate_limit_event` lines the pump saw, and
+    /// those its usage tap wrote to `state/accounts.toml` (`accounts::usage::UsageTap`).
+    pub const RATE_LIMIT: &str = "rate_limit";
+    /// A1: `usage_limited:<n>` when n > 0: the usage-limit results the chat got (the pump).
+    pub const USAGE_LIMITED: &str = "usage_limited";
+    /// Every part: the end row's, then the start row's, then S10's (all the end row's), then A1's.
+    pub const ALL: [&str; 30] = [
         VM,
         VM_HOW,
         SPAWN,
@@ -198,6 +206,9 @@ pub mod census_part {
         UNPARK_RESUMED,
         CLOSE_PARKED,
         CARRIED,
+        ACCOUNT,
+        RATE_LIMIT,
+        USAGE_LIMITED,
     ];
 }
 
@@ -281,8 +292,14 @@ pub mod audit_event {
     pub const SESSION_REAP: &str = "session_reap";
     /// S10: a wrapper's gc reconcile: `marked`, `removed`, `closed`, `ms`.
     pub const VM_GC_RECONCILE: &str = "vm_gc_reconcile";
+    /// A1: a generation runs as another Claude account than the one it replaces (a `creds account use` came
+    /// between): `session`, `gen`, `kind` (`first`, or the move's), `from`, `from_tag`, `to`, `to_tag`.
+    pub const SESSION_ACCOUNT: &str = "session_account";
+    /// A1: a chat's turn got its account's usage-limit result: `account`, `tag`, `kind`, `resets_at` (`-`
+    /// unknown), `text` (the CLI's, cut), `gen`, `source` (`chat`).
+    pub const USAGE_LIMITED: &str = "usage_limited";
     /// Every event above (never a URL, a query, a credential or a transcript byte in any detail).
-    pub const ALL: [&str; 29] = [
+    pub const ALL: [&str; 31] = [
         SESSION_REMOTE_START,
         SESSION_REMOTE_END,
         SESSION_REMOTE_FAILED,
@@ -312,6 +329,8 @@ pub mod audit_event {
         SESSION_PARK_REFUSED,
         SESSION_REAP,
         VM_GC_RECONCILE,
+        SESSION_ACCOUNT,
+        USAGE_LIMITED,
     ];
 }
 
@@ -345,7 +364,15 @@ pub enum Failure {
     /// path makes (`first_line` of the error).
     Config { first_line: String },
     /// P0, exit 5: no sealed setup-token, or a seal Anthropic refused (`why`).
-    NoToken { why: String },
+    /// A1: `accounts`, Claude accounts exist (or their store cannot be
+    /// read): `why` then names its own fix (`credential::refuse_rejected`'s
+    /// account texts: seal the account anew, use another, repair the
+    /// store), which the line keeps whole, as [`Failure::NoAccount`]'s.
+    NoToken { why: String, accounts: bool },
+    /// P0, or a move's re-plan, exit 5 (A1): no Claude account is active
+    /// (`credentials/setup-token.env` absent while accounts exist:
+    /// `accounts::spawn_problem`); `why` names its own fix.
+    NoAccount { why: String },
     /// P0 or P1, exit 5: the runtime key is not sealed (absent, or a file
     /// that is no ai-env container: `why`), which `make runtime-key` seals.
     NoRuntimeKey { why: String },
@@ -441,9 +468,10 @@ pub enum Failure {
 
 impl Failure {
     /// Every kind's [`Failure::word`].
-    pub const WORDS: [&'static str; 26] = [
+    pub const WORDS: [&'static str; 27] = [
         "config",
         "no_token",
+        "no_account",
         "no_runtime_key",
         "not_git_repo",
         "refused",
@@ -476,6 +504,7 @@ impl Failure {
         match self {
             Failure::Config { .. } => "config",
             Failure::NoToken { .. } => "no_token",
+            Failure::NoAccount { .. } => "no_account",
             Failure::NoRuntimeKey { .. } => "no_runtime_key",
             Failure::NotGitRepo => "not_git_repo",
             Failure::Refused { .. } => "refused",
@@ -510,7 +539,7 @@ impl Failure {
             Failure::Config { .. } => 1,
             Failure::PinInvalid => 2,
             Failure::TouchIdCancelled => 3,
-            Failure::NoToken { .. } | Failure::NoRuntimeKey { .. } | Failure::TouchIdTimeout { .. } | Failure::TokenRefused => 5,
+            Failure::NoToken { .. } | Failure::NoAccount { .. } | Failure::NoRuntimeKey { .. } | Failure::TouchIdTimeout { .. } | Failure::TokenRefused => 5,
             Failure::OldImage { .. } => 7,
             Failure::PinGone { .. } | Failure::HelloRefused { .. } | Failure::LinkLost { .. } | Failure::MovesExhausted { .. } => 8,
             Failure::Move { inner, .. } => inner.exit_code(),
@@ -579,7 +608,11 @@ impl Failure {
     pub fn line(&self) -> String {
         let text = match self {
             Failure::Config { first_line } => format!("{}; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally", part(first_line, PART_MAX)),
-            Failure::NoToken { why } => format!("{}: run ai-env creds setup-token", part(why, PART_MAX)),
+            Failure::NoToken { why, accounts: false } => format!("{}: run ai-env creds setup-token", part(why, PART_MAX)),
+            // A1: an account's refusal says its own fix (`creds setup-token` re-seals the active account only): whole.
+            Failure::NoToken { why, accounts: true } => part(why, LINE_MAX - PREFIX.len()),
+            // Its why says the fix (`accounts::NO_ACTIVE`): the line is it, whole.
+            Failure::NoAccount { why } => part(why, LINE_MAX - PREFIX.len()),
             Failure::NoRuntimeKey { why } => format!("{}: run make runtime-key", part(why, PART_MAX)),
             Failure::NotGitRepo => "not a git repository: ai-env seeds git workspaces only; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally".to_string(),
             Failure::Refused { what } => format!("refused before any Touch ID: {}", part(what, PART_MAX)),
@@ -733,6 +766,13 @@ pub fn note_migrating(vm: &str, trigger: &MigrateTrigger) -> String {
     format!("ai-env: moving the chat off {} ({why}): Touch ID for the setup token; the chat goes on meanwhile", part(vm, SHORT_MAX))
 }
 
+/// A1: a move's generation runs as another Claude account (`to`) than the
+/// one it left (`from`): the active one since `ai-env creds account use`.
+#[must_use]
+pub fn note_account(to: &str, from: &str) -> String {
+    format!("ai-env: the chat now runs as Claude account {} (it ran as {}): the active account since ai-env creds account use", part(to, SHORT_MAX), part(from, SHORT_MAX))
+}
+
 /// A migration's phase A failed, or its switch fell back: the chat stays on `vm`.
 #[must_use]
 pub fn note_stayed(vm: &str, why: &str, then: StayedThen) -> String {
@@ -745,8 +785,8 @@ pub fn note_stayed(vm: &str, why: &str, then: StayedThen) -> String {
 }
 
 /// The first line of `text`, scrubbed, control characters blanked, at most
-/// `max` characters.
-fn part(text: &str, max: usize) -> String {
+/// `max` characters (A1's usage note cuts its parts with it too).
+pub(crate) fn part(text: &str, max: usize) -> String {
     let first = text.lines().next().unwrap_or_default();
     let shown: String = scrub(first).chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     cut(&shown, max)
@@ -894,7 +934,9 @@ mod tests {
     fn fix_of(f: &Failure) -> &'static str {
         match f {
             Failure::Config { .. } | Failure::NotGitRepo => "AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally",
-            Failure::NoToken { .. } => "run ai-env creds setup-token",
+            Failure::NoToken { accounts: false, .. } => "run ai-env creds setup-token",
+            Failure::NoToken { accounts: true, .. } => "or `ai-env creds account use OTHER`",
+            Failure::NoAccount { .. } => "`ai-env creds account use NAME` installs one",
             Failure::NoRuntimeKey { .. } => "run make runtime-key",
             Failure::Refused { .. } => "refused before any Touch ID: ",
             Failure::PinInvalid | Failure::PinGone { .. } => "ai-env vm list",
@@ -932,7 +974,9 @@ mod tests {
         let vm = format!("microvm-{}", "f".repeat(100));
         let cases: Vec<(Failure, i32)> = vec![
             (Failure::Config { first_line: long.clone() }, 1),
-            (Failure::NoToken { why: format!("the sealed setup-token {token} was refused") }, 5),
+            (Failure::NoToken { why: format!("the sealed setup-token {token} was refused"), accounts: false }, 5),
+            (Failure::NoToken { why: format!("Claude account work's token {token} was refused: seal a fresh one, or `ai-env creds account use OTHER`; nothing was unsealed"), accounts: true }, 5),
+            (Failure::NoAccount { why: crate::bridge::accounts::NO_ACTIVE.into() }, 5),
             (Failure::NoRuntimeKey { why: "/Users/mike/.config/ai-env/bridge/credentials/aws.env does not exist".into() }, 5),
             (Failure::NotGitRepo, 9),
             (Failure::Refused { what: long.clone() }, 9),
@@ -997,6 +1041,15 @@ mod tests {
         let config = Failure::Config { first_line: long }.line();
         assert!(config.starts_with("aws run_microvm: xxx") && config.contains("\u{2026}; AI_ENV_BRIDGE_LOCAL=1"), "{config}");
         assert_eq!(Failure::NotGitRepo.line(), "not a git repository: ai-env seeds git workspaces only; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally", "plan §1's text");
+        // A1: no active account's line is the store's text, whole, scrubbed like any part.
+        assert_eq!(Failure::NoAccount { why: crate::bridge::accounts::NO_ACTIVE.into() }.line(), crate::bridge::accounts::NO_ACTIVE);
+        assert!(!Failure::NoAccount { why: format!("no account: {token}") }.line().contains(&token));
+        // A1: with Claude accounts the token's refusal is the line, whole (its fix inside, never `creds setup-token`
+        // after it); a tree with none keeps today's line, its part cut.
+        let refused = "Claude account work's token was refused by Anthropic on 2026-10-21T09:12:00Z: seal a fresh one with `claude setup-token` (logged in as that account), then `ai-env creds account add work`, or `ai-env creds account use OTHER`; nothing was unsealed";
+        assert!(refused.chars().count() > PART_MAX);
+        assert_eq!(Failure::NoToken { why: refused.into(), accounts: true }.line(), refused);
+        assert_eq!(Failure::NoToken { why: refused.into(), accounts: false }.line(), format!("{}: run ai-env creds setup-token", part(refused, PART_MAX)));
         // S9: the old image names the stage its cap needs (workspace_v1's text unchanged); one VM is singular (F5).
         assert_eq!(Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }.line(), "microvm-1 runs an image older than S8 (no workspace_v1): run make deploy, then reopen the chat");
         assert_eq!(Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1 }.line(), "microvm-1 runs an image older than S9 (no transcript_s3_v1): run make deploy, then reopen the chat");
@@ -1053,7 +1106,7 @@ mod tests {
         let long = "y".repeat(400);
         let mut cases: Vec<(Failure, &str)> = vec![
             (Failure::Config { first_line: long.clone() }, "; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally"),
-            (Failure::NoToken { why: long.clone() }, ": run ai-env creds setup-token"),
+            (Failure::NoToken { why: long.clone(), accounts: false }, ": run ai-env creds setup-token"),
             (Failure::NoRuntimeKey { why: long.clone() }, ": run make runtime-key"),
             (Failure::PinGone { vm: long.clone() }, "or pin a VM ai-env vm list shows"),
             (Failure::Select { code: 7, first_line: long.clone() }, "; ai-env doctor checks the setup"),
@@ -1185,6 +1238,8 @@ mod tests {
         assert_eq!(note_stayed("microvm-1", "the gate refused it", StayedThen::Nothing), "ai-env: the chat stays on microvm-1 (the gate refused it)");
         let token = format!("{}-{}-{}-{}", "sk", "ant", "oat01", "d".repeat(60));
         assert!(!note_stayed("microvm-1", &format!("a failure that quoted {token}"), StayedThen::Nothing).contains(&token), "a why is scrubbed");
+        // A1: a moved chat that runs as another Claude account says so, after `note_continues`.
+        assert_eq!(note_account("work", "default"), "ai-env: the chat now runs as Claude account work (it ran as default): the active account since ai-env creds account use");
     }
 
     /// S10 (§10): the moves' budgets.

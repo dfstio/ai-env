@@ -135,6 +135,31 @@ impl Paths {
         self.credentials().join("combined.env")
     }
 
+    /// `credentials/accounts` (A1, 0700): the Claude accounts' sealed
+    /// setup-tokens, their derived combined containers and their backups. The
+    /// active account's two are installed by byte copy as
+    /// [`Paths::setup_token_env`] and [`Paths::combined_env`] (`bridge::accounts`).
+    #[must_use]
+    pub fn accounts_dir(&self) -> PathBuf {
+        self.credentials().join("accounts")
+    }
+
+    /// `credentials/accounts/<name>.env` (A1): Claude account `name`'s sealed
+    /// setup-token. `name` must already be an account name
+    /// (`accounts::valid_name`: never a `.` or a `/`).
+    #[must_use]
+    pub fn account_env(&self, name: &str) -> PathBuf {
+        self.accounts_dir().join(format!("{name}.env"))
+    }
+
+    /// `credentials/accounts/<name>.combined.env` (A1): the runtime key with
+    /// account `name`'s token in one container; derived (built by `make
+    /// runtime-key` and the account's sealing), never backed up.
+    #[must_use]
+    pub fn account_combined_env(&self, name: &str) -> PathBuf {
+        self.accounts_dir().join(format!("{name}.combined.env"))
+    }
+
     /// `state/infra.toml`: what `ai-env infra status --write` learned from the stack
     /// (image state and versions, zip hash, bucket, log group) for doctor.
     #[must_use]
@@ -267,6 +292,14 @@ impl Paths {
     #[must_use]
     pub fn creds_state(&self) -> PathBuf {
         self.root.join("state").join("creds.toml")
+    }
+
+    /// `state/accounts.toml` (A1): the Claude accounts by seal id, the active
+    /// one and what was observed of their usage; written under
+    /// `state/accounts.toml.lock` (`bridge::accounts`).
+    #[must_use]
+    pub fn accounts_state(&self) -> PathBuf {
+        self.root.join("state").join("accounts.toml")
     }
 
     /// `state/egress-verified.toml`: the passing `ai-env egress check` runs, one

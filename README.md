@@ -166,8 +166,11 @@ ai-env creds  aws-verify [--user ai-env-runtime|ai-env-ops]   # one Touch ID: th
 ai-env creds  deployer-key [--account ACCOUNT] | deployer-key --clipboard-check   # create-access-key's JSON on stdin → the deployer's
                                                           #   Strongbox entry through this Mac's concealed clipboard, pasted back, checked;
                                                           #   never stored here / only a marker, which must not paste on another Apple device
-ai-env creds  setup-token [--stdin|--from-env] [--no-combined] [--force]   # seal the Claude setup-token (asked for hidden) (S7)
-ai-env creds  status [--json] [--unseal] | forget [--yes] [--ops]  # what is sealed, without Touch ID / delete the token and its copies
+ai-env creds  setup-token [--stdin|--from-env] [--no-combined] [--force]   # seal the active Claude account's setup-token anew (asked for hidden) (S7)
+ai-env creds  account add NAME [--stdin|--from-env] [--use] [--force] [--note TEXT]; rename OLD NEW; note NAME [TEXT]; use NAME; list [--json]; forget NAME [--yes]; check [NAME…] [--json] [--model M]   # Claude
+                                                          #   accounts (A1): seal one (one Touch ID) / make it the active one (no Touch ID) / list them /
+                                                          #   delete one / one turn each on this Mac's claude: 5-hour and weekly usage (a Touch ID each)
+ai-env creds  status [--json] [--unseal] | forget [--yes] [--ops]  # what is sealed, without Touch ID / delete the token, its copies and every account
                                                           #   (--ops: only credentials/ops.env and its backups; the IAM commands are printed)
 ai-env vm     images [--managed] | list [--all] | status ID | health ID   # MicroVMs of the ai-env image (bridge feature);
                                                           #   list (without --json) then reconciles the registry locally, as run and smoke do (S10)
@@ -346,7 +349,7 @@ make deploy                    # (deployer: one paste, after the zip is built an
 make infra-status WRITE=1      # (ops: one Touch ID) stack outputs (+ the image's live state) → bridge.toml [aws] (comments kept)
                                #   + state/infra.toml
 make runtime-key               # (deployer: one paste) seal a key of the ai-env-runtime user under the bridge keystore key,
-                               #   rebuild combined.env (one Touch ID when a setup-token is sealed), then verify it (one
+                               #   rebuild every Claude account's combined.env (one Touch ID each), then verify the key (one
                                #   Touch ID); ROTATE=1 replaces it
 make claude-update             # (at a terminal; asks once: when it deploys the passphrase's Touch ID unless set, then the
                                #   deployer's key; else ops' Touch ID) follow the Cursor extension's Claude Code: claude-pin,
@@ -691,8 +694,9 @@ fake API, or for any other address, it is refused; release builds compile it out
 ### Credentials (stage S7)
 
 `ai-env creds setup-token` seals a Claude setup-token (what `claude setup-token` prints after a browser
-login: an inference-only OAuth token, valid for a year) into `credentials/setup-token.env`, an ai-env
-container sealed to `[creds].key` like the runtime key. It asks for the token hidden on the terminal
+login: an inference-only OAuth token, valid for a year) as the active Claude account's (see Claude
+accounts below; `default` when there is none yet), an ai-env container sealed to `[creds].key` like the
+runtime key, and installs it as `credentials/setup-token.env`. It asks for the token hidden on the terminal
 (`--stdin` takes exactly one line from a pipe and refuses a terminal; `--from-env` reads
 `CLAUDE_CODE_OAUTH_TOKEN`); an API key (`sk-ant-api…`) is refused. What is recorded about the token, in
 the container's metadata line and the audit row, is its kind prefix (`sk-ant-oat01-`), its length and
@@ -700,6 +704,47 @@ when it was sealed, never more. Clear the terminal's scrollback and the clipboar
 `--stdin` also any file or shell history line that held it; after `--from-env`, unset the variable
 instead): the command reminds you.
 
+- **Claude accounts.** Each sealed token is a Claude account's: `credentials/accounts/<name>.env`
+  (a name is 1-32 of `a-z 0-9 _ -`). One account is the active one: its token and its combined.env
+  (below) are installed by byte copy as `credentials/setup-token.env` and `combined.env`, the files
+  every remote chat, move and credentialed command reads, so seal ids, refusals and the VMs' caches
+  work as before. `ai-env creds account add NAME` seals another (log in to claude.ai as that account
+  before `claude setup-token`; one Touch ID, for its combined.env); `--use`, or a first account, makes
+  it the active one. `ai-env creds account use NAME` makes another one active with no Touch ID, and a
+  token Anthropic refused is never made active (exit 5). A running claude keeps the token it was
+  given until its next start: `use` names each live remote chat still on another account, which
+  `ai-env session migrate UUID` moves now (one Touch ID) or a reopen restarts; its next restart or
+  move takes the new account. `creds setup-token` seals the active account anew (with accounts but
+  none active it refuses, exit 9). The first `creds account` command, `creds setup-token` or `creds
+  aws-set` adopts a token sealed before accounts existed as `default`, by byte copy and with no Touch
+  ID. `ai-env creds account list` shows them (no Touch ID), `ai-env creds account forget NAME --yes`
+  deletes one, and `creds status`, doctor, the audit rows (`creds_account_use` among them) and the
+  VMs that may hold a token name the account. `state/accounts.toml` keeps the accounts' seal ids and
+  what was seen of their usage; one that cannot be read never stops a chat or a credentialed command
+  (names read `unknown`, `creds status` and doctor warn), and `creds account` never writes over it:
+  remove it, and `creds account list` rebuilds it from the files. `ai-env vm exec ID --credential-file
+  ~/.config/ai-env/bridge/credentials/accounts/NAME.env -- …` runs one command as another account
+  without switching.
+- **Names and notes.** A name is a short label you choose (`work`, `spare`), never the account's
+  email: a setup-token cannot read its profile, and names reach file names, the audit, the census and
+  Cursor's notes. `ai-env creds account rename OLD NEW` renames one with no Touch ID: its files, row,
+  usage, note and active mark move, its sealed bytes do not (so its seal, the installed copies,
+  refusals and the VMs' caches are untouched; census rows already written keep the old name).
+  `ai-env creds account note NAME TEXT` (or `add NAME --note TEXT`) keeps a note with it, free text of
+  1-120 characters that must never hold a credential (one that looks like a token or key is refused);
+  `note NAME` alone clears it. Only `state/accounts.toml` keeps the text, and only `creds account list`
+  and `creds status` show it (`work (active) [mk's Max seat]`): the audit row
+  `creds_account_note` says only that it was set or cleared.
+- **Usage and the live check.** A setup-token cannot read its account's limits, so ai-env learns an
+  account's usage from the turns it carries, and `ai-env creds account check [NAME…]` measures it: one
+  tiny turn per account (`--model haiku` by default) on this Mac's claude (Cursor's bundled one, else
+  PATH's), one Touch ID each, then its 5-hour and weekly use with their resets (`work (active): 5h 23%
+  (resets 14:00Z), 7d 81% (resets Thu 10:00Z)`), or the limit it hit (`spare: limited: weekly, "resets
+  10am (UTC)"`). The token goes on fd 3 (in the environment under `[creds] deliver = "env"`) to a claude
+  with an empty environment and a fresh HOME, never in its argv; a refusal is recorded as `vm exec`
+  records one, and a seal already refused costs no Touch ID. It exits 3 on a dismissed dialog, 5 at the
+  Touch ID deadline or when an account was refused, 130 or 143 when stopped, 1 when a run failed;
+  `--json` adds each run's `rate_limit_event` and result lines, scrubbed.
 - **One Touch ID per credentialed command.** In container mode the runtime key is a Touch ID of its
   own. `creds setup-token` and `creds aws-set` therefore also write `credentials/combined.env`: both
   credentials in one container, recording the hashes of the two files it was built from, so `vm exec
@@ -711,7 +756,11 @@ instead): the command reminds you.
   builds none from what that replaced, and says so. The seal itself still succeeds (`creds setup-token`
   writes its audit row and its `setup-token-prefix` probe row before the rebuild). `--credential-file`
   always costs two Touch IDs: the runtime key, then the file's own container. `creds status` shows
-  which case holds, without a prompt.
+  which case holds, without a prompt. Each Claude account has its own,
+  `credentials/accounts/<name>.combined.env`, judged against its own token and installed as
+  `combined.env` only beside it: `make runtime-key` rebuilds every account's, one Touch ID each, the
+  active one first, and an account whose rebuild failed costs two Touch IDs once it is made active,
+  until the next one.
 - **Delivery.** `ai-env vm exec ID --with-credential -- claude -p '…'` runs the credential gate before
   the token is sent. Without a Touch ID: a vpc VM whose egress echo gate passed, not a `--shell` VM, a
   shim that can hold a credential (once its `/health` was read), a passing `egress check` recorded for
@@ -779,20 +828,23 @@ instead): the command reminds you.
   line), audits `credential_rejected`, and never starts the command again; `vm smoke --with-credential`
   records a refused `claude -p` the same way. The rejection is recorded against the sealed container:
   credentialed commands then refuse at once (exit 5, no Touch ID) until `creds setup-token` seals a new
-  token. That record is `state/creds.toml`: one that cannot be read refuses them too (exit 5, naming
+  token for that account, or `creds account use` makes another one active (a refused account is never
+  made active). That record is `state/creds.toml`: one that cannot be read refuses them too (exit 5, naming
   it, since which tokens were refused is then unknown), the wrapper's `local-scratch` child then runs
   logged out, and `creds status` and doctor show it as a warning. A refused `--credential-file`
   container with a seal of its own blocks only itself; the sealed setup-token is not affected. A byte
   copy of `setup-token.env` has the sealed token's seal, so its refusal is the sealed token's.
-- **Forgetting.** `creds forget` lists, then with `--yes` deletes, `setup-token.env`, `combined.env` and
-  their backups; `aws.env` stays. It cannot revoke the token, which Anthropic honours until it is
-  revoked. To retire one: revoke it in the claude.ai account that created it, under Settings, then
-  Claude Code (https://claude.ai/settings/claude-code; Anthropic's Help Center article 10310342); check
-  that it is refused (a credentialed command such as
+- **Forgetting.** `creds forget` lists, then with `--yes` deletes, `setup-token.env`, `combined.env`,
+  every Claude account (`credentials/accounts/` and `state/accounts.toml`) and their backups; `aws.env`
+  stays. `creds account forget NAME` deletes one account the same way (its files, its backups, and the
+  installed copies when it is the active one, which leaves none active). Neither can revoke a token,
+  which Anthropic honours until it is revoked. To retire one: revoke it in the claude.ai account that
+  created it, under Settings, then Claude Code (https://claude.ai/settings/claude-code; Anthropic's
+  Help Center article 10310342); check that it is refused (a credentialed command such as
   `ai-env vm exec ID --with-credential -- claude -p 'Reply OK'` exits 5 with the
   `ai-env: Anthropic refused the delivered setup-token` line, or `make test-claude` fails on a 401);
-  then `ai-env creds forget --yes`, and terminate the VMs `ai-env creds status` lists, which may hold a
-  copy until they are TERMINATED.
+  then `ai-env creds forget --yes` (or `ai-env creds account forget NAME --yes` for one account), and
+  terminate the VMs `ai-env creds status` lists, which may hold a copy until they are TERMINATED.
 - **Touch ID and signals.** Every Touch ID of a credentialed command (the runtime key's too) shows a
   countdown and has a deadline, `[creds].unseal_timeout_s` (default 60, 10–600). A dismissed dialog is 3;
   no answer in time is 5 (`vm exec` names `vm warm` for the token's own prompt, which a warm VM spares);
@@ -821,7 +873,11 @@ instead): the command reminds you.
 ```sh
 ai-env creds setup-token        # paste what `claude setup-token` printed (hidden); rebuilds combined.env with one Touch ID
 ai-env creds status             # what is sealed, combined.env against its sources, the credential gate's local preconditions,
-                                #   a recorded refusal, the VMs that may hold the token: no Touch ID
+                                #   a recorded refusal, the Claude accounts, the VMs that may hold the token: no Touch ID
+ai-env creds account list       # the Claude accounts, the active one marked: no Touch ID
+ai-env creds account add work   # paste what `claude setup-token` printed, logged in as that account (hidden); one Touch ID
+ai-env creds account use work   # new chats, moves and credentialed commands take it (no Touch ID); names the live chats still on another
+ai-env creds account check      # one turn per account on this Mac's claude, a Touch ID each: 5-hour and weekly usage and their resets
 ai-env vm exec ID --with-credential -- claude -p 'Reply with exactly OK' --output-format json
 ai-env vm warm ~/work/project   # deliver ahead of time
 make test-claude                # T7.2 on this Mac: the token drives the real claude (real model requests)
@@ -953,6 +1009,10 @@ with the line
 `no Touch ID within N s (Cursor's 60 s window): nothing was started; ai-env vm warm prepares the VM ahead`.
 Since S10 an open chat that moves to a new VM asks one more, for the setup token alone, in a dialog of
 `[creds].unseal_timeout_s` within the move's 180 s (what a dismissal does then: stage S10).
+With several Claude accounts each of these prompts opens the active account's token, as
+`credentials/setup-token.env` holds it at that moment (`ai-env creds account use NAME` switches it, with
+no Touch ID): a new chat, and the next move of an open one, take the switch; a running claude keeps
+the account it started with.
 When Cursor opens a window it runs `auth status --json`; under the roots the wrapper then starts
 `ai-env vm warm WORKSPACE --prewarm` detached, so the VM is running and seeded before the first chat.
 `[vm] prewarm_on_auth_status` is `"auto"` (the default: only when the workspace has no VM to reuse),
@@ -1703,6 +1763,34 @@ A value out of its range fails every `vm` and `lab` command, a remote chat's sta
 `park_after_s` (it reads `migrate_before_wall_s`, which S9 uses only to stop reusing a VM near its
 wall): take those out before going back.
 
+**The Claude account a chat runs as.** Every start of claude takes the active Claude account at that
+moment, the one `credentials/setup-token.env` holds (`ai-env creds account use NAME` installs one, with
+no Touch ID): a new chat, a move's new VM, a restart on the same VM, a migration's new VM (its account
+is the one installed when the migration's Touch ID was asked) and the old VM a migration falls back
+to. A running claude keeps its account until its next start, and a retry keeps the account of the
+start it retries: a resume miss's (it asks no Touch ID), and a move's on the same VM while that VM
+still holds the token. A restart on a VM that already holds the new account's token asks no Touch ID;
+one whose VM holds the old one asks one, for the new token. A chat that now runs as another account
+says so, right after the note that it goes on:
+
+`ai-env: the chat now runs as Claude account NEW (it ran as OLD): the active account since ai-env creds account use`
+
+A turn refused for the account's usage limit reaches the chat as claude printed it
+(`You've hit your weekly limit · resets …`), and a note follows it, naming another account to go on
+with (the one with the lowest weekly use ai-env saw, else one it saw with no weekly use known, else one
+it never saw, which the note says) and how:
+
+`ai-env: account NAME hit its weekly limit (it resets 10am (UTC)); to go on now with account OTHER: ai-env creds account use OTHER, then reopen this chat or run ai-env session migrate UUID`
+
+When every other account is limited too, as far as ai-env knows, the note says so and names
+`ai-env creds account check`; with no other account, it names `ai-env creds account add NAME`. What a
+turn's `rate_limit_event` says of the account's 5-hour and weekly windows, and a limit, go into
+`[usage.NAME]` in `state/accounts.toml` (written at once for the first, a limit, a change of status or
+the first answer after a limit, else at most once a minute, and never waiting for the file's lock). A
+limit whose reset time claude did not give counts for at most its window (5 hours for the session
+limit, else a week) from when it was hit. With no account at all (one token sealed with
+`ai-env creds setup-token`), there is no note and no `[usage.NAME]`, and no record names an account.
+
 **What the records say.** A remote chat's census end row adds `moves:readdress=N,respawn=N,migrate=N`
 once a move started (a reopen's carry counted too), with `move_ms` (the last move's) and `cut` (`none`,
 `at` or `fresh`: how the moved claude resumed); `carried:readdress` or `carried:migrate` for a reopen
@@ -1724,7 +1812,14 @@ message), `parked`, `migrating` (a move under way) or `closed`, and its `vms` li
 on, across reopens (the newest 64), with why it started (`first`, `retry`, `readdress:vm_gone`,
 `respawn:spawn_gone`, `migrate:wall`, `migrate:command`, `migrate:reopen`, …), how it ended and the
 wrapper's pid. Whether Cursor showed a move's note is recorded by hand after a move:
-`ai-env lab run move-note --manual shown` (or `not-shown:WHAT`).
+`ai-env lab run move-note --manual shown` (or `not-shown:WHAT`). The end row also adds
+`rate_limit:SEEN/WRITTEN` once claude printed a `rate_limit_event` (the lines seen, and those recorded
+for an account) and `usage_limited:N` once a turn was refused for a usage limit; `audit.jsonl` records
+each such turn as `usage_limited` (with the account, `-` when none holds the token). With Claude
+accounts, the end row adds `account:NAME[,NAME…]` (the accounts the chat's starts ran as, in order);
+`audit.jsonl` adds `session_account` (a start on another account than the one before it), and names
+the account in `session_remote_start`, `session_move_end` (with `account_from` when it changed),
+`credential_unseal` and `credential_deliver`; the row's `vms` entries name each start's account.
 
 ```sh doc-test
 ai-env session list               # each chat's status: active, detached, parked, migrating or closed
@@ -2166,6 +2261,16 @@ the diffs annoy you.
   requires macOS 26 Tahoe). Encrypting to existing recipients works on any OS with `age`.
 - `keys forget` removes local files only — Secure Enclave keys cannot be enumerated or
   deleted; the enclave slot is orphaned. Files remain recoverable via their recovery identity.
+- A Claude account's usage, as ai-env knows it, is only as fresh as ai-env's last turn on that
+  account: claude.ai, the desktop app and Claude Code sessions outside ai-env use the same limits
+  unseen. `ai-env creds account check` measures (one turn and one Touch ID per account).
+- Two live chats on one VM that run as different Claude accounts and start claude within the same
+  moment can race on the VM's one credential slot: the second token delivered replaces the first
+  before the first claude reads it, so that claude runs as the other account. Fixing it needs the
+  image (the spawn naming the token it expects).
+- A wrapper still running from before an `ai-env` with Claude accounts was installed (a chat left
+  open across `make install`) fails its moves after a `creds account use` (the token was sealed anew
+  under it: exit 5). Reopen such a chat.
 
 ## Security invariants (enforced by tests)
 

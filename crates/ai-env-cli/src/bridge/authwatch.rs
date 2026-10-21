@@ -72,7 +72,10 @@
 //!
 //! Never evidence: 429, 5xx, a connection error, the egress proxy's own 403
 //! or any other 4xx but 401 (as text, or as a result's `api_error_status`),
-//! or a line over [`LINE_MAX`] bytes (its head shows progress, no more).
+//! or a line over [`LINE_MAX`] bytes (its head shows progress, no more). A
+//! 429 includes the account's usage limit (S10 addendum A1: claude 2.1.305's
+//! `usage_limit_reached` result, `You've hit your weekly limit · …`), which is
+//! no progress either: the pump's usage tap reads it (`wire::ratelimit`).
 //!
 //! **Pinned from B7** (S7 part B, 11 Oct 2026), no longer provisional: claude
 //! 2.1.296 given a garbage setup-token on fd 3 on a vpc MicroVM. With
@@ -1008,6 +1011,28 @@ mod tests {
         let mut w = AuthWatch::new();
         assert_eq!(w.feed(Stream::Stdout, event.as_bytes()), Verdict::Watching);
         assert!(w.retries() == 0 && !w.rejected_at_exit(Some(1)));
+    }
+
+    /// A1: claude 2.1.305's usage-limit result (S10 part B's B2, the
+    /// fixture as captured) is nothing. No evidence: alone, then exit 1, it
+    /// is no refusal, and a session on the measured claude does not stop.
+    /// No progress: two retry 401s before it stay counted, and a third
+    /// after it stops the command.
+    #[test]
+    fn the_usage_limit_result_is_nothing() {
+        let limit = include_str!("../../tests/fixtures/claude/usage-limit-result-2.1.305.json");
+        assert!(limit.contains("\"api_error_status\":429") && limit.contains("\"is_error\":true"), "the fixture is B2's 429");
+        let mut w = AuthWatch::new();
+        assert_eq!(w.feed(Stream::Stdout, limit.as_bytes()), Verdict::Watching);
+        assert!(w.retries() == 0 && !w.rejected_at_exit(Some(1)), "no refusal at exit 1");
+        let mut w = AuthWatch::for_session(true);
+        assert_eq!((w.feed(Stream::Stdout, limit.as_bytes()), w.verdict_how()), (Verdict::Watching, None));
+        let r401 = retry(401, "authentication_failed");
+        let mut w = AuthWatch::new();
+        w.feed(Stream::Stdout, format!("{r401}{r401}").as_bytes());
+        assert_eq!(w.feed(Stream::Stdout, limit.as_bytes()), Verdict::Watching);
+        assert_eq!(w.retries(), 2, "no progress: the retries stay counted");
+        assert_eq!(w.feed(Stream::Stdout, r401.as_bytes()), Verdict::Rejected);
     }
 
     /// B16's json `--verbose` run: one line, the array of its run's four

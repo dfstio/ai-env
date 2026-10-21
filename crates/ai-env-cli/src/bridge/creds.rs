@@ -468,13 +468,16 @@ fn check_target(paths: &Paths) -> Check {
 }
 
 /// [`check_target`] for any file under `credentials/` (S7: the setup-token
-/// and the derived `combined.env`).
+/// and the derived `combined.env`; A1: a Claude account's, in
+/// `credentials/accounts/`, whose directory is checked as `credentials/` is,
+/// and created 0700 when absent).
 pub(crate) fn check_target_file(paths: &Paths, target: &Path) -> Check {
     let dir = paths.credentials();
     match std::fs::symlink_metadata(&dir) {
         Ok(m) if m.file_type().is_symlink() => Err(CliError::Msg(format!("{} is a symlink: refusing to seal credentials through it", dir.display()))),
         Ok(m) if !m.is_dir() => Err(CliError::Msg(format!("{} is not a directory", dir.display()))),
         Ok(_) if !writable(&dir) => Err(CliError::Msg(format!("{} is not writable", dir.display()))),
+        Ok(_) if target.parent().is_some_and(|sub| sub != dir) => check_sub_dir(target),
         Ok(_) => match aws_env_state(target) {
             AwsEnvState::Sealed => Ok(format!("{} exists: backed up before it is replaced", target.display())),
             AwsEnvState::Absent => Ok(format!("{} (new)", target.display())),
@@ -489,6 +492,25 @@ pub(crate) fn check_target_file(paths: &Paths, target: &Path) -> Check {
             }
         }
         Err(e) => Err(CliError::Msg(format!("cannot stat {}: {e}", dir.display()))),
+    }
+}
+
+/// [`check_target_file`] for a target in a directory under `credentials/`
+/// (`accounts/`, A1), `credentials/` itself checked: that directory a real,
+/// writable one, or absent (created 0700), then the target as any.
+fn check_sub_dir(target: &Path) -> Check {
+    let Some(sub) = target.parent() else { return Err(CliError::Msg(format!("{} has no directory", target.display()))) };
+    match std::fs::symlink_metadata(sub) {
+        Ok(m) if m.file_type().is_symlink() => Err(CliError::Msg(format!("{} is a symlink: refusing to seal credentials through it", sub.display()))),
+        Ok(m) if !m.is_dir() => Err(CliError::Msg(format!("{} is not a directory", sub.display()))),
+        Ok(_) if !writable(sub) => Err(CliError::Msg(format!("{} is not writable", sub.display()))),
+        Ok(_) => match aws_env_state(target) {
+            AwsEnvState::Sealed => Ok(format!("{} exists: backed up before it is replaced", target.display())),
+            AwsEnvState::Absent => Ok(format!("{} (new)", target.display())),
+            AwsEnvState::NotSealed(why) => Err(CliError::Msg(format!("{} exists but {why}: move it away (and rotate whatever it holds) before sealing", target.display()))),
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(format!("{} (new; its directory is created 0700)", target.display())),
+        Err(e) => Err(CliError::Msg(format!("cannot stat {}: {e}", sub.display()))),
     }
 }
 
@@ -588,7 +610,7 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
 
 /// Copy the current container to `<name>.<unix seconds>.bak` (0600, never
 /// clobbering, the source opened without following a symlink).
-fn backup_existing(target: &Path) -> Result<PathBuf> {
+pub(crate) fn backup_existing(target: &Path) -> Result<PathBuf> {
     backup_existing_at(target, unix_now())
 }
 
@@ -698,6 +720,10 @@ pub(crate) fn seal_file(store: &Keystore, paths: &Paths, key_name: &str, target:
     let text = container::write_annotated(&ciphertext, notes)?;
     container::read(&text).map_err(|e| CliError::Msg(format!("age output is not an age file ({e}): nothing written")))?;
     ensure_private_dir(&paths.credentials())?;
+    // A1: a Claude account's file goes into `credentials/accounts/`, made 0700 as its parent is.
+    if let Some(sub) = target.parent().filter(|sub| *sub != paths.credentials()) {
+        ensure_private_dir(sub)?;
+    }
     let backup = match std::fs::symlink_metadata(target) {
         Ok(m) if m.file_type().is_symlink() => bail!("{} is a symlink: refusing to replace it", target.display()),
         Ok(m) if !m.is_file() => bail!("{} is not a regular file", target.display()),

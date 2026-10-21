@@ -470,21 +470,15 @@ impl Pre {
 /// What a command that will deliver the sealed setup-token to a VM it has
 /// not chosen yet (`vm warm`, `vm smoke --with-credential`) can check before
 /// the Touch ID about the token: `[creds]`, a sealed token, its seal not
-/// refused. The gate's local half follows ([`provisional_gate`]); the chosen
-/// VM's own row is checked once it is chosen (`credential::check`).
+/// refused, and (A1) the Claude account it is (`credential::read_installed`:
+/// a label, never a failure of the store). The gate's local half follows
+/// ([`provisional_gate`]); the chosen VM's own row is checked once it is
+/// chosen (`credential::check`).
 pub(crate) fn sealed_token_plan(ctx: &Ctx) -> Result<crate::bridge::agent::credential::CredentialPlan> {
-    use crate::bridge::creds::{aws_env_state, AwsEnvState};
     ctx.cfg.creds.validate()?;
-    let token = ctx.paths.setup_token_env();
-    match aws_env_state(&token) {
-        AwsEnvState::Sealed => {}
-        AwsEnvState::Absent => return Err(CliError::AuthUnavailable(format!("{} does not exist: seal it with `ai-env creds setup-token`", token.display()))),
-        AwsEnvState::NotSealed(why) => return Err(CliError::AuthUnavailable(format!("{} {why}: seal it with `ai-env creds setup-token`", token.display()))),
-    }
-    let tag = crate::bridge::agent::credential::seal_tag(&token).ok_or_else(|| CliError::AuthUnavailable(format!("{} cannot be read", token.display())))?;
-    crate::bridge::agent::credential::refuse_rejected(&ctx.paths, &tag)?;
+    let installed = crate::bridge::agent::credential::read_installed(&ctx.paths)?;
     let deliver = if ctx.cfg.creds.deliver == "env" { crate::wire::frame::Deliver::Env } else { crate::wire::frame::Deliver::Fd };
-    Ok(crate::bridge::agent::credential::CredentialPlan { deliver, file: None, tag })
+    Ok(crate::bridge::agent::credential::CredentialPlan { deliver, file: None, tag: installed.seal.tag, account: installed.seal.account })
 }
 
 /// The gate's local half before the Touch ID of a command that chooses its
@@ -851,7 +845,7 @@ fn warm_dry_run(ctx: &Ctx, w: &Warm, json: bool) -> Result<()> {
     if json {
         return json_out(&serde_json::json!({
             "backend": ctx.backend_name(), "dry_run": true, "workspace": key, "seed": seed,
-            "reuse": reusable.map(|r| r.id.clone()), "image_version": w.plan.want_version, "tag": w.cred.tag,
+            "reuse": reusable.map(|r| r.id.clone()), "image_version": w.plan.want_version, "tag": w.cred.tag, "account": w.cred.account,
         }));
     }
     match &w.seed {
@@ -876,7 +870,8 @@ fn warm_dry_run(ctx: &Ctx, w: &Warm, json: bool) -> Result<()> {
         None if !w.plan.reuse => outln!("the VM: a new one with vpc egress (image version {}; [vm].reuse_per_workspace is off)", w.plan.want_version),
         None => outln!("the VM: a new one with vpc egress (image version {})", w.plan.want_version),
     }
-    outln!("the setup-token: seal {}, delivered unless the VM holds it; nothing was started: no AWS call, no Touch ID", w.cred.tag);
+    let account = w.cred.account.as_ref().map(|a| format!(" (Claude account {a})")).unwrap_or_default();
+    outln!("the setup-token: seal {}{account}, delivered unless the VM holds it; nothing was started: no AWS call, no Touch ID", w.cred.tag);
     Ok(())
 }
 
@@ -1107,10 +1102,11 @@ async fn warm<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointCl
         return Ok(None);
     }
     if json {
-        json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "seed": seed_word, "seed_note": seed_note }))?;
+        json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "account": cred.account, "seed": seed_word, "seed_note": seed_note }))?;
     } else {
         let how = if warmed == Warmed::Delivered { "now holds" } else { "already held" };
-        outln!("{} {how} the setup-token (seal {}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
+        let account = cred.account.as_ref().map(|a| format!(", Claude account {a}")).unwrap_or_default();
+        outln!("{} {how} the setup-token (seal {}{account}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
         if let Some(word) = seed_word {
             outln!("{}: the workspace's checkout {word}", vm.id);
         }

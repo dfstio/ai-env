@@ -38,6 +38,10 @@
 //! And it writes two lines to the host: the move's informational note
 //! ([`informational_line`]) and the withdrawal of a dead CLI's request
 //! ([`control_cancel_line`]).
+//!
+//! S10 addendum A1 reads one more, forwarded as [`ChildFrame::Other`] was:
+//! child → host `{"type":"rate_limit_event","rate_limit_info":{…},…}`, its
+//! info kept raw for the pump's usage tap (`wire::ratelimit` reads it).
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -107,6 +111,8 @@ pub enum ChildFrame<'a> {
     KeepAlive,
     /// S10: `control_cancel_request` from the CLI: it withdraws its own request.
     ControlCancel { request_id: Option<Cow<'a, str>> },
+    /// A1: `rate_limit_event`; `info` its `rate_limit_info`, raw.
+    RateLimit { info: Option<&'a RawValue> },
     /// Everything else (`stream_event`, other `system` subtypes, non-JSON
     /// noise): forwarded untouched.
     Other,
@@ -151,6 +157,7 @@ impl PartialEq for ChildFrame<'_> {
             ) => s1 == s2 && e1 == e2 && f1 == f2 && u1 == u2 && v1 == v2,
             (F::Assistant { uuid: a, top_level: x }, F::Assistant { uuid: b, top_level: y }) => a == b && x == y,
             (F::ControlCancel { request_id: a }, F::ControlCancel { request_id: b }) => a == b,
+            (F::RateLimit { info: a }, F::RateLimit { info: b }) => a.map(RawValue::get) == b.map(RawValue::get),
             (F::KeepAlive, F::KeepAlive) | (F::Other, F::Other) => true,
             _ => false,
         }
@@ -208,6 +215,8 @@ struct Peek<'a> {
     /// `None` when absent or `null` (serde reads a `null` option as none).
     #[serde(borrow, default)]
     parent_tool_use_id: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    rate_limit_info: Option<&'a RawValue>,
 }
 
 /// The two fields of a nested `request` / `response` object.
@@ -284,6 +293,7 @@ pub fn classify_child(line: &[u8]) -> ChildFrame<'_> {
         "assistant" => ChildFrame::Assistant { uuid: text(p.uuid), top_level: p.parent_tool_use_id.is_none() },
         "keep_alive" => ChildFrame::KeepAlive,
         "control_cancel_request" => ChildFrame::ControlCancel { request_id: text(p.request_id) },
+        "rate_limit_event" => ChildFrame::RateLimit { info: p.rate_limit_info },
         _ => ChildFrame::Other,
     }
 }
@@ -481,6 +491,26 @@ mod tests {
         assert_eq!(classify_child(br#"{"type":"control_cancel_request"}"#), ChildFrame::ControlCancel { request_id: None });
         assert_ne!(classify_child(br#"{"type":"keep_alive"}"#), ChildFrame::Other, "no longer Other");
         assert_ne!(ChildFrame::Assistant { uuid: None, top_level: true }, ChildFrame::Assistant { uuid: None, top_level: false });
+    }
+
+    /// A1: `rate_limit_event` classifies with its info kept raw (B16's
+    /// trimmed line, the constructed full one), compared by its text; one
+    /// with no info has none; the host never sends one (`Other` there).
+    #[test]
+    fn a_rate_limit_event_classifies_with_its_raw_info() {
+        let b16 = include_str!("../../tests/fixtures/claude/valid-stream-json-2.1.296.jsonl").lines().find(|l| l.contains("rate_limit_event")).unwrap();
+        let ChildFrame::RateLimit { info: Some(info) } = classify_child(b16.as_bytes()) else { panic!("not a rate limit: {b16}") };
+        assert_eq!(info.get(), r#"{"status":"allowed"}"#);
+        let full = include_str!("../../tests/fixtures/claude/rate-limit-event-constructed-2.1.305.jsonl").lines().next().unwrap();
+        let ChildFrame::RateLimit { info: Some(info) } = classify_child(full.as_bytes()) else { panic!("not a rate limit: {full}") };
+        assert!(info.get().starts_with(r#"{"status":"allowed_warning","#) && info.get().contains("unifiedWindows"), "{}", info.get());
+        assert_eq!(classify_child(br#"{"type":"rate_limit_event"}"#), ChildFrame::RateLimit { info: None });
+        let a = raw(r#"{"status":"allowed"}"#);
+        let b = raw(r#"{"status":"rejected"}"#);
+        assert_eq!(ChildFrame::RateLimit { info: Some(&a) }, ChildFrame::RateLimit { info: Some(&raw(r#"{"status":"allowed"}"#)) });
+        assert_ne!(ChildFrame::RateLimit { info: Some(&a) }, ChildFrame::RateLimit { info: Some(&b) });
+        assert_ne!(ChildFrame::RateLimit { info: None }, ChildFrame::Other);
+        assert_eq!(classify_host(b16.as_bytes()), HostFrame::Other);
     }
 
     /// The two lines S10's pump writes to the host, byte for byte: the
