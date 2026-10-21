@@ -16,7 +16,7 @@ use crate::wire::time::unix_now;
 use aws_sdk_lambdamicrovms::error::BuildError;
 use aws_sdk_lambdamicrovms::types::{HookState, Hooks, IdlePolicy, MicrovmHooks, MicrovmImageHooks, MicrovmState};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::Mutex;
 
@@ -436,11 +436,15 @@ impl FakeFailure {
 /// The platform as the fakes model it: RunMicrovm idempotent by client token,
 /// PENDING → RUNNING on [`FakeState::advance_all`] (or on the first `get`
 /// with `auto_advance`), terminate → TERMINATING, then TERMINATED on the
-/// next `get`/`list`, suspend only from RUNNING (Conflict otherwise), resume
-/// only from SUSPENDED, TERMINATED VMs stay listed, tokens scoped to one port
-/// and checked by the fake endpoint (403 `UNAUTHORIZED` for a wrong VM, port
+/// next `get`/`list` (S10, opt-in [`FakeState::terminate_after_hook`]: once
+/// the VM's shim answered its `/terminate`), suspend only from RUNNING
+/// (Conflict otherwise), resume only from SUSPENDED, TERMINATED VMs stay
+/// listed, tokens scoped to one port and checked by the fake endpoint (403
+/// `UNAUTHORIZED` for a wrong VM, port
 /// or an expired token), a SUSPENDED VM with auto-resume resumed by the first
-/// endpoint request, and per-VM scripted endpoint statuses.
+/// endpoint request, and per-VM scripted endpoint statuses. S10, opt-in
+/// ([`FakeState::enforce_wall`]): the wall, a VM ended at `started_at_unix +
+/// max_duration_s`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FakeState {
     pub vms: BTreeMap<String, VmInfo>,
@@ -511,7 +515,46 @@ pub struct FakeState {
     /// `None`: this state answers.
     #[serde(default)]
     pub health_detail_at: Option<std::net::SocketAddr>,
+    /// S10: the platform's wall, asked for (the remote rig, `tests/common/remote.rs`):
+    /// a live VM whose `started_at_unix + max_duration_s` is at or before now
+    /// ends at the next look ([`FakeState::settle`]), its suspended time
+    /// counted, and `suspend`, `resume` and `create_auth_token` look first.
+    /// Off by default: fixtures start VMs long ago on purpose (the orphans
+    /// `tests/vm/gc.rs` keeps RUNNING), and `clock_offset_s` stays the
+    /// tokens' alone.
+    #[serde(default)]
+    pub enforce_wall: bool,
+    /// S10: the platform's end waits for the VM's shim, asked for (the
+    /// remote rig sets it beside [`FakeState::enforce_wall`]): a TERMINATING
+    /// VM whose shim the fake endpoint ran ([`FakeState::hook_ran`]) stays
+    /// TERMINATING, whoever looks, until that shim answered its `/terminate`
+    /// ([`FakeState::terminate_answered`]) or for [`TERMINATE_HOOK_WAIT_S`]
+    /// at most ([`FakeState::terminating_since`]), as the platform's VM ends
+    /// once its terminate hook returned: a move's wait for the old VM's
+    /// TERMINATED then finds `/terminate`'s tail pushed. Off, or for a VM no
+    /// shim ran, TERMINATED at the next look, as ever.
+    #[serde(default)]
+    pub terminate_after_hook: bool,
+    /// S10: the VMs whose shim the fake endpoint's platform runs, so their
+    /// hooks (`/terminate` among them) are posted: recorded by the remote
+    /// rig as it hands a VM its shim, just before the endpoint's `/run`.
+    #[serde(default)]
+    pub hook_ran: BTreeSet<String>,
+    /// S10: the VMs whose shim answered `/terminate`, or whose post gave up
+    /// (the endpoint's step limit): recorded by the remote rig's hooks
+    /// listener before the answer goes back.
+    #[serde(default)]
+    pub terminate_answered: BTreeSet<String>,
+    /// S10: when a look first saw each VM TERMINATING (unix seconds), with
+    /// [`FakeState::terminate_after_hook`]: the start of its bounded wait.
+    #[serde(default)]
+    pub terminating_since: BTreeMap<String, u64>,
 }
+
+/// How long a TERMINATING VM waits for its shim's `/terminate` answer at
+/// most ([`FakeState::terminate_after_hook`]): a shim that never answers
+/// (gone, or its hook never posted) still ends.
+pub const TERMINATE_HOOK_WAIT_S: u64 = 60;
 
 fn default_retry_after_429() -> Option<u64> {
     Some(1)
@@ -519,6 +562,19 @@ fn default_retry_after_429() -> Option<u64> {
 
 /// The image the fakes serve unless told otherwise.
 pub const FAKE_IMAGE_ARN: &str = "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent";
+
+/// The `stateReason` the fake gives a VM its wall ended (S10,
+/// [`FakeState::enforce_wall`]). A placeholder: part B records the
+/// platform's own, and no code may parse it.
+pub const FAKE_WALL_REASON: &str = "fake: maxDurationInSeconds reached";
+
+/// Whether `vm`'s wall has passed at `now` (unix seconds): its start plus its
+/// maximum duration at or before it, suspended time counted (S10). A VM with
+/// no start, or no positive duration, has none.
+fn past_wall(vm: &VmInfo, now: u64) -> bool {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    vm.max_duration_s > 0 && vm.started_at_unix.is_some_and(|started| started.saturating_add(i64::from(vm.max_duration_s)) <= now)
+}
 
 impl FakeState {
     /// The default image: `ai-env-agent`, version `1.0` SUCCESSFUL/ACTIVE, 2048 MiB.
@@ -556,13 +612,65 @@ impl FakeState {
         self.vms.get_mut(id).ok_or_else(|| BridgeError::VmNotFound(format!("MicroVM not found: {id}")))
     }
 
-    /// TERMINATING becomes TERMINATED the next time anyone looks.
-    fn settle(&mut self) {
+    /// TERMINATING becomes TERMINATED the next time anyone looks; with
+    /// [`FakeState::terminate_after_hook`] (S10), a VM a shim ran only once
+    /// that shim answered its `/terminate` or [`TERMINATE_HOOK_WAIT_S`] after
+    /// a look first saw it TERMINATING. With [`FakeState::enforce_wall`]
+    /// (S10), a live VM past its wall then becomes TERMINATING with
+    /// [`FAKE_WALL_REASON`], so the look after finds it TERMINATED (or
+    /// waiting for its shim). Public for the fake endpoint's hook bridge,
+    /// which takes one look under the file's lock when its copy shows a VM
+    /// past its wall (`vm::fake_file::FileFakeMicrovmApi::settled`).
+    pub fn settle(&mut self) {
+        let now = unix_now();
         for vm in self.vms.values_mut() {
             if vm.state == VmState::Terminating {
+                if self.terminate_after_hook {
+                    let since = *self.terminating_since.entry(vm.id.clone()).or_insert(now);
+                    let owed = self.hook_ran.contains(&vm.id) && !self.terminate_answered.contains(&vm.id);
+                    if owed && now < since.saturating_add(TERMINATE_HOOK_WAIT_S) {
+                        continue;
+                    }
+                }
                 vm.state = VmState::Terminated;
-                vm.terminated_at_unix = Some(unix_now() as i64);
+                vm.terminated_at_unix = Some(now as i64);
             }
+        }
+        if self.enforce_wall {
+            for vm in self.vms.values_mut() {
+                if !vm.state.is_terminal() && past_wall(vm, now) {
+                    vm.state = VmState::Terminating;
+                    vm.state_reason = Some(FAKE_WALL_REASON.to_string());
+                }
+            }
+        }
+    }
+
+    /// S10: the look `suspend`, `resume` and `create_auth_token` take first
+    /// when the wall is asked for (a VM past it refuses them, as the
+    /// platform's would); without it they keep their earlier behaviour.
+    fn settle_for_wall(&mut self) {
+        if self.enforce_wall {
+            self.settle();
+        }
+    }
+
+    /// S10: whether the next look ends a VM at its wall
+    /// ([`FakeState::enforce_wall`] on, a live VM past it), read without
+    /// changing anything: what the fake endpoint's hook bridge asks of its
+    /// unlocked copy every tick.
+    #[must_use]
+    pub fn wall_due(&self) -> bool {
+        let now = unix_now();
+        self.enforce_wall && self.vms.values().any(|vm| !vm.state.is_terminal() && past_wall(vm, now))
+    }
+
+    /// S10: `id`'s start moved back by `secs`, its wall as much nearer (the
+    /// remote rig's `bring_wall_near` ages the Mac's row with it); a VM
+    /// not here, or with no start, is left as it is.
+    pub fn age(&mut self, id: &str, secs: u64) {
+        if let Some(started) = self.vms.get_mut(id).and_then(|vm| vm.started_at_unix.as_mut()) {
+            *started = started.saturating_sub(i64::try_from(secs).unwrap_or(i64::MAX));
         }
     }
 
@@ -663,26 +771,55 @@ impl FakeState {
         Ok(vm)
     }
 
+    /// SuspendMicrovm: recorded, a scripted failure, the wall's look
+    /// ([`FakeState::enforce_wall`]), then RUNNING → SUSPENDED (Conflict from
+    /// any other state). A call whose own look ended the VM at its wall
+    /// leaves no record (S10): it moved nothing, and the fake endpoint
+    /// replays every recorded suspend to the VM's shim before its
+    /// `/terminate`.
     pub fn suspend(&mut self, id: &str) -> Result<(), BridgeError> {
         self.calls.push(Call::Suspend(id.to_string()));
         self.fail("suspend", "suspend_microvm")?;
-        let vm = self.vm_mut(id, "suspend_microvm")?;
-        if vm.state != VmState::Running {
-            return Err(BridgeError::Conflict(format!("{id} is {}, not RUNNING", vm.state.as_str())));
+        let live = self.live(id);
+        self.settle_for_wall();
+        let state = self.vm_mut(id, "suspend_microvm")?.state.clone();
+        if state != VmState::Running {
+            self.unrecord_if_ended(live, &state);
+            return Err(BridgeError::Conflict(format!("{id} is {}, not RUNNING", state.as_str())));
         }
-        vm.state = VmState::Suspended;
+        self.vm_mut(id, "suspend_microvm")?.state = VmState::Suspended;
         Ok(())
     }
 
+    /// ResumeMicrovm: as [`FakeState::suspend`], SUSPENDED → RUNNING
+    /// (Conflict from any other state); a call whose own look ended the VM
+    /// at its wall leaves no record.
     pub fn resume(&mut self, id: &str) -> Result<(), BridgeError> {
         self.calls.push(Call::Resume(id.to_string()));
         self.fail("resume", "resume_microvm")?;
-        let vm = self.vm_mut(id, "resume_microvm")?;
-        if vm.state != VmState::Suspended {
-            return Err(BridgeError::Conflict(format!("{id} is {}, not SUSPENDED", vm.state.as_str())));
+        let live = self.live(id);
+        self.settle_for_wall();
+        let state = self.vm_mut(id, "resume_microvm")?.state.clone();
+        if state != VmState::Suspended {
+            self.unrecord_if_ended(live, &state);
+            return Err(BridgeError::Conflict(format!("{id} is {}, not SUSPENDED", state.as_str())));
         }
-        vm.state = VmState::Running;
+        self.vm_mut(id, "resume_microvm")?.state = VmState::Running;
         Ok(())
+    }
+
+    /// Whether `id` is a VM that has not ended (before a call's look).
+    fn live(&self, id: &str) -> bool {
+        self.vms.get(id).is_some_and(|vm| !vm.state.is_terminal())
+    }
+
+    /// S10: a suspend or resume refused because its own look ended the VM
+    /// (`live` before the look, `state` terminal after it: the wall) takes
+    /// back the call it just recorded, its last.
+    fn unrecord_if_ended(&mut self, live: bool, state: &VmState) {
+        if live && state.is_terminal() {
+            self.calls.pop();
+        }
     }
 
     /// Idempotent (terminating a TERMINATED VM succeeds, as documented).
@@ -730,6 +867,7 @@ impl FakeState {
     pub fn create_auth_token(&mut self, id: &str, minutes: u16, port: u16) -> Result<AuthToken, BridgeError> {
         self.calls.push(Call::Token { id: id.to_string(), minutes, port });
         self.fail("token", "create_microvm_auth_token")?;
+        self.settle_for_wall();
         let vm = self.vm_mut(id, "create_microvm_auth_token")?;
         if vm.state.is_terminal() {
             return Err(BridgeError::Conflict(format!("{id} is {}", vm.state.as_str())));
@@ -903,7 +1041,174 @@ impl FakeState {
             uptime_s: 1,
             wire: Some(crate::wire::frame::WIRE_VERSION),
             caps: self.health_caps.clone(),
+            mem_total_mib: None,
         }
+    }
+}
+
+/// S10 (R): the fake API's wall ([`FakeState::enforce_wall`]).
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod r_tests {
+    use super::*;
+
+    /// A RUNNING VM of the fake image, its wall 900 s after its start, which is `aged` seconds ago.
+    fn running(s: &mut FakeState, token: &str, aged: u64) -> String {
+        let spec = RunSpec {
+            image_arn: FAKE_IMAGE_ARN.into(),
+            image_version: "1.0".into(),
+            execution_role_arn: None,
+            ingress_connectors: vec![],
+            egress_connectors: vec![],
+            idle: IdleSpec { max_idle_s: 300, suspended_s: 900, auto_resume: true },
+            max_duration_s: 900,
+            run_hook_payload: "{}".into(),
+            client_token: token.into(),
+        };
+        let id = s.run(&spec).unwrap().id;
+        s.advance_all();
+        s.age(&id, aged);
+        id
+    }
+
+    /// Off by default, a VM past its wall runs on whoever looks; asked for,
+    /// the next look ends it (TERMINATING, with the reason), the look after
+    /// finds it TERMINATED, and a VM short of its wall runs on.
+    #[test]
+    fn the_wall_ends_a_vm_at_the_next_look_only_when_asked() {
+        let mut s = FakeState::new();
+        assert!(!s.enforce_wall, "off by default");
+        let old = running(&mut s, "t1", 900);
+        assert_eq!(s.get(&old).unwrap().state, VmState::Running, "no wall without the switch");
+        assert_eq!(s.list(None).unwrap()[0].state, VmState::Running);
+        assert!(!s.wall_due());
+        s.enforce_wall = true;
+        assert!(s.wall_due(), "the next look ends it");
+        let ended = s.get(&old).unwrap();
+        assert_eq!((&ended.state, ended.state_reason.as_deref()), (&VmState::Terminating, Some(FAKE_WALL_REASON)));
+        let gone = s.get(&old).unwrap();
+        assert_eq!((&gone.state, gone.state_reason.as_deref()), (&VmState::Terminated, Some(FAKE_WALL_REASON)), "TERMINATED at the look after");
+        assert!(gone.terminated_at_unix.is_some());
+        assert!(!s.wall_due(), "an ended VM has no wall left to reach");
+        let young = running(&mut s, "t2", 800);
+        assert_eq!(s.get(&young).unwrap().state, VmState::Running, "100 s short of its wall");
+        assert!(!s.wall_due());
+    }
+
+    /// The wall counts suspended time (the platform's, S6's C21): a
+    /// SUSPENDED VM past it ends too, and a resume, which looks first, is
+    /// refused.
+    #[test]
+    fn suspended_time_counts_toward_the_wall() {
+        let mut s = FakeState { enforce_wall: true, ..FakeState::new() };
+        let id = running(&mut s, "t1", 0);
+        s.suspend(&id).unwrap();
+        s.age(&id, 900);
+        assert!(s.wall_due());
+        let refused = s.resume(&id).unwrap_err();
+        assert!(matches!(&refused, BridgeError::Conflict(m) if m.contains("TERMINATING")), "{refused}");
+        assert_eq!(s.list(None).unwrap()[0].state, VmState::Terminated);
+    }
+
+    /// Asked for, `suspend` and `create_auth_token` look first too, so a VM
+    /// past its wall refuses both, and the endpoint's check answers the
+    /// proxy's 502 for one whose token was minted before its wall.
+    #[test]
+    fn suspend_tokens_and_the_endpoint_see_the_wall() {
+        let mut s = FakeState { enforce_wall: true, ..FakeState::new() };
+        let a = running(&mut s, "t1", 900);
+        assert!(matches!(s.suspend(&a), Err(BridgeError::Conflict(_))), "suspend looks first");
+        let b = running(&mut s, "t2", 900);
+        assert!(matches!(s.create_auth_token(&b, 5, APP_PORT), Err(BridgeError::Conflict(_))), "a token too");
+        let c = running(&mut s, "t3", 0);
+        let token = s.create_auth_token(&c, 5, APP_PORT).unwrap();
+        let endpoint = s.vms[&c].endpoint.clone();
+        assert_eq!(s.endpoint_check(&endpoint, &token, APP_PORT), Ok(c.clone()));
+        s.age(&c, 900);
+        let refused = s.endpoint_check(&endpoint, &token, APP_PORT).unwrap_err();
+        assert_eq!((refused.status, refused.proxy_error.as_deref()), (502, Some("BAD_GATEWAY")));
+        assert_eq!(s.vms[&c].state, VmState::Terminating);
+    }
+
+    /// `age` moves a start back and nothing else; a VM not here is left alone.
+    #[test]
+    fn age_moves_the_start_back() {
+        let mut s = FakeState::new();
+        let id = running(&mut s, "t1", 0);
+        let started = s.vms[&id].started_at_unix.unwrap();
+        s.age(&id, 120);
+        assert_eq!((s.vms[&id].started_at_unix, &s.vms[&id].state), (Some(started - 120), &VmState::Running));
+        s.age("microvm-nope", 120);
+        s.enforce_wall = true;
+        assert!(!s.wall_due(), "120 s of its 900 gone");
+    }
+
+    /// Asked for (`terminate_after_hook`), a TERMINATING VM a shim ran
+    /// (`hook_ran`) waits for that shim's `/terminate` answer
+    /// (`terminate_answered`), whoever looks, and the look after the answer
+    /// ends it, the wall's reason kept. A VM no shim ran ends at the next
+    /// look; TerminateMicrovm's TERMINATING waits the same way, at most
+    /// `TERMINATE_HOOK_WAIT_S` after a look first saw it. Off, every VM
+    /// ends at the next look, nothing recorded.
+    #[test]
+    fn terminated_waits_for_the_shims_terminate_answer_when_asked() {
+        let mut s = FakeState { enforce_wall: true, terminate_after_hook: true, ..FakeState::new() };
+        let (ran, quiet) = (running(&mut s, "t1", 900), running(&mut s, "t2", 900));
+        s.hook_ran.insert(ran.clone());
+        assert_eq!((s.get(&ran).unwrap().state, s.vms[&quiet].state.clone()), (VmState::Terminating, VmState::Terminating), "the wall's look");
+        for _ in 0..3 {
+            assert_eq!(s.get(&ran).unwrap().state, VmState::Terminating, "held until its shim answered /terminate");
+        }
+        assert_eq!(s.get(&quiet).unwrap().state, VmState::Terminated, "no shim ran it: nothing to wait for");
+        assert!(s.terminating_since.contains_key(&ran), "the wait's start");
+        s.terminate_answered.insert(ran.clone());
+        let ended = s.get(&ran).unwrap();
+        assert_eq!((&ended.state, ended.state_reason.as_deref(), ended.terminated_at_unix.is_some()), (&VmState::Terminated, Some(FAKE_WALL_REASON), true));
+        let gone = running(&mut s, "t3", 0);
+        s.hook_ran.insert(gone.clone());
+        s.terminate(&gone).unwrap();
+        assert_eq!(s.list(None).unwrap().iter().find(|v| v.id == gone).map(|v| v.state.clone()), Some(VmState::Terminating), "TerminateMicrovm's end waits too");
+        *s.terminating_since.get_mut(&gone).unwrap() -= TERMINATE_HOOK_WAIT_S;
+        assert_eq!(s.get(&gone).unwrap().state, VmState::Terminated, "a shim that never answers is waited for so long at most");
+        let mut off = FakeState::new();
+        let id = running(&mut off, "t4", 0);
+        off.hook_ran.insert(id.clone());
+        off.terminate(&id).unwrap();
+        assert_eq!(off.get(&id).unwrap().state, VmState::Terminated, "off: at the next look");
+        assert!(off.terminating_since.is_empty(), "off: no wait recorded");
+    }
+
+    /// A suspend or a resume whose own look ends the VM at its wall is
+    /// refused and leaves no record: it moved nothing, and the fake endpoint
+    /// replays every recorded one to the VM's shim before its `/terminate`.
+    /// One refused for a VM that ended before it, for its state without the
+    /// wall, or by a scripted failure keeps its record, as ever.
+    #[test]
+    fn a_call_whose_own_look_ends_the_vm_leaves_no_record() {
+        let mut s = FakeState { enforce_wall: true, ..FakeState::new() };
+        let a = running(&mut s, "t1", 900);
+        let before = s.calls.clone();
+        assert!(matches!(s.suspend(&a), Err(BridgeError::Conflict(_))), "the wall's look ends it first");
+        assert_eq!((&s.calls, &s.vms[&a].state), (&before, &VmState::Terminating), "no Suspend recorded");
+        let b = running(&mut s, "t2", 0);
+        s.suspend(&b).unwrap();
+        s.age(&b, 900);
+        let before = s.calls.clone();
+        assert!(matches!(s.resume(&b), Err(BridgeError::Conflict(_))), "suspended time counts");
+        assert_eq!(s.calls, before, "no Resume recorded");
+        assert!(matches!(s.suspend(&a), Err(BridgeError::Conflict(_))), "ended before the call");
+        assert_eq!(s.calls.last(), Some(&Call::Suspend(a.clone())));
+        assert!(matches!(s.resume(&b), Err(BridgeError::Conflict(_))));
+        assert_eq!(s.calls.last(), Some(&Call::Resume(b.clone())));
+        let c = running(&mut s, "t3", 900);
+        s.failures.push_back(FakeFailure { kind: "throttled".into(), message: "Rate exceeded".into(), on: Some("suspend".into()), after_effect: false });
+        assert!(matches!(s.suspend(&c), Err(BridgeError::Throttled(_))));
+        assert_eq!((s.calls.last(), &s.vms[&c].state), (Some(&Call::Suspend(c.clone())), &VmState::Running), "a scripted failure comes before the look");
+        let mut off = FakeState::new();
+        let d = running(&mut off, "t4", 900);
+        off.suspend(&d).unwrap();
+        assert!(matches!(off.suspend(&d), Err(BridgeError::Conflict(_))));
+        assert_eq!(off.calls.last(), Some(&Call::Suspend(d.clone())), "no wall: a refusal for the state is recorded");
     }
 }
 

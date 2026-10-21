@@ -147,7 +147,10 @@ ai-env wrapper uninstall [--write]                        # take claudeProcessWr
                                                           #   it warns first while remote chats keep only their view here, S9)
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env wrapper settings-sync UUID [--rule R]… [--all-safe] [--write] [--image-dir DIR]   # a remote chat's approved rules → the image (S8)
-ai-env session list [--json] | show UUID [--json] [--settings-diff] | forget UUID [--purge] | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8)
+ai-env session list [--json] | show UUID [--json] [--settings-diff] | forget UUID... [--purge] | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8);
+                                                          #   forget: several ids, every one checked first, one Touch ID for --purge (S10)
+ai-env session migrate UUID [--json]                      # a remote chat to a new VM now: its running wrapper moves it between turns,
+                                                          #   else this command does (S10; one Touch ID either way)
 ai-env session stage UUID [--warm] [--json] | sync UUID [--json]   # a chat begun on this Mac into S3, its view left / a remote chat's
                                                           #   transcript from its VM to S3 now (S9; one Touch ID each; --warm adds vm warm's and restores the chat into its VM)
 ai-env session gc --remote [--older-than DAYS] [--yes] [--json] | migrate-s9 [--yes] [--json]   # the S3 transcripts of chats closed over
@@ -166,7 +169,8 @@ ai-env creds  deployer-key [--account ACCOUNT] | deployer-key --clipboard-check 
 ai-env creds  setup-token [--stdin|--from-env] [--no-combined] [--force]   # seal the Claude setup-token (asked for hidden) (S7)
 ai-env creds  status [--json] [--unseal] | forget [--yes] [--ops]  # what is sealed, without Touch ID / delete the token and its copies
                                                           #   (--ops: only credentials/ops.env and its backups; the IAM commands are printed)
-ai-env vm     images [--managed] | list [--all] | status ID | health ID   # MicroVMs of the ai-env image (bridge feature)
+ai-env vm     images [--managed] | list [--all] | status ID | health ID   # MicroVMs of the ai-env image (bridge feature);
+                                                          #   list (without --json) then reconciles the registry locally, as run and smoke do (S10)
 ai-env vm     run [--workspace PATH] [--max-duration S] [--egress internet|vpc] [--shell] [--json] …
 ai-env vm     token ID [--port 8080|8082|9418] [--minutes M] [--reveal]   # the value only with --reveal
 ai-env vm     suspend ID | resume ID | terminate ID|--all [--yes] | gc [--yes] [--include-orphans AGE]
@@ -240,10 +244,12 @@ allowlist of non-secret values, argv with MCP credentials and the positional tai
 masked). `ai-env wrapper census` prints it; `--record-probes` writes the `entrypoint` and
 `stock-ext-oauth` verdicts (from the newest session row) and, once the census holds remote end rows
 (S8), `init-wrapper` (the newest cold and warm ones: on a VM started for the session, against 30 s;
-on one reused or resumed, against 5 s) to `lab/probes.jsonl`. It exits 1 after writing when a verdict
-misses its expectation, a `gap:cold` or `gap:warm` included: after the first cold chat alone it reads
-`gap:warm` (or `over:cold`). `AI_ENV_BRIDGE_LOCAL=1` in the extension's environment is the kill
-switch: exec the real binary, no census, no bridge.
+on one reused, against 5 s; on one resumed, against 8 s (since S10); a session that moved the chat, a
+reopen's carry included, is judged only past 30 s, as the cold row, and never a pinned chat's) to
+`lab/probes.jsonl`. It exits 1 after writing when a verdict misses its expectation, a `gap:cold` or
+`gap:warm` included: after the first cold chat alone it reads `gap:warm` (or `over:cold`).
+`AI_ENV_BRIDGE_LOCAL=1` in the extension's environment is the kill switch: exec the real binary, no
+census, no bridge.
 
 With `AI_ENV_BRIDGE_MODE=local-child` (or `local-scratch`) in `claudeCode.environmentVariables`,
 a stream-json chat session is no longer exec'd: the wrapper spawns the bundled binary as a piped
@@ -607,7 +613,8 @@ token Anthropic refuses ends with 5 and such a line too: Credentials).
   second socket 10 min before the token expires) or `"lazy"`; `keepalive = "http"` (a `GET /health`
   every max-idle/3 keeps a running command's VM from idling into suspend) or `"frames"`;
   `suspend_wait_s` (after the VM was suspended under a client, how long it waits for someone to resume
-  it — it never resumes one itself — before exit 8 naming `vm resume` and `vm attach`).
+  it — it never resumes one itself — before exit 8 naming `vm resume` and `vm attach`; since S10 a
+  Cursor chat that parks waits for its next message instead, which resumes the VM: stage S10).
 - **The endpoint's answers.** 401/403: one re-mint, then exit 7. 429: wait the longer of `Retry-After`
   and the backoff step (exponential when no `Retry-After` comes), never re-mint, audited `endpoint_429`.
   502: GetMicrovm decides (gone or terminating: exit 8; suspended: resume, then reattach). The shim's 503
@@ -855,9 +862,11 @@ typo from `[wrapper]` (`[wraper]`) or a `mode` key outside any table leave the m
 counts as remote; a file that cannot be read or is not TOML at all fails every session unless
 `AI_ENV_BRIDGE_MODE` names a mode other than `remote`; with no bridge.toml there are no roots). A
 workspace has one VM: the config probe and the chats share it, and a reopened chat goes back to the VM
-it ran on while that VM lives.
+it ran on while that VM lives (since S10 a lost VM moves an open chat to a new one, and a VM near its
+wall migrates it: stage S10).
 When Cursor closes a chat the wrapper exits within 1.5 s: claude in the VM gets 1.2 s to end by itself
-(it takes 0.5 to 1.1 s), then the VM's shim finishes the job.
+(it takes 0.5 to 1.1 s), then the VM's shim finishes the job (a parked chat whose VM is suspended
+closes at once: stage S10).
 
 **Install and switch on.** `make install` puts `ai-env` and `ai-env-claude` in `~/.cargo/bin` (never
 point Cursor at a build under `target/`: `cargo clean` would break it). Then, from the installed
@@ -942,6 +951,8 @@ countdown goes to the wrapper's stderr, and the dialog must be answered within C
 `Touch ID was cancelled: nothing was started; reopen the chat to try again`; no answer in time exits 5,
 with the line
 `no Touch ID within N s (Cursor's 60 s window): nothing was started; ai-env vm warm prepares the VM ahead`.
+Since S10 an open chat that moves to a new VM asks one more, for the setup token alone, in a dialog of
+`[creds].unseal_timeout_s` within the move's 180 s (what a dismissal does then: stage S10).
 When Cursor opens a window it runs `auth status --json`; under the roots the wrapper then starts
 `ai-env vm warm WORKSPACE --prewarm` detached, so the VM is running and seeded before the first chat.
 `[vm] prewarm_on_auth_status` is `"auto"` (the default: only when the workspace has no VM to reuse),
@@ -1038,10 +1049,12 @@ S3, and the Mac's `~/.claude/projects/` holds only its view (the last 10 message
 project name, so Cursor's picker lists the chat as before (stage S9). Reopening it starts a session with
 `--resume`: the wrapper takes the VM the chat ran on while it lives, which keeps its copy; on a new VM
 (the old one terminated, or past its wall) it seeds the workspace and restores the transcript from S3
-before claude starts. A chat begun on this Mac goes up the first time it reopens remote, its transcript
-and its subagents' files through the tripwires first (see Security): a finding is exit 9 and none of it
-is sent. `ai-env session show UUID` shows a chat's VM, spawn, seeded head and newest fetched snapshot,
-and since S9 where its transcript is kept (`transcript_home`), where it began (`origin`) and its view.
+before claude starts (since S10 the seed is the old VM's last fetched work, and a reopen near the old
+VM's wall moves the chat off it first: stage S10). A chat begun on this Mac goes up the first time it
+reopens remote, its transcript and its subagents' files through the tripwires first (see Security): a
+finding is exit 9 and none of it is sent. `ai-env session show UUID` shows a chat's VM, spawn, seeded
+head and newest fetched snapshot, since S9 where its transcript is kept (`transcript_home`), where it
+began (`origin`) and its view, and since S10 every VM it ran on (`vms`, with why each started).
 
 ```sh doc-test
 ai-env session list        # the chats the wrapper registered, newest first
@@ -1104,7 +1117,7 @@ make test-docker deploy   # the image with the rule (test-docker builds the zip 
 
 - the VM holds the delivered setup-token (S7) and the agent can read it there: an inference-only token,
   good for model requests and nothing else; a suspended VM's snapshot may hold it until the VM is
-  TERMINATED;
+  TERMINATED (since S10 every parked chat's VM is such a snapshot, claude's copy in it: stage S10);
 - the VM reaches the network through the allowlist only (S5: `api.anthropic.com`,
   `platform.claude.com`, `index.crates.io`, `static.crates.io`, and `egress allow` extras), and the
   wrapper sets `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`,
@@ -1132,9 +1145,11 @@ make test-docker deploy   # the image with the rule (test-docker builds the zip 
 - the VM has no `origin` and no push credential: nothing the agent writes reaches a remote before you
   merge it and push it yourself, and since S9 the pre-push hook reviews that push (stage S9).
 
-**Cost and clean-up.** An open chat keeps its VM running, and billed, for as long as it stays open (the
-session's keep-alive holds off the idle policy, up to the VM's wall, `[vm] max_duration_s`); S10 parks
-idle chats. When the last chat of a workspace closes, the wrapper suspends its VM
+**Cost and clean-up.** An open chat keeps its VM running, and billed, while it works. Since S10 an idle
+one parks after `[vm] park_after_s` and the idle policy then suspends its VM, at most 10 minutes after
+its last activity at the defaults (stage S10); with `[vm] park = false`, or on a VM of an older image,
+the session's keep-alive holds off the idle policy for as long as the chat stays open, up to the VM's
+wall, `[vm] max_duration_s`. When the last chat of a workspace closes, the wrapper suspends its VM
 (`[vm] suspend_on_close`); otherwise the idle policy suspends it after `[vm] max_idle_s`, and a
 suspended VM is terminated once its suspended time or its wall runs out.
 `ai-env vm terminate --all --yes` ends every VM you started; do it at the end of a day, since a snapshot
@@ -1151,12 +1166,15 @@ ai-env vm gc --yes   # terminate expired VMs and clear stale rows (without --yes
   line is `ai-env-claude: …` naming the fix. N is 1 (bridge.toml, the workspace's repository, a
   seed too large for Cursor's window, or since S9 a `state/infra.toml` that records no transcripts
   bucket, `make infra-status WRITE=1`: the line says which), 2 (`AI_ENV_BRIDGE_VM` is not a MicroVM
-  id), 3 (Touch ID dismissed), 4 or 6 (the keystore key, or a credentials file:
-  `ai-env creds status`), 5 (no Touch ID in time, no sealed token or runtime key, or Anthropic refused
-  the token), 7 (AWS, or an image older than S8 or S9: the line names what it lacks, `make deploy`), 8
-  (the VM is gone, or its connection stayed lost: reopen the chat from the picker), 9 (a policy refusal:
+  id), 3 (Touch ID dismissed, a move's too), 4 or 6 (the keystore key, or a credentials file:
+  `ai-env creds status`), 5 (no Touch ID in time, a move's too, no sealed token or runtime key, or
+  Anthropic refused the token), 7 (AWS, or an image older than S8 or S9: the line names what it lacks,
+  `make deploy`), 8 (the VM is gone, or its connection stayed lost, and since S10 the chat could not
+  move: past `[vm] max_readdress` moves, a pinned VM, or a move that failed at 8 (stage S10); reopen
+  the chat from the picker), 9 (a policy refusal:
   a scan finding, not a git repository, `[vm] max_concurrent` (a closed chat's suspended VM counts until
-  its suspended time or its wall runs out: `ai-env vm terminate ID` frees a slot; `vm gc --yes` ends only
+  its suspended time or its wall runs out, and since S10 so does a parked chat's; the line names the
+  suspended VMs no open chat holds: `ai-env vm terminate ID` frees a slot; `vm gc --yes` ends only
   expired VMs), the credential gate, a refused environment name, and since S9 a transcript over the
   64 MiB a reopen carries or pulls (run what the line names in a terminal:
   `ai-env session stage UUID --warm`, after `ai-env session migrate-s9 --yes` for an S8 mirror, and
@@ -1187,7 +1205,8 @@ source though nothing was sent, or cached though the VM had lost its copy (exit 
 up_to_date, kept), `transcript` (S9: kept on the VM, restored from S3, staged from this Mac, or none),
 `mirror_dropped:N` (S9: transcript frames a remote child sent anyway, dropped; only when N is above 0),
 `fetch` (the fetches
-that succeeded, of those asked for), `close_ms`, `link_drops`, `auth_timers` and `pid_rewrite`, and for
+that succeeded, of those asked for), `close_ms`, `link_drops`, `auth_timers` and `pid_rewrite` (S10
+adds the moves' and the parks' parts: stage S10), and for
 a session that never started its `step`; a start row refused for a view notes `view_refused:resume` or
 `view_refused:continue`. Under `~/.config/ai-env/bridge/`, `logs/wrapper.log` holds the
 wrapper's notes and warnings (Cursor never shows them), `logs/ai-env.log` the CLI's, and `audit.jsonl`
@@ -1196,7 +1215,8 @@ and why, `vm_select`, `seed`, `seed_refused`, `codeout_fetch` (S9: with `via`, `
 `smart-http`), `box_fetch_finding`, `settings_capture`, `settings_sync`, `prewarm`,
 `auth_timers_unmeasured`, and S9's `transcript_push`, `transcript_pull`, `transcript_view`,
 `transcript_stage`, `transcript_gc`, `transcript_migrate`, `box_review`, `hook_install` and
-`drop_transport`; never a URL or a transcript byte; the S4 to S7 rows a session
+`drop_transport`, and S10's rows of the moves, the parks and the reaper (stage S10); never a URL or a
+transcript byte; the S4 to S7 rows a session
 writes carry purpose `session` or `prewarm`). `AI_ENV_BRIDGE_VM=ID` in Cursor's environment pins its
 chats to one VM, checked before any Touch ID. `ai-env session drop-transport UUID` closes a running
 remote chat's connection from the wrapper's side, and the chat reattaches (part B's check of T8.6).
@@ -1329,12 +1349,13 @@ travels to the VM in a request body behind the session bearer, and there curl ru
 (`ai-env-net`) with the URL on its fd 3, out of the agent's reach. `ai-env session sync UUID` syncs one
 chat now (one Touch ID). Before this Mac ends a running VM (`vm terminate`, `vm gc --yes`) it syncs the
 chats it holds (at most 60 s for them all; `[vm] auto_gc` does the same); a suspended one is ended as it
-is, never woken: what a turn added after the last sync went up at its `/suspend`, once (a line written
-after that push and before the next sync is lost: S10). What a turn adds after the last sync goes up from
-the VM itself at `/suspend` or `/terminate`, through a URL signed ahead for an hour, without the length
-or the sha256 it cannot know (the main transcript only: a subagent's file changed after the last sync is
-lost). That URL is handed as soon as the chat has its id and again before
-each turn, so a chat closed before its first sync still goes up whole; until that sync its view is a
+is, never woken: what a turn added after the last sync went up at its `/suspend` (since S10 a line
+written after that push goes up too, through the next tail of a chain: stage S10). What a turn adds
+after the last sync goes up from the VM itself at `/suspend` or `/terminate`, through a URL signed ahead
+for an hour, without the length or the sha256 it cannot know (the main transcript only: a subagent's
+file changed after the last sync is lost). That URL is handed as soon as the chat has its id and again
+before each turn (since S10 at every unpark too, and the VM keeps it until S3 has answered its push),
+so a chat closed before its first sync still goes up whole; until that sync its view is a
 placeholder (`Remote chat`) that Cursor lists and reopens. A chat whose subagent and tool files pass 256
 files or 256 MiB is synced without them (said once); a file synced once is never dropped from S3 by a
 later sync.
@@ -1378,10 +1399,10 @@ rule, and nothing is sent), sent to S3 by the Mac (`transcript:staged`), then mo
 chat is refused before any Touch ID, exit 9:
 `the chat's transcript is SIZE (over the 64 MiB a reopen carries inline): run ai-env session stage UUID --warm in a terminal, then reopen the chat`.
 `ai-env session stage UUID` stages a chat of up to 4 GiB (what a restore pulls) from a terminal (one
-Touch ID): scanned first, then a multipart upload (64 MiB parts, 8 at a time, a sha256 each; a
-part's timeout allows for the 8 sharing an uplink of at least 1 MB/s, and a part that gets no answer,
-or S3's 500 or 503, goes again, 3 tries at most) that resumes where a cut left it, never sending again
-an object S3 holds; `--warm` then runs `ai-env vm warm`
+Touch ID): scanned first, then a multipart upload (64 MiB parts, 8 at a time, a sha256 each; since
+S10 a part is held to its progress, not to a timeout of the whole (stage S10), and a part that gets no
+answer, or S3's 500 or 503, goes again, 3 tries at most) that resumes where a cut left it, never
+sending again an object S3 holds; `--warm` then runs `ai-env vm warm`
 on the chat's workspace (its own Touch ID), so the VM is up and seeded, and restores the chat from S3
 into that VM (no Touch ID of its own), where its reopen keeps it (below). Before anything is sent it
 refuses (exit 9) a chat whose transcript records a cwd outside `bridge.toml`'s roots or in no git
@@ -1425,7 +1446,9 @@ days ago (`--older-than DAYS`), then their manifests and views; a Mac-begun chat
 chat whose upload or first sync was cut before its manifest counts too, by the age of what it left in
 `state/transcripts/`. Without `--yes` it lists them from this Mac's state (no AWS call, no Touch ID).
 `ai-env session forget UUID --purge` also deletes one chat's S3 objects, its manifest, its original
-under `state/transcripts/` and its view, after S8's checks (never while the chat runs).
+under `state/transcripts/` and its view, after S8's checks (never while the chat runs); since S10 it
+takes several ids, checks every one before it removes anything, and purges them all with one Touch ID
+(stage S10).
 
 ```sh doc-test
 ai-env session gc --remote --yes   # the S3 transcripts of chats closed over 90 days ago (without --yes: the list, no Touch ID)
@@ -1462,6 +1485,315 @@ with `-` (`--version`, `-V`, `--help` or `-h` alone still print and exit 0) or i
 `claude` (CUSTODY-4: `ai-env-claude help` never runs the Mac's
 claude), before any config read or census row; under the kill switch the first argument is still
 exec'd as it is.
+
+### Chats move to a new VM, idle chats park (stage S10)
+
+**What changes.** A remote chat now outlives its VM. A lost VM (terminated, or no longer answering)
+moves the chat to a new VM, with one Touch ID for the setup token and a note in the chat; a claude lost
+on a VM that still runs restarts there, with no Touch ID while that VM holds the token; either way the
+message the loss interrupted is sent again. Before its VM reaches the 8-hour wall a chat migrates to a
+new VM between turns, with one Touch ID, and `ai-env session migrate UUID` does the same on demand. An
+idle chat parks: the wrapper goes silent, the platform suspends the VM, and the next message resumes
+it, with no Touch ID. None of it ends the chat Cursor runs: it keeps its process, its session and its
+history. Moves work on S9's image too; parking needs S10's (its `/health` names `park_v1`): a chat on
+an older VM never parks (`park:off(no_cap)` in the census) and keeps S8's keep-alive.
+
+**A lost VM.** What ended the link decides, never a message's text:
+
+- the VM was terminated (`vm terminate`, its wall, the platform) or is gone: the chat moves to a new
+  VM once the old one is TERMINATED (at most 15 s), so the transcript's last tail, which a VM pushes as
+  it ends, is in S3 before the restore;
+- the VM stopped answering (its reconnect budget, 300 s, ran out: the shim down, the endpoint
+  throttling): it moves too, once the old VM was synced (best effort, at most 10 s) and terminated
+  (`vm_terminate` with `by` `readdress`), so that one no longer counts against `[vm] max_concurrent`;
+- claude's spawn is gone, or a reattach found a replay gap, on a VM that still runs: claude restarts
+  there (below);
+- anything else (a newer client took the session, a refused hello or token) ends the chat as in S9,
+  and so does any loss of a chat that is closing, or of a session that keeps no transcript.
+
+The move asks its Touch ID at once, while it picks the VM: the workspace's other VM when one can be
+reused (never the lost one), else a new one. The new VM gets the lost VM's work as this Mac last
+fetched it (the branch, its commits and the snapshot of its uncommitted files at the last turn's end);
+this Mac's checkout instead when that VM had nothing of its own (its last fetched head in this Mac's
+history, no uncommitted files), and also, with a note, when nothing was ever fetched from it. Then
+the transcript comes from S3, and claude starts with `--resume`, cut just before the interrupted
+message when the transcript holds it (`--resume-session-at`); the message is sent again, and its turn
+runs again from the prompt. A permission prompt left open is withdrawn (Cursor dismisses it, and the
+turn asks again), and an interrupt you sent goes again after the message. The chat shows a note, a
+line Cursor renders that never reaches claude or the transcript (wrapper.log keeps a copy):
+
+`ai-env: this chat's VM ID was lost (it was terminated); moving the chat to a new VM (Touch ID for the setup token); the interrupted message is sent again; files are as of the last turn's end`
+
+(`it stopped answering` for a VM that did), then, once claude runs on the new VM:
+
+`ai-env: the chat continues on ID; background tasks and MCP servers did not survive the move`
+
+A loss with no turn in flight waits for your next message, so you are there for the Touch ID; the
+chat's row says `detached` meanwhile, and the note reads:
+
+`ai-env: this chat's VM ID was lost (it was terminated); the chat moves to a new VM with your next message (Touch ID for the setup token)`
+
+A loss mid-turn, or before Cursor's `initialize` was answered, moves at once. A move loses what the
+lost VM did after its last turn's end (an edit made after the last answer, which no fetch took), the
+interrupted turn's partial work (it runs again), background tasks, MCP servers and the old VM's file
+history (no rewind across a move). It also misses a branch switch or a HEAD move that made no new
+object (`git checkout -b topic`, a reset to a commit this Mac already has): the turn's fetch finds
+nothing new, so this Mac keeps the record of the fetch before, and the new VM gets that fetch's branch
+and HEAD (no commit is lost; the fix is deferred past S10). What was fetched stays under
+`refs/remotes/box/*`, as before.
+
+`[vm] max_readdress` (3; 0 to 10) bounds the moves after a lost link in one wrapper process, to a new
+VM and on the same one (a migration counts none). With 0 a lost VM ends the chat as in S9 (exit 8);
+past the limit it ends with exit 8 and:
+
+`lost the VM ID after 3 moves in this session ([vm] max_readdress): reopen the chat from the picker`
+
+A move has 180 s to get claude running (one that starts before Cursor's `initialize` was answered
+keeps the start's 50 s). One that fails ends the chat with the exit of what failed (3 a dismissed
+Touch ID, 5 none in time, 7 to 9 the new VM, its seed, the restore or the spawn) and this line, the
+failure's own in the middle:
+
+`the chat's VM ID was lost (it was terminated); moving the chat to a new VM failed: …; reopen the chat from the picker`
+
+One loss is one move and at most one new VM: a VM lost twice makes two. A chat pinned to a VM
+(`AI_ENV_BRIDGE_VM`) never moves off it: a lost VM ends it as in S9, and only a restart on the pinned
+VM runs. Several chats on one lost VM move each with its own Touch ID, to one new VM when they can: a
+VM whose checkout changed since its seed (another chat's) keeps it as it is (`seed:kept`,
+`another chat moved here first`).
+
+**A lost claude on a live VM.** A replay gap, or a gone spawn (a reattach found it ended, or its detach
+grace ran out while the link was down), on a VM that still runs: the wrapper stops what is left of that
+claude and starts it again there, cut and sent again as above:
+
+`ai-env: this chat's claude on ID was lost (its spawn is gone); restarting it there; the interrupted message is sent again`
+
+(`a replay gap` for a gap; with no turn in flight it waits:
+`ai-env: this chat's claude on ID was lost (its spawn is gone); it restarts there with your next message`).
+It asks no Touch ID while the VM holds the token (`touchid` `cached`); every suspend and resume empties
+the VM's copy (S7), so a restart after a park asks one. It moves to a new VM instead, with that move's
+Touch ID, when the VM no longer runs, when the gapped claude does not stop within 3 s, or when the chat
+has had no answer yet (it starts again under its session id, `--session-id`, which needs a VM without
+that chat's file).
+
+**Migration before the wall.** A VM lives at most `[vm] max_duration_s` (8 hours), running and
+suspended together. After an answer, when the chat's VM has less than `[vm] migrate_before_wall_s` left
+(1200 s), the wrapper prepares a new VM while the chat goes on:
+
+`ai-env: moving the chat off ID (its 8-hour wall): Touch ID for the setup token; the chat goes on meanwhile`
+
+That one Touch ID, the new VM (never the old one), the credential gate and the token's delivery run in
+the background, and the prepared VM is kept running for up to 15 minutes. At the next quiet point (no
+message in flight, no prompt open either way) the wrapper switches: the old claude ends, the old VM's
+work is fetched with its uncommitted files and the chat synced to S3, the new VM is seeded from that and
+the transcript restored, and claude resumes there with nothing sent again (`the chat continues on ID`,
+as above). The old VM is synced and terminated afterwards (`vm_terminate` with `by` `migrate`) unless
+another chat's claude still runs there; until it ends, no new chat reuses it.
+
+A dismissed or unanswered Touch ID keeps the chat where it is and asks again after the next turn:
+
+`ai-env: the chat stays on ID (no Touch ID in time); it tries again after the next turn`
+
+A new VM that cannot be prepared for another reason (`[vm] max_concurrent` reached, the gate), or a
+second switch that fell back, ends wall migrations in that wrapper process (the note then ends
+`it moves when the VM reaches its wall`): the wall is the backstop, and the chat then moves as from a
+lost VM. A switch that fails after the old claude stopped restarts claude on the old VM (one more Touch
+ID when a suspend emptied that VM's copy of the token). A pinned chat never migrates.
+`migrate_before_wall_s = 0`, or one at or above `max_duration_s`, turns migration off; 1 to 59 is
+refused, and a value over half of `max_duration_s` puts a line in wrapper.log: a VM would migrate in
+the first half of its life.
+
+With migration on, reopening a chat whose VM is within `migrate_before_wall_s` of its wall moves the
+chat before it starts: a new VM, never the old one, seeded from a fetch of the old one run beside the
+new VM's start (from its last fetch when too little of Cursor's 60 s window is left), the chat synced
+there too; the old VM is terminated afterwards (`carried:migrate` in the census). A reopen whose VM is
+gone, or past its wall, starts on a new VM seeded from that VM's last fetch (`carried:readdress`).
+Both stay within the reopen's own start and its usual Touch IDs, and count no move against
+`[vm] max_readdress`. For a chat over the 64 MiB a reopen pulls inline, a VM near its wall no longer
+counts as one that holds it (stage S9's big chats: `ai-env session stage UUID --warm` first).
+
+**Moving a chat on demand.** `ai-env session migrate UUID` moves a remote chat to a new VM now,
+whatever its wall:
+
+- with the chat open (its wrapper runs, an S10 one), the command leaves a request
+  (`state/sessions/UUID.migrate.json`) and signals the wrapper (SIGUSR1), which prepares the new VM at
+  once (its Touch ID, shown by the wrapper) and switches at the chat's next quiet point, as above; the
+  command waits for the answer, at most 300 s;
+- with the chat closed, the command moves it itself, with one Touch ID, the runtime key's alone (the
+  chat's next reopen delivers the token): the old VM resumed, fetched and synced (its last fetch when
+  it is gone), a new VM, the seed and the restore with no time limit, the chat's row pointed at the new
+  VM (its `vms` gain `migrate:command`), and the old VM terminated, synced first, unless another chat's
+  claude still runs there. Meanwhile a reopen of the chat exits 1
+  (`session UUID is being moved to a new VM (pid N): reopen it in a minute`), and `session forget`
+  refuses it.
+
+It prints `session UUID: moved from ID to ID (live)` (or `offline`), and with `--json` one document
+(`session`, `outcome`, `how`, `from_vm`, `to_vm`, `ms`, `code`). Before any Touch ID it refuses a chat
+on this Mac (exit 9, `session UUID runs on this Mac: there is no VM to move it from`), an unknown chat
+or one with no VM (exit 1), a move another command asked in the last minute (exit 1,
+`a move of session UUID was asked N s ago (pid N): wait for it`), and an open chat whose wrapper
+predates S10, which SIGUSR1 would end (exit 1,
+`session UUID's wrapper (pid N) predates S10: close the chat and reopen it, then run ai-env session migrate again`).
+Its exits: 0 moved; 1 refused (another move under way, the chat closing, a pinned chat), given up
+(the prepared VM's hold ran out, a loss moved the chat first, the chat closed), or no answer within
+300 s (the wrapper may still move it at the chat's next quiet point); 3 or 5 the Touch ID (dismissed,
+or none in time); 7 AWS; 8 the wrapper exited before it answered; 9 a policy refusal (the credential
+gate). Migration off does not stop it, and it is the way out of a move whose seed was too large for its
+window (exit 9, naming it).
+
+**Parking.** After `[vm] park_after_s` of quiet (unset: `[vm] max_idle_s`, 300 s) a chat parks: no
+message in flight, or only a permission prompt waiting for your answer; no line either way; claude's
+own output quiet; the turn's fetch and sync done. The wrapper asks the VM's shim to park claude, then
+stops its pings and its keep-alive, and the platform suspends the VM about `max_idle_s` later, with
+claude in it as it was. The next message, or the prompt's answer, unparks it: the wrapper reconnects
+(the endpoint resumes a suspended VM) and hands the line on, with no Touch ID (the runtime key is in its
+memory, and claude kept its token in its own). Several chats on one VM each park on their own, and the
+VM suspends only once all are silent. `ai-env session list` shows a parked chat as `parked`.
+
+The shim refuses a park while the chat's processes are at work: more than 300 ms of CPU in a 10 s
+sample, a process running (one the agent detached included) or any stdio, within the last 30 s; the
+wrapper asks again after `park_after_s`. A build or a test run therefore keeps its VM up and finishes.
+What waits quietly is frozen with the VM and goes on only when it resumes: a timer, a `sleep`, a
+server, a job waiting on the network.
+
+A suspend under a working chat (`ai-env vm suspend ID`) no longer ends it after
+`[transport].suspend_wait_s`: the chat waits for your next message, which resumes the VM. Closing a
+parked chat whose VM is suspended returns at once and wakes nothing (`close_parked:1`): its claude
+stays parked in the VM's snapshot until the next chat started on that VM ends it, or the VM ends. A
+parked chat whose VM ended meanwhile (its wall, `[vm] suspended_s`, `vm terminate`) moves to a new VM
+at its next message, as from any lost VM. `[vm] park = false` keeps S8's keep-alive: an open chat's VM
+never idles, and a suspend under it waits `[transport].suspend_wait_s`, then exits 8, as `vm exec` and
+`vm attach` do.
+
+**The setup token in a parked VM.** A parked chat's VM is suspended with claude, and with the setup
+token in claude's memory, in its snapshot. That is S7's accepted invariant (a VM given the token may
+hold it until it is TERMINATED), now the everyday case. The shim's own copy is still dropped at
+`/suspend`, which is why a restart after a park asks a Touch ID where an unpark asks none.
+`ai-env creds status` lists the VMs that may hold the token, and `ai-env vm terminate --all --yes` at
+the end of a day ends them.
+
+**Bounds and clean-up.** A parked chat's VM runs at most `park_after_s + max_idle_s` after the chat's
+last activity (10 minutes at the defaults), then sits suspended (its snapshot kept, nothing running)
+until the next message, `[vm] suspended_s` or the wall, whichever comes first. A suspended VM still
+counts against `[vm] max_concurrent`, and the refusal names the ones no open chat holds:
+
+`3 VMs already run ([vm].max_concurrent, suspended ones included): parked with no open chat: ID; ai-env vm terminate ID frees a slot, then reopen the chat`
+
+(`ID (+N more)` when there are more). Each chat's wrapper reconciles the registry 10 s after its start,
+at most every 15 minutes across them all: a VM row whose VM the platform ended is marked terminated,
+old terminated rows go, and a session row whose VM is gone and whose wrapper is dead is closed; it
+never terminates a VM and never asks a Touch ID (`vm_gc_reconcile`). `ai-env vm list` (without
+`--json`), `vm run` and `vm smoke` run the same reconcile every time. Before claude starts on a VM (a
+reopen, a move), the wrapper ends that chat's claude left by a wrapper that is gone (`leftover`) and
+every parked claude whose wrapper is gone (`orphan`), within 2 s each (`session_reap`): two claudes
+never share one transcript. A leftover that does not stop fails the start, exit 8
+(`this chat's claude from an earlier wrapper (spawn UUID) did not stop on ID`).
+
+**The keys** of bridge.toml's `[vm]`, at their defaults:
+
+```toml
+[vm]
+max_readdress = 3            # 0..=10; 0: a lost VM exits 8 as in S9
+park = true                  # false: never park (S8's keep-alive)
+# park_after_s = 300         # 30..=3600; unset: max_idle_s
+migrate_before_wall_s = 1200 # 0, or max_duration_s or more: no migration; 1 to 59 refused
+```
+
+A value out of its range fails every `vm` and `lab` command, a remote chat's start (exit 1) and doctor's
+`[vm]` row, naming the key. An S9 build refuses a bridge.toml that sets `max_readdress`, `park` or
+`park_after_s` (it reads `migrate_before_wall_s`, which S9 uses only to stop reusing a VM near its
+wall): take those out before going back.
+
+**What the records say.** A remote chat's census end row adds `moves:readdress=N,respawn=N,migrate=N`
+once a move started (a reopen's carry counted too), with `move_ms` (the last move's) and `cut` (`none`,
+`at` or `fresh`: how the moved claude resumed); `carried:readdress` or `carried:migrate` for a reopen
+that moved first; on every remote row `inits:F/S` and `echoes:F/S` (claude's inits and message echoes
+forwarded to Cursor and swallowed: a respawn's or a move's duplicates never reach it); `ka_dropped:N`
+(Cursor's `keep_alive` lines dropped while parked; only when N is above 0); `park:N`, or
+`park:off(no_cap)`, `park:off(config)` or `park:off(no_owner)`; `park_refused:N`, `parked_s`,
+`unpark_ms` (the slowest unpark), `unpark_resumed:N` (unparks that found the VM suspended) and
+`close_parked:1`; and `end:move_failed` with `step` for a chat whose move failed. `audit.jsonl` adds
+`session_move` and `session_move_end` (the kind, the cause or the trigger, the VMs, where the seed
+came from, the transcript, the cut, whether a Touch ID was asked, the ms, and the outcome: `done`,
+`failed`, `stayed`, `abandoned` or `refused`), `session_migrate_request`, `session_park`, `session_unpark`,
+`session_park_refused` (at most one per 10 minutes per chat), `session_reap` and `vm_gc_reconcile`;
+`vm_select` gains the generation and the VM it avoided, `seed` its source (`box`, `mac`, `kept`),
+`session_remote_start` why its VM started, `vm_terminate` the reasons `readdress` and `migrate`, and
+the closing suspend's `vm_suspend` its outcome, why it was skipped and its ms, so a missed suspend
+shows. A session row's status is `active`, `detached` (the link down, or a loss waiting for the next
+message), `parked`, `migrating` (a move under way) or `closed`, and its `vms` list each VM the chat ran
+on, across reopens (the newest 64), with why it started (`first`, `retry`, `readdress:vm_gone`,
+`respawn:spawn_gone`, `migrate:wall`, `migrate:command`, `migrate:reopen`, …), how it ended and the
+wrapper's pid. Whether Cursor showed a move's note is recorded by hand after a move:
+`ai-env lab run move-note --manual shown` (or `not-shown:WHAT`).
+
+```sh doc-test
+ai-env session list               # each chat's status: active, detached, parked, migrating or closed
+ai-env session show UUID          # its VM, and in vms each VM it ran on: why it started, how it ended
+ai-env wrapper census --last 4    # the end rows' moves, cut, inits, echoes and park parts
+ai-env vm list                    # the VMs, a parked chat's suspended one too; then the registry reconciled
+ai-env doctor                     # the [vm] row: the memory baseline and the guest's MemTotal ([NO ] naming a key out of its range)
+```
+
+**Also in S10.**
+
+- `ai-env session forget UUID... --purge` takes several chats: every id is checked first (a refusal
+  names its id, and nothing is removed), then one Touch ID purges them all (S9 asked one per chat).
+- A line a chat writes after its VM's `/suspend` pushed the transcript's tail is no longer lost
+  (stage S9's gap): the shim keeps a tail URL until S3 answered its push, the wrapper hands the next
+  tail of the chain before each turn and at every unpark, and a reopen restores the whole chain. An S9
+  build cannot read a chat's manifest that records such tails: its reopen, sync, gc and
+  `forget --purge` fail there until S10 is installed again.
+- `ai-env session stage UUID --warm` with `[vm] reuse_per_workspace` off is refused before any Touch ID
+  (exit 9, naming the switch); a pinned reopen of a chat over 64 MiB in S3 names `AI_ENV_BRIDGE_VM`
+  (unset it, then `--warm`).
+- Code out scans the new objects of all the branches a fetch brings as one, and reads their settings
+  files in one walk of their trees; a branch's own scan runs only after a finding, with the same
+  findings as before (in an S9 test a fetch of 2100 branches took 96 s).
+- The S3 uploads (`session stage`, a reopen's inline stage) are held to their progress, not a budget
+  of the whole: a try fails once its body hands nothing for 60 s, or its answer's head is 120 s late, or
+  a chunk of the answer 60 s late; S3's 409 `OperationAborted` and `ConditionalRequestConflict` and its
+  400 `RequestTimeout` go again; a Complete whose answer was lost counts once S3 lists the object; an
+  upload below 1 MB/s warns once.
+- In the VM, each subagent file a reopen restores has a time budget that allows for the files pulled
+  beside it, sharing the VM's link (S9 budgeted each as if alone), and a transfer slower than 1 KiB/s
+  for 60 s fails; the seed record survives a shim restart; `/suspend`'s snapshot and tail push finish
+  when the hook's client goes; the run report and `/health` carry the guest's `MemTotal`.
+- `ai-env doctor`'s `[vm]` row reads the memory as
+  `2048 MiB baseline (the image's minimum; bursts to 4×, billed while used)`, with the guest's
+  `MemTotal` beside it once a VM's `/health` named it; the quota row sums baselines.
+- `init-wrapper` judges a reused VM's start against 5 s and a resumed one's against 8 s (stages S1–S2,
+  above), and a resume polls the VM at 200, 300 and 500 ms before its 1 s steps.
+- The census keeps a `--max-thinking-tokens=` of 1 to 7 digits as written (anything else is still
+  masked), and `make proxy-patch` names squid's version after the patch even when the document's
+  output is cut.
+- claude 2.1.303 is pinned, and the image build fails when the claude binary lacks a string a move
+  relies on (`--resume-session-at`, `--session-id` and their errors).
+
+**What the first S10 measurements found** (taken before S10's image was built, on image 11.0 and
+claude 2.1.302; `plans/s10-measurements.md`). At rest claude used at most 50 ms of CPU in any 10 s
+sample at a permission prompt and 70 ms after a turn; it wrote nothing to stdout, and Cursor sent
+nothing between turns. So the shim refuses a park only above 300 ms a sample, a parked claude's output
+is not held, and Cursor's `keep_alive` lines are dropped while parked as a guard (no `ka_dropped` part
+is the norm: it is written only above 0). A fresh VM's first claude answers `initialize` about 0.6 s
+later than a warm one (it pages in 142 MiB of its 272 MiB binary, and makes two fetches it then
+keeps), on a second fresh VM just the same; the rest of the binary reads at 6.5 to 14.5 MiB/s, so no
+warm inside the VM would help, and the image does none.
+The slow cold starts S8 and S9 saw (17 to 20 s) were claude's fetch retries while the egress was down
+(`ai-env egress status`). The guest's `MemTotal` read 8016 MiB against the image's 2048 MiB minimum.
+The live tests on S10's image read the park figures again on claude 2.1.303, from the census's `park`
+parts.
+
+```sh
+make test-aws S10=1            # S10's live tests (live_s10_*): a close and a reopen, a lid's sleep, a VM terminated mid-turn
+                               #   and one after an edit, a park at a permission prompt then subagents across a move,
+                               #   session migrate (about 21 Touch IDs)
+make test-aws S10=1 SLOW=1     # + the three wall tests: a wall migration, a reopen near the wall, a reopen after it (about 30)
+make test-cursor STEP=t10_3 SINCE=TIME   # one S10 Cursor step's evidence (t10_2, t10_3, t10_4, t10_5, t10_p), in a fixture window
+```
+
+Debug builds also honour `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS=<n>`: the park's quiet in n ms (1 to
+3600000) in place of `[vm].park_after_s`, with or without the fake API. The live Makefile targets drop
+it, and release builds compile it out.
 
 ### Identities: the deployer, ops and the runtime key
 

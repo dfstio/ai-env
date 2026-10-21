@@ -49,6 +49,22 @@ pub struct Manifest {
     /// The `<sid>/` subtree, by rel.
     #[serde(default)]
     pub files: Vec<ManifestFile>,
+    /// S10 (R1): the tail URLs this Mac handed the VM, a chain each starting
+    /// where the one before ended (none written: the manifest is S9's, byte
+    /// for byte; an S9 build refuses one that holds any).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tails: Vec<ManifestTail>,
+}
+
+/// A tail URL this Mac handed the VM (S10 R1): its key `v1/<sid>/vm/g<gen>/t/<from:016x>`, its generation, its start, when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestTail {
+    pub key: String,
+    pub gen: u32,
+    pub from: u64,
+    /// RFC 3339 UTC.
+    pub at: String,
 }
 
 /// One part of the transcript in S3.
@@ -148,10 +164,17 @@ pub fn write(paths: &Paths, m: &Manifest) -> Result<(), BridgeError> {
 /// The session's manifest lock (`state/transcripts/<sid>.lock`, flock): one
 /// writer of the manifest at a time, waited for at most [`LOCK_BUDGET`].
 pub async fn lock(paths: &Paths, sid: &str) -> Result<crate::bridge::vm::lock::FlockGuard, BridgeError> {
+    lock_within(paths, sid, LOCK_BUDGET).await
+}
+
+/// [`lock`], waited for at most `wait` (S10, R1: the record of a tail handed
+/// before a turn's fetch waits a moment, never [`LOCK_BUDGET`]); past it
+/// `Busy`.
+pub async fn lock_within(paths: &Paths, sid: &str, wait: std::time::Duration) -> Result<crate::bridge::vm::lock::FlockGuard, BridgeError> {
     if !crate::bridge::registry::is_uuid(sid) {
         return Err(BridgeError::Config(format!("manifest: not a session id: {sid:?}")));
     }
-    crate::bridge::vm::lock::lock_exclusive(&paths.transcript_lock(sid), LOCK_BUDGET, &format!("the transcript manifest of {sid}")).await
+    crate::bridge::vm::lock::lock_exclusive(&paths.transcript_lock(sid), wait, &format!("the transcript manifest of {sid}")).await
 }
 
 impl Manifest {
@@ -174,6 +197,7 @@ impl Manifest {
             superseded: Vec::new(),
             parts: Vec::new(),
             files: Vec::new(),
+            tails: Vec::new(),
         }
     }
 
@@ -238,6 +262,50 @@ impl Manifest {
     }
 }
 
+// ---- S10 (R1): the tails this Mac handed the VM ------------------------------------------------
+
+impl Manifest {
+    /// The generation a tail is handed and listed under: `max(gen, 1)` (a
+    /// Mac-begun chat's first VM bytes, and a session that committed
+    /// nothing, open generation 1).
+    #[must_use]
+    pub fn tail_gen(&self) -> u32 {
+        self.gen.max(1)
+    }
+
+    /// `key` among the keys deleted at the next sync, once; never one of the
+    /// parts.
+    pub fn supersede(&mut self, key: String) {
+        if !self.superseded.contains(&key) && !self.parts.iter().any(|p| p.key == key) {
+            self.superseded.push(key);
+        }
+    }
+
+    /// `tail` recorded as handed to the VM, once by its key: handed again,
+    /// its `at` is the later one.
+    pub fn record_tail(&mut self, tail: ManifestTail) {
+        match self.tails.iter_mut().find(|t| t.key == tail.key) {
+            Some(t) => t.at = tail.at,
+            None => self.tails.push(tail),
+        }
+    }
+
+    /// The sync's rule after a commit (plans/s10-contracts.md §1.4): every
+    /// recorded tail starting below `committed` (its bytes are in the parts
+    /// now, and a restore's chain starts at `committed`), or of a generation
+    /// older than [`Self::tail_gen`] (the file was rewritten), leaves `tails`
+    /// for `superseded`, deleted at the next sync. The tail at `committed`,
+    /// and any past it, stays.
+    pub fn supersede_tails(&mut self) {
+        let (gen, committed) = (self.tail_gen(), self.committed);
+        let (gone, kept): (Vec<ManifestTail>, Vec<ManifestTail>) = std::mem::take(&mut self.tails).into_iter().partition(|t| t.gen < gen || t.from < committed);
+        self.tails = kept;
+        for t in gone {
+            self.supersede(t.key);
+        }
+    }
+}
+
 /// What the next sync pushes of the VM's transcript ([`plan_push`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushPlan {
@@ -259,7 +327,11 @@ pub enum PushPlan {
 /// `committed` no longer hash to `fp` (`fp_ok` false) — or a compaction is
 /// due ([`Manifest::compaction_due`]): then a full copy as the next
 /// generation's base. Without a manifest (or nothing committed yet) the
-/// first push is generation 1's base.
+/// first push is generation 1's base. S10 (R1): the next generation is the
+/// one after the generation its tails were handed under
+/// ([`Manifest::tail_gen`]), so a chat begun on this Mac (gen 0, its tails
+/// generation 1's) rebases as generation 2: no tail of the old file then
+/// continues the new base.
 #[must_use]
 pub fn plan_push(m: Option<&Manifest>, stat: &crate::wire::workspace::TranscriptStat, vm: &str) -> PushPlan {
     if !stat.present {
@@ -269,7 +341,7 @@ pub fn plan_push(m: Option<&Manifest>, stat: &crate::wire::workspace::Transcript
         let gen = m.map_or(0, |m| m.gen) + 1;
         return if stat.size == 0 { PushPlan::UpToDate } else { PushPlan::Base { gen, len: stat.size, why: "first" } };
     };
-    let next = PushPlan::Base { gen: m.gen + 1, len: stat.size, why: "" };
+    let next = PushPlan::Base { gen: m.tail_gen() + 1, len: stat.size, why: "" };
     let base = |why: &'static str| match next {
         PushPlan::Base { gen, len, .. } => PushPlan::Base { gen, len, why },
         _ => unreachable!("next is a base"),
@@ -479,5 +551,124 @@ mod g4_tests {
             assert_eq!(origin_of(&paths, S), want, "{r:?}");
         }
         assert_eq!(origin_of(&paths, "not-a-uuid"), None);
+    }
+}
+
+#[cfg(test)]
+mod p0_tests {
+    use super::*;
+
+    const S: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+    /// S10 (R1, §1.4): a manifest with no tails writes as S9's did, byte for
+    /// byte (no `tails` key, `MANIFEST_V` still 1); one with tails reads back
+    /// whole, last; a tail with an unknown key is refused.
+    #[test]
+    fn the_tails_are_additive_and_round_trip() {
+        let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
+        let m = Manifest::new(S, &target, ORIGIN_VM, &format!("-w/{S}.jsonl"), "2026-10-20T10:00:00.000Z");
+        let s9 = toml::to_string(&m).unwrap();
+        assert!(!s9.contains("tails") && MANIFEST_V == 1, "{s9}");
+        assert_eq!(toml::from_str::<Manifest>(&s9).unwrap(), m, "an S9 manifest reads, its tails none");
+        let tail = |gen: u32, from: u64| ManifestTail { key: format!("v1/{S}/vm/g{gen}/t/{from:016x}"), gen, from, at: "2026-10-20T10:05:00Z".into() };
+        let with = Manifest { tails: vec![tail(1, 0), tail(1, 4096)], ..m };
+        let text = toml::to_string(&with).unwrap();
+        assert!(text.trim_end().ends_with(&format!("[[tails]]\nkey = \"v1/{S}/vm/g1/t/0000000000001000\"\ngen = 1\nfrom = 4096\nat = \"2026-10-20T10:05:00Z\"")), "{text}");
+        assert_eq!(toml::from_str::<Manifest>(&text).unwrap(), with);
+        assert!(toml::from_str::<Manifest>(&text.replace("from = 4096", "from = 4096\nlen = 1")).is_err(), "a tail's unknown key is refused");
+        assert_eq!(crate::bridge::s3::TAIL_CHAIN_MAX, 32);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod c2_tests {
+    use super::*;
+    use crate::bridge::s3::{S3Endpoint, S3Target, LAB_BUCKET, LAB_OWNER};
+    use crate::wire::s3::S3Key;
+
+    const S: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    const VM: &str = "microvm-0123456789abcdef";
+
+    fn target() -> S3Target {
+        S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Aws }
+    }
+
+    fn tail(gen: u32, from: u64, at: &str) -> ManifestTail {
+        ManifestTail { key: S3Key::Tail { session: S.into(), gen, offset: from }.render(), gen, from, at: at.into() }
+    }
+
+    fn part(key: S3Key, from: u64, len: u64) -> ManifestPart {
+        ManifestPart { key: key.render(), version_id: format!("fv{from}"), from, len, sha256: "a".repeat(64) }
+    }
+
+    /// S10 (R1, §1.4): a tail handed again is recorded once, its `at` the
+    /// later; a commit moves every recorded tail below the new committed
+    /// length to `superseded` (each once, never a part's key), keeping the
+    /// one at it and those past it; a new generation's base moves every
+    /// tail of the older one, whatever its start. A gen-0 manifest (a
+    /// Mac-begun chat) hands its tails under generation 1.
+    #[test]
+    fn a_commit_supersedes_the_tails_below_it_or_of_an_older_generation() {
+        let mut m = Manifest::new(S, &target(), ORIGIN_MAC, &format!("-w/{S}.jsonl"), "t0");
+        assert_eq!(m.tail_gen(), 1, "a Mac object alone: generation 1's tails");
+        m.parts.push(part(S3Key::Mac { session: S.into(), sha256: "b".repeat(64) }, 0, 300));
+        m.committed = 300;
+        m.record_tail(tail(1, 300, "t1"));
+        m.record_tail(tail(1, 420, "t2"));
+        m.record_tail(tail(1, 300, "t3"));
+        assert_eq!(m.tails, [tail(1, 300, "t3"), tail(1, 420, "t2")], "once by key, the later `at`");
+        // The VM's bytes from 300 to 420 committed: the tail at 300 is in the parts now, the one at 420 starts the chain.
+        m.commit_segment(part(S3Key::Segment { session: S.into(), gen: 1, offset: 300 }, 300, 120), "f", Some(7), VM, "t4");
+        m.record_tail(tail(1, 600, "t5"));
+        m.supersede_tails();
+        assert_eq!((m.gen, m.committed), (1, 420));
+        assert_eq!(m.tails, [tail(1, 420, "t2"), tail(1, 600, "t5")], "the one at the committed length, and the one past it");
+        assert_eq!(m.superseded, [tail(1, 300, "").key]);
+        m.supersede_tails();
+        assert_eq!(m.superseded.len(), 1, "nothing twice");
+        // A rewritten file: generation 2's base; every generation 1 tail goes, past the new length or not.
+        m.commit_base(2, part(S3Key::Base { session: S.into(), gen: 2 }, 0, 1000), "g", Some(8), VM, "t6");
+        m.supersede_tails();
+        assert!(m.tails.is_empty(), "{:?}", m.tails);
+        let keys: Vec<String> = m.superseded.clone();
+        for key in [tail(1, 300, "").key, tail(1, 420, "").key, tail(1, 600, "").key] {
+            assert_eq!(keys.iter().filter(|k| **k == key).count(), 1, "{key} once: {keys:?}");
+        }
+        // A part's key is never superseded.
+        let base = m.parts[0].key.clone();
+        m.supersede(base.clone());
+        assert!(!m.superseded.contains(&base));
+        // The tails survive the file: they read back as written.
+        m.record_tail(tail(2, 1000, "t7"));
+        assert_eq!(toml::from_str::<Manifest>(&toml::to_string(&m).unwrap()).unwrap(), m);
+    }
+
+    /// S10 (R1): a rebase goes past the generation the tails were handed
+    /// under: a Mac-begun chat's gen-0 manifest (its tails generation 1's)
+    /// rebases as generation 2, whatever the reason, so its base's commit
+    /// supersedes every generation 1 tail, one at the new length too; a VM
+    /// generation's rebase is the next, as in S9.
+    #[test]
+    fn a_mac_begun_chats_rebase_is_past_its_tails_generation() {
+        let stat = |size: u64, ino: u64, fp_ok: bool| crate::wire::workspace::TranscriptStat { present: true, size, ino: Some(ino), fp_ok: Some(fp_ok), end_fp: Some(format!("{size:064x}")), ..Default::default() };
+        let mut mac = Manifest::new(S, &target(), ORIGIN_MAC, &format!("-w/{S}.jsonl"), "t0");
+        mac.parts.push(part(S3Key::Mac { session: S.into(), sha256: "b".repeat(64) }, 0, 500));
+        mac.committed = 500;
+        mac.vm = Some(VM.into());
+        mac.ino = Some(7);
+        assert_eq!(plan_push(Some(&mac), &stat(400, 7, true), VM), PushPlan::Base { gen: 2, len: 400, why: "shrank" });
+        assert_eq!(plan_push(Some(&mac), &stat(800, 8, true), VM), PushPlan::Base { gen: 2, len: 800, why: "inode" });
+        assert_eq!(plan_push(Some(&mac), &stat(800, 7, false), VM), PushPlan::Base { gen: 2, len: 800, why: "fingerprint" });
+        assert_eq!(plan_push(Some(&mac), &stat(600, 7, true), VM), PushPlan::Segment { gen: 1, from: 500, len: 100 }, "its first VM bytes: generation 1's segment");
+        mac.record_tail(tail(1, 500, "t1"));
+        mac.record_tail(tail(1, 800, "t2"));
+        mac.commit_base(2, part(S3Key::Base { session: S.into(), gen: 2 }, 0, 800), "f", Some(8), VM, "t3");
+        mac.supersede_tails();
+        assert!(mac.tails.is_empty(), "{:?}", mac.tails);
+        assert_eq!(mac.superseded[1..], [tail(1, 500, "").key, tail(1, 800, "").key], "the one at the new length too");
+        let mut vm = Manifest::new(S, &target(), ORIGIN_VM, &format!("-w/{S}.jsonl"), "t0");
+        vm.commit_base(1, part(S3Key::Base { session: S.into(), gen: 1 }, 0, 500), "f", Some(7), VM, "t1");
+        assert_eq!(plan_push(Some(&vm), &stat(800, 7, false), VM), PushPlan::Base { gen: 2, len: 800, why: "fingerprint" });
     }
 }

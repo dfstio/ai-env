@@ -202,6 +202,21 @@ name = "workspace_fd"
 path = "tests/workspace_fd.rs"
 required-features = ["bridge", "shim"]
 
+# S10 (wave 1b, C): the continuity engine end to end (re-address, migration, `session migrate`, the reaper) on the
+# multi-VM rig; the rig's own self-tests in tests/continuity/rig.rs (wave 1a, R). Declared in phase 0 with ignored
+# placeholders.
+[[test]]
+name = "continuity"
+path = "tests/continuity.rs"
+required-features = ["bridge", "shim"]
+
+# S10 (wave 1b, P): parking an idle remote session, against the in-process shim; declared in phase 0 with an
+# ignored placeholder.
+[[test]]
+name = "parking"
+path = "tests/parking.rs"
+required-features = ["bridge", "shim"]
+
 # Negative fixture for `make lint-negative`: clippy must REJECT it (every clippy.toml
 # disallowed method is called once). Built only with the lint-negative feature.
 [[example]]

@@ -40,13 +40,28 @@
 //! symlink the agent planted refused with 409; and with a script standing
 //! for the helper (`--helper`), a helper past its budget has its session
 //! ended (`/proc` and pidfds), and one running holds the idle sweep off.
+//! S10 agent L1 (image 12.0's VM side, through the same raw client): the
+//! park (`park_v1`) as root on Linux with the agent's spawn — refused `busy`
+//! while a process of the spawn's session runs, and on the session's CPU
+//! alone while its leader spins, `parked` once it is quiet (a process of the
+//! session alive and asleep), `unpark`, and a parked spawn whose socket is
+//! lost living its park grace;
+//! R1, a tail's URL kept by the root shim after curl got no status or S3 a
+//! 5xx (the S9 fake curl as the shim's `--curl`) and pushed again at the
+//! next hook; the guest's memory (`MemTotal`) in `/health` and the run report.
 //! L2: the locally built image (`make image-build-local`) with the real,
 //! pinned claude — the version gate, `/validate` (from the host and from
 //! inside), no build-time state, modes, and (S6) `claude --version` and a
-//! `setsid` escaper through `/agent`.
+//! `setsid` escaper through `/agent`; (S10) such an escaper makes a park
+//! `busy` while it spins and nothing once it sleeps (V-6), and
+//! `/var/lib/ai-env` is root's, 0700 and empty.
 //! The only claude ever executed is the pinned Linux binary inside L2.
+#[path = "common/curl.rs"]
+mod curl;
+
 use ai_env_cli::wire::chunk::{decode, Chunker};
 use ai_env_cli::wire::frame::{ClientInfo, CredentialErrCode, Deliver, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, RunHookPayload, Scope, Sig, SpawnErrCode, SpawnId};
+use ai_env_cli::wire::frame::{ParkOwner, ParkRefusal, SpawnDetail, CAP_PARK_V1};
 use ai_env_cli::wire::redact::Secret;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
@@ -751,6 +766,8 @@ const SPAWN_WAIT: Duration = Duration::from_secs(120);
 struct Agent {
     rt: tokio::runtime::Runtime,
     ws: Ws,
+    /// `hello_ok.caps`: what the shim can do beyond wire v1's core.
+    caps: Vec<String>,
 }
 
 /// A `spawn` frame's fields (defaults: no cwd, env or secret; the exec grace).
@@ -802,11 +819,14 @@ impl Agent {
             assert!(resp.headers().get("sec-websocket-protocol").is_none(), "{resp:?}");
             ws
         });
-        let mut a = Agent { rt, ws };
+        let mut a = Agent { rt, ws, caps: Vec::new() };
         let client = ClientInfo { name: "shim_docker".into(), version: env!("CARGO_PKG_VERSION").into(), host: "test@docker".into() };
         a.send(&Frame::Hello { session_token: Secret::new(token.to_string()), client, resume: vec![], idle_s: None });
         match a.next() {
-            Ok(Frame::HelloOk { wire, run_hook_seen, has_credentials, .. }) => assert_eq!((wire, run_hook_seen, has_credentials), (1, true, false)),
+            Ok(Frame::HelloOk { wire, run_hook_seen, has_credentials, caps, .. }) => {
+                assert_eq!((wire, run_hook_seen, has_credentials), (1, true, false));
+                a.caps = caps;
+            }
             other => panic!("hello_ok, got {other:?}"),
         }
         a
@@ -943,6 +963,56 @@ impl Agent {
             Ok(Frame::CredentialErr { code, message, .. }) => (code, message),
             Ok(f) => panic!("credential_err, got {}", f.kind()),
             Err(close) => panic!("credential_err, the socket ended ({close:?})"),
+        }
+    }
+
+    /// S10 (`park_v1`): `park` the spawn `id` with the park grace `grace_s`
+    /// and the busy check's window `min_quiet_s` ([`CPU_BUSY_MS`],
+    /// [`PARK_OWNER`], stdout not held), as the Mac's session would: the
+    /// shim's answer, `parked` or `park_refused`. Frames about other spawns,
+    /// pongs and events are skipped.
+    fn park(&mut self, id: &SpawnId, grace_s: u32, min_quiet_s: u32) -> Frame {
+        self.send(&Frame::Park { spawn_id: id.clone(), grace_s, min_quiet_s, cpu_busy_ms: CPU_BUSY_MS, hold_output: false, owner: PARK_OWNER });
+        loop {
+            match self.next() {
+                Ok(f @ (Frame::Parked { .. } | Frame::ParkRefused { .. })) if f.spawn_id() == Some(id) => return f,
+                Ok(f @ Frame::Error { .. }) => panic!("{f:?} while parking {id}"),
+                Ok(f) if f.spawn_id() != Some(id) => {}
+                other => panic!("parked or park_refused for {id}, got {other:?}"),
+            }
+        }
+    }
+
+    /// [`Agent::park`] (a window of 0: the look at the park alone) once a
+    /// second until the shim parks `id`, within `within`; every answer before
+    /// it must be a `busy` refusal. The `parked` answer, and how many
+    /// refusals came first.
+    fn park_when_quiet(&mut self, id: &SpawnId, grace_s: u32, within: Duration) -> (Frame, usize) {
+        let deadline = Instant::now() + within;
+        let mut refused = 0;
+        loop {
+            match self.park(id, grace_s, 0) {
+                f @ Frame::Parked { .. } => return (f, refused),
+                Frame::ParkRefused { reason: ParkRefusal::Busy, .. } if Instant::now() < deadline => refused += 1,
+                other => panic!("parked within {within:?} ({refused} busy refusal(s) before), got {other:?}"),
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// S10: `unpark` the spawn `id` (it has no answer), then a `ping`: its
+    /// `pong` shows the shim took the `unpark` (one socket's frames are
+    /// handled in order).
+    fn unpark(&mut self, id: &SpawnId) {
+        self.send(&Frame::Unpark { spawn_id: id.clone() });
+        let ts = ai_env_cli::wire::time::unix_now_ms();
+        self.send(&Frame::Ping { ts });
+        loop {
+            match self.next() {
+                Ok(Frame::Pong { ts: t }) if t == ts => return,
+                Ok(_) => {}
+                Err(close) => panic!("the socket ended ({close:?}) before the unpark's pong"),
+            }
         }
     }
 }
@@ -2080,6 +2150,378 @@ fn l1_curl_url_invisible_to_uid_1000() {
     vm.c.wait_gone(10, "curl");
 }
 
+// ---- S10 agent L1: the park, the tail's URL, the guest's memory -----------------------------
+//
+// The park (`park_v1`, plans/s10-contracts.md §1.2) through the raw client,
+// its frames sent as the Mac's session sends them: the root shim's busy
+// check reads the session of the agent's spawn in `/proc` on Linux (its CPU
+// per sample, its processes but the leader), and a parked spawn whose
+// socket goes lives its park grace. R1 (§1.4): the root shim keeps a tail's
+// URL until S3 gave its push a final answer; curl runs as `ai-env-net`, the
+// S9 fake curl (`tests/fakes/s3-curl.sh`) standing in for curl and S3. The
+// guest's memory (§1.5) in `/health` and the run report.
+
+/// S10: the busy check's threshold these parks send (`park.cpu_busy_ms`,
+/// CPU ms per 10 s sample): B0's (plans/s10-measurements.md, 20 Oct), which
+/// the Mac sends from I2 on. An idle `sleep` uses next to none of it, a busy
+/// loop a whole CPU.
+const CPU_BUSY_MS: u32 = 300;
+
+/// S10: the wrapper these parks name (`park.owner`); the shim only reports it back.
+const PARK_OWNER: ParkOwner = ParkOwner { pid: 51_234, started: 1_792_483_200 };
+
+/// Where the setsid escaper of [`l2_a_setsid_escaper_makes_a_park_busy`]
+/// writes its pid (as the agent).
+const ESCAPER_PID: &str = "/tmp/ai-env-s10-escaper.pid";
+
+/// Touched (by root) to end that escaper's busy loop: it then sleeps.
+const ESCAPER_STOP: &str = "/tmp/ai-env-s10-escaper.stop";
+
+/// Where the fake curl of [`l1_a_tail_url_is_kept_on_no_status_or_a_5xx_and_pushed_at_the_next_hook`]
+/// logs, in a directory only `ai-env-net` (999) enters: the calls'
+/// configurations hold the URL.
+const TAIL_CURL_DIR: &str = "/tmp/ai-env-s10-curl";
+
+impl Vm {
+    /// The spawn `id` as `/health/detail` reports it.
+    fn spawn_detail(&self, id: &SpawnId) -> SpawnDetail {
+        self.detail().spawns.into_iter().find(|s| s.status.spawn_id == *id).unwrap_or_else(|| panic!("{id} is not in /health/detail"))
+    }
+}
+
+impl Container {
+    /// The live processes (not zombies) of the session `leader` leads, the
+    /// leader left out (`/proc/<pid>/stat`'s sixth field).
+    fn session_members(&self, leader: u32) -> Vec<u32> {
+        let script = format!("for s in /proc/[0-9]*/stat; do set -- $(cat \"$s\" 2>/dev/null); [ \"$6\" = {leader} ] && [ \"$1\" != {leader} ] && [ \"$3\" != Z ] && echo \"$1\"; done; true");
+        self.sh(&script).lines().filter_map(|l| l.trim().parse().ok()).collect()
+    }
+
+    /// [`Container::session_members`] once there are `n` of them, within 10 s.
+    fn wait_session_members(&self, leader: u32, n: usize) -> Vec<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let members = self.session_members(leader);
+            if members.len() == n {
+                return members;
+            }
+            assert!(Instant::now() < deadline, "{n} process(es) in the session of {leader} within 10 s, not {members:?}:\n{}", self.logs());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Wait (at most `secs`) until `pid` is gone or a zombie.
+    fn wait_dead(&self, secs: u64, pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self.alive(pid) {
+            assert!(Instant::now() < deadline, "{pid} still runs after {secs} s:\n{}", self.logs());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Wait (at most `secs`) until `pid` runs `comm` (`/proc/<pid>/comm`:
+    /// a busy loop that stopped and exec'd a `sleep`).
+    fn wait_comm(&self, secs: u64, pid: u32, comm: &str) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self.sh(&format!("cat /proc/{pid}/comm 2>/dev/null; true")) != comm {
+            assert!(Instant::now() < deadline, "{pid} does not run {comm} after {secs} s:\n{}", self.logs());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// The fake curl's knobs, `curl.knobs` beside it in the fake dir `fake`
+/// (mounted at /opt/fake): its log in [`TAIL_CURL_DIR`], then `knobs`.
+/// Written on the Mac; returns once the container reads them too.
+fn set_curl_knobs(c: &Container, fake: &Path, knobs: &[(&str, &str)]) {
+    let mut text = format!("export S3CURL_LOG='{TAIL_CURL_DIR}/curl.log'\n");
+    for (name, value) in knobs {
+        text.push_str(&format!("export {name}='{value}'\n"));
+    }
+    std::fs::write(fake.join("curl.knobs"), &text).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.sh("cat /opt/fake/curl.knobs") != text.trim_end() {
+        assert!(Instant::now() < deadline, "the container never read the fake curl's new knobs:\n{text}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// S10 (§1.2) as root on Linux, the spawn the agent's: the shim names
+/// `park_v1`. A spawn whose session runs a busy loop (a process but the
+/// leader, running) is refused `busy` on that running process, the loop its
+/// one process (`procs`), and is not parked. Once the loop stops (it execs a
+/// `sleep`: alive, asleep, no more CPU, as claude's background shell or a
+/// stdio MCP server at rest) the spawn parks within a sample's time (once a
+/// sample took the loop's last CPU in, the look at the park sees none), that
+/// process still alive: `parked` with one process but the leader,
+/// `/health/detail` naming its owner, its socket kept (no grace runs). An
+/// `unpark` (no answer: the ping's pong follows it) takes the park away.
+/// The shim logs the refusal, the park and the unpark.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_park_is_refused_busy_while_the_session_runs_then_parked_and_unparked() {
+    use ai_env_cli::shim::spawn::ACTIVITY_SAMPLE;
+    let vm = agent_l1(&[]);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    assert!(a.caps.iter().any(|cap| cap == CAP_PARK_V1), "the shim names {CAP_PARK_V1}: {:?}", a.caps);
+    let stop = "/tmp/ai-env-s10-loop.stop";
+    let script = format!("sh -c 'while [ ! -e {stop} ]; do :; done; exec sleep 300' & exec sleep 300");
+    let (id, leader) = a.spawn(&Spec { grace: Some(60), ..Spec::argv(&["sh", "-c", &script]) }).unwrap_or_else(|e| panic!("{e:?}"));
+    let busy = c.wait_session_members(leader, 1)[0];
+    // The loop runs (R): the refusal is that running process's, whatever its CPU.
+    std::thread::sleep(Duration::from_millis(1500));
+    match a.park(&id, 600, 0) {
+        Frame::ParkRefused { reason: ParkRefusal::Busy, procs: 1, .. } => {}
+        other => panic!("park_refused busy, the loop the session's one process, got {other:?}"),
+    }
+    assert_eq!(vm.spawn_detail(&id).parked, None, "a refused park parks nothing");
+    c.sh(&format!("touch {stop}"));
+    c.wait_comm(5, busy, "sleep");
+    let (answer, refusals) = a.park_when_quiet(&id, 600, ACTIVITY_SAMPLE + Duration::from_secs(5));
+    match answer {
+        Frame::Parked { procs: 1, quiet_s, .. } => assert!(quiet_s < 120, "no stdio since the spawn: {quiet_s} s"),
+        other => panic!("parked with the loop's process alive and asleep, got {other:?}"),
+    }
+    assert_eq!(c.session_members(leader), vec![busy], "the sleeping process is still the session's");
+    let d = vm.spawn_detail(&id);
+    assert!(d.status.alive && d.parked == Some(PARK_OWNER) && d.detach_left_s.is_none(), "parked, its owner named, its socket kept: {d:?}");
+    a.unpark(&id);
+    let d = vm.spawn_detail(&id);
+    assert!(d.status.alive && d.parked.is_none(), "unparked: {d:?}");
+    let logs = c.wait_log(5, &format!("ai-env: spawn {id} unparked by unpark"));
+    assert!(logs.lines().any(|l| l.starts_with("ai-env: spawn ") && l.contains(" park refused (busy): ") && l.contains(", procs 1, cpu ")), "the refusal:\n{logs}");
+    let parked = format!("ai-env: spawn {id} parked: park grace 600 s, ");
+    assert!(logs.lines().any(|l| l.starts_with(&parked) && l.ends_with(", procs 1, owner pid 51234 started 1792483200")), "the park:\n{logs}");
+    eprintln!("L1 park: parked after {refusals} busy refusal(s) once the loop slept");
+}
+
+/// S10 (§1.2) on Linux: the busy check's CPU half, the only one that sees
+/// the leader (claude itself: `running` never counts it). The leader spins
+/// on its own (`[` and `:` are the shell's builtins: no child), so no
+/// process but the leader runs (`procs` 0, none running), and a `park`
+/// whose window (11 s) holds a whole sample (one per `ACTIVITY_SAMPLE`) is
+/// refused `busy` on the session's CPU alone: the busiest sample's CPU is
+/// over the threshold sent, and no more than one CPU could use since the
+/// spawn (the kernel's clock ticks read at their rate). The spawn is 12 s
+/// old with no stdio, so the window is quiet (not `output`). Once the loop
+/// stops (the leader execs a `sleep`) the spawn parks within a sample's
+/// time, with no process but the leader.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_park_is_refused_busy_on_the_leaders_cpu_alone() {
+    use ai_env_cli::shim::spawn::ACTIVITY_SAMPLE;
+    let vm = agent_l1(&[]);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    let stop = "/tmp/ai-env-s10-spin.stop";
+    let script = format!("while [ ! -e {stop} ]; do :; done; exec sleep 300");
+    let t0 = Instant::now();
+    let (id, leader) = a.spawn(&Spec { grace: Some(60), ..Spec::argv(&["sh", "-c", &script]) }).unwrap_or_else(|e| panic!("{e:?}"));
+    std::thread::sleep(ACTIVITY_SAMPLE + Duration::from_secs(2));
+    assert_eq!(c.session_members(leader), Vec::<u32>::new(), "the leader spins alone");
+    let (quiet_s, cpu_ms) = match a.park(&id, 600, 11) {
+        Frame::ParkRefused { reason: ParkRefusal::Busy, procs: 0, quiet_s, cpu_ms, .. } => (quiet_s, cpu_ms),
+        other => panic!("park_refused busy on the leader's CPU alone, got {other:?}"),
+    };
+    let age_ms = u64::try_from(t0.elapsed().as_millis()).unwrap();
+    assert!(quiet_s >= 11, "no stdio since the spawn: {quiet_s} s");
+    assert!(cpu_ms > u64::from(CPU_BUSY_MS) && cpu_ms <= age_ms + 50, "the busiest sample's CPU, {cpu_ms} ms: over {CPU_BUSY_MS} ms, and at most one CPU's {age_ms} ms since the spawn");
+    assert_eq!(vm.spawn_detail(&id).parked, None, "a refused park parks nothing");
+    c.sh(&format!("touch {stop}"));
+    c.wait_comm(5, leader, "sleep");
+    let (answer, refusals) = a.park_when_quiet(&id, 600, ACTIVITY_SAMPLE + Duration::from_secs(5));
+    assert!(matches!(answer, Frame::Parked { procs: 0, .. }), "parked once the leader slept, got {answer:?}");
+    let logs = c.logs();
+    let refused = format!(", procs 0, cpu {cpu_ms} ms");
+    assert!(logs.lines().any(|l| l.starts_with("ai-env: spawn ") && l.contains(" park refused (busy): ") && l.ends_with(&refused)), "the refusal:\n{logs}");
+    eprintln!("L1 park on CPU: refused busy at {cpu_ms} ms of CPU in a sample ({age_ms} ms since the spawn); parked after {refusals} busy refusal(s) once the leader slept");
+}
+
+/// S10 V-6 (phase 4, BUSY-1) on Linux: two chats on one VM, each its spawn
+/// on a socket of its own, each spawn its own session as the agent. One
+/// spawn's session runs a busy loop (a process but its leader, running):
+/// it is never the other's escaper, as every look takes every live spawn's
+/// leader (the escapers are only the agent's processes in no live spawn's
+/// session), so the quiet spawn beside it parks, with no process but its
+/// leader. The busy spawn's own park is refused `busy`, its loop the one
+/// process. (Before: the quiet spawn's look took the loop for its escaper,
+/// and neither chat ever parked.)
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_busy_chat_beside_never_keeps_a_quiet_one_from_parking() {
+    let vm = agent_l1(&[]);
+    let c = &vm.c;
+    let (mut busy_chat, mut quiet_chat) = (vm.agent(), vm.agent());
+    let (busy, leader) = busy_chat.spawn(&Spec { grace: Some(60), ..Spec::argv(&["sh", "-c", "sh -c 'while :; do :; done' & exec sleep 300"]) }).unwrap_or_else(|e| panic!("{e:?}"));
+    let (quiet, _) = quiet_chat.spawn(&Spec { grace: Some(60), ..Spec::argv(&["sleep", "300"]) }).unwrap_or_else(|e| panic!("{e:?}"));
+    c.wait_session_members(leader, 1);
+    // The loop runs (R) in the busy spawn's session, and has used some CPU by now.
+    std::thread::sleep(Duration::from_millis(1500));
+    match quiet_chat.park(&quiet, 600, 0) {
+        Frame::Parked { procs: 0, .. } => {}
+        other => panic!("the quiet spawn parked beside the busy one, got {other:?}:\n{}", c.logs()),
+    }
+    match busy_chat.park(&busy, 600, 0) {
+        Frame::ParkRefused { reason: ParkRefusal::Busy, procs: 1, .. } => {}
+        other => panic!("the busy spawn's own park refused busy, its loop the one process, got {other:?}"),
+    }
+    assert_eq!(vm.spawn_detail(&quiet).parked, Some(PARK_OWNER), "parked");
+    assert_eq!(vm.spawn_detail(&busy).parked, None, "not parked");
+}
+
+/// S10 (§1.2): a parked spawn whose socket is lost lives its park grace,
+/// not its detach grace. `sleep 300` with a 60 s detach grace, parked with a
+/// 5 s park grace, loses its socket: the shim says the park grace starts
+/// (`lost connection …: park grace 5 s`); `/health/detail` shows it still
+/// parked (its owner named), detached, its 5 s running; and TERM ends it once
+/// those 5 s ran (`park grace over`), timed on the shim's own log lines.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_lost_parked_socket_lives_its_park_grace() {
+    let vm = agent_l1(&[]);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    let (id, pid) = a.spawn(&Spec { grace: Some(60), ..Spec::argv(&["sleep", "300"]) }).unwrap_or_else(|e| panic!("{e:?}"));
+    match a.park(&id, 5, 0) {
+        Frame::Parked { procs: 0, .. } => {}
+        other => panic!("parked, got {other:?}"),
+    }
+    // No detach frame: a lost socket.
+    drop(a);
+    let lost = format!("ai-env: spawn {id} lost connection");
+    let logs = c.wait_log(5, &lost);
+    let line = logs.lines().find(|l| l.starts_with(&lost)).unwrap_or_default();
+    assert!(line.ends_with(": park grace 5 s"), "the park grace, not the 60 s detach grace: {line}");
+    let d = vm.spawn_detail(&id);
+    assert!(d.parked == Some(PARK_OWNER) && !d.status.attached && !d.frozen && d.detach_left_s.is_some_and(|s| s <= 5), "parked with no socket, its park grace running: {d:?}");
+    let over = format!("ai-env: spawn {id} park grace over");
+    c.wait_log(15, &over);
+    c.wait_dead(5, pid);
+    let timed = c.timed_logs();
+    let took = logged_at(&timed, &over) - logged_at(&timed, &lost);
+    assert!((took - 5.0).abs() < 1.0, "TERM {took:.2} s after the socket was lost: the 5 s park grace");
+}
+
+/// S10 (R1, §1.4) on Linux: a tail's URL goes only once S3 gave its push a
+/// final answer. The agent's transcript grows past the tail's `from`, and at
+/// each `/suspend` the root shim pushes `[from, size)` to the tail's key with
+/// curl as `ai-env-net` (the S9 fake curl as the shim's `--curl`; its knobs,
+/// rewritten before each hook, pick the answer). curl with no HTTP status
+/// keeps the URL (`; kept`), and so does S3's 503 (`SlowDown`): the next
+/// `/suspend` (after a `/resume`) pushes the same key again, with the bytes
+/// past `from` as the file holds them then; S3's 200 spends it, and the next
+/// hook (`/terminate`, the file grown once more) pushes nothing. Each push
+/// is the same PUT (no checksum, `If-None-Match: *`, the proxy) through fd 3
+/// alone; the URL's signature never reaches the shim's log.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_a_tail_url_is_kept_on_no_status_or_a_5xx_and_pushed_at_the_next_hook() {
+    use ai_env_cli::wire::s3::{bucket_host, PresignedUrl, S3Key, SIGNED_HEADERS_TAIL};
+    use ai_env_cli::wire::workspace::TranscriptTail;
+    use sha2::Digest as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = fake_dir(&format!("VERSION={}\n", lock_version()));
+    std::fs::copy(curl::FAKE_CURL, fake.path().join("curl")).unwrap();
+    std::fs::set_permissions(fake.path().join("curl"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let host = fake.path().to_path_buf();
+    std::fs::write(host.join("curl.knobs"), "").unwrap();
+    let (c, fake) = agent_l1_ready_with(fake, &[("--curl", "/opt/fake/curl")]);
+    let vm = Vm::started(c, Some(fake), 20);
+    let c = &vm.c;
+    c.sh(&format!("mkdir -m 0700 {TAIL_CURL_DIR} && chown 999:999 {TAIL_CURL_DIR}"));
+    // The agent's transcript, S3 holding it up to `from`.
+    let (session, owner) = ("0199d2a0-0000-7000-8000-00000000000b", "123456789012");
+    let rel = format!("{SLUG}/{session}.jsonl");
+    let file = format!("/Users/mike/.claude/projects/{rel}");
+    let append = |line: &str| c.sh_as("1000", &format!("printf '%s\\n' '{line}' >> {file}"));
+    let size = || -> u64 { c.sh(&format!("stat -c %s {file}")).parse().unwrap() };
+    c.sh_as("1000", &format!("mkdir -p /Users/mike/.claude/projects/{SLUG}"));
+    append("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a turn\"}}");
+    let from = size();
+    let signature = hex::encode(sha2::Sha256::digest(SpawnId::new_v7().to_string().as_bytes()));
+    let key = S3Key::Tail { session: session.into(), gen: 1, offset: from }.render();
+    let query = format!("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261020%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261020T080000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders={}&X-Amz-Signature={signature}", SIGNED_HEADERS_TAIL.replace(';', "%3B"));
+    let url = PresignedUrl::new(format!("https://{}/{key}?{query}", bucket_host(&format!("ai-env-transcripts-{owner}")))).expect("a tail URL of the store");
+    let proxy = format!("http://{}:3128", c.ip());
+    let tail = TranscriptTail { rel: rel.clone(), from, url: url.clone(), owner: owner.into(), proxy: Some(proxy.clone()), expires_at: ai_env_cli::wire::time::unix_now() + 3600 };
+    let bearer = format!("Authorization: Bearer {}\r\n", vm.token);
+    let (s, body) = http_with(c.port(8080), "POST", "/transcript/tail", &bearer, &serde_json::to_string(&tail).unwrap());
+    assert_eq!(s, 204, "the tail kept: {body}");
+    let hook = |name: &str| assert_eq!(http(c.port(9000), "POST", &format!("{PREFIX}/{name}"), "{}").0, 200, "/{name}");
+    let tails = |logs: &str| logs.lines().filter(|l| l.starts_with("ai-env: transcript_tail ")).map(str::to_string).collect::<Vec<_>>();
+    let prefix = format!("ai-env: transcript_tail suspend rel={rel} from={from} ");
+    let saved = format!("{TAIL_CURL_DIR}/saved");
+    let answers: [&[(&str, &str)]; 3] = [&[("S3CURL_FAIL", "7")], &[("S3CURL_STATUS", "503"), ("S3CURL_CODE", "SlowDown")], &[("S3CURL_SAVE", saved.as_str())]];
+    for (n, knobs) in answers.into_iter().enumerate() {
+        set_curl_knobs(c, &host, knobs);
+        append(&format!("{{\"type\":\"assistant\",\"n\":{n}}}"));
+        let len = size() - from;
+        hook("suspend");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let logged = loop {
+            let logged = tails(&c.logs());
+            if logged.len() > n {
+                break logged;
+            }
+            assert!(Instant::now() < deadline, "no transcript_tail line for /suspend {}:\n{}", n + 1, c.logs());
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert_eq!(logged.len(), n + 1, "one push per /suspend: {logged:#?}");
+        let line = &logged[n];
+        match n {
+            0 => assert!(line.starts_with(&format!("{prefix}failed: ")) && line.ends_with("; kept"), "curl without a status keeps the URL: {line}"),
+            1 => assert_eq!(*line, format!("{prefix}len={len} status=503; kept"), "S3's 503 keeps the URL"),
+            _ => assert_eq!(*line, format!("{prefix}len={len} status=200"), "S3's 200 spends it"),
+        }
+        hook("resume");
+    }
+    // What curl was given: the fake's log, copied out (root reads the 0700 directory).
+    let copied = tempfile::tempdir().unwrap();
+    std::fs::write(copied.path().join("curl.log"), c.sh(&format!("cat {TAIL_CURL_DIR}/curl.log"))).unwrap();
+    let calls = curl::curl_calls(&copied.path().join("curl.log"));
+    assert_eq!(calls.len(), 3, "the three pushes");
+    for call in &calls {
+        assert_eq!((call.uid, call.fds.as_slice(), call.args.as_slice()), (999, &[3][..], &["-q".to_string(), "-K".to_string(), "/dev/fd/3".to_string()][..]), "curl as ai-env-net, fd 3 alone, its argv");
+        assert_eq!(call.conf("url"), [url.expose()], "the same tail key each time");
+        assert_eq!((call.conf("request"), call.conf("proxy")), (vec!["PUT".to_string()], vec![proxy.clone()]));
+        let headers = call.conf("header");
+        assert!(headers.iter().any(|h| h == "If-None-Match: *") && !headers.iter().any(|h| h.starts_with("x-amz-checksum-sha256")), "a tail's PUT: {headers:?}");
+    }
+    let pushed = c.sh(&format!("cat {saved}/3.put"));
+    assert_eq!(pushed, c.sh(&format!("tail -c +{} {file}", from + 1)), "the third push: the bytes past from as the file held them");
+    assert_eq!(pushed.lines().count(), 3, "the three lines the agent wrote past from: {pushed}");
+    // Spent: the file grows, /terminate pushes nothing.
+    append("{\"type\":\"summary\"}");
+    hook("terminate");
+    let logs = c.wait_log(10, "\"hook\":\"terminate\"");
+    assert_eq!(tails(&logs).len(), 3, "a spent URL is never pushed again:\n{logs}");
+    assert!(!logs.contains(&signature), "the URL's signature reached the shim's log");
+}
+
+/// S10 (§1.5): the guest's memory on Linux. `/health` (and the bearer's
+/// `/health/detail`) carry `mem_total_mib`, `/proc/meminfo`'s `MemTotal`
+/// read once at start, in MiB; the run report after `/run` carries
+/// `mem_total_kb` (that `MemTotal`) and `mem_available_kb` (at most it).
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l1_mem_total_in_the_run_report_and_health() {
+    let vm = agent_l1(&[]);
+    let c = &vm.c;
+    let kb: u64 = c.sh("sed -n 's/^MemTotal: *\\([0-9]*\\) kB$/\\1/p' /proc/meminfo").parse().expect("MemTotal in kB");
+    let mib = u32::try_from(kb / 1024).unwrap();
+    let (s, body) = http(c.port(8080), "GET", "/health", "");
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Health>(&body).unwrap().mem_total_mib, Some(mib), "{body}");
+    assert_eq!(vm.detail().health.mem_total_mib, Some(mib), "/health/detail");
+    let logs = c.wait_log(10, "ai-env: run-report ");
+    let report: serde_json::Value = logs.lines().find_map(|l| l.strip_prefix("ai-env: run-report ").and_then(|j| serde_json::from_str(j).ok())).expect("a run report");
+    assert_eq!((report["hook"].as_str(), report["mem_total_kb"].as_u64()), (Some("run"), Some(kb)), "{report}");
+    let available = report["mem_available_kb"].as_u64().unwrap_or_else(|| panic!("mem_available_kb: {report}"));
+    assert!(available > 0 && available <= kb, "{report}");
+    eprintln!("L1 memory: MemTotal {kb} kB ({mib} MiB), MemAvailable {available} kB at /run");
+}
+
 // ---- L2: the locally built image ---------------------------------------------------------
 
 fn l2() -> Container {
@@ -2216,4 +2658,66 @@ fn l2_a_setsid_escaper_is_swept() {
     assert_eq!(exit, ExitInfo { code: Some(0), signal: None }, "{}", String::from_utf8_lossy(&err));
     assert_swept(&vm.c, &out);
     assert_eq!(vm.c.exec(&["pgrep", "-x", "sleep"]).status.code(), Some(1), "no sleep is left");
+}
+
+/// S10 V-6 in the real image (plans/s10-contracts.md §1.2's amendment): the
+/// busy check counts the agent's escapers. A child of the spawn leaves its
+/// session with the image's setsid(1) and spins: its own session's leader,
+/// uid 1000, no spawn's and no helper's. A `park` of the spawn, whose own
+/// session holds nothing but its quiet leader (`procs` 0), is refused `busy`
+/// all the same (the escaper runs), as a backgrounded build must keep its VM
+/// up. Once the escaper's loop stops (it execs a `sleep`: alive, asleep, no
+/// more CPU, as an escaper waiting on its next job) it adds nothing: the
+/// spawn parks within a sample's time, with no process but the leader, and
+/// the escaper lives on.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_a_setsid_escaper_makes_a_park_busy() {
+    use ai_env_cli::shim::spawn::ACTIVITY_SAMPLE;
+    let vm = Vm::started(l2(), None, 120);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    assert!(a.caps.iter().any(|cap| cap == CAP_PARK_V1), "the image's shim names {CAP_PARK_V1}: {:?}", a.caps);
+    let script = format!("setsid sh -c 'echo $$ > {ESCAPER_PID}; while [ ! -e {ESCAPER_STOP} ]; do :; done; exec sleep 300' & exec sleep 300");
+    let (id, leader) = a.spawn(&Spec { grace: Some(60), ..Spec::argv(&["sh", "-c", &script]) }).unwrap_or_else(|e| panic!("{e:?}"));
+    let escaper = c.pid_in(ESCAPER_PID);
+    assert_eq!(c.group_and_session(escaper), (escaper, escaper), "the escaper leads a group and a session of its own");
+    assert_eq!(c.group_and_session(leader), (leader, leader), "the spawn's leader leads its own");
+    assert_eq!(c.session_members(leader), Vec::<u32>::new(), "nothing but the leader in the spawn's session");
+    // The escaper runs (R): the refusal is that running escaper's, whatever its CPU.
+    std::thread::sleep(Duration::from_millis(1500));
+    match a.park(&id, 600, 0) {
+        Frame::ParkRefused { reason: ParkRefusal::Busy, procs: 0, .. } => {}
+        other => panic!("park_refused busy, the spawn's own session quiet, got {other:?}"),
+    }
+    assert_eq!(vm.spawn_detail(&id).parked, None, "a refused park parks nothing");
+    c.sh(&format!("touch {ESCAPER_STOP}"));
+    c.wait_comm(5, escaper, "sleep");
+    let (answer, refusals) = a.park_when_quiet(&id, 600, ACTIVITY_SAMPLE + Duration::from_secs(5));
+    assert!(matches!(answer, Frame::Parked { procs: 0, .. }), "parked once the escaper slept, got {answer:?}");
+    assert_eq!(vm.spawn_detail(&id).parked, Some(PARK_OWNER));
+    assert!(c.alive(escaper), "the escaper lives on, asleep:\n{}", c.logs());
+    let logs = c.logs();
+    assert!(logs.lines().any(|l| l.starts_with("ai-env: spawn ") && l.contains(" park refused (busy): ") && l.contains(", procs 0, cpu ")), "the refusal:\n{logs}");
+    eprintln!("L2 escaper: parked after {refusals} busy refusal(s) once the escaper slept");
+}
+
+/// S10 (W3 #2, plans/s10-contracts.md §6.4) in the real image: the
+/// directory a VM's shim keeps its last seed's record in, /var/lib/ai-env,
+/// is root's, 0700 and empty, as every VM starts from the image (a record
+/// baked in would be every VM's), and a shim that started and took `/run`
+/// (no seed came) wrote nothing there: the container's diff names nothing
+/// under /var/lib. The agent cannot list it.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_seed_record_dir_is_roots_0700_and_empty() {
+    let c = l2();
+    wait_ready(&c, 120);
+    assert_eq!(http(c.port(9000), "POST", &format!("{PREFIX}/run"), &run_body("mvm-s10", Some(&payload("mike@mbp")))).0, 200);
+    assert_eq!(c.sh("stat -c '%a %u:%g %F' /var/lib/ai-env"), "700 0:0 directory");
+    assert_eq!(c.sh("ls -A /var/lib/ai-env"), "", "no record in the image or written since");
+    let diff = ok_stdout(&["diff", &c.id]);
+    assert!(!diff.lines().any(|l| l.contains("/var/lib")), "the running shim changed /var/lib: {diff}");
+    let out = c.exec_as("1000", &["ls", "-A", "/var/lib/ai-env"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "the agent listed it: {}", String::from_utf8_lossy(&out.stdout));
 }

@@ -1032,6 +1032,8 @@ impl View {
             }
             SpawnEvent::Note(text) => err.line(format!("ai-env: {text}")),
             SpawnEvent::Link(up) => self.linked = up,
+            // S10: `vm exec`'s and `vm attach`'s sessions never park.
+            SpawnEvent::Park(report) => tracing::debug!("vm {}: a park report: {report:?}", self.vm),
             SpawnEvent::Exit(exit) => {
                 if let Some(n) = self.dropped.exit(exit.stderr_dropped, Instant::now()) {
                     note_dropped(err, n);
@@ -1383,6 +1385,7 @@ async fn capture<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spe
                     keep(&mut cap.stderr, &bytes);
                     consumed.stderr_done(seq);
                 }
+                SpawnEvent::Park(report) => tracing::debug!("a park report: {report:?}"),
                 SpawnEvent::Started { .. } | SpawnEvent::Note(_) | SpawnEvent::Link(_) | SpawnEvent::Exit(_) => {}
             }
         }
@@ -1846,6 +1849,7 @@ mod tests {
             detach_left_s: Some(0),
             frozen: false,
             group_alive,
+            parked: None,
         };
         assert!(gone_from(&[], &id), "not listed: collected or released");
         assert!(!gone_from(&[detail(true, true)], &id), "the leader runs");
@@ -1965,7 +1969,7 @@ mod tests {
         use crate::wire::frame::{CredentialView, ExitInfo, Health, HealthStatus, ListenerInfo, SpawnDetail, SpawnStatus};
         let spawn = SpawnStatus { spawn_id: SpawnId::new_v7(), argv0: "cat".into(), pid: 42, pgid: 42, alive: false, attached: true, out_seq: 7, out_from: 3, err_seq: 2, in_seq: 5, stdin_closed: true, exit: Some(ExitInfo { code: None, signal: Some(15) }) };
         let d = HealthDetail {
-            health: Health { status: HealthStatus::Ok, shim_version: "0.1.0".into(), claude_version: Some("2.1.287".into()), microvm_id: Some(ID.into()), owner: None, created: None, boot_nonce: None, run_hook_seen: true, uptime_s: 12, wire: Some(1), caps: vec![] },
+            health: Health { status: HealthStatus::Ok, shim_version: "0.1.0".into(), claude_version: Some("2.1.287".into()), microvm_id: Some(ID.into()), owner: None, created: None, boot_nonce: None, run_hook_seen: true, uptime_s: 12, wire: Some(1), caps: vec![], mem_total_mib: None },
             image_version: Some("7.0".into()),
             hook_source: "peer".into(),
             agent_guard: "on".into(),
@@ -1974,7 +1978,7 @@ mod tests {
             hook_refusals: BTreeMap::new(),
             sockets_open: 1,
             sockets_authenticated: 1,
-            spawns: vec![SpawnDetail { status: spawn, started_at: "2026-10-03T08:00:01Z".into(), detach_left_s: None, frozen: false, group_alive: false }],
+            spawns: vec![SpawnDetail { status: spawn, started_at: "2026-10-03T08:00:01Z".into(), detach_left_s: None, frozen: false, group_alive: false, parked: None }],
             has_credentials: false,
             clock: Some(serde_json::json!({"hook": "resume", "drift_s": 0, "mode": "measure"})),
             listeners: vec![

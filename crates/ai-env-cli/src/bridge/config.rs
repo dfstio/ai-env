@@ -67,6 +67,27 @@ impl Paths {
         self.root.join("state").join("sessions")
     }
 
+    /// `state/sessions/<sid>.migrate.json` (S10 §6.5, 0600, created `O_EXCL`
+    /// with `O_NOFOLLOW`): `session migrate`'s request to the session's live
+    /// wrapper, taken on `registry::MIGRATE_SIGNAL`. `sid` must already be a
+    /// session id; `registry::list` reads only `<uuid>.toml`.
+    #[must_use]
+    pub fn session_migrate_request(&self, sid: &str) -> PathBuf {
+        self.sessions().join(format!("{sid}.migrate.json"))
+    }
+
+    /// `state/gc.lock` (S10, 0600): a non-blocking flock around a wrapper's gc reconcile.
+    #[must_use]
+    pub fn gc_lock(&self) -> PathBuf {
+        self.root.join("state").join("gc.lock")
+    }
+
+    /// `state/gc.stamp` (S10, 0600): the last gc reconcile's unix seconds.
+    #[must_use]
+    pub fn gc_stamp(&self) -> PathBuf {
+        self.root.join("state").join("gc.stamp")
+    }
+
     /// `state/scratch`: per-session scratch `CLAUDE_CONFIG_DIR`s (`local-scratch` mode).
     #[must_use]
     pub fn scratch(&self) -> PathBuf {
@@ -410,7 +431,64 @@ impl VmCfg {
         if self.memory_mib == 0 {
             return bad("memory_mib", "must be positive");
         }
+        // S10: the continuity keys' ranges; their warnings are P0's to log.
+        self.validate_continuity()?;
         self.prewarm_mode().map(|_| ())
+    }
+
+    /// S10 (§5): the ranges of `max_readdress` (0..=10), `park_after_s`
+    /// (30..=3600 when set) and `migrate_before_wall_s` (1 to 59 refused:
+    /// 0 turns migration off, a value at or past `max_duration_s` too, see
+    /// [`VmCfg::migrate_margin`]): `Config` (exit 1) naming the key. The
+    /// warnings: a margin above half of `max_duration_s` and below it (a
+    /// wall migration then waits for half of the wall:
+    /// [`VmCfg::wall_migration_margin`]).
+    pub fn validate_continuity(&self) -> Result<Vec<String>, BridgeError> {
+        let bad = |key: &str, why: String| Err(BridgeError::Config(format!("[vm].{key}: {why}")));
+        if self.max_readdress > MAX_READDRESS {
+            return bad("max_readdress", format!("{} is outside 0..={MAX_READDRESS}", self.max_readdress));
+        }
+        if let Some(s) = self.park_after_s.filter(|s| !PARK_AFTER_S.contains(s)) {
+            return bad("park_after_s", format!("{s} is outside {}..={} (unset: [vm].max_idle_s)", PARK_AFTER_S.start(), PARK_AFTER_S.end()));
+        }
+        let margin = self.migrate_before_wall_s;
+        if (1..MIGRATE_MARGIN_MIN_S).contains(&margin) {
+            return bad("migrate_before_wall_s", format!("{margin} is under {MIGRATE_MARGIN_MIN_S} s: 0 turns migration off, else at least {MIGRATE_MARGIN_MIN_S}"));
+        }
+        let mut warnings = Vec::new();
+        if margin > self.max_duration_s / 2 && margin < self.max_duration_s {
+            warnings.push(format!("[vm].migrate_before_wall_s {margin} s is over half of [vm].max_duration_s {} s: a wall migration then waits for half of it", self.max_duration_s));
+        }
+        Ok(warnings)
+    }
+
+    /// S10 M5: how long a chat stays quiet before it parks: `park_after_s`,
+    /// else `max_idle_s`.
+    #[must_use]
+    pub fn park_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.park_after_s.unwrap_or(self.max_idle_s)))
+    }
+
+    /// S10 L6: the wall migration's margin, `None` when there is no
+    /// migration: `migrate_before_wall_s` 0, or at least `max_duration_s` (as
+    /// the default 1200 with a wall of 1200 s or less). The wall's
+    /// re-address then stands.
+    #[must_use]
+    pub fn migrate_margin(&self) -> Option<u32> {
+        let margin = self.migrate_before_wall_s;
+        (margin != 0 && margin < self.max_duration_s).then_some(margin)
+    }
+
+    /// S10 L6 (§14, phase 4b): when a live chat's wall migration is due: the
+    /// margin ([`VmCfg::migrate_margin`]) at most half of `max_duration_s`
+    /// (never under the 60 s floor), so every VM serves at least half its
+    /// wall before a wall migration moves a chat off it: a margin close to
+    /// the wall would otherwise migrate after every turn, each a Touch ID, a
+    /// RunMicrovm and a terminate. A reopen's carry and `reuse_candidate`
+    /// keep the margin itself.
+    #[must_use]
+    pub fn wall_migration_margin(&self) -> Option<u32> {
+        self.migrate_margin().map(|m| m.min((self.max_duration_s / 2).max(MIGRATE_MARGIN_MIN_S)))
     }
 
     /// `prewarm_on_auth_status` as a mode, or exit 1 naming the key.
@@ -498,7 +576,26 @@ pub struct VmCfg {
     pub migrate_before_wall_s: u32,
     pub prewarm_on_auth_status: String,
     pub auto_gc: bool,
+    /// S10 L6: moves after a lost link per wrapper process (re-addresses and respawns; migrations are
+    /// unlimited); 0 keeps S9's exit 8. 0..=10.
+    pub max_readdress: u32,
+    /// S10 M2: an idle chat parks. After [`VmCfg::park_after`] of quiet (no line either way, its claude's
+    /// stdio quiet, the code-out trigger idle) the wrapper's session asks the VM's shim to park its claude
+    /// (`park_v1`) and goes silent: no ping, no keep-alive, so the platform suspends the VM `max_idle_s`
+    /// later; the next input resumes it, with no Touch ID. `false` keeps S8's keep-alive: the VM never idles
+    /// while the chat is open, and a suspend under it waits `[transport].suspend_wait_s`, then exit 8.
+    pub park: bool,
+    /// S10 M5: seconds of quiet before a park; `None`: `max_idle_s` (a parked chat's VM then runs at most
+    /// `park_after_s + max_idle_s` after its last activity). 30..=3600 when set.
+    pub park_after_s: Option<u32>,
 }
+
+/// The most `[vm].max_readdress` takes (S10 §5).
+const MAX_READDRESS: u32 = 10;
+/// `[vm].park_after_s`'s range when set (S10 §5).
+const PARK_AFTER_S: std::ops::RangeInclusive<u32> = 30..=3600;
+/// The least `[vm].migrate_before_wall_s` other than 0 (S10 L6's floor).
+const MIGRATE_MARGIN_MIN_S: u32 = 60;
 
 impl Default for VmCfg {
     fn default() -> Self {
@@ -514,6 +611,9 @@ impl Default for VmCfg {
             migrate_before_wall_s: 1200,
             prewarm_on_auth_status: "auto".into(),
             auto_gc: false,
+            max_readdress: 3,
+            park: true,
+            park_after_s: None,
         }
     }
 }
@@ -947,8 +1047,12 @@ pub struct TransportCfg {
     /// suspend; `frames`: pings only (when probe e5 shows frames count).
     pub keepalive: Keepalive,
     /// After the VM was suspended under a client (`event hook_suspend`), how
-    /// long it waits for someone to resume the VM — it never resumes one
-    /// itself — before exit 8 (10..=3600).
+    /// long `vm exec`, `vm attach` and a wrapper session with `[vm].park =
+    /// false` wait for someone to resume the VM — they never resume one
+    /// themselves — before exit 8 (10..=3600). S10: a parking wrapper session
+    /// never gives up on it: it waits with no socket for its next input,
+    /// which resumes the VM (or, when the shim had not parked its spawn, for
+    /// the VM running again).
     pub suspend_wait_s: u32,
 }
 
@@ -1122,6 +1226,65 @@ mod tests {
         assert_eq!(p.transcript_stage(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/stage.toml")));
         assert_eq!(p.transcript_origin(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/origin")));
         assert_eq!(p.transcript_lock(sid), PathBuf::from(format!("/r/state/transcripts/{sid}.lock")));
+        // S10 (§6.5): `session migrate`'s request beside the session's row, the reconcile's lock and stamp.
+        assert_eq!(p.session_migrate_request(sid), PathBuf::from(format!("/r/state/sessions/{sid}.migrate.json")));
+        assert_eq!(p.gc_lock(), PathBuf::from("/r/state/gc.lock"));
+        assert_eq!(p.gc_stamp(), PathBuf::from("/r/state/gc.stamp"));
+    }
+
+    /// S10 (§5): `max_readdress` (3), `park` (on) and `park_after_s` (unset:
+    /// `max_idle_s`) by default, and their ranges, refused through
+    /// `VmCfg::validate` too, naming the key; `migrate_before_wall_s` 1 to 59
+    /// refused, 0 and a margin at or past `max_duration_s` no migration and no
+    /// error; a margin over half the wall a warning only.
+    #[test]
+    fn the_s10_vm_keys_and_their_ranges() {
+        let d = BridgeConfig::parse("").unwrap().vm;
+        assert_eq!((d.max_readdress, d.park, d.park_after_s), (3, true, None));
+        assert_eq!(d.park_after(), std::time::Duration::from_secs(300), "unset: max_idle_s");
+        assert_eq!((d.validate_continuity().unwrap(), d.migrate_margin()), (Vec::<String>::new(), Some(1200)));
+        d.validate().unwrap();
+        let of = |body: &str| BridgeConfig::parse(&format!("[vm]\n{body}")).unwrap().vm;
+        let set = of("max_readdress = 0\npark = false\npark_after_s = 60\n");
+        assert_eq!((set.max_readdress, set.park, set.park_after()), (0, false, std::time::Duration::from_secs(60)));
+        set.validate().unwrap();
+        for ok in ["max_readdress = 10", "park_after_s = 30", "park_after_s = 3600", "migrate_before_wall_s = 0", "migrate_before_wall_s = 60"] {
+            of(&format!("{ok}\n")).validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (body, key) in [
+            ("max_readdress = 11", "[vm].max_readdress: 11 is outside 0..=10"),
+            ("park_after_s = 29", "[vm].park_after_s: 29 is outside 30..=3600"),
+            ("park_after_s = 3601", "[vm].park_after_s: 3601 is outside 30..=3600"),
+            ("migrate_before_wall_s = 1", "[vm].migrate_before_wall_s: 1 is under 60 s"),
+            ("migrate_before_wall_s = 59", "[vm].migrate_before_wall_s: 59 is under 60 s"),
+        ] {
+            let vm = of(&format!("{body}\n"));
+            let e = vm.validate_continuity().unwrap_err();
+            assert!(matches!(&e, BridgeError::Config(m) if m.contains(key)), "{body}: {e}");
+            let through = vm.validate().unwrap_err().to_string();
+            assert!(through.contains(key), "VmCfg::validate refuses it too: {body}: {through}");
+            assert_eq!(crate::errors::CliError::from(e).exit_code(), 1);
+        }
+        // No migration: 0, or a margin at or past the wall (the default 1200 with a wall of 1200 s or less).
+        assert_eq!(of("migrate_before_wall_s = 0\n").migrate_margin(), None);
+        let short = of("max_duration_s = 900\n");
+        assert_eq!((short.migrate_margin(), short.validate_continuity().unwrap()), (None, Vec::<String>::new()), "S9's 900 s wall with the default margin");
+        short.validate().unwrap();
+        assert_eq!(of("max_duration_s = 1200\n").migrate_margin(), None);
+        assert_eq!(of("max_duration_s = 1201\n").migrate_margin(), Some(1200));
+        // A live chat's wall migration waits for half the wall (the floor kept); a reopen's carry keeps the margin.
+        assert_eq!((d.wall_migration_margin(), of("max_duration_s = 1201\n").wall_migration_margin()), (Some(1200), Some(600)));
+        assert_eq!((of("max_duration_s = 1800\n").wall_migration_margin(), of("max_duration_s = 100\nmigrate_before_wall_s = 60\n").wall_migration_margin()), (Some(900), Some(60)));
+        assert_eq!((of("migrate_before_wall_s = 0\n").wall_migration_margin(), short.wall_migration_margin()), (None, None), "no migration: none");
+        // Over half the wall and under it: a warning, no error.
+        let early = of("max_duration_s = 2000\nmigrate_before_wall_s = 1200\n");
+        let warnings = early.validate_continuity().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[vm].migrate_before_wall_s 1200 s is over half of [vm].max_duration_s 2000 s: a wall migration then waits for half of it"), "{warnings:?}");
+        assert_eq!((early.migrate_margin(), early.wall_migration_margin()), (Some(1200), Some(1000)));
+        early.validate().unwrap();
+        assert!(of("max_duration_s = 2400\nmigrate_before_wall_s = 1200\n").validate_continuity().unwrap().is_empty(), "half exactly: no warning");
+        assert!(BridgeConfig::parse("[vm]\npark_after = 60\n").is_err(), "an unknown key is still refused");
     }
 
     /// S9: `[transcript]` takes `view_messages` alone (10 unless set); a

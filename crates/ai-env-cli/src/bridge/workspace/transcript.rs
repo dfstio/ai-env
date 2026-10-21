@@ -217,25 +217,29 @@ pub fn digest_stream(rules: &crate::bridge::scan::Rules, input: &mut dyn Read, p
 /// nothing; when the VM holds the committed prefix (its size at least
 /// `committed`, its bytes before it hashing to the manifest's fingerprint)
 /// it is kept; else the parts are presigned (GETs by version, expiring
-/// after the pull's budget), with a tail `/suspend` or `/terminate` pushed
-/// past `committed` (found by listing `g<max(gen, 1)>/t/`, where the sync
-/// signs it), and pulled (`POST /transcript/pull`: each part checked in the
-/// VM, renamed only when all passed): a tail is only ever the main
-/// transcript's (its key names no file); audited `transcript_pull`, the
-/// manifest's inode and VM updated for the next sync's rewrite check. A
+/// after the pull's budget), with the tails `/suspend` and `/terminate`
+/// pushed from `committed` (S10, R1: one listing of `g<max(gen, 1)>/t/`,
+/// where the Mac signs them, and the chain followed from `committed`, each
+/// tail where the one before ended, at most `TAIL_CHAIN_MAX` links and as
+/// many as one pull's `PULL_PARTS_MAX` parts take; a tail off that chain is
+/// left out, logged), and pulled (`POST /transcript/pull`: each part
+/// checked in the VM, renamed only when all passed): a tail is only ever
+/// the main transcript's (its key names no file); audited
+/// `transcript_pull`, the manifest's inode and VM updated for the next
+/// sync's rewrite check. A
 /// part that did not check is `BridgeError::S3` (exit 7), the VM's copy
 /// unchanged. Only the main transcript is restored here, all `--resume`
 /// needs, within P3's deadline: the subtree's files follow after the spawn
 /// ([`restore_subtree`], the code-out trigger's first step, no deadline).
 /// Under a deadline (generation 1's P3: `ctx.deadline`) the pull, its parts
-/// and its tail together, is at most `wire::s3::INLINE_MAX`: more is
+/// and its tails together, is at most `wire::s3::INLINE_MAX`: more is
 /// `TranscriptPullTooLarge` (exit 9) before any pull starts ([`pull_one`]),
 /// naming `session stage UUID --warm`. Without one (a resume miss's retry,
 /// `session stage --warm`) it pulls whatever the size.
 /// A chat begun on a VM that S3 holds nothing committed of (no manifest:
 /// closed before its first sync) is kept on a VM that holds its file, else
 /// restored from the tail the shim pushed from 0 (`g1/t/0000000000000000`,
-/// the URL handed before any sync), when S3 holds it.
+/// the URL handed before any sync) and the chain after it, when S3 holds it.
 pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
     ctx: &EnsureCtx<'_, A, D, T>,
     sync: &crate::bridge::s3::TranscriptSync,
@@ -292,7 +296,12 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
                 audit(ctx.paths, audit_event::TRANSCRIPT_MIGRATE, &[("session", sid.to_string()), ("from", "gone_vm".to_string()), ("outcome", "migrated".to_string()), ("bytes", up.bytes.to_string())]);
             } else {
                 stage::leave_view(ctx.paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, &rules, build)?;
-                audit(ctx.paths, audit_event::TRANSCRIPT_STAGE, &[("session", sid.to_string()), ("bytes", up.bytes.to_string()), ("parts", up.parts.to_string()), ("outcome", "staged".to_string()), ("ms", ms.to_string())]);
+                // `rate` only when something went up, as `session stage` writes it (S10 F5).
+                let mut pairs = vec![("session", sid.to_string()), ("bytes", up.bytes.to_string()), ("parts", up.parts.to_string()), ("outcome", "staged".to_string()), ("ms", ms.to_string())];
+                if up.sent > 0 {
+                    pairs.push(("rate", up.rate().to_string()));
+                }
+                audit(ctx.paths, audit_event::TRANSCRIPT_STAGE, &pairs);
             }
             staged = Some(up.bytes);
         }
@@ -312,20 +321,17 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
     }
     let t0 = std::time::Instant::now();
     let client = crate::bridge::s3::client::S3Client::new(ctx.api, &sync.target)?;
-    // The sync hands the shim its tail URL under g<max(gen, 1)> (a Mac-begun chat's first VM bytes open generation 1).
-    let tail_gen = m.gen.max(1);
-    let tail = if m.committed > 0 {
-        let key = crate::wire::s3::S3Key::Tail { session: sid.to_string(), gen: tail_gen, offset: m.committed }.render();
-        client.list(&format!("v1/{sid}/vm/g{tail_gen}/t/")).await?.into_iter().find(|o| o.key == key && o.size > 0)
-    } else {
-        None
-    };
+    // The tails are handed under g<max(gen, 1)> (a Mac-begun chat's first VM bytes open generation 1). S10 (R1): the
+    // chain from the committed length, each tail where the one before ended, as many as one pull takes.
+    let tail_gen = m.tail_gen();
+    let room = crate::wire::s3::PULL_PARTS_MAX.saturating_sub(m.parts.len()).min(crate::bridge::s3::TAIL_CHAIN_MAX);
+    let listed = client.list(&crate::bridge::s3::sync::tail_prefix(sid, tail_gen)).await?;
+    let chain = crate::bridge::s3::sync::tail_chain(&listed, sid, tail_gen, m.committed, room);
+    left_out(sid, &chain);
     let mut pieces: Vec<(String, String, u64, Option<String>)> = m.parts.iter().map(|p| (p.key.clone(), p.version_id.clone(), p.len, Some(p.sha256.clone()))).collect();
-    if let Some(t) = &tail {
-        pieces.push((t.key.clone(), String::new(), t.size, None));
-    }
-    let whole = (m.parts.len() == 1 && tail.is_none()).then(|| m.parts[0].sha256.clone());
-    let (parts, bytes) = pull_one(&sctx, sid, &rel, &pieces, whole).await?;
+    pieces.extend(chain.links.iter().map(|(key, size)| (key.clone(), String::new(), *size, None)));
+    let whole = (m.parts.len() == 1 && chain.links.is_empty()).then(|| m.parts[0].sha256.clone());
+    let (parts, bytes) = pull_one(&sctx, sid, &rel, &pieces, whole, 1).await?;
     let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(session = sid, parts, bytes, ms, "transcript restored from S3");
     if let Ok(after) = sctx.stat(&prefix).await {
@@ -342,10 +348,12 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
 /// [`restore`] of a chat begun on a VM that S3 holds nothing committed of
 /// (no manifest: it closed before its first sync completed): a VM holding
 /// its file keeps it; else the tail the shim pushed from 0 at `/suspend` or
-/// `/terminate` (`v1/<sid>/vm/g1/t/0000000000000000`, its whole transcript,
-/// no sha256 to check, as any tail), found by listing `g1/t/`, is pulled;
-/// else nothing is there to restore. The next sync pushes it as generation
-/// 1's base and supersedes that tail.
+/// `/terminate` (`v1/<sid>/vm/g1/t/0000000000000000`, the transcript from
+/// its start, no sha256 to check, as any tail), found by listing `g1/t/`,
+/// and, S10 (R1), the chain of tails after it (each where the one before
+/// ended: a URL handed after a `/suspend`'s push), are pulled; else nothing
+/// is there to restore. The next sync pushes it as generation 1's base and
+/// supersedes those tails.
 async fn restore_unsynced<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
     sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>,
     sid: &str,
@@ -357,14 +365,32 @@ async fn restore_unsynced<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlan
         return Ok(TranscriptOutcome::KeptOnVm);
     }
     let client = crate::bridge::s3::client::S3Client::new(sctx.api, &sctx.sync.target)?;
-    let key = crate::wire::s3::S3Key::Tail { session: sid.to_string(), gen: 1, offset: 0 }.render();
-    let Some(tail) = client.list(&format!("{}{sid}/vm/g1/t/", crate::wire::s3::KEY_PREFIX)).await?.into_iter().find(|o| o.key == key && o.size > 0) else {
+    let listed = client.list(&crate::bridge::s3::sync::tail_prefix(sid, 1)).await?;
+    let room = crate::wire::s3::PULL_PARTS_MAX.min(crate::bridge::s3::TAIL_CHAIN_MAX);
+    let chain = crate::bridge::s3::sync::tail_chain(&listed, sid, 1, 0, room);
+    left_out(sid, &chain);
+    if chain.links.is_empty() {
         tracing::info!(session = sid, "transcript: a VM-begun chat that never reached S3: nothing to restore");
         return Ok(TranscriptOutcome::NothingToRestore);
-    };
-    let (parts, bytes) = pull_one(sctx, sid, rel, &[(tail.key, String::new(), tail.size, None)], None).await?;
-    tracing::info!(session = sid, bytes, "transcript restored from its tail (closed before its first sync)");
+    }
+    let pieces: Vec<(String, String, u64, Option<String>)> = chain.links.iter().map(|(key, size)| (key.clone(), String::new(), *size, None)).collect();
+    let (parts, bytes) = pull_one(sctx, sid, rel, &pieces, None, 1).await?;
+    tracing::info!(session = sid, bytes, tails = parts, "transcript restored from its tails (closed before its first sync)");
     Ok(TranscriptOutcome::Restored { parts, bytes })
+}
+
+/// S10 (R1): the tails a restore leaves out, logged: those off the chain it
+/// follows (below the committed length: superseded at the next hand or
+/// sync; past a gap or inside a link: no restore reaches them), and a chain
+/// longer than one pull takes.
+fn left_out(sid: &str, chain: &crate::bridge::s3::sync::TailChain) {
+    if !chain.off.is_empty() {
+        let starts: Vec<String> = chain.off.iter().map(|(_, from)| from.to_string()).collect();
+        tracing::info!(session = sid, links = chain.links.len(), "transcript: tail(s) off the chain left out, starting at {}", starts.join(", "));
+    }
+    if chain.more {
+        tracing::info!(session = sid, links = chain.links.len(), "transcript: S3 holds a tail at {} past the chain followed: left out", chain.end);
+    }
 }
 
 /// What [`restore_subtree`] did.
@@ -424,13 +450,17 @@ pub async fn restore_subtree<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataP
         }
         Err(e) => return Err(e),
     };
-    let mut pulls = Vec::new();
+    let mut todo = Vec::new();
     for (frel, f) in due {
         match held.iter().find(|(r, _, _)| *r == frel) {
             Some((_, size, sha)) if *size > f.len || (*size == f.len && *sha == f.sha256) => done.kept += 1,
-            _ => pulls.push(pull_file(sctx, sid, frel, f.clone())),
+            _ => todo.push((frel, f.clone())),
         }
     }
+    // S10 §1.3: up to TRANSFERS_MAX pulls share the VM's link at once, so each one's budget (and its presigned
+    // GETs' life) is its bytes times the pulls sharing it.
+    let share = u32::try_from(todo.len().min(crate::wire::workspace::TRANSFERS_MAX)).unwrap_or(1).max(1);
+    let pulls: Vec<_> = todo.into_iter().map(|(frel, f)| pull_file(sctx, sid, frel, f, share)).collect();
     let pulled: Vec<(u32, u64)> = futures_util::stream::iter(pulls).buffer_unordered(crate::wire::workspace::TRANSFERS_MAX).try_collect().await?;
     done.pulled = u32::try_from(pulled.len()).unwrap_or(u32::MAX);
     if done.unnamed > 0 {
@@ -445,9 +475,10 @@ async fn pull_file<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: T
     sid: &str,
     frel: String,
     f: crate::bridge::s3::manifest::ManifestFile,
+    share: u32,
 ) -> Result<(u32, u64), BridgeError> {
     let sha = Some(f.sha256.clone());
-    pull_one(sctx, sid, &frel, &[(f.key, f.version_id.unwrap_or_default(), f.len, sha.clone())], sha).await
+    pull_one(sctx, sid, &frel, &[(f.key, f.version_id.unwrap_or_default(), f.len, sha.clone())], sha, share).await
 }
 
 /// A stage cut after its manifest and before its view (`session stage`,
@@ -504,6 +535,7 @@ async fn pull_one<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: To
     rel: &str,
     pieces: &[(String, String, u64, Option<String>)],
     whole: Option<String>,
+    share: u32,
 ) -> Result<(u32, u64), BridgeError> {
     use crate::bridge::s3::{presign, S3Method};
     let t0 = std::time::Instant::now();
@@ -511,14 +543,15 @@ async fn pull_one<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: To
     if sctx.deadline.is_some() && bytes > crate::wire::s3::INLINE_MAX {
         return Err(BridgeError::TranscriptPullTooLarge { session: sid.to_string(), bytes });
     }
-    let expires = presign::pull_expiry(bytes);
+    // One pull alone (S10: C sends the share of the pulls that run at once).
+    let expires = presign::pull_expiry(bytes, share);
     let mut parts = Vec::with_capacity(pieces.len());
     for (key, version, len, sha) in pieces {
         let query = if version.is_empty() { Vec::new() } else { vec![("versionId".to_string(), version.clone())] };
         let url = sctx.api.presign(&presign::request(S3Method::Get, &sctx.sync.target, Some(key.clone()), query, Vec::new(), expires)).await?;
         parts.push(crate::wire::workspace::PullPart { url, len: *len, sha256: sha.clone() });
     }
-    let req = crate::wire::workspace::TranscriptPull { rel: rel.to_string(), parts, sha256: whole, owner: sctx.sync.target.owner.clone(), proxy: sctx.sync.proxy.clone() };
+    let req = crate::wire::workspace::TranscriptPull { rel: rel.to_string(), parts, sha256: whole, owner: sctx.sync.target.owner.clone(), proxy: sctx.sync.proxy.clone(), share };
     let x = Exchange { api: sctx.api, tokens: sctx.tokens, vm_id: &sctx.target.vm_id, port: APP_PORT, cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1, route: "POST /transcript/pull", deadline: sctx.deadline, idempotent: false };
     let reply = match exchange(&x, |t| {
         let req = &req;

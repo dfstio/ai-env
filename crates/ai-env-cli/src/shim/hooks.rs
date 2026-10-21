@@ -25,9 +25,12 @@
 //! snapshots the workspace's uncommitted work (S8, L6: a `refs/wip/*` ref
 //! made by the agent's helper within `budget::SUSPEND_SNAPSHOT`, only for a
 //! seeded VM, skipped while a seed or a code-out holds the workspace; none
-//! in `/terminate`, whose disk has no reader), then sends `event
-//! hook_suspend` to every `/agent` socket and closes them (1001, at most
-//! 1 s); `/resume` reports the clock, then thaws the graces;
+//! in `/terminate`, whose disk has no reader) and pushes the transcript's
+//! tail (S9), both in a task of their own the hook awaits at most
+//! [`SUSPEND_WORK_BOUND`] (S10, W3 #11: a hook client that goes leaves
+//! them running), then sends `event hook_suspend` to every `/agent` socket
+//! and closes them (1001, at most 1 s); `/resume` reports the clock, then
+//! thaws the graces (a parked spawn's park grace among them, S10);
 //! `/terminate` drains, sends `event hook_terminate` and closes every
 //! socket, stops the spawns (TERM every process group, at most 5 s for the
 //! leaders, then KILL the groups whose leader still runs, at most 1 s: the
@@ -76,6 +79,12 @@ pub const MAX_BODY: usize = 32 * 1024;
 /// ladder (TERM, at most 5 s for the leaders, KILL, at most 1 s) with room
 /// to spare, well inside the platform's 60 s terminate budget.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+
+/// S10 (W3 #11): how long `/suspend` waits for its snapshot and tail push,
+/// a task of their own: the snapshot's 8 s and the tail's 8 s with room,
+/// inside the platform's 30 s `suspendTimeoutSeconds`. Past it the hook
+/// goes on (closes the sockets, answers) and the work keeps running.
+pub const SUSPEND_WORK_BOUND: Duration = Duration::from_secs(18);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookSource {
@@ -409,6 +418,8 @@ async fn run(State(state): State<Arc<ShimState>>, body: Bytes) -> Response {
     errln!("ai-env: run microvm={microvm_log} payload={} {entropy}", if fail_closed { "absent (fail-closed: every hello will be refused)" } else { "ok" });
     errln!("ai-env: clock {}", serde_json::to_string(&clock).unwrap_or_default());
     keep_clock(&state, &clock);
+    // S10: the cold-start warm (`--cold-warm`), in the background beside the Mac's next steps.
+    state.cold_warm();
     if state.opts.delay_run > 0 {
         errln!("ai-env: run delayed {} s (--delay-run)", state.opts.delay_run);
         tokio::time::sleep(Duration::from_secs(state.opts.delay_run)).await;
@@ -438,16 +449,29 @@ async fn resume(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
 }
 
 /// Drop the cached credential and close the cache until `/resume` (S7), then
-/// freeze the detach graces, then snapshot the workspace (S8), then tell
-/// every `/agent` socket and close it (no socket survives a suspend), then
-/// answer.
+/// freeze the detach graces, then snapshot the workspace (S8) and push the
+/// transcript's tail (S9), then tell every `/agent` socket and close it (no
+/// socket survives a suspend), then answer. S10 (W3 #11): the snapshot and
+/// the tail run as a task of their own, which the hook awaits at most
+/// [`SUSPEND_WORK_BOUND`]: a hook client that goes (its request dropped)
+/// no longer ends the snapshot's helper before its rollback, nor the push.
 async fn suspend(State(state): State<Arc<ShimState>>, _body: Bytes) -> Response {
     // First: the cached credential goes before the snapshot can take it, and none is accepted until /resume (S7).
     state.spawns.credential().close(CredentialErrCode::Suspended, "suspend");
     state.spawns.freeze();
-    crate::shim::asagent::suspend_snapshot(&state).await;
-    // S9: the transcript's tail past what S3 holds, once (`s3xfer::tail_push`).
-    crate::shim::s3xfer::tail_push(&state, "suspend").await;
+    let work = tokio::spawn({
+        let state = state.clone();
+        async move {
+            crate::shim::asagent::suspend_snapshot(&state).await;
+            // S9: the transcript's tail past what S3 holds (`s3xfer::tail_push`).
+            crate::shim::s3xfer::tail_push(&state, "suspend").await;
+        }
+    });
+    match tokio::time::timeout(SUSPEND_WORK_BOUND, work).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => errln!("ai-env: suspend work ended: {e}"),
+        Err(_) => errln!("ai-env: suspend work still running after {} s: the sockets close now, it goes on", SUSPEND_WORK_BOUND.as_secs()),
+    }
     state.agents.close_all_with(CLOSE_GOING_AWAY, "suspend", Some(event(EventKind::HookSuspend))).await;
     reply(StatusCode::OK, serde_json::json!({"status": "ok"}))
 }
@@ -578,5 +602,19 @@ mod tests {
         assert!(!sane_id(""));
         assert!(!sane_id("mvm 1"));
         assert!(!sane_id(&"a".repeat(129)));
+    }
+
+    /// S10 (W3 #11): `/suspend` waits for its snapshot and tail push at most
+    /// 18 s: both budgets with room, inside the platform's suspend timeout
+    /// (infra/image-config.json's `suspendTimeoutSeconds`).
+    #[test]
+    fn the_suspend_work_bound_fits_its_parts_and_the_platforms_timeout() {
+        use crate::wire::workspace::budget;
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/image-config.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let platform = config.pointer("/hooks/suspendTimeoutSeconds").and_then(serde_json::Value::as_u64).expect("hooks.suspendTimeoutSeconds");
+        assert_eq!(SUSPEND_WORK_BOUND, Duration::from_secs(18));
+        assert!(budget::SUSPEND_SNAPSHOT + budget::TRANSCRIPT_TAIL < SUSPEND_WORK_BOUND, "the snapshot's and the tail's budgets fit");
+        assert!(SUSPEND_WORK_BOUND < Duration::from_secs(platform), "inside the platform's {platform} s");
     }
 }

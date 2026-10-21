@@ -74,6 +74,23 @@
 //! - **working directory** (S8): a spawn's `cwd` is a VM path; with the
 //!   shim's `--fs-root` (native tests) it is entered under that prefix, as
 //!   every VM path is.
+//! - **park** (S10, `park_v1`): [`SpawnManager::park`] parks a spawn its
+//!   socket carries once the busy check passes: no stdio and no unacked
+//!   stdout or stdin within the window, and (Linux) no sample of its session
+//!   over the Mac's CPU threshold and no process but the leader running (R
+//!   or D). The samples are taken every [`ACTIVITY_SAMPLE`] from `/proc`
+//!   (the CPU of every process of the session, sid = pgid = the leader's
+//!   pid), and once more at the `park` (judged with them, never kept: the
+//!   kept samples stay one per [`ACTIVITY_SAMPLE`]); native macOS has the
+//!   stdio part only. A parked spawn keeps its socket; when that socket
+//!   goes, it lives its park grace instead of its detach grace, frozen and
+//!   thawed with the others and given back time by the jump guard; its end
+//!   is TERM, then KILL, as a detach grace's. `unpark`, any frame for the
+//!   spawn on its socket (`stdin`, `stdin_eof`, `signal`, `ack`, `detach`),
+//!   a hello resuming it and a `park` refused to it (the answer says it is
+//!   not parked) end the park; `hold_output` keeps its stdout (and so its
+//!   exit) in its window meanwhile. `/health/detail` names a parked spawn's
+//!   owner, the wrapper that parked it.
 //!
 //! Group signals: a group is signalled only while its leader is UNREAPED.
 //! The leader's death is observed with `waitid(WNOWAIT)`, the group ladder
@@ -94,6 +111,7 @@ use crate::wire::frame::{Deliver, ErrorCode, ExitInfo, Frame, ResumePoint, Resum
 use crate::wire::frame::{
     ARGV_MAX_BYTES, CHUNK_MAX, DETACH_GRACE_EXEC_S, ENV_MAX_ENTRIES, GROUP_KILL_AFTER, LADDER_KILL_AFTER, LADDER_TERM_AFTER, MAX_SPAWNS, STDERR_BUFFER_BYTES, STDIN_WINDOW_BYTES, STDOUT_WINDOW_CHUNKS,
 };
+use crate::wire::frame::{ParkOwner, ParkRefusal, PARK_GRACE_MAX_S};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -221,6 +239,13 @@ const JUMP: Duration = Duration::from_secs(10);
 const SWEEP_PASSES: usize = 5;
 /// ... this far apart, so what one pass killed is a zombie (skipped) by the next.
 const SWEEP_PAUSE: Duration = Duration::from_millis(20);
+/// The busy check's sample (S10, `park_v1`): every this often, the CPU of
+/// each live spawn's session and its running processes are read (Linux);
+/// the Mac's `park.cpu_busy_ms` is per sample.
+pub const ACTIVITY_SAMPLE: Duration = Duration::from_secs(10);
+/// The longest busy-check window a `park` may name (`min_quiet_s`); the
+/// samples are kept this long.
+const PARK_WINDOW_MAX_S: u32 = 3600;
 
 // ---- state -------------------------------------------------------------------------------
 
@@ -265,6 +290,79 @@ impl Grace {
         }
         through
     }
+}
+
+/// What a `park` asks of one spawn (S10, `park_v1`): the frame's fields but its spawn id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkAsk {
+    /// The park grace (1..=[`PARK_GRACE_MAX_S`]).
+    pub grace_s: u32,
+    /// The busy check's window (0..=3600).
+    pub min_quiet_s: u32,
+    /// CPU of the session per sample above which it is busy.
+    pub cpu_busy_ms: u32,
+    pub hold_output: bool,
+    pub owner: ParkOwner,
+}
+
+/// A parked spawn's park (S10): the grace its socket's loss starts, the
+/// wrapper that parked it, whether its stdout waits in its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkState {
+    grace: Duration,
+    owner: ParkOwner,
+    hold_output: bool,
+}
+
+/// One busy-check sample of a spawn's session (Linux, S10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sample {
+    at: Instant,
+    /// The session's CPU since the sample before it (ms).
+    cpu_ms: u64,
+    /// Its processes but the leader running or in uninterruptible sleep (R, D).
+    running: u32,
+}
+
+/// The busy check's record of one spawn: the samples of the last
+/// [`PARK_WINDOW_MAX_S`], and its session's CPU at the newest (0 at the start).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Activity {
+    samples: VecDeque<Sample>,
+    cpu_total_ms: u64,
+}
+
+impl Activity {
+    /// A look at the session at `at`: its CPU since the last becomes a
+    /// sample; the samples older than the longest window go.
+    fn record(&mut self, at: Instant, now: &SessionNow) {
+        if let Some(total) = now.cpu_ms {
+            self.samples.push_back(Sample { at, cpu_ms: total.saturating_sub(self.cpu_total_ms), running: now.running });
+            self.cpu_total_ms = total;
+        }
+        let keep = Duration::from_secs(u64::from(PARK_WINDOW_MAX_S));
+        while self.samples.front().is_some_and(|s| at.saturating_duration_since(s.at) > keep) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The samples within `window` before `now` (inclusive): the busiest
+    /// one's CPU, and whether one ran over `cpu_busy_ms` or saw a process
+    /// but the leader running.
+    fn busy(&self, now: Instant, window: Duration, cpu_busy_ms: u32) -> (bool, u64) {
+        let within = self.samples.iter().filter(|s| now.saturating_duration_since(s.at) <= window);
+        within.fold((false, 0), |(busy, max), s| (busy || s.cpu_ms > u64::from(cpu_busy_ms) || s.running > 0, max.max(s.cpu_ms)))
+    }
+}
+
+/// One look at a spawn's session (S10's busy check): its CPU so far (ms;
+/// `None` where it cannot be read: native macOS), its processes but the
+/// leader that run (R or D), and those alive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionNow {
+    cpu_ms: Option<u64>,
+    running: u32,
+    procs: u32,
 }
 
 /// How a spawn's attachment ends.
@@ -324,6 +422,13 @@ struct Spawn {
     drained: Arc<Notify>,
     readers: Vec<AbortHandle>,
     writer: Option<AbortHandle>,
+    /// S10: the park, while parked (module doc).
+    park: Option<ParkState>,
+    /// S10: its last stdio (a stdin frame taken, a stdout or stderr chunk
+    /// read; its start before any): the busy check's quiet.
+    last_io: Instant,
+    /// S10: the busy check's samples of its session (Linux).
+    activity: Activity,
 }
 
 impl Spawn {
@@ -361,12 +466,53 @@ impl Spawn {
     }
 
     /// Detached now: the grace starts (frozen while the VM is suspended),
-    /// unless a ladder already ends the spawn.
+    /// unless a ladder already ends the spawn. A parked spawn's is its park
+    /// grace (S10): only a lost socket meets one, as every frame of the Mac's
+    /// for it, a `detach` among them, unparks it first.
     fn detached(&mut self, frozen: bool, now: Instant) {
         self.attached = None;
         if self.ending == Ending::Attached {
-            self.ending = Ending::Grace(Grace::new(self.grace, frozen, now));
+            let grace = self.park.map_or(self.grace, |p| p.grace);
+            self.ending = Ending::Grace(Grace::new(grace, frozen, now));
         }
+    }
+
+    /// The Mac took the spawn back (`unpark`, a frame for it on its socket,
+    /// a resuming hello: `by`): it is parked no more. Whether it was.
+    fn unpark(&mut self, id: &SpawnId, by: &str) -> bool {
+        let was = self.park.take().is_some();
+        if was {
+            log(&format!("ai-env: spawn {id} unparked by {by}"));
+        }
+        was
+    }
+
+    /// Whole seconds since its last stdio.
+    fn quiet_s(&self, now: Instant) -> u32 {
+        u32::try_from(now.saturating_duration_since(self.last_io).as_secs()).unwrap_or(u32::MAX)
+    }
+
+    /// The busy check (S10) at `now`, judged on `activity` (its samples and
+    /// the session's look then): why it may not park, in this order (`not_attached` is the caller's):
+    /// a grace or a window out of range, or a leader gone (`other`); stdout
+    /// or stdin not acked (`unacked`); stdio within the window (`output`);
+    /// a sample within it over `cpu_busy_ms`, or one that saw a process but
+    /// the leader running (`busy`). With the busiest sample's CPU in the window.
+    fn park_check(&self, activity: &Activity, ask: &ParkAsk, now: Instant) -> (Option<ParkRefusal>, u64) {
+        let window = Duration::from_secs(u64::from(ask.min_quiet_s));
+        let (busy, cpu_ms) = activity.busy(now, window, ask.cpu_busy_ms);
+        let refusal = if !(1..=PARK_GRACE_MAX_S).contains(&ask.grace_s) || ask.min_quiet_s > PARK_WINDOW_MAX_S || self.leader.is_some() {
+            Some(ParkRefusal::Other)
+        } else if self.out.unacked().1 > 0 || self.stdin.in_seq() > self.stdin_acked {
+            Some(ParkRefusal::Unacked)
+        } else if now.saturating_duration_since(self.last_io) < window {
+            Some(ParkRefusal::Output)
+        } else if busy {
+            Some(ParkRefusal::Busy)
+        } else {
+            None
+        };
+        (refusal, cpu_ms)
     }
 
     fn abort_tasks(self) {
@@ -436,6 +582,14 @@ struct State {
 impl State {
     fn live(&self) -> usize {
         self.spawns.values().filter(|s| s.leader.is_none()).count()
+    }
+
+    /// The live spawns' leaders, each with its spawn (S10 V-6): every look
+    /// of the busy check takes them all, as each session one of them leads
+    /// is its own spawn's and never another's escaper ([`sample_sessions`]'
+    /// `leaders`): the sampler's looks and a `park`'s alike.
+    fn live_leaders(&self) -> Vec<(SpawnId, u32)> {
+        self.spawns.iter().filter(|(_, s)| s.leader.is_none()).map(|(id, s)| (id.clone(), s.pid)).collect()
     }
 
     /// The groups of the helpers running now.
@@ -518,6 +672,10 @@ impl State {
         let last = q.rr_out.clone();
         for id in round_robin(&mine, last.as_ref()) {
             let s = spawns.get_mut(id)?;
+            // S10: a park that holds its output keeps the stdout (and so the exit) in its window.
+            if s.park.is_some_and(|p| p.hold_output) {
+                continue;
+            }
             if let Some((seq, chunk)) = s.cursor.next_out(&s.out) {
                 let frame = Frame::Stdout { spawn_id: id.clone(), seq, data: chunk.clone() };
                 q.rr_out = Some(id.clone());
@@ -570,6 +728,15 @@ impl Inner {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// What the busy check counts beyond the sessions (S10 V-6): the agent's
+    /// uid and the sessions its workspace helpers lead, when the shim owns
+    /// that uid as the idle sweep does (`sweep`, Linux and root, and an agent
+    /// uid that is not root's); `None` otherwise (native tests: the test's
+    /// own uid runs everything else on the machine).
+    fn escapers(&self) -> Option<(u32, Vec<u32>)> {
+        (self.opts.sweep && self.opts.agent_uid != 0).then(|| (self.opts.agent_uid, self.lock().helper_groups()))
+    }
+
     fn bump(&self) {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
     }
@@ -606,10 +773,12 @@ impl Inner {
                 if let Ending::Grace(g) = s.ending {
                     if g.deadline().is_some_and(|d| d <= now) {
                         s.ending = Ending::Expired;
+                        // S10: a parked spawn's grace is its park grace; it ends the park too.
+                        let which = if s.park.take().is_some() { "park" } else { "detach" };
                         if s.leader.is_none() {
                             s.signal_group(libc::SIGTERM);
                             s.due.push((now + GRACE_KILL_AFTER, libc::SIGKILL));
-                            log(&format!("ai-env: spawn {id} detach grace over: TERM, KILL in {} s", GRACE_KILL_AFTER.as_secs()));
+                            log(&format!("ai-env: spawn {id} {which} grace over: TERM, KILL in {} s", GRACE_KILL_AFTER.as_secs()));
                         }
                     }
                 }
@@ -917,6 +1086,9 @@ impl SpawnManager {
             drained: Arc::new(Notify::new()),
             readers: Vec::new(),
             writer: None,
+            park: None,
+            last_io: Instant::now(),
+            activity: Activity::default(),
         };
         let (credit, ready) = (record.credit.clone(), record.ready.clone());
         {
@@ -942,10 +1114,13 @@ impl SpawnManager {
         Ok(Frame::Spawned { spawn_id: id, pid, pgid: pid, claude_version: None })
     }
 
-    /// The clock task, once a runtime exists (the first hello or spawn).
+    /// The clock task, once a runtime exists (the first hello or spawn); on
+    /// Linux the busy check's sampler with it (S10).
     fn start_clock(&self) {
         if !self.inner.clock_started.swap(true, Ordering::SeqCst) {
             tokio::spawn(run_clock(Arc::downgrade(&self.inner), self.inner.clock_wake.clone()));
+            #[cfg(target_os = "linux")]
+            tokio::spawn(run_sampler(Arc::downgrade(&self.inner)));
         }
     }
 
@@ -966,6 +1141,8 @@ impl SpawnManager {
                             if let Ending::Grace(_) = s.ending {
                                 s.ending = Ending::Attached;
                             }
+                            // S10: a hello resuming a parked spawn unparks it (its grace went above).
+                            s.unpark(&p.spawn_id, "a resuming hello");
                             if let Some(old) = s.attached.replace(conn).filter(|old| *old != conn) {
                                 if let Some(q) = conns.get_mut(&old) {
                                     q.superseded.push_back(p.spawn_id.clone());
@@ -1030,23 +1207,35 @@ impl SpawnManager {
                     Ending::Grace(g) => (Some(g.remaining(now).as_secs()), g.since.is_none()),
                     Ending::Expired | Ending::Final => (Some(0), false),
                 };
-                SpawnDetail { status: s.status(id, None), started_at: s.started_at.clone(), detach_left_s, frozen, group_alive: group_alive(s.pid) }
+                // S10: a parked spawn names the wrapper that parked it (the reaper's owner check).
+                SpawnDetail { status: s.status(id, None), started_at: s.started_at.clone(), detach_left_s, frozen, group_alive: group_alive(s.pid), parked: s.park.map(|p| p.owner) }
             })
             .collect()
     }
 
-    /// The spawn `id` if it is attached to `conn`.
-    fn with_attached<T>(&self, conn: ConnGen, id: &SpawnId, f: impl FnOnce(&mut Spawn) -> Result<T, ErrorCode>) -> Result<T, ErrorCode> {
-        let mut st = self.inner.lock();
-        let s = st.spawns.get_mut(id).filter(|s| s.attached == Some(conn)).ok_or(ErrorCode::NotAttached)?;
-        f(s)
+    /// The spawn `id` if it is attached to `conn`. A frame for a parked
+    /// spawn on its socket unparks it first (S10; `by` names the frame), and
+    /// the outbox is woken for what the park held.
+    fn with_attached<T>(&self, conn: ConnGen, id: &SpawnId, by: &str, f: impl FnOnce(&mut Spawn) -> Result<T, ErrorCode>) -> Result<T, ErrorCode> {
+        let (out, unparked) = {
+            let mut st = self.inner.lock();
+            let s = st.spawns.get_mut(id).filter(|s| s.attached == Some(conn)).ok_or(ErrorCode::NotAttached)?;
+            let unparked = s.unpark(id, by);
+            (f(s), unparked)
+        };
+        if unparked {
+            self.inner.bump();
+        }
+        out
     }
 
     pub fn stdin(&self, conn: ConnGen, id: &SpawnId, seq: u64, bytes: Vec<u8>) -> Result<(), ErrorCode> {
-        let discarded = self.with_attached(conn, id, |s| {
+        let discarded = self.with_attached(conn, id, "stdin", |s| {
             if !s.stdin.offer(seq, bytes)? {
                 return Ok(false);
             }
+            // S10: stdin is the spawn's I/O (the busy check's quiet).
+            s.last_io = Instant::now();
             if s.stdin_broken {
                 s.stdin.discard();
                 return Ok(true);
@@ -1061,7 +1250,7 @@ impl SpawnManager {
     }
 
     pub fn stdin_eof(&self, conn: ConnGen, id: &SpawnId, seq: u64) -> Result<(), ErrorCode> {
-        self.with_attached(conn, id, |s| {
+        self.with_attached(conn, id, "stdin_eof", |s| {
             s.stdin.eof(seq);
             s.ready.notify_one();
             Ok(())
@@ -1069,7 +1258,7 @@ impl SpawnManager {
     }
 
     pub fn signal(&self, conn: ConnGen, id: &SpawnId, sig: Sig) -> Result<(), ErrorCode> {
-        self.with_attached(conn, id, |s| {
+        self.with_attached(conn, id, "signal", |s| {
             s.signal_group(sig.number());
             Ok(())
         })?;
@@ -1081,6 +1270,8 @@ impl SpawnManager {
         let released = {
             let mut st = self.inner.lock();
             let s = st.spawns.get_mut(id).filter(|s| s.attached == Some(conn)).ok_or(ErrorCode::NotAttached)?;
+            // S10: an ack (the Mac took VM output) unparks; the bump below wakes the outbox for what it held.
+            s.unpark(id, "ack");
             s.out.ack(seq);
             s.err.ack(err_seq);
             s.credit.notify_one();
@@ -1104,6 +1295,8 @@ impl SpawnManager {
             let frozen = st.frozen;
             let s = st.spawns.get_mut(id).filter(|s| s.attached == Some(conn)).ok_or(ErrorCode::NotAttached)?;
             let now = Instant::now();
+            // S10: a detach unparks first: the Mac's own detach takes its detach grace.
+            s.unpark(id, "detach");
             s.detached(frozen, now);
             if is_final {
                 s.ending = Ending::Final;
@@ -1135,8 +1328,10 @@ impl SpawnManager {
             let now = Instant::now();
             let mut lost = Vec::new();
             for (id, s) in st.spawns.iter_mut().filter(|(_, s)| s.attached == Some(conn)) {
+                // S10: a parked spawn stays parked, under its park grace.
+                let (which, grace) = s.park.map_or(("grace", s.grace), |p| ("park grace", p.grace));
                 s.detached(frozen, now);
-                log(&format!("ai-env: spawn {id} lost connection {conn}: grace {} s{}", s.grace.as_secs(), if frozen { " (frozen)" } else { "" }));
+                log(&format!("ai-env: spawn {id} lost connection {conn}: {which} {} s{}", grace.as_secs(), if frozen { " (frozen)" } else { "" }));
                 lost.push(id.clone());
             }
             lost.iter().filter_map(|id| st.settle(id)).collect()
@@ -1145,6 +1340,69 @@ impl SpawnManager {
             r.abort_tasks();
         }
         self.inner.clock_wake.notify_one();
+    }
+
+    /// `park` (S10, `park_v1`; the module doc): park the spawn `id` that
+    /// `conn` carries, or say why not. Its session is looked at once more
+    /// first (off the runtime's workers; with every live spawn's leader, as
+    /// the sampler looks: another live spawn's session is never this one's
+    /// escaper, V-6), then the busy check
+    /// ([`Spawn::park_check`], on its samples and that look, which is not
+    /// kept) and the park itself run under one lock: a
+    /// spawn not this socket's (or no longer) is `not_attached`. The answer
+    /// is `parked` (the quiet in whole seconds, the processes but the
+    /// leader) or `park_refused` (its reason, the same two, and the busiest
+    /// sample's CPU in the window). A parked spawn parked again takes the
+    /// new terms; refused, it is parked no more (what its park held goes out).
+    pub async fn park(&self, conn: ConnGen, id: &SpawnId, ask: ParkAsk) -> Frame {
+        let refused = |reason: ParkRefusal, quiet_s: u32, procs: u32, cpu_ms: u64| {
+            log(&format!("ai-env: spawn {} park refused ({}): quiet {quiet_s} s, procs {procs}, cpu {cpu_ms} ms", short(&id.0), refusal_word(reason)));
+            Frame::ParkRefused { spawn_id: id.clone(), reason, quiet_s, procs, cpu_ms }
+        };
+        // Its leader and every live one, under one lock (BUSY-1: a look with this leader alone took the other
+        // spawns' sessions for its escapers). `escapers` takes the same lock: after this guard went.
+        let looked = {
+            let st = self.inner.lock();
+            st.spawns.get(id).filter(|s| s.attached == Some(conn)).map(|s| (s.pid, st.live_leaders().into_iter().map(|(_, pid)| pid).collect::<Vec<u32>>()))
+        };
+        let Some((pid, leaders)) = looked else { return refused(ParkRefusal::NotAttached, 0, 0, 0) };
+        let away = self.inner.escapers();
+        let session = tokio::task::spawn_blocking(move || session_now(pid, &leaders, away)).await.unwrap_or_default();
+        let now = Instant::now();
+        let mut st = self.inner.lock();
+        let Some(s) = st.spawns.get_mut(id).filter(|s| s.attached == Some(conn) && s.pid == pid) else { return refused(ParkRefusal::NotAttached, 0, 0, 0) };
+        let mut seen = s.activity.clone();
+        seen.record(now, &session);
+        let quiet_s = s.quiet_s(now);
+        let (refusal, cpu_ms) = s.park_check(&seen, &ask, now);
+        if let Some(reason) = refusal {
+            let was = s.unpark(id, "a refused park");
+            drop(st);
+            if was {
+                self.inner.bump();
+            }
+            return refused(reason, quiet_s, session.procs, cpu_ms);
+        }
+        s.park = Some(ParkState { grace: Duration::from_secs(u64::from(ask.grace_s)), owner: ask.owner, hold_output: ask.hold_output });
+        log(&format!(
+            "ai-env: spawn {id} parked: park grace {} s, quiet {quiet_s} s, procs {}, owner pid {} started {}{}",
+            ask.grace_s,
+            session.procs,
+            ask.owner.pid,
+            ask.owner.started,
+            if ask.hold_output { ", stdout held" } else { "" }
+        ));
+        Frame::Parked { spawn_id: id.clone(), quiet_s, procs: session.procs }
+    }
+
+    /// `unpark` (S10): the spawn `id` that `conn` carries is the Mac's
+    /// again, and what its park held goes out. No answer either way: a spawn
+    /// not attached to `conn` is left as it is.
+    pub fn unpark(&self, conn: ConnGen, id: &SpawnId) {
+        let was = self.inner.lock().spawns.get_mut(id).filter(|s| s.attached == Some(conn)).is_some_and(|s| s.unpark(id, "unpark"));
+        if was {
+            self.inner.bump();
+        }
     }
 
     /// The frames `conn` is owed.
@@ -1372,6 +1630,10 @@ async fn read_stdout(inner: Arc<Inner>, id: SpawnId, pipe: Option<ChildStdout>, 
             if s.out_done {
                 return;
             }
+            if n > 0 {
+                // S10: stdout is the spawn's I/O (the busy check's quiet).
+                s.last_io = Instant::now();
+            }
             let chunks = if n == 0 { chunker.finish().into_iter().collect() } else { chunker.push(&buf[..n]) };
             for c in chunks {
                 s.out.push(c);
@@ -1404,6 +1666,10 @@ async fn read_stderr(inner: Arc<Inner>, id: SpawnId, pipe: Option<ChildStderr>) 
             let Some(s) = st.spawns.get_mut(&id) else { return };
             if s.err_done {
                 return;
+            }
+            if n > 0 {
+                // S10: so is stderr.
+                s.last_io = Instant::now();
             }
             let chunks = if n == 0 { chunker.finish().into_iter().collect() } else { chunker.push(&buf[..n]) };
             for c in chunks {
@@ -1534,6 +1800,167 @@ async fn run_clock(inner: Weak<Inner>, wake: Arc<Notify>) {
         let now = Instant::now();
         i.woke(last, now);
         last = now;
+    }
+}
+
+// ---- the park's busy check (S10) ---------------------------------------------------------
+
+/// The busy check's sampler (Linux): every [`ACTIVITY_SAMPLE`], one look
+/// at the session of each live spawn (`/proc`, off the runtime's workers),
+/// recorded as a sample of its own. Holds the manager only while it works,
+/// so dropping the manager ends it at the next wake.
+#[cfg(target_os = "linux")]
+async fn run_sampler(inner: Weak<Inner>) {
+    let hz = clock_ticks();
+    loop {
+        tokio::time::sleep(ACTIVITY_SAMPLE).await;
+        let leaders: Vec<(SpawnId, u32)> = match inner.upgrade() {
+            Some(i) => i.lock().live_leaders(),
+            None => return,
+        };
+        if leaders.is_empty() {
+            continue;
+        }
+        let pids: Vec<u32> = leaders.iter().map(|(_, pid)| *pid).collect();
+        let away = match inner.upgrade() {
+            Some(i) => i.escapers(),
+            None => return,
+        };
+        let Ok(looks) = tokio::task::spawn_blocking(move || sample_sessions(Path::new("/proc"), &pids, hz, away.as_ref().map(|(uid, helpers)| (*uid, helpers.as_slice())))).await else { continue };
+        let Some(i) = inner.upgrade() else { return };
+        let at = Instant::now();
+        let mut st = i.lock();
+        for (id, pid) in leaders {
+            if let (Some(s), Some(look)) = (st.spawns.get_mut(&id).filter(|s| s.pid == pid), looks.get(&pid)) {
+                s.activity.record(at, look);
+            }
+        }
+    }
+}
+
+/// The kernel's clock ticks a second (`/proc/<pid>/stat`'s CPU unit).
+#[cfg(target_os = "linux")]
+fn clock_ticks() -> u64 {
+    // SAFETY: sysconf takes a name and returns a value, or -1.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(hz).ok().filter(|h| *h > 0).unwrap_or(100)
+}
+
+/// The busy check's look at the session `leader` leads, now (Linux: from
+/// `/proc`), the agent's escapers counted in it ([`Inner::escapers`]):
+/// `leaders` are every live spawn's leader, `leader` among them, whose
+/// sessions are their own spawns' and never an escaper's (V-6). A `leader`
+/// not among them (its spawn's leader died) gets the default look.
+#[cfg(target_os = "linux")]
+fn session_now(leader: u32, leaders: &[u32], away: Option<(u32, Vec<u32>)>) -> SessionNow {
+    sample_sessions(Path::new("/proc"), leaders, clock_ticks(), away.as_ref().map(|(uid, helpers)| (*uid, helpers.as_slice()))).remove(&leader).unwrap_or_default()
+}
+
+/// Native macOS: the busy check is the stdio part alone (no CPU, nothing
+/// running counted); the session's processes are counted for the answer.
+#[cfg(target_os = "macos")]
+fn session_now(leader: u32, _leaders: &[u32], _away: Option<(u32, Vec<u32>)>) -> SessionNow {
+    SessionNow { cpu_ms: None, running: 0, procs: u32::try_from(crate::shim::asagent::session_pids(leader).len()).unwrap_or(u32::MAX) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn session_now(_leader: u32, _leaders: &[u32], _away: Option<(u32, Vec<u32>)>) -> SessionNow {
+    SessionNow::default()
+}
+
+/// One `/proc/<pid>/stat` as the busy check reads it: its state, its
+/// session, and the CPU (clock ticks) it and its reaped children used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatLine {
+    state: char,
+    session: u32,
+    cpu_ticks: u64,
+}
+
+/// A `/proc/<pid>/stat` text's fields past the `)` that closes `comm`
+/// (the last one: `comm` may hold spaces and parentheses): the state
+/// (field 3), the session (6), utime, stime, cutime and cstime (14 to 17).
+/// `None` for a text that does not parse.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_stat(text: &str) -> Option<StatLine> {
+    let fields: Vec<&str> = text[text.rfind(')')? + 1..].split_whitespace().collect();
+    let state = fields.first()?.chars().next()?;
+    let session = fields.get(3)?.parse().ok()?;
+    let ticks = |i: usize| fields.get(i).and_then(|f| f.parse::<i64>().ok()).map(|t| u64::try_from(t).unwrap_or(0));
+    let cpu_ticks = [11, 12, 13, 14].into_iter().try_fold(0u64, |sum, i| ticks(i).map(|t| sum.saturating_add(t)))?;
+    Some(StatLine { state, session, cpu_ticks })
+}
+
+/// One session's count in [`sample_sessions`].
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionCount {
+    ticks: u64,
+    running: u32,
+    alive: u32,
+    /// The leader's own stat was read.
+    leader: bool,
+}
+
+/// The sessions of `leaders` under `proc` (`/proc`; a planted tree in the
+/// tests), from one pass over its numeric entries: per leader, the CPU in
+/// ms (at `hz` ticks a second) of every process of its session (a
+/// zombie's too: its parent's children count takes it once reaped), and
+/// its processes but the leader alive, and running (R or D). A leader
+/// whose own stat was not read (gone meanwhile) is missing: a count
+/// without it would start the next sample's CPU from nothing.
+///
+/// With `away` (S10 V-6: the agent's uid and the sessions its workspace
+/// helpers lead), the agent's escapers count in every leader's look too:
+/// each running process (not a zombie) whose real and effective uid are
+/// the agent's, in no leader's session and no helper's, such as a child of
+/// claude that called `setsid` (a backgrounded build). Their CPU and those
+/// running (R or D) are added; `procs` stays the session's own. A session
+/// left out of `leaders` is counted so too: every look passes every live
+/// spawn's leader ([`State::live_leaders`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sample_sessions(proc: &Path, leaders: &[u32], hz: u64, away: Option<(u32, &[u32])>) -> BTreeMap<u32, SessionNow> {
+    let Ok(rd) = std::fs::read_dir(proc) else { return BTreeMap::new() };
+    let mut seen: BTreeMap<u32, SessionCount> = leaders.iter().map(|l| (*l, SessionCount::default())).collect();
+    let mut escaped = SessionCount::default();
+    for e in rd.flatten() {
+        let Some(pid) = e.file_name().to_str().filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).and_then(|n| n.parse::<u32>().ok()) else { continue };
+        // Lossy: a `comm` that is not UTF-8 must not hide the process's CPU.
+        let Some(line) = std::fs::read(e.path().join("stat")).ok().and_then(|b| parse_stat(&String::from_utf8_lossy(&b))) else { continue };
+        let Some(count) = seen.get_mut(&line.session) else {
+            if let Some((uid, helpers)) = away {
+                if !helpers.contains(&line.session) && std::fs::read_to_string(e.path().join("status")).is_ok_and(|s| crate::shim::sys::is_running_as(&s, uid)) {
+                    escaped.ticks = escaped.ticks.saturating_add(line.cpu_ticks);
+                    if matches!(line.state, 'R' | 'D') {
+                        escaped.running += 1;
+                    }
+                }
+            }
+            continue;
+        };
+        count.ticks = count.ticks.saturating_add(line.cpu_ticks);
+        if pid == line.session {
+            count.leader = true;
+        } else if !matches!(line.state, 'Z' | 'X') {
+            count.alive += 1;
+            if matches!(line.state, 'R' | 'D') {
+                count.running += 1;
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, c)| c.leader)
+        .map(|(leader, c)| (leader, SessionNow { cpu_ms: Some(c.ticks.saturating_add(escaped.ticks).saturating_mul(1000) / hz.max(1)), running: c.running + escaped.running, procs: c.alive }))
+        .collect()
+}
+
+/// `park_refused.reason`'s word, for the log.
+fn refusal_word(r: ParkRefusal) -> &'static str {
+    match r {
+        ParkRefusal::Busy => "busy",
+        ParkRefusal::Output => "output",
+        ParkRefusal::Unacked => "unacked",
+        ParkRefusal::NotAttached => "not_attached",
+        ParkRefusal::Other => "other",
     }
 }
 
@@ -2025,6 +2452,9 @@ mod tests {
             drained: Arc::new(Notify::new()),
             readers: Vec::new(),
             writer: None,
+            park: None,
+            last_io: Instant::now(),
+            activity: Activity::default(),
         };
         let one = || Chunk { text: Some("x".into()), b64: None };
         for _ in 0..STDOUT_WINDOW_CHUNKS {
@@ -3106,5 +3536,282 @@ mod tests {
         let mut bad = req(&["pwd"]);
         bad.cwd = Some("/Users/../x".into());
         assert_eq!(refused(&m, bad).await.0, SpawnErrCode::Cwd, "the VM path's own rules first");
+    }
+
+    // ---- S10: the park ----
+
+    /// A bare record (S10's busy check): pid 0 and `reaped` signal no one.
+    fn bare_spawn() -> Spawn {
+        Spawn {
+            argv0: "x".into(),
+            holds_secret: false,
+            pid: 0,
+            started_at: String::new(),
+            grace: Duration::ZERO,
+            attached: None,
+            ending: Ending::Attached,
+            cursor: Cursor { out: 1, err: 1, exit_sent: false },
+            out: OutWindow::default(),
+            err: ErrBuffer::new(STDERR_BUFFER_BYTES),
+            stdin: StdinQueue::new(STDIN_WINDOW_BYTES),
+            stdin_acked: 0,
+            stdin_closed: false,
+            stdin_broken: false,
+            leader: None,
+            reaped: true,
+            out_done: false,
+            err_done: false,
+            truncated: false,
+            exit: None,
+            due: Vec::new(),
+            credit: Arc::new(Notify::new()),
+            ready: Arc::new(Notify::new()),
+            drained: Arc::new(Notify::new()),
+            readers: Vec::new(),
+            writer: None,
+            park: None,
+            last_io: Instant::now(),
+            activity: Activity::default(),
+        }
+    }
+
+    /// The park's busy check in its order: `other` (a grace of 0 or past
+    /// the max, a window past an hour, a leader gone) before `unacked`
+    /// (stdout or stdin) before `output` (stdio within the window) before
+    /// `busy` (a sample within it over the CPU threshold, or one that saw a
+    /// process but the leader running); a sample older than the window
+    /// counts for nothing; the busiest's CPU is named whatever the verdict.
+    #[test]
+    fn the_park_check_refuses_in_its_order() {
+        let ask = ParkAsk { grace_s: 600, min_quiet_s: 30, cpu_busy_ms: 500, hold_output: false, owner: ParkOwner { pid: 7, started: 8 } };
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let now = at(4000);
+        let mut s = bare_spawn();
+        s.last_io = t0;
+        assert_eq!(s.park_check(&s.activity, &ask, now), (None, 0), "quiet, nothing sampled");
+        for bad in [ParkAsk { grace_s: 0, ..ask }, ParkAsk { grace_s: PARK_GRACE_MAX_S + 1, ..ask }, ParkAsk { min_quiet_s: 3601, ..ask }] {
+            assert_eq!(s.park_check(&s.activity, &bad, now).0, Some(ParkRefusal::Other), "{bad:?}");
+        }
+        assert_eq!(s.park_check(&s.activity, &ParkAsk { grace_s: PARK_GRACE_MAX_S, min_quiet_s: 3600, ..ask }, now).0, None, "the limits themselves");
+        s.activity.record(at(3980), &SessionNow { cpu_ms: Some(600), running: 0, procs: 0 });
+        assert_eq!(s.park_check(&s.activity, &ask, now), (Some(ParkRefusal::Busy), 600), "600 ms in a sample 20 s ago");
+        assert_eq!(s.park_check(&s.activity, &ParkAsk { min_quiet_s: 10, ..ask }, now), (None, 0), "older than the window");
+        s.activity.record(at(3995), &SessionNow { cpu_ms: Some(700), running: 1, procs: 1 });
+        assert_eq!(s.park_check(&s.activity, &ParkAsk { min_quiet_s: 10, ..ask }, now), (Some(ParkRefusal::Busy), 100), "a process but the leader running");
+        s.last_io = at(3995);
+        assert_eq!(s.park_check(&s.activity, &ask, now), (Some(ParkRefusal::Output), 600), "stdio 5 s ago, before busy");
+        s.stdin.offer(1, b"x".to_vec()).unwrap();
+        assert_eq!(s.park_check(&s.activity, &ask, now).0, Some(ParkRefusal::Unacked), "stdin not acked, before output");
+        s.stdin_acked = 1;
+        s.out.push(crate::wire::frame::Chunk { text: Some("y".into()), b64: None });
+        assert_eq!(s.park_check(&s.activity, &ask, now).0, Some(ParkRefusal::Unacked), "stdout not acked");
+        s.leader = Some(ExitInfo { code: Some(0), signal: None });
+        assert_eq!(s.park_check(&s.activity, &ask, now).0, Some(ParkRefusal::Other), "a leader gone, before all");
+    }
+
+    /// The busy check's samples: each the session's CPU since the one
+    /// before (never below 0), the window inclusive, an hour of them kept; a
+    /// look without CPU (native macOS) adds none.
+    #[test]
+    fn the_activity_keeps_an_hour_of_samples_and_takes_deltas() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let look = |cpu: u64, running: u32| SessionNow { cpu_ms: Some(cpu), running, procs: running };
+        let mut a = Activity::default();
+        a.record(t0, &look(250, 0));
+        a.record(at(10), &look(1250, 0));
+        a.record(at(20), &look(1200, 0));
+        assert_eq!(a.samples.iter().map(|s| s.cpu_ms).collect::<Vec<_>>(), [250, 1000, 0], "the CPU since the last; a lower total is 0");
+        assert_eq!(a.busy(at(20), Duration::from_secs(10), 500), (true, 1000), "the sample 10 s back is within");
+        assert_eq!(a.busy(at(21), Duration::from_secs(10), 500), (false, 0));
+        a.record(at(20), &SessionNow { cpu_ms: None, running: 3, procs: 3 });
+        assert_eq!(a.samples.len(), 3, "no CPU read: no sample");
+        a.record(at(3611), &look(1300, 0));
+        assert_eq!(a.samples.iter().map(|s| s.cpu_ms).collect::<Vec<_>>(), [0, 100], "an hour of them kept");
+    }
+
+    /// `/proc/<pid>/stat` as the busy check reads it: the state and the
+    /// session past the last `)` (a `comm` may hold spaces and
+    /// parentheses), the CPU as utime, stime, cutime and cstime; a text cut
+    /// short is none, a negative children's count is 0.
+    #[test]
+    fn a_proc_stat_line_gives_its_state_session_and_cpu() {
+        let line = "4242 (my (odd) name) S 1 4242 4242 0 -1 4194304 100 0 0 0 7 3 2 1 20 0 1 0 100 1000 100";
+        assert_eq!(parse_stat(line), Some(StatLine { state: 'S', session: 4242, cpu_ticks: 13 }));
+        assert_eq!(parse_stat("7 (sh) R 1 7 4242 0 -1 0 0 0 0 0 5 5"), None, "cut before cutime");
+        assert_eq!(parse_stat("no parenthesis"), None);
+        assert_eq!(parse_stat("9 (x) Z 1 9 4242 0 -1 0 0 0 0 0 0 0 -1 0").map(|l| (l.state, l.cpu_ticks)), Some(('Z', 0)));
+    }
+
+    /// One pass over a (planted) `/proc` counts each leader's session: the
+    /// CPU of all its processes (a zombie's too) in ms at the clock's ticks,
+    /// its processes but the leader alive, and those running (R or D);
+    /// another session's process counts for nothing, and a leader whose own
+    /// stat is not there is missing. A `comm` that is not UTF-8 still counts.
+    #[test]
+    fn a_sample_counts_a_sessions_cpu_and_its_running_processes() {
+        let t = tempfile::tempdir().unwrap();
+        let stat = |pid: u32, state: char, session: u32, utime: u64| format!("{pid} (p {pid}) {state} 1 {session} {session} 0 -1 0 0 0 0 0 {utime} 0 0 0 20 0 1 0");
+        let planted = [(100, 'S', 100, 50), (101, 'R', 100, 30), (102, 'D', 100, 10), (103, 'Z', 100, 10), (104, 'S', 100, 0), (200, 'R', 200, 5), (300, 'R', 999, 7)];
+        for (pid, state, session, utime) in planted {
+            std::fs::create_dir_all(t.path().join(pid.to_string())).unwrap();
+            std::fs::write(t.path().join(format!("{pid}/stat")), stat(pid, state, session, utime)).unwrap();
+        }
+        std::fs::create_dir_all(t.path().join("105")).unwrap();
+        std::fs::write(t.path().join("105/stat"), b"105 (\xff\xfe) S 1 100 100 0 -1 0 0 0 0 0 20 0 0 0 20 0 1 0").unwrap();
+        std::fs::create_dir_all(t.path().join("self")).unwrap();
+        let looks = sample_sessions(t.path(), &[100, 200, 400], 100, None);
+        assert_eq!(looks.get(&100), Some(&SessionNow { cpu_ms: Some(1200), running: 2, procs: 4 }));
+        assert_eq!(looks.get(&200), Some(&SessionNow { cpu_ms: Some(50), running: 0, procs: 0 }), "the leader is neither");
+        assert_eq!(looks.get(&400), None, "a leader whose stat is not there");
+        assert!(sample_sessions(&t.path().join("absent"), &[100], 100, None).is_empty());
+    }
+
+    /// S10 V-6: with the agent's uid, its escapers count in every leader's
+    /// look: a process of that uid in no leader's session and no helper's
+    /// (300, running: a backgrounded build that called setsid) adds its CPU
+    /// and its running; one asleep adds its CPU only; a helper's session, a
+    /// zombie and another uid's process add nothing; `procs` stays the session's.
+    #[test]
+    fn the_agents_escapers_count_in_every_look() {
+        let t = tempfile::tempdir().unwrap();
+        let stat = |pid: u32, state: char, session: u32, utime: u64| format!("{pid} (p {pid}) {state} 1 {session} {session} 0 -1 0 0 0 0 0 {utime} 0 0 0 20 0 1 0");
+        let status = |state: char, uid: u32| format!("Name:\tp\nState:\t{state} (x)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+        let planted = [(100, 'S', 100, 50, 1000), (101, 'S', 100, 10, 1000), (200, 'S', 200, 5, 1000), (300, 'R', 300, 70, 1000), (301, 'S', 300, 30, 1000), (310, 'Z', 310, 40, 1000), (500, 'R', 500, 90, 1000), (600, 'R', 600, 80, 0)];
+        for (pid, state, session, utime, uid) in planted {
+            std::fs::create_dir_all(t.path().join(pid.to_string())).unwrap();
+            std::fs::write(t.path().join(format!("{pid}/stat")), stat(pid, state, session, utime)).unwrap();
+            std::fs::write(t.path().join(format!("{pid}/status")), status(state, uid)).unwrap();
+        }
+        let looks = sample_sessions(t.path(), &[100, 200], 100, Some((1000, &[500])));
+        assert_eq!(looks.get(&100), Some(&SessionNow { cpu_ms: Some(600 + 1000), running: 1, procs: 1 }), "300 and 301 escaped; 310 is a zombie, 500 a helper's, 600 root's");
+        assert_eq!(looks.get(&200), Some(&SessionNow { cpu_ms: Some(50 + 1000), running: 1, procs: 0 }), "every leader's look");
+        assert_eq!(sample_sessions(t.path(), &[100], 100, None).get(&100), Some(&SessionNow { cpu_ms: Some(600), running: 0, procs: 1 }), "without the agent's uid, the session alone");
+        // BUSY-1: a session left out of `leaders` is an escaper's, so every look passes every live leader.
+        let alone = sample_sessions(t.path(), &[100], 100, Some((1000, &[500])));
+        assert_eq!(alone.get(&100), Some(&SessionNow { cpu_ms: Some(600 + 1000 + 50), running: 1, procs: 1 }), "200's session, not passed, counts as escaped");
+    }
+
+    /// S10 V-6: what every look of the busy check counts beyond the sessions
+    /// is the agent's, and only where the shim sweeps (Linux and root:
+    /// `sweep`) and the agent is not root: its uid, with the groups of the
+    /// workspace helpers forked by then (a hold not forked yet names none).
+    /// Otherwise none (native runs: the test's own uid runs everything else).
+    #[tokio::test]
+    async fn the_busy_check_counts_the_agents_escapers_only_where_it_sweeps() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = 3_999_999_999;
+        let m = SpawnManager::new(SpawnOpts { sweep: true, agent_uid: agent, ..opts(home.path(), STDOUT_WINDOW_BYTES) });
+        assert_eq!(m.inner.escapers(), Some((agent, vec![])));
+        let hold = m.hold_helper(false).await.expect("a hold");
+        assert_eq!(m.inner.escapers(), Some((agent, vec![])), "a helper not forked yet leads no group");
+        // Past every pid_max (Linux's 4 194 304, macOS's 99 998): no process's group; no stop signals it here.
+        hold.set_group(4_194_305);
+        assert_eq!(m.inner.escapers(), Some((agent, vec![4_194_305])), "a forked helper's group is its own");
+        hold.clear_group();
+        drop(hold);
+        for off in [SpawnOpts { sweep: false, ..m.opts().clone() }, SpawnOpts { agent_uid: 0, ..m.opts().clone() }] {
+            assert_eq!(SpawnManager::new(off.clone()).inner.escapers(), None, "sweep {}, agent uid {}", off.sweep, off.agent_uid);
+        }
+    }
+
+    /// S10 V-6 (BUSY-1) as root on Linux (the image; skipped elsewhere), the
+    /// shim sweeping as it does there, under a uid of this test's alone (the
+    /// other root tests' sweeps kill uid 1000's processes): two chats'
+    /// spawns, each its own session. One whose session runs a busy loop
+    /// (a process but the leader, running) is no escaper of the other's: the
+    /// quiet one parks beside it, and its own park is refused `busy`. A busy
+    /// loop of the agent's that left every spawn's session (setsid) is one:
+    /// the quiet spawn's next park is refused `busy`.
+    #[tokio::test]
+    async fn as_root_a_busy_spawn_beside_is_no_escaper_but_a_setsid_one_is() {
+        const AGENT: u32 = 61_000;
+        if !cfg!(target_os = "linux") || !nix::unistd::geteuid().is_root() {
+            eprintln!("needs root on Linux (the image): skipped");
+            return;
+        }
+        let _sweeps = SWEEPS.lock().await;
+        let swept = || LOG.lock().unwrap().iter().filter(|l| l.starts_with("ai-env: idle sweep: ")).count();
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(home.path(), Some(AGENT), Some(AGENT)).unwrap();
+        let m = SpawnManager::new(SpawnOpts { uid: Some(AGENT), gid: Some(AGENT), agent_uid: AGENT, sweep: true, ..opts(home.path(), STDOUT_WINDOW_BYTES) });
+        let ask = ParkAsk { grace_s: 600, min_quiet_s: 0, cpu_busy_ms: 300, hold_output: false, owner: ParkOwner { pid: 7, started: 8 } };
+        let (busy, _) = start(&m, 2, req(&["sh", "-c", "sh -c 'while :; do :; done' & exec sleep 100"])).await;
+        let (quiet, _) = start(&m, 1, req(&["sleep", "100"])).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let parked = m.park(1, &quiet, ask).await;
+        assert!(matches!(parked, Frame::Parked { procs: 0, .. }), "a busy spawn beside is no escaper: {parked:?}");
+        let own = m.park(2, &busy, ask).await;
+        assert!(matches!(own, Frame::ParkRefused { reason: ParkRefusal::Busy, procs: 1, .. }), "its own loop runs: {own:?}");
+        let mut e = Client::new(&m, 3);
+        // The leader waits for the loop's setsid: its death TERMs its group.
+        start(&m, 3, req(&["sh", "-c", "setsid sh -c 'while :; do :; done' </dev/null >/dev/null 2>&1 & sleep 0.5; echo $!"])).await;
+        assert!(e.until(WAIT, |c| c.exit.is_some()).await);
+        let escaper: u32 = String::from_utf8_lossy(&e.out).trim().parse().unwrap();
+        let refused = m.park(1, &quiet, ask).await;
+        // SAFETY: the escaper this test started.
+        unsafe { libc::kill(libc::pid_t::try_from(escaper).unwrap(), libc::SIGKILL) };
+        assert!(matches!(refused, Frame::ParkRefused { reason: ParkRefusal::Busy, procs: 0, .. }), "the setsid loop is the agent's escaper: {refused:?}");
+        let before = swept();
+        m.shutdown("test").await;
+        // Its idle sweep, before the next test that counts them may start.
+        assert!(wait_until(Duration::from_secs(5), || swept() > before).await, "the idle sweep after the last leader");
+    }
+
+    /// A parked spawn whose connection goes lives its park grace (not its
+    /// 60 s detach grace), parked still; at its end TERM, logged as the
+    /// park grace's, and its park goes. Another one, unparked by a frame for
+    /// it (`stdin`), takes its detach grace when its connection goes.
+    #[tokio::test]
+    async fn a_lost_parked_connection_lives_its_park_grace_then_term() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let owner = ParkOwner { pid: 7, started: 8 };
+        let ask = ParkAsk { grace_s: 1, min_quiet_s: 0, cpu_busy_ms: 500, hold_output: false, owner };
+        let (id, _) = start(&m, 1, req(&["sleep", "100"])).await;
+        assert!(matches!(m.park(1, &id, ask).await, Frame::Parked { ref spawn_id, procs: 0, .. } if *spawn_id == id));
+        let t = Instant::now();
+        m.connection_lost(1);
+        let d = m.detail().into_iter().find(|d| d.status.spawn_id == id).unwrap();
+        assert!(d.detach_left_s.is_some_and(|left| left <= 1) && d.parked == Some(owner), "{d:?}");
+        let (other, _) = start(&m, 2, req(&["sleep", "100"])).await;
+        assert!(matches!(m.park(2, &other, ask).await, Frame::Parked { .. }));
+        m.stdin(2, &other, 1, b"x".to_vec()).unwrap();
+        m.connection_lost(2);
+        let d = m.detail().into_iter().find(|d| d.status.spawn_id == other).unwrap();
+        assert!(d.detach_left_s.is_some_and(|left| left > 50) && d.parked.is_none(), "unparked by its stdin: the detach grace: {d:?}");
+        assert!(wait_until(Duration::from_secs(4), || m.live() == 1).await);
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(900) && took < Duration::from_secs(2), "TERM after the 1 s park grace: {took:?}");
+        let log = LOG.lock().unwrap().join("\n");
+        assert!(log.contains(&format!("ai-env: spawn {id} lost connection 1: park grace 1 s")) && log.contains(&format!("ai-env: spawn {id} park grace over: TERM")), "{log}");
+        assert!(log.contains(&format!("ai-env: spawn {other} unparked by stdin")), "{log}");
+        m.shutdown("test").await;
+    }
+
+    /// A `park` refused to a spawn already parked ends its park (the answer
+    /// says it is not parked): `/health/detail` names no owner, the log says
+    /// why, and its lost connection takes its detach grace. Another
+    /// socket's `park` (`not_attached`) leaves the park as it is.
+    #[tokio::test]
+    async fn a_park_refused_to_a_parked_spawn_ends_its_park() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let owner = ParkOwner { pid: 7, started: 8 };
+        let ask = ParkAsk { grace_s: 600, min_quiet_s: 0, cpu_busy_ms: 500, hold_output: true, owner };
+        let (id, _) = start(&m, 1, req(&["sleep", "100"])).await;
+        let detail = || m.detail().into_iter().find(|d| d.status.spawn_id == id).unwrap();
+        assert!(matches!(m.park(1, &id, ask).await, Frame::Parked { .. }));
+        assert!(matches!(m.park(2, &id, ask).await, Frame::ParkRefused { reason: ParkRefusal::NotAttached, .. }));
+        assert_eq!(detail().parked, Some(owner), "another socket's park changes nothing");
+        assert!(matches!(m.park(1, &id, ParkAsk { grace_s: 0, ..ask }).await, Frame::ParkRefused { reason: ParkRefusal::Other, .. }));
+        assert_eq!(detail().parked, None, "refused: parked no more");
+        m.connection_lost(1);
+        let d = detail();
+        assert!(d.detach_left_s.is_some_and(|left| left > 50 && left <= 60), "the detach grace, not the park grace: {d:?}");
+        let log = LOG.lock().unwrap().join("\n");
+        assert!(log.contains(&format!("ai-env: spawn {id} unparked by a refused park")), "{log}");
+        m.shutdown("test").await;
     }
 }

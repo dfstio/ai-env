@@ -92,7 +92,7 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 84] = [
+pub const REMOVED_ENV: [&str; 93] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -118,6 +118,8 @@ pub const REMOVED_ENV: [&str; 84] = [
     // S9: the fake S3's address and the code token's minutes (debug builds).
     "AI_ENV_BRIDGE_LAB_S3_ADDR",
     "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
+    // S10: the park's quiet (debug builds).
+    "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS",
     "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -169,6 +171,15 @@ pub const REMOVED_ENV: [&str; 84] = [
     "FAKE_ENV_DUMP",
     // S9: the fake claude's api-request lines, and the fake git's whole environment.
     "FAKE_API_REQUEST",
+    // S10: the fake claude's permission prompt, subagents and long tool run.
+    "FAKE_ASK",
+    "FAKE_ASK_TURN",
+    "FAKE_ASK_RESULT",
+    "FAKE_PERMISSION_LOG",
+    "FAKE_SUBAGENTS",
+    "FAKE_SUBTREE_LOG",
+    "FAKE_TURN_MS",
+    "FAKE_TURN_MARK",
     "GIT_ARGV_LOG",
     "GIT_REAL",
     "FAKE_GIT_FAIL",
@@ -1314,20 +1325,54 @@ impl Harness {
         self.assert_vm_empty();
     }
 
-    /// Within [`VM_END`], no spawn left in the rig's shim and no CLI the
-    /// fake logged still a process (a run on the remote link).
+    /// Within [`VM_END`], no spawn left in any shim of the rig (S10: every
+    /// VM's, [`remote::RemoteRig::vm_ids`]: a chat that moved leaves its
+    /// old VMs' too; the rig's first shim when no VM took it yet), none
+    /// alive in an ended VM's (its shim, told `/terminate`, drains: a
+    /// stopped shim keeps the exits nobody collected, and the platform
+    /// discards the VM), and no CLI the fake logged still a process (a run
+    /// on the remote link). Call it on the harness that owns the rig: a
+    /// second wrapper's harness (`Prepared::launch_wrapper` in a tempdir
+    /// without the rig) has neither the rig nor its logs.
     #[cfg(feature = "shim")]
-    fn assert_vm_empty(&self) {
-        let deadline = Instant::now() + VM_END;
+    pub fn assert_vm_empty(&self) {
+        self.assert_vm_empty_within(VM_END);
+    }
+
+    /// [`Harness::assert_vm_empty`] with its bound `within`.
+    #[cfg(feature = "shim")]
+    pub fn assert_vm_empty_within(&self, within: Duration) {
+        let rig = self.rig();
+        let deadline = Instant::now() + within;
         let clis: Vec<u32> = (1..=self.spawn_count()).filter_map(|gen| self.fake_pid(gen)).collect();
-        while !self.rig().vm_spawns().is_empty() || clis.iter().any(|pid| pid_alive(*pid)) {
-            assert!(Instant::now() < deadline, "the VM still holds a spawn or a CLI {VM_END:?} after the session: {:?}, CLIs {clis:?}\n{}", self.rig().vm_spawns(), self.transcript());
+        // The shims that still hold a spawn, each named by its VM, with those spawns (a draining one's live ones).
+        let held = || -> Vec<(String, Vec<ai_env_cli::wire::frame::SpawnStatus>)> {
+            let vms = rig.vm_ids();
+            let tables = if vms.is_empty() {
+                vec![("the rig's first shim".to_string(), rig.vm_spawns())]
+            } else {
+                vms.into_iter()
+                    .map(|vm| {
+                        let ended = rig.shim_of(&vm).is_draining();
+                        let spawns = rig.vm_spawns_of(&vm).into_iter().filter(|s| !ended || s.alive).collect();
+                        (vm, spawns)
+                    })
+                    .collect()
+            };
+            tables.into_iter().filter(|(_, spawns)| !spawns.is_empty()).collect()
+        };
+        loop {
+            let (spawns, alive): (Vec<_>, Vec<u32>) = (held(), clis.iter().copied().filter(|pid| pid_alive(*pid)).collect());
+            if spawns.is_empty() && alive.is_empty() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the VMs still hold a spawn or a CLI {within:?} after the session: {spawns:?}, CLIs alive {alive:?} of {clis:?}\n{}", self.transcript());
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
     #[cfg(not(feature = "shim"))]
-    fn assert_vm_empty(&self) {
+    pub fn assert_vm_empty(&self) {
         panic!("the remote link needs the shim feature: on_links! builds its remote half only with it");
     }
 
@@ -1401,4 +1446,68 @@ pub fn note_number(note: &str, key: &str) -> Option<u64> {
 #[must_use]
 pub fn note_has(note: &str, part: &str) -> bool {
     note.split("; ").any(|p| p == part)
+}
+
+// ---- S10 (R): the fake claude's permission prompt, its turns' ids, its generations' sessions -----
+
+/// A `can_use_tool` control_request of the CLI (S10; the fake's `FAKE_ASK`,
+/// its `request_id` `perm-<gen>-<turn>`).
+#[must_use]
+pub fn is_permission_request(v: &Value) -> bool {
+    v["type"] == "control_request" && v["request"]["subtype"] == "can_use_tool"
+}
+
+/// The host's answer to the CLI's permission request `request_id` (S10): a
+/// success whose `behavior` is `allow` (the input as asked) or `deny` (with
+/// a message), which the fake logs (`FAKE_PERMISSION_LOG`).
+#[must_use]
+pub fn permission_answer(request_id: &str, allow: bool) -> String {
+    let decision = if allow { r#"{"behavior":"allow","updatedInput":{}}"# } else { r#"{"behavior":"deny","message":"denied by the test"}"# };
+    format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{request_id}","response":{decision}}}}}"#)
+}
+
+impl Harness {
+    /// Answer the CLI's permission request `request_id` (S10): allow or deny.
+    pub fn answer_permission(&mut self, request_id: &str, allow: bool) {
+        self.send(&permission_answer(request_id, allow));
+    }
+}
+
+/// The uuid of turn `turn`'s reply in the fake's generation `gen` (S10): its
+/// `assistant` frame's and its transcript entry's,
+/// `<turn:08x>-0000-4000-a000-<gen:012x>` (a cut, `--resume-session-at`,
+/// names one).
+#[must_use]
+pub fn fake_reply_uuid(turn: u64, gen: u64) -> String {
+    format!("{turn:08x}-0000-4000-a000-{gen:012x}")
+}
+
+/// The uuid of a tool turn's `tool_use` (S10): its `assistant` frame's and
+/// its entry's, `…-b000-…`.
+#[must_use]
+pub fn fake_tool_use_uuid(turn: u64, gen: u64) -> String {
+    format!("{turn:08x}-0000-4000-b000-{gen:012x}")
+}
+
+/// The uuid of a tool turn's `tool_result` (S10): its `user` frame's and its
+/// entry's, `…-c000-…`.
+#[must_use]
+pub fn fake_tool_result_uuid(turn: u64, gen: u64) -> String {
+    format!("{turn:08x}-0000-4000-c000-{gen:012x}")
+}
+
+/// The session id of the fake's generation `gen` when neither
+/// `FAKE_SESSION_ID`, `--session-id` nor `--resume` names one (S10): the
+/// first process's fixed one ([`fake_fixed_sid`]), each later one's own.
+#[must_use]
+pub fn fake_gen_sid(gen: u64) -> String {
+    if gen <= 1 { fake_fixed_sid() } else { uuid(3054 + 65536 * gen) }
+}
+
+/// The session id of the fake's generation `gen` when it forks the
+/// `--resume` session (`--fork-session`, S10) and neither `--session-id`
+/// nor `FAKE_SESSION_ID` names one: `<gen:08x>-0000-4000-f000-<gen:012x>`.
+#[must_use]
+pub fn fake_fork_sid(gen: u64) -> String {
+    format!("{gen:08x}-0000-4000-f000-{gen:012x}")
 }

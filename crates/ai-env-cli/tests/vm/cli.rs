@@ -175,6 +175,7 @@ pub fn foreign_vm(n: u64, owner: Option<&str>, state: VmState, age_s: i64) -> (V
         uptime_s: 1,
         wire: None,
         caps: vec![],
+        mem_total_mib: None,
     });
     (vm, health)
 }

@@ -11,6 +11,12 @@
 //! restored from S3 into that VM ([`restore_into`], no deadline): the way a
 //! chat over what a reopen pulls inline (`wire::s3::INLINE_MAX`) reopens,
 //! one begun on a VM (S3 holds it already: nothing to stage) as well.
+//! S10 (F5): each request is held to its progress (`client::Waits`), not a
+//! budget; a Complete whose answer was lost, or an upload S3 no longer
+//! knows, is done once S3 lists the key at its length; an upload below
+//! `dataplane::MIN_RATE` warns once, and `transcript_stage` records its
+//! `rate`. S10 (F3a): `--warm` with `[vm].reuse_per_workspace` off is
+//! refused before any Touch ID.
 use super::client::{Body, S3Client, Written};
 use super::manifest::{self, Manifest, ManifestFile, ManifestPart};
 use super::{S3Sign, S3Target};
@@ -164,28 +170,119 @@ pub struct Uploaded {
     pub resumed: bool,
     /// The key held an object already (412): named by its bytes' sha256, so those bytes.
     pub existed: bool,
+    /// S10 (F5): the bytes this upload sent (the parts S3 answered; none sent again for a part S3 held).
+    pub sent: u64,
+}
+
+/// The latency a stage's pace allows before it is judged below
+/// `dataplane::MIN_RATE` ([`below_min_rate`]): a few requests' round trips,
+/// which a small chat's upload is mostly made of.
+const PACE_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `sent` bytes in `ms` milliseconds ran below
+/// `dataplane::MIN_RATE` (1 MB/s), [`PACE_SLACK`] allowed for the requests'
+/// latency: the bytes took longer than at that rate by more than the slack.
+fn below_min_rate(sent: u64, ms: u64) -> bool {
+    let at_min = sent.saturating_mul(1000) / crate::bridge::dataplane::MIN_RATE;
+    sent > 0 && ms > at_min.saturating_add(u64::try_from(PACE_SLACK.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// S10 (F5): the pace of one chat's upload. Its files' bytes are counted as
+/// S3 answers their parts (`sent`, the report's rate), and as the connection
+/// takes them, the parts in flight too (`handed`, `S3Client::counting`):
+/// judged on what was handed each time a file or a part lands, the pace
+/// warns once it falls below `dataplane::MIN_RATE` ([`below_min_rate`]),
+/// once. Judged on the answers alone, eight parts side by side would count
+/// one part's bytes over the time all eight took. No budget cuts a slow
+/// upload that moves any more (`client::Waits`); the warning says why it
+/// takes long.
+struct Pace<'a> {
+    sid: &'a str,
+    started: std::time::Instant,
+    sent: std::sync::atomic::AtomicU64,
+    handed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> Pace<'a> {
+    fn new(sid: &'a str) -> Pace<'a> {
+        Pace {
+            sid,
+            started: std::time::Instant::now(),
+            sent: std::sync::atomic::AtomicU64::new(0),
+            handed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn sent(&self) -> u64 {
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `n` bytes more landed: the warning, the first time what the
+    /// connections took (never less than what landed) is below the rate.
+    fn add(&self, n: u64) {
+        use std::sync::atomic::Ordering;
+        let sent = self.sent.fetch_add(n, Ordering::Relaxed).saturating_add(n);
+        let handed = self.handed.load(Ordering::Relaxed).max(sent);
+        let ms = self.ms();
+        if below_min_rate(handed, ms) && !self.warned.swap(true, Ordering::Relaxed) {
+            let min = crate::bridge::dataplane::MIN_RATE / 1000;
+            crate::bridge::voice::warn(&format!("the upload of {} runs at {} ({handed} bytes in {} s), below the {min} kB/s ai-env's transfer budgets assume; it goes on", self.sid, shown_rate(rate_of(handed, ms)), ms / 1000));
+        }
+    }
+}
+
+/// `sent` bytes in `ms` milliseconds, in bytes per second.
+fn rate_of(sent: u64, ms: u64) -> u64 {
+    sent.saturating_mul(1000) / ms.max(1)
+}
+
+/// A rate as the warning shows it: `kB/s` from 10 kB/s, else `B/s`.
+fn shown_rate(bytes_per_s: u64) -> String {
+    if bytes_per_s >= 10_000 {
+        format!("{} kB/s", bytes_per_s / 1000)
+    } else {
+        format!("{bytes_per_s} B/s")
+    }
 }
 
 /// Upload `path` (its digest `d`) as `key` through `client`: one part is a
 /// PutObject; more are a multipart upload of `part_len` parts, at most
 /// `MULTIPART_PARALLEL` at once, each streamed from the file with its signed
-/// sha256, its budget allowing for the parts in flight beside it
-/// (`client::budget`), resumable through `stage.toml` (the parts S3 lists
-/// with the expected size and checksum are not sent again; an upload S3 no
-/// longer knows starts over), completed new-only, `stage.toml` removed
-/// after. A part, or the PutObject, that gets no answer (or S3's 500 or
-/// 503) goes again, `client::PART_TRIES` tries in all.
+/// sha256, each held to its own progress (`client::Waits`), resumable
+/// through `stage.toml` (the parts S3 lists with the expected size and
+/// checksum are not sent again; an upload S3 no longer knows is done when S3
+/// lists the key at its length, its Complete's answer lost, else it starts
+/// over), completed new-only, `stage.toml` removed after. A part, the
+/// PutObject or the Complete that gets no answer (or S3's 500 or 503, or a
+/// transient 409) goes again, `client::PART_TRIES` tries in all.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_file<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, key: &str, path: &Path, d: &FileDigest, part_len: u64) -> Result<Uploaded, BridgeError> {
+    upload_paced(client, paths, sid, key, path, d, part_len, &Pace::new(sid)).await
+}
+
+/// [`upload_file`], its bytes counted into `pace` as the connections take
+/// them and as S3 answers them.
+#[allow(clippy::too_many_arguments)]
+async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, key: &str, path: &Path, d: &FileDigest, part_len: u64, pace: &Pace<'_>) -> Result<Uploaded, BridgeError> {
     use futures_util::StreamExt as _;
+    let counted = client.counting(&pace.handed);
+    let client = &counted;
     let part_len = part_len.max(1);
     if d.parts.len() <= 1 {
         let w = client.put_object(key, Body::File { path: path.to_path_buf(), offset: 0, len: d.len }, d.len, &d.sha256).await?;
+        pace.add(d.len);
         return Ok(match w {
-            Written::Stored(v) => Uploaded { version_id: v, parts: 1, resumed: false, existed: false },
-            Written::Exists => Uploaded { version_id: String::new(), parts: 1, resumed: false, existed: true },
+            Written::Stored(v) => Uploaded { version_id: v, parts: 1, resumed: false, existed: false, sent: d.len },
+            Written::Exists => Uploaded { version_id: String::new(), parts: 1, resumed: false, existed: true, sent: d.len },
         });
     }
+    let count = u32::try_from(d.parts.len()).map_err(|_| BridgeError::Config(format!("{key}: more than {} parts", u32::MAX)))?;
     let prior = read_stage(paths, sid)?;
     let same = |s: &Stage| s.key == key && s.len == d.len && s.sha256 == d.sha256 && s.part_len == part_len;
     let mut resumed = prior.as_ref().is_some_and(same);
@@ -205,6 +302,13 @@ pub async fn upload_file<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid
     if resumed {
         match client.list_parts(key, &stage.upload_id).await? {
             None => {
+                // S3 knows the upload no more: its Complete made the object and the answer was lost (or the run
+                // was cut before `stage.toml` went), or S3's lifecycle aborted it. The key is the bytes' sha256: a
+                // listing of it at their length says done before every part goes again.
+                if client.holds(key, d.len).await? {
+                    crate::bridge::registry::remove_if_present(&paths.transcript_stage(sid))?;
+                    return Ok(Uploaded { version_id: String::new(), parts: count, resumed: true, existed: true, sent: 0 });
+                }
                 resumed = false;
                 stage.upload_id = client.create_multipart(key).await?;
                 stage.parts.clear();
@@ -224,40 +328,44 @@ pub async fn upload_file<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid
         }
         write_stage(paths, &stage)?;
     }
-    let count = u32::try_from(d.parts.len()).map_err(|_| BridgeError::Config(format!("{key}: more than {} parts", u32::MAX)))?;
     let done: std::collections::BTreeSet<u32> = stage.parts.iter().map(|p| p.number).collect();
     let upload_id = stage.upload_id.clone();
     let missing: Vec<u32> = (1..=count).filter(|n| !done.contains(n)).collect();
-    // The parts in flight share the uplink: each one's budget allows for all of them (`client::budget`).
-    let shared = MULTIPART_PARALLEL.min(missing.len());
+    // The parts in flight share the uplink; each is held to its own progress (`client::Waits`), never to a budget.
     let sends = missing.into_iter().map(|n| {
         let (upload_id, sha) = (upload_id.clone(), d.parts[n as usize - 1].clone());
         let offset = u64::from(n - 1) * part_len;
         let len = part_len.min(d.len - offset);
         async move {
-            let etag = client.upload_part(key, &upload_id, n, Body::File { path: path.to_path_buf(), offset, len }, len, &sha, shared).await?;
+            let etag = client.upload_part(key, &upload_id, n, Body::File { path: path.to_path_buf(), offset, len }, len, &sha).await?;
             Ok::<StagePart, BridgeError>(StagePart { number: n, len, sha256: sha, etag })
         }
     });
     let mut running = futures_util::stream::iter(sends).buffer_unordered(MULTIPART_PARALLEL);
+    let mut sent = 0u64;
     while let Some(part) = running.next().await {
-        stage.parts.push(part?);
+        let part = part?;
+        sent += part.len;
+        pace.add(part.len);
+        stage.parts.push(part);
         stage.parts.sort_by_key(|p| p.number);
         write_stage(paths, &stage)?;
     }
     drop(running);
     let list: Vec<(u32, String, String)> = stage.parts.iter().map(|p| (p.number, p.etag.clone(), p.sha256.clone())).collect();
-    let w = client.complete_multipart(key, &upload_id, &list).await?;
+    let w = client.complete_multipart(key, &upload_id, &list, d.len).await?;
     crate::bridge::registry::remove_if_present(&paths.transcript_stage(sid))?;
     Ok(match w {
-        Written::Stored(v) => Uploaded { version_id: v, parts: count, resumed, existed: false },
-        Written::Exists => Uploaded { version_id: String::new(), parts: count, resumed, existed: true },
+        Written::Stored(v) => Uploaded { version_id: v, parts: count, resumed, existed: false, sent },
+        Written::Exists => Uploaded { version_id: String::new(), parts: count, resumed, existed: true, sent },
     })
 }
 
 /// What a chat's upload left: the manifest to write (`origin = "mac"`), and
 /// for the report the main object's key, the bytes, the parts, whether it
-/// resumed, whether S3 held it already.
+/// resumed, whether S3 held it already; S10 (F5) its pace: the bytes it
+/// sent, its milliseconds, and whether it ran below `dataplane::MIN_RATE`
+/// (warned, once).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatUpload {
     pub manifest: Manifest,
@@ -266,6 +374,17 @@ pub struct ChatUpload {
     pub parts: u32,
     pub resumed: bool,
     pub existed: bool,
+    pub sent: u64,
+    pub ms: u64,
+    pub slow: bool,
+}
+
+impl ChatUpload {
+    /// Its bytes sent per second (the `transcript_stage` row's `rate`).
+    #[must_use]
+    pub fn rate(&self) -> u64 {
+        rate_of(self.sent, self.ms)
+    }
 }
 
 /// Upload every file of `chat` (`digests` in its order) as
@@ -277,7 +396,10 @@ pub struct ChatUpload {
 /// `forget --purge` and `gc --remote` find. One ListObjectsV2 of
 /// `v1/<sid>/mac/` first: an object S3 holds already at its key with its
 /// length (the key is its bytes' sha256, and only this Mac writes there) is
-/// not sent again, its version unknown, as after a 412.
+/// not sent again, its version unknown, as after a 412. S10 (F5): its pace
+/// is judged as its files and parts land, on the bytes the connections took
+/// (the parts in flight too), and an upload below `dataplane::MIN_RATE`
+/// warns once (`ChatUpload::slow`).
 pub async fn upload_chat<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, chat: &MacChat, digests: &[FileDigest], part_len: u64, at: &str) -> Result<ChatUpload, BridgeError> {
     let (Some((main_rel, _)), Some(main)) = (chat.files.first(), digests.first()) else {
         return Err(BridgeError::Config(format!("{sid}: no transcript to stage")));
@@ -286,15 +408,17 @@ pub async fn upload_chat<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid
         return Err(BridgeError::Config(format!("{}: the transcript is empty: nothing to stage", chat.dir.join(main_rel).display())));
     }
     crate::bridge::registry::ensure_private_dir(&paths.transcript_dir(sid))?;
+    let pace = Pace::new(sid);
     let held: Vec<super::client::Listed> = client.list(&format!("{}{sid}/mac/", crate::wire::s3::KEY_PREFIX)).await?;
     let upload = |key: String, path: PathBuf, d: FileDigest| {
         let there = held.iter().any(|o| o.key == key && o.size == d.len);
+        let pace = &pace;
         async move {
             if there {
                 tracing::info!(session = sid, "{key}: S3 holds it already: not sent again");
-                return Ok(Uploaded { version_id: String::new(), parts: u32::try_from(d.parts.len().max(1)).unwrap_or(u32::MAX), resumed: false, existed: true });
+                return Ok(Uploaded { version_id: String::new(), parts: u32::try_from(d.parts.len().max(1)).unwrap_or(u32::MAX), resumed: false, existed: true, sent: 0 });
             }
-            upload_file(client, paths, sid, &key, &path, &d, part_len).await
+            upload_paced(client, paths, sid, &key, &path, &d, part_len, pace).await
         }
     };
     let key = S3Key::Mac { session: sid.to_string(), sha256: main.sha256.clone() }.render();
@@ -313,7 +437,8 @@ pub async fn upload_chat<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid
         let version = Some(f.version_id).filter(|v| !v.is_empty()).or_else(|| m.file_version(&fkey));
         m.files.push(ManifestFile { rel: format!("{}/{rel}", chat.slug), key: fkey, version_id: version, len: d.len, sha256: d.sha256.clone() });
     }
-    Ok(ChatUpload { manifest: m, key, bytes: chat.bytes(), parts: up.parts, resumed: up.resumed, existed: up.existed })
+    let slow = pace.warned.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(ChatUpload { manifest: m, key, bytes: chat.bytes(), parts: up.parts, resumed: up.resumed, existed: up.existed, sent: pace.sent(), ms: pace.ms(), slow })
 }
 
 /// Move `chat`'s files (`<sid>.jsonl`, the `<sid>/` subtree) into
@@ -499,6 +624,8 @@ pub struct StageReport {
     pub view: Option<String>,
     /// Where the originals went.
     pub origin: Option<PathBuf>,
+    /// S10 (F5): the upload's bytes sent per second (`None`: nothing went up, `already`).
+    pub rate: Option<u64>,
 }
 
 /// The stage of `sid` (`cmd_stage` without the printing): refusals first,
@@ -548,7 +675,7 @@ where
             }
             _ => (row.as_ref().and_then(|r| r.view.clone()), Some(paths.transcript_origin(sid)).filter(|p| p.exists())),
         };
-        let report = StageReport { session: sid.to_string(), bytes: m.committed + m.files.iter().map(|f| f.len).sum::<u64>(), parts: 1, key: m.parts.first().map(|p| p.key.clone()).unwrap_or_default(), outcome: "already", view, origin };
+        let report = StageReport { session: sid.to_string(), bytes: m.committed + m.files.iter().map(|f| f.len).sum::<u64>(), parts: 1, key: m.parts.first().map(|p| p.key.clone()).unwrap_or_default(), outcome: "already", view, origin, rate: None };
         audit_stage(paths, &report, t0);
         return Ok(report);
     }
@@ -572,7 +699,8 @@ where
     }
     let (view, origin) = leave_view(paths, sid, &chat, projects, &mac_cwd, n, &rules, build)?;
     let outcome = if up.resumed { "resumed" } else { "staged" };
-    let report = StageReport { session: sid.to_string(), bytes: up.bytes, parts: up.parts, key: up.key, outcome, view, origin };
+    let rate = (up.sent > 0).then(|| up.rate());
+    let report = StageReport { session: sid.to_string(), bytes: up.bytes, parts: up.parts, key: up.key, outcome, view, origin, rate };
     audit_stage(paths, &report, t0);
     Ok(report)
 }
@@ -751,7 +879,7 @@ fn held_report(paths: &Paths, sid: &str) -> Result<StageReport, BridgeError> {
         Some(m) => (m.committed + m.files.iter().map(|f| f.len).sum::<u64>(), u32::try_from(m.parts.len()).unwrap_or(u32::MAX), m.parts.first().map(|p| p.key.clone()).unwrap_or_default()),
         None => (0, 0, String::new()),
     };
-    Ok(StageReport { session: sid.to_string(), bytes, parts, key, outcome: "already", view, origin: None })
+    Ok(StageReport { session: sid.to_string(), bytes, parts, key, outcome: "already", view, origin: None, rate: None })
 }
 
 /// While held, this process's stdout (fd 1) is a copy of another
@@ -915,10 +1043,14 @@ fn report_and_warm<W: FnOnce() -> crate::errors::Result<Option<WarmRestore>>>(re
     warmed.map(drop)
 }
 
-/// The `transcript_stage` audit row of `r`.
+/// The `transcript_stage` audit row of `r`; S10 (F5) with its `rate` (bytes
+/// per second) when it uploaded.
 fn audit_stage(paths: &Paths, r: &StageReport, t0: std::time::Instant) {
     let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let pairs = [("session", r.session.clone()), ("bytes", r.bytes.to_string()), ("parts", r.parts.to_string()), ("outcome", r.outcome.to_string()), ("ms", ms.to_string())];
+    let mut pairs = vec![("session", r.session.clone()), ("bytes", r.bytes.to_string()), ("parts", r.parts.to_string()), ("outcome", r.outcome.to_string()), ("ms", ms.to_string())];
+    if let Some(rate) = r.rate {
+        pairs.push(("rate", rate.to_string()));
+    }
     crate::bridge::workspace::audit(paths, crate::bridge::remote::audit_event::TRANSCRIPT_STAGE, &pairs);
 }
 
@@ -936,15 +1068,19 @@ fn audit_stage(paths: &Paths, r: &StageReport, t0: std::time::Instant) {
 /// `already`), the warm's (the runtime key, the token with it when
 /// `combined.env` is current), none for the restore. With `--json` stdout
 /// holds the one document, the warm's lines go to stderr
-/// (`report_and_warm`).
+/// (`report_and_warm`). S10 (F3a): `--warm` with
+/// `[vm].reuse_per_workspace` off is refused right after bridge.toml is
+/// read, before anything is staged and before any Touch ID
+/// ([`refuse_warm_without_reuse`]).
 /// Exits: 0 staged, resumed or already (and with `--warm` warmed and
 /// restored); 9 a finding (nothing sent), or a chat whose recorded cwd is
 /// outside the roots or in no git repository (it could never reopen once
-/// staged: [`chat_workspace`], with `--warm` or without); 1 no such chat,
-/// one begun on a VM (without `--warm`), or an S8 mirror (`session
-/// migrate-s9` takes it), one whose cwd is unknown, gone or an unsupported
-/// repository, an original that is not the copy S3 holds; 2 usage; 5 no
-/// runtime key; 7 S3; the warm's own.
+/// staged: [`chat_workspace`], with `--warm` or without), or `--warm` with
+/// `[vm].reuse_per_workspace` off; 1 no such chat, one begun on a VM
+/// (without `--warm`), or an S8 mirror (`session migrate-s9` takes it), one
+/// whose cwd is unknown, gone or an unsupported repository, an original
+/// that is not the copy S3 holds; 2 usage; 5 no runtime key; 7 S3; the
+/// warm's own.
 pub fn cmd_stage(store: &Keystore, uuid: &str, warm: bool, json: bool) -> crate::errors::Result<()> {
     use crate::bridge::vm::cmd::{backend, runtime, Backend, Ctx};
     use std::os::fd::AsFd as _;
@@ -952,6 +1088,9 @@ pub fn cmd_stage(store: &Keystore, uuid: &str, warm: bool, json: bool) -> crate:
         return Err(CliError::Usage(format!("not a session id: {uuid}")));
     }
     let ctx = Ctx::load()?;
+    if warm {
+        refuse_warm_without_reuse(&ctx.cfg, uuid)?;
+    }
     let projects = crate::bridge::mirror::mac_config_dir().map(|d| d.join("projects")).ok_or_else(|| CliError::Msg("neither CLAUDE_CONFIG_DIR nor HOME is set: no projects directory to stage from".into()))?;
     let workspace = if warm { Some(warm_workspace(&ctx.paths, &ctx.cfg, &projects, uuid)?) } else { None };
     let target = S3Target::resolve(&ctx.paths, &ctx.knobs)?;
@@ -972,6 +1111,20 @@ pub fn cmd_stage(store: &Keystore, uuid: &str, warm: bool, json: bool) -> crate:
     let chat = ChatRestore { session: uuid.to_string(), projects, slugs };
     let warm = workspace.map(|workspace| move || crate::bridge::vm::cmd::main_with(store, crate::cli::VmCmd::Warm { workspace, json: false, dry_run: false, prewarm: false }, Some(chat)));
     report_and_warm(&report, json, &mut std::io::stdout(), std::io::stderr().as_fd(), warm)
+}
+
+/// S10 (F3a): `session stage --warm` warms the workspace's VM so that the
+/// chat's reopen reuses it with the chat restored there; with
+/// `[vm].reuse_per_workspace` off no reopen reuses a VM, so the warm would
+/// cost Touch IDs and a VM for nothing. Refused then (`Policy`, exit 9),
+/// naming the switch, before anything is staged or asked.
+pub fn refuse_warm_without_reuse(cfg: &BridgeConfig, uuid: &str) -> crate::errors::Result<()> {
+    if cfg.vm.reuse_per_workspace {
+        return Ok(());
+    }
+    Err(CliError::Policy(format!(
+        "session stage --warm: [vm] reuse_per_workspace is off, so the chat's reopen would reuse no VM and never the one --warm warms: set it to true in bridge.toml, then run ai-env session stage {uuid} --warm again (nothing was staged or warmed)"
+    )))
 }
 
 /// The presigner a command unsealed: the runtime key, or the fake API's lab key.
@@ -1072,7 +1225,7 @@ mod g4_tests {
             (m.dev(), m.ino())
         };
         let before = fd1();
-        let report = StageReport { session: SID.into(), bytes: 600, parts: 1, key: format!("v1/{SID}/mac/{}", "a".repeat(64)), outcome: "staged", view: Some(format!("-w/{SID}.jsonl")), origin: Some(PathBuf::from("/s/origin")) };
+        let report = StageReport { session: SID.into(), bytes: 600, parts: 1, key: format!("v1/{SID}/mac/{}", "a".repeat(64)), outcome: "staged", view: Some(format!("-w/{SID}.jsonl")), origin: Some(PathBuf::from("/s/origin")), rate: Some(1_000_000) };
         let mut err = tempfile::tempfile().unwrap();
         let mut out = Vec::new();
         let restored = WarmRestore { vm: "microvm-1".into(), outcome: TranscriptOutcome::Restored { parts: 1, bytes: 600 }, ms: 42 };
@@ -1195,5 +1348,39 @@ mod g4_tests {
         refused(&format!("session {SID} began on a VM and its row records no cwd"));
         crate::bridge::registry::write(&paths, &crate::bridge::registry::SessionRow { transcript_home: None, ..row }).unwrap();
         refused("ai-env session migrate-s9 moves it to S3");
+    }
+}
+
+#[cfg(test)]
+mod s10_tests {
+    use super::*;
+
+    /// F5: a stage's pace is below `dataplane::MIN_RATE` once its bytes
+    /// took longer than at 1 MB/s by more than the slack a few requests'
+    /// latency take: never for nothing sent, nor for a small chat a slow
+    /// round trip holds up; the 1.87 GB chat at S9's 0.6 MB/s is. The rate
+    /// is its bytes per second, shown in kB/s from 10 kB/s.
+    #[test]
+    fn the_pace_is_below_min_rate_past_the_slack() {
+        assert!(!below_min_rate(0, 60_000), "nothing sent");
+        assert!(!below_min_rate(100_000, 1_900), "a small chat, a slow round trip");
+        assert!(below_min_rate(100_000, 2_200));
+        assert!(!below_min_rate(1_000_000, 3_000) && below_min_rate(1_000_000, 3_001), "1 MB at the rate, then the slack");
+        assert!(below_min_rate(1_870_000_000, 1_870_000_000 / 600), "the dev chat at 0.6 MB/s");
+        assert!(!below_min_rate(1_870_000_000, 1_870_000_000 / 1_100), "at 1.1 MB/s");
+        assert_eq!((rate_of(600_000, 1_000), rate_of(5, 0), rate_of(u64::MAX, 1)), (600_000, 5_000, u64::MAX), "saturating");
+        assert_eq!((shown_rate(640), shown_rate(9_999), shown_rate(10_000), shown_rate(612_345)), ("640 B/s".to_string(), "9999 B/s".to_string(), "10 kB/s".to_string(), "612 kB/s".to_string()));
+    }
+
+    /// F3a: `--warm` is refused with `[vm].reuse_per_workspace` off (exit 9,
+    /// naming the switch and the command to run again), never with it on.
+    #[test]
+    fn warm_without_reuse_is_refused_naming_the_switch() {
+        const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert!(refuse_warm_without_reuse(&BridgeConfig::default(), SID).is_ok(), "reuse is on by default");
+        let off = BridgeConfig::parse("[vm]\nreuse_per_workspace = false\n").unwrap();
+        let e = refuse_warm_without_reuse(&off, SID).unwrap_err();
+        assert_eq!(e.exit_code(), 9);
+        assert_eq!(e.to_string(), format!("session stage --warm: [vm] reuse_per_workspace is off, so the chat's reopen would reuse no VM and never the one --warm warms: set it to true in bridge.toml, then run ai-env session stage {SID} --warm again (nothing was staged or warmed)"));
     }
 }

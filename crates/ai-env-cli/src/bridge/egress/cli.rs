@@ -37,8 +37,11 @@
 //!   `--yes`: exit 9; then waits for `stopped`), `proxy start` (waits for
 //!   running, SSM Online and squid serving the current parameters), `proxy
 //!   patch` (`dnf -y upgrade --security --releasever=latest` through SSM —
-//!   the AMI's locked release alone sees no update —, the release and squid
-//!   printed before and after, a squid restart, then the same proof).
+//!   the AMI's locked release alone sees no update —, bounded inside the
+//!   document's timeout, its output logged on the proxy and only its tail in
+//!   the invocation's output, which the CLI does not print; the release and
+//!   squid printed before and after (squid's package from the status run
+//!   when SSM cut the after line), a squid restart, then the same proof).
 //! - A proxy id that is terminated or unknown to EC2 (the stack replaces the
 //!   instance on any user-data change) means `state/infra.toml` is stale:
 //!   every command says so and names `make infra-status WRITE=1`.
@@ -581,7 +584,7 @@ fn apply_edit(ctx: &Ctx, instance: &str, e: Edit<'_>) -> Result<()> {
         Reload::Applied { line, .. } => {
             if e.deny {
                 let proof = match status_line(ctx, instance, e.what) {
-                    Ok(st) => verify_applied(st.as_ref().map(|(_, pairs)| pairs), e.param, &e.value),
+                    Ok((_, st)) => verify_applied(st.as_ref().map(|(_, pairs)| pairs), e.param, &e.value),
                     Err(err) => Err(format!("its --status could not be read ({err})")),
                 };
                 if let Err(why) = proof {
@@ -847,14 +850,15 @@ fn wait_online(instance: &str, wait: Wait) -> std::result::Result<(), String> {
 type StatusLine = (String, BTreeMap<String, String>);
 
 /// One run of the status document (`rpm -q squid`, then
-/// `ai-env-proxy-reload --status`): the `--status` line (the last `squid=`
-/// line) and its pairs, `None` when it printed none (it could not fetch the
-/// parameters).
-fn status_line(ctx: &Ctx, instance: &str, comment: &str) -> std::result::Result<Option<StatusLine>, String> {
+/// `ai-env-proxy-reload --status`): its `rpm -q squid` line (S10, F6:
+/// `proxy patch`'s after line when SSM cut the patch's output), and the
+/// `--status` line (the last `squid=` line) with its pairs, each `None` when
+/// it printed none (no status line: it could not fetch the parameters).
+fn status_line(ctx: &Ctx, instance: &str, comment: &str) -> std::result::Result<(Option<String>, Option<StatusLine>), String> {
     let inv = ops::run_document(instance, ProxyDoc::Status, comment, ctx.wait(Wait::STATUS))?;
-    let Some(line) = split_status_output(&inv.stdout).1 else { return Ok(None) };
-    let pairs = parse_reload_status(line)?;
-    Ok(Some((line.to_string(), pairs)))
+    let (rpm, line) = split_status_output(&inv.stdout);
+    let status = line.map(|l| parse_reload_status(l).map(|pairs| (l.to_string(), pairs))).transpose()?;
+    Ok((rpm.map(str::to_string), status))
 }
 
 /// squid serves the current parameters: active, they parse, and they are
@@ -874,9 +878,9 @@ fn wait_serving(ctx: &Ctx, instance: &str, wait: Wait) -> std::result::Result<St
             std::thread::sleep(wait.step);
         }
         match status_line(ctx, instance, "ai-env proxy start") {
-            Ok(Some((line, pairs))) if serving(&pairs) => return Ok(line),
-            Ok(Some((line, _))) => last = line,
-            Ok(None) => last = "no status line (the parameters could not be fetched)".into(),
+            Ok((_, Some((line, pairs)))) if serving(&pairs) => return Ok(line),
+            Ok((_, Some((line, _)))) => last = line,
+            Ok((_, None)) => last = "no status line (the parameters could not be fetched)".into(),
             Err(e) if e.contains("InvalidInstanceId") => last = e,
             Err(e) => return Err(e),
         }
@@ -908,13 +912,48 @@ fn proxy_start() -> Result<()> {
 /// and squid are printed before and after; squid restarts only when the
 /// upgrade succeeded. S8 operators: `infra/proxy/documents/patch.json`'s
 /// `runCommand` is exactly these lines (`the_proxy_documents_are_what_the_cli_sends`).
-pub const PATCH_SCRIPT: [&str; 5] = [
+/// S10 (F6): SSM keeps only the first 24,000 characters of the output, which
+/// dnf's alone could pass, cutting the after line: dnf writes to
+/// [`PATCH_LOG`] on the proxy and only its last 20 lines are printed (on
+/// stderr when it fails, its error the last line, and its exit status kept).
+/// dnf runs under `timeout` (TERM after 1740 s, KILL 30 s later), inside the
+/// document's [`ops::PATCH_EXEC_S`], so a hung upgrade still prints its tail
+/// (exit 124; 137 after the KILL, which the kernel's out-of-memory kill of
+/// dnf also gives, and `proxy patch` names both) before SSM would end the script: no
+/// operator can read the log (ai-env-ops and ai-env-deployer send the three
+/// proxy documents only, never `AWS-RunShellScript`, nor a session).
+pub const PATCH_SCRIPT: [&str; 7] = [
     "set -e",
     r#"echo "before: $(rpm -q system-release) $(rpm -q squid)""#,
-    "dnf -y upgrade --security --releasever=latest",
+    "log=/var/log/ai-env-proxy-patch.log",
+    r#"timeout -k 30 1740 dnf -y upgrade --security --releasever=latest >"$log" 2>&1 || { rc=$?; tail -n 20 "$log" >&2; exit "$rc"; }"#,
+    r#"tail -n 20 "$log""#,
     r#"echo "after: $(rpm -q system-release) $(rpm -q squid)""#,
     "systemctl restart squid",
 ];
+
+/// The proxy's log of the patch's last dnf run (S10, F6), which
+/// [`PATCH_SCRIPT`] names on its `log=` line.
+pub const PATCH_LOG: &str = "/var/log/ai-env-proxy-patch.log";
+
+/// `proxy patch`'s after line when the patch's output has none (SSM cut it:
+/// the patch document before S10 printed all of dnf's output): squid's
+/// package from the status run that follows the patch (`rpm` is that run's
+/// `rpm -q squid` line), else the patch's last line (S10, F6). Said before a
+/// failed status run's error too: the patch itself succeeded.
+fn cut_after_line(instance: &str, rpm: Option<&str>, last: &str) -> String {
+    match rpm.map(str::trim).filter(|r| r.starts_with("squid-")) {
+        Some(squid) => format!("after:  {squid} (from the status run; SSM cut the patch's output)"),
+        None => format!("patched {instance} (no after line: {last})"),
+    }
+}
+
+/// The patch's `before:` and `after:` lines (what follows each marker), the
+/// first of each in its output.
+fn patch_lines(stdout: &str) -> (Option<String>, Option<String>) {
+    let marked = |m: &str| stdout.lines().map(str::trim).find_map(|l| l.strip_prefix(m)).map(str::to_string);
+    (marked("before: "), marked("after: "))
+}
 
 fn proxy_patch() -> Result<()> {
     let ctx = Ctx::load()?;
@@ -925,25 +964,45 @@ fn proxy_patch() -> Result<()> {
     if state != "running" {
         return Err(CliError::Aws(format!("proxy patch: the proxy {instance} is {state}: `ai-env proxy start` first")));
     }
-    note(&format!("patching {instance} through SSM: dnf -y upgrade --security --releasever=latest, then systemctl restart squid"));
+    note(&format!("patching {instance} through SSM: dnf -y upgrade --security --releasever=latest (its output in {PATCH_LOG}), then systemctl restart squid"));
     let inv: Invocation = ops::run_document(instance, ProxyDoc::Patch, "ai-env proxy patch", ctx.wait(Wait::PATCH)).map_err(aws("proxy patch"))?;
     let ok = inv.succeeded();
     audit(&ctx.paths, "proxy_patch", &[("instance", instance.to_string()), ("result", if ok { "ok".to_string() } else { format!("{} exit {}", inv.status, inv.code) })]);
-    let marked = |m: &str| inv.stdout.lines().map(str::trim).find_map(|l| l.strip_prefix(m)).map(str::to_string);
-    let (before, after) = (marked("before: "), marked("after: "));
+    patch_report(instance, &inv, || status_line(&ctx, instance, "ai-env proxy patch"), say)
+}
+
+/// What `proxy patch` says once the patch document ran, each line to `out`:
+/// the before line; then, when the patch succeeded, its after line, the
+/// status run (`status_run`: the status document after the restart), the
+/// after line from that run when SSM cut the patch's ([`cut_after_line`],
+/// S10, F6), and the status line, which must say squid serves the current
+/// parameters. Apart from SSM and stdout, so a unit test runs it.
+fn patch_report(instance: &str, inv: &Invocation, status_run: impl FnOnce() -> std::result::Result<(Option<String>, Option<StatusLine>), String>, mut out: impl FnMut(&str)) -> Result<()> {
+    let (before, after) = patch_lines(&inv.stdout);
     if let Some(b) = &before {
-        say(&format!("before: {b}"));
+        out(&format!("before: {b}"));
     }
-    if !ok {
-        return Err(CliError::Aws(format!("proxy patch: the patch ended {} (exit {}): {}", inv.status, inv.code, inv.last_line())));
+    if !inv.succeeded() {
+        // PATCH_SCRIPT runs dnf under `timeout -k 30 1740`: 124 is that bound for certain; 137 is a KILL, timeout's 30 s
+        // past it or the kernel's (out of memory on the proxy's 512 MiB).
+        let why = match inv.code {
+            124 => " (dnf did not finish within the patch's 1740 s bound: timeout ended it)",
+            137 => " (dnf was killed: timeout's KILL 30 s past the patch's 1740 s bound, or the kernel's, e.g. out of memory)",
+            _ => "",
+        };
+        return Err(CliError::Aws(format!("proxy patch: the patch ended {} (exit {}){why}: {}", inv.status, inv.code, inv.last_line())));
     }
-    match (&before, &after) {
-        (Some(b), Some(a)) => say(&format!("after:  {a}{}", if a == b { " (the release and squid unchanged)" } else { "" })),
-        _ => say(&format!("patched {instance} (no before/after line: {})", inv.last_line())),
+    if let Some(a) = &after {
+        out(&format!("after:  {a}{}", if before.as_ref() == Some(a) { " (the release and squid unchanged)" } else { "" }));
     }
-    match status_line(&ctx, instance, "ai-env proxy patch").map_err(aws("proxy patch"))? {
+    let run = status_run();
+    if after.is_none() {
+        out(&cut_after_line(instance, run.as_ref().ok().and_then(|(rpm, _)| rpm.as_deref()), inv.last_line()));
+    }
+    let (_, status) = run.map_err(aws("proxy patch"))?;
+    match status {
         Some((line, pairs)) => {
-            say(&line);
+            out(&line);
             if !serving(&pairs) {
                 return Err(CliError::Aws(format!("proxy patch: squid does not serve the current parameters after the restart ({line}): ai-env egress status")));
             }
@@ -2404,14 +2463,187 @@ mod tests {
 
     /// S8 operators: `proxy patch` sends the patch document, whose
     /// `runCommand` is `PATCH_SCRIPT` (`the_proxy_documents_are_what_the_cli_sends`
-    /// holds infra/proxy/documents/patch.json to it), with no parameter.
+    /// holds infra/proxy/documents/patch.json to it), with no parameter. S10
+    /// (F6): dnf's output goes to [`PATCH_LOG`], its tail printed before the
+    /// after line; dnf's bound and the KILL's grace after it end 20 s or more
+    /// before the document's timeout (the before line's two rpm runs and the
+    /// tail fit in the rest), so even a hung dnf's tail is printed.
     #[test]
     fn the_patch_takes_the_newest_release_and_shows_before_and_after() {
-        assert!(PATCH_SCRIPT.contains(&"dnf -y upgrade --security --releasever=latest"));
         let at = |s: &str| PATCH_SCRIPT.iter().position(|c| c.contains(s)).unwrap();
+        assert!(PATCH_SCRIPT[at("dnf -y")].starts_with(r#"timeout -k 30 1740 dnf -y upgrade --security --releasever=latest >"$log" 2>&1 || "#), "{}", PATCH_SCRIPT[at("dnf -y")]);
+        let (grace, bound): (u32, u32) = match PATCH_SCRIPT[at("dnf -y")].split_whitespace().collect::<Vec<_>>()[..] {
+            ["timeout", "-k", k, d, "dnf", ..] => (k.parse().unwrap(), d.parse().unwrap()),
+            _ => panic!("dnf runs under timeout -k: {}", PATCH_SCRIPT[at("dnf -y")]),
+        };
+        assert!(bound + grace + 20 <= ops::PATCH_EXEC_S, "dnf's {bound} s and the KILL's {grace} s against the document's {} s", ops::PATCH_EXEC_S);
         assert!(PATCH_SCRIPT[0] == "set -e" && at("before:") < at("dnf -y") && at("dnf -y") < at("after:") && at("after:") < at("systemctl restart squid"));
         assert!(PATCH_SCRIPT[at("before:")].contains("rpm -q system-release") && PATCH_SCRIPT[at("after:")].contains("rpm -q squid"));
+        assert_eq!(PATCH_SCRIPT[at("log=")], format!("log={PATCH_LOG}"));
+        assert!(at("log=") < at("dnf -y") && PATCH_SCRIPT[at("dnf -y") + 1] == r#"tail -n 20 "$log""# && at("dnf -y") + 2 == at("after:"), "the tail right before the after line: {PATCH_SCRIPT:#?}");
         assert_eq!((ProxyDoc::Patch.name(), ProxyDoc::Patch.parameters(), ProxyDoc::Patch.exec_s()), (super::super::PATCH_DOCUMENT, None, ops::PATCH_EXEC_S));
+    }
+
+    /// What SSM's `get-command-invocation` keeps of a command's stdout
+    /// (`StandardOutputContent`): its first 24,000 characters.
+    const SSM_STDOUT_KEPT: usize = 24_000;
+
+    /// S10 (F6): the patch document is [`PATCH_SCRIPT`]; run here under
+    /// /bin/sh with stand-ins for dnf (5000 lines of output, far past what
+    /// SSM keeps), timeout, rpm and systemctl, and its log in a temp dir.
+    /// dnf's output lands in the log and only its last 20 lines are printed,
+    /// so the before and the after line both fit in what SSM keeps, and squid
+    /// restarts after the after line. A failed upgrade prints the tail on
+    /// stderr (dnf's error is then `proxy patch`'s last line), exits with
+    /// dnf's status, and prints no after line and restarts nothing; so does a
+    /// hung one that timeout ended (its exit 124). With dnf's output on
+    /// stdout (the document before S10) the after line is past the cut.
+    #[test]
+    fn the_patch_logs_dnf_and_prints_its_tail_so_both_lines_fit() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        fake(
+            "dnf",
+            r#"awk 'BEGIN { for (i = 0; i < 5000; i++) printf "  Upgrading        : pkg-%04d-1.0-1.amzn2023.aarch64      %d/5000\n", i, i + 1 }'
+if [ -n "$FAKE_DNF_FAIL" ]; then echo "Error: Failed to download metadata for repo 'amazonlinux'" >&2; exit 1; fi
+echo "Complete!""#,
+        );
+        // GNU timeout's stand-in (macOS has none): its arguments, then the command. FAKE_DNF_HANG plays a dnf that hung
+        // after two lines, which timeout ended (exit 124).
+        fake(
+            "timeout",
+            r#"if [ "$1" = -k ]; then shift 2; fi
+shift
+if [ -n "$FAKE_DNF_HANG" ]; then printf 'Dependencies resolved.\n  Running scriptlet: pkg-0042-1.0-1.amzn2023.aarch64\n'; exit 124; fi
+exec "$@""#,
+        );
+        fake("rpm", r#"case "$2" in system-release) echo system-release-2023.9.20251001-0.amzn2023.noarch ;; squid) echo squid-6.13-1.amzn2023.0.1.aarch64 ;; *) exit 1 ;; esac"#);
+        fake("systemctl", r#"echo "systemctl $*" >> "$FAKE_SYSTEMCTL_LOG""#);
+        let log = t.path().join("patch.log");
+        let systemctl = t.path().join("systemctl.log");
+        let on_the_proxy = format!("log={PATCH_LOG}");
+        let script = |lines: &[&str]| lines.iter().map(|l| if *l == on_the_proxy { format!("log={}", log.display()) } else { (*l).to_string() }).collect::<Vec<_>>().join("\n");
+        let run = |script: &str, envs: &[(&str, &str)]| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(script).env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("FAKE_SYSTEMCTL_LOG", &systemctl).envs(envs.iter().copied());
+            let out = cmd.output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let ours = script(&PATCH_SCRIPT);
+        assert!(ours.contains(&format!("log={}\n", log.display())), "the log line moved to the temp dir: {ours}");
+
+        let (code, stdout, stderr) = run(&ours, &[]);
+        assert_eq!(code, Some(0), "{stderr}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1 + 20 + 1, "before, the tail, after: {stdout}");
+        assert_eq!(lines[0], "before: system-release-2023.9.20251001-0.amzn2023.noarch squid-6.13-1.amzn2023.0.1.aarch64");
+        assert_eq!((lines[1], lines[20]), ("  Upgrading        : pkg-4981-1.0-1.amzn2023.aarch64      4982/5000", "Complete!"), "dnf's last 20 lines");
+        assert!(lines[21].starts_with("after: system-release-") && lines[21].ends_with(" squid-6.13-1.amzn2023.0.1.aarch64"), "{stdout}");
+        assert!(stdout.len() < SSM_STDOUT_KEPT, "{} characters", stdout.len());
+        let kept: String = stdout.chars().take(SSM_STDOUT_KEPT).collect();
+        assert_eq!(patch_lines(&kept), (Some(lines[0]["before: ".len()..].to_string()), Some(lines[21]["after: ".len()..].to_string())), "both lines in what SSM keeps");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 5001, "the whole output in the log");
+        assert_eq!(std::fs::read_to_string(&systemctl).unwrap(), "systemctl restart squid\n");
+
+        std::fs::remove_file(&systemctl).unwrap();
+        let (code, stdout, stderr) = run(&ours, &[("FAKE_DNF_FAIL", "1")]);
+        assert_eq!(code, Some(1), "dnf's status: {stderr}");
+        assert_eq!(stdout.lines().collect::<Vec<_>>(), [lines[0]], "the before line alone: {stdout}");
+        assert_eq!(stderr.lines().count(), 20, "dnf's tail on stderr: {stderr}");
+        let inv = Invocation { status: "Failed".into(), code: 1, stdout, stderr };
+        assert_eq!(inv.last_line(), "Error: Failed to download metadata for repo 'amazonlinux'", "proxy patch names dnf's error");
+        assert!(!systemctl.exists(), "squid restarted after a failed upgrade");
+
+        // A hung upgrade, ended by timeout inside the document's own timeout: its tail is still printed (no operator
+        // can read the log on the proxy), on stderr, with timeout's status.
+        let (code, stdout, stderr) = run(&ours, &[("FAKE_DNF_HANG", "1")]);
+        assert_eq!(code, Some(124), "timeout's status: {stderr}");
+        assert_eq!(stdout.lines().collect::<Vec<_>>(), [lines[0]], "the before line alone: {stdout}");
+        assert_eq!(stderr, "Dependencies resolved.\n  Running scriptlet: pkg-0042-1.0-1.amzn2023.aarch64\n", "the hung dnf's last lines on stderr");
+        assert!(!systemctl.exists(), "squid restarted after a hung upgrade");
+        // What proxy patch says of it: the bound named (no operator can read the log), dnf's last line still last.
+        assert!(PATCH_SCRIPT[3].starts_with("timeout -k 30 1740 dnf "), "the bound proxy patch names: {}", PATCH_SCRIPT[3]);
+        let ended = |code: i64| {
+            let inv = Invocation { status: "Failed".into(), code, stdout: stdout.clone(), stderr: stderr.clone() };
+            let said = std::cell::RefCell::new(Vec::new());
+            let e = patch_report("i-0123456789abcdef0", &inv, || Err("never run".to_string()), |l: &str| said.borrow_mut().push(l.to_string())).unwrap_err().to_string();
+            assert_eq!(said.into_inner(), [lines[0]], "the before line alone");
+            assert!(e.ends_with(": Running scriptlet: pkg-0042-1.0-1.amzn2023.aarch64"), "{e}");
+            e
+        };
+        let timed_out = ended(124);
+        assert!(timed_out.contains("the patch ended Failed (exit 124) (dnf did not finish within the patch's 1740 s bound: timeout ended it)"), "{timed_out}");
+        let killed = ended(137);
+        assert!(killed.contains("(exit 137) (dnf was killed: timeout's KILL 30 s past the patch's 1740 s bound, or the kernel's, e.g. out of memory)"), "{killed}");
+        assert!(!ended(1).contains("1740"), "another exit names no bound");
+
+        // The document before S10: dnf printed it all, unbounded, and SSM's cut takes the after line.
+        let old = ours.replace("timeout -k 30 1740 ", "").replace(r#" >"$log" 2>&1 || { rc=$?; tail -n 20 "$log" >&2; exit "$rc"; }"#, "").replace("\ntail -n 20 \"$log\"\n", "\n");
+        assert!(!old.contains("tail") && !old.contains("timeout"), "{old}");
+        let (code, stdout, _) = run(&old, &[]);
+        assert!(code == Some(0) && stdout.len() > SSM_STDOUT_KEPT, "{} characters", stdout.len());
+        let kept: String = stdout.chars().take(SSM_STDOUT_KEPT).collect();
+        assert!(patch_lines(&kept).0.is_some() && patch_lines(&kept).1.is_none(), "the after line is past the cut");
+    }
+
+    /// S10 (F6): when SSM cut the patch's output before its after line (the
+    /// document before S10, or any output past 24,000 characters), `proxy
+    /// patch` takes squid's package from the status run that proves squid
+    /// serves after the restart, and says where it came from; with no such
+    /// line, the patch's last line, as before. [`patch_report`] says it once
+    /// that run is back (before a failed run's error too); a whole output's
+    /// after line comes before the run, and no other.
+    #[test]
+    fn a_cut_patch_output_takes_squid_from_the_status_run() {
+        let i = "i-0123456789abcdef0";
+        let before = "before: system-release-2023.6.20241010-0.amzn2023.noarch squid-6.10-1.amzn2023.0.1.aarch64";
+        let dnf: String = (0..2000).map(|n| format!("  Upgrading        : pkg-{n:04}-1.0-1.amzn2023.aarch64\n")).collect();
+        let cut: String = format!("{before}\n{dnf}Complete!\nafter: system-release-2023.9.20251001-0.amzn2023.noarch squid-6.13-1.amzn2023.0.1.aarch64\n").chars().take(SSM_STDOUT_KEPT).collect();
+        let (b, a) = patch_lines(&cut);
+        assert_eq!((b.as_deref(), a), (Some(&before["before: ".len()..]), None), "SSM kept the before line and cut the after line");
+        let status = "squid-6.13-1.amzn2023.0.1.aarch64\nsquid=active allowed=4 extras=0 suspended=0 parse=ok applied=yes\n";
+        let (rpm, line) = split_status_output(status);
+        assert!(line.is_some_and(|l| l.starts_with("squid=active ")), "{status}");
+        assert_eq!(cut_after_line(i, rpm, "Complete!"), "after:  squid-6.13-1.amzn2023.0.1.aarch64 (from the status run; SSM cut the patch's output)");
+        // No package line from the status run: the patch's last line, as before S10.
+        for rpm in [None, Some("package squid is not installed"), Some("  ")] {
+            assert_eq!(cut_after_line(i, rpm, "Complete!"), format!("patched {i} (no after line: Complete!)"), "{rpm:?}");
+        }
+        // A whole output keeps its own after line, compared with the before line.
+        let whole = "before: a squid-1\n  Upgrading : x\nafter: b squid-2\n";
+        assert_eq!(patch_lines(whole), (Some("a squid-1".to_string()), Some("b squid-2".to_string())));
+
+        // What proxy patch says (patch_report), the status run marked where it is made.
+        let report = |stdout: &str, run: std::result::Result<(Option<String>, Option<StatusLine>), String>| {
+            let said = std::cell::RefCell::new(Vec::new());
+            let inv = Invocation { status: "Success".into(), code: 0, stdout: stdout.into(), stderr: String::new() };
+            let r = patch_report(
+                i,
+                &inv,
+                || {
+                    said.borrow_mut().push("(the status run)".to_string());
+                    run
+                },
+                |l: &str| said.borrow_mut().push(l.to_string()),
+            );
+            (r.is_ok(), said.into_inner())
+        };
+        let serves = line.map(|l| (l.to_string(), parse_reload_status(l).unwrap()));
+        let (b, s, run) = (before.to_string(), line.unwrap().to_string(), "(the status run)".to_string());
+        let squid = "after:  squid-6.13-1.amzn2023.0.1.aarch64 (from the status run; SSM cut the patch's output)".to_string();
+        assert_eq!(report(&cut, Ok((rpm.map(str::to_string), serves.clone()))), (true, vec![b.clone(), run.clone(), squid, s.clone()]));
+        let short = format!("{before}\nComplete!\n");
+        let patched = format!("patched {i} (no after line: Complete!)");
+        assert_eq!(report(&short, Ok((None, serves.clone()))), (true, vec![b.clone(), run.clone(), patched.clone(), s.clone()]));
+        assert_eq!(report(&short, Err("throttled".into())), (false, vec![b, run.clone(), patched]), "said before the failed run's error");
+        assert_eq!(report(whole, Ok((rpm.map(str::to_string), serves))), (true, vec!["before: a squid-1".to_string(), "after:  b squid-2".to_string(), run, s]));
     }
 
     #[test]

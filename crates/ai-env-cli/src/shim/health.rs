@@ -24,7 +24,7 @@ use crate::shim::peer::AgentGuard;
 use crate::shim::spawn::{SpawnManager, SpawnOpts};
 use crate::shim::state::RunState;
 use crate::shim::sys::{ClockMode, RealSys, SysOps};
-use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
+use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_PARK_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
 use crate::wire::workspace::{budget, refusal, vm_path_check, PathQuery, SettingsCapture, TranscriptStat, WsRefusal, SETTINGS_ROUTE, TRANSCRIPT_ROUTE};
 use crate::wire::workspace::{TRANSCRIPT_PULL_ROUTE, TRANSCRIPT_PUSH_ROUTE, TRANSCRIPT_TAIL_ROUTE, TRANSCRIPT_VIEW_ROUTE};
 use axum::extract::{Request, State};
@@ -66,6 +66,31 @@ impl ProbeSpec {
     }
 }
 
+/// The cold-start warm (S10, the hidden `--cold-warm`; B0's numbers choose
+/// it, plans/s10-contracts.md §13). The image's ENTRYPOINT passes no flag:
+/// off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColdWarm {
+    /// No warm (S9's start)
+    #[default]
+    Off,
+    /// A background read of the claude binary right after the first accepted /run (ShimState::cold_warm)
+    Read,
+    /// A fuller warm before /ready (not built: B0 chose no warm)
+    Run,
+}
+
+impl ColdWarm {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ColdWarm::Off => "off",
+            ColdWarm::Read => "read",
+            ColdWarm::Run => "run",
+        }
+    }
+}
+
 /// The `ai-env shim` options the handlers read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShimOpts {
@@ -94,6 +119,9 @@ pub struct ShimOpts {
     /// `ai-env-net`; the shim's own uid otherwise, the native tests).
     pub net_uid: u32,
     pub net_gid: u32,
+    /// The cold-start warm (S10, hidden `--cold-warm`): `read` reads the claude binary once in the background after the first accepted /run
+    /// (`ShimState::cold_warm`); `run` is not built and says so. B0 chose no warm: the image passes no flag.
+    pub cold_warm: ColdWarm,
 }
 
 /// The image's git, the helper's unless `--git` names another.
@@ -122,6 +150,7 @@ impl Default for ShimOpts {
             curl: PathBuf::from(CURL_DEFAULT),
             net_uid: NET_UID,
             net_gid: NET_GID,
+            cold_warm: ColdWarm::Off,
         }
     }
 }
@@ -168,6 +197,8 @@ pub struct ShimState {
     pub workspace: WorkspaceSlot,
     /// The transcript store's transfers (S9): the runs under way, the tails waiting for a hook.
     pub transfers: crate::shim::s3xfer::Transfers,
+    /// S10: the guest's `MemTotal` in MiB, read once at start (`/health`).
+    mem_total_mib: Option<u32>,
 }
 
 impl ShimState {
@@ -193,6 +224,9 @@ impl ShimState {
             sweep: cfg!(target_os = "linux") && probe.uid.is_some(),
             fs_root: opts.fs_root.clone(),
         });
+        // S10 (W3 #2): the last seed's record survives a shim restart.
+        let workspace = WorkspaceSlot::persisted(asagent::RecordStore::for_shim(&opts));
+        let mem_total_mib = sys.meminfo().and_then(|text| crate::shim::sys::parse_meminfo(&text).0).map(|kb| u32::try_from(kb / 1024).unwrap_or(u32::MAX));
         ShimState {
             started: Instant::now(),
             claude,
@@ -212,8 +246,9 @@ impl ShimState {
             refused: Mutex::new(BTreeMap::new()),
             last_clock: Mutex::new(None),
             ports: OnceLock::new(),
-            workspace: WorkspaceSlot::default(),
+            workspace,
             transfers: crate::shim::s3xfer::Transfers::default(),
+            mem_total_mib,
         }
     }
 
@@ -262,7 +297,9 @@ impl ShimState {
     /// `/health`'s, in this order: `credential_cache`; then, with a helper,
     /// `workspace_v1`, `git_http_v1` once the git routes are built
     /// (`gitcgi::SERVED`) and `transcript_s3_v1` once the transfers are
-    /// (`s3xfer::SERVED`, S9): a route is mounted exactly when its cap is named.
+    /// (`s3xfer::SERVED`, S9): a route is mounted exactly when its cap is
+    /// named. Then `park_v1` once the park is built (`agent::PARK_SERVED`,
+    /// S10), with or without a helper.
     #[must_use]
     pub fn caps(&self) -> Vec<String> {
         let mut caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
@@ -274,6 +311,9 @@ impl ShimState {
             if crate::shim::s3xfer::SERVED {
                 caps.push(CAP_TRANSCRIPT_S3_V1.to_string());
             }
+        }
+        if crate::shim::agent::PARK_SERVED {
+            caps.push(CAP_PARK_V1.to_string());
         }
         caps
     }
@@ -377,6 +417,31 @@ impl ShimState {
             uptime_s: since.elapsed().as_secs(),
             wire: Some(WIRE_VERSION),
             caps: self.caps(),
+            // S10: the guest's MemTotal, read once at start (none where /proc/meminfo is not).
+            mem_total_mib: self.mem_total_mib,
+        }
+    }
+
+    /// The cold-start warm (S10, `--cold-warm`; plans/s10-contracts.md
+    /// §13), right after the first `/run` it accepted and never waited for:
+    /// `read` reads the claude binary through once in the background (beside
+    /// the Mac's seed and restore), so its pages are in memory when the
+    /// first spawn starts it; `run`, the fuller warm, is not built (B0 did
+    /// not point there) and says so; `off` does nothing.
+    pub fn cold_warm(&self) {
+        match self.opts.cold_warm {
+            ColdWarm::Off => {}
+            ColdWarm::Read => {
+                let claude = self.claude.clone();
+                drop(tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    match read_through(&claude) {
+                        Ok(bytes) => errln!("ai-env: cold-warm read {bytes} bytes of {} in {} ms", claude.display(), started.elapsed().as_millis()),
+                        Err(e) => errln!("ai-env: cold-warm read of {} failed: {e}", claude.display()),
+                    }
+                }));
+            }
+            ColdWarm::Run => errln!("ai-env: cold-warm run is not built (B0 chose no fuller warm): nothing warmed"),
         }
     }
 
@@ -405,6 +470,11 @@ impl ShimState {
             workspace: self.serves_workspace().then(|| self.workspace.view(self.spawns.helpers())),
         }
     }
+}
+
+/// Read `path` to its end, dropping the bytes (the cold-start warm): how many there were.
+fn read_through(path: &Path) -> std::io::Result<u64> {
+    std::io::copy(&mut std::fs::File::open(path)?, &mut std::io::sink())
 }
 
 async fn health(State(state): State<Arc<ShimState>>) -> Json<Health> {
@@ -683,6 +753,42 @@ mod tests {
         assert!(e.starts_with("probe HOME chown: ") && !e.contains("capabilities"), "every drop cap present: no hint: {e}");
         let e = ShimState::with(PathBuf::from("/nonexistent/claude"), ShimOpts::default(), ProbeSpec::default(), Arc::new(Caps(0))).probe_fresh().await.unwrap_err();
         assert!(e.starts_with("cannot run ") && !e.contains("capabilities"), "no drop, no hint: {e}");
+    }
+
+    /// S10: `park_v1` comes last, with or without a helper, exactly when the
+    /// park is built (`agent::PARK_SERVED`); the caps before it are S9's.
+    #[test]
+    fn park_v1_is_named_last_once_the_park_is_built() {
+        let park: &[&str] = if crate::shim::agent::PARK_SERVED { &[CAP_PARK_V1] } else { &[] };
+        let bare = ShimState::with(PathBuf::from("c"), ShimOpts::default(), ProbeSpec::default(), Arc::new(RealSys));
+        assert_eq!(bare.caps(), [&[CAP_CREDENTIAL_CACHE][..], park].concat());
+        let opts = ShimOpts { helper: Some(PathBuf::from("/nonexistent/helper")), ..ShimOpts::default() };
+        let helper = ShimState::with(PathBuf::from("c"), opts, ProbeSpec::default(), Arc::new(RealSys));
+        let s9 = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1];
+        assert_eq!(helper.caps(), [&s9[..], park].concat());
+    }
+
+    /// S10: the hidden `--cold-warm` takes off, read or run; off is the
+    /// default (the image's ENTRYPOINT passes no flag) and what the options
+    /// default to.
+    #[test]
+    fn the_cold_warm_flag_is_hidden_and_off_by_default() {
+        use clap::{CommandFactory as _, Parser, ValueEnum as _};
+        #[derive(Parser)]
+        struct Args {
+            #[command(flatten)]
+            shim: crate::shim::ShimArgs,
+        }
+        assert_eq!(ShimOpts::default().cold_warm, ColdWarm::Off);
+        assert_eq!(ColdWarm::value_variants().iter().map(|w| w.name()).collect::<Vec<_>>(), ["off", "read", "run"]);
+        let parse = |extra: &[&str]| Args::try_parse_from(["shim", "--claude", "/usr/local/bin/claude"].iter().chain(extra)).map(|a| a.shim.cold_warm);
+        assert_eq!(parse(&[]).unwrap(), ColdWarm::Off);
+        for w in ColdWarm::value_variants() {
+            assert_eq!(parse(&["--cold-warm", w.name()]).unwrap(), *w);
+        }
+        assert!(parse(&["--cold-warm", "fast"]).is_err());
+        let cmd = Args::command();
+        assert!(cmd.get_arguments().any(|a| a.get_id() == "cold_warm" && a.is_hide_set()), "hidden");
     }
 
     #[test]

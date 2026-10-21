@@ -36,9 +36,10 @@ use std::time::Duration;
 
 /// Every child a test runs itself (a git, an `ai-env` but the many refs' fetch).
 const LIMIT: Duration = Duration::from_secs(60);
-/// `box fetch` of [`MANY`] branches: S8's import scans and promotes each ref
-/// with git runs of its own (some 90 s alone on this Mac, twice that beside
-/// the binary's other tests).
+/// `box fetch` of [`MANY`] branches: S8's import scanned and promoted each
+/// ref with git runs of its own (some 90 s alone on this Mac, twice that
+/// beside the binary's other tests); S10's batch (F4) scans them as one, and
+/// the test prints how long it took.
 const MANY_LIMIT: Duration = Duration::from_secs(600);
 /// The VM branches of the many-refs tests (the design's 2100): an `ls-refs`
 /// answer of about 127 KiB and a request of 2100 wants (some 103 KiB), each past 64 KiB.
@@ -308,8 +309,8 @@ fn client_git(rig: &RemoteRig, vm: &str, dir: &Path, args: &[&str], env: &[(&str
 
 /// `ai-env args` of the rig with this Mac's git first on its `PATH` (a
 /// link to it in `<tmp>/bin-real`; the fake age still behind it): the fake
-/// git takes 20 ms a run to log it, and S8's import runs git a few times
-/// for each ref it promotes.
+/// git takes 20 ms a run to log it, and S8's import ran git a few times for
+/// each ref it promoted (S10's batch runs it a few times in all).
 fn ai_env_real_git(rig: &RemoteRig, args: &[&str]) -> Command {
     let dir = rig.root().join("bin-real");
     if !dir.join("git").exists() {
@@ -706,7 +707,8 @@ fn t9_1_a_real_git_client_with_2100_refs_fetches_with_gzip_over_v2_and_v0() {
 /// `ls-refs` answer lists them, one `fetch` request wants their 2100
 /// commits (under `GIT_REQUEST_MAX`), and S8's import promotes each as
 /// `refs/remotes/box/<branch>` at its commit, `box/main` beside them:
-/// three requests, three http-backend runs.
+/// three requests, three http-backend runs. S10 (F4): the fetch's time is
+/// printed (T9.1's 96 s was the import's per-ref scans).
 #[test]
 fn t9_1_2100_vm_branches_come_out() {
     let mut p = Harness::prepare();
@@ -717,7 +719,9 @@ fn t9_1_2100_vm_branches_come_out() {
     let mut want: BTreeMap<String, String> = branches.iter().map(|(name, id)| (format!("refs/remotes/box/{}", name.strip_prefix("refs/heads/").unwrap_or(name)), id.clone())).collect();
     want.insert("refs/remotes/box/main".to_string(), rig.head().to_string());
     let (requests, calls) = (git_requests(rig).len(), rig.vm_git_calls().len());
+    let t = std::time::Instant::now();
     let o = run_within(ai_env_real_git(rig, &["box", "fetch", &dir, "--smart-http", "--json"]), None, MANY_LIMIT, "box fetch --smart-http of 2100 branches");
+    eprintln!("box fetch --smart-http of {MANY} VM branches: {:?}", t.elapsed());
     let got = promoted(&report_of(&o));
     assert!(got == want, "{} promoted of {}", got.len(), want.len());
     let refs = remote_refs(&work);

@@ -52,6 +52,13 @@
 //! through the egress proxy's address with curl as `ai-env-net` (the decoy
 //! refuses the CONNECT to the bucket's host), the body never chunked; the
 //! image's git is 2.46 or later and runs the helper's commands.
+//!
+//! S10 (image 12.0's VM side): the seed's record kept by the root shim in
+//! /var/lib/ai-env/seed-record.json (W3 #2: root's, 0600, in a root 0700
+//! directory) is loaded again by the shim a container restart starts, so the
+//! Mac's next `box seed` finds the VM seeded (`up_to_date`, nothing sent);
+//! and `ai-env vm exec` never parks, on a shim that parks (`park_v1`) and
+//! whatever the parking quiet (`AI_ENV_BRIDGE_LAB_PARK_AFTER_MS`).
 #[path = "common/curl.rs"]
 mod curl;
 #[path = "common/docker_tunnel.rs"]
@@ -444,6 +451,41 @@ fn l2_vm_exec_runs_the_pinned_claude_as_the_agent_and_exits_with_the_remote_code
     let spawned: Vec<(&str, usize, &str)> = spawned.iter().map(|(_, argv0, argc, secret)| (argv0.as_str(), *argc, secret.as_str())).collect();
     assert_eq!(spawned, [("claude", 2, "none"), ("id", 2, "none"), ("sh", 3, "none")], "the shim's spawns, in order");
     assert!(!w.c.logs().contains(&w.session_token()), "the session token reached the container's log");
+}
+
+/// S10's lab knob (plans/s10-contracts.md §9, debug builds): a parking
+/// session's quiet before it parks, in place of `[vm].park_after_s`.
+const PARK_AFTER_KNOB: &str = "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS";
+
+/// S10: `ai-env vm exec` never parks (its session has no park control;
+/// plans/s10-design-parking.md §1.3), however short the parking quiet. The
+/// image's shim parks (`/health` names `park_v1`), and an exec whose command
+/// is quiet for 3 s, fifteen times the 200 ms quiet of [`PARK_AFTER_KNOB`],
+/// runs to its end on its one socket: its output and exit come through the
+/// endpoint (one upgrade), one `vm_exec` audit row, and the shim parked
+/// nothing (no `parked`, `park refused` or `unparked` line).
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_vm_exec_never_parks() {
+    use ai_env_cli::wire::frame::CAP_PARK_V1;
+    let w = World::new();
+    let (s, body) = http(w.c.port(8080), "GET", "/health", "");
+    assert_eq!(s, 200, "{body}");
+    let health: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert!(health["caps"].as_array().is_some_and(|caps| caps.iter().any(|c| c == CAP_PARK_V1)), "the image's shim parks: {body}");
+    let mut cmd = w.cmd(&["vm", "exec", &w.id, "--", "sh", "-c", "sleep 3; echo slept"]);
+    cmd.env(PARK_AFTER_KNOB, "200");
+    let o = bounded(cmd);
+    assert_eq!(o.status.code(), Some(0), "{}\n{}", text(&o.stderr), w.c.logs());
+    assert_eq!(text(&o.stdout), "slept\n", "{}", text(&o.stderr));
+    let attempts: Vec<(u16, String)> = w.endpoint.attempts().into_iter().map(|a| (a.status, a.path)).collect();
+    assert_eq!(attempts, [(101, "/agent".to_string())], "one upgrade: the exec never left its socket");
+    let audit = w.audit("vm_exec");
+    let rows: Vec<(&str, &str)> = audit.iter().map(|r| (r["detail"]["argv0"].as_str().unwrap_or_default(), r["detail"]["status"].as_str().unwrap_or_default())).collect();
+    assert_eq!(rows, [("sh", "0")]);
+    let logs = w.c.wait_for(10, "the exec's spawn line", |l| !spawns(l).is_empty());
+    let parks: Vec<&str> = logs.lines().filter(|l| l.starts_with("ai-env: spawn ") && [" parked: ", " park refused (", " unparked by "].iter().any(|word| l.contains(word))).collect();
+    assert!(parks.is_empty(), "vm exec parked: {parks:#?}");
 }
 
 // ---- S7: `ai-env vm exec --with-credential` on the real image --------------------------
@@ -1664,6 +1706,77 @@ fn l2_seed_into_an_agent_planted_symlink_is_409() {
     assert_eq!(rig.c.sh(HOME_TREE), before, "nothing under the agent's home changed");
 }
 
+/// Where the root shim keeps the last seed's record (S10, W3 #2;
+/// `shim::asagent::SEED_RECORD_PATH`: this file also builds without the
+/// `shim` feature).
+const SEED_RECORD: &str = "/var/lib/ai-env/seed-record.json";
+
+impl DockerRig {
+    /// The platform's `/run` for the VM `id` again, through the hooks tunnel,
+    /// with the payload its RunMicrovm carried (the fake's `specs`): the
+    /// endpoint plays it once per VM, and a shim the container's restart
+    /// started has seen none.
+    fn post_run(&self, id: &str) -> u16 {
+        let st = FileFakeMicrovmApi::open(&self.root.join("fake.json")).and_then(|api| api.snapshot()).expect("the fake's state");
+        let token = st.tokens.iter().find(|(_, v)| *v == id).map(|(k, _)| k.clone()).expect("the VM's client token");
+        let payload = st.specs.iter().find(|s| s.client_token == token).expect("the VM's run spec").run_hook_payload.clone();
+        let body = serde_json::json!({ "microvmId": id, "runHookPayload": payload }).to_string();
+        http(self.hooks.addr, "POST", &format!("{PREFIX}/run"), &body).0
+    }
+}
+
+/// S10 W3 #2 on the real image: the seed's record outlives the shim. After
+/// `box seed`, the root shim keeps the record in [`SEED_RECORD`]: root's,
+/// 0600, alone in a root 0700 directory (no temp file left), `{"v":1,
+/// "record":…}` naming the workspace's VM path, the seeded head and the
+/// clone; the agent can read neither. The container restarts (the shim
+/// stops on SIGTERM and the ENTRYPOINT starts a new one on the same disk):
+/// the new shim loads the record at its start (its log line names the path
+/// and the head) and, once the platform's `/run` came again, `/health/detail`
+/// names it as the workspace's seed. The Mac's next `box seed` finds the VM
+/// seeded and pristine: `up_to_date`, one `GET /seed` and no `PUT` (without
+/// the record the VM would read unseeded, and a clone into the occupied
+/// path would be refused), the file as it was.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_seed_record_survives_a_shim_restart() {
+    use ai_env_cli::wire::workspace::CODE_PORT;
+    let rig = DockerRig::new(&[], &[]);
+    let vm = rig.vm_dir();
+    let id = rig.start_vm();
+    assert_eq!(rig.box_json(&["seed", &vm])["outcome"].as_str(), Some("seeded"));
+    assert_eq!(rig.c.sh(&format!("stat -c '%a %u:%g %F' /var/lib/ai-env {SEED_RECORD}")), "700 0:0 directory\n600 0:0 regular file");
+    assert_eq!(rig.c.sh("ls -A /var/lib/ai-env"), "seed-record.json", "the record alone: no temp file left");
+    let kept = rig.c.sh(&format!("cat {SEED_RECORD}"));
+    let file: serde_json::Value = serde_json::from_str(&kept).unwrap_or_else(|e| panic!("{e}: {kept}"));
+    assert_eq!((file["v"].as_u64(), file.as_object().map(serde_json::Map::len)), (Some(1), Some(2)), "{{\"v\":1,\"record\":…}}: {kept}");
+    let record = &file["record"];
+    assert_eq!((record["path"].as_str(), record["head"].as_str(), record["mode"].as_str()), (Some(vm.as_str()), Some(rig.head.as_str()), Some("clone")), "{kept}");
+    for path in ["/var/lib/ai-env", SEED_RECORD] {
+        let o = docker(&["exec", "-u", AGENT_UID, &rig.c.id, "cat", path]);
+        assert!(!o.status.success() && text(&o.stderr).contains("Permission denied"), "the agent read {path}: {}", text(&o.stdout));
+    }
+    // The shim stops on SIGTERM; the ENTRYPOINT starts a new one on the same disk.
+    let restarted = docker_within(&["restart", "-t", "10", &rig.c.id], DOCKER_LIMIT).unwrap_or_else(|e| panic!("{e}"));
+    assert!(restarted.status.success(), "docker restart: {}", text(&restarted.stderr));
+    ready_through(&rig.c, rig.hooks.addr, 120);
+    let loaded = format!("ai-env: seed record loaded from {SEED_RECORD}: {vm} at {}", rig.head);
+    let logs = rig.c.wait_for(10, "the record's load line", |l| l.contains(&loaded));
+    assert_eq!(logs.lines().filter(|l| l.starts_with("ai-env: shim worker pid ")).count(), 2, "two shims ran:\n{logs}");
+    assert_eq!(rig.post_run(&id), 200, "{}", rig.c.logs());
+    let (status, detail) = tunnel_request(rig.app.addr, "GET", "/health/detail", &rig.bearer(&id), b"");
+    assert_eq!(status, 200, "{detail}");
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap_or_else(|e| panic!("{e}: {detail}"));
+    assert_eq!(detail["workspace"]["seed"], *record, "the restarted shim's seed is the kept record");
+    let before = rig.endpoint.attempts().len();
+    assert_eq!(rig.box_json(&["seed", &vm])["outcome"].as_str(), Some("up_to_date"), "{}", rig.c.logs());
+    let seeds: Vec<(String, u16)> = rig.endpoint.attempts().into_iter().skip(before).filter(|a| a.port == CODE_PORT && a.path.starts_with("/seed")).map(|a| (a.path, a.status)).collect();
+    assert!(seeds.len() == 1 && seeds[0].1 == 200, "one GET /seed, no PUT: {seeds:?}");
+    let applied = rig.c.logs().lines().filter(|l| l.starts_with("ai-env: workspace seed-apply ")).count();
+    assert_eq!(applied, 1, "the first seed alone went in");
+    assert_eq!(rig.c.sh(&format!("cat {SEED_RECORD}")), kept, "the file as it was");
+}
+
 /// D7's code-out on the real image: after a seed the agent commits in the
 /// VM (as claude does, the image's git and its system identity) and edits
 /// on without committing. `box fetch --wip` brings the commit into
@@ -2209,7 +2322,7 @@ fn l2_push_pull_through_decoy_proxy() {
     let (status, said) = tunnel_request(rig.app.addr, "POST", "/transcript/push", &bearer, serde_json::to_string(&push).unwrap().as_bytes());
     assert_eq!((status, serde_json::from_str::<serde_json::Value>(&said).ok().and_then(|v| v["code"].as_str().map(str::to_string)).as_deref()), (500, Some("transfer_failed")), "the push: {said}");
     let part = PullPart { url: store_url(&S3Key::Segment { session: session.into(), gen: 1, offset: 0 }, SIGNED_HEADERS_GET, Some("fv1"), &pull_sig), len: 9, sha256: Some("0".repeat(64)) };
-    let pull = TranscriptPull { rel, parts: vec![part], sha256: None, owner, proxy };
+    let pull = TranscriptPull { rel, parts: vec![part], sha256: None, owner, proxy, share: 1 };
     let (status, said) = tunnel_request(rig.app.addr, "POST", "/transcript/pull", &bearer, serde_json::to_string(&pull).unwrap().as_bytes());
     assert_eq!((status, serde_json::from_str::<serde_json::Value>(&said).ok().and_then(|v| v["code"].as_str().map(str::to_string)).as_deref()), (500, Some("transfer_failed")), "the pull: {said}");
     assert_eq!(rig.c.agent_sh(&format!("cat '{file}'")), body.trim_end(), "the VM's copy is kept");
@@ -2245,4 +2358,63 @@ fn l2_push_pull_through_decoy_proxy() {
     }
     let counters = rig.assert_no_way_out();
     eprintln!("L2 transcript transfers: both refused at the decoy, curl as 999 through the proxy; container counters {counters:?}");
+}
+
+// ---- S10 I2 (the lead): the real wrapper parks on the real image -----------------------------------
+
+/// S10 I2 (from K): the real `ai-env-claude` parks on its own on the real
+/// image, and the host's next line unparks it. A remote session of the
+/// pinned claude behind the decoy proxy (no way out, no model request), its
+/// `initialize` answered, is left idle: past the wrapper's parking quiet
+/// ([`PARK_AFTER_KNOB`], 500 ms) it asks the image's shim to park its spawn,
+/// and the shim parks it once its busy check lets it (claude's start-up
+/// fetches and stdio out of the 30 s window, its CPU at rest under B0's
+/// 300 ms a sample): `session_park` (`idle`), and the shim's `parked` line
+/// naming this wrapper the owner. The host's next line (a
+/// `set_permission_mode` request) unparks the session on its open socket
+/// (`session_unpark` by `control_request`, the VM `running`; the shim's
+/// `unparked by unpark`) and reaches claude, whose answer comes back. The
+/// host's EOF then ends the chat, exit 0; the end row counts the park and
+/// the unpark. One Touch ID (D1).
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_wrapper_parks_on_its_own_and_unparks_on_the_next_line() {
+    // The busy check's window (`park::MIN_QUIET_S`, no backoff knob here) past claude's start-up, with room.
+    const PARK_LIMIT: Duration = Duration::from_secs(180);
+    let rig = DockerRig::behind_a_decoy_proxy();
+    let touch = rig.decrypts();
+    let mut cmd = rig.wrapper();
+    cmd.env(PARK_AFTER_KNOB, "500");
+    let mut s = Session::start(cmd);
+    s.send(r#"{"request_id":"init0001","type":"control_request","request":{"subtype":"initialize","hooks":{},"jsonSchema":null}}"#);
+    let answer = s.expect("the initialize answer", Duration::from_secs(90), |v| v["type"] == "control_response" && v["response"]["request_id"] == "init0001");
+    assert_eq!(answer["response"]["subtype"].as_str(), Some("success"), "{answer}");
+    let asked = Instant::now();
+    let parked = loop {
+        if let Some(row) = rig.audit("session_park").into_iter().next() {
+            break row;
+        }
+        assert!(asked.elapsed() < PARK_LIMIT, "no park within {PARK_LIMIT:?} (refused: {:?})\n{}", rig.audit("session_park_refused"), s.err_text());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let took = asked.elapsed();
+    assert_eq!(parked["detail"]["why"].as_str(), Some("idle"), "{parked}");
+    let owner = format!(" owner pid {} started ", s.pid());
+    let logs = rig.c.wait_for(10, "the shim's park line naming the wrapper", |l| l.lines().any(|l| l.starts_with("ai-env: spawn ") && l.contains(" parked: park grace ") && l.contains(&owner)));
+    let spawn = logs.lines().find(|l| l.starts_with("ai-env: spawn ") && l.contains(&owner)).and_then(|l| l.split(' ').nth(2)).unwrap_or_default().to_string();
+    // The host's next line unparks the session on its open socket and reaches claude.
+    s.send(r#"{"request_id":"req0002","type":"control_request","request":{"subtype":"set_permission_mode","mode":"default"}}"#);
+    let answered = s.expect("claude's answer after the unpark", Duration::from_secs(60), |v| v["type"] == "control_response" && v["response"]["request_id"] == "req0002");
+    let unparks = rig.audit("session_unpark");
+    assert!(unparks.iter().any(|r| r["detail"]["by"] == "control_request" && r["detail"]["vm_state"] == "running"), "{unparks:?}");
+    let unparked = format!("ai-env: spawn {spawn} unparked by unpark");
+    rig.c.wait_for(10, "the shim's unpark line", |l| l.lines().any(|l| l == unparked));
+    s.close_stdin();
+    let (status, _) = s.wait(Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0), "{}", s.err_text());
+    let note = rig.end_note();
+    let parks = note_part(&note, "park").and_then(|n| n.parse::<u32>().ok());
+    assert!(parks.is_some_and(|n| n >= 1) && note_part(&note, "unpark_ms").is_some(), "the park and the unpark in the census: {note}");
+    assert_eq!(rig.decrypts() - touch, 1, "one Touch ID for the process (D1)");
+    eprintln!("L2 park: parked {took:?} after the initialize answer (refusals {}), claude answered {} after the unpark; {note}", rig.audit("session_park_refused").len(), answered["response"]["subtype"]);
 }

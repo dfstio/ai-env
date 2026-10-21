@@ -938,3 +938,143 @@ fn memory_warning_names_both_values() {
     assert_eq!(memory_warning(2048, &v(None)), None, "nothing to compare");
     assert_eq!(memory_warning(4096, &v(Some(2048))).unwrap(), "[vm].memory_mib = 4096 but version 1.0 has 2048 MiB (the quota check uses [vm].memory_mib)");
 }
+
+// ---- S10: a move's SELECT_VM and the resumed VM's poll (wave 1b, C2) ----------------------
+
+mod s10 {
+    use super::*;
+    use ai_env_cli::bridge::api::{AuthToken, ImageInfo, ManagedImage, MicrovmApi, RunSpec, VmInfo, VmSummary};
+    use ai_env_cli::bridge::vm::run::Choice;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// S10 (§2.7, §6.2): a move's SELECT_VM never takes the VM it moves off
+    /// (`RunPlan.avoid`), not even as the session's preferred VM, nor a VM
+    /// whose chat a migration moved on (`leaving_for`): the workspace's other
+    /// VM, else a new one; a plan that avoids nothing takes the old VM again.
+    #[tokio::test]
+    async fn select_avoids_a_moves_old_vm_and_a_leaving_one() {
+        let env = Env::new();
+        let api = api();
+        let plan = env.plan(&env.flags());
+        assert!(plan.avoid.is_empty(), "the configured plan avoids nothing");
+        let old = started_id(&select_vm(&api, &env.paths, &plan, fast()).await.unwrap());
+        let avoiding = RunPlan { avoid: vec![old.clone()], ..plan.clone() };
+        let other = started_id(&select_vm(&api, &env.paths, &avoiding, fast()).await.unwrap());
+        assert_ne!(other, old, "the old VM is never taken");
+        assert_eq!(reused_id(&select_vm(&api, &env.paths, &avoiding, fast()).await.unwrap()), other, "the workspace's other VM is");
+        let preferred = RunPlan { choice: Choice::Prefer(old.clone()), ..avoiding.clone() };
+        assert_eq!(reused_id(&select_vm(&api, &env.paths, &preferred, fast()).await.unwrap()), other, "avoided even as the session's VM");
+        // The other VM's chat moved on: it is leaving, synced and terminated once no chat's spawn lives there.
+        registry::update_row(&env.paths, &other, |r| {
+            r.leaving_for = Some(old.clone());
+            r.leaving_since = Some(unix_now());
+        })
+        .unwrap();
+        assert_eq!(reused_id(&select_vm(&api, &env.paths, &plan, fast()).await.unwrap()), old, "a leaving VM is never reused; the old one is, by a plan that avoids nothing");
+        let third = started_id(&select_vm(&api, &env.paths, &avoiding, fast()).await.unwrap());
+        assert!(third != old && third != other, "one avoided, one leaving: a new VM");
+        assert_eq!(api.run_specs().len(), 3);
+        assert_eq!(env.row(&other).leaving_for.as_deref(), Some(old.as_str()), "SELECT_VM leaves the mark as it is");
+    }
+
+    /// The fake API, but a VM it resumed answers SUSPENDED (a platform still
+    /// resuming it) until the `ready`-th look after the ResumeMicrovm; the
+    /// instants of those looks.
+    struct Resuming {
+        inner: FakeMicrovmApi,
+        ready: usize,
+        resumed: Mutex<Option<String>>,
+        looks: Mutex<Vec<Instant>>,
+    }
+
+    impl Resuming {
+        fn new(ready: usize) -> Resuming {
+            Resuming { inner: api(), ready, resumed: Mutex::new(None), looks: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl MicrovmApi for Resuming {
+        async fn run(&self, spec: &RunSpec) -> Result<VmInfo, BridgeError> {
+            self.inner.run(spec).await
+        }
+
+        async fn get(&self, id: &str) -> Result<VmInfo, BridgeError> {
+            if self.resumed.lock().unwrap().as_deref() == Some(id) {
+                let n = {
+                    let mut looks = self.looks.lock().unwrap();
+                    looks.push(Instant::now());
+                    looks.len()
+                };
+                self.inner.set_state(id, if n >= self.ready { VmState::Running } else { VmState::Suspended });
+            }
+            self.inner.get(id).await
+        }
+
+        async fn suspend(&self, id: &str) -> Result<(), BridgeError> {
+            self.inner.suspend(id).await
+        }
+
+        async fn resume(&self, id: &str) -> Result<(), BridgeError> {
+            self.inner.resume(id).await?;
+            *self.resumed.lock().unwrap() = Some(id.to_string());
+            Ok(())
+        }
+
+        async fn terminate(&self, id: &str) -> Result<(), BridgeError> {
+            self.inner.terminate(id).await
+        }
+
+        async fn list(&self, image_arn: Option<&str>) -> Result<Vec<VmSummary>, BridgeError> {
+            self.inner.list(image_arn).await
+        }
+
+        async fn create_auth_token(&self, id: &str, minutes: u16, port: u16) -> Result<AuthToken, BridgeError> {
+            self.inner.create_auth_token(id, minutes, port).await
+        }
+
+        async fn create_shell_token(&self, id: &str, minutes: u16) -> Result<AuthToken, BridgeError> {
+            self.inner.create_shell_token(id, minutes).await
+        }
+
+        async fn get_image(&self, arn: &str) -> Result<ImageInfo, BridgeError> {
+            self.inner.get_image(arn).await
+        }
+
+        async fn list_image_versions(&self, arn: &str) -> Result<Vec<ImageVersion>, BridgeError> {
+            self.inner.list_image_versions(arn).await
+        }
+
+        async fn list_managed_images(&self) -> Result<Vec<ManagedImage>, BridgeError> {
+            self.inner.list_managed_images().await
+        }
+    }
+
+    /// S10 (F9): SELECT_VM's reuse of a suspended VM (P2's) polls it after
+    /// the ResumeMicrovm on `Poll::RESUMED`'s ramp, at the caller's scale:
+    /// RUNNING at the fourth look, the three waits before it are 40, 60 and
+    /// 100 ms at 200 ms a second (the ramp's 200, 300, 500 ms), where the
+    /// steps alone take 600 ms; the VM is reused, resumed.
+    #[tokio::test]
+    async fn a_resumed_vm_is_polled_on_the_resumed_ramp() {
+        let env = Env::new();
+        let api = Resuming::new(4);
+        let plan = env.plan(&env.flags());
+        let id = started_id(&select_vm(&api, &env.paths, &plan, fast()).await.unwrap());
+        api.inner.set_state(&id, VmState::Suspended);
+        let mut row = env.row(&id);
+        row.status = RowStatus::Suspended;
+        registry::write_row(&env.paths, &row).unwrap();
+        match select_vm(&api, &env.paths, &plan, Poll::RUNNING.scaled(Some(200))).await.unwrap() {
+            Selected::Reused { row, resumed, .. } => assert_eq!((row.id.as_str(), resumed), (id.as_str(), true)),
+            other => panic!("expected the suspended VM resumed, started {}", other.row().id),
+        }
+        let looks = api.looks.lock().unwrap().clone();
+        assert_eq!(looks.len(), 4, "RUNNING at the fourth look");
+        let waits: Vec<Duration> = looks.windows(2).map(|w| w[1] - w[0]).collect();
+        for (wait, ramp) in waits.iter().zip([40, 60, 100]) {
+            assert!(*wait >= Duration::from_millis(ramp), "{waits:?}");
+        }
+        assert!(looks[3] - looks[0] < Duration::from_millis(500), "the ramp, not three 200 ms steps: {waits:?}");
+    }
+}

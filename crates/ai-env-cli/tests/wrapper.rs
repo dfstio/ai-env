@@ -27,11 +27,12 @@ fn wrapper() -> &'static str {
 /// S7's `local-scratch` login reads: the token, the keystore directory and
 /// its two lab knobs; S8's VM pin and transcript knob, the remote session's
 /// lab knobs and its trace; the S8 operators' `ai-env as` marker and the
-/// pasteboard's osascript knob; S9's fake S3 address and code token minutes)
+/// pasteboard's osascript knob; S9's fake S3 address and code token minutes;
+/// S10's park quiet)
 /// or the fake (`tests/fakes/claude.sh`'s knobs
 /// but the argv log `command` sets). Every `AI_ENV_BRIDGE_*` knob the code
 /// reads is here but the bridge root (`tests/infra/image.rs` checks it).
-const WRAPPER_ENV: [&str; 28] = [
+const WRAPPER_ENV: [&str; 29] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -55,6 +56,7 @@ const WRAPPER_ENV: [&str; 28] = [
     "AI_ENV_BRIDGE_LAB_OSASCRIPT",
     "AI_ENV_BRIDGE_LAB_S3_ADDR",
     "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
+    "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS",
     "AI_ENV_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "FAKE_STDOUT",

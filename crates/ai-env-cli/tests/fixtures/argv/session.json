@@ -1,7 +1,7 @@
 {
   "name": "session",
   "ext_version": "2.1.303",
-  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=[redacted:len=5]", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
   "route": "remote",
   "session": {
     "resume": null,
@@ -14,5 +14,5 @@
     "continue": false,
     "debug": true
   },
-  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=[redacted:len=5]", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]
+  "sanitised": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages", "--session-mirror"]
 }

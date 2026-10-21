@@ -3,7 +3,9 @@
 //! reconnect and reattach, token re-mint and rotation, 429 backoff, the
 //! keep-alive that stops the VM idling into suspend under a running command,
 //! and the reaction to a suspended or terminated VM — under `vm exec`,
-//! `vm attach` and `vm smoke --exec` (`exec`).
+//! `vm attach` and `vm smoke --exec` (`exec`). S10: a wrapper's session
+//! parks when the chat is idle ([`run_spawn_parked`]), and [`stop_spawn`]
+//! ends a spawn no session of this process carries.
 //!
 //! `conn` is one socket (dial, hello, frames), `session` is [`run_spawn`]
 //! (everything across sockets), `exec` is the CLI's stdin, stdout, stderr,
@@ -66,8 +68,9 @@ pub struct RunPolicy {
     /// After `event hook_suspend`: wait this long for the VM to be resumed by someone else.
     pub suspend_wait: Duration,
     /// Reconnect backoff: first step, cap, and when it resets: once the spawn
-    /// was carried `stable_after` without a break (a rotation is none), and
-    /// after a suspended VM runs again.
+    /// was carried `stable_after` without a break (a rotation is none), after
+    /// a suspended VM runs again, and (S10) at a socket lost to its `park`'s
+    /// handshake, however short it lived.
     /// `backoff_min` is also the session's second for the waits the server
     /// or the platform set: one second of `Retry-After`, the 60 s a resume or
     /// a boot may take, the 3 s between GetMicrovm polls of a suspended VM.
@@ -75,7 +78,7 @@ pub struct RunPolicy {
     pub backoff_max: Duration,
     pub stable_after: Duration,
     /// How long reconnecting may go on before the session gives up (exit 8).
-    /// It restarts with the backoff: sockets lost within `stable_after` keep it running.
+    /// It restarts with the backoff: sockets lost within `stable_after` otherwise keep it running.
     pub reconnect_budget: Duration,
     /// How long 503 `not_run` is retried (the run hook's budget).
     pub not_run_budget: Duration,
@@ -477,6 +480,24 @@ pub enum SpawnEvent {
     /// `spawn` sent again when the VM did not hold it).
     Link(bool),
     Exit(RemoteExit),
+    /// S10 §D: what became of a park (a session with a `ParkCtl` only): the
+    /// remote link counts it and tells the pump; every other consumer logs it.
+    Park(ParkReport),
+}
+
+/// S10 §D: what the session tells its consumer of a park (the adapter
+/// counts it into the census, `remote::link::ParkCounts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParkReport {
+    /// `parked`: `why` `idle`, `prompt`, or `suspended` (a `hook_suspend` while idle); the quiet before it.
+    Parked { why: &'static str, quiet_ms: u64 },
+    /// `park_refused`: the shim's reason word.
+    Refused { reason: &'static str },
+    /// Unparked: `by` (`session_unpark`'s words), the VM's state then
+    /// (`running`, `suspending`, `suspended`), the ms to the reattach.
+    Unparked { by: &'static str, vm_state: &'static str, ms: u64 },
+    /// No park this session: `no_cap` (no `park_v1` in `hello_ok.caps`).
+    Off { why: &'static str },
 }
 
 impl std::fmt::Debug for SpawnEvent {
@@ -488,6 +509,7 @@ impl std::fmt::Debug for SpawnEvent {
             SpawnEvent::Note(text) => write!(f, "Note({text:?})"),
             SpawnEvent::Link(up) => write!(f, "Link({up})"),
             SpawnEvent::Exit(exit) => write!(f, "Exit({exit:?})"),
+            SpawnEvent::Park(report) => write!(f, "Park({report:?})"),
         }
     }
 }
@@ -559,7 +581,15 @@ pub fn spawn_channels(input_slots: usize) -> (SpawnIo, ConsumerIo) {
 pub struct SpawnOutcome {
     pub spawn_id: SpawnId,
     pub exit: RemoteExit,
+    /// S10 §D: the session ended at a host EOF while parked with no socket,
+    /// with no dial: exit 0, its claude left parked on the VM (the next
+    /// start there reaps it by its owner, or its park grace ends it).
+    pub parked_close: bool,
 }
+
+/// S10 (§2.7): how long a move's `Gap` waits for [`stop_spawn`] to end the
+/// gapped spawn before the move becomes a re-address.
+pub const STOP_SPAWN_WITHIN: Duration = Duration::from_secs(3);
 
 /// Everything a session needs besides its channels.
 pub struct AgentEnv<'a, A: MicrovmApi, E: EndpointClient> {
@@ -576,7 +606,7 @@ pub struct AgentEnv<'a, A: MicrovmApi, E: EndpointClient> {
 /// VM refused the spawn; a `--shell` row's target is refused before any
 /// mint or dial (`Policy`, exit 9: see [`AgentTarget::shell`]).
 pub async fn run_spawn<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo) -> Result<SpawnOutcome, BridgeError> {
-    session::run(env, start, io, None).await
+    session::run(env, start, io, None, None).await
 }
 
 /// [`run_spawn`] with a credential for the new spawn (S7): the session
@@ -584,7 +614,71 @@ pub async fn run_spawn<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E
 /// another VM than the target, or with a reattach, is refused (exit 9;
 /// `session::run` checks it, for every caller).
 pub async fn run_spawn_with<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo, delivery: Option<Delivery>) -> Result<SpawnOutcome, BridgeError> {
-    session::run(env, start, io, delivery).await
+    session::run(env, start, io, delivery, None).await
+}
+
+/// S10 §D: [`run_spawn_with`] for a wrapper session that parks when idle,
+/// with its park control (`bridge::park::ParkCtl`; see `session`'s module
+/// doc): it parks its spawn once the chat is quiet, sends nothing while
+/// parked, resumes the VM at the next input after a suspend (no
+/// `suspend_wait`, no exit 8), and reports each step as a
+/// [`SpawnEvent::Park`]. A host EOF while parked with no socket ends it at
+/// once ([`SpawnOutcome::parked_close`]).
+pub async fn run_spawn_parked<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo, delivery: Option<Delivery>, park: crate::bridge::park::ParkCtl) -> Result<SpawnOutcome, BridgeError> {
+    session::run(env, start, io, delivery, Some(park)).await
+}
+
+/// How long past its `within` [`stop_spawn`] gives its session to end once
+/// the detach went out (its socket's close).
+const STOP_SPAWN_SLACK: Duration = Duration::from_secs(2);
+
+/// S10 (§2.7): end `spawn_id` on the target VM, a spawn no session of this
+/// process carries (a gapped one, a leftover or an orphan claude): attach
+/// with `Start::Attach { from_seq: None }` (a `hello` resuming it, which
+/// unparks a parked one) and `Signal(Term)` to its group; its death is its
+/// `exit`, delivered and acked on that socket (the shim then releases it),
+/// every chunk it replays marked consumed and dropped. Half `within` without
+/// it, `Signal(Kill)`; at `within`, `detach{final}` (the shim's TERM and
+/// KILL ladder ends it) and `false`. `true` once it is gone: its exit acked,
+/// or a resume answered `unknown` (the VM holds no such spawn). Its callers
+/// take `false` and an error alike.
+pub async fn stop_spawn<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, spawn_id: &SpawnId, within: Duration) -> Result<bool, BridgeError> {
+    let (io, consumer) = spawn_channels(1);
+    let ConsumerIo { input: _input, control, mut events, consumed } = consumer;
+    let _ = control.send(SpawnInput::Signal(Sig::Term));
+    let session = session::run(env, Start::Attach { spawn_id: spawn_id.clone(), from_seq: None, err_from_seq: None }, io, None, None);
+    let watch = async {
+        let (kill, end) = (tokio::time::sleep(within / 2), tokio::time::sleep(within));
+        tokio::pin!(kill, end);
+        let (mut killed, mut detached) = (false, false);
+        loop {
+            tokio::select! {
+                ev = events.recv() => match ev {
+                    Some(SpawnEvent::Stdout { seq, .. }) => consumed.stdout_done(seq),
+                    Some(SpawnEvent::Stderr { seq, .. }) => consumed.stderr_done(seq),
+                    Some(_) => {}
+                    // The session ended: whether it was told to detach.
+                    None => return detached,
+                },
+                () = &mut kill, if !killed => {
+                    killed = true;
+                    tracing::info!(vm = %env.target.vm_id, spawn = %spawn_id, "stop_spawn: no exit within half its bound: SIGKILL");
+                    let _ = control.send(SpawnInput::Signal(Sig::Kill));
+                }
+                () = &mut end, if !detached => {
+                    detached = true;
+                    let _ = control.send(SpawnInput::Detach { is_final: true });
+                }
+            }
+        }
+    };
+    let stopped = match tokio::time::timeout(within + STOP_SPAWN_SLACK, async { tokio::join!(session, watch) }).await {
+        Ok((Ok(_), _)) | Ok((Err(BridgeError::SpawnGone(_)), _)) => Ok(true),
+        Ok((Err(_), true)) | Err(_) => Ok(false),
+        Ok((Err(e), false)) => Err(e),
+    };
+    tracing::info!(vm = %env.target.vm_id, spawn = %spawn_id, within_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX), stopped = ?stopped.as_ref().ok(), "stop_spawn");
+    stopped
 }
 
 #[cfg(test)]

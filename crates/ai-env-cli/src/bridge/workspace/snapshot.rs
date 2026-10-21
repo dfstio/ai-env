@@ -504,6 +504,82 @@ pub fn snapshot(ws: &WorkspaceRef, scratch: &Scratch, lim: &SeedLimits, set: &Sc
     }))
 }
 
+/// S10 (L7): the WIP of a dead VM's last fetch, its `refs/wip/*` snapshot
+/// `wip` on `head` (both promoted into the user's store by the code-out,
+/// which `scratch` reads through its alternates). The VM's helper makes it in
+/// [`snapshot`]'s shape: its tree the VM's worktree, its parents `head` and,
+/// when the index differed from `head`'s tree, the index commit; so it is
+/// carried as this Mac's WIP is (the worktree uncommitted, the index from
+/// the second parent), under the same caps (`[seed]`: each blob, all of them)
+/// and with the paths it adds for the dotenv rule. `None` when it changes
+/// nothing of `head`'s tree. Refused: over a cap (`wip_too_large`, exit 9,
+/// naming the largest as a path the rules match shows); a snapshot that is
+/// not on `head`, or not a commit this store holds, fails (`git_failed`).
+pub(crate) fn box_wip(scratch: &Scratch, head: &str, wip: &str, lim: &SeedLimits, set: &ScanSet) -> Result<Option<Wip>, BridgeError> {
+    let git = scratch.git();
+    let tree_of = |c: &str| -> Result<String, BridgeError> { Ok(line(&git.output(["rev-parse", "--verify", "--end-of-options", &format!("{c}^{{tree}}")]).map_err(git_failed("git rev-parse of the VM's snapshot"))?)) };
+    let head_tree = tree_of(head)?;
+    let shown = line(&git.output(["show", "-s", "--format=%T %P", "--end-of-options", &format!("{wip}^{{commit}}")]).map_err(git_failed("git show of the VM's snapshot"))?);
+    let mut words = shown.split(' ');
+    let tree = words.next().unwrap_or_default().to_string();
+    let parents: Vec<&str> = words.collect();
+    if parents.first() != Some(&head) || parents.len() > 2 {
+        return Err(BridgeError::WorkspaceFailed { code: crate::wire::workspace::refusal::GIT_FAILED, message: "the dead VM's snapshot is not on the head its fetch recorded".into() });
+    }
+    let index_commit = parents.get(1).map(|i| (*i).to_string());
+    let index_tree = match &index_commit {
+        Some(i) => tree_of(i)?,
+        None => head_tree.clone(),
+    };
+    if tree == head_tree && index_tree == head_tree {
+        return Ok(None);
+    }
+    let mut paths = BTreeSet::new();
+    let mut added = BTreeSet::new();
+    let mut blobs: Vec<(String, String)> = Vec::new();
+    for to in [&tree, &index_tree] {
+        for (path, is_added, blob) in changes(&git, &head_tree, to)? {
+            if is_added {
+                added.insert(path.clone());
+            }
+            if let Some(id) = blob {
+                if !blobs.iter().any(|(b, _)| *b == id) {
+                    blobs.push((id, path.clone()));
+                }
+            }
+            paths.insert(path);
+        }
+    }
+    let ids: Vec<String> = blobs.iter().map(|(id, _)| id.clone()).collect();
+    let blob_sizes = sizes(&git, &ids)?;
+    let with_size: Vec<(String, u64)> = blobs.iter().zip(&blob_sizes).map(|((_, p), s)| (p.clone(), *s)).collect();
+    let over: Vec<(String, u64)> = with_size.iter().filter(|(_, s)| *s > lim.max_blob_bytes).cloned().collect();
+    if !over.is_empty() {
+        return Err(BridgeError::WorkspaceRefused { code: super::code::WIP_TOO_LARGE, message: format!("the dead VM's uncommitted files over [seed].max_blob_mib ({}): {}", human_bytes(lim.max_blob_bytes), largest(set, over)) });
+    }
+    let new_bytes: u64 = blob_sizes.iter().sum();
+    if new_bytes > lim.max_wip_bytes {
+        return Err(BridgeError::WorkspaceRefused {
+            code: super::code::WIP_TOO_LARGE,
+            message: format!("the dead VM's uncommitted changes add {}, over [seed].max_wip_mib ({}); the largest: {}", human_bytes(new_bytes), human_bytes(lim.max_wip_bytes), largest(set, with_size)),
+        });
+    }
+    Ok(Some(Wip {
+        head: head.to_string(),
+        head_tree,
+        commit: wip.to_string(),
+        tree,
+        index_commit,
+        index_tree,
+        changed: u32::try_from(paths.len()).unwrap_or(u32::MAX),
+        // The VM's snapshot does not say which of its files were untracked there.
+        untracked: 0,
+        new_bytes,
+        added: added.into_iter().collect(),
+        notes: Vec::new(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

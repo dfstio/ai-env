@@ -15,6 +15,7 @@
 //! deployer key's hand-over through it (`handover`). S9: git smart-HTTP's
 //! client (`gitsmart`), `box review` and its pre-push hook (`review`), the
 //! transcript store in S3 (`s3`) and a remote chat's view on this Mac (`view`).
+//! S10: `session migrate` (`migrate`) and an idle chat's park (`park`).
 //! Nothing here is compiled into the VM image.
 pub mod agent;
 pub mod api;
@@ -39,7 +40,9 @@ pub mod imagepin;
 pub mod infra;
 pub mod lab;
 pub mod logging;
+pub mod migrate;
 pub mod mirror;
+pub mod park;
 pub mod pasteboard;
 pub mod probes;
 pub mod pump;

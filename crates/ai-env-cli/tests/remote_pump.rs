@@ -763,7 +763,7 @@ mod remote_link {
                     let api = FileFakeMicrovmApi::open(&fake).expect("the fake API");
                     let target = AgentTarget::from_row(&row).expect("the VM's target");
                     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::new(api), dp: Arc::new(NoDataPlane), tokens: Arc::new(NoDataPlane), paths, cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false, transcript: None });
-                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session })
+                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None })
                 })
             }),
         )
@@ -2437,6 +2437,8 @@ fn resume_into_a_new_vm_restores_the_transcript_first() {
     assert_eq!(held_in_s3(h.rig(), &sid), std::fs::read(&vm_copy).unwrap(), "S3 holds the whole conversation");
     assert!(is_view(&mirror), "the Mac keeps the view in the mirror's place");
     assert!(!paths.transcript_origin(&sid).exists(), "an S8 mirror is not kept once S3 holds it");
+    // S10 (FK-8): the reopen's carry off the terminated VM left nothing on the new one.
+    h.assert_vm_empty();
 }
 
 // ---- S9 R5-AWS-1: a big chat is made ready in its VM ahead, and a reopen pulls at most 64 MiB ----------
@@ -2744,14 +2746,19 @@ fn a_resume_miss_retry_pulls_a_chat_over_the_inline_cap() {
     assert!(common::note_has(&h.end_note(), "transcript:restored"), "{}", h.end_note());
 }
 
-/// T8.5's VM gone mid-session: once the VM is terminated (`vm terminate`;
-/// the platform's `/terminate`), the session's socket ends with the hook's
-/// event and nothing reattaches: the wrapper exits 8 with the line naming the
-/// picker, nothing started again. L6: `/terminate` takes no snapshot (the
-/// VM's disk dies with it), so an edit made after the last fetch is in no
-/// new `refs/wip/*`.
+/// T8.5's VM gone mid-session, S10's form: once the VM is terminated (`vm
+/// terminate`; the platform's `/terminate`) the session's socket ends with
+/// the hook's event and the chat moves (§A): with no turn in flight it waits
+/// for the next line (L5, the note saying so), which is then answered on a
+/// new VM (one RunMicrovm, one Touch ID for the setup token, `why`
+/// `readdress:vm_gone`), and the session closes 0, its census counting the
+/// move. L6 stays: `/terminate` takes no snapshot (the VM's disk dies with
+/// it), so an edit made after the last fetch is in no new `refs/wip/*` and
+/// on no new VM, whose carry seed came from the last fetch's record or,
+/// without one, this Mac (`seed` `source`). S9's name was
+/// `a_terminated_vm_mid_session_exits_8_naming_the_picker`.
 #[test]
-fn a_terminated_vm_mid_session_exits_8_naming_the_picker() {
+fn a_terminated_vm_mid_session_moves_with_the_next_line() {
     let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WIP_EDIT", "agent.txt:from the VM, not committed")]);
     started(&mut h);
     turn(&mut h, "hello");
@@ -2766,15 +2773,30 @@ fn a_terminated_vm_mid_session_exits_8_naming_the_picker() {
     std::fs::write(vm_dir.join("late.txt"), "after the last fetch\n").expect("write late.txt in the VM");
     let o = rig.run(&["vm", "terminate", &vm, "--yes"], None);
     assert!(o.status.success(), "vm terminate: {}", String::from_utf8_lossy(&o.stderr));
-    let (status, _) = h.wait(EXIT);
-    assert_eq!(status.code(), Some(8), "{}", h.transcript());
-    let err = h.err_text();
-    assert_eq!(last_line(&err), format!("ai-env-claude: lost the VM {vm}: reopen the chat from the picker"), "{err}");
-    assert!(common::note_has(&h.end_note(), "end:link_lost"), "{}", h.end_note());
-    assert_eq!((h.spawn_count(), h.audit_events("session_remote_start").len()), (1, 1), "nothing started again");
+    // After the command's own Touch ID.
+    let (runs_before, decrypts_before) = (runs(rig), rig.decrypts());
+    h.expect_out(|v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains(&vm) && c.contains("with your next message")), T);
+    turn(&mut h, "after the terminate");
+    let starts = h.audit_events("session_remote_start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    let moved = starts[1]["detail"]["id"].as_str().expect("the new VM").to_string();
+    assert_ne!(moved, vm, "a new VM");
+    assert_eq!(starts[1]["detail"]["why"].as_str(), Some("readdress:vm_gone"));
+    let rig = h.rig();
+    assert_eq!((runs(rig) - runs_before, rig.decrypts() - decrypts_before), (1, 1), "one RunMicrovm, one Touch ID");
+    closed(&mut h);
+    let note = h.end_note();
+    assert!(common::note_has(&note, "moves:readdress=1,respawn=0,migrate=0"), "{note}");
     let rig = h.rig();
     assert!(rig.endpoint.hooks().iter().any(|k| k.vm == vm && k.name == "terminate" && k.status == 200), "{:?}", rig.endpoint.hooks());
     assert_eq!(wips(), before, "no snapshot at /terminate (L6)");
+    let moved_dir = rig.vm_path_of(&moved, &rig.work());
+    assert!(!moved_dir.join("late.txt").exists(), "an edit after the last fetch is on no new VM (L6)");
+    let seeds = h.audit_events("seed");
+    let carry = seeds.iter().find(|r| r["detail"]["vm"] == moved.as_str()).unwrap_or_else(|| panic!("the new VM's seed: {seeds:?}"));
+    assert!(matches!(carry["detail"]["source"].as_str(), Some("box" | "mac")), "{carry}");
+    // S10 (FK-8): the move left nothing on either VM.
+    h.assert_vm_empty();
 }
 
 /// S9 (review CUT-5): before this Mac terminates a VM itself (`vm
@@ -2784,14 +2806,16 @@ fn a_terminated_vm_mid_session_exits_8_naming_the_picker() {
 /// summary written after the result) is committed to the manifest and held
 /// in S3 byte for byte before the VM ends, with no warning. The shim's
 /// `/terminate` tail push never moves the manifest's `committed`, so only
-/// that sync passes this. The session then loses its VM (exit 8).
+/// that sync passes this. The session then loses its VM, and (S10) its next
+/// line is served on a new VM whose restore pulls that sync's commit.
 #[test]
 fn vm_terminate_syncs_a_live_sessions_transcript_to_s3_first() {
     terminate_syncs_the_transcript_first(false);
 }
 
 /// S9 (review CUT-5): `vm terminate --all --yes` syncs each target's
-/// sessions first, as `vm terminate ID` does.
+/// sessions first, as `vm terminate ID` does. (S10: the host then closes
+/// while the chat waits for its next line: exit 0, nothing moved.)
 #[test]
 fn vm_terminate_all_syncs_each_live_sessions_transcript_to_s3_first() {
     terminate_syncs_the_transcript_first(true);
@@ -2828,17 +2852,35 @@ fn terminate_syncs_the_transcript_first(all: bool) {
     let now = committed();
     assert!(now > at_turn && now == held.len() as u64, "committed {now} of the VM's {} bytes (the turn's sync: {at_turn})", held.len());
     assert_eq!(held_in_s3(h.rig(), &sid), held, "S3 holds the VM's copy, the late line too");
-    let (status, _) = h.wait(EXIT);
-    assert_eq!(status.code(), Some(8), "{}", h.transcript());
+    // S10 (§A, L5): the chat waits for its next line, served on a new VM; or the host closes meanwhile, exit 0.
+    h.expect_out(|v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains(&vm) && c.contains("with your next message")), T);
+    if all {
+        closed(&mut h);
+        assert_eq!(h.audit_events("session_remote_start").len(), 1, "a close moves nothing");
+        return;
+    }
+    turn(&mut h, "after the terminate");
+    let starts = h.audit_events("session_remote_start");
+    let moved = starts.last().and_then(|r| r["detail"]["id"].as_str()).expect("the new VM").to_string();
+    assert_ne!(moved, vm, "a new VM: {starts:?}");
+    let copy = std::fs::read(h.rig().vm_projects_of(&moved).join(h.slug()).join(format!("{sid}.jsonl"))).expect("the new VM's copy");
+    assert!(copy.len() > held.len() && copy.starts_with(&held), "the restore pulled what the sync committed, the late line too");
+    closed(&mut h);
 }
 
 /// S9 round 5 (R1): `vm terminate` never wakes a VM the chat's closing
 /// suspend left SUSPENDED to sync it first. After the host's EOF the CLI
 /// writes one more line, which that suspend's `/suspend` pushed as the tail
-/// (`g1/t/<committed>`, through the URL the turn's sync handed). `vm
-/// terminate` then ends the VM with no request to it: no `/resume` (the
-/// platform's auto-resume), no warning, the manifest as the turn's sync left
-/// it, and S3 still holding the tail, byte for byte.
+/// (`g1/t/<committed>`, through the URL the turn's sync handed). S10 (R1,
+/// the chain): the chat reopened on that VM (resumed, its copy kept) is
+/// handed the chain's next tail, where the first one ends (the manifest
+/// records it), so the line its CLI writes after the host's EOF reaches S3
+/// through it at the next suspend, where S9 lost it to a 412. `vm terminate`
+/// then ends the VM with no request to it: no `/resume` (the platform's
+/// auto-resume), no warning, the manifest's commit as the turn's sync left
+/// it, and S3 still holding both tails, byte for byte. A reopen on a new VM
+/// restores the chain: the turn's base, then both tails, the CLI resuming
+/// from all of it.
 #[test]
 fn vm_terminate_never_wakes_a_suspended_vm_to_sync_it() {
     use ai_env_cli::bridge::api::VmState;
@@ -2852,14 +2894,31 @@ fn vm_terminate_never_wakes_a_suspended_vm_to_sync_it() {
     let at_turn = manifest();
     closed(&mut h);
     let vm = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
-    let written = std::fs::read(h.rig().vm_projects().join(h.slug()).join(format!("{sid}.jsonl"))).expect("the VM's copy");
+    let vm_copy = h.rig().vm_projects().join(h.slug()).join(format!("{sid}.jsonl"));
+    let written = std::fs::read(&vm_copy).expect("the VM's copy");
     assert!(written.len() as u64 > at_turn.committed, "the CLI wrote on after the turn's sync");
-    let late = &written[usize::try_from(at_turn.committed).unwrap()..];
+    let late = written[usize::try_from(at_turn.committed).unwrap()..].to_vec();
     let rig = h.rig();
-    wait_for("the VM suspended in the fake", Duration::from_secs(10), || rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended));
-    let tail = ai_env_cli::wire::s3::S3Key::Tail { session: sid.clone(), gen: at_turn.gen.max(1), offset: at_turn.committed }.render();
-    wait_for("the tail /suspend pushed", T, || rig.s3().get(&tail).is_some());
-    assert_eq!(rig.s3().get(&tail).as_deref(), Some(late), "the tail is what the CLI wrote after the sync");
+    let suspended = || rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended);
+    wait_for("the VM suspended in the fake", Duration::from_secs(10), suspended);
+    let tail = |from: u64| ai_env_cli::wire::s3::S3Key::Tail { session: sid.clone(), gen: at_turn.tail_gen(), offset: from }.render();
+    let first = tail(at_turn.committed);
+    wait_for("the tail /suspend pushed", T, || rig.s3().get(&first).is_some());
+    assert_eq!(rig.s3().get(&first).as_deref(), Some(late.as_slice()), "the tail is what the CLI wrote after the sync");
+    // The chat reopened on its VM: the chain's next tail, at the end of the first, handed and recorded.
+    let next = tail(at_turn.committed + late.len() as u64);
+    let resume = format!("--resume={sid}");
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_FINAL_MIRROR_MS", "200"), ("FAKE_EXIT_DELAY_MS", "400"), ("FAKE_RESUME_NEEDS_FILE", "1")]));
+    assert_eq!(started(&mut second)["session_id"].as_str(), Some(sid.as_str()), "the same session");
+    wait_for("the reopen's tail handed past the first and recorded", T, || manifest().tails.iter().any(|t| t.key == next));
+    closed(&mut second);
+    assert_eq!(part_of(&end_note_of(&h, second.pid()), "transcript").as_deref(), Some("kept"), "its VM held the chat");
+    wait_for("the VM suspended again", Duration::from_secs(10), suspended);
+    let written = std::fs::read(&vm_copy).expect("the VM's copy");
+    let later = written[usize::try_from(at_turn.committed).unwrap() + late.len()..].to_vec();
+    assert!(!later.is_empty(), "the reopened CLI wrote on after the host's EOF");
+    wait_for("the next tail /suspend pushed", T, || rig.s3().get(&next).is_some());
+    assert_eq!(rig.s3().get(&next).as_deref(), Some(later.as_slice()), "the line written after the first tail reached S3 through the next");
     let resumes = rig.endpoint.resumes();
     let o = rig.run(&["vm", "terminate", &vm, "--yes"], None);
     let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
@@ -2867,8 +2926,21 @@ fn vm_terminate_never_wakes_a_suspended_vm_to_sync_it() {
     assert!(!stderr.contains("not synced"), "{stderr}");
     assert_eq!(rig.endpoint.resumes(), resumes, "no request resumed the VM: {:?}", rig.endpoint.hooks());
     assert!(rig.fake().vms.get(&vm).is_some_and(|v| v.state.is_terminal()), "the VM ended");
-    assert_eq!(manifest(), at_turn, "no sync ran");
-    assert_eq!(rig.s3().get(&tail).as_deref(), Some(late), "the tail stays in S3");
+    let now = manifest();
+    assert_eq!((now.gen, now.committed, &now.parts, &now.fp), (at_turn.gen, at_turn.committed, &at_turn.parts, &at_turn.fp), "no sync ran");
+    assert_eq!(now.tails.iter().map(|t| t.key.clone()).collect::<Vec<_>>(), [first.clone(), next.clone()], "the tails this Mac handed, recorded");
+    assert_eq!((rig.s3().get(&first), rig.s3().get(&next)), (Some(late), Some(later)), "both tails stay in S3");
+    // The chat reopened on a new VM: the turn's base, then the chain.
+    let mut third = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_RESUME_NEEDS_FILE", "1")]));
+    assert_eq!(started(&mut third)["session_id"].as_str(), Some(sid.as_str()), "the same session, resumed from the restored copy");
+    let new_vm = rig.newest_vm().expect("the reopen's VM");
+    assert_ne!(new_vm, vm, "a new VM");
+    let restored = std::fs::read(rig.vm_projects_of(&new_vm).join(h.slug()).join(format!("{sid}.jsonl"))).expect("the new VM's copy");
+    assert_eq!(restored, written, "the base, then both tails");
+    let pull = audit_rows(rig, "transcript_pull");
+    let pull = pull.last().expect("the restore's pull");
+    assert_eq!((pull["detail"]["outcome"].as_str(), pull["detail"]["parts"].as_str()), (Some("written"), Some((at_turn.parts.len() + 2).to_string().as_str())), "{pull}");
+    closed(&mut third);
 }
 
 /// T8.6 offline: the endpoint cuts every connection mid-turn (the turn's
@@ -4043,6 +4115,8 @@ fn a_rule_approved_on_a_vm_the_session_left_survives_a_resume_on_a_new_vm() {
     for want in [format!("  allow {rule}  (local; {gone})  promote"), "dry run: nothing written; re-run with --write".to_string()] {
         assert!(out.lines().any(|l| l == want), "{want}: {out}");
     }
+    // S10 (FK-8): the reopen's carry off the terminated VM left nothing on the new one.
+    h.assert_vm_empty();
 }
 
 // ---- phase 4 F9: the shim's own /health/detail, the fake's init per turn -------------------

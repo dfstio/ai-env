@@ -9,6 +9,11 @@
 //! re-split at the CLI's 256 MiB). Flow control is a credit window per
 //! direction (`ack` / `stdin_ack`); nothing is ever dropped but stderr beyond
 //! its 2 MiB buffer (counted in `dropped`). Plan: S6 (D2, D3).
+//!
+//! S10 (plans/s10-contracts.md §1) adds the park frames (`park`, `parked`,
+//! `park_refused`, `unpark`), sent only on a socket whose shim names
+//! [`CAP_PARK_V1`], and two reply fields a reader may ignore
+//! (`SpawnDetail.parked`, `Health.mem_total_mib`).
 use crate::wire::redact::Secret;
 use crate::wire::workspace::WorkspaceView;
 use serde::{Deserialize, Serialize};
@@ -62,6 +67,13 @@ pub const IDLE_MAX_S: u32 = 3600;
 /// Default `detach_grace_s`: a detached spawn lives this long before TERM.
 pub const DETACH_GRACE_EXEC_S: u32 = 60;
 pub const DETACH_GRACE_SESSION_S: u32 = 900;
+/// S10: the longest park grace a `park` may name (the 8 h wall plus one
+/// hour). A parked spawn whose socket goes lives its park grace, not the
+/// detach grace.
+pub const PARK_GRACE_MAX_S: u32 = 32_400;
+/// S10: a parked socket's idle timer, in place of `hello.idle_s`, until the
+/// next inbound frame.
+pub const PARKED_IDLE_MAX: Duration = Duration::from_secs(86_400);
 /// The S2 D22 ladder, run by the shim after `detach {final: true}`: TERM, then KILL.
 pub const LADDER_TERM_AFTER: Duration = Duration::from_millis(800);
 pub const LADDER_KILL_AFTER: Duration = Duration::from_millis(1200);
@@ -107,16 +119,24 @@ pub const CAP_GIT_HTTP_V1: &str = "git_http_v1";
 /// it (`shim::s3xfer::SERVED`).
 pub const CAP_TRANSCRIPT_S3_V1: &str = "transcript_s3_v1";
 
+/// The capability a shim names (S10, M2) when it answers the park frames
+/// (`park`, `unpark`) and parks spawns. The Mac sends `park` only on a
+/// socket whose `hello_ok.caps` names it: on an older image a session never
+/// parks (`park:off(no_cap)`). Named with or without a workspace helper,
+/// once the shim's park is built (`shim::agent::PARK_SERVED`).
+pub const CAP_PARK_V1: &str = "park_v1";
+
 /// The stage whose image first names `cap` (what `BridgeError::NoCapability`
 /// and `remote::Failure::OldImage` say an older image predates):
 /// `credential_cache` S7, `workspace_v1` S8, `git_http_v1` and
-/// `transcript_s3_v1` S9, any other `this ai-env`.
+/// `transcript_s3_v1` S9, `park_v1` S10, any other `this ai-env`.
 #[must_use]
 pub fn cap_stage(cap: &str) -> &'static str {
     match cap {
         CAP_CREDENTIAL_CACHE => "S7",
         CAP_WORKSPACE_V1 => "S8",
         CAP_GIT_HTTP_V1 | CAP_TRANSCRIPT_S3_V1 => "S9",
+        CAP_PARK_V1 => "S10",
         _ => "this ai-env",
     }
 }
@@ -381,6 +401,33 @@ pub enum EventKind {
     Other,
 }
 
+/// Why the shim did not park a spawn (S10, `park_refused.reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParkRefusal {
+    /// CPU over `cpu_busy_ms` in a sample, or a non-leader process running (state R or D), within `min_quiet_s`.
+    Busy,
+    /// stdout or stdin I/O within `min_quiet_s`.
+    Output,
+    /// stdout or stdin not acked yet.
+    Unacked,
+    /// The spawn is not this socket's.
+    NotAttached,
+    /// Anything else: a grace or a window out of range, a shim that does not park (`PARK_SERVED` false).
+    #[serde(other)]
+    Other,
+}
+
+/// The wrapper that parked a spawn (S10): its pid and its start (unix
+/// seconds), as `registry::process_identity` reads them on the Mac. No
+/// secret: `/health/detail` reports it (`SpawnDetail.parked`), so a later
+/// start on the VM can end a parked spawn whose wrapper is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkOwner {
+    pub pid: u32,
+    pub started: u64,
+}
+
 /// One raw stdio chunk: exactly one of `text` (valid UTF-8) or `b64`
 /// (standard base64), at most [`CHUNK_MAX`] bytes decoded. Built and read by
 /// `wire::chunk`.
@@ -592,6 +639,34 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// Mac → VM (S10, [`CAP_PARK_V1`]): park the spawn this socket carries;
+    /// the shim answers `parked` or `park_refused`. Every field of the four
+    /// park frames is required: they are new, and sent only behind the cap.
+    Park {
+        spawn_id: SpawnId,
+        /// The park grace: a parked spawn whose socket goes lives this long (1..=[`PARK_GRACE_MAX_S`]).
+        grace_s: u32,
+        /// The busy check's window (0..=3600): no sample over `cpu_busy_ms`, no running non-leader, no stdio within it.
+        min_quiet_s: u32,
+        /// CPU of the spawn's session per sample (`ACTIVITY_SAMPLE`) above which it is busy.
+        cpu_busy_ms: u32,
+        /// Hold the parked spawn's stdout in its window instead of sending it.
+        hold_output: bool,
+        /// The wrapper that parks it, reported back in `SpawnDetail.parked` for the reaper.
+        owner: ParkOwner,
+    },
+    /// VM → Mac (S10): parked. The socket's idle timer is [`PARKED_IDLE_MAX`],
+    /// and a lost socket starts the park grace. `quiet_s`: seconds since the
+    /// spawn's last stdio; `procs`: its live processes but the leader.
+    Parked { spawn_id: SpawnId, quiet_s: u32, procs: u32 },
+    /// VM → Mac (S10): not parked, and what the busy check saw (`cpu_ms`:
+    /// the busiest sample's CPU in the window).
+    ParkRefused { spawn_id: SpawnId, reason: ParkRefusal, quiet_s: u32, procs: u32, cpu_ms: u64 },
+    /// Mac → VM (S10): unpark. A `stdin`, `stdin_eof`, `signal`, `ack` or
+    /// `detach` for the spawn, and a `hello` resuming it, unpark it too. No
+    /// answer: the Mac sends a `ping` beside it and takes the `pong`, or a
+    /// `stdin_ack`, as the socket's proof.
+    Unpark { spawn_id: SpawnId },
 }
 
 impl std::fmt::Debug for Frame {
@@ -624,6 +699,14 @@ impl std::fmt::Debug for Frame {
             Frame::CredentialOk { name, cached, tag } => write!(f, "{kind}({name}, cached={cached}, tag={tag:?})"),
             Frame::CredentialErr { name, code, .. } => write!(f, "{kind}({name}, {code:?})"),
             Frame::CredentialForget { name } => write!(f, "{kind}({name:?})"),
+            Frame::Park { spawn_id, grace_s, min_quiet_s, cpu_busy_ms, hold_output, owner } => write!(
+                f,
+                "{kind}({spawn_id}, grace_s={grace_s}, min_quiet_s={min_quiet_s}, cpu_busy_ms={cpu_busy_ms}, hold_output={hold_output}, owner_pid={}, owner_started={})",
+                owner.pid, owner.started
+            ),
+            Frame::Parked { spawn_id, quiet_s, procs } => write!(f, "{kind}({spawn_id}, quiet_s={quiet_s}, procs={procs})"),
+            Frame::ParkRefused { spawn_id, reason, quiet_s, procs, cpu_ms } => write!(f, "{kind}({spawn_id}, {reason:?}, quiet_s={quiet_s}, procs={procs}, cpu_ms={cpu_ms})"),
+            Frame::Unpark { spawn_id } => write!(f, "{kind}({spawn_id})"),
         }
     }
 }
@@ -690,9 +773,9 @@ impl From<serde_json::Error> for WireError {
 }
 
 /// Every `t` this build knows.
-pub const KINDS: [&str; 24] = [
+pub const KINDS: [&str; 28] = [
     "hello", "hello_ok", "hello_err", "spawn", "spawned", "spawn_err", "stdin", "stdin_eof", "stdin_ack", "signal", "detach", "stdout", "stderr", "ack", "exit", "ping", "pong", "event", "error",
-    "credential", "credential_ok", "credential_err", "credential_forget", "_",
+    "credential", "credential_ok", "credential_err", "credential_forget", "park", "parked", "park_refused", "unpark", "_",
 ];
 
 impl Frame {
@@ -723,6 +806,10 @@ impl Frame {
             Frame::CredentialOk { .. } => "credential_ok",
             Frame::CredentialErr { .. } => "credential_err",
             Frame::CredentialForget { .. } => "credential_forget",
+            Frame::Park { .. } => "park",
+            Frame::Parked { .. } => "parked",
+            Frame::ParkRefused { .. } => "park_refused",
+            Frame::Unpark { .. } => "unpark",
         }
     }
 
@@ -741,7 +828,11 @@ impl Frame {
             | Frame::Stdout { spawn_id, .. }
             | Frame::Stderr { spawn_id, .. }
             | Frame::Ack { spawn_id, .. }
-            | Frame::Exit { spawn_id, .. } => Some(spawn_id),
+            | Frame::Exit { spawn_id, .. }
+            | Frame::Park { spawn_id, .. }
+            | Frame::Parked { spawn_id, .. }
+            | Frame::ParkRefused { spawn_id, .. }
+            | Frame::Unpark { spawn_id } => Some(spawn_id),
             Frame::Error { spawn_id, .. } => spawn_id.as_ref(),
             _ => None,
         }
@@ -927,6 +1018,11 @@ pub struct Health {
     /// `/health/detail` record the caps in the VM's row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caps: Vec<String>,
+    /// S10: the guest's `MemTotal` in MiB (`/proc/meminfo`, read once at
+    /// start). Absent from an older image, or where it cannot be read; the
+    /// Mac records it in the VM's row where it records the caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_mib: Option<u32>,
 }
 
 /// The last peer of one runtime hook, as the guard saw it.
@@ -975,6 +1071,13 @@ pub struct SpawnDetail {
     /// it reads as before; an older shim never says it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub group_alive: bool,
+    /// S10: the wrapper that parked the spawn, while it is parked (its
+    /// `park.owner`). The closing suspend counts a parked spawn of another
+    /// chat as no live spawn, and a later start on the VM ends one whose
+    /// owner is no live wrapper. Left out when not parked, so a detail
+    /// without it reads, and is written, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<ParkOwner>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1094,18 +1197,27 @@ mod tests {
             Frame::CredentialOk { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), cached: true, tag: Some("seal-1".into()) },
             Frame::CredentialErr { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), code: CredentialErrCode::Suspended, message: "suspended".into() },
             Frame::CredentialForget { name: None },
+            Frame::Park { spawn_id: sid(), grace_s: 30_600, min_quiet_s: 30, cpu_busy_ms: 500, hold_output: false, owner: owner() },
+            Frame::Parked { spawn_id: sid(), quiet_s: 600, procs: 0 },
+            Frame::ParkRefused { spawn_id: sid(), reason: ParkRefusal::Busy, quiet_s: 300, procs: 1, cpu_ms: 2350 },
+            Frame::Unpark { spawn_id: sid() },
         ]
+    }
+
+    /// The park golden's wrapper (a pid and a start in October 2026).
+    fn owner() -> ParkOwner {
+        ParkOwner { pid: 51_234, started: 1_792_483_200 }
     }
 
     #[test]
     fn roundtrip_every_variant() {
         let all = every_variant();
-        assert_eq!(all.len(), 23);
+        assert_eq!(all.len(), 27);
         let mut kinds: Vec<&str> = all.iter().map(Frame::kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 23, "one sample per kind");
-        assert_eq!(KINDS.len(), 24, "every kind and the _ sentinel");
+        assert_eq!(kinds.len(), 27, "one sample per kind");
+        assert_eq!(KINDS.len(), 28, "every kind and the _ sentinel");
         for k in &kinds {
             assert!(KINDS.contains(k), "{k} is listed in KINDS");
         }
@@ -1184,7 +1296,7 @@ mod tests {
     /// older shim's spawn (no field) reads as false.
     #[test]
     fn group_alive_is_additive() {
-        let d = SpawnDetail { status: status(), started_at: "2026-10-08T08:00:00Z".into(), detach_left_s: None, frozen: false, group_alive: false };
+        let d = SpawnDetail { status: status(), started_at: "2026-10-08T08:00:00Z".into(), detach_left_s: None, frozen: false, group_alive: false, parked: None };
         let before = format!("{},\"started_at\":\"2026-10-08T08:00:00Z\",\"detach_left_s\":null,\"frozen\":false}}", serde_json::to_string(&status()).unwrap().trim_end_matches('}'));
         assert_eq!(serde_json::to_string(&d).unwrap(), before, "no group_alive while false");
         assert_eq!(serde_json::from_str::<SpawnDetail>(&before).unwrap(), d, "an older shim's spawn reads as false");
@@ -1226,7 +1338,7 @@ mod tests {
         assert_eq!(caps.iter().collect::<std::collections::BTreeSet<_>>().len(), caps.len(), "unique");
         assert_eq!(caps.map(cap_stage), ["S7", "S8", "S9", "S9"]);
         assert_eq!(cap_stage("workspace_v2"), "this ai-env");
-        let old = Health { status: HealthStatus::Ok, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, owner: None, created: None, boot_nonce: None, run_hook_seen: true, uptime_s: 1, wire: Some(WIRE_VERSION), caps: vec![CAP_CREDENTIAL_CACHE.into(), CAP_WORKSPACE_V1.into()] };
+        let old = Health { status: HealthStatus::Ok, shim_version: "0.1.0".into(), claude_version: None, microvm_id: None, owner: None, created: None, boot_nonce: None, run_hook_seen: true, uptime_s: 1, wire: Some(WIRE_VERSION), caps: vec![CAP_CREDENTIAL_CACHE.into(), CAP_WORKSPACE_V1.into()], mem_total_mib: None };
         let json = serde_json::to_string(&old).unwrap();
         let mut caps = serde_json::from_str::<Health>(&json).unwrap().caps;
         caps.extend([CAP_GIT_HTTP_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()]);
@@ -1234,9 +1346,98 @@ mod tests {
         assert_eq!(serde_json::from_str::<Health>(&serde_json::to_string(&new).unwrap()).unwrap(), new, "the wire stays v1: the caps are a list");
     }
 
+    /// S10 (M2, L10): `park_v1` beside S7's to S9's caps, named by its
+    /// stage. The four park frames are known kinds, before the sentinel;
+    /// every field of theirs is required, and a reason from a later shim
+    /// reads as `other`. The park's two limits are the plan's.
+    #[test]
+    fn the_s10_cap_is_additive_and_named_by_stage() {
+        assert_eq!(CAP_PARK_V1, "park_v1");
+        let caps = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_PARK_V1];
+        assert_eq!(caps.iter().collect::<std::collections::BTreeSet<_>>().len(), caps.len(), "unique");
+        assert_eq!(caps.map(cap_stage), ["S7", "S8", "S9", "S9", "S10"]);
+        assert_eq!(cap_stage("park_v2"), "this ai-env");
+        assert_eq!(KINDS[KINDS.len() - 5..], ["park", "parked", "park_refused", "unpark", "_"]);
+        let park = format!("{{\"v\":1,\"t\":\"park\",\"spawn_id\":\"{SID}\",\"grace_s\":30600,\"min_quiet_s\":30,\"cpu_busy_ms\":500,\"hold_output\":false,\"owner\":{{\"pid\":51234,\"started\":1792483200}}}}");
+        let want = Frame::Park { spawn_id: sid(), grace_s: 30_600, min_quiet_s: 30, cpu_busy_ms: 500, hold_output: false, owner: owner() };
+        assert_eq!((Frame::from_json(&park).unwrap(), want.to_json()), (want, park.clone()));
+        for field in ["spawn_id", "grace_s", "min_quiet_s", "cpu_busy_ms", "hold_output", "owner"] {
+            let mut v: serde_json::Value = serde_json::from_str(&park).unwrap();
+            v.as_object_mut().unwrap().remove(field);
+            assert!(matches!(Frame::from_json(&v.to_string()), Err(WireError::Json(_))), "a park without {field} is malformed");
+        }
+        let mut no_started: serde_json::Value = serde_json::from_str(&park).unwrap();
+        no_started["owner"].as_object_mut().unwrap().remove("started");
+        assert!(matches!(Frame::from_json(&no_started.to_string()), Err(WireError::Json(_))), "an owner without its start is malformed");
+        for (t, fields) in [("parked", "\"quiet_s\":1"), ("park_refused", "\"reason\":\"busy\",\"quiet_s\":1,\"procs\":0")] {
+            let short = format!("{{\"v\":1,\"t\":\"{t}\",\"spawn_id\":\"{SID}\",{fields}}}");
+            assert!(matches!(Frame::from_json(&short), Err(WireError::Json(_))), "{t} without its last field is malformed");
+        }
+        let words = [ParkRefusal::Busy, ParkRefusal::Output, ParkRefusal::Unacked, ParkRefusal::NotAttached, ParkRefusal::Other].map(|r| serde_json::to_string(&r).unwrap());
+        assert_eq!(words, ["\"busy\"", "\"output\"", "\"unacked\"", "\"not_attached\"", "\"other\""]);
+        let later = format!("{{\"v\":1,\"t\":\"park_refused\",\"spawn_id\":\"{SID}\",\"reason\":\"from_the_future\",\"quiet_s\":0,\"procs\":0,\"cpu_ms\":0}}");
+        assert!(matches!(Frame::from_json(&later).unwrap(), Frame::ParkRefused { reason: ParkRefusal::Other, .. }));
+        assert_eq!((PARK_GRACE_MAX_S, PARKED_IDLE_MAX), (8 * 3600 + 3600, Duration::from_secs(24 * 3600)));
+        const { assert!(PARK_GRACE_MAX_S > DETACH_GRACE_SESSION_S && PARKED_IDLE_MAX.as_secs() > IDLE_MAX_S as u64) };
+    }
+
+    /// The park frames' `Debug`: the kind, the spawn id and the numbers
+    /// (a refusal's reason by its name), nothing else.
+    #[test]
+    fn park_frames_debug_shows_ids_and_numbers_only() {
+        let all = every_variant();
+        let park = &all[all.len() - 4..];
+        let shown: Vec<String> = park.iter().map(|f| format!("{f:?}")).collect();
+        assert_eq!(
+            shown,
+            [
+                format!("park({SID}, grace_s=30600, min_quiet_s=30, cpu_busy_ms=500, hold_output=false, owner_pid=51234, owner_started=1792483200)"),
+                format!("parked({SID}, quiet_s=600, procs=0)"),
+                format!("park_refused({SID}, Busy, quiet_s=300, procs=1, cpu_ms=2350)"),
+                format!("unpark({SID})"),
+            ]
+        );
+        for f in park {
+            assert_eq!(f.spawn_id(), Some(&sid()), "{} names its spawn", f.kind());
+        }
+    }
+
+    /// S10's two reply fields (no cap: a reader may ignore them):
+    /// `Health.mem_total_mib` and `SpawnDetail.parked` are left out when
+    /// absent, so an older shim's document reads as `None` and is written
+    /// back byte for byte; when set they come last, and `/health/detail`
+    /// carries the memory in its flattened `Health`.
+    #[test]
+    fn the_s10_reply_fields_are_additive() {
+        let older = "{\"status\":\"ok\",\"shim_version\":\"0.1.0\",\"claude_version\":null,\"microvm_id\":null,\"owner\":null,\"created\":null,\"boot_nonce\":null,\"run_hook_seen\":true,\"uptime_s\":3,\"wire\":1,\"caps\":[\"credential_cache\"]}";
+        let h: Health = serde_json::from_str(older).unwrap();
+        assert_eq!(h.mem_total_mib, None);
+        assert_eq!(serde_json::to_string(&h).unwrap(), older, "byte-identical for an S9 reader");
+        let with = Health { mem_total_mib: Some(2048), ..h };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.ends_with(",\"caps\":[\"credential_cache\"],\"mem_total_mib\":2048}"), "{json}");
+        assert_eq!(serde_json::from_str::<Health>(&json).unwrap(), with);
+        let d: HealthDetail = serde_json::from_value(serde_json::json!({
+            "status": "ok", "shim_version": "0.1.0", "run_hook_seen": true, "uptime_s": 1, "mem_total_mib": 2048, "hook_source": "peer", "agent_guard": "on",
+            "refused_peers": {}, "hook_peers": {}, "sockets_open": 0, "sockets_authenticated": 0, "spawns": [], "has_credentials": false, "listeners": [],
+        }))
+        .unwrap();
+        assert_eq!(d.health.mem_total_mib, Some(2048), "the detail's flattened Health");
+        let spawn = SpawnDetail { status: status(), started_at: "2026-10-20T08:00:00Z".into(), detach_left_s: None, frozen: true, group_alive: false, parked: None };
+        let before = serde_json::to_string(&spawn).unwrap();
+        assert!(!before.contains("parked") && before.ends_with(",\"frozen\":true}"), "left out while not parked: {before}");
+        assert_eq!(serde_json::from_str::<SpawnDetail>(&before).unwrap(), spawn);
+        let parked = SpawnDetail { parked: Some(owner()), ..spawn };
+        let json = serde_json::to_string(&parked).unwrap();
+        assert!(json.ends_with(",\"frozen\":true,\"parked\":{\"pid\":51234,\"started\":1792483200}}"), "{json}");
+        assert_eq!(serde_json::from_str::<SpawnDetail>(&json).unwrap(), parked);
+    }
+
     /// S8 changes neither earlier golden conversation: both files are pinned
     /// by their sha256 (public known-answers of the committed files, not
-    /// credentials), so a change to the S6 or S7 wire would show here.
+    /// credentials), so a change to the S6 or S7 wire would show here. S9's
+    /// 38 codeport documents are pinned the same way, in
+    /// `wire::workspace`'s `golden_codeport_documents_round_trip_byte_identically`.
     #[test]
     fn the_s6_and_s7_goldens_stay_byte_identical() {
         use sha2::{Digest, Sha256};
@@ -1370,6 +1571,53 @@ mod tests {
         assert!(frames.iter().all(|f| !format!("{f:?}").contains(secret.as_str())), "a frame's Debug shows the secret");
     }
 
+    /// The golden park conversation (S10, tests/fixtures/wire/park-golden.jsonl):
+    /// a `hello_ok` naming `park_v1`; a spawn and a turn of stdio with its
+    /// acks; a `park` refused by the busy check; a `park` answered `parked`;
+    /// an `unpark` with a `ping` and its `pong`; stdin after it; a second
+    /// `parked`; then a second socket's `hello` resuming the spawn (`ok`,
+    /// which unparks), `stdin_eof` and the exit. Every line parses as v1 and
+    /// serialises back byte-identically, each kind comes from the side that
+    /// sends it, every S10 kind is there, and each names the one spawn. Both
+    /// ends replay it (`tests/shim_local.rs`, `agent/session.rs`). Messages
+    /// name the line by its number in the file.
+    #[test]
+    fn golden_park_conversation_round_trips() {
+        let text = include_str!("../../tests/fixtures/wire/park-golden.jsonl");
+        let mut frames: Vec<Frame> = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let n = i + 1;
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("line {n}: {e}"));
+            let dir = v["dir"].as_str().unwrap_or_default().to_string();
+            // The frame's own text, in its original key order (`{"dir":…,"frame":<frame>}`).
+            let raw = line.split_once(",\"frame\":").and_then(|(_, rest)| rest.strip_suffix('}')).unwrap_or_else(|| panic!("line {n}: no frame"));
+            let f = Frame::from_json(raw).unwrap_or_else(|e| panic!("line {n}: {e}"));
+            assert!(f.to_json() == raw, "line {n} ({}): not byte-identical once re-serialised", f.kind());
+            match (dir.as_str(), &f) {
+                ("mac", Frame::Hello { .. } | Frame::Spawn { .. } | Frame::Stdin { .. } | Frame::StdinEof { .. } | Frame::Ack { .. } | Frame::Ping { .. } | Frame::Park { .. } | Frame::Unpark { .. }) => {}
+                ("vm", Frame::HelloOk { caps, .. }) => assert!(caps.iter().any(|c| c == CAP_PARK_V1), "line {n}: the shim names {CAP_PARK_V1}"),
+                ("vm", Frame::Spawned { .. } | Frame::StdinAck { .. } | Frame::Stdout { .. } | Frame::Pong { .. } | Frame::Parked { .. } | Frame::ParkRefused { .. } | Frame::Exit { .. }) => {}
+                _ => panic!("line {n}: {dir} does not send {}", f.kind()),
+            }
+            frames.push(f);
+        }
+        let park_kinds = ["park", "parked", "park_refused", "unpark"];
+        for kind in park_kinds {
+            assert!(frames.iter().any(|f| f.kind() == kind), "{kind} missing");
+        }
+        let id = frames.iter().find_map(|f| if let Frame::Spawn { spawn_id, .. } = f { Some(spawn_id.clone()) } else { None }).expect("a spawn");
+        assert!(frames.iter().filter(|f| park_kinds.contains(&f.kind())).all(|f| f.spawn_id() == Some(&id)), "every park frame names the one spawn");
+        assert!(frames.iter().any(|f| matches!(f, Frame::ParkRefused { reason: ParkRefusal::Busy, .. })), "a park refused by the busy check");
+        assert_eq!(frames.iter().filter(|f| f.kind() == "parked").count(), 2, "parked twice");
+        let at = frames.iter().position(|f| f.kind() == "unpark").expect("an unpark");
+        assert!(matches!((&frames[at + 1], &frames[at + 2]), (Frame::Ping { ts: a }, Frame::Pong { ts: b }) if a == b), "an unpark goes with a ping, and its pong proves the socket");
+        assert!(frames[at..].iter().any(|f| matches!(f, Frame::Stdin { .. })), "stdin after the unpark");
+        let last = frames.iter().rposition(|f| f.kind() == "parked").expect("parked");
+        let resumed = frames[last..].iter().position(|f| matches!(f, Frame::HelloOk { resumed, .. } if resumed.len() == 1 && resumed[0].spawn_id == id && resumed[0].status == ResumeStatus::Ok));
+        let resumed = resumed.expect("a second socket's hello resumes the parked spawn") + last;
+        assert!(frames[resumed..].iter().any(|f| matches!(f, Frame::StdinEof { .. })) && frames[resumed..].iter().any(|f| matches!(f, Frame::Exit { .. })), "stdin_eof and the exit after it");
+    }
+
     #[test]
     fn message_binary_rejected() {
         let r = Frame::try_from(Message::Binary(vec![1u8, 2].into()));
@@ -1483,6 +1731,7 @@ mod tests {
             uptime_s: 3,
             wire: None,
             caps: vec![],
+            mem_total_mib: None,
         };
         let s = serde_json::to_string(&h).unwrap();
         assert!(s.starts_with("{\"status\":\"ok\",\"shim_version\":\"0.1.0\""), "{s}");

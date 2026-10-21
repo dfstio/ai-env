@@ -55,6 +55,17 @@ pub fn request_timeout(bytes: u64, helper: Duration) -> Duration {
     REQUEST_BASE + Duration::from_secs(bytes.div_ceil(MIN_RATE)) + helper
 }
 
+/// How long the Mac waits for `POST /transcript/pull` (S10): the pull's
+/// budget as the shim counts its deadline and the presigned GETs their
+/// lifetime (`wire::workspace::budget::pull_budget` of its parts' bytes
+/// and its `share`, the pulls running beside it, which split the VM's
+/// downlink). At share 1 it is S9's [`request_timeout`] of those bytes and
+/// `budget::TRANSCRIPT_PULL`.
+#[must_use]
+pub fn pull_timeout(req: &TranscriptPull) -> Duration {
+    crate::wire::workspace::budget::pull_budget(req.parts.iter().map(|p| p.len).sum::<u64>(), req.share)
+}
+
 /// The endpoint tokens of one VM, by port. W4's `MintingTokens` keeps them
 /// in memory only (never in a row or a file), mints with the wrapper's own
 /// API object (D1), and mints again below [`REMINT_BELOW`].
@@ -855,9 +866,7 @@ impl DataPlane for HttpsEndpoint {
             return Err(BridgeError::Config(format!("POST /transcript/pull: a {}-byte request (at most {})", json.len(), crate::wire::workspace::TRANSFER_REQUEST_MAX)));
         }
         let shown = url.as_str().to_string();
-        let bytes = req.parts.iter().map(|p| p.len).sum::<u64>();
-        let timeout = request_timeout(bytes, crate::wire::workspace::budget::TRANSCRIPT_PULL);
-        let resp = self.send(reqwest::Method::POST, target, token, url, timeout, Payload::Json(json)).await?;
+        let resp = self.send(reqwest::Method::POST, target, token, url, pull_timeout(req), Payload::Json(json)).await?;
         reply_of(resp, &[200, 201], "POST", &shown).await
     }
 
@@ -1211,6 +1220,38 @@ mod tests {
         assert_eq!(request_timeout(64 * 1024 * 1024, budget::SEED_CLONE), Duration::from_secs(30 + 68 + 600), "64 MiB at 1 MB/s, rounded up");
         assert_eq!(request_timeout(1, Duration::ZERO), Duration::from_secs(31));
         assert_eq!((TOKEN_MINUTES_SEED, TOKEN_MINUTES, REMINT_BELOW, BUSY_RETRY), (15, 5, Duration::from_secs(60), Duration::from_secs(30)), "plan §10");
+    }
+
+    /// S10 (§1.3): the Mac waits for a transcript pull as long as the shim
+    /// gives it and its presigned GETs live (`pull_budget` of its parts'
+    /// bytes and its share): alone, S9's wait (30 s, the bytes at 1 MB/s,
+    /// the helper's 60 s); one of four pulls at once (the subtree's
+    /// `restore_subtree`), its bytes four times over, so a pull sharing the
+    /// VM's downlink is not cut while the shim still waits for it.
+    #[test]
+    fn a_pull_waits_by_the_shared_pull_budget() {
+        use crate::wire::workspace::{budget, PullPart};
+        let url = || {
+            let key = crate::wire::s3::S3Key::Base { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), gen: 1 }.render();
+            let credential = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261017%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261017T101530Z";
+            let text = format!("https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/{key}?{credential}&X-Amz-Expires=300&X-Amz-SignedHeaders={}&X-Amz-Signature={}", crate::wire::s3::SIGNED_HEADERS_GET.replace(';', "%3B"), "e".repeat(64));
+            crate::wire::s3::PresignedUrl::new(text).unwrap()
+        };
+        let pull = |lens: &[u64], share: u32| TranscriptPull {
+            rel: "-w/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/subagents/a.jsonl".into(),
+            parts: lens.iter().map(|len| PullPart { url: url(), len: *len, sha256: None }).collect(),
+            sha256: None,
+            owner: "123456789012".into(),
+            proxy: None,
+            share,
+        };
+        for bytes in [0u64, 1, 52_000, 300_000_000] {
+            assert_eq!(pull_timeout(&pull(&[bytes], 1)), request_timeout(bytes, budget::TRANSCRIPT_PULL), "{bytes} bytes alone: S9's wait");
+        }
+        assert_eq!(pull_timeout(&pull(&[200_000_000, 100_000_000], 1)), Duration::from_secs(30 + 300 + 60), "the parts' bytes summed");
+        assert_eq!(pull_timeout(&pull(&[300_000_000], 4)), Duration::from_secs(30 + 1200 + 60), "one of four: its bytes four times over");
+        assert_eq!(pull_timeout(&pull(&[300_000_000], 4)), budget::pull_budget(300_000_000, 4), "the shim's and the presign's budget");
+        assert!(pull_timeout(&pull(&[300_000_000], 4)) > pull_timeout(&pull(&[300_000_000], 1)));
     }
 
     use crate::bridge::api::{Call, FakeMicrovmApi, IdleSpec, MicrovmApi, RunSpec, FAKE_IMAGE_ARN};

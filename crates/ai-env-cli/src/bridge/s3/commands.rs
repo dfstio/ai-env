@@ -148,12 +148,16 @@ pub const TERMINATE_SYNC_BUDGET: std::time::Duration = std::time::Duration::from
 /// committed length: the tail key is written once (`If-None-Match: *`) and
 /// only a sync moves it. So bytes written after the first such push, with
 /// no sync since, are lost here, as is a subtree file changed since the
-/// last sync. The warnings.
+/// last sync. S10 (I2): a chat that moved off the VM is never synced from
+/// it ([`moved_off`], logged, no warning): its copy there may be behind
+/// what S3 holds, and a sync would commit that older copy as a new base,
+/// rolling the manifest back. The warnings.
 pub async fn sync_before_terminate<A: MicrovmApi + S3Sign>(ctx: &Ctx, api: &A, vm_id: &str) -> Vec<String> {
     let sessions: Vec<SessionRow> = registry::list(&ctx.paths)
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.microvm_id.as_deref() == Some(vm_id) && (r.transcript_home.as_deref() == Some(manifest::HOME_S3) || ctx.paths.transcript_manifest(&r.session_id).exists()))
+        .filter(|r| !moved_off_logged(&ctx.paths, &r.session_id, vm_id))
         .collect();
     if sessions.is_empty() {
         return Vec::new();
@@ -187,12 +191,113 @@ pub async fn sync_before_terminate<A: MicrovmApi + S3Sign>(ctx: &Ctx, api: &A, v
     let sync_one = |row: SessionRow| {
         let (vm, projects, rules) = (&vm, &projects, &rules);
         async move {
+            // S10 (I2): read again at its turn: a move may have taken the chat off this VM since the listing.
+            if moved_off_logged(&ctx.paths, &row.session_id, vm_id) {
+                return Ok(SyncReport { session: row.session_id.clone(), vm: vm_id.to_string(), pushed: None, files: 0, view: None, committed: 0 });
+            }
             let sync = row_sync(&ctx.paths, &ctx.cfg, &ctx.knobs, &row, projects)?;
             sync_on_vm(ctx, api, vm, &row.session_id, &sync, rules).await
         }
     };
     warnings.extend(sync_each_within(vm_id, sessions, until, sync_one).await);
     warnings
+}
+
+/// S10 (I2): why the chat `sid` is no longer synced from `vm_id` before that
+/// VM ends, if it is not: its row no longer names the VM (gone, or a move
+/// pointed it elsewhere), or the last commit of its transcript came from
+/// another VM (`Manifest.vm`: the chat moved, and the VM it moved to
+/// committed since). Either way the copy on `vm_id` may be behind what S3
+/// holds. A row or a manifest that cannot be read is no reason: the sync
+/// runs and says what failed.
+#[must_use]
+pub fn moved_off(paths: &Paths, sid: &str, vm_id: &str) -> Option<String> {
+    match registry::read(paths, sid) {
+        Ok(Some(row)) if row.microvm_id.as_deref() != Some(vm_id) => return Some(format!("its row names {} now", row.microvm_id.as_deref().unwrap_or("no VM"))),
+        Ok(None) => return Some("its row is gone".to_string()),
+        _ => {}
+    }
+    match manifest::read(paths, sid) {
+        Ok(Some(m)) => m.vm.filter(|committer| committer != vm_id).map(|committer| format!("its transcript was last committed from {committer}")),
+        _ => None,
+    }
+}
+
+/// [`moved_off`], its reason logged: whether the chat is left alone.
+fn moved_off_logged(paths: &Paths, sid: &str, vm_id: &str) -> bool {
+    let why = moved_off(paths, sid, vm_id);
+    if let Some(why) = &why {
+        tracing::info!(session = sid, vm = vm_id, "transcript not synced before the VM ends: {why} (the copy there may be behind S3's)");
+    }
+    why.is_some()
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod i2_tests {
+    use super::*;
+    use crate::bridge::api::FakeMicrovmApi;
+    use crate::bridge::s3::manifest::{Manifest, ManifestPart};
+
+    const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    const VM: &str = "microvm-00000000-0000-4000-8000-000000000001";
+    const OTHER: &str = "microvm-00000000-0000-4000-8000-000000000002";
+
+    /// The session's row naming `vm`, its transcript kept in S3.
+    fn row_on(paths: &Paths, vm: Option<&str>) {
+        let row = SessionRow { session_id: SID.into(), mode: "remote".into(), microvm_id: vm.map(str::to_string), transcript_home: Some(manifest::HOME_S3.into()), slug: Some("-w".into()), ..SessionRow::default() };
+        registry::write(paths, &row).unwrap();
+    }
+
+    /// The session's manifest, its last commit from `committer` (none: never a VM's).
+    fn committed_by(paths: &Paths, committer: Option<&str>) {
+        let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
+        let mut m = Manifest::new(SID, &target, manifest::ORIGIN_VM, &format!("-w/{SID}.jsonl"), "2026-10-20T10:15:30.000Z");
+        m.parts.push(ManifestPart { key: format!("v1/{SID}/vm/g1/b"), version_id: "v1".into(), from: 0, len: 10, sha256: "a".repeat(64) });
+        (m.gen, m.committed, m.vm) = (1, 10, committer.map(str::to_string));
+        manifest::write(paths, &m).unwrap();
+    }
+
+    /// A chat is synced from the VM its row names and last committed from
+    /// (or that no VM committed yet); it is left alone once its row names
+    /// another VM or none, or is gone, or once another VM committed it.
+    #[test]
+    fn moved_off_reads_the_row_then_the_manifests_committer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        assert_eq!(moved_off(&paths, SID, VM).as_deref(), Some("its row is gone"));
+        row_on(&paths, Some(VM));
+        assert_eq!(moved_off(&paths, SID, VM), None, "no manifest yet");
+        committed_by(&paths, None);
+        assert_eq!(moved_off(&paths, SID, VM), None, "no VM committed it yet (a chat staged from the Mac)");
+        committed_by(&paths, Some(VM));
+        assert_eq!(moved_off(&paths, SID, VM), None, "this VM committed it last");
+        committed_by(&paths, Some(OTHER));
+        assert_eq!(moved_off(&paths, SID, VM).as_deref(), Some(format!("its transcript was last committed from {OTHER}").as_str()));
+        committed_by(&paths, Some(VM));
+        row_on(&paths, Some(OTHER));
+        assert_eq!(moved_off(&paths, SID, VM).as_deref(), Some(format!("its row names {OTHER} now").as_str()));
+        row_on(&paths, None);
+        assert_eq!(moved_off(&paths, SID, VM).as_deref(), Some("its row names no VM now"));
+    }
+
+    /// Before a VM ends, a chat whose row still names it but whose
+    /// transcript another VM committed last is never synced from it: no
+    /// warning, no AWS call (the VM's row is not even read). Without the
+    /// guard the session is taken, and its missing VM row is a warning.
+    #[tokio::test]
+    async fn a_chat_another_vm_committed_is_never_synced_from_this_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx { paths: Paths::from_root_and_env(tmp.path().join("bridge"), None), cfg: BridgeConfig::default(), knobs: crate::bridge::lab::VmKnobs::default() };
+        let api = FakeMicrovmApi::new();
+        row_on(&ctx.paths, Some(VM));
+        committed_by(&ctx.paths, Some(OTHER));
+        assert_eq!(sync_before_terminate(&ctx, &api, VM).await, Vec::<String>::new());
+        assert!(api.calls().is_empty(), "{:?}", api.calls());
+        committed_by(&ctx.paths, Some(VM));
+        let w = sync_before_terminate(&ctx, &api, VM).await;
+        assert!(w.len() == 1 && w[0].contains("not synced before it ends"), "this VM committed it: taken (its VM row is missing here): {w:?}");
+    }
 }
 
 /// [`sync_before_terminate`]'s loop: `sync_one` of each of `sessions` in
@@ -398,28 +503,49 @@ pub fn cmd_gc(store: &Keystore, older_than: u32, yes: bool, json: bool) -> Resul
 /// object under `v1/<sid>/` is deleted with the runtime key (a Touch ID),
 /// then `state/transcripts/<sid>/` whole (`origin/` included) and the lock
 /// file, then the view (only a view: never a transcript). Whether anything
-/// went.
+/// went. [`forget_purge_many`] of the one session.
 pub fn forget_purge(store: &Keystore, paths: &Paths, sid: &str) -> std::result::Result<bool, BridgeError> {
-    if !registry::is_uuid(sid) {
-        return Err(BridgeError::Config(format!("not a session id: {sid:?}")));
+    Ok(forget_purge_many(store, paths, &[sid.to_string()])?.first().copied().unwrap_or(false))
+}
+
+/// S10 (F1): `session forget UUID... --purge`'s S3 half for several
+/// sessions (once `registry::forget_check` passed for each): [`forget_purge`]
+/// of each, in their order, with one unseal of the runtime key for all of
+/// them (one Touch ID, asked only when one of them left a trace
+/// ([`s3_traces`]); S9 asked one per session). Each view's rel is read
+/// before its manifest goes. A non-uuid is refused before anything; a
+/// failure of one session's purge ends it there (the sessions purged before
+/// it stay purged, the command's forget of every row is not reached).
+/// Whether each removed anything.
+pub fn forget_purge_many(store: &Keystore, paths: &Paths, sids: &[String]) -> std::result::Result<Vec<bool>, BridgeError> {
+    if let Some(bad) = sids.iter().find(|sid| !registry::is_uuid(sid)) {
+        return Err(BridgeError::Config(format!("not a session id: {bad:?}")));
     }
-    let m = manifest::read(paths, sid).ok().flatten();
-    let mut removed = false;
-    if s3_traces(paths, sid) {
+    let rels: Vec<Option<String>> = sids.iter().map(|sid| manifest::read(paths, sid).ok().flatten().map(|m| m.rel).or_else(|| registry::read(paths, sid).ok().flatten().and_then(|r| r.view))).collect();
+    let traced: Vec<bool> = sids.iter().map(|sid| s3_traces(paths, sid)).collect();
+    let mut removed = vec![false; sids.len()];
+    if traced.contains(&true) {
         let ctx = Ctx::load().map_err(BridgeError::Cli)?;
         let target = S3Target::resolve(paths, &ctx.knobs)?;
         let rt = runtime().map_err(BridgeError::Cli)?;
-        removed |= rt.block_on(async {
+        removed = rt.block_on(async {
             let b = backend(store, &ctx).await.map_err(BridgeError::Cli)?;
             with_backend!(&b, |api, _ep| {
                 let client = S3Client::new(api, &target)?;
-                purge_with(&client, paths, sid).await
+                let mut purged = Vec::with_capacity(sids.len());
+                for (sid, traced) in sids.iter().zip(&traced) {
+                    purged.push(*traced && purge_with(&client, paths, sid).await?);
+                }
+                Ok::<_, BridgeError>(purged)
             })
         })?;
     }
-    let rel = m.map(|m| m.rel).or_else(|| registry::read(paths, sid).ok().flatten().and_then(|r| r.view));
-    if let (Some(rel), Ok(p)) = (rel, projects()) {
-        removed |= remove_view(&p, &rel);
+    if let Ok(p) = projects() {
+        for (removed, rel) in removed.iter_mut().zip(rels) {
+            if let Some(rel) = rel {
+                *removed |= remove_view(&p, &rel);
+            }
+        }
     }
     Ok(removed)
 }

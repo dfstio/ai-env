@@ -26,8 +26,17 @@
 //! nothing renamed); `transfer_failed` (500) is curl without a status (the
 //! proxy, a connection) or the helper's bytes cut short. A run waits for
 //! its rel's turn and a slot at most the workspace's `busy_wait` (then 409
-//! `busy`), and ends with its budget (`budget::TRANSCRIPT_PUSH` or `_PULL`
-//! plus the bytes' transfer time; 504 past it).
+//! `busy`), and ends with its budget (`budget::TRANSCRIPT_PUSH` plus the
+//! bytes' transfer time; a pull's `budget::pull_budget` at its share, S10;
+//! 504 past it); curl itself ends a transfer that moved less than
+//! [`SPEED_LIMIT`] bytes a second for [`SPEED_TIME_S`] (S10: a stalled one
+//! fails in a minute, not at its ceiling).
+//!
+//! S10 (R1): a tail's URL is dropped only once S3 gave its push a final
+//! answer (200, or 412: a push before this one stored the key, or another
+//! 4xx that pushing again cannot change); curl without a status, a 5xx, or
+//! a 4xx S3 asks to retry (408, 409 `ConditionalRequestConflict`, 429, 400
+//! `RequestTimeout`) keeps it for the next hook.
 use crate::shim::health::ShimState;
 use crate::wire::workspace::{refusal, WsRefusal};
 use axum::extract::{Request, State};
@@ -62,6 +71,10 @@ const CURL_LINE_MAX: usize = 4096;
 const CURL_SHOWN_MAX: usize = 300;
 /// curl's own wait for its connection (the proxy's, or the lab's S3).
 const CONNECT_TIMEOUT_S: u64 = 20;
+/// S10: curl ends a transfer slower than this many bytes a second ...
+pub const SPEED_LIMIT: u64 = 1024;
+/// ... for this many seconds in a row (a stalled transfer fails then, not at its `max-time`).
+pub const SPEED_TIME_S: u64 = 60;
 /// The first word of the line curl's write-out prints on its stderr.
 const STATUS_WORD: &str = "ai-env-curl ";
 /// curl's write-out (S9 §3.4): S3's status, version id, checksum and ETag, one line on stderr.
@@ -121,12 +134,17 @@ impl Transfers {
         tails.values().cloned().collect()
     }
 
-    /// `tail` is pushed now, at most once: it goes, unless another replaced it meanwhile.
+    /// `tail` was pushed and S3 answered (S10, R1): it goes, unless another replaced it meanwhile.
     fn take_tail(&self, tail: &TranscriptTail) {
         let mut tails = self.tails.lock().unwrap_or_else(PoisonError::into_inner);
         if tails.get(&tail.rel) == Some(tail) {
             tails.remove(&tail.rel);
         }
+    }
+
+    /// Is `tail` still the one kept for its rel (no hook took it since, no newer one replaced it)?
+    fn kept(&self, tail: &TranscriptTail) -> bool {
+        self.tails.lock().unwrap_or_else(PoisonError::into_inner).get(&tail.rel) == Some(tail)
     }
 }
 
@@ -350,7 +368,8 @@ pub async fn pull(State(state): State<Arc<ShimState>>, req: Request) -> Response
             Ok(slot) => slot,
             Err(held) => return asagent::refuse(op, started, &asagent::busy(op, held, wait)),
         };
-        let deadline = tokio::time::Instant::now() + budget::TRANSCRIPT_PULL + asagent::transfer(total);
+        // S10: the one pull budget both ends use, at the pull's share of the link.
+        let deadline = tokio::time::Instant::now() + budget::pull_budget(total, p.share);
         match pull_parts(&state, &p, total, deadline).await {
             Ok(reply) => {
                 let status = if reply.written { 201 } else { 200 };
@@ -623,11 +642,13 @@ pub async fn tail(State(state): State<Arc<ShimState>>, req: Request) -> Response
 }
 
 /// `/suspend` (after the WIP snapshot) and `/terminate` (after the spawns
-/// stopped): each main transcript's kept tail pushed once, within
+/// stopped): each main transcript's kept tail pushed, within
 /// `budget::TRANSCRIPT_TAIL`, when the file grew past its `from`; logged as
 /// `ai-env: transcript_tail <why> …`, never the URL. A tail whose file did
-/// not grow stays for the next hook; an expired one is dropped. A subtree
-/// file has no tail: one changed since the last sync is not pushed here.
+/// not grow, or whose push got no final answer from S3 (S10, R1: no status,
+/// the budget past, or an answer `tail_spent` keeps: a 5xx, 408, 409, 429,
+/// 400 `RequestTimeout`), stays for the next hook; an expired one is dropped. A
+/// subtree file has no tail: one changed since the last sync is not pushed here.
 pub async fn tail_push(state: &ShimState, why: &str) {
     if !(SERVED && state.serves_workspace()) {
         return;
@@ -641,27 +662,49 @@ pub async fn tail_push(state: &ShimState, why: &str) {
 }
 
 /// One kept tail at a hook (§1.4, X8): when the file grew past `from`,
-/// `[from, size)` PUT once to its tail key (no checksum: its bytes were
-/// unknown when it was signed), by `deadline`.
+/// `[from, size)` PUT to its tail key (no checksum: its bytes were unknown
+/// when it was signed), by `deadline`. S10 (R1): the URL goes only once S3
+/// gave a final answer ([`tail_spent`]); a push S3 never answered, or
+/// answered to retry, leaves it for the next hook (`kept` in the log
+/// line), as does every failure before the push. One another hook already
+/// pushed (it is no longer kept) is skipped.
 async fn tail_one(state: &ShimState, why: &str, tail: &TranscriptTail, deadline: tokio::time::Instant) {
     let op = "transcript-tail";
     let run = async {
         let _slot = state.transfers.slot(&tail.rel, deadline).await.map_err(|held| format!("skipped: {held}"))?;
+        if !state.transfers.kept(tail) {
+            return Err("skipped: a hook pushed it meanwhile".to_string());
+        }
         let Some(size) = tail_size(state, tail, deadline).await?.filter(|size| *size > tail.from) else { return Ok(None) };
-        state.transfers.take_tail(tail);
         let len = (size - tail.from).min(PUSH_MAX);
         let kind = Kind::Put { len, checksum: None, owner: &tail.owner };
         let push = PushRun { op, rel: &tail.rel, from: tail.from, len, deadline, during_stop: true };
-        let reply = push_range(state, push, |max_time| curl_config(&tail.url, tail.proxy.as_deref(), max_time, &kind)).await.map_err(|r| format!("failed: {} ({})", r.code, r.message))?;
-        Ok::<_, String>(Some((len, reply.s3_status)))
+        let reply = push_range(state, push, |max_time| curl_config(&tail.url, tail.proxy.as_deref(), max_time, &kind)).await.map_err(|r| format!("failed: {} ({}); kept", r.code, r.message))?;
+        let spent = tail_spent(reply.s3_status, reply.s3_code.as_deref());
+        if spent {
+            state.transfers.take_tail(tail);
+        }
+        Ok::<_, String>(Some((len, reply.s3_status, spent)))
     };
     let (rel, from) = (&tail.rel, tail.from);
     match tokio::time::timeout_at(deadline, run).await {
-        Ok(Ok(Some((len, status)))) => errln!("ai-env: transcript_tail {why} rel={rel} from={from} len={len} status={status}"),
+        Ok(Ok(Some((len, status, spent)))) => errln!("ai-env: transcript_tail {why} rel={rel} from={from} len={len} status={status}{}", if spent { "" } else { "; kept" }),
         Ok(Ok(None)) => errln!("ai-env: transcript_tail {why} rel={rel} from={from} skipped: nothing past from"),
         Ok(Err(what)) => errln!("ai-env: transcript_tail {why} rel={rel} from={from} {what}"),
-        Err(_) => errln!("ai-env: transcript_tail {why} rel={rel} from={from} failed: not within {} s", budget::TRANSCRIPT_TAIL.as_secs()),
+        Err(_) => errln!("ai-env: transcript_tail {why} rel={rel} from={from} failed: not within {} s; kept", budget::TRANSCRIPT_TAIL.as_secs()),
     }
+}
+
+/// Whether S3's answer to a tail's push (its status and `<Code>`) ends its
+/// URL (S10, R1): 200 (the bytes are in), 412 (a push before stored the
+/// key: the Mac's next tail starts where that one ended) and any other
+/// final answer (pushing again cannot change it). A 5xx, and the 4xx S3
+/// asks to retry, keep it: 408, 409 (`ConditionalRequestConflict`: a
+/// conditional write of the key still in flight, which may yet fail), 429
+/// and 400 `RequestTimeout` (the body stalled).
+fn tail_spent(s3_status: u16, s3_code: Option<&str>) -> bool {
+    let retry = (500..600).contains(&s3_status) || matches!(s3_status, 408 | 409 | 429) || (s3_status == 400 && s3_code == Some("RequestTimeout"));
+    !retry
 }
 
 /// The tail's file's size now (`None`: absent), by the helper's extended stat (`--from`: its delta alone is hashed).
@@ -689,8 +732,10 @@ enum Kind<'a> {
 
 /// curl's configuration (S9 §3.4, pinned line by line), for its fd 3 and
 /// nowhere else: the URL (the VM's one read of it), the common lines
-/// (`max_time` the route's budget left, whole seconds; `proto` `=http` for a
-/// lab URL), the proxy when the request names one, then the request's own.
+/// (`max_time` the route's budget left, whole seconds; S10: the stall
+/// limit, [`SPEED_LIMIT`] bytes a second for [`SPEED_TIME_S`]; `proto`
+/// `=http` for a lab URL), the proxy when the request names one, then the
+/// request's own.
 fn curl_config(url: &PresignedUrl, proxy: Option<&str>, max_time: u64, kind: &Kind<'_>) -> String {
     let proto = if url.is_lab() { "=http" } else { "=https" };
     let mut lines = vec![
@@ -700,6 +745,8 @@ fn curl_config(url: &PresignedUrl, proxy: Option<&str>, max_time: u64, kind: &Ki
         format!("proto = \"{proto}\""),
         format!("connect-timeout = {CONNECT_TIMEOUT_S}"),
         format!("max-time = {max_time}"),
+        format!("speed-limit = {SPEED_LIMIT}"),
+        format!("speed-time = {SPEED_TIME_S}"),
         WRITE_OUT.to_string(),
     ];
     if let Some(p) = proxy {
@@ -867,7 +914,7 @@ mod tests {
         let sum = sha256_b64(&"ab".repeat(32)).unwrap();
         let text = curl_config(&put, Some("http://10.42.0.10:3128"), 61, &Kind::Put { len: 7, checksum: Some(&sum), owner: "123456789012" });
         let want = format!(
-            "url = \"{}\"\nsilent\nshow-error\nproto = \"=https\"\nconnect-timeout = 20\nmax-time = 61\n{WRITE_OUT}\nproxy = \"http://10.42.0.10:3128\"\nrequest = \"PUT\"\nupload-file = \"-\"\nheader = \"Content-Length: 7\"\nheader = \"Transfer-Encoding:\"\nheader = \"Expect:\"\nheader = \"x-amz-checksum-sha256: {sum}\"\nheader = \"If-None-Match: *\"\nheader = \"x-amz-expected-bucket-owner: 123456789012\"\noutput = \"-\"\n",
+            "url = \"{}\"\nsilent\nshow-error\nproto = \"=https\"\nconnect-timeout = 20\nmax-time = 61\nspeed-limit = 1024\nspeed-time = 60\n{WRITE_OUT}\nproxy = \"http://10.42.0.10:3128\"\nrequest = \"PUT\"\nupload-file = \"-\"\nheader = \"Content-Length: 7\"\nheader = \"Transfer-Encoding:\"\nheader = \"Expect:\"\nheader = \"x-amz-checksum-sha256: {sum}\"\nheader = \"If-None-Match: *\"\nheader = \"x-amz-expected-bucket-owner: 123456789012\"\noutput = \"-\"\n",
             put.expose()
         );
         assert_eq!(text, want);
@@ -876,7 +923,25 @@ mod tests {
         assert!(!tail.contains("header = \"x-amz-checksum-sha256") && !tail.contains("proxy") && tail.contains("max-time = 8\n"), "{tail}");
         let get = url(key, SIGNED_HEADERS_GET, true);
         let text = curl_config(&get, None, 9, &Kind::Get { owner: "123456789012" });
-        assert_eq!(text, format!("url = \"{}\"\nsilent\nshow-error\nproto = \"=http\"\nconnect-timeout = 20\nmax-time = 9\n{WRITE_OUT}\nrequest = \"GET\"\nheader = \"x-amz-expected-bucket-owner: 123456789012\"\nfail\noutput = \"-\"\n", get.expose()));
+        assert_eq!(
+            text,
+            format!("url = \"{}\"\nsilent\nshow-error\nproto = \"=http\"\nconnect-timeout = 20\nmax-time = 9\nspeed-limit = 1024\nspeed-time = 60\n{WRITE_OUT}\nrequest = \"GET\"\nheader = \"x-amz-expected-bucket-owner: 123456789012\"\nfail\noutput = \"-\"\n", get.expose())
+        );
+    }
+
+    /// S10 (R1): S3's final answer to a tail's push ends its URL: 200, 412
+    /// (the key stored by a push before), 403 or another 400 (pushing again
+    /// changes nothing) drop it; a 5xx, and 408, 409, 429 and 400
+    /// `RequestTimeout` (S3 asks to retry), keep it for the next hook (as
+    /// does curl without a status, which never reaches here).
+    #[test]
+    fn a_tails_url_is_spent_by_a_final_answer() {
+        for (spent, code) in [(200, None), (201, None), (400, None), (400, Some("BadDigest")), (403, Some("AccessDenied")), (404, None), (412, Some("PreconditionFailed"))] {
+            assert!(tail_spent(spent, code), "{spent} {code:?}");
+        }
+        for (kept, code) in [(500, None), (502, None), (503, Some("SlowDown")), (504, None), (599, None), (408, None), (409, Some("ConditionalRequestConflict")), (409, None), (429, None), (400, Some("RequestTimeout"))] {
+            assert!(!tail_spent(kept, code), "{kept} {code:?}");
+        }
     }
 
     /// curl's status line, S3's `<Code>` and the words of a run without a status.
@@ -923,6 +988,7 @@ mod tests {
         t.keep_tail(tail(10, 100), 50);
         t.keep_tail(tail(20, 100), 50);
         assert_eq!(t.tails_due(60).iter().map(|t| t.from).collect::<Vec<_>>(), [20], "the newest replaces");
+        assert!(t.kept(&tail(20, 100)) && !t.kept(&tail(10, 100)), "S10: only the newest is kept");
         t.take_tail(&tail(10, 100));
         assert_eq!(t.tails_due(60).len(), 1, "a tail replaced meanwhile is not taken");
         t.take_tail(&tail(20, 100));

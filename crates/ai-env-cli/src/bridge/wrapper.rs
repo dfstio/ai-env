@@ -1148,7 +1148,7 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     }
     // 3. Same version as this binary.
     let mine = env!("CARGO_PKG_VERSION");
-    let banner = run_capture(&wrapper, &["--version"], Duration::from_secs(5)).map_err(|e| CliError::Msg(format!("ai-env-claude --version: {e}")))?;
+    let banner = run_capture(&wrapper, &["--version"], Duration::from_secs(15)).map_err(|e| CliError::Msg(format!("ai-env-claude --version: {e}")))?;
     let Some(theirs) = version_token(&banner) else {
         bail!("ai-env-claude --version printed no version: {banner:?}");
     };

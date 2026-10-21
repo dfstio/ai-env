@@ -40,6 +40,8 @@ mod cli;
 mod e2e;
 #[path = "workspace/smart_http.rs"]
 mod smart_http;
+#[path = "workspace/carry.rs"]
+mod carry;
 
 use ai_env_cli::gitrun::{GitRun, OVERRIDES};
 use common::{git_calls, git_real, install_fake_git, GitCall};
@@ -328,9 +330,9 @@ fn a_gitlink_at_a_tripping_path_refuses_the_seed_before_any_note() {
 /// path as the other notes name theirs (`blobscan::shown_path`, then the
 /// scrubber). No rule matches a key-shaped segment (`token=<value>`, built
 /// at run time), so the seed goes on, and the note shows no value; an
-/// ordinary path keeps its name. The note is `blobscan::scan_settings`'
-/// (nothing else reads a gitlink's path, as `rev-list --objects` lists
-/// none).
+/// ordinary path keeps its name. The note is
+/// `blobscan::scan_settings_within`' (nothing else reads a gitlink's path,
+/// as `rev-list --objects` lists none).
 #[test]
 fn a_seed_note_never_shows_a_key_shaped_submodule_path() {
     use ai_env_cli::bridge::workspace::{prepare, resolve, SeedLimits};

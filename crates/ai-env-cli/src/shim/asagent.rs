@@ -19,18 +19,23 @@
 //! helper dropped mid-op is killed before its own rollback ran.
 //!
 //! Also here: [`WorkspaceSlot`], the shim's one workspace (one per VM): the
-//! last seed's record (in memory, so it survives a suspend), and the lock
-//! that serialises seed, code-out and snapshot (a request waits at most
-//! `budget::BUSY_WAIT`, then 409 `busy` with `Retry-After`); and the answers
-//! the routes give (`refused`, `answered`). S9's git CGI (`gitcgi`) takes no
+//! last seed's record (in memory, so it survives a suspend; S10, W3 #2: and
+//! in [`SEED_RECORD_PATH`], root's, so it survives a shim restart:
+//! [`RecordStore`]), and the lock that serialises seed, code-out and
+//! snapshot (a request waits at most `budget::BUSY_WAIT`, then 409 `busy`
+//! with `Retry-After`); and the answers the routes give (`refused`, `answered`). S9's git CGI (`gitcgi`) takes no
 //! lock, only one of its own two slots ([`WorkspaceSlot::try_cgi`]), and
 //! reads its helper's output past the head as a CGI's
 //! ([`AgentProc::read_cgi_head`], [`AgentProc::into_stream`]).
 use crate::shim::childproc::{child_setup, cwd_parts, fd_walk_end, CWD_ERRNO_BASE};
-use crate::shim::health::ShimState;
+use crate::shim::health::{ShimOpts, ShimState};
 use crate::shim::spawn::{killpg, wait_exited, HelperHold};
 use crate::wire::workspace::{budget, parse_head, read_head_line_async, refusal, head_line, HelperHead, SeedRecord, SnapshotReply, WorkspaceView, WsRefusal, HEAD_LINE_MAX};
 use crate::wire::workspace::{GIT_CGI_HEADERS, GIT_CGI_HEAD_MAX, GIT_CGI_MAX};
+use crate::wire::workspace::{branch_check, vm_path_check, JsonPayloadReply, JSON_PAYLOAD_MAX};
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
+use std::path::{Path, PathBuf};
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -503,6 +508,54 @@ pub async fn run_with_body<T: DeserializeOwned>(state: &ShimState, cmd: AgentCmd
             Err(e)
         }
     }
+}
+
+/// [`run_op`] for an op that answers in the payload form (S10: `seed-state`,
+/// whose shallow list can pass a head line): its head a `JsonPayloadReply`,
+/// then exactly the `len` bytes it names (at most `JSON_PAYLOAD_MAX`), read
+/// within the run's deadline and their sha256 checked, then the run
+/// finished: as with [`run_op`], the helper is reaped before this returns,
+/// so the route answers with no helper left (S9's `s3xfer::run_payload`
+/// finishes the run off the reply's path instead). The reply; or the
+/// refusal: the helper's own, `timeout` past the deadline, else
+/// `git_failed` (a payload that is not what its head announced among them).
+pub async fn run_op_payload<T: DeserializeOwned>(state: &ShimState, cmd: AgentCmd) -> Result<T, Box<WsRefusal>> {
+    let op = cmd.op;
+    let failed = |e: AgentProcError| Box::new(e.refusal(op));
+    let mut proc = AgentProc::start(state, cmd).await.map_err(failed)?;
+    let head = match proc.head::<JsonPayloadReply>().await {
+        Ok(h) => h,
+        Err(e) => {
+            proc.stop().await;
+            return Err(failed(e));
+        }
+    };
+    let (sums, len) = match head.outcome() {
+        Some(Ok((sums, Some(len)))) if len <= JSON_PAYLOAD_MAX as u64 => (sums, len),
+        Some(Err(r)) => {
+            if let Err(e) = proc.finish().await {
+                errln!("ai-env: workspace {op} helper ended badly after its refusal: {}", e.refusal(op).message);
+            }
+            return Err(Box::new(r));
+        }
+        _ => {
+            proc.stop().await;
+            return Err(failed(AgentProcError::BadHead(format!("no payload of at most {JSON_PAYLOAD_MAX} bytes announced"))));
+        }
+    };
+    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or_default()];
+    let why = match tokio::time::timeout_at(proc.deadline, proc.stdout.read_exact(&mut bytes)).await {
+        Err(_) => Some(AgentProcError::Timeout),
+        Ok(Err(e)) => Some(AgentProcError::BadHead(format!("the payload: {e}"))),
+        Ok(Ok(_)) if hex::encode(Sha256::digest(&bytes)) != sums.sha256 => Some(AgentProcError::BadHead(format!("a payload of {len} bytes that is not the one announced"))),
+        Ok(Ok(_)) => None,
+    };
+    if let Some(e) = why {
+        proc.stop().await;
+        return Err(failed(e));
+    }
+    proc.finish().await.map_err(failed)?;
+    serde_json::from_slice(&bytes).map_err(|e| failed(AgentProcError::BadHead(format!("a payload that does not parse: {}", parse_error(&e)))))
 }
 
 async fn finish_head<T: DeserializeOwned>(mut proc: AgentProc) -> Result<HelperHead<T>, AgentProcError> {
@@ -1013,7 +1066,7 @@ fn stat_session(stat: &str) -> Option<u32> {
 
 /// The processes of the session `sid` but its leader, zombies left out.
 #[cfg(target_os = "linux")]
-fn session_pids(sid: u32) -> Vec<u32> {
+pub(crate) fn session_pids(sid: u32) -> Vec<u32> {
     let Ok(rd) = std::fs::read_dir("/proc") else { return Vec::new() };
     rd.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok()).filter(|pid| *pid != sid && in_session(*pid, sid)).collect()
 }
@@ -1044,7 +1097,7 @@ fn signal_in_session(pid: u32, sid: u32, sig: libc::c_int) -> bool {
 /// The processes of the session `sid` but its leader (native tests: the
 /// shim runs on Linux).
 #[cfg(target_os = "macos")]
-fn session_pids(sid: u32) -> Vec<u32> {
+pub(crate) fn session_pids(sid: u32) -> Vec<u32> {
     // SAFETY: a null buffer of no size asks how many pids there are.
     let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let Ok(n) = usize::try_from(n) else { return Vec::new() };
@@ -1073,7 +1126,7 @@ fn signal_in_session(pid: u32, sid: u32, sig: libc::c_int) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn session_pids(_sid: u32) -> Vec<u32> {
+pub(crate) fn session_pids(_sid: u32) -> Vec<u32> {
     Vec::new()
 }
 
@@ -1110,6 +1163,8 @@ pub struct WorkspaceSlot {
     shared: Arc<SlotShared>,
     /// The git CGI's runs (S9): `GIT_CGI_MAX` at once, never waited for.
     cgi: Arc<tokio::sync::Semaphore>,
+    /// S10 (W3 #2): where the record persists (`None`: in memory only).
+    store: Option<RecordStore>,
 }
 
 /// One git CGI run's slot ([`WorkspaceSlot::try_cgi`]); dropped (its stream
@@ -1133,11 +1188,23 @@ impl Drop for SlotGuard {
 impl Default for WorkspaceSlot {
     fn default() -> Self {
         let shared = SlotShared { lock: Arc::new(tokio::sync::Mutex::new(())), state: Mutex::new(SlotState::default()), wait: Mutex::new(budget::BUSY_WAIT) };
-        WorkspaceSlot { shared: Arc::new(shared), cgi: Arc::new(tokio::sync::Semaphore::new(GIT_CGI_MAX)) }
+        WorkspaceSlot { shared: Arc::new(shared), cgi: Arc::new(tokio::sync::Semaphore::new(GIT_CGI_MAX)), store: None }
     }
 }
 
 impl WorkspaceSlot {
+    /// The slot of a shim whose record persists in `store` (S10, W3 #2):
+    /// what a shim before this one kept there, when it passes the load's
+    /// checks ([`RecordStore::load`]), is the last seed's from the start.
+    #[must_use]
+    pub fn persisted(store: Option<RecordStore>) -> WorkspaceSlot {
+        let slot = WorkspaceSlot { store, ..WorkspaceSlot::default() };
+        if let Some(record) = slot.store.as_ref().and_then(RecordStore::load) {
+            slot.shared.state().record = Some(record);
+        }
+        slot
+    }
+
     /// How long a request waits for the workspace before 409 `busy`.
     #[must_use]
     pub fn busy_wait(&self) -> Duration {
@@ -1177,8 +1244,22 @@ impl WorkspaceSlot {
     }
 
     /// Keep `record` as the last seed's (one workspace per VM: the shim keeps
-    /// its path for the VM's life).
+    /// its path for the VM's life), in its store too (S10, W3 #2: written
+    /// atomically, [`RecordStore::save`]; a record the load would refuse, or
+    /// a write that fails, is kept in memory only, with a log line, and the
+    /// file an earlier seed wrote goes: a restarted shim then has no record,
+    /// never an older one).
     pub fn set_record(&self, record: SeedRecord) {
+        if let Some(store) = &self.store {
+            if let Err(why) = store.save(&record) {
+                let old = match std::fs::remove_file(&store.path) {
+                    Ok(()) => "the older file removed".to_string(),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => "no older file".to_string(),
+                    Err(e) => format!("the older file not removed: {e}"),
+                };
+                errln!("ai-env: seed record not kept in {} ({why}): in memory only, {old}", store.path.display());
+            }
+        }
         self.shared.state().record = Some(record);
     }
 
@@ -1194,6 +1275,163 @@ impl WorkspaceSlot {
     pub fn view(&self, helpers: usize) -> WorkspaceView {
         let st = self.shared.state();
         WorkspaceView { seed: st.record.clone(), busy: st.busy.map(str::to_string), helpers: u32::try_from(helpers).unwrap_or(u32::MAX), last_wip: st.last_wip.clone(), last_wip_at: st.last_wip_at.clone() }
+    }
+}
+
+// ---- the persisted seed record (S10, W3 #2) --------------------------------------------------
+
+/// Where the shim keeps the last seed's record: root's, 0600, in a root
+/// 0700 directory the image makes (and bakes no record into); under
+/// `--fs-root` in the native tests. The root shim alone reads and writes it:
+/// no path the agent can write is ever touched (invariant 17).
+pub const SEED_RECORD_PATH: &str = "/var/lib/ai-env/seed-record.json";
+/// The record file's version: `{"v":1,"record":<SeedRecord>}`.
+pub const SEED_RECORD_V: u32 = 1;
+/// The largest record file read (a record is a few hundred bytes).
+const SEED_RECORD_MAX: u64 = 64 * 1024;
+/// The keys a `SeedRecord` writes: a record file's `record` holds no other.
+const SEED_RECORD_KEYS: [&str; 9] = ["path", "mode", "branch", "head", "wip", "wip_tree", "index_tree", "object_format", "at"];
+
+/// The record file as it is read: no key but these two.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordFileIn {
+    v: u32,
+    record: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The record file as it is written.
+#[derive(Debug, Serialize)]
+struct RecordFileOut<'a> {
+    v: u32,
+    record: &'a SeedRecord,
+}
+
+/// The persisted record (S10, W3 #2): its file, and the agent's home (with
+/// the fs root) every record's path must lie under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStore {
+    path: PathBuf,
+    home: PathBuf,
+    fs_root: Option<PathBuf>,
+}
+
+impl RecordStore {
+    /// The shim's store: [`SEED_RECORD_PATH`], under `--fs-root` when set. A
+    /// shim with neither an fs root nor root's uid (an in-process test) has
+    /// none: its record lives in memory only, as before S10, and it never
+    /// reads or writes this machine's `/var/lib`.
+    #[must_use]
+    pub fn for_shim(opts: &ShimOpts) -> Option<RecordStore> {
+        let path = match &opts.fs_root {
+            Some(root) => root.join(SEED_RECORD_PATH.trim_start_matches('/')),
+            None if nix::unistd::geteuid().is_root() => PathBuf::from(SEED_RECORD_PATH),
+            None => return None,
+        };
+        Some(RecordStore { path, home: opts.home.clone(), fs_root: opts.fs_root.clone() })
+    }
+
+    /// The file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A record's checks, at the load and before each write: its path a VM
+    /// path (absolute, NFC, no `.` or `..` component: `vm_path_check`)
+    /// strictly under the agent's home; its branch one git takes; its
+    /// `head`, `wip`, `wip_tree` and `index_tree` ids of its object format.
+    fn check(&self, r: &SeedRecord) -> Result<(), String> {
+        vm_path_check(&r.path).map_err(|e| format!("its path {e}"))?;
+        let disk = match &self.fs_root {
+            Some(root) => root.join(r.path.trim_start_matches('/')),
+            None => PathBuf::from(&r.path),
+        };
+        if !disk.strip_prefix(&self.home).is_ok_and(|rest| rest.components().next().is_some()) {
+            return Err(format!("its path {} is not under the agent's home", r.path));
+        }
+        if let Some(b) = &r.branch {
+            branch_check(b).map_err(|e| format!("its branch {e}"))?;
+        }
+        for (what, id) in [("head", Some(&r.head)), ("wip", r.wip.as_ref()), ("wip_tree", r.wip_tree.as_ref()), ("index_tree", r.index_tree.as_ref())] {
+            if id.is_some_and(|id| !r.object_format.is_id(id)) {
+                return Err(format!("its {what} is no {} id", r.object_format.name()));
+            }
+        }
+        Ok(())
+    }
+
+    /// A record file's text, checked strictly: one JSON object of `v` 1 and
+    /// the record, no other key in either, and the record's checks.
+    fn parse(&self, bytes: &[u8]) -> Result<SeedRecord, String> {
+        let file: RecordFileIn = serde_json::from_slice(bytes).map_err(|e| format!("it does not parse ({})", parse_error(&e)))?;
+        if file.v != SEED_RECORD_V {
+            return Err(format!("its v is {}, not {SEED_RECORD_V}", file.v));
+        }
+        if let Some(key) = file.record.keys().find(|k| !SEED_RECORD_KEYS.contains(&k.as_str())) {
+            return Err(format!("its record has an unknown key {:?}", key.chars().take(64).collect::<String>()));
+        }
+        let record: SeedRecord = serde_json::from_value(serde_json::Value::Object(file.record)).map_err(|e| format!("its record does not parse ({})", parse_error(&e)))?;
+        self.check(&record)?;
+        Ok(record)
+    }
+
+    /// The record the file holds when it passes every check ([`Self::parse`]):
+    /// else `None`, logged with the reason (silently for a VM never seeded,
+    /// which has no file).
+    #[must_use]
+    pub fn load(&self) -> Option<SeedRecord> {
+        let shown = self.path.display();
+        let read = match std::fs::symlink_metadata(&self.path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+            Err(e) => Err(e.to_string()),
+            Ok(md) if !md.is_file() => Err("it is not a regular file".into()),
+            Ok(md) if md.len() > SEED_RECORD_MAX => Err(format!("it is over {SEED_RECORD_MAX} bytes")),
+            Ok(_) => std::fs::read(&self.path).map_err(|e| e.to_string()),
+        };
+        match read.and_then(|bytes| self.parse(&bytes)) {
+            Ok(record) => {
+                errln!("ai-env: seed record loaded from {shown}: {} at {}", record.path, record.head);
+                Some(record)
+            }
+            Err(why) => {
+                errln!("ai-env: seed record {shown} ignored: {why}");
+                None
+            }
+        }
+    }
+
+    /// Write `record` atomically (a record the load would refuse never is):
+    /// a temp file (0600) beside the file, in its directory (made 0700 when
+    /// missing, and kept 0700), fsynced, renamed over it, the directory
+    /// fsynced after. `Err` says why not.
+    fn save(&self, record: &SeedRecord) -> Result<(), String> {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        self.check(record)?;
+        let dir = self.path.parent().ok_or("the file has no directory")?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("cannot keep {} 0700: {e}", dir.display()))?;
+        let mut text = serde_json::to_vec(&RecordFileOut { v: SEED_RECORD_V, record }).map_err(|e| e.to_string())?;
+        text.push(b'\n');
+        let mut tmp = tempfile::Builder::new().prefix(".seed-record-").tempfile_in(dir).map_err(|e| format!("cannot make a temp file in {}: {e}", dir.display()))?;
+        std::io::Write::write_all(&mut tmp, &text).map_err(|e| e.to_string())?;
+        tmp.as_file().sync_all().map_err(|e| e.to_string())?;
+        tmp.persist(&self.path).map_err(|e| e.error.to_string())?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+}
+
+/// A parse error as a log line names it: where, and what, unless the text
+/// quotes a value.
+fn parse_error(e: &serde_json::Error) -> String {
+    let what = e.to_string();
+    if what.contains('"') {
+        format!("invalid at line {} column {}", e.line(), e.column())
+    } else {
+        what
     }
 }
 
@@ -1593,7 +1831,8 @@ mod tests {
         assert!(matches!(e, AgentProcError::Draining));
         assert_eq!(e.refusal("seed-state").status(), 503);
         let none = ShimState::with(PathBuf::from("/nonexistent/claude"), ShimOpts::default(), ProbeSpec::default(), Arc::new(RealSys));
-        assert!(!none.serves_workspace() && none.caps() == [crate::wire::frame::CAP_CREDENTIAL_CACHE]);
+        // S10: `park_v1` is named with or without a helper.
+        assert!(!none.serves_workspace() && none.caps() == [crate::wire::frame::CAP_CREDENTIAL_CACHE, crate::wire::frame::CAP_PARK_V1]);
         assert!(matches!(run_op::<SeedState>(&none, cmd("seed-state", Duration::from_secs(5)), None).await, Err(AgentProcError::Spawn(_))));
         // A body for a helper that does not start is still read to its end (the client gets the answer, not a reset).
         for (st, want) in [(&state, "draining"), (&none, "spawn")] {
@@ -1607,5 +1846,144 @@ mod tests {
             assert!(matches!((&e, want), (AgentProcError::Draining, "draining") | (AgentProcError::Spawn(_), "spawn")), "{e:?}");
             assert_eq!(read.load(std::sync::atomic::Ordering::SeqCst), 16, "{want}: the body was read");
         }
+    }
+
+    /// S10: an op in the payload form (`seed-state`): the head names the
+    /// payload's length and sha256, the reply parses from those bytes, and
+    /// the helper is reaped before the run returns (no helper left, though
+    /// it lingers after its last byte); a payload other than the one
+    /// announced is 500 `git_failed`; a refusal is the helper's own.
+    #[tokio::test]
+    async fn a_payload_run_reads_its_reply_and_reaps_the_helper() {
+        use sha2::Digest as _;
+        let reply = r#"{"tip":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0","clean":true,"pristine":false,"shallow":["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"]}"#;
+        let script = |sha: &str| format!("printf '%s\\n' '{{\"ok\":true,\"reply\":{{\"sha256\":\"{sha}\"}},\"len\":{}}}'\nprintf '%s' '{reply}'\nsleep 0.3\n", reply.len());
+        let (_t, dir) = home();
+        let state = shim(&dir, &script(&hex::encode(sha2::Sha256::digest(reply.as_bytes()))));
+        let st = run_op_payload::<SeedState>(&state, cmd("seed-state", Duration::from_secs(20))).await.unwrap();
+        assert_eq!(st.shallow, Some(vec!["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_string()]));
+        assert_eq!(state.spawns.helpers(), 0, "reaped before the reply");
+        let (_t, dir) = home();
+        let other = shim(&dir, &script(&"0".repeat(64)));
+        let r = run_op_payload::<SeedState>(&other, cmd("seed-state", Duration::from_secs(20))).await.unwrap_err();
+        assert!(r.code == refusal::GIT_FAILED && r.message.contains("not the one announced"), "{r:?}");
+        let (_t, dir) = home();
+        let refusing = shim(&dir, "printf '%s\\n' '{\"ok\":false,\"code\":\"other_workspace\",\"message\":\"the VM was seeded at /w2\"}'\n");
+        assert_eq!(run_op_payload::<SeedState>(&refusing, cmd("seed-state", Duration::from_secs(20))).await.unwrap_err().code, refusal::OTHER_WORKSPACE);
+    }
+
+    /// A record of the workspace `/Users/agent/ws` (two ids of sha1).
+    fn record() -> SeedRecord {
+        SeedRecord {
+            path: "/Users/agent/ws".into(),
+            mode: crate::wire::workspace::SeedMode::Clone,
+            branch: Some("main".into()),
+            head: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".into(),
+            wip: Some("b".repeat(40)),
+            wip_tree: Some("c".repeat(40)),
+            index_tree: Some("d".repeat(40)),
+            object_format: crate::wire::workspace::ObjectFormat::Sha1,
+            at: "2026-10-20T08:00:00Z".into(),
+        }
+    }
+
+    /// S10 (W3 #2): a store under the fs root, the agent's home beneath it.
+    fn store_in(root: &Path) -> RecordStore {
+        let opts = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), ..ShimOpts::default() };
+        RecordStore::for_shim(&opts).expect("a store under the fs root")
+    }
+
+    /// S10 (W3 #2): the record file is written atomically (no temp file
+    /// left), 0600 in a 0700 directory, `{"v":1,"record":…}` with the
+    /// record's own keys, and read back by a new slot; a shim with neither
+    /// an fs root nor root's uid keeps none (it never touches this
+    /// machine's `/var/lib`). The keys a record writes are the ones a file's
+    /// record may hold.
+    #[test]
+    fn the_seed_record_is_written_atomically_and_read_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_t, dir) = home();
+        let store = store_in(&dir);
+        assert_eq!(store.path(), dir.join("vm/var/lib/ai-env/seed-record.json"));
+        let slot = WorkspaceSlot::persisted(Some(store.clone()));
+        assert_eq!(slot.record(), None, "no file: never seeded");
+        slot.set_record(record());
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert_eq!(text, format!("{{\"v\":1,\"record\":{}}}\n", serde_json::to_string(&record()).unwrap()));
+        assert_eq!(std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(store.path().parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        let left: Vec<_> = std::fs::read_dir(store.path().parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, [std::ffi::OsString::from("seed-record.json")], "no temp file left");
+        assert_eq!(WorkspaceSlot::persisted(Some(store.clone())).record(), Some(record()), "a restarted shim's slot");
+        let mut later = record();
+        later.mode = crate::wire::workspace::SeedMode::Update;
+        later.head = "e".repeat(40);
+        slot.set_record(later.clone());
+        assert_eq!(store.load(), Some(later), "replaced whole");
+        let keys: std::collections::BTreeSet<String> = serde_json::to_value(record()).unwrap().as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, SEED_RECORD_KEYS.iter().map(|k| (*k).to_string()).collect(), "every key a full record writes");
+        if !nix::unistd::geteuid().is_root() {
+            assert_eq!(RecordStore::for_shim(&ShimOpts::default()), None);
+        }
+    }
+
+    /// S10 (W3 #2): a file failing any check is ignored, and a record the
+    /// load would refuse is never written (kept in memory only, the file of
+    /// the seed before it removed, so a restart finds no record): another
+    /// version, an unknown key outside or inside the record, a record that
+    /// does not parse, a path that is not a VM path or not under the home
+    /// (or is the home itself), a bad branch, an id of another format or
+    /// none; a file that is no regular file or too large.
+    #[test]
+    fn a_seed_record_file_failing_a_check_is_ignored() {
+        let (_t, dir) = home();
+        let store = store_in(&dir);
+        std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        let good = serde_json::to_value(record()).unwrap();
+        let with = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut file = serde_json::json!({"v": 1, "record": good.clone()});
+            f(&mut file);
+            file.to_string()
+        };
+        let cases: Vec<(&str, String)> = vec![
+            ("v 2", with(&|f| f["v"] = 2.into())),
+            ("an unknown key", with(&|f| f["extra"] = true.into())),
+            ("an unknown record key", with(&|f| f["record"]["extra"] = true.into())),
+            ("no record", serde_json::json!({"v": 1}).to_string()),
+            ("a record without its head", with(&|f| drop(f["record"].as_object_mut().unwrap().remove("head")))),
+            ("a relative path", with(&|f| f["record"]["path"] = "Users/agent/ws".into())),
+            ("a dotdot path", with(&|f| f["record"]["path"] = "/Users/agent/../agent/ws".into())),
+            ("a path outside the home", with(&|f| f["record"]["path"] = "/Users/other/ws".into())),
+            ("the home itself", with(&|f| f["record"]["path"] = "/Users/agent".into())),
+            ("a bad branch", with(&|f| f["record"]["branch"] = "-x".into())),
+            ("a short head", with(&|f| f["record"]["head"] = "a1b2".into())),
+            ("a sha256 wip in a sha1 record", with(&|f| f["record"]["wip"] = "b".repeat(64).into())),
+            ("an index tree that is no id", with(&|f| f["record"]["index_tree"] = "HEAD".into())),
+            ("not JSON", "{\"v\":1,".into()),
+        ];
+        for (what, text) in &cases {
+            std::fs::write(store.path(), text).unwrap();
+            assert_eq!(store.load(), None, "{what}: {text}");
+        }
+        std::fs::write(store.path(), with(&|_| {})).unwrap();
+        assert_eq!(store.load(), Some(record()), "the good one reads");
+        std::fs::write(store.path(), format!("{}{}", with(&|_| {}), " ".repeat(SEED_RECORD_MAX as usize))).unwrap();
+        assert_eq!(store.load(), None, "too large");
+        std::fs::remove_file(store.path()).unwrap();
+        std::fs::create_dir(store.path()).unwrap();
+        assert_eq!(store.load(), None, "a directory");
+        std::fs::remove_dir(store.path()).unwrap();
+        let slot = WorkspaceSlot::persisted(Some(store.clone()));
+        let mut bad = record();
+        bad.path = "/Users/other/ws".into();
+        slot.set_record(bad.clone());
+        assert_eq!((slot.record(), store.path().exists()), (Some(bad), false), "kept in memory only, never written");
+        slot.set_record(record());
+        assert_eq!(store.load(), Some(record()));
+        let mut refused = record();
+        refused.branch = Some("-x".into());
+        slot.set_record(refused.clone());
+        assert_eq!((slot.record(), store.path().exists()), (Some(refused), false), "in memory only, the older file removed");
+        assert_eq!(WorkspaceSlot::persisted(Some(store)).record(), None, "a restarted shim has no record, not the older one");
     }
 }

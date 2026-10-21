@@ -863,7 +863,11 @@ for (const d of j.diagnostics || []) if (d.severity === "error") process.stderr.
 
 # infra_state_lag <outputs> <state/infra.toml>: the keys of the file whose value is not the stack output's (the egress
 # ids and hashes the ai-env egress commands read from it, S9's transcript store included: a deploy that only changes
-# the S3 endpoint's policy is lag, never drift), space-separated; "-" when the file does not exist.
+# the S3 endpoint's policy is lag, never drift; S10: the connector, which egress status judges by the ARN the file
+# records, compared as egress status compares connectors (a final :N version dropped: the file holds the live read's
+# ARN), and the names of the proxy documents, which every egress command holds to the ones it sends), space-separated;
+# "-" when the file does not exist. Only keys whose lag egress status would call drift belong here: each one listed
+# skips post-deploy's drift check until make infra-status WRITE=1.
 infra_state_lag() {
     printf '%s' "$1" | node -e '
 const fs = require("fs");
@@ -876,8 +880,13 @@ const keys = { proxyInstanceId: "proxy_instance_id", proxyPrivateIp: "proxy_priv
     vmEgressSecurityGroupId: "vm_egress_security_group_id", proxySecurityGroupId: "proxy_security_group_id", egressLogGroup: "egress_log_group",
     dnsMode: "dns_mode", parameterPrefix: "parameter_prefix", squidConfSha256: "squid_conf_sha256", allowSha256: "allow_sha256",
     transcriptsBucket: "transcripts_bucket", s3EndpointId: "s3_endpoint_id", s3EndpointPolicySha256: "s3_endpoint_policy_sha256",
-    transcriptsBucketPolicySha256: "transcripts_bucket_policy_sha256", proxyRouteTableId: "proxy_route_table_id" };
-console.log(Object.keys(keys).filter((k) => String(out[k] ?? "") !== (rec[keys[k]] ?? "")).map((k) => keys[k]).join(" "));
+    transcriptsBucketPolicySha256: "transcripts_bucket_policy_sha256", proxyRouteTableId: "proxy_route_table_id",
+    connectorArn: "connector_arn", proxyReloadDocument: "proxy_reload_document", proxyStatusDocument: "proxy_status_document",
+    proxyPatchDocument: "proxy_patch_document" };
+// normalize_connector (src/bridge/egress/mod.rs): trimmed, a final all-digit segment after the resource name dropped.
+const connector = (a) => { const p = a.trim().split(":"); return p.length >= 8 && /^[0-9]+$/.test(p[p.length - 1]) ? p.slice(0, -1).join(":") : a.trim(); };
+const same = (k, a, b) => (k === "connectorArn" ? connector(a) === connector(b) : a === b);
+console.log(Object.keys(keys).filter((k) => !same(k, String(out[k] ?? ""), rec[keys[k]] ?? "")).map((k) => keys[k]).join(" "));
 ' "$2"
 }
 
@@ -912,10 +921,12 @@ vpc_rows() {
 # serve what it booted with; nothing can name it until a deploy completes); no step 4 (a half-applied stack drifts by
 # definition).
 # The ai-env egress commands read the stack's ids from state/infra.toml; the outputs tell whether it is current: the
-# reload needs the same proxy instance, the status every egress id and hash (else a note says to run make
-# infra-status WRITE=1 first). Exit 1 when the reload failed, the proxy's state could not be read, or status found drift.
+# reload needs the same proxy instance and no proxy document the state names that the stack no longer exports (every
+# egress command refuses such a state), the status every egress id and hash, the connector and the proxy documents'
+# names (else a note says to run make infra-status WRITE=1 first). Exit 1 when the reload failed, the proxy's state
+# could not be read, or status found drift.
 cmd_post_deploy() {
-    local after=0 reloaded=0 have_outputs=1 bridge infra_toml outputs lag proxy doc st rc=0 vms pre="$out/pre-deploy-image.json" post="$out/post-deploy-image.json" a b s report drift
+    local after=0 reloaded=0 have_outputs=1 bridge infra_toml outputs lag named_docs k proxy doc st rc=0 vms pre="$out/pre-deploy-image.json" post="$out/post-deploy-image.json" a b s report drift
     case "${1:-}" in
     "") ;;
     --after-failure) after=1 ;;
@@ -930,11 +941,20 @@ cmd_post_deploy() {
         have_outputs=0
     fi
     lag=$(infra_state_lag "$outputs" "$infra_toml") || exit 1
+    # The proxy documents the state names but the stack no longer exports (a renamed document): every egress command
+    # refuses such a state (exit 1), the reload included. A state that names none (from before the documents' outputs)
+    # passes the CLI's check, so its reload runs; lag "-" (no state) never reaches the grep.
+    named_docs=""
+    for k in proxy_reload_document proxy_status_document proxy_patch_document; do
+        if in_words "$k" "$lag" && grep -q "^$k = \"..*\"\$" "$infra_toml"; then named_docs="$named_docs $k"; fi
+    done
     proxy=$(printf '%s' "$outputs" | jsq 'j.proxyInstanceId') || exit 1
     if [ -z "$proxy" ]; then
         echo "deploy: stack $stack exports no proxyInstanceId: egress reload skipped"
     elif [ "$lag" = - ] || in_words proxy_instance_id "$lag"; then
         echo "deploy: $infra_toml does not name the proxy instance $proxy yet (a new instance reads its parameters at boot): egress reload skipped; make infra-status WRITE=1, then make allowlist-reload if a parameter changed since the proxy booted (an earlier failed deploy counts)"
+    elif [ -n "$named_docs" ]; then
+        echo "deploy: $infra_toml names other proxy documents than this deploy's (${named_docs# }; every egress command refuses it): egress reload skipped; make infra-status WRITE=1, then make allowlist-reload"
     elif doc=$(aws ec2 describe-instances --instance-ids "$proxy" --region "$region" --endpoint-url "$ec2_url" --output json) \
         && st=$(printf '%s' "$doc" | jsq '(j.Reservations || []).flatMap((r) => r.Instances || []).map((i) => (i.State || {}).Name)'); then
         case "$st" in
@@ -959,7 +979,7 @@ cmd_post_deploy() {
         if [ "$have_outputs" = 1 ] && [ -z "$proxy" ]; then
             echo "deploy: the stack outputs name no proxy yet (no S5 pulumi up has completed): nothing can be reloaded now. A proxy an S5 update created read squid.conf and allow at its own boot; if an earlier failed deploy created it and they changed since, run make infra-status WRITE=1 and make allowlist-reload after the next deploy that completes (make proxy-start and ai-env egress status refuse a proxy serving an older config). Fix the failure above and run make deploy again"
         else
-            echo "deploy: THE DEPLOY FAILED AFTER pulumi up STARTED, AND THE PROXY WAS NOT RELOADED: it may still serve the pre-deploy parameters: make allowlist-reload (make infra-status WRITE=1 first when state/infra.toml does not name the proxy instance)"
+            echo "deploy: THE DEPLOY FAILED AFTER pulumi up STARTED, AND THE PROXY WAS NOT RELOADED: it may still serve the pre-deploy parameters: make allowlist-reload (make infra-status WRITE=1 first when state/infra.toml does not name the proxy instance or names other proxy documents)"
         fi
     fi
     vms=$(vpc_rows "$bridge/state/vms")

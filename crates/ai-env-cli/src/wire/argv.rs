@@ -15,7 +15,8 @@
 //! `--thinking=disabled`, `--max-thinking-tokens=N`), all but `--mcp-config`
 //! and `--managed-settings`; both spellings are read.
 //! `tests/fixtures/argv/*.json` carry `FIXTURE_EXT_VERSION` (its doc names
-//! the 8 that keep 2.1.278's argv). The 2.1.282 SDK builder
+//! the 8 that keep 2.1.278's argv; `KEPT_FIXTURES` the 4 of them the
+//! extension makes no more). The 2.1.282 SDK builder
 //! can also push `--managed-settings X`, `--plugin-dir-no-mcp X` and
 //! `--channels X` (space-separated values, listed in `VALUE_FLAGS`) and
 //! `--no-session-persistence` (a query whose transcript is never written —
@@ -56,13 +57,15 @@ pub fn split(argv: &[OsString]) -> Result<Invocation, ArgvError> {
     Ok(Invocation { real_binary: PathBuf::from(real), args })
 }
 
-/// The extension version `tests/fixtures/argv/*.json` were captured from;
+/// The extension version `tests/fixtures/argv/*.json` were captured from (a
+/// kept fixture, [`KEPT_FIXTURES`], may carry an older one);
 /// `ai-env doctor` warns when the installed bundle differs. S9's re-capture
 /// (19 Oct 2026) took 9 of the 17 from 2.1.303's census; the other 8 keep
 /// their 2.1.278 argv, tagged by hand: 2.1.303 makes `--version`, `--bare`,
-/// `--output-format json` and a session's Chrome `--mcp-config` no more, and
-/// `design-login`, `edit-permission-rules` and `--claude-in-chrome-mcp` only
-/// in flows the capture skipped.
+/// `--output-format json` and a session's Chrome `--mcp-config` no more
+/// ([`KEPT_FIXTURES`]), and `design-login`, `edit-permission-rules` and
+/// `--claude-in-chrome-mcp` only in flows the capture skipped (part B's
+/// Cursor checklist makes them).
 pub const FIXTURE_EXT_VERSION: &str = "2.1.303";
 
 /// Every fixture name under `tests/fixtures/argv/` (one source of truth:
@@ -87,6 +90,17 @@ pub const FIXTURE_NAMES: [&str; 17] = [
     "bare",
     "not_stream_json",
 ];
+
+/// The fixtures of shapes the extension makes no more (S10 F10), in
+/// [`FIXTURE_NAMES`]' order: 2.1.303 starts no `--version`, no `--bare`, no
+/// `--output-format json` and no session with Chrome's `--mcp-config`, so its
+/// census holds no row of them. They keep their 2.1.278 argv (the router
+/// still meets the shapes, from an older extension or a claude run by hand).
+/// `make argv-fixtures` rewrites one only from a row of its shape (the
+/// extension making it again) and otherwise reports it as kept, never as
+/// missing; a kept fixture's `ext_version` may stay below
+/// [`FIXTURE_EXT_VERSION`] when that moves on (never above it).
+pub const KEPT_FIXTURES: [&str; 4] = ["session_chrome_mcp", "version", "bare", "not_stream_json"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalReason {
@@ -144,7 +158,7 @@ pub enum Route {
 }
 
 /// Flags that consume the following token (unless written as `--flag=value`).
-const VALUE_FLAGS: [&str; 30] = [
+const VALUE_FLAGS: [&str; 32] = [
     "--output-format",
     "--input-format",
     "--permission-mode",
@@ -171,6 +185,9 @@ const VALUE_FLAGS: [&str; 30] = [
     "--permission-prompts",
     "--resume",
     "--session-id",
+    // S10's cut (a moved CLI resumes at a message); the second is never added, only stripped.
+    "--resume-session-at",
+    "--resume-drops-turn",
     "--setting-sources",
     "--managed-settings",
     "--plugin-dir-no-mcp",
@@ -451,11 +468,24 @@ mod tests {
         }
     }
 
+    /// Whether fixture `name`'s `ext_version` holds: `FIXTURE_EXT_VERSION`;
+    /// for a kept fixture (S10 F10, `KEPT_FIXTURES`, which a re-capture
+    /// rewrites only from a row of its shape) it or an older N.N.N.
+    fn tag_holds(name: &str, ext_version: &str) -> bool {
+        fn version(v: &str) -> Option<[u32; 3]> {
+            let mut parts = v.split('.').map(|p| Some(p).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).and_then(|p| p.parse::<u32>().ok()));
+            let out = [parts.next()??, parts.next()??, parts.next()??];
+            parts.next().is_none().then_some(out)
+        }
+        ext_version == FIXTURE_EXT_VERSION || (KEPT_FIXTURES.contains(&name) && version(ext_version).zip(version(FIXTURE_EXT_VERSION)).is_some_and(|(v, at)| v <= at))
+    }
+
     #[test]
     fn kat_fixtures() {
+        assert!(tag_holds("bare", "2.1.278") && !tag_holds("bare", "99.0.0") && !tag_holds("session", "2.1.278"), "a kept fixture may keep an older tag, no other");
         for text in FIXTURES {
             let f: Fixture = serde_json::from_str(text).expect("fixture json");
-            assert_eq!(f.ext_version, FIXTURE_EXT_VERSION, "fixture {} is tagged with another extension version", f.name);
+            assert!(tag_holds(&f.name, &f.ext_version), "fixture {} is tagged with another extension version ({})", f.name, f.ext_version);
             let route = classify(&f.argv);
             match (&route, f.route.as_str()) {
                 (Route::Local(r), "local") => {
@@ -569,8 +599,8 @@ mod tests {
     /// (thinking off, and the config probe: `--thinking=disabled`), and with
     /// no `--model` or `--effort`: the panel sends them after init.
     /// Every joined flag the router reads is read. The remote child keeps the
-    /// budget byte for byte (the fixtures' `[redacted:len=5]` is the census's
-    /// scrub of it) and loses `--add-dir=` and the debug flags.
+    /// budget byte for byte (the census too, S10 F7: the fixtures carry it)
+    /// and loses `--add-dir=` and the debug flags.
     #[test]
     fn the_joined_forms_of_2_1_303() {
         let id = "123ce858-087d-4061-a4e0-dafc20958256";
@@ -705,5 +735,34 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod n_tests {
+    use super::*;
+
+    /// The `argv` array of a fixture's text.
+    fn argv_of(text: &str) -> Vec<String> {
+        let j: serde_json::Value = serde_json::from_str(text).unwrap();
+        j["argv"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+    }
+
+    /// S10 F10: the kept fixtures are four of the index, in its order, and
+    /// their shapes are the ones extension 2.1.303 makes no more: `--version`,
+    /// `--bare`, a non-stream-json run, and a session whose `--mcp-config`
+    /// names Chrome's server.
+    #[test]
+    fn the_kept_fixtures_are_the_four_shapes_the_extension_makes_no_more() {
+        let at: Vec<usize> = KEPT_FIXTURES.iter().map(|k| FIXTURE_NAMES.iter().position(|n| n == k).unwrap_or_else(|| panic!("{k} is no fixture"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "in FIXTURE_NAMES' order: {at:?}");
+        assert_eq!(KEPT_FIXTURES, ["session_chrome_mcp", "version", "bare", "not_stream_json"]);
+        assert_eq!(classify(&argv_of(include_str!("../../tests/fixtures/argv/version.json"))), Route::Local(LocalReason::Version));
+        assert_eq!(classify(&argv_of(include_str!("../../tests/fixtures/argv/bare.json"))), Route::Local(LocalReason::Bare));
+        assert_eq!(classify(&argv_of(include_str!("../../tests/fixtures/argv/not_stream_json.json"))), Route::Local(LocalReason::NotStreamJson));
+        let chrome = argv_of(include_str!("../../tests/fixtures/argv/session_chrome_mcp.json"));
+        assert!(matches!(classify(&chrome), Route::Remote(s) if s.has_mcp_config), "{chrome:?}");
+        assert!(value_of(&chrome, "--mcp-config").is_some_and(|c| c.contains("claude-in-chrome")), "{chrome:?}");
     }
 }

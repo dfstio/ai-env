@@ -35,6 +35,20 @@
 //!   `mcp_message`, a superseded `set_*`, …) are failed towards the host with
 //!   an error `control_response` (`fail_in_flight`), so nothing waits forever.
 //!
+//! S10 (§3.1) adds the other direction and a move's needs:
+//! * the CLI's open requests to the host (`can_use_tool`, `hook_callback`,
+//!   `mcp_message`, …), by id, until the host answers one, the CLI withdraws
+//!   it (`control_cancel_request`) or, for a `can_use_tool`, a `result` ends
+//!   its turn ([`HostState::child_requests`], which `bridge::park` reads);
+//! * at a move they are withdrawn toward the host
+//!   ([`HostState::cancel_child_requests`]: the extension dismisses the
+//!   prompt), and a late host answer to one is dropped ([`HostVerdict::Drop`]):
+//!   the re-run asks again under a new id;
+//! * a move's replay sends a pending host `interrupt` again, last
+//!   ([`HostState::replay_move`]), so the re-run turn ends interrupted;
+//! * what the swallow rules and a move did is counted ([`DupCounts`]: the
+//!   census's `inits` and `echoes` parts).
+//!
 //! Every line crossing this API is WITHOUT its trailing `\n`.
 use crate::bridge::registry::HostStateSnapshot;
 use crate::wire::claude::{self, ChildFrame, HostFrame, CUMULATIVE_SUBTYPE};
@@ -101,6 +115,31 @@ pub enum ChildVerdict {
     Swallow(Swallowed),
 }
 
+/// What the pump does with one host → child line (S10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostVerdict {
+    /// Forward it (recorded as before).
+    Forward,
+    /// Drop it: the host's answer to a CLI request withdrawn at a move (`child_cancelled`); counted.
+    Drop,
+}
+
+/// What the swallow rules and a move did, for the census and the move's rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DupCounts {
+    pub inits_forwarded: u32,
+    pub inits_swallowed: u32,
+    pub echoes_forwarded: u32,
+    pub echoes_swallowed: u32,
+    pub answers_swallowed: u32,
+    pub lines_resent: u32,
+    pub requests_cancelled: u32,
+    pub answers_dropped: u32,
+}
+
+/// The subtype of the host request a move's replay sends again ([`HostState::replay_move`]).
+const INTERRUPT_SUBTYPE: &str = "interrupt";
+
 /// The recorder. `HostState::default()` is generation 1 with nothing recorded.
 #[derive(Debug)]
 pub struct HostState {
@@ -121,6 +160,13 @@ pub struct HostState {
     gen: u32,
     init_seen_this_gen: bool,
     inits_forwarded: u32,
+    /// S10: the CLI's request id → subtype, not yet answered by the host,
+    /// withdrawn by the CLI, or (a `can_use_tool`) ended with its turn.
+    child_pending: BTreeMap<String, String>,
+    /// S10: the CLI's request ids withdrawn toward the host at a move: a late answer is dropped.
+    child_cancelled: BTreeSet<String>,
+    /// S10: the counts but `inits_forwarded` ([`HostState::counts`]).
+    counts: DupCounts,
 }
 
 impl Default for HostState {
@@ -138,6 +184,9 @@ impl Default for HostState {
             gen: 1,
             init_seen_this_gen: false,
             inits_forwarded: 0,
+            child_pending: BTreeMap::new(),
+            child_cancelled: BTreeSet::new(),
+            counts: DupCounts::default(),
         }
     }
 }
@@ -171,15 +220,17 @@ impl HostState {
         Self::default()
     }
 
-    /// Record one host → child line (always forwarded by the pump).
-    pub fn on_host_frame(&mut self, frame: &HostFrame<'_>, line: &[u8]) {
+    /// Record one host → child line, and whether the pump forwards it: every
+    /// line but the host's answer to a CLI request withdrawn at a move
+    /// ([`HostVerdict::Drop`], counted in `answers_dropped`).
+    pub fn on_host_frame(&mut self, frame: &HostFrame<'_>, line: &[u8]) -> HostVerdict {
         match frame {
             HostFrame::ControlRequest { request_id, subtype, request } => {
                 let sub = subtype.as_deref().unwrap_or("");
                 if let Some(id) = request_id {
                     self.pending.insert(id.to_string(), sub.to_string());
                 }
-                let Some(request) = request else { return };
+                let Some(request) = request else { return HostVerdict::Forward };
                 let rec = Recorded { subtype: sub.to_string(), request_id: request_id.as_deref().unwrap_or("").to_string(), request: owned(request) };
                 if sub == "initialize" {
                     self.initialize = Some(rec);
@@ -199,8 +250,49 @@ impl HostState {
             HostFrame::User { uuid } => {
                 self.outstanding.push_back(UserLine { uuid: uuid.as_deref().map(str::to_string), line: Bytes::copy_from_slice(line), turn_started: false });
             }
-            HostFrame::ControlCancel { request_id: None } | HostFrame::ControlResponse { .. } | HostFrame::Other => {}
+            HostFrame::ControlResponse { request_id: Some(id) } => {
+                if self.child_cancelled.contains(id.as_ref()) {
+                    self.counts.answers_dropped += 1;
+                    return HostVerdict::Drop;
+                }
+                self.child_pending.remove(id.as_ref());
+            }
+            HostFrame::ControlCancel { request_id: None } | HostFrame::ControlResponse { request_id: None } | HostFrame::KeepAlive | HostFrame::Other => {}
         }
+        HostVerdict::Forward
+    }
+
+    /// The CLI's open requests to the host, by request id: their subtype.
+    #[must_use]
+    pub fn child_requests(&self) -> &BTreeMap<String, String> {
+        &self.child_pending
+    }
+
+    /// At a move: one `control_cancel_request` line for the host per open
+    /// CLI request (the extension dismisses its prompt); their ids move to
+    /// `child_cancelled`, so a late answer is dropped ([`HostVerdict::Drop`]).
+    pub fn cancel_child_requests(&mut self) -> Vec<Bytes> {
+        let open = std::mem::take(&mut self.child_pending);
+        self.counts.requests_cancelled += u32::try_from(open.len()).unwrap_or(u32::MAX);
+        open.into_keys()
+            .map(|id| {
+                let line = claude::control_cancel_line(&id);
+                self.child_cancelled.insert(id);
+                line
+            })
+            .collect()
+    }
+
+    /// Was `id` withdrawn at a move?
+    #[must_use]
+    pub fn child_cancelled(&self, id: &str) -> bool {
+        self.child_cancelled.contains(id)
+    }
+
+    /// What the swallow rules and the moves did so far.
+    #[must_use]
+    pub fn counts(&self) -> DupCounts {
+        DupCounts { inits_forwarded: self.inits_forwarded, ..self.counts }
     }
 
     /// Fold the two oldest `apply_flag_settings` into one: the older one's
@@ -237,10 +329,21 @@ impl HostState {
                             Some(rewritten) => ChildVerdict::Rewritten(rewritten),
                             None => ChildVerdict::Forward,
                         },
-                        _ => ChildVerdict::Swallow(Swallowed::ReplayResponse),
+                        _ => {
+                            self.counts.answers_swallowed += 1;
+                            ChildVerdict::Swallow(Swallowed::ReplayResponse)
+                        }
                     };
                 }
                 self.pending.remove(id);
+                ChildVerdict::Forward
+            }
+            ChildFrame::ControlRequest { request_id: Some(id), subtype } => {
+                self.child_pending.insert(id.to_string(), subtype.as_deref().unwrap_or("").to_string());
+                ChildVerdict::Forward
+            }
+            ChildFrame::ControlCancel { request_id: Some(id) } => {
+                self.child_pending.remove(id.as_ref());
                 ChildVerdict::Forward
             }
             ChildFrame::Init { .. } => {
@@ -248,6 +351,7 @@ impl HostState {
                 self.init_seen_this_gen = true;
                 if first_of_gen && self.gen >= 2 && self.swallow_init {
                     self.swallow_init = false;
+                    self.counts.inits_swallowed += 1;
                     return ChildVerdict::Swallow(Swallowed::SecondInit);
                 }
                 self.inits_forwarded += 1;
@@ -259,17 +363,25 @@ impl HostState {
             }
             ChildFrame::User { uuid: Some(u), is_replay: true } => {
                 if self.swallow_echo.remove(u.as_ref()) {
+                    self.counts.echoes_swallowed += 1;
                     return ChildVerdict::Swallow(Swallowed::UserEcho);
                 }
                 if self.outstanding.iter().any(|l| l.uuid.as_deref() == Some(u.as_ref())) {
                     self.echoed.insert(u.to_string());
                 }
+                self.counts.echoes_forwarded += 1;
+                ChildVerdict::Forward
+            }
+            ChildFrame::User { uuid: None, is_replay: true } => {
+                self.counts.echoes_forwarded += 1;
                 ChildVerdict::Forward
             }
             ChildFrame::Result { user_message_uuid, user_message_uuids, .. } => {
                 self.retire(user_message_uuid.as_deref(), user_message_uuids);
                 // A result means the new child is serving turns: stop holding host input.
                 self.window.clear();
+                // Its turn is over: no permission prompt of it is still open.
+                self.child_pending.retain(|_, subtype| subtype != "can_use_tool");
                 ChildVerdict::Forward
             }
             _ => ChildVerdict::Forward,
@@ -325,7 +437,26 @@ impl HostState {
         }
         self.swallow_echo = self.outstanding.iter().filter_map(|l| l.uuid.clone()).filter(|u| self.echoed.contains(u)).collect();
         out.extend(self.outstanding.iter().map(|l| l.line.clone()));
+        self.counts.lines_resent += u32::try_from(self.outstanding.len()).unwrap_or(u32::MAX);
         self.swallow_init = self.outstanding.front().is_some_and(|l| l.turn_started);
+        out
+    }
+
+    /// A move's replay (S10 L4): [`HostState::replay_lines`], then each
+    /// pending host `interrupt` sent again under a fresh id, last, so the new
+    /// CLI ends the re-run turn as interrupted; the new CLI's answer carries
+    /// the original id back to the host (as a replayed request's does).
+    /// Call [`HostState::begin_gen`] first and [`HostState::fail_in_flight`] after.
+    pub fn replay_move(&mut self, fresh_id: &mut dyn FnMut() -> String) -> Vec<Bytes> {
+        let mut out = self.replay_lines(fresh_id);
+        let interrupts: Vec<String> = self.pending.iter().filter(|(_, sub)| sub.as_str() == INTERRUPT_SUBTYPE).map(|(id, _)| id.clone()).collect();
+        for original in interrupts {
+            let Ok(request) = RawValue::from_string(format!(r#"{{"subtype":"{INTERRUPT_SUBTYPE}"}}"#)) else { continue };
+            let id = fresh_id();
+            out.push(claude::control_request_line(&id, &request));
+            self.fresh.insert(id.clone(), Some(original));
+            self.window.insert(id);
+        }
         out
     }
 
@@ -720,5 +851,158 @@ mod tests {
         st.begin_gen(2);
         let lines = texts(&st.replay_lines(&mut ids()));
         assert!(lines[0].ends_with(r#""request":{"subtype":"apply_flag_settings","settings":{"z":1,"a":2.50,"s":"x\"y"}}}"#), "{}", lines[0]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod p0_tests {
+    use super::*;
+    use crate::wire::claude::{classify_child, classify_host};
+
+    fn host(st: &mut HostState, line: &str) -> HostVerdict {
+        st.on_host_frame(&classify_host(line.as_bytes()), line.as_bytes())
+    }
+
+    fn child(st: &mut HostState, line: &str) -> ChildVerdict {
+        st.on_child_frame(&classify_child(line.as_bytes()), line.as_bytes())
+    }
+
+    fn ids() -> impl FnMut() -> String {
+        let mut n = 0;
+        move || {
+            n += 1;
+            format!("fresh-{n}")
+        }
+    }
+
+    fn ask(id: &str, subtype: &str) -> String {
+        format!(r#"{{"type":"control_request","request_id":"{id}","request":{{"subtype":"{subtype}"}}}}"#)
+    }
+
+    fn answer(id: &str) -> String {
+        format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{}}}}}}"#)
+    }
+
+    const INIT: &str = r#"{"request_id":"i1","type":"control_request","request":{"subtype":"initialize","hooks":{}}}"#;
+    const USER1: &str = r#"{"type":"user","uuid":"u1","session_id":"","message":{"role":"user","content":"one"}}"#;
+    const RESULT1: &str = r#"{"type":"result","subtype":"success","is_error":false,"user_message_uuid":"u1","user_message_uuids":["u1"]}"#;
+
+    fn texts(lines: &[Bytes]) -> Vec<String> {
+        lines.iter().map(|b| String::from_utf8(b.to_vec()).unwrap()).collect()
+    }
+
+    /// The CLI's requests to the host are open from the CLI's
+    /// `control_request` until the host's answer, the CLI's own
+    /// `control_cancel_request`, or, for a `can_use_tool`, the turn's
+    /// `result`, as the extension keeps them; one without an id is not kept.
+    #[test]
+    fn child_requests_open_and_close_like_the_extensions() {
+        let mut st = HostState::new();
+        assert!(st.child_requests().is_empty());
+        for (id, sub) in [("perm-1", "can_use_tool"), ("hook-1", "hook_callback"), ("mcp-1", "mcp_message"), ("perm-2", "can_use_tool")] {
+            assert_eq!(child(&mut st, &ask(id, sub)), ChildVerdict::Forward);
+        }
+        child(&mut st, r#"{"type":"control_request","request":{"subtype":"can_use_tool"}}"#);
+        assert_eq!(st.child_requests().iter().map(|(i, s)| (i.as_str(), s.as_str())).collect::<Vec<_>>(), [("hook-1", "hook_callback"), ("mcp-1", "mcp_message"), ("perm-1", "can_use_tool"), ("perm-2", "can_use_tool")]);
+        assert_eq!(host(&mut st, &answer("hook-1")), HostVerdict::Forward);
+        assert!(!st.child_requests().contains_key("hook-1"), "the host answered it");
+        assert_eq!(child(&mut st, r#"{"type":"control_cancel_request","request_id":"mcp-1"}"#), ChildVerdict::Forward);
+        assert!(!st.child_requests().contains_key("mcp-1"), "the CLI withdrew it");
+        child(&mut st, &ask("hook-2", "hook_callback"));
+        child(&mut st, RESULT1);
+        assert_eq!(st.child_requests().keys().map(String::as_str).collect::<Vec<_>>(), ["hook-2"], "a result ends its turn's permission prompts only");
+        assert_eq!(host(&mut st, &answer("nobody")), HostVerdict::Forward, "an answer to no open request still goes");
+        assert_eq!(host(&mut st, r#"{"type":"keep_alive"}"#), HostVerdict::Forward);
+        assert_eq!(st.pending_len(), 0, "the CLI's requests are no host requests");
+    }
+
+    /// At a move the open CLI requests are withdrawn toward the host, one
+    /// `control_cancel_request` each; the host's late answer to one is
+    /// dropped and counted, never forwarded to the new CLI, which asks again
+    /// under a new id; an answer to that new id goes.
+    #[test]
+    fn a_cancelled_requests_late_answer_is_dropped() {
+        let mut st = HostState::new();
+        child(&mut st, &ask("perm-1", "can_use_tool"));
+        child(&mut st, &ask("hook-1", "hook_callback"));
+        let lines = texts(&st.cancel_child_requests());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, id) in lines.iter().zip(["hook-1", "perm-1"]) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!((v["type"].as_str(), v["request_id"].as_str()), (Some("control_cancel_request"), Some(id)), "{line}");
+        }
+        assert!(st.child_requests().is_empty() && st.child_cancelled("perm-1") && st.child_cancelled("hook-1") && !st.child_cancelled("perm-2"));
+        assert_eq!(host(&mut st, &answer("perm-1")), HostVerdict::Drop, "a late answer to a withdrawn prompt");
+        child(&mut st, &ask("perm-2", "can_use_tool"));
+        assert_eq!(host(&mut st, &answer("perm-2")), HostVerdict::Forward, "the re-run's own prompt");
+        assert!(st.cancel_child_requests().is_empty(), "nothing open: nothing to withdraw");
+        let c = st.counts();
+        assert_eq!((c.requests_cancelled, c.answers_dropped), (2, 1));
+    }
+
+    /// The counts follow the swallow rules: an init forwarded or swallowed
+    /// (the new CLI's first, its turn already started), an echo forwarded or
+    /// swallowed (once seen by the host), a replayed answer swallowed, every
+    /// outstanding line re-sent.
+    #[test]
+    fn the_counts_follow_the_swallow_rules() {
+        let mut st = HostState::new();
+        assert_eq!(st.counts(), DupCounts::default());
+        host(&mut st, INIT);
+        child(&mut st, &answer("i1"));
+        host(&mut st, USER1);
+        child(&mut st, r#"{"type":"system","subtype":"init","session_id":"s"}"#);
+        child(&mut st, r#"{"type":"user","uuid":"u1","isReplay":true}"#);
+        child(&mut st, r#"{"type":"user","isReplay":true}"#);
+        st.begin_gen(2);
+        let lines = st.replay_lines(&mut ids());
+        assert_eq!(lines.len(), 2, "initialize, then the outstanding line");
+        assert_eq!(child(&mut st, &answer("fresh-1")), ChildVerdict::Swallow(Swallowed::ReplayResponse));
+        assert_eq!(child(&mut st, r#"{"type":"system","subtype":"init","session_id":"s"}"#), ChildVerdict::Swallow(Swallowed::SecondInit));
+        assert_eq!(child(&mut st, r#"{"type":"user","uuid":"u1","isReplay":true}"#), ChildVerdict::Swallow(Swallowed::UserEcho));
+        child(&mut st, RESULT1);
+        child(&mut st, r#"{"type":"system","subtype":"init","session_id":"s"}"#);
+        assert_eq!(
+            st.counts(),
+            DupCounts { inits_forwarded: 2, inits_swallowed: 1, echoes_forwarded: 2, echoes_swallowed: 1, answers_swallowed: 1, lines_resent: 1, requests_cancelled: 0, answers_dropped: 0 }
+        );
+        assert_eq!(st.counts().inits_forwarded, st.inits_forwarded());
+    }
+
+    /// A move's replay is `replay_lines`' (initialize, the state, the
+    /// outstanding lines), then the pending host `interrupt` under a fresh
+    /// id, last; it is no request `fail_in_flight` fails, and the new CLI's
+    /// answer to it carries the host's id back. Another pending request is
+    /// failed as before.
+    #[test]
+    fn a_moves_replay_sends_a_pending_interrupt_last() {
+        let mut st = HostState::new();
+        host(&mut st, INIT);
+        child(&mut st, &answer("i1"));
+        host(&mut st, USER1);
+        host(&mut st, &ask("int-9", "interrupt"));
+        host(&mut st, &ask("mcp-7", "mcp_message"));
+        st.begin_gen(2);
+        let lines = texts(&st.replay_move(&mut ids()));
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains(r#""request_id":"fresh-1""#) && lines[0].contains("initialize"), "{}", lines[0]);
+        assert_eq!(lines[1], USER1, "the line sent again");
+        assert_eq!(lines[2], r#"{"type":"control_request","request_id":"fresh-2","request":{"subtype":"interrupt"}}"#, "the interrupt last, under a fresh id");
+        let failed = texts(&st.fail_in_flight());
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains(r#""request_id":"mcp-7""#), "{}", failed[0]);
+        match child(&mut st, &answer("fresh-2")) {
+            ChildVerdict::Rewritten(b) => assert_eq!(String::from_utf8(b.to_vec()).unwrap(), answer("int-9")),
+            other => panic!("the interrupt's answer carries the host's id: {other:?}"),
+        }
+        assert_eq!(st.pending_len(), 0);
+        assert_eq!(st.counts().lines_resent, 1);
+        // Nothing pending: a move's replay is replay_lines' alone.
+        let mut quiet = HostState::new();
+        host(&mut quiet, INIT);
+        child(&mut quiet, &answer("i1"));
+        quiet.begin_gen(2);
+        assert_eq!(texts(&quiet.replay_move(&mut ids())).len(), 1, "initialize alone");
     }
 }

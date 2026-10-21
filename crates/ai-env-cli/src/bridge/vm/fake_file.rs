@@ -59,6 +59,21 @@ impl FileFakeMicrovmApi {
     pub fn snapshot(&self) -> Result<FakeState, BridgeError> {
         self.with(|s| Ok(s.clone()))
     }
+
+    /// One look at the state, saved, and the state after it (S10): what
+    /// every call's [`FakeState::settle`] does first, alone. A TERMINATING
+    /// VM becomes TERMINATED (with `FakeState::terminate_after_hook`, once
+    /// its shim answered `/terminate`) and, with `FakeState::enforce_wall`,
+    /// a live VM past its wall TERMINATING. The fake endpoint's hook bridge takes it
+    /// when its unlocked copy shows a VM past its wall
+    /// (`FakeState::wall_due`), then posts that VM's `/terminate`: nothing
+    /// else may look at a quiet VM.
+    pub fn settled(&self) -> Result<FakeState, BridgeError> {
+        self.with(|s| {
+            s.settle();
+            Ok(s.clone())
+        })
+    }
 }
 
 impl MicrovmApi for FileFakeMicrovmApi {
@@ -227,5 +242,71 @@ mod tests {
         let api = FileFakeMicrovmApi::open(&path).unwrap();
         assert!(matches!(api.get("microvm-nope").await.unwrap_err(), BridgeError::VmNotFound(_)));
         assert_eq!(api.snapshot().unwrap().calls, vec![Call::Get("microvm-nope".into())]);
+    }
+
+    /// S10: the wall through the file (`FakeState::enforce_wall`): a VM
+    /// one handle aged past its wall is still RUNNING in a copy no one
+    /// looked at; one look (`settled`) ends it for every handle, its
+    /// reason saved, and records no call (the platform's end, not a
+    /// TerminateMicrovm); the look after finds it TERMINATED.
+    #[tokio::test]
+    async fn the_wall_is_one_locked_look_every_handle_sees() {
+        use crate::bridge::api::FAKE_WALL_REASON;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.json");
+        let (a, b) = (FileFakeMicrovmApi::open(&path).unwrap(), FileFakeMicrovmApi::open(&path).unwrap());
+        let vm = a.run(&spec("t1")).await.unwrap();
+        a.with(|s| {
+            s.enforce_wall = true;
+            s.advance_all();
+            s.age(&vm.id, 900);
+            Ok(())
+        })
+        .unwrap();
+        let copy = b.snapshot().unwrap();
+        assert!(copy.wall_due() && copy.vms[&vm.id].state == VmState::Running, "no look yet");
+        let calls = copy.calls.len();
+        let looked = b.settled().unwrap();
+        assert_eq!((&looked.vms[&vm.id].state, looked.vms[&vm.id].state_reason.as_deref()), (&VmState::Terminating, Some(FAKE_WALL_REASON)));
+        let saved = a.snapshot().unwrap();
+        assert_eq!((&saved.vms[&vm.id].state, saved.calls.len()), (&VmState::Terminating, calls), "saved, no call recorded");
+        assert_eq!(a.settled().unwrap().vms[&vm.id].state, VmState::Terminated);
+    }
+
+    /// S10: the wait for a shim's `/terminate` answer through the file
+    /// (`FakeState::terminate_after_hook`): what one handle recorded (the
+    /// VM's shim ran, then answered) is what every other handle's look
+    /// goes by, and a state saved before the fields existed reads with the
+    /// switch off.
+    #[tokio::test]
+    async fn the_terminate_wait_is_kept_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.json");
+        let (a, b) = (FileFakeMicrovmApi::open(&path).unwrap(), FileFakeMicrovmApi::open(&path).unwrap());
+        let vm = a.run(&spec("t1")).await.unwrap();
+        a.with(|s| {
+            s.terminate_after_hook = true;
+            s.advance_all();
+            s.hook_ran.insert(vm.id.clone());
+            Ok(())
+        })
+        .unwrap();
+        b.terminate(&vm.id).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(b.get(&vm.id).await.unwrap().state, VmState::Terminating, "its shim has not answered");
+        }
+        a.with(|s| {
+            s.terminate_answered.insert(vm.id.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(b.get(&vm.id).await.unwrap().state, VmState::Terminated);
+        let mut old: serde_json::Value = serde_json::to_value(FakeState::new()).unwrap();
+        for key in ["terminate_after_hook", "hook_ran", "terminate_answered", "terminating_since"] {
+            assert!(old.as_object_mut().unwrap().remove(key).is_some(), "{key} is saved");
+        }
+        std::fs::write(&path, old.to_string()).unwrap();
+        let read = b.snapshot().unwrap();
+        assert!(!read.terminate_after_hook && read.hook_ran.is_empty() && read.terminate_answered.is_empty() && read.terminating_since.is_empty());
     }
 }

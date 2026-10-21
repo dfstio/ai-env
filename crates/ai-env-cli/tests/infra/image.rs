@@ -416,10 +416,10 @@ fn the_make_child_carries_no_outer_make_or_operator_state() {
 
 const MUST_NOT_RUN: &[&str] = &["aws", "pulumi", "docker", "curl", "gpg", "cargo", "npm", "node", "zip", "shasum", "rustup", "sleep"];
 
-/// `$(LAB_UNSET)` as the live recipes run it: the seventeen lab knobs
+/// `$(LAB_UNSET)` as the live recipes run it: the eighteen lab knobs
 /// (`the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read` holds the
 /// Makefile's list to every one the code and ops.sh read).
-const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES";
+const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES -u AI_ENV_BRIDGE_LAB_PARK_AFTER_MS";
 
 /// The stand-in's log line of the operator CLI's keyless build (D18: infra.mk's `$(AI_ENV_BUILD)`, TIER's first
 /// step, and ops.sh's need_ai_env): `--version`, with no marker and no lab knob in its environment.
@@ -2308,6 +2308,73 @@ fn post_deploy_names_a_transcript_store_change_as_lag_never_drift() {
         assert!(c.iter().any(|l| l.starts_with("egress reload --if-changed")), "{what}: the same proxy instance is still reloaded: {c:#?}");
         if lag.is_empty() {
             assert!(!out.status.success() && text.contains("deploy: DRIFT: ai-env egress status found drift in vpc-endpoints"), "{what}: {text}");
+            continue;
+        }
+        assert!(out.status.success(), "{what}: {text}");
+        assert!(text.contains(&format!("predates this deploy ({lag} differ from the stack outputs): make infra-status WRITE=1")), "{what}: {text}");
+        assert!(!text.contains("DRIFT") && !c.iter().any(|l| l.starts_with("egress status")), "{what}: no egress status against the old state: {text}");
+    }
+}
+
+/// `o` with the proxy documents' names an S8 operators stack exports, as this ai-env sends them.
+fn with_documents(mut o: Value) -> Value {
+    o["proxyReloadDocument"] = json!("ai-env-proxy-reload");
+    o["proxyStatusDocument"] = json!("ai-env-proxy-status");
+    o["proxyPatchDocument"] = json!("ai-env-proxy-patch");
+    o
+}
+
+/// S10 (F2): post-deploy's lag check covers the connector and the proxy documents' names. egress status judges the
+/// connector by the ARN state/infra.toml records, and every egress command refuses a state naming other documents than
+/// the ones it sends (exit 1, which post-deploy reads as drift): a deploy that replaced the connector or renamed a
+/// document leaves the state behind, so post-deploy names those keys and runs no egress status; a state from before the
+/// documents' outputs names all three. A state that names a document the stack no longer exports is refused by the
+/// reload too, so post-deploy skips it, saying so (a good deploy never fails on it); a state that names none (from
+/// before the documents' outputs) passes the CLI's check, and its reload runs. The connector is compared as egress
+/// status compares connectors, a final `:N` version dropped (the state holds the live read's ARN): the same connector
+/// with and without one is no lag. A current state still runs egress status, and its drift fails the deploy.
+#[test]
+fn post_deploy_names_a_replaced_connector_or_renamed_documents_as_lag_never_drift() {
+    let deployed = with_documents(with_s9(outputs()));
+    let with = |o: &Value, changes: &[(&str, &str)]| {
+        let mut o = o.clone();
+        for (k, v) in changes {
+            o[*k] = json!(v);
+        }
+        o
+    };
+    let versioned = format!("{CONNECTOR_ARN}:1");
+    // (what, the recorded state, the deployed outputs, the lag post-deploy names; none: egress status runs)
+    let cases = [
+        ("a replaced connector", deployed.clone(), with(&deployed, &[("connectorArn", "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0fedcba9876543210")]), "connector_arn"),
+        ("a renamed document", deployed.clone(), with(&deployed, &[("proxyPatchDocument", "ai-env-proxy-patch-v2")]), "proxy_patch_document"),
+        ("a state from before the documents' outputs", with_s9(outputs()), deployed.clone(), "proxy_reload_document proxy_status_document proxy_patch_document"),
+        ("a replaced connector and a renamed document", deployed.clone(), with(&deployed, &[("connectorArn", "arn:aws:lambda:eu-central-1:123456789012:network-connector:nc-0fedcba9876543210"), ("proxyReloadDocument", "ai-env-proxy-reload-v2")]), "connector_arn proxy_reload_document"),
+        ("the same connector, a version recorded", with(&deployed, &[("connectorArn", versioned.as_str())]), deployed.clone(), ""),
+        ("the same connector, a version deployed", deployed.clone(), with(&deployed, &[("connectorArn", versioned.as_str())]), ""),
+        ("a current state", deployed.clone(), deployed.clone(), ""),
+    ];
+    for (what, recorded, now, lag) in &cases {
+        let (t, bin) = post_deploy_tree(Some(recorded), "running", "2", "2");
+        if recorded["connectorArn"] != now["connectorArn"] {
+            assert!(read(&t.path().join("bridge/state/infra.toml")).contains(&format!("connector_arn = {}\n", recorded["connectorArn"])), "{what}: the state records the connector it was written with");
+        }
+        write_outputs(t.path(), now);
+        // What the real egress status finds against an old state: the recorded connector is not the live one.
+        let out = ops5(t.path(), &bin, &["post-deploy"]).env("FAKE_AIENV_STATUS_RC", "1").env("FAKE_AIENV_DRIFT", "connector").bounded();
+        let text = all(&out);
+        let c = calls(t.path());
+        // The documents the state names that the stack no longer exports: the reload would be refused (exit 1).
+        let renamed: Vec<&str> = ["proxyReloadDocument", "proxyStatusDocument", "proxyPatchDocument"].into_iter().filter(|k| recorded.get(*k).is_some_and(|v| v.is_string()) && recorded[*k] != now[*k]).collect();
+        if renamed.is_empty() {
+            assert!(c.iter().any(|l| l.starts_with("egress reload --if-changed")), "{what}: the same proxy instance is still reloaded: {c:#?}");
+        } else {
+            assert!(!c.iter().any(|l| l.starts_with("egress reload")), "{what}: no reload the CLI would refuse: {c:#?}");
+            assert!(text.contains("names other proxy documents than this deploy's (") && text.contains("every egress command refuses it): egress reload skipped; make infra-status WRITE=1, then make allowlist-reload"), "{what}: {text}");
+        }
+        if lag.is_empty() {
+            assert!(!out.status.success() && text.contains("deploy: DRIFT: ai-env egress status found drift in connector"), "{what}: {text}");
+            assert!(!text.contains("predates this deploy"), "{what}: {text}");
             continue;
         }
         assert!(out.status.success(), "{what}: {text}");
@@ -5433,10 +5500,10 @@ fn make_n_of_the_s8_targets_names_their_commands_and_runs_nothing() {
 
 /// test-cursor checks STEP and SINCE before cargo runs: a missing STEP (also
 /// one only the environment names) and one that names no step are exit 2,
-/// naming the five steps; a missing or empty SINCE (also one only the
-/// environment names) is exit 2 too, naming SINCE=all; a step runs the
-/// checks with the gate, the step and the filters the command line gives,
-/// and no lab knob.
+/// naming the steps (S8's five, S9's t9_s3, S10's t10_2 to t10_5 and t10_p);
+/// a missing or empty SINCE (also one only the environment names) is exit 2
+/// too, naming SINCE=all; a step runs the checks with the gate, the step and
+/// the filters the command line gives, and no lab knob.
 #[test]
 fn test_cursor_refuses_a_missing_or_unknown_step_before_cargo() {
     let t = tempfile::tempdir().unwrap();
@@ -5452,11 +5519,18 @@ fn test_cursor_refuses_a_missing_or_unknown_step_before_cargo() {
         (out, lines_of(&log))
     };
     let steps = "(or t8_4, t8_5, t8_6, t8_7)";
+    let s10 = "or STEP=t9_s3 after S9's, or STEP=t10_2 (or t10_3, t10_4, t10_5, t10_p) after S10's";
+    let all_steps = "one of t8_3, t8_4, t8_5, t8_6, t8_7, t9_s3, t10_2, t10_3, t10_4, t10_5, t10_p";
     for (what, args, envs, want) in [
-        ("no STEP", &["test-cursor"][..], &[][..], format!("test-cursor: STEP is missing: make test-cursor STEP=t8_3 {steps} after that step in Cursor")),
+        ("no STEP", &["test-cursor"][..], &[][..], format!("test-cursor: STEP is missing: make test-cursor STEP=t8_3 {steps} after that step in Cursor, {s10}")),
         ("STEP in the environment only", &["test-cursor"][..], &[("STEP", "t8_3")][..], "test-cursor: STEP is missing".to_string()),
-        ("an unknown step", &["test-cursor", "STEP=t8_8"][..], &[][..], "test-cursor: STEP=t8_8 names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7".to_string()),
+        ("an unknown step", &["test-cursor", "STEP=t8_8"][..], &[][..], format!("test-cursor: STEP=t8_8 names no step: {all_steps}")),
         ("a test's name", &["test-cursor", "STEP=t8_3_evidence"][..], &[][..], "test-cursor: STEP=t8_3_evidence names no step".to_string()),
+        // S10: T10.1 is cargo test's (tests/continuity.rs), never a Cursor step; a step's prefix or a test's name is no step.
+        ("T10.1", &["test-cursor", "STEP=t10_1"][..], &[][..], format!("test-cursor: STEP=t10_1 names no step: {all_steps}")),
+        ("an S10 step's prefix", &["test-cursor", "STEP=t10"][..], &[][..], "test-cursor: STEP=t10 names no step".to_string()),
+        ("an S10 test's name", &["test-cursor", "STEP=t10_3_mid_turn_resends_the_line_once"][..], &[][..], "test-cursor: STEP=t10_3_mid_turn_resends_the_line_once names no step".to_string()),
+        ("an S10 step in the environment only", &["test-cursor"][..], &[("STEP", "t10_2")][..], "test-cursor: STEP is missing".to_string()),
     ] {
         let (out, calls) = run(args, envs);
         assert_eq!(out.status.code(), Some(2), "{what}: {}", all(&out));
@@ -5483,6 +5557,16 @@ fn test_cursor_refuses_a_missing_or_unknown_step_before_cargo() {
     let (out, calls) = run(&["test-cursor", "STEP=t8_3", "SINCE=all"], &[("WORKSPACE", "/w")]);
     assert!(out.status.success(), "{}", all(&out));
     assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP=t8_3 SINCE=all WORKSPACE=unset] [LAB=]")], "the environment's WORKSPACE never reaches the checks");
+    // S10's steps (tests/cursor_live.rs reads each one's evidence): each runs the checks as S8's and S9's do, with
+    // SINCE required, and no lab knob.
+    for step in ["t10_2", "t10_3", "t10_4", "t10_5", "t10_p"] {
+        let step_arg = format!("STEP={step}");
+        let (out, calls) = run(&["test-cursor", step_arg.as_str(), "SINCE=2026-10-20T09:00:00Z"], &[("AI_ENV_BRIDGE_LAB_PARK_AFTER_MS", "100")]);
+        assert!(out.status.success(), "{step}: {}", all(&out));
+        assert_eq!(calls, vec![format!("{checks} [TESTS=1 STEP={step} SINCE=2026-10-20T09:00:00Z WORKSPACE=unset] [LAB=]")], "{step}");
+        let (out, calls) = run(&["test-cursor", step_arg.as_str()], &[]);
+        assert!(out.status.code() == Some(2) && all(&out).contains(since) && calls.is_empty(), "{step}: SINCE is required: {}", all(&out));
+    }
 }
 
 /// The `ai-env` of the pair `make acceptance` runs (ACCEPT_BIN), a
@@ -6176,4 +6260,123 @@ fn make_n_test_aws_slow_1_sets_the_code_token_minutes_again_after_lab_unset() {
         assert!(knobs_set(&plain).is_empty() && !plain.contains("AI_ENV_AWS_SLOW"), "{what}: a lab knob or the slow switch set: {plain}");
     }
     assert_eq!(read(&log), "", "make -n ran a tool");
+}
+
+// ---- S10: test-aws S10=1 and S3=1 CHAT=dev ----
+
+/// `make -n test-aws S10=1` (S10's live tests, `live_s10_*`): the keyless compile first (D2), then the run with
+/// `AI_ENV_S10_TESTS=1` after `$(LAB_UNSET)` and the `live_s10_` filter. With SLOW=1 the three wall tests' switch,
+/// `AI_ENV_AWS_SLOW=1`, alone: no lab knob (the code token's minutes are S9's re-mint test's, which the filter leaves
+/// out). With S3=1 the two filters and gates add up. S10=1 in the environment is ignored, and the forms without it are
+/// S9's lines unchanged. Nothing runs.
+#[test]
+fn make_n_test_aws_s10_1_runs_the_s10_tests_and_slow_1_adds_the_slow_switch_alone() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make(t.path(), &bin, &["-n", "test-aws"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws";
+    let compile = format!("{NO_KEY} {LAB_UNSET} {cargo} --no-run");
+    let tail = format!("{cargo} -- --ignored --test-threads=1 --nocapture");
+    // The run's line: the one that starts with the lab knobs' removal (the compile's starts with the key's).
+    let run_line = |text: &str| text.lines().find(|l| l.starts_with(LAB_UNSET)).unwrap_or_else(|| panic!("no test run in the dry run: {text}")).to_string();
+    let knobs_set = |text: &str| text.split_whitespace().filter(|w| w.starts_with("AI_ENV_BRIDGE_LAB_") && w.contains('=')).map(str::to_string).collect::<Vec<_>>();
+
+    let s10 = dry(&["S10=1"], &[]);
+    assert_eq!(s10.lines().next(), Some(compile.as_str()), "the keyless compile first: {s10}");
+    assert_eq!(run_line(&s10), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S10_TESTS=1  {tail} live_s10_"));
+    assert!(knobs_set(&s10).is_empty() && !s10.contains("AI_ENV_AWS_SLOW"), "{s10}");
+    let slow = dry(&["S10=1", "SLOW=1"], &[]);
+    assert_eq!(slow.lines().next(), Some(compile.as_str()), "{slow}");
+    assert_eq!(run_line(&slow), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_S10_TESTS=1  {tail} live_s10_"), "the wall tests' switch, no code token minutes");
+    assert!(knobs_set(&slow).is_empty(), "a lab knob set for S10's tests: {slow}");
+    assert_eq!(run_line(&dry(&["S10=1", "S3=1"], &[])), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S3_TESTS=1 AI_ENV_S10_TESTS=1  {tail} live_s3_ live_s10_"));
+    for (what, plain, line) in [
+        ("no S10", dry(&[], &[]), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1   {tail}")),
+        ("S10=1 in the environment, which is ignored", dry(&[], &[("S10", "1")]), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1   {tail}")),
+        ("SLOW=1 without S10", dry(&["SLOW=1"], &[]), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2  {tail}")),
+        ("S3=1 without S10", dry(&["S3=1"], &[("S10", "1")]), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S3_TESTS=1  {tail} live_s3_")),
+    ] {
+        assert_eq!(run_line(&plain), line, "{what}");
+        assert!(!plain.contains("AI_ENV_S10_TESTS") && !plain.contains("live_s10_"), "{what}: {plain}");
+    }
+    assert_eq!(read(&log), "", "make -n ran a tool");
+}
+
+/// S10 (F12): `make test-aws S3=1 CHAT=dev` runs the S3 store's gib test alone (`live_s3_gib_round_trip_timing`, a
+/// top-level test of tests/aws.rs and the only one its filter names) with `AI_ENV_S3_CHAT` set to the Makefile's
+/// S3_CHAT_DEV, the development chat's shape (names and sizes only, set at part B's P0); a dry run shows the check
+/// before it, after the keyless compile (D2). Run (cargo a stand-in that logs): another CHAT, CHAT=dev without S3=1,
+/// and an empty or malformed S3_CHAT_DEV are exit 2 after the compile, before the tests; a well-formed one runs them
+/// with the shape and no lab knob; CHAT only the environment names is ignored, and so is S3_CHAT_DEV (the Makefile's
+/// line or the command line sets it: a stale export never picks the shape).
+#[test]
+fn test_aws_chat_dev_runs_the_gib_test_alone_on_the_dev_shape_or_refuses_before_the_tests() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let shape = "main=215,subtree=1650,files=40";
+    let shape_arg = format!("S3_CHAT_DEV={shape}");
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws";
+    let tail = format!("{cargo} -- --ignored --test-threads=1 --nocapture");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make(t.path(), &bin, &["-n", "test-aws"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let text = dry(&["S3=1", "CHAT=dev", shape_arg.as_str()], &[]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], format!("{NO_KEY} {LAB_UNSET} {cargo} --no-run"), "the keyless compile first: {text}");
+    assert!(lines[1].starts_with(&format!("chat='dev'; shape='{shape}'; case \"$chat\" in dev) ;; ")), "the check next: {text}");
+    assert_eq!(lines[2], format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S3_TESTS=1 AI_ENV_S3_CHAT='{shape}'  {tail} live_s3_gib_round_trip_timing"));
+    let s3 = dry(&["S3=1"], &[("CHAT", "dev"), ("S3_CHAT_DEV", shape)]);
+    assert!(!s3.contains("chat=") && !s3.contains("AI_ENV_S3_CHAT") && s3.contains(&format!("{tail} live_s3_\n")), "CHAT=dev in the environment is ignored: {s3}");
+    assert_eq!(read(&log), "", "make -n ran a tool");
+    let aws = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/aws.rs"));
+    assert!(aws.contains("\n#[test]\n#[ignore = ") && aws.contains("\nfn live_s3_gib_round_trip_timing() {\n"), "live_s3_gib_round_trip_timing is no longer a top-level test: make test-aws S3=1 CHAT=dev's filter names it");
+    let named: Vec<&str> = aws.lines().filter(|l| l.starts_with("fn ") && l.contains("live_s3_gib_round_trip_timing")).collect();
+    assert_eq!(named.len(), 1, "CHAT=dev's filter names more than the gib test: {named:?}");
+
+    let tools = t.path().join("bin2");
+    std::fs::create_dir_all(&tools).unwrap();
+    script(
+        &tools.join("cargo"),
+        r#"printf 'cargo %s [TESTS=%s S3=%s CHAT=%s] [LAB=%s]\n' "$*" "${AI_ENV_AWS_TESTS-}" "${AI_ENV_S3_TESTS-}" "${AI_ENV_S3_CHAT-unset}" "$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | tr '\n' ' ')" >> "$FAKE_LOG""#,
+    );
+    let calls = t.path().join("cargo.log");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        std::fs::remove_file(&calls).ok();
+        let out = make(t.path(), &tools, &["test-aws"]).args(args).env("FAKE_LOG", &calls).envs(envs.iter().copied()).bounded();
+        (out, lines_of(&calls))
+    };
+    let compiled = format!("{cargo} --no-run [TESTS= S3= CHAT=unset] [LAB=]");
+    let malformed = "S3_CHAT_DEV=main=215,subtree=1.6G,files=40";
+    for (what, args, want) in [
+        ("another chat", &["S3=1", "CHAT=gib", shape_arg.as_str()][..], "test-aws: CHAT=gib names no chat shape: make test-aws S3=1 CHAT=dev runs the gib test alone on the development chat's shape (S3_CHAT_DEV)"),
+        ("CHAT=dev without S3=1", &["CHAT=dev", shape_arg.as_str()][..], "test-aws: CHAT=dev needs S3=1: make test-aws S3=1 CHAT=dev"),
+        ("no shape", &["S3=1", "CHAT=dev"][..], "test-aws: S3_CHAT_DEV is empty: set it at part B's P0 to main=<MiB>,subtree=<MiB>,files=<n>, from the development chat's file names and sizes only (never its content)"),
+        ("a malformed shape", &["S3=1", "CHAT=dev", malformed][..], "test-aws: S3_CHAT_DEV=main=215,subtree=1.6G,files=40 is not main=<MiB>,subtree=<MiB>,files=<n>"),
+    ] {
+        let (out, calls) = run(args, &[("AI_ENV_BRIDGE_LAB_FAKE_API", "/f.json")]);
+        assert_eq!(out.status.code(), Some(2), "{what}: {}", all(&out));
+        assert!(all(&out).contains(want), "{what}: {}", all(&out));
+        assert_eq!(calls, vec![compiled.clone()], "{what}: the keyless compile alone, no test run");
+    }
+    // A shape only the environment gives (a stale export) is ignored: the run stops as with none.
+    let (out, calls) = run(&["S3=1", "CHAT=dev"], &[("S3_CHAT_DEV", shape)]);
+    assert_eq!(out.status.code(), Some(2), "{}", all(&out));
+    assert!(all(&out).contains("test-aws: S3_CHAT_DEV is empty"), "the environment's S3_CHAT_DEV is ignored: {}", all(&out));
+    assert_eq!(calls, vec![compiled.clone()], "the keyless compile alone, no test run");
+    let (out, calls) = run(&["S3=1", "CHAT=dev", shape_arg.as_str()], &[("AI_ENV_BRIDGE_LAB_FAKE_API", "/f.json")]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(calls, vec![compiled.clone(), format!("{tail} live_s3_gib_round_trip_timing [TESTS=1 S3=1 CHAT={shape}] [LAB=]")], "the gib test alone, its shape, no lab knob");
+    let (out, calls) = run(&["S3=1"], &[("CHAT", "gib"), ("S3_CHAT_DEV", "x")]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(calls, vec![compiled, format!("{tail} live_s3_ [TESTS=1 S3=1 CHAT=unset] [LAB=]")], "CHAT in the environment is ignored: the S3 suite, no shape");
 }

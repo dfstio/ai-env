@@ -192,12 +192,13 @@ pub fn write_headers(len: u64, sha256: &str, new_only: bool) -> Result<Vec<(Stri
 }
 
 /// How long the parts of one pull of `bytes` in all stay valid: the pull's
-/// budget (`budget::TRANSCRIPT_PULL` plus the bytes at 1 MB/s, as the shim
-/// counts it), at least `PRESIGN_EXPIRY`, at most `PULL_EXPIRY_MAX`.
+/// budget, as the shim and the Mac count it (S10:
+/// `wire::workspace::budget::pull_budget`, `share` the pulls that run at
+/// once, 1 for one alone), at least `PRESIGN_EXPIRY`, at most `PULL_EXPIRY_MAX`.
 #[must_use]
-pub fn pull_expiry(bytes: u64) -> Duration {
-    let budget = crate::wire::workspace::budget::TRANSCRIPT_PULL.as_secs() + bytes.div_ceil(crate::bridge::dataplane::MIN_RATE);
-    Duration::from_secs(budget.clamp(crate::wire::s3::PRESIGN_EXPIRY.as_secs(), crate::wire::s3::PULL_EXPIRY_MAX.as_secs()))
+pub fn pull_expiry(bytes: u64, share: u32) -> Duration {
+    let budget = crate::wire::workspace::budget::pull_budget(bytes, share);
+    budget.clamp(crate::wire::s3::PRESIGN_EXPIRY, crate::wire::s3::PULL_EXPIRY_MAX)
 }
 
 #[cfg(test)]
@@ -304,7 +305,11 @@ mod tests {
         } else {
             assert!(url.is_err());
         }
-        assert_eq!((pull_expiry(0), pull_expiry(10_000_000_000)), (PRESIGN_EXPIRY, crate::wire::s3::PULL_EXPIRY_MAX));
-        assert_eq!(pull_expiry(300_000_000), Duration::from_secs(360), "60 s plus 300 MB at 1 MB/s");
+        assert_eq!((pull_expiry(0, 1), pull_expiry(10_000_000_000, 1)), (PRESIGN_EXPIRY, crate::wire::s3::PULL_EXPIRY_MAX));
+        // S10: the pull's budget as both ends count it (`pull_budget`: 60 s, 30 s, the bytes at 1 MB/s times the share).
+        assert_eq!(pull_expiry(300_000_000, 1), Duration::from_secs(390), "60 s plus 30 s plus 300 MB at 1 MB/s");
+        assert_eq!(pull_expiry(300_000_000, 4), Duration::from_secs(1290), "four pulls at once share the rate");
+        assert_eq!(pull_expiry(300_000_000, 0), pull_expiry(300_000_000, 1), "a share of 0 counts as 1");
+        assert_eq!(pull_expiry(300_000_000, 1), crate::wire::workspace::budget::pull_budget(300_000_000, 1), "the budget itself when inside the bounds");
     }
 }

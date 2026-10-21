@@ -201,7 +201,7 @@ pub struct ProbeSpec {
 
 /// Every probe the stages record (plan §7), S1 and S3 included so `lab list`
 /// shows the whole picture.
-pub const CATALOG: [ProbeSpec; 32] = [
+pub const CATALOG: [ProbeSpec; 33] = [
     ProbeSpec { name: "entrypoint", stage: "S1", source: Source::Census, expect: Expect::Exact("claude-vscode"), recorded_by: "ai-env wrapper census --record-probes", what: "CLAUDE_CODE_ENTRYPOINT the extension sets for the wrapper" },
     ProbeSpec { name: "stock-ext-oauth", stage: "S1", source: Source::Census, expect: Expect::Exact("absent"), recorded_by: "ai-env wrapper census --record-probes", what: "whether the stock extension advertises OAuth refresh (CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH among a session's environment names); S7's second half in the note: with the debug-build knob AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS the wrapper's pump sends the extension one oauth_token_refresh of its own once the session is initialized, the census end row records the class of the answer (synthetic_oauth:<class>; the stock extension answers error(getOAuthToken callback is not provided.)), and --record-probes puts it in this row's note" },
     ProbeSpec { name: "image-version-delete", stage: "S3", source: Source::Deploy, expect: Expect::Exact("kept"), recorded_by: "make deploy RECORD_PROBE=1", what: "whether an image update deletes earlier versions" },
@@ -234,16 +234,18 @@ pub const CATALOG: [ProbeSpec; 32] = [
     ProbeSpec { name: "touchid-gui", stage: "S7", source: Source::Mac, expect: Expect::Exact("prompted"), recorded_by: "ai-env lab run touchid-gui (from Cursor's integrated terminal)", what: "whether age-plugin-se shows its Touch ID dialog to processes Cursor started: an unseal in the terminal, then one from a detached setsid child without a terminal (S8's prewarm): prompted, terminal-only, or failed:<why>" },
     ProbeSpec { name: "init-budget", stage: "S7", source: Source::Live, expect: Expect::Exact("within-budget"), recorded_by: "ai-env lab run init-budget", what: "how long a credentialed claude takes to answer initialize (stream-json host mode), judged on the answer (each session's close after it is noted, not counted): cold, the sum of the token's unseal (its Touch ID wait: with a current combined.env the one Touch ID lab run takes for the runtime key and the token, before the VM is started; without one the token's own, after the gate, while the runtime key's own Touch ID before the VM is not counted), RunMicrovm to RUNNING and /health, the gate, and the delivery and spawn to the answer; warm (the VM holds the token), the gate and the spawn to the answer. Against 30 s and 5 s: within-budget, over:<cold|warm>, or gap:unseal (the combined unseal's time could not be read); each leg in the note" },
     // S8 (plan L8): what Cursor shows after a resume the VM's transcript missed (the miss, the seed retry and the
-    // replay), recorded by hand from Cursor with the newest remote session's census evidence; the trust prompt of
-    // a fresh VM; the wrapper's own initialize budget, from the census.
-    ProbeSpec { name: "dup-init", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-init --manual VERDICT (after a resume in Cursor)", what: "after a resume whose transcript the VM lacked (T8.5: the transcript put there before the spawn, S8's upload or S9's restore from S3, or the resume miss, the seed retry and the replay), whether Cursor shows the session's start twice: no-duplicate, or duplicate:<what>; observed in Cursor, and recorded only with that resume's census evidence, which the note carries: the newest census end row of a remote session that resumed a conversation (--resume), answered initialize and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more), with its session, VM, transcript word, respawns, init_ms, end and exit" },
-    ProbeSpec { name: "dup-user-replay", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-user-replay --manual VERDICT (after a resume in Cursor)", what: "after the same resume, whether Cursor shows the replayed user message twice (a doubled bubble): no-duplicate, or duplicate:<what>; observed in Cursor, with the census evidence as dup-init's" },
+    // replay), or (S10) after a move of the chat to a new VM, recorded by hand from Cursor with the newest remote
+    // session's census evidence; the trust prompt of a fresh VM; the wrapper's own initialize budget, from the census.
+    ProbeSpec { name: "dup-init", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-init --manual VERDICT (after a resume in Cursor)", what: "after a resume whose transcript the VM lacked (T8.5: the transcript put there before the spawn, S8's upload or S9's restore from S3, or the resume miss, the seed retry and the replay) or a move of the chat to a new VM (S10 T10.3: the moved claude's init and the resent message, which the swallow rules hide), whether Cursor shows the session's start twice: no-duplicate, or duplicate:<what>; observed in Cursor, and recorded only with that resume's or move's census evidence, which the note carries: the newest census end row of a remote session that answered initialize and either resumed a conversation (--resume) into a VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more) or moved (its moves adding up to 1 or more, not counting the failed last move of an end:move_failed row), with its session (a new chat's row names none), VM, transcript word, respawns, moves, inits and echoes (forwarded/swallowed), init_ms, end and exit" },
+    ProbeSpec { name: "dup-user-replay", stage: "S8", source: Source::Cursor, expect: Expect::Exact("no-duplicate"), recorded_by: "ai-env lab run dup-user-replay --manual VERDICT (after a resume in Cursor)", what: "after the same resume or move (a move sends the interrupted message again), whether Cursor shows the replayed user message twice (a doubled bubble): no-duplicate, or duplicate:<what>; observed in Cursor, with the census evidence as dup-init's" },
     ProbeSpec { name: "fresh-claude-json", stage: "S8", source: Source::Live, expect: Expect::Exact("no-stall"), recorded_by: "ai-env lab run fresh-claude-json", what: "whether the image's claude, started as Cursor starts a session (the extension's stream-json argv as the wrapper sends it, its entrypoint, the setup-token on fd 3) in the current directory's workspace seeded into a fresh VM whose .claude.json has no entry for it, answers without a trust dialog or onboarding: no-stall (initialize answered within Cursor's 60 s window, then one turn's result, no error), or stall:initialize (no answer to initialize, or claude exited first), stall:turn (no result for the turn within 120 s, or claude exited first) or stall:turn-error (an error result); the project's .claude.json keys before and after, claude's requests to its host and its first stderr line in the note (on a stall the seed then writes the project's hasTrustDialogAccepted, L7)" },
-    ProbeSpec { name: "init-wrapper", stage: "S8", source: Source::Census, expect: Expect::Exact("within-budget"), recorded_by: "ai-env wrapper census --record-probes", what: "how long the wrapper's remote sessions take to answer initialize, from the census end rows (T0 to the forwarded answer, with the legs touchid, select, workspace, gate and spawn): the newest cold row (vm_how:started) against 30 s and the newest warm one (vm_how:reused or resumed) against 5 s, each with its Touch ID leg in the note: within-budget, over:<cold|warm>, or gap:<cold|warm> while the census holds no such row; a pinned VM's rows and starts that never answered are not judged; not recorded until remote end rows exist" },
+    ProbeSpec { name: "init-wrapper", stage: "S8", source: Source::Census, expect: Expect::Exact("within-budget"), recorded_by: "ai-env wrapper census --record-probes", what: "how long the wrapper's remote sessions take to answer initialize, from the census end rows (T0 to the forwarded answer, with the legs touchid, select, workspace, gate and spawn): the newest cold row (vm_how:started) against 30 s and the newest warm one against its own VM's budget (vm_how:reused 5 s; resumed 8 s, S10 F9: the VM's resume on top), each with its Touch ID leg in the note: within-budget, over:<cold|warm>, or gap:<cold|warm> while the census holds no such row; a pinned VM's rows and starts that never answered are not judged, nor (S10) sessions that moved the chat, a reopen's carry included (a move rewrites the row's vm_how while its init_ms stays the first answer's), but one past 30 s stands as the cold row, over whatever its first VM was (a pinned chat's never); not recorded until remote end rows exist" },
     // S9 (plan L6): what the endpoint does with git smart-HTTP v2 and with a chunked request body, each measured
     // with ai-env's own clients, never a git child holding a token (design D12).
     ProbeSpec { name: "protocol-v2", stage: "S9", source: Source::Live, expect: Expect::Exact("v2"), recorded_by: "ai-env lab run protocol-v2", what: "whether git smart-HTTP v2 reaches the VM's http-backend through the endpoint: ai-env's own client asks a seeded VM's GET /workspace.git/info/refs?service=git-upload-pack with Git-Protocol: version=2: v2 (the header passed and http-backend answered version 2), v0 (it answered the v0 # service= advertisement: the header was dropped), or failed:<status>; the response's framing (chunked or a length) and the time to the advertisement in the note" },
     ProbeSpec { name: "chunked-put", stage: "S9", source: Source::Live, expect: Expect::Recorded, recorded_by: "ai-env lab run chunked-put", what: "what the endpoint does with a chunked request body: a PUT /seed with Transfer-Encoding: chunked to an unseeded VM: forwarded (the shim saw it chunked and answered 411), dechunked (it arrived with a Content-Length), or refused:<status> (the endpoint answered itself); 1 MB and 20 MB PUT /seed timings with a Content-Length in the note" },
+    // S10 (L3): what Cursor shows of the note the wrapper writes the chat when it moves it to a new VM.
+    ProbeSpec { name: "move-note", stage: "S10", source: Source::Cursor, expect: Expect::Exact("shown"), recorded_by: "ai-env lab run move-note --manual VERDICT (after a move in Cursor)", what: "after a chat moved to a new VM (T10.3), whether Cursor showed ai-env's informational line in the chat: shown, or not-shown:<what>; observed in Cursor, and recorded with the move's census evidence (the newest remote end row whose moves is above 0)" },
 ];
 
 /// The catalog entry of `name`.
@@ -284,22 +286,29 @@ fn field<'a>(row: &'a serde_json::Value, name: &str) -> &'a str {
 }
 
 /// One remote end row `init-wrapper` judges: one that answered `initialize`
-/// (`init_ms`) on a VM started for it (cold) or reused or resumed (warm).
+/// (`init_ms`) on a VM started for it (cold) or reused or resumed (warm),
+/// `how` its `vm_how`, and never moved the chat; or (S10, `moved`) one that
+/// moved it, a reopen's carry included, past the cold budget, which stands
+/// as the cold row.
 struct InitRow<'a> {
     row: &'a serde_json::Value,
     parts: Parts<'a>,
     init_ms: u64,
+    how: &'a str,
+    moved: bool,
 }
 
 impl InitRow<'_> {
     /// The row in the note's words: its time from the census start to the
-    /// forwarded answer, how its VM was had, its Touch ID leg named first,
-    /// every leg, the VM and when it started.
+    /// forwarded answer, a moved session's named as such, how its VM was
+    /// had, its Touch ID leg named first, every leg, the VM and when it
+    /// started.
     fn describe(&self, kind: &str) -> String {
         let legs = part(&self.parts, crate::bridge::remote::census_part::LEGS);
         let touchid = legs.and_then(|l| l.split(',').find_map(|leg| leg.strip_prefix("touchid="))).map_or_else(|| "touchid not recorded".to_string(), |ms| format!("touchid {ms} ms"));
+        let moved = if self.moved { ", a session that moved the chat, past every budget" } else { "" };
         format!(
-            "{kind} {} ms ({touchid}; vm_how:{}; legs {}; {} at {})",
+            "{kind} {} ms{moved} ({touchid}; vm_how:{}; legs {}; {} at {})",
             self.init_ms,
             part(&self.parts, crate::bridge::remote::census_part::VM_HOW).unwrap_or("-"),
             legs.unwrap_or("-"),
@@ -310,17 +319,18 @@ impl InitRow<'_> {
 }
 
 /// init-wrapper's verdict on the newest cold and warm initialize times:
-/// `over:<cold|warm|cold,warm>` past [`INIT_COLD_BUDGET_MS`] or
-/// [`INIT_WARM_BUDGET_MS`] (a budget met exactly passes), else
-/// `gap:<cold|warm|cold,warm>` for a kind the census has no row of yet,
-/// else `within-budget`.
+/// `over:<cold|warm|cold,warm>` past [`INIT_COLD_BUDGET_MS`] or the warm
+/// row's own budget ([`warm_budget_ms`] of its `vm_how`: S10 F9) (a budget
+/// met exactly passes), else `gap:<cold|warm|cold,warm>` for a kind the
+/// census has no row of yet, else `within-budget`. `warm` is the newest
+/// warm row's time and its `vm_how`.
 #[must_use]
-pub fn verdict_init_wrapper(cold_ms: Option<u64>, warm_ms: Option<u64>) -> String {
-    let over: Vec<&str> = [(cold_ms.is_some_and(|c| u128::from(c) > INIT_COLD_BUDGET_MS), "cold"), (warm_ms.is_some_and(|w| u128::from(w) > INIT_WARM_BUDGET_MS), "warm")].into_iter().filter(|(o, _)| *o).map(|(_, n)| n).collect();
+pub fn verdict_init_wrapper(cold_ms: Option<u64>, warm: Option<(u64, &str)>) -> String {
+    let over: Vec<&str> = [(cold_ms.is_some_and(|c| u128::from(c) > INIT_COLD_BUDGET_MS), "cold"), (warm.is_some_and(|(w, how)| u128::from(w) > warm_budget_ms(how)), "warm")].into_iter().filter(|(o, _)| *o).map(|(_, n)| n).collect();
     if !over.is_empty() {
         return format!("over:{}", over.join(","));
     }
-    let gap: Vec<&str> = [(cold_ms.is_none(), "cold"), (warm_ms.is_none(), "warm")].into_iter().filter(|(g, _)| *g).map(|(_, n)| n).collect();
+    let gap: Vec<&str> = [(cold_ms.is_none(), "cold"), (warm.is_none(), "warm")].into_iter().filter(|(g, _)| *g).map(|(_, n)| n).collect();
     if !gap.is_empty() {
         return format!("gap:{}", gap.join(","));
     }
@@ -333,11 +343,21 @@ pub fn verdict_init_wrapper(cold_ms: Option<u64>, warm_ms: Option<u64>) -> Strin
 /// that answered `initialize` (`init_ms`, from the census start to the
 /// forwarded answer); the newest whose VM was started for it (cold,
 /// `vm_how:started`) against 30 s, the newest on a reused or resumed one
-/// (warm) against 5 s ([`verdict_init_wrapper`]); the note names each
-/// one's Touch ID leg and its legs, and counts the remote starts that never
-/// answered (not judged, nor is a pinned VM's row). `ext` and `claude` are
-/// the newest judged row's (the extension's bundle, the VM's claude). `None`
-/// while no remote end row exists.
+/// (warm) against its VM's budget, 5 s reused and 8 s resumed (S10 F9,
+/// [`verdict_init_wrapper`]); the note names each one's Touch ID leg and
+/// its legs, and counts the remote starts that never answered (not judged)
+/// and the answered sessions that moved the chat (judged only past the cold
+/// budget, never a pinned VM's; nor is a pinned VM's row judged). S10: a
+/// move rewrites the row's `vm` and `vm_how` while its `init_ms` stays the
+/// first answer the host got, and a reopen's carry, counted in `moves` too
+/// (§2.7), is not told apart; so a moved row is judged only past
+/// [`INIT_COLD_BUDGET_MS`], the largest budget, where it stands as the cold
+/// row (`over:cold` whatever its first VM was), unless the chat was pinned
+/// (a pinned VM has no budget): `vm_how:pinned`, which a respawn keeps, or
+/// `AI_ENV_BRIDGE_VM` among the row's `env_names`, the start row's, which
+/// still name it once the chat moved off the pinned VM. `ext` and `claude`
+/// are the newest judged row's (the extension's bundle, the VM's claude).
+/// `None` while no remote end row exists.
 #[must_use]
 pub fn init_wrapper_verdict(rows: &[serde_json::Value]) -> Option<ProbeRow> {
     use crate::bridge::remote::census_part::{CLAUDE, VM_HOW};
@@ -346,23 +366,36 @@ pub fn init_wrapper_verdict(rows: &[serde_json::Value]) -> Option<ProbeRow> {
     if ends.is_empty() {
         return None;
     }
-    let newest = |hows: &[&str]| {
+    let newest = |hows: &[&str], slow_moved: bool| {
         ends.iter().rev().find_map(|(i, row, parts)| {
             let how = part(parts, VM_HOW)?;
             let init_ms = part(parts, "init_ms")?.parse::<u64>().ok()?;
-            hows.contains(&how).then(|| (*i, InitRow { row, parts: parts.clone(), init_ms }))
+            // S10: every generation rewrites the link's vm and vm_how, a move's too, while init_ms stays the first
+            // answer's and a move adds no legs, so no budget of its vm_how fits a moved session's row; a reopen's
+            // carry (generation 1, counted in moves too) is not told apart. Past the cold budget, the largest, the
+            // row is over whatever its first VM was: it stands as the cold row, so a slow start never reads within.
+            // Never a pinned chat's (a pinned VM has no budget): vm_how:pinned, which a respawn keeps, or the pin
+            // knob among its env_names, the start row's, which still name it once the chat moved off the pinned VM.
+            let moved = moves_of(parts) >= 1;
+            let pinned = how == "pinned" || row.get("env_names").and_then(serde_json::Value::as_array).is_some_and(|n| n.iter().any(|v| v == crate::bridge::remote::PIN_KNOB));
+            let take = if moved { slow_moved && !pinned && u128::from(init_ms) > INIT_COLD_BUDGET_MS } else { hows.contains(&how) };
+            take.then(|| (*i, InitRow { row, parts: parts.clone(), init_ms, how, moved }))
         })
     };
-    let (cold, warm) = (newest(&["started"]), newest(&["reused", "resumed"]));
+    let (cold, warm) = (newest(&["started"], true), newest(&["reused", "resumed"], false));
     let unanswered = ends.iter().filter(|(_, _, p)| part(p, "init_ms").is_none()).count();
-    let verdict = verdict_init_wrapper(cold.as_ref().map(|(_, c)| c.init_ms), warm.as_ref().map(|(_, w)| w.init_ms));
+    let moved = ends.iter().filter(|(_, _, p)| part(p, "init_ms").is_some() && moves_of(p) >= 1).count();
+    let verdict = verdict_init_wrapper(cold.as_ref().map(|(_, c)| c.init_ms), warm.as_ref().map(|(_, w)| (w.init_ms, w.how)));
     let mut note = vec![
         cold.as_ref().map_or_else(|| "no cold row yet (a session whose VM was started for it)".to_string(), |(_, c)| c.describe("cold")),
         warm.as_ref().map_or_else(|| "no warm row yet (a session on a reused or resumed VM)".to_string(), |(_, w)| w.describe("warm")),
-        format!("budgets {INIT_COLD_BUDGET_MS} and {INIT_WARM_BUDGET_MS} ms from the census start to the forwarded answer"),
+        format!("budgets {INIT_COLD_BUDGET_MS} ms cold, {INIT_WARM_BUDGET_MS} ms reused and {INIT_RESUMED_BUDGET_MS} ms resumed, from the census start to the forwarded answer"),
     ];
     if unanswered > 0 {
         note.push(format!("{unanswered} remote end row(s) never answered initialize (not judged)"));
+    }
+    if moved > 0 {
+        note.push(format!("{moved} remote end row(s) moved the chat, a reopen's carry included (judged only past the {INIT_COLD_BUDGET_MS} ms cold budget: a move rewrites the row's vm_how while its init_ms stays the first answer's)"));
     }
     let judged = [cold, warm].into_iter().flatten().max_by_key(|(i, _)| *i).map(|(_, j)| j);
     let text = |k: &str| judged.as_ref().and_then(|j| j.row.get(k)).and_then(|v| v.as_str()).map(str::to_string);
@@ -375,32 +408,80 @@ pub fn init_wrapper_verdict(rows: &[serde_json::Value]) -> Option<ProbeRow> {
     })
 }
 
-/// The census evidence the dup probes are recorded with (S8 T8.5): the
-/// newest end row of a remote session whose argv resumes a conversation
-/// (`--resume UUID`), that answered `initialize` (`init_ms`) and found its
-/// VM without the transcript (`transcript:uploaded`, S8's upload before the
-/// spawn, or S9's `transcript:restored`, its pull from S3, or
-/// `transcript:staged`, a chat S3 did not hold yet, begun on this Mac or an
-/// S8 mirror, sent up at the reopen and pulled into the VM; or `respawns` of
-/// 1 or more, the resume miss's seed retry). `Ok`
-/// is that row in the note's words, naming the forced replay only when the
-/// start row recorded `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` and the end row a
-/// retry (L8: a release wrapper, or another value, forces nothing); `Err`
-/// says what the newest remote resume lacks (or that there is none) and how
-/// to get the evidence.
+/// The conversation a census row's argv resumes (`--resume UUID`, either
+/// spelling), its wrapper and bundled claude skipped; `None` for a new chat.
+fn resumed_id(row: &serde_json::Value) -> Option<String> {
+    let argv: Vec<String> = row.get("argv")?.as_array()?.iter().skip(2).filter_map(|a| a.as_str().map(str::to_string)).collect();
+    crate::wire::argv::value_of(&argv, "--resume").filter(|id| crate::wire::workspace::is_uuid(id)).map(str::to_string)
+}
+
+/// The moves a census end row counts (S10 §4.1, written once one started):
+/// the sum of its `moves:readdress=<n>,respawn=<n>,migrate=<n>`; 0 without
+/// the part, and a count that does not parse, or of another kind, adds nothing.
+fn moves_of(parts: &[(&str, &str)]) -> u32 {
+    part(parts, crate::bridge::remote::census_part::MOVES).map_or(0, |m| {
+        m.split(',').filter_map(|kv| kv.split_once('=')).filter(|(kind, _)| matches!(*kind, "readdress" | "respawn" | "migrate")).filter_map(|(_, n)| n.parse::<u32>().ok()).fold(0, u32::saturating_add)
+    })
+}
+
+/// 1 when a reopen's P0 to P4 carried the row's chat off its `--resume`
+/// row's VM (S10 §2.7, `carried:`), which `moves` counts too; else 0.
+fn carried_of(parts: &[(&str, &str)]) -> u32 {
+    u32::from(part(parts, crate::bridge::remote::census_part::CARRIED).is_some())
+}
+
+/// The moves of a census end row whose claude ran (S10): [`moves_of`], less
+/// the last one when the row ends `end:move_failed` and less a reopen's
+/// carry ([`carried_of`]). `moves` counts the moves started, and a failed
+/// move ends the session at its start, so no moved claude ran for it and
+/// nothing was sent again; a carry sends nothing again either (its
+/// `transcript:restored` keeps S9's rule).
+fn moves_done(parts: &[(&str, &str)]) -> u32 {
+    let failed = part(parts, "end") == Some(crate::bridge::pump::EndReason::MoveFailed.name());
+    moves_of(parts).saturating_sub(u32::from(failed)).saturating_sub(carried_of(parts))
+}
+
+/// The census evidence the dup probes are recorded with (S8 T8.5, S10
+/// T10.3): the newest end row of a remote session that answered
+/// `initialize` (`init_ms`) and either resumed a conversation (`--resume
+/// UUID`) into a VM without the transcript (`transcript:uploaded`, S8's
+/// upload before the spawn, or S9's `transcript:restored`, its pull from S3,
+/// or `transcript:staged`, a chat S3 did not hold yet, begun on this Mac or
+/// an S8 mirror, sent up at the reopen and pulled into the VM; or
+/// `respawns` of 1 or more, the resume miss's seed retry), or (S10) moved
+/// the chat, its `moves` adding up to 1 or more but for a failed last one
+/// (`moves_done`: a move that failed at its start sent nothing again),
+/// with or without `--resume` (a new chat's row names no session). A start
+/// row and its end row pair by the wrapper's pid and the census start, both
+/// numbers (a row without them pairs with none). `Ok` is that row in the
+/// note's words, with S10's `moves`, `inits` and `echoes` when the row has
+/// them, naming the forced replay only when the start row recorded
+/// `AI_ENV_BRIDGE_LAB_TRANSCRIPT=skip` and the end row a retry (L8: a
+/// release wrapper, or another value, forces nothing); `Err` says what the
+/// newest remote resume or move lacks (or that there is none) and how to
+/// get the evidence.
 pub fn resume_evidence(rows: &[serde_json::Value]) -> std::result::Result<String, String> {
-    use crate::bridge::remote::census_part::{TRANSCRIPT, VM, VM_HOW};
-    const NEEDS: &str = "a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more)";
-    let resumed = |r: &serde_json::Value| -> Option<String> {
-        let argv: Vec<String> = r.get("argv")?.as_array()?.iter().skip(2).filter_map(|a| a.as_str().map(str::to_string)).collect();
-        crate::wire::argv::value_of(&argv, "--resume").filter(|id| crate::wire::workspace::is_uuid(id)).map(str::to_string)
-    };
-    let starts: Vec<(&serde_json::Value, String)> = rows.iter().filter(|r| !is_end_row(r) && field(r, "route") == "remote" && is_remote(&note_parts(r))).filter_map(|r| resumed(r).map(|id| (r, id))).collect();
-    let end_of = |start: &serde_json::Value| rows.iter().rev().find(|r| is_end_row(r) && r.get("pid") == start.get("pid") && r.get("start") == start.get("start"));
+    use crate::bridge::remote::census_part::{ECHOES, INITS, MOVES, TRANSCRIPT, VM, VM_HOW};
+    const NEEDS: &str = "a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more), or (S10) one that answered initialize and moved the chat (its moves adding up to 1 or more, not counting the failed last move of an end:move_failed row)";
+    // Each run's end row by its (pid, start), both numbers as the wrapper writes them, the newest should one repeat:
+    // every remote start is looked up (S10's moves), so the census is read once.
+    let key = |r: &serde_json::Value| Some((r.get("pid")?.as_u64()?, r.get("start")?.as_u64()?));
+    let ends: std::collections::HashMap<(u64, u64), &serde_json::Value> = rows.iter().filter(|r| is_end_row(r)).filter_map(|r| Some((key(r)?, r))).collect();
+    let end_of = |start: &serde_json::Value| key(start).and_then(|k| ends.get(&k).copied());
+    // The remote starts that resumed a conversation, and (S10) those whose end row shows a move done, `--resume` or not.
+    let starts: Vec<(&serde_json::Value, Option<String>)> = rows
+        .iter()
+        .filter(|r| !is_end_row(r) && field(r, "route") == "remote" && is_remote(&note_parts(r)))
+        .filter_map(|r| {
+            let id = resumed_id(r);
+            (id.is_some() || end_of(r).is_some_and(|e| moves_done(&note_parts(e)) >= 1)).then_some((r, id))
+        })
+        .collect();
     let qualifies = |end: &serde_json::Value| {
         let parts = note_parts(end);
-        part(&parts, "init_ms").is_some() && (matches!(part(&parts, TRANSCRIPT), Some("uploaded" | "restored" | "staged")) || part(&parts, "respawns").and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n >= 1))
+        part(&parts, "init_ms").is_some() && (matches!(part(&parts, TRANSCRIPT), Some("uploaded" | "restored" | "staged")) || part(&parts, "respawns").and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n >= 1) || moves_done(&parts) >= 1)
     };
+    let pid = |start: &serde_json::Value| start.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0);
     if let Some((start, id, end)) = starts.iter().rev().find_map(|(s, id)| end_of(s).filter(|e| qualifies(e)).map(|e| (*s, id, e))) {
         let parts = note_parts(end);
         let p = |name: &str| part(&parts, name).unwrap_or("-");
@@ -409,10 +490,13 @@ pub fn resume_evidence(rows: &[serde_json::Value]) -> std::result::Result<String
         let knob = start.get("env_selected").and_then(|s| s.get(crate::bridge::remote::TRANSCRIPT_KNOB)).and_then(serde_json::Value::as_str);
         let forced = knob == Some("skip") && part(&parts, "respawns").and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n >= 1);
         let exit = end.get("exit").and_then(serde_json::Value::as_i64).map_or_else(|| "null".to_string(), |c| c.to_string());
+        let who = id.as_ref().map_or_else(|| "a new chat (no --resume) started".to_string(), |id| format!("session {id} resumed"));
+        // S10's counts where the row has them (an S9 wrapper's has none): the moves, and what the swallow rules forwarded and swallowed.
+        let counts: String = [MOVES, INITS, ECHOES].iter().filter_map(|k| part(&parts, k).map(|v| format!(", {k}:{v}"))).collect();
         return Ok(format!(
-            "census: session {id} resumed in remote mode at {} (wrapper pid {}) on {} (vm_how:{}): transcript:{}, respawns:{}, init_ms:{}, end:{}, exit {exit}{}",
+            "census: {who} in remote mode at {} (wrapper pid {}) on {} (vm_how:{}): transcript:{}, respawns:{}{counts}, init_ms:{}, end:{}, exit {exit}{}",
             field(start, "ts"),
-            start.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            pid(start),
             p(VM),
             p(VM_HOW),
             p(TRANSCRIPT),
@@ -423,16 +507,20 @@ pub fn resume_evidence(rows: &[serde_json::Value]) -> std::result::Result<String
         ));
     }
     let Some((start, id)) = starts.last() else {
-        return Err(format!("no remote resume in the census; the dup probes need {NEEDS}: reopen a chat from Cursor's picker into a VM without its transcript (T8.5: ai-env vm terminate, then the picker), close it, then record"));
+        return Err(format!("no remote resume in the census; the dup probes need {NEEDS}: reopen a chat from Cursor's picker into a VM without its transcript (T8.5: ai-env vm terminate, then the picker), or move one to a new VM (T10.3: ai-env vm terminate during a turn), close it, then record"));
     };
-    let newest = format!("the newest remote resume (session {id}, started {})", field(start, "ts"));
+    let newest = match id {
+        Some(id) => format!("the newest remote resume (session {id}, started {})", field(start, "ts")),
+        None => format!("the newest remote move (a new chat, wrapper pid {}, started {})", pid(start), field(start, "ts")),
+    };
     let Some(end) = end_of(start) else {
         return Err(format!("{newest} has no census end row yet: close the chat (or reload Cursor), then record; the dup probes need {NEEDS}"));
     };
     let parts = note_parts(end);
     if part(&parts, "init_ms").is_none() {
         let exit = end.get("exit").and_then(serde_json::Value::as_i64).map_or_else(|| "null".to_string(), |c| c.to_string());
-        return Err(format!("{newest} never answered initialize (end:{}, exit {exit}): reopen it from Cursor's picker, then record; the dup probes need {NEEDS}", part(&parts, "end").unwrap_or("-")));
+        let again = if id.is_some() { "reopen it from Cursor's picker" } else { "move a chat that answered (T10.3), close it" };
+        return Err(format!("{newest} never answered initialize (end:{}, exit {exit}): {again}, then record; the dup probes need {NEEDS}", part(&parts, "end").unwrap_or("-")));
     }
     Err(format!(
         "{newest} found its VM holding the transcript (transcript:{}, respawns:{}): the dup probes judge a resume into a VM without it (T8.5: ai-env vm terminate, then reopen the chat from the picker); they need {NEEDS}",
@@ -450,14 +538,67 @@ pub fn check_dup_verdict(probe: &str, verdict: &str) -> std::result::Result<(), 
     Err(format!("{probe}: the verdict is no-duplicate, or duplicate:<what Cursor showed twice> (got {verdict:?})"))
 }
 
-/// `lab run dup-init|dup-user-replay --manual VERDICT` (S8 T8.5): the
-/// verdict's form ([`check_dup_verdict`], exit 2), then the census evidence
-/// of a remote resume into a VM without the transcript ([`resume_evidence`],
-/// from `logs/census.jsonl`), which the row's note carries; without it
-/// nothing is recorded (exit 1, naming the evidence).
+/// move-note's verdict as Cursor showed it (S10 L3): `shown`, or
+/// `not-shown:<what>` naming what Cursor showed instead; `Err` names the form.
+pub fn check_move_note_verdict(verdict: &str) -> std::result::Result<(), String> {
+    if verdict == "shown" || verdict.strip_prefix("not-shown:").is_some_and(|what| !what.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(format!("move-note: the verdict is shown, or not-shown:<what Cursor showed instead> (got {verdict:?})"))
+}
+
+/// The census evidence `move-note` is recorded with (S10 L3, T10.3): the
+/// newest remote end row whose `moves` add up to 1 or more beyond a reopen's
+/// carry ([`carried_of`]), whatever else
+/// it shows (a move that failed showed its note at its start too, so it
+/// counts here, unlike the dup probes' `moves_done`), in the note's words:
+/// its chat (the `--resume` id; a new chat's row names none), when its
+/// wrapper started, the VM it was last on, the moves, the last move's time
+/// and cut, the swallow rules' counts, `init_ms`, the end and the exit. A
+/// reopen's carry (§2.7: it shows no note), counted in `moves` too and told
+/// apart by `carried:`, is not taken. `Err` says there is none and how to
+/// get one.
+pub fn move_evidence(rows: &[serde_json::Value]) -> std::result::Result<String, String> {
+    use crate::bridge::remote::census_part::{CUT, ECHOES, INITS, MOVES, MOVE_MS, VM, VM_HOW};
+    let newest = rows.iter().rev().filter(|r| is_end_row(r) && field(r, "route") == "remote").map(|r| (r, note_parts(r))).find(|(_, parts)| is_remote(parts) && moves_of(parts) > carried_of(parts));
+    let Some((end, parts)) = newest else {
+        return Err("no remote end row in the census shows a move (moves adding up to 1 or more, a reopen's carry not counted); move-note is recorded only with that evidence: move a chat to a new VM in Cursor (T10.3: ai-env vm terminate during a turn), close it (or reload Cursor), then record".to_string());
+    };
+    let p = |name: &str| part(&parts, name).unwrap_or("-");
+    let who = resumed_id(end).map_or_else(|| "a new chat (no --resume)".to_string(), |id| format!("session {id}"));
+    let exit = end.get("exit").and_then(serde_json::Value::as_i64).map_or_else(|| "null".to_string(), |c| c.to_string());
+    Ok(format!(
+        "census: {who} moved in remote mode (started {}, wrapper pid {}), last on {} (vm_how:{}): moves:{}, move_ms:{}, cut:{}, inits:{}, echoes:{}, init_ms:{}, end:{}, exit {exit}",
+        field(end, "ts"),
+        end.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        p(VM),
+        p(VM_HOW),
+        p(MOVES),
+        p(MOVE_MS),
+        p(CUT),
+        p(INITS),
+        p(ECHOES),
+        p("init_ms"),
+        p("end")
+    ))
+}
+
+/// `lab run dup-init|dup-user-replay|move-note --manual VERDICT` (S8 T8.5,
+/// S10 T10.3): the verdict's form ([`check_dup_verdict`],
+/// [`check_move_note_verdict`]; exit 2), then the census evidence the probe
+/// is recorded with, from `logs/census.jsonl`: a remote resume into a VM
+/// without the transcript, or a move ([`resume_evidence`]), and for
+/// move-note a move ([`move_evidence`]). The row's note carries it; without
+/// it nothing is recorded (exit 1, naming the evidence).
 pub fn cursor_evidence(paths: &crate::bridge::config::Paths, probe: &str, verdict: &str) -> Result<String> {
-    check_dup_verdict(probe, verdict).map_err(CliError::Usage)?;
-    resume_evidence(&read_rows(&paths.census(), None)?).map_err(|why| CliError::Msg(format!("{probe}: {why}; nothing recorded")))
+    let evidence = if probe == "move-note" {
+        check_move_note_verdict(verdict).map_err(CliError::Usage)?;
+        move_evidence(&read_rows(&paths.census(), None)?)
+    } else {
+        check_dup_verdict(probe, verdict).map_err(CliError::Usage)?;
+        resume_evidence(&read_rows(&paths.census(), None)?)
+    };
+    evidence.map_err(|why| CliError::Msg(format!("{probe}: {why}; nothing recorded")))
 }
 
 /// fresh-claude-json's verdict: `no-stall` once claude answered
@@ -1425,6 +1566,21 @@ pub fn verdict_touchid_gui(detached_ok: bool) -> &'static str {
 /// then RunMicrovm to the answer to `initialize`; warm, on a VM that holds the token.
 pub const INIT_COLD_BUDGET_MS: u128 = 30_000;
 pub const INIT_WARM_BUDGET_MS: u128 = 5_000;
+/// S10 F9: init-wrapper's budget for a session whose VM was resumed
+/// (`vm_how:resumed`): the warm path plus the VM's resume, which S8 and S9
+/// measured at 5.5 to 6.5 s in all (their Touch ID 2.3 to 2.9 s of it).
+pub const INIT_RESUMED_BUDGET_MS: u128 = 8_000;
+
+/// The budget init-wrapper judges a warm row by (S10 F9): on a resumed VM
+/// [`INIT_RESUMED_BUDGET_MS`], on a reused one [`INIT_WARM_BUDGET_MS`].
+#[must_use]
+pub fn warm_budget_ms(vm_how: &str) -> u128 {
+    if vm_how == "resumed" {
+        INIT_RESUMED_BUDGET_MS
+    } else {
+        INIT_WARM_BUDGET_MS
+    }
+}
 
 /// init-budget's verdict on the times to claude's `initialize` answer:
 /// `over:<cold|warm|cold,warm>` past [`INIT_COLD_BUDGET_MS`] or
@@ -1561,7 +1717,7 @@ mod tests {
                 ("init-wrapper", Source::Census, "within-budget".to_string(), "ai-env wrapper census --record-probes"),
             ]
         );
-        assert_eq!(CATALOG.len(), 32, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4, S9 2");
+        assert_eq!(CATALOG.len(), 33, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4, S9 2, S10 1");
         assert_eq!(Source::Cursor.name(), "cursor");
     }
 
@@ -1572,6 +1728,14 @@ mod tests {
     fn the_two_s9_probes_have_their_source_recorder_and_expectation() {
         let s9: Vec<(&str, Source, String, &str)> = CATALOG.iter().filter(|p| p.stage == "S9").map(|p| (p.name, p.source, p.expect.expectation().render(), p.recorded_by)).collect();
         assert_eq!(s9, [("protocol-v2", Source::Live, "v2".to_string(), "ai-env lab run protocol-v2"), ("chunked-put", Source::Live, "recorded".to_string(), "ai-env lab run chunked-put")]);
+    }
+
+    /// S10's one probe (L3): what Cursor showed of the move's note, by hand
+    /// only (`--manual`), expecting exactly `shown`.
+    #[test]
+    fn the_s10_probe_is_the_move_note_cursor_shows() {
+        let s10: Vec<(&str, Source, String, &str)> = CATALOG.iter().filter(|p| p.stage == "S10").map(|p| (p.name, p.source, p.expect.expectation().render(), p.recorded_by)).collect();
+        assert_eq!(s10, [("move-note", Source::Cursor, "shown".to_string(), "ai-env lab run move-note --manual VERDICT (after a move in Cursor)")]);
     }
 
     /// A session id of the picker's shape, built at run time.
@@ -1612,7 +1776,8 @@ mod tests {
 
     /// init-wrapper (plan L8): nothing until a remote end row exists; then
     /// the newest cold row (vm_how:started) against 30 s and the newest warm
-    /// one (reused or resumed) against 5 s, each named with its Touch ID leg
+    /// one against its VM's budget (reused 5 s, resumed 8 s since S10 F9),
+    /// each named with its Touch ID leg
     /// in the note; local sessions, start rows, pinned VMs and starts that
     /// never answered are not judged (the unanswered are counted); a
     /// missing kind is a gap, an over wins over a gap, a budget met exactly
@@ -1636,11 +1801,11 @@ mod tests {
         assert_eq!((row.probe.as_str(), row.stage.as_str(), row.verdict.as_str(), row.expected.as_str()), ("init-wrapper", "S8", "within-budget", "within-budget"));
         let note = row.note.clone().unwrap();
         assert!(note.contains("; warm 4100 ms (touchid 1500 ms; vm_how:reused; legs touchid=1500,"), "{note}");
-        assert!(note.contains("; budgets 30000 and 5000 ms from the census start to the forwarded answer; 1 remote end row(s) never answered"), "{note}");
+        assert!(note.contains("; budgets 30000 ms cold, 5000 ms reused and 8000 ms resumed, from the census start to the forwarded answer; 1 remote end row(s) never answered"), "{note}");
         assert!(!note.contains("pinned"), "a pinned VM's row is not judged: {note}");
         assert_eq!((row.ext.as_deref(), row.sdk.as_deref(), row.claude.as_deref()), (Some("2.1.296"), Some("0.3.296"), Some("2.1.296")));
-        // The newest of each kind is judged: a newer warm row on a resumed VM over its budget.
-        rows.extend(session(16, 7, "mode:remote", &[], Some(&remote_tail(Some(5_001), "resumed", 1500)), 0));
+        // The newest of each kind is judged: a newer warm row on a resumed VM over its own budget (S10 F9: 8 s).
+        rows.extend(session(16, 7, "mode:remote", &[], Some(&remote_tail(Some(8_001), "resumed", 1500)), 0));
         assert_eq!(init_wrapper_verdict(&rows).unwrap().verdict, "over:warm");
         rows.extend(session(17, 8, "mode:remote", &[], Some(&remote_tail(Some(30_001), "started", 1500)), 0));
         assert_eq!(init_wrapper_verdict(&rows).unwrap().verdict, "over:cold,warm");
@@ -1651,10 +1816,10 @@ mod tests {
 
     #[test]
     fn the_init_wrapper_verdict_names_what_is_over_or_missing() {
-        assert_eq!(verdict_init_wrapper(Some(29_000), Some(4_000)), "within-budget");
+        assert_eq!(verdict_init_wrapper(Some(29_000), Some((4_000, "reused"))), "within-budget");
         assert_eq!(verdict_init_wrapper(Some(31_000), None), "over:cold", "an over wins over a gap");
-        assert_eq!(verdict_init_wrapper(None, Some(6_000)), "over:warm");
-        assert_eq!(verdict_init_wrapper(None, Some(4_000)), "gap:cold");
+        assert_eq!(verdict_init_wrapper(None, Some((6_000, "reused"))), "over:warm");
+        assert_eq!(verdict_init_wrapper(None, Some((4_000, "resumed"))), "gap:cold");
         assert_eq!(verdict_init_wrapper(Some(1), None), "gap:warm");
         assert_eq!(verdict_init_wrapper(None, None), "gap:cold,warm");
         for v in ["within-budget", "over:cold", "gap:warm"] {
@@ -2348,5 +2513,305 @@ mod tests {
         assert_eq!(last_row(&path, "hooks-port").unwrap().unwrap()["verdict"], "8080");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod n_tests {
+    use super::*;
+
+    /// A session id of the picker's shape, built at run time.
+    fn sid(n: u32) -> String {
+        format!("{n:08x}-0000-4000-8000-{:012x}", u64::from(n) << 24)
+    }
+
+    /// The census rows of one piped session: its start row (the wrapper and
+    /// the bundled claude, then `args`; `mode` its mode note), and its end
+    /// row (the pump's clone with `end`, `exit` and `tail` after the note)
+    /// unless `tail` is `None`.
+    fn session(pid: u32, start: u64, mode: &str, args: &[&str], tail: Option<&str>, exit: i32) -> Vec<serde_json::Value> {
+        let mut argv = vec!["/Users/mike/.cargo/bin/ai-env-claude", "/Users/mike/.cursor/extensions/anthropic.claude-code-2.1.303-darwin-arm64/resources/native-binary/claude"];
+        argv.extend_from_slice(args);
+        let row = serde_json::json!({
+            "v": 1, "ts": format!("2026-10-20T10:{:02}:00Z", start % 60), "start": start, "pid": pid, "ppid": 700, "ext": "2.1.303", "route": "remote", "reason": "session",
+            "argv": argv, "cwd": "/Users/mike/Documents/DeFi/ai-env/target/s8/x", "env_names": ["CLAUDE_CODE_ENTRYPOINT", "HOME"],
+            "env_selected": {"CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}, "note": mode,
+        });
+        let mut out = vec![row.clone()];
+        if let Some(tail) = tail {
+            let mut end = row;
+            end["end"] = serde_json::json!(start + 9_000);
+            end["exit"] = serde_json::json!(exit);
+            end["note"] = serde_json::json!(format!("{mode}; {tail}"));
+            out.push(end);
+        }
+        out
+    }
+
+    /// An S10 remote end row's tail (§4.1's order): `init_ms` when given;
+    /// the moves (readdress, respawn, migrate), the last one's time and cut,
+    /// when any is above 0; the swallow rules' counts; the link's parts on
+    /// `vm`, had as `how`, with the `transcript` word.
+    fn s10_tail(init_ms: Option<u64>, moves: [u32; 3], transcript: &str, vm: &str, how: &str) -> String {
+        let init = init_ms.map_or_else(String::new, |ms| format!("; init_ms:{ms}"));
+        let [readdress, respawn, migrate] = moves;
+        let moved = if moves.iter().any(|n| *n > 0) { format!("; moves:readdress={readdress},respawn={respawn},migrate={migrate}; move_ms:4200; cut:at") } else { String::new() };
+        format!(
+            "end:eof; child_pid:-; respawns:0; mirror:0/0; dropped:0; oauth_refresh_answered:0{init}; credential:combined{moved}; inits:2/1; echoes:1/1; vm:{vm}; vm_how:{how}; spawn:s2; vm_pid:41; claude:2.1.303; legs:touchid=2100,select=900,workspace=700,gate=200,spawn=600; seed:seeded; transcript:{transcript}; fetch:1/1; close_ms:540; link_drops:0; auth_timers:match; park:0; pid_rewrite:ok"
+        )
+    }
+
+    /// S10 F9: init-wrapper judges the newest warm row against its own VM's
+    /// budget: a reused one against 5 s, a resumed one (the VM's resume on
+    /// top: S8 and S9 measured 5.5 to 6.5 s) against 8 s; a budget met exactly
+    /// passes, and the note names the three budgets.
+    #[test]
+    fn init_wrapper_judges_reused_against_5_s_and_resumed_against_8_s() {
+        assert_eq!((INIT_COLD_BUDGET_MS, INIT_WARM_BUDGET_MS, INIT_RESUMED_BUDGET_MS), (30_000, 5_000, 8_000));
+        assert_eq!((warm_budget_ms("reused"), warm_budget_ms("resumed")), (5_000, 8_000));
+        for (warm, want) in [((5_000, "reused"), "within-budget"), ((5_001, "reused"), "over:warm"), ((5_985, "resumed"), "within-budget"), ((8_000, "resumed"), "within-budget"), ((8_001, "resumed"), "over:warm")] {
+            assert_eq!(verdict_init_wrapper(Some(20_000), Some(warm)), want, "{warm:?}");
+        }
+        assert_eq!(verdict_init_wrapper(None, Some((6_450, "resumed"))), "gap:cold", "within its budget: only the cold row is missing");
+        // From the census: the newest warm row decides, by its own vm_how.
+        let mut rows = session(40, 1, "mode:remote", &[], Some(&s10_tail(Some(21_000), [0; 3], "none", "microvm-a", "started")), 0);
+        rows.extend(session(41, 2, "mode:remote", &[], Some(&s10_tail(Some(6_450), [0; 3], "kept", "microvm-a", "resumed")), 0));
+        let row = init_wrapper_verdict(&rows).expect("remote end rows exist");
+        assert_eq!(row.verdict, "within-budget", "{row:?}");
+        let note = row.note.unwrap_or_default();
+        assert!(note.contains("; warm 6450 ms (touchid 2100 ms; vm_how:resumed;") && note.contains("; budgets 30000 ms cold, 5000 ms reused and 8000 ms resumed, from the census start"), "{note}");
+        rows.extend(session(42, 3, "mode:remote", &[], Some(&s10_tail(Some(6_450), [0; 3], "kept", "microvm-a", "reused")), 0));
+        assert_eq!(init_wrapper_verdict(&rows).unwrap().verdict, "over:warm", "the same time on a reused VM is over");
+    }
+
+    /// S10: init-wrapper judges a session that moved the chat only past the
+    /// cold budget. Its end row's `vm` and `vm_how` are its last VM's (every
+    /// generation rewrites them, a move's too), while its `init_ms` is the
+    /// first answer the host got and its legs generation 1's (a move adds
+    /// none), and a reopen's carry (generation 1, counted in `moves` too) is
+    /// not told apart: no budget of its `vm_how` fits it. So a moved row is
+    /// no warm row and, within 30 s, no cold row: it never hides an older
+    /// row's over, nor makes one of its own. Past 30 s, the largest budget,
+    /// it is over whatever its first VM was and stands as the cold row while
+    /// it is the newest (a slow reopen's carry never reads within-budget),
+    /// but never a pinned chat's (a pinned VM has no budget: `vm_how:pinned`,
+    /// or the pin knob among `env_names` once it moved off the pinned VM);
+    /// the note counts the moved rows that answered.
+    #[test]
+    fn init_wrapper_judges_a_moved_session_only_past_the_cold_budget() {
+        let moved = |pid: u32, start: u64, init_ms: u64, moves: [u32; 3], how: &str| session(pid, start, "mode:remote", &[], Some(&s10_tail(Some(init_ms), moves, "restored", "microvm-m", how)), 0);
+        let counted = |n: usize| format!("; {n} remote end row(s) moved the chat, a reopen's carry included (judged only past the 30000 ms cold budget: a move rewrites the row's vm_how while its init_ms stays the first answer's)");
+        // A cold start of 21 s, then re-addressed onto a suspended VM of the workspace: alone, nothing is judged (never over:warm).
+        let row = init_wrapper_verdict(&moved(50, 1, 21_000, [1, 0, 0], "resumed")).expect("a remote end row exists");
+        assert_eq!(row.verdict, "gap:cold,warm", "{row:?}");
+        let note = row.note.unwrap_or_default();
+        assert!(note.starts_with("no cold row yet") && note.ends_with(&counted(1)), "{note}");
+        // An older cold row over its 30 s stays the cold row beside a newer warm start migrated onto a started VM.
+        let mut rows = session(51, 2, "mode:remote", &[], Some(&s10_tail(Some(31_000), [0; 3], "none", "microvm-a", "started")), 0);
+        rows.extend(moved(52, 3, 4_100, [0, 0, 1], "started"));
+        assert_eq!(init_wrapper_verdict(&rows).unwrap().verdict, "over:cold");
+        // A 7 s answer on a reused VM, moved onto a resumed one, is not judged against 8 s; nor a cold 20 s, respawned on its VM, against 5 s.
+        let mut rows = session(53, 4, "mode:remote", &[], Some(&s10_tail(Some(21_000), [0; 3], "none", "microvm-a", "started")), 0);
+        rows.extend(moved(54, 5, 7_000, [1, 0, 0], "resumed"));
+        rows.extend(moved(55, 6, 20_000, [0, 1, 0], "reused"));
+        let row = init_wrapper_verdict(&rows).unwrap();
+        assert_eq!(row.verdict, "gap:warm", "{row:?}");
+        assert!(row.note.unwrap_or_default().contains("; no warm row yet (a session on a reused or resumed VM); budgets "), "the moved rows are no warm rows");
+        // A warm row that never moved is judged as before, the moved rows counted beside it.
+        rows.extend(session(56, 7, "mode:remote", &[], Some(&s10_tail(Some(4_000), [0; 3], "kept", "microvm-a", "reused")), 0));
+        let row = init_wrapper_verdict(&rows).unwrap();
+        assert_eq!(row.verdict, "within-budget", "{row:?}");
+        assert!(row.note.unwrap_or_default().ends_with(&counted(2)));
+        // A reopen carried off its gone VM onto a started one in 41 s, newer than the cold 21 s: over:cold, named as moved.
+        rows.extend(moved(57, 8, 41_000, [1, 0, 0], "started"));
+        let row = init_wrapper_verdict(&rows).unwrap();
+        assert_eq!(row.verdict, "over:cold", "{row:?}");
+        let note = row.note.unwrap_or_default();
+        assert!(note.starts_with("cold 41000 ms, a session that moved the chat, past every budget (touchid 2100 ms; vm_how:started; legs touchid=2100,") && note.ends_with(&counted(3)), "{note}");
+        // Alone as well, whatever its last VM; at 30 s exactly it is within every budget, so not judged.
+        assert_eq!(init_wrapper_verdict(&moved(58, 9, 30_001, [0, 0, 1], "reused")).unwrap().verdict, "over:cold");
+        assert_eq!(init_wrapper_verdict(&moved(59, 10, 30_000, [1, 0, 0], "started")).unwrap().verdict, "gap:cold,warm");
+        // Never a pinned chat's: respawned on its pinned VM (a respawn keeps vm_how:pinned), or moved off it onto a started
+        // one, its env_names (the start row's) naming the pin.
+        assert_eq!(init_wrapper_verdict(&moved(61, 12, 35_000, [0, 1, 0], "pinned")).unwrap().verdict, "gap:cold,warm");
+        let mut pinned = moved(62, 13, 35_000, [0, 0, 1], "started");
+        for r in &mut pinned {
+            r["env_names"] = serde_json::json!(["AI_ENV_BRIDGE_VM", "CLAUDE_CODE_ENTRYPOINT", "HOME"]);
+        }
+        assert_eq!(init_wrapper_verdict(&pinned).unwrap().verdict, "gap:cold,warm", "{pinned:?}");
+        let mut beside = rows.clone();
+        beside.extend(pinned);
+        let row = init_wrapper_verdict(&beside).unwrap();
+        assert!(row.verdict == "over:cold" && row.note.as_deref().unwrap_or_default().starts_with("cold 41000 ms, "), "the older unpinned 41 s row stays the cold row: {row:?}");
+        // A newer cold start that never moved decides again.
+        rows.extend(session(60, 11, "mode:remote", &[], Some(&s10_tail(Some(22_000), [0; 3], "none", "microvm-b", "started")), 0));
+        assert_eq!(init_wrapper_verdict(&rows).unwrap().verdict, "within-budget");
+        assert!(spec("init-wrapper").unwrap().what.contains("nor (S10) sessions that moved the chat, a reopen's carry included (a move rewrites the row's vm_how while its init_ms stays the first answer's), but one past 30 s stands as the cold row, over whatever its first VM was (a pinned chat's never);"));
+    }
+
+    /// S10 (T10.3): a move is dup evidence too: the newest end row of a
+    /// remote session that answered initialize and whose moves add up to 1
+    /// or more, a new chat's (its row names no session) as a reopened one's,
+    /// whatever its transcript word; the evidence then prints the moves and
+    /// the swallow rules' inits and echoes (an S9 row, without them, reads as
+    /// before). Moves adding up to 0, or a local session's, are no move, nor
+    /// is the move an `end:move_failed` row failed at the start of (no moved
+    /// claude ran), though an earlier move of that row is; a move that never
+    /// answered initialize is named, not taken, and hides no older evidence.
+    /// The dup probes' texts name the moves.
+    #[test]
+    fn a_move_is_dup_evidence_and_the_note_prints_moves_inits_and_echoes() {
+        let a = sid(0x10a1);
+        let moved = session(60, 1, "mode:remote(config)", &["--output-format", "stream-json"], Some(&s10_tail(Some(9_000), [1, 0, 0], "none", "microvm-new", "started")), 0);
+        assert_eq!(
+            resume_evidence(&moved).unwrap(),
+            "census: a new chat (no --resume) started in remote mode at 2026-10-20T10:01:00Z (wrapper pid 60) on microvm-new (vm_how:started): transcript:none, respawns:0, moves:readdress=1,respawn=0,migrate=0, inits:2/1, echoes:1/1, init_ms:9000, end:eof, exit 0"
+        );
+        // A reopened chat that moved on its own VM (a respawn), its transcript kept there: still a move.
+        let resume_a = format!("--resume={a}");
+        let respawned = session(61, 2, "mode:remote", &[resume_a.as_str()], Some(&s10_tail(Some(4_000), [0, 1, 0], "kept", "microvm-a", "reused")), 0);
+        assert_eq!(
+            resume_evidence(&respawned).unwrap(),
+            format!("census: session {a} resumed in remote mode at 2026-10-20T10:02:00Z (wrapper pid 61) on microvm-a (vm_how:reused): transcript:kept, respawns:0, moves:readdress=0,respawn=1,migrate=0, inits:2/1, echoes:1/1, init_ms:4000, end:eof, exit 0")
+        );
+        // An S10 resume into a new VM, no move: its counts as well.
+        let restored = session(62, 3, "mode:remote", &["--resume", &a], Some(&s10_tail(Some(8_000), [0; 3], "restored", "microvm-b", "started")), 0);
+        let evidence = resume_evidence(&restored).unwrap();
+        assert!(evidence.ends_with("(vm_how:started): transcript:restored, respawns:0, inits:2/1, echoes:1/1, init_ms:8000, end:eof, exit 0"), "{evidence}");
+        // Moves adding up to 0, a local session's moves, a new chat whose one move failed at its start (end:move_failed:
+        // no moved claude ran, nothing was sent again): neither a move nor a resume.
+        let zero = session(63, 4, "mode:remote", &[], Some(&s10_tail(Some(9_000), [0; 3], "none", "microvm-c", "started").replace("; inits:", "; moves:readdress=0,respawn=0,migrate=0; inits:")), 0);
+        let local = session(64, 5, "mode:local-child", &[], Some("end:eof; child_pid:9; respawns:0; init_ms:900; moves:readdress=1,respawn=0,migrate=0"), 0);
+        let failed = session(66, 7, "mode:remote", &[], Some(&s10_tail(Some(9_000), [1, 0, 0], "none", "microvm-a", "started").replace("end:eof", "end:move_failed")), 8);
+        for rows in [&zero, &local, &failed] {
+            let why = resume_evidence(rows).unwrap_err();
+            assert!(why.starts_with("no remote resume in the census; the dup probes need a census end row of a remote session (mode:remote) that resumed a conversation (--resume), answered initialize (init_ms) and found its VM without the transcript (transcript:uploaded, restored or staged, or respawns:1 or more), or (S10) one that answered initialize and moved the chat (its moves adding up to 1 or more, not counting the failed last move of an end:move_failed row): "), "{why}");
+            assert!(why.contains("(T10.3: ai-env vm terminate during a turn)"), "{why}");
+        }
+        // A move whose chat never answered initialize (the host closed first): no evidence, named as the newest.
+        let unanswered = session(65, 6, "mode:remote", &[], Some(&s10_tail(None, [1, 0, 0], "none", "microvm-d", "started")), 0);
+        let why = resume_evidence(&unanswered).unwrap_err();
+        assert!(why.starts_with("the newest remote move (a new chat, wrapper pid 65, started 2026-10-20T10:06:00Z) never answered initialize (end:eof, exit 0): move a chat that answered (T10.3), close it, then record; the dup probes need "), "{why}");
+        // The newest row that qualifies wins, of either kind; a newer unanswered move, or a failed one, hides nothing.
+        let mut all = moved.clone();
+        all.extend(respawned.clone());
+        all.extend(unanswered);
+        all.extend(failed);
+        assert!(resume_evidence(&all).unwrap().starts_with(&format!("census: session {a} resumed in remote mode at 2026-10-20T10:02:00Z (wrapper pid 61)")));
+        // Two moves, the second failed at its start: the first one's claude ran, so the row is evidence.
+        all.extend(session(67, 8, "mode:remote", &[], Some(&s10_tail(Some(9_000), [1, 1, 0], "restored", "microvm-e", "started").replace("end:eof", "end:move_failed")), 8));
+        assert_eq!(
+            resume_evidence(&all).unwrap(),
+            "census: a new chat (no --resume) started in remote mode at 2026-10-20T10:08:00Z (wrapper pid 67) on microvm-e (vm_how:started): transcript:restored, respawns:0, moves:readdress=1,respawn=1,migrate=0, inits:2/1, echoes:1/1, init_ms:9000, end:move_failed, exit 8"
+        );
+        for probe in ["dup-init", "dup-user-replay"] {
+            assert!(spec(probe).unwrap().what.contains(" move"), "{probe} names the moves");
+        }
+        assert!(spec("dup-init").unwrap().what.contains("or moved (its moves adding up to 1 or more, not counting the failed last move of an end:move_failed row), with its session (a new chat's row names none), VM, transcript word, respawns, moves, inits and echoes"));
+    }
+
+    /// resume_evidence pairs a start row with its end row by the wrapper's
+    /// pid and the census start, both numbers as the wrapper writes them: a
+    /// row without them, or with values of another type, pairs with none, so
+    /// another run's end row is never a resume's evidence (the start is named
+    /// as having no end row yet); numbers pair as before.
+    #[test]
+    fn resume_evidence_pairs_rows_by_a_numeric_pid_and_start() {
+        let (a, b) = (sid(0x10c1), sid(0x10c2));
+        let row = |id: &str, note: &str, ids: Option<(serde_json::Value, serde_json::Value)>, end: bool| {
+            let mut r = serde_json::json!({"route": "remote", "note": note, "argv": ["w", "c", format!("--resume={id}")], "ts": "2026-10-20T10:07:00Z"});
+            if let Some((pid, start)) = ids {
+                r["pid"] = pid;
+                r["start"] = start;
+            }
+            if end {
+                r["end"] = serde_json::json!(5);
+                r["exit"] = serde_json::json!(0);
+            }
+            r
+        };
+        let ended = "mode:remote; init_ms:900; transcript:restored; vm:microvm-b; vm_how:started";
+        let alone = format!("the newest remote resume (session {a}, started 2026-10-20T10:07:00Z) has no census end row yet: close the chat (or reload Cursor), then record; the dup probes need ");
+        // Session A's start beside another run's end row (session B's): a pid and a start of another type, or none at all.
+        let typed = [row(&a, "mode:remote", Some((serde_json::json!("4100"), serde_json::json!("x"))), false), row(&b, ended, Some((serde_json::json!(-1), serde_json::json!(1.5))), true)];
+        let bare = [row(&a, "mode:remote", None, false), row(&b, ended, None, true)];
+        for rows in [&typed, &bare] {
+            let why = resume_evidence(rows).unwrap_err();
+            assert!(why.starts_with(&alone), "{why}");
+        }
+        let ids = Some((serde_json::json!(4100), serde_json::json!(1_791_000_000_000u64)));
+        let paired = [row(&a, "mode:remote", ids.clone(), false), row(&a, ended, ids, true)];
+        assert_eq!(
+            resume_evidence(&paired).unwrap(),
+            format!("census: session {a} resumed in remote mode at 2026-10-20T10:07:00Z (wrapper pid 4100) on microvm-b (vm_how:started): transcript:restored, respawns:-, init_ms:900, end:-, exit 0")
+        );
+    }
+
+    /// S10 (L3, T10.3): move-note records what Cursor showed of the move's
+    /// note, by hand, only with the census evidence of a move: its verdict is
+    /// `shown`, or `not-shown:<what>` (else exit 2, before the census is
+    /// read); the evidence is the newest remote end row whose moves add up to
+    /// 1 or more, whatever else it shows (a failed move's too); without one
+    /// nothing is recorded (exit 1, naming how to get one).
+    #[test]
+    fn move_note_needs_shown_or_not_shown_and_a_moves_census_evidence() {
+        assert_eq!(check_move_note_verdict("shown"), Ok(()));
+        assert_eq!(check_move_note_verdict("not-shown:no line in the chat"), Ok(()));
+        for bad in ["not-shown:", "not-shown: ", "Shown", "no-duplicate", "shown:yes", ""] {
+            let e = check_move_note_verdict(bad).unwrap_err();
+            assert!(e.starts_with("move-note: the verdict is shown, or not-shown:<what Cursor showed instead>"), "{bad:?}: {e}");
+        }
+        let expected = spec("move-note").unwrap().expect.expectation().render();
+        assert!(expectation_holds(&expected, "shown") && !expectation_holds(&expected, "not-shown:nothing"));
+        let none = move_evidence(&[]).unwrap_err();
+        assert!(none.starts_with("no remote end row in the census shows a move (moves adding up to 1 or more, a reopen's carry not counted)") && none.contains("(T10.3: ai-env vm terminate during a turn), close it (or reload Cursor), then record"), "{none}");
+        let a = sid(0x10b1);
+        // A resume with no move, a local session's moves, a session still open: no evidence.
+        let mut rows = session(70, 1, "mode:remote", &["--resume", &a], Some(&s10_tail(Some(8_000), [0; 3], "restored", "microvm-b", "started")), 0);
+        rows.extend(session(71, 2, "mode:local-child", &[], Some("end:eof; child_pid:9; respawns:0; init_ms:900; moves:readdress=1,respawn=0,migrate=0"), 0));
+        rows.extend(session(72, 3, "mode:remote", &[], None, 0));
+        assert!(move_evidence(&rows).unwrap_err().starts_with("no remote end row in the census shows a move"));
+        // A reopened chat's re-address, then a new chat's migration that failed: the newest move, failed or not.
+        let resume_a = format!("--resume={a}");
+        rows.extend(session(73, 4, "mode:remote", &[resume_a.as_str()], Some(&s10_tail(Some(4_000), [1, 0, 0], "restored", "microvm-c", "started")), 0));
+        let readdress = format!("census: session {a} moved in remote mode (started 2026-10-20T10:04:00Z, wrapper pid 73), last on microvm-c (vm_how:started): moves:readdress=1,respawn=0,migrate=0, move_ms:4200, cut:at, inits:2/1, echoes:1/1, init_ms:4000, end:eof, exit 0");
+        assert_eq!(move_evidence(&rows).unwrap(), readdress);
+        rows.extend(session(74, 5, "mode:remote", &[], Some(&s10_tail(Some(3_000), [0, 0, 1], "none", "microvm-c", "reused").replace("end:eof", "end:move_failed")), 8));
+        assert_eq!(
+            move_evidence(&rows).unwrap(),
+            "census: a new chat (no --resume) moved in remote mode (started 2026-10-20T10:05:00Z, wrapper pid 74), last on microvm-c (vm_how:reused): moves:readdress=0,respawn=0,migrate=1, move_ms:4200, cut:at, inits:2/1, echoes:1/1, init_ms:3000, end:move_failed, exit 8"
+        );
+        // `lab run move-note --manual VERDICT`'s path: the verdict's form first, then the census.
+        let d = tempfile::tempdir().unwrap();
+        let paths = crate::bridge::config::Paths::from_root_and_env(d.path().to_path_buf(), None);
+        let usage = cursor_evidence(&paths, "move-note", "maybe").unwrap_err();
+        assert!(matches!(&usage, CliError::Usage(m) if m.starts_with("move-note: the verdict is shown")), "{usage:?}");
+        let empty = cursor_evidence(&paths, "move-note", "shown").unwrap_err();
+        assert!(matches!(&empty, CliError::Msg(m) if m.starts_with("move-note: no remote end row in the census shows a move") && m.ends_with("; nothing recorded")), "{empty:?}");
+        std::fs::create_dir_all(paths.census().parent().unwrap()).unwrap();
+        std::fs::write(paths.census(), rows[..rows.len() - 2].iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+        assert_eq!(cursor_evidence(&paths, "move-note", "not-shown:a blank line").unwrap(), readdress);
+        // The dup probes take the same move.
+        let dup = cursor_evidence(&paths, "dup-init", "no-duplicate").unwrap();
+        assert!(dup.starts_with(&format!("census: session {a} resumed in remote mode at 2026-10-20T10:04:00Z (wrapper pid 73) on microvm-c (vm_how:started): transcript:restored, respawns:0, moves:readdress=1,")), "{dup}");
+    }
+
+    /// S10 §2.7: a reopen's carry (`carried:`) counts in `moves`, but it is no
+    /// move `move-note` takes (it shows no note) and none the dup probes'
+    /// `moves_done` counts (it sends nothing again); a move after the carry is.
+    #[test]
+    fn a_reopens_carry_is_no_move_for_move_note_or_the_dup_probes() {
+        let a = sid(0x10c1);
+        let resume_a = format!("--resume={a}");
+        let carried = |moves: [u32; 3]| format!("{}; carried:readdress", s10_tail(Some(9_000), moves, "restored", "microvm-d", "started"));
+        let mut rows = session(80, 1, "mode:remote", &[resume_a.as_str()], Some(&carried([1, 0, 0])), 0);
+        let end_parts = |rows: &[serde_json::Value]| note_parts(rows.iter().rev().find(|r| is_end_row(r)).unwrap()).iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect::<Vec<_>>();
+        let done = |parts: &[(String, String)]| moves_done(&parts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        assert_eq!(done(&end_parts(&rows)), 0, "the carry alone sends nothing again");
+        assert!(move_evidence(&rows).unwrap_err().starts_with("no remote end row in the census shows a move (moves adding up to 1 or more, a reopen's carry not counted)"));
+        rows = session(81, 2, "mode:remote", &[resume_a.as_str()], Some(&carried([2, 0, 0])), 0);
+        assert_eq!(done(&end_parts(&rows)), 1, "the move after the carry");
+        assert!(move_evidence(&rows).unwrap().starts_with(&format!("census: session {a} moved in remote mode")));
     }
 }

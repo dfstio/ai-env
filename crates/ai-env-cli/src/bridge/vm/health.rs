@@ -527,6 +527,10 @@ fn record_health(paths: &Paths, id: &str, h: &Health) {
             row.shim_version = Some(h.shim_version.clone());
             // S7: what this shim can do (empty: an S6 shim, which cannot hold a credential).
             row.caps = Some(h.caps.clone());
+            // S10: the guest's memory, when the shim names it (image 12.0 on).
+            if h.mem_total_mib.is_some() {
+                row.mem_total_mib = h.mem_total_mib;
+            }
         })?;
         Ok(())
     };
@@ -593,6 +597,7 @@ mod tests {
             uptime_s: 1,
             wire: None,
             caps: vec![],
+            mem_total_mib: None,
         }
     }
 

@@ -1,6 +1,6 @@
 //! S8 §13: the doc-test. The fenced `sh doc-test` blocks of the README's
-//! "Cursor in a MicroVM (stage S8)" section, of its S9 section ([`S9_SECTION`])
-//! and of `skills/ai-env/SKILL.md`
+//! "Cursor in a MicroVM (stage S8)" section, of its S9 section ([`S9_SECTION`]),
+//! of its S10 section ([`S10_SECTION`]) and of `skills/ai-env/SKILL.md`
 //! run in their dry forms ([`DRY_FORMS`] is the specification) against a
 //! planted HOME: S7's green world (the sealed runtime key and setup-token,
 //! the egress record, the fake age), the file-backed fake API with one VM
@@ -26,10 +26,12 @@
 //! files are unchanged (no pre-push hook written either). Beside it: the
 //! Commands block parses (`--help`), the VM's CLAUDE.md in the README is
 //! `image/claude/CLAUDE.md` byte for byte, every JSON block parses, every
-//! `ai-env` command of the two S8 sections and of the S9 section is
-//! doc-tested, and the engine refuses what it must. In `make test` (the
-//! default and bridge worlds) and `make doc-test`. Built in S8 wave 2 (W9);
-//! the S9 section and its rows in S9 wave 2 (G9).
+//! `ai-env` command of the two S8 sections and of the S9 and S10 sections
+//! is doc-tested, the S10 section quotes the wrapper's notes and lines as
+//! the code writes them and shows `[vm]`'s S10 keys at their defaults, and
+//! the engine refuses what it must. In `make test` (the default and bridge
+//! worlds) and `make doc-test`. Built in S8 wave 2 (W9); the S9 section and
+//! its rows in S9 wave 2 (G9); the S10 section in S10 wave 2 (D).
 //!
 //! A doc-test line is one `ai-env` command, optionally followed by two
 //! spaces and a `#` comment. Words split on whitespace, single and double
@@ -48,8 +50,10 @@ use common::green_world;
 mod green_world;
 
 use ai_env_cli::bridge::api::{Call, FakeState};
-use ai_env_cli::bridge::config::Paths;
+use ai_env_cli::bridge::config::{BridgeConfig, Paths, VmCfg};
 use ai_env_cli::bridge::registry::{self, SessionRow};
+use ai_env_cli::bridge::remote::link::{LossCause, MigrateTrigger, MoveKind};
+use ai_env_cli::bridge::remote::{self, Failure, StayedThen};
 use ai_env_cli::bridge::settings_capture::{capture_path, CapturePhase};
 use ai_env_cli::bridge::vm::fake_file::FileFakeMicrovmApi;
 use ai_env_cli::wire::frame::{CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
@@ -70,6 +74,8 @@ const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 const SECTION: &str = "### Cursor in a MicroVM (stage S8)";
 /// The README's S9 section, by its heading.
 const S9_SECTION: &str = "### Pushes reviewed, transcripts in S3 (stage S9)";
+/// The README's S10 section, by its heading.
+const S10_SECTION: &str = "### Chats move to a new VM, idle chats park (stage S10)";
 /// The bridge's audit log, relative to the planted HOME: a documented command
 /// may only append to it, and only the rows its [`DryForm::audits`] names.
 const AUDIT_LOG: &str = "bridge/audit.jsonl";
@@ -168,16 +174,18 @@ impl DryForm {
 /// and whether it may run the refused tools. The three that reach AWS cost
 /// one Touch ID each, the runtime key's unseal: `box fetch --dry-run` mints
 /// a code-port token to read the VM's refs, and `vm list` and `vm gc` list
-/// the VMs; `box seed --dry-run` and `vm warm --dry-run` reach neither AWS
+/// the VMs (S10 L12: `vm list` also runs gc's local reconcile, which audits
+/// `vm_gc_reconcile` and stamps `state/gc.stamp`); `box seed --dry-run` and `vm warm --dry-run` reach neither AWS
 /// nor age. S9's: `box review` is read-only as written (no AWS, no Touch ID;
 /// it audits each review, `box_review`), `box hook-install --dry-run` writes
 /// no hook, and `session gc --remote` and `session migrate-s9` without
 /// `--yes` list from the Mac's own files (no S3 read, no Touch ID). Not
 /// listed on purpose: `vm status` and `vm health` (they rewrite the VM's
 /// row), `vm terminate`, `vm exec`, `egress check`, `session stage`,
-/// `session sync` and `session forget` (no dry form). `box fetch
-/// --smart-http` stays out of the blocks: the stand-in endpoint answers a
-/// code-out's manifest and speaks no git smart-HTTP.
+/// `session sync`, `session forget` and S10's `session migrate` (no dry
+/// form: it moves the chat, and with no wrapper unseals and starts a VM).
+/// `box fetch --smart-http` stays out of the blocks: the stand-in endpoint
+/// answers a code-out's manifest and speaks no git smart-HTTP.
 const DRY_FORMS: [DryForm; 20] = [
     DryForm::new(&["wrapper", "install"], Dry::Drop("--write"), &[0], &["dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "uninstall"], Dry::Drop("--write"), &[0], &["nothing to remove", "dry run"], 0, Api::None, false),
@@ -193,7 +201,7 @@ const DRY_FORMS: [DryForm; 20] = [
     DryForm::new(&["session", "list"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["session", "show"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["wrapper", "census"], Dry::AsIs, &[0], &[], 0, Api::None, false),
-    DryForm::new(&["vm", "list"], Dry::AsIs, &[0], &[], 1, Api::Reads, false),
+    DryForm::new(&["vm", "list"], Dry::AsIs, &[0], &[], 1, Api::Reads, false).audited(&["vm_gc_reconcile"]),
     DryForm::new(&["lab", "list"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["box", "review"], Dry::AsIs, &[0], &["box review: pass", "\"verdict\": \"pass\""], 0, Api::None, false).audited(&["box_review"]),
     DryForm::new(&["box", "hook-install"], Dry::Add("--dry-run"), &[0], &["nothing was written", "\"would_install\""], 0, Api::None, false),
@@ -425,11 +433,11 @@ fn docs() -> (String, String) {
     (read("README.md"), read("skills/ai-env/SKILL.md"))
 }
 
-/// The doc-test lines of the README's S8 section, then of its S9 section, then of SKILL.md.
+/// The doc-test lines of the README's S8 section, then of its S9 and S10 sections, then of SKILL.md.
 fn documented_lines() -> Vec<DocLine> {
     let (readme, skill) = docs();
     let mut lines = Vec::new();
-    for heading in [SECTION, S9_SECTION] {
+    for heading in [SECTION, S9_SECTION, S10_SECTION] {
         let (first, text) = section(&readme, heading).unwrap_or_else(|| panic!("README.md has no {heading:?} section"));
         lines.extend(doc_lines(text, "README.md", first));
     }
@@ -710,10 +718,12 @@ fn tree(dir: &Path, skip: &dyn Fn(&str) -> bool) -> BTreeMap<String, String> {
 /// `logs/`; the seed's clean-object cache (`state/scan-cache/`, the ids of
 /// objects a scan found clean, no content); the parent of its scratch
 /// repositories (`state/tmp`, which must end empty); and the settings diff
-/// `session show --settings-diff` writes beside the captures (plan §9).
+/// `session show --settings-diff` writes beside the captures (plan §9); and
+/// the local reconcile's stamp and lock (`state/gc.stamp`, `state/gc.lock`;
+/// S10 L12).
 fn allowed_change(rel: &str) -> bool {
     let under = |dir: &str| rel == dir || rel.starts_with(&format!("{dir}/"));
-    under("bridge/logs") || under("bridge/state/scan-cache") || rel == "bridge/state/tmp" || (rel.starts_with("bridge/quarantine/") && rel.ends_with("/settings/diff.json"))
+    under("bridge/logs") || under("bridge/state/scan-cache") || rel == "bridge/state/tmp" || (rel.starts_with("bridge/quarantine/") && rel.ends_with("/settings/diff.json")) || rel == "bridge/state/gc.stamp" || rel == "bridge/state/gc.lock"
 }
 
 /// What a command did to the audit log, `before` and `after` its run, that
@@ -978,7 +988,7 @@ impl World {
 // ---- the tests ----------------------------------------------------------------------------
 
 /// The doc-test itself (the module doc): every `sh doc-test` line of the
-/// README's S8 and S9 sections and of SKILL.md runs in its dry form in the
+/// README's S8, S9 and S10 sections and of SKILL.md runs in its dry form in the
 /// planted world, asks for what its row allows and no more, and changes
 /// nothing a dry run may not change. Every failure is listed, each laid at
 /// the door of the line that caused it, the world's checks too, before the
@@ -1073,16 +1083,17 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
     assert!(problems.is_empty(), "{} problem(s) in the doc-test of {} documented commands:\n\n{}", problems.len(), lines.len(), problems.join("\n\n"));
 }
 
-/// Both S8 sections and the README's S9 section exist and doc-test their
-/// commands: each holds `sh doc-test` lines, and no plain `sh` block there
-/// holds an `ai-env` command, which would escape the doc-test (git and make
-/// commands sit in plain blocks; S9's commands without a dry form, such as
-/// `session stage`, are named in the prose).
+/// Both S8 sections and the README's S9 and S10 sections exist and doc-test
+/// their commands: each holds `sh doc-test` lines, and no plain `sh` block
+/// there holds an `ai-env` command, which would escape the doc-test (git and
+/// make commands sit in plain blocks; the commands without a dry form, such
+/// as S9's `session stage` and S10's `session migrate`, are named in the
+/// prose).
 #[test]
 fn the_s8_sections_doc_test_every_ai_env_command() {
     let (readme, skill) = docs();
     let mut escaped = Vec::new();
-    for (file, md, heading, at_least) in [("README.md", &readme, SECTION, 12), ("README.md", &readme, S9_SECTION, 4), ("skills/ai-env/SKILL.md", &skill, SKILL_SECTION, 4)] {
+    for (file, md, heading, at_least) in [("README.md", &readme, SECTION, 12), ("README.md", &readme, S9_SECTION, 4), ("README.md", &readme, S10_SECTION, 4), ("skills/ai-env/SKILL.md", &skill, SKILL_SECTION, 5)] {
         let (first, text) = section(md, heading).unwrap_or_else(|| panic!("{file} has no {heading:?} section"));
         let n = doc_lines(text, file, first).len();
         assert!(n >= at_least, "{file}'s {heading:?} holds {n} doc-test lines (at least {at_least})");
@@ -1177,6 +1188,94 @@ fn readme_json_blocks_parse() {
     assert!(n >= 1, "no json block at all");
 }
 
+/// `text`'s words joined by one space: a quote the README wraps over lines
+/// reads as the one line the wrapper writes.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Why a stayed note says the chat stayed after an unanswered Touch ID, as
+/// the README quotes it. The pump's `stayed_why` words it, a private
+/// function, so this text is the test's own: the one part of the quotes
+/// below that is not taken from the code.
+const STAYED_UNANSWERED: &str = "no Touch ID in time";
+
+/// The README's S10 section quotes what the wrapper writes as the code
+/// writes it (whitespace aside: a quote may wrap), the VM named `ID`: the
+/// notes a move, a restart and a migration leave in the chat
+/// (`remote::note_*`; the stayed note's reason is [`STAYED_UNANSWERED`]),
+/// the words of the other causes and of the wall's end (each quoted on its
+/// own), and the lines Cursor shows for a chat past its moves, for a failed
+/// move (the failure's own line in its middle shown as `…`) and for
+/// `[vm].max_concurrent` naming a parked VM. A text the code changes fails
+/// here before the docs drift from it.
+#[test]
+fn the_s10_section_quotes_the_wrappers_notes_and_lines() {
+    let (readme, _) = docs();
+    let (_, s10) = section(&readme, S10_SECTION).unwrap_or_else(|| panic!("README.md has no {S10_SECTION:?} section"));
+    let text = flat(s10);
+    let vm = "ID";
+    let inner = Failure::TouchIdCancelled;
+    let failed = Failure::Move { kind: MoveKind::Readdress, from_vm: vm.into(), cause: Some(LossCause::VmGone), inner: Box::new(inner.clone()) }.line();
+    assert!(failed.contains(&inner.line()), "the failure's own line, whole: {failed}");
+    let quotes = [
+        remote::note_moving(vm, LossCause::VmGone),
+        remote::note_move_at_next(vm, LossCause::VmGone),
+        remote::note_continues(vm),
+        remote::note_restarting(vm, LossCause::SpawnGone),
+        remote::note_restart_at_next(vm, LossCause::SpawnGone),
+        remote::note_migrating(vm, &MigrateTrigger::Wall { left_s: 1200 }),
+        remote::note_stayed(vm, STAYED_UNANSWERED, StayedThen::Retry),
+        Failure::MovesExhausted { vm: vm.into(), moves: VmCfg::default().max_readdress }.line(),
+        failed.replace(&inner.line(), "…"),
+        Failure::MaxConcurrent { running: VmCfg::default().max_concurrent, parked: vec![vm.into()] }.line(),
+    ];
+    let mut missing: Vec<String> = quotes.iter().filter(|q| !text.contains(&format!("`{}`", flat(q)))).cloned().collect();
+    // Quoted as words of their own: what a note says inside its parentheses for the other causes, and the end of a stayed
+    // note once no wall migration is left.
+    let inside = |note: &str| note.split_once(" (").and_then(|(_, rest)| rest.split_once(')')).map(|(cause, _)| cause.to_string()).unwrap_or_default();
+    let stayed = remote::note_stayed(vm, "WHY", StayedThen::AtWall);
+    let words = [inside(&remote::note_moving(vm, LossCause::Unreachable)), inside(&remote::note_restarting(vm, LossCause::Gap)), stayed.rsplit_once("; ").map(|(_, end)| end.to_string()).unwrap_or_default()];
+    missing.extend(words.into_iter().filter(|w| w.is_empty() || !text.contains(&format!("`{w}`"))));
+    assert!(missing.is_empty(), "README.md's S10 section does not quote these as the wrapper writes them:\n{}", missing.join("\n"));
+}
+
+/// The README's S10 section shows `[vm]`'s S10 keys as bridge.toml holds
+/// them: its one `toml` block parses as a bridge.toml, passes
+/// `VmCfg::validate`, and reads as `VmCfg::default()` (each key it sets is
+/// at its default); it names every S10 key, the commented `park_after_s`
+/// too, whose value, uncommented, parks after what the default's unset key
+/// does (`max_idle_s`).
+#[test]
+fn the_s10_sections_vm_keys_are_bridge_toml_at_their_defaults() {
+    let (readme, _) = docs();
+    let (first, s10) = section(&readme, S10_SECTION).unwrap_or_else(|| panic!("README.md has no {S10_SECTION:?} section"));
+    let found: Vec<Block> = blocks(s10).into_iter().filter(|b| b.info == "toml").collect();
+    assert_eq!(found.len(), 1, "one ```toml block in the S10 section");
+    let (block, at) = (&found[0], first + found[0].first - 1);
+    let parsed = |text: &str| BridgeConfig::parse(text).unwrap_or_else(|e| panic!("README.md:{at}: the [vm] block: {e}"));
+    let cfg = parsed(&block.text());
+    cfg.vm.validate().unwrap_or_else(|e| panic!("README.md:{at}: {e}"));
+    assert_eq!(cfg.vm, VmCfg::default(), "README.md:{at}: the [vm] block's values are the defaults it says they are");
+    let doc: toml::Table = block.text().parse().unwrap_or_else(|e| panic!("README.md:{at}: {e}"));
+    let set: Vec<&str> = doc.get("vm").and_then(toml::Value::as_table).map(|t| t.keys().map(String::as_str).collect()).unwrap_or_default();
+    for key in ["max_readdress", "park", "migrate_before_wall_s"] {
+        assert!(set.contains(&key), "README.md:{at}: the [vm] block sets {key} (it sets {set:?})");
+    }
+    let uncommented: String = block
+        .lines
+        .iter()
+        .map(|l| match l.strip_prefix("# ") {
+            Some(key) if key.starts_with("park_after_s =") => format!("{key}\n"),
+            _ => format!("{l}\n"),
+        })
+        .collect();
+    assert_ne!(uncommented, block.text(), "README.md:{at}: the [vm] block names park_after_s, commented out");
+    let set_after = parsed(&uncommented).vm;
+    set_after.validate().unwrap_or_else(|e| panic!("README.md:{at}: park_after_s uncommented: {e}"));
+    assert!(set_after.park_after_s.is_some() && set_after.park_after() == VmCfg::default().park_after(), "README.md:{at}: park_after_s's shown value is what the unset key means ([vm].max_idle_s)");
+}
+
 /// The engine on a synthetic page: the dry forms of the table, comments and
 /// quotes, and a refusal, naming why, for a command without a dry form, a
 /// flag that acts, shell syntax, an unknown placeholder, an unclosed quote,
@@ -1262,7 +1361,8 @@ ai-env vm terminate ID --yes
     assert_eq!(s9("ai-env box hook-install WORKSPACE"), ("box hook-install /w --dry-run".to_string(), &[][..]));
     assert_eq!(s9("ai-env session gc --remote --yes"), ("session gc --remote".to_string(), &[][..]));
     assert_eq!(s9("ai-env session migrate-s9 --yes"), ("session migrate-s9".to_string(), &[][..]));
-    for acting in ["ai-env session stage UUID --warm", "ai-env session sync UUID", "ai-env session forget UUID --purge"] {
+    // S10's: `session migrate` moves the chat (offline it unseals and starts a VM), and `forget` of several ids acts as one.
+    for acting in ["ai-env session stage UUID --warm", "ai-env session sync UUID", "ai-env session forget UUID --purge", "ai-env session forget UUID UUID --purge", "ai-env session migrate UUID", "ai-env session migrate UUID --json"] {
         let why = plan(acting, &fill).expect_err("no dry form");
         assert!(why.contains("has no dry form"), "{acting}: {why}");
     }

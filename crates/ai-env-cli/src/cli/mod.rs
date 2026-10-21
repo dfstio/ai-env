@@ -180,7 +180,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: WrapperCmd,
     },
-    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget, drop-transport; a remote chat's transcript in S3 (S9): stage, sync, gc --remote, migrate-s9
+    /// Sessions the wrapper registered (state/sessions/*.toml): list, show, forget, drop-transport; a remote chat's transcript in S3 (S9): stage, sync, gc --remote, migrate-s9; a remote chat to a new VM now (S10): migrate
     #[cfg(feature = "bridge")]
     Session {
         #[command(subcommand)]
@@ -387,7 +387,7 @@ pub enum VmCmd {
         #[arg(long)]
         json: bool,
     },
-    /// VMs of the image (ListMicrovms) joined with state/vms; TERMINATED hidden without --all
+    /// VMs of the image (ListMicrovms) joined with state/vms; TERMINATED hidden without --all; then, without --json, the registry reconciled locally (S10): a row whose VM the platform ended marked terminated, old terminated rows removed, a session row whose VM is gone and whose wrapper is dead closed (never a terminate, no Touch ID of its own)
     List {
         /// Include TERMINATED VMs and terminated rows
         #[arg(long)]
@@ -1035,13 +1035,22 @@ pub enum SessionCmd {
         #[arg(long)]
         settings_diff: bool,
     },
-    /// Delete a session's row, its scratch config dir and its quarantine (the settings captures, diff.json and settings-sync's backups); refused while the session is active
+    /// Delete each session's row, its scratch config dir and its quarantine (the settings captures, diff.json and settings-sync's backups); every id is checked first, and one a wrapper still serves (active, detached, parked or migrating) or session migrate is moving refuses them all, nothing removed
     Forget {
-        /// Session id (a uuid)
-        uuid: String,
-        /// Also delete its S3 transcript, its manifest, the original kept under state/transcripts and the view
+        /// Session ids (uuids): every one is checked before any is removed
+        #[arg(required = true, num_args = 1.., value_name = "UUID")]
+        uuids: Vec<String>,
+        /// Also delete their S3 transcripts, their manifests, the originals kept under state/transcripts and the views: one Touch ID for all of them, none when this Mac records none of them in S3
         #[arg(long)]
         purge: bool,
+    },
+    /// Move a remote chat to a new VM now: its running wrapper moves it between turns (one Touch ID there), or, with no wrapper, this command moves it (one Touch ID)
+    Migrate {
+        /// Session id (a uuid) of a remote chat (one on this Mac is refused, exit 9, before any Touch ID)
+        uuid: String,
+        /// One JSON document: session, outcome, how (live or offline), from_vm, to_vm, ms and code
+        #[arg(long)]
+        json: bool,
     },
     /// Close a remote session's socket from the wrapper's side; the session reattaches (T8.6)
     DropTransport {
@@ -1092,6 +1101,58 @@ pub enum SessionCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// S10's help texts (wave 2, D; plans/s10-contracts.md §6.1, §7.1, §7.2,
+/// §2.7's reconcile): `session forget --help` says every id is checked
+/// first and what refuses them all (a wrapper still serving one, whatever
+/// its status, or a `session migrate` moving it), and that the purge asks
+/// one Touch ID for all; `session migrate --help` names a local chat's
+/// refusal and the keys of its `--json` document; `vm list --help` says it
+/// then reconciles the registry locally (not with `--json`, which returns
+/// before the reconcile) and never terminates; the `session` group's line
+/// names S10's `migrate` beside S9's `migrate-s9`.
+#[cfg(all(test, feature = "bridge"))]
+#[allow(clippy::items_after_test_module)]
+mod d_tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    /// `ai-env <cmd> <sub> --help`.
+    fn long_help(cmd: &str, sub: &str) -> String {
+        let mut cli = Cli::command();
+        cli.find_subcommand_mut(cmd).and_then(|c| c.find_subcommand_mut(sub)).unwrap_or_else(|| panic!("{cmd} {sub}")).render_long_help().to_string()
+    }
+
+    #[test]
+    fn the_s10_helps_say_what_forget_migrate_and_vm_list_do() {
+        let (forget, migrate, list) = (long_help("session", "forget"), long_help("session", "migrate"), long_help("vm", "list"));
+        let wants = [
+            (&forget, "Delete each session's row, its scratch config dir and its quarantine"),
+            (&forget, "every id is checked first, and one a wrapper still serves (active, detached, parked or migrating) or session migrate is moving refuses them all, nothing removed"),
+            (&forget, "Also delete their S3 transcripts, their manifests, the originals kept under state/transcripts and the views: one Touch ID for all of them, none when this Mac records none of them in S3"),
+            (&migrate, "Session id (a uuid) of a remote chat (one on this Mac is refused, exit 9, before any Touch ID)"),
+            (&migrate, "One JSON document: session, outcome, how (live or offline), from_vm, to_vm, ms and code"),
+            (&list, "TERMINATED hidden without --all; then, without --json, the registry reconciled locally (S10)"),
+            (&list, "a session row whose VM is gone and whose wrapper is dead closed (never a terminate, no Touch ID of its own)"),
+        ];
+        let missing: Vec<&str> = wants.iter().filter(|(help, want)| !help.contains(want)).map(|(_, want)| *want).collect();
+        assert!(missing.is_empty(), "missing {missing:?}:\n{forget}\n{migrate}\n{list}");
+        assert!(!forget.contains("refused while the session is active"), "S9's text: a detached, parked or migrating chat's live wrapper refuses it too\n{forget}");
+    }
+
+    /// `ai-env --help` lists the `session` group with this line, and
+    /// `session --help` opens with it.
+    #[test]
+    fn the_session_groups_line_names_migrate_beside_migrate_s9() {
+        let want = "a remote chat's transcript in S3 (S9): stage, sync, gc --remote, migrate-s9; a remote chat to a new VM now (S10): migrate";
+        let mut cli = Cli::command();
+        let top = cli.render_long_help().to_string();
+        let session = cli.find_subcommand_mut("session").expect("session").render_long_help().to_string();
+        for help in [&top, &session] {
+            assert!(help.contains(want), "{help}");
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1256,7 +1317,8 @@ pub fn run(cli: Cli) -> Result<()> {
             SessionCmd::List { json } => crate::bridge::registry::cmd_list(json),
             SessionCmd::Show { uuid, json, settings_diff: false } => crate::bridge::registry::cmd_show(&uuid, json),
             SessionCmd::Show { uuid, json, settings_diff: true } => crate::bridge::settings_capture::cmd_settings_diff(&uuid, json),
-            SessionCmd::Forget { uuid, purge } => crate::bridge::registry::cmd_forget(&store, &uuid, purge),
+            SessionCmd::Forget { uuids, purge } => crate::bridge::registry::cmd_forget(&store, &uuids, purge),
+            SessionCmd::Migrate { uuid, json } => crate::bridge::migrate::cmd_migrate(&store, &uuid, json),
             SessionCmd::DropTransport { uuid } => crate::bridge::registry::cmd_drop_transport(&uuid),
             SessionCmd::Stage { uuid, warm, json } => crate::bridge::s3::stage::cmd_stage(&store, &uuid, warm, json),
             SessionCmd::Sync { uuid, json } => crate::bridge::s3::cmd_sync(&store, &uuid, json),
@@ -1440,8 +1502,8 @@ mod tests {
         let Cmd::Session { cmd: SessionCmd::Gc { remote: true, older_than: 90, yes: false, json: false } } = cmd(&["session", "gc", "--remote"]) else { panic!("session gc --remote") };
         let Cmd::Session { cmd: SessionCmd::Gc { remote: true, older_than: 30, yes: true, json: true } } = cmd(&["session", "gc", "--remote", "--older-than", "30", "--yes", "--json"]) else { panic!("session gc, every flag") };
         let Cmd::Session { cmd: SessionCmd::MigrateS9 { yes: true, json: false } } = cmd(&["session", "migrate-s9", "--yes"]) else { panic!("session migrate-s9") };
-        let Cmd::Session { cmd: SessionCmd::Forget { uuid, purge: true } } = cmd(&["session", "forget", id, "--purge"]) else { panic!("session forget --purge") };
-        assert_eq!(uuid, id);
+        let Cmd::Session { cmd: SessionCmd::Forget { uuids, purge: true } } = cmd(&["session", "forget", id, "--purge"]) else { panic!("session forget --purge") };
+        assert_eq!(uuids, [id]);
         let Cmd::Session { cmd: SessionCmd::Forget { purge: false, .. } } = cmd(&["session", "forget", id]) else { panic!("session forget") };
         for bad in [
             &["session", "gc"][..],
@@ -1454,6 +1516,27 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// S10's `session` commands (plans/s10-contracts.md §7.1, §7.2):
+    /// `migrate` with and without `--json`; `forget` of several ids, with
+    /// `--purge`; `forget` of none refused; `migrate` takes one id.
+    #[test]
+    fn session_s10_commands_parse() {
+        let (a, b, c) = ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d");
+        let Cmd::Session { cmd: SessionCmd::Migrate { uuid, json: false } } = cmd(&["session", "migrate", a]) else { panic!("session migrate") };
+        assert_eq!(uuid, a);
+        let Cmd::Session { cmd: SessionCmd::Migrate { uuid, json: true } } = cmd(&["session", "migrate", a, "--json"]) else { panic!("session migrate --json") };
+        assert_eq!(uuid, a);
+        let Cmd::Session { cmd: SessionCmd::Forget { uuids, purge: true } } = cmd(&["session", "forget", a, b, c, "--purge"]) else { panic!("session forget of three ids --purge") };
+        assert_eq!(uuids, [a, b, c], "in their order");
+        let Cmd::Session { cmd: SessionCmd::Forget { uuids, purge: false } } = cmd(&["session", "forget", a, b]) else { panic!("session forget of two ids") };
+        assert_eq!(uuids, [a, b]);
+        for bad in [&["session", "forget"][..], &["session", "forget", "--purge"], &["session", "migrate"], &["session", "migrate", a, b], &["session", "migrate", a, "--purge"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let migrate = long_help("session", "migrate");
+        assert!(migrate.contains("Move a remote chat to a new VM now: its running wrapper moves it between turns (one Touch ID there), or, with no wrapper, this command moves it (one Touch ID)"), "{migrate}");
     }
 
     /// `session stage --help` says what `--warm` does (S9, R5-AWS-1): it

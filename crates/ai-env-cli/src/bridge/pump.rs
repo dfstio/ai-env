@@ -94,13 +94,18 @@ use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::census::{self, CensusRow};
 use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::creds::{aws_env_state, AwsEnvState};
-use crate::bridge::hoststate::{ChildVerdict, HostState};
+use crate::bridge::hoststate::{ChildVerdict, DupCounts, HostState, HostVerdict};
 use crate::bridge::lab::{self, PumpKnobs};
 use crate::bridge::logging::{self, LogOpts};
 use crate::bridge::mirror::{self, MirrorCfg, Writer};
 use crate::bridge::registry::{self, SessionRow};
-use crate::bridge::remote::link::{CloseTimings, LinkFactory, LinkKind, LinkLoss, LocalLinks, RemoteLinks, RemoteStarted, SpawnFailure, StartReq, StartStep, StartWhy, PENDING_IN_BYTES, PENDING_IN_LINES, STEP_PART};
+use crate::bridge::remote::link::{CloseTimings, LinkFactory, LinkKind, LinkLoss, LocalLinks, MoveFailure, MoveReady, RemoteLinks, RemoteStarted, SpawnFailure, StartReq, StartStep, StartWhy, PENDING_IN_BYTES, PENDING_IN_LINES, STEP_PART};
 use crate::bridge::remote::{audit_event, census_part, pipeline, Failure};
+use crate::bridge::remote::link::{LossCause, MoveKind, MoveWhy, RemoteSnapshot};
+use crate::bridge::remote::{note_continues, note_move_at_next, note_moving, note_restart_at_next, note_restarting};
+use crate::bridge::park::QuietState;
+use crate::bridge::remote::link::{request_of, MigrateTrigger};
+use crate::bridge::remote::{note_migrating, note_stayed, StayedThen, MIGRATE_PREP_TRIES};
 use crate::bridge::route::Mode;
 use crate::bridge::voice;
 use crate::bridge::seed;
@@ -358,6 +363,9 @@ pub enum EndReason {
     /// S8: Anthropic refused the token delivered to the remote session (the
     /// AuthWatch verdict, `ChildEvent::Rejected`).
     CredentialRejected,
+    /// S10: a move's start failed (its `ChildEvent::SpawnFailed`); the exit is
+    /// the failure's, the end row carries `step:<step>`.
+    MoveFailed,
 }
 
 impl EndReason {
@@ -373,6 +381,7 @@ impl EndReason {
             EndReason::SpawnFailed => "spawn_failed",
             EndReason::LinkLost => "link_lost",
             EndReason::CredentialRejected => "credential_rejected",
+            EndReason::MoveFailed => "move_failed",
         }
     }
 }
@@ -417,6 +426,16 @@ pub struct Outcome {
     /// A remote session: the `system/init` session ids not adopted, each
     /// naming another session's row ([`INIT_ID_REFUSED_PART`]).
     pub init_id_refused: u64,
+    /// S10: the moves started (readdress, respawn, migrate): the census's `moves`.
+    pub moves: [u32; 3],
+    /// S10: the last move's ms, to its generation's `Started` or its failure.
+    pub move_ms: Option<u64>,
+    /// S10: the last move that sent lines again: `none`, `at`, `fresh`.
+    pub cut: Option<&'static str>,
+    /// S10: what the swallow rules and the moves did (`HostState::counts`): a remote session's only.
+    pub dups: Option<DupCounts>,
+    /// S10: the host's `keep_alive` lines dropped while parked.
+    pub ka_dropped: u64,
 }
 
 /// The end row's part counting a remote session's `system/init` ids that
@@ -436,7 +455,9 @@ pub const MIRROR_DROPPED_PART: &str = "mirror_dropped";
 /// mirror part when n > 0; then `init_ms`, `eof_to_sigterm_ms` when known;
 /// `credential:<fd|env|inherited|none>` for `local-scratch`, a remote session's
 /// `credential:<combined|setup-token|cached>`; `synthetic_oauth:<class>` with the lab
-/// knob; `init_id_refused:<n>` when n > 0; `step:<step>` for a failed remote start; a remote link's parts
+/// knob; `init_id_refused:<n>` when n > 0; S10's `moves`, `move_ms` and `cut` once a move started,
+/// a remote session's `inits:<forwarded>/<swallowed>` and `echoes:<forwarded>/<swallowed>`,
+/// `ka_dropped:<n>` when n > 0; `step:<step>` for a failed remote start; a remote link's parts
 /// with `close_ms` before its `link_drops`, `remote::census_part::ALL`'s order; else
 /// `close_ms` after the rest; `pid_rewrite:<ok|failed>` once an `initialize` answer went).
 #[must_use]
@@ -469,6 +490,24 @@ pub fn end_row(start: &CensusRow, out: &Outcome, now_ms: u64) -> CensusRow {
     }
     if out.init_id_refused > 0 {
         parts.push(format!("{INIT_ID_REFUSED_PART}:{}", out.init_id_refused));
+    }
+    // S10: the moves (once one started), then the swallow rules' counts of a remote session.
+    if out.moves.iter().any(|n| *n > 0) {
+        let [readdress, respawn, migrate] = out.moves;
+        parts.push(format!("{}:readdress={readdress},respawn={respawn},migrate={migrate}", census_part::MOVES));
+        if let Some(ms) = out.move_ms {
+            parts.push(format!("{}:{ms}", census_part::MOVE_MS));
+        }
+        if let Some(cut) = out.cut {
+            parts.push(format!("{}:{cut}", census_part::CUT));
+        }
+    }
+    if let Some(d) = out.dups {
+        parts.push(format!("{}:{}/{}", census_part::INITS, d.inits_forwarded, d.inits_swallowed));
+        parts.push(format!("{}:{}/{}", census_part::ECHOES, d.echoes_forwarded, d.echoes_swallowed));
+    }
+    if out.ka_dropped > 0 {
+        parts.push(format!("{}:{}", census_part::KA_DROPPED, out.ka_dropped));
     }
     if let Some(step) = out.step {
         parts.push(format!("{STEP_PART}:{step}"));
@@ -635,6 +674,12 @@ pub enum ChildEvent {
     Link(bool),
     /// A remote transport note for the wrapper's log, never its stderr.
     Note(String),
+    /// S10 §B: a migration's phase A is done: the new VM is chosen, gated and holds the token.
+    MoveReady(MoveReady),
+    /// S10 §B: phase A failed, or its Touch ID went unanswered: the chat stays on its VM.
+    MoveFailed(MoveFailure),
+    /// S10 §D: the session parked (`true`) or unparked (`false`): the row says `parked`, then `active`; never an exit.
+    Parked(bool),
 }
 
 impl ChildEvent {
@@ -654,6 +699,9 @@ impl ChildEvent {
             ChildEvent::Rejected { .. } => "rejected",
             ChildEvent::Link(_) => "link",
             ChildEvent::Note(_) => "note",
+            ChildEvent::MoveReady(_) => "move_ready",
+            ChildEvent::MoveFailed(_) => "move_failed",
+            ChildEvent::Parked(_) => "parked",
         }
     }
 }
@@ -926,6 +974,8 @@ enum HostSignal {
     Term,
     /// `registry::DROP_TRANSPORT_SIGNAL` (`session drop-transport`, T8.6).
     DropTransport,
+    /// S10: `registry::MIGRATE_SIGNAL` (`session migrate`, §7.1).
+    Migrate,
 }
 
 /// The wrapper's signal handlers, installed by the supervisor before the
@@ -939,6 +989,9 @@ enum Signals {
         /// leave a Touch ID dialog orphaned (S8 §3).
         hup: Option<tokio::signal::unix::Signal>,
         drop_transport: tokio::signal::unix::Signal,
+        /// S10: every piped mode answers `session migrate`'s signal (its
+        /// default action would end the wrapper).
+        migrate: tokio::signal::unix::Signal,
     },
     /// The tests' signals.
     #[cfg(test)]
@@ -956,18 +1009,25 @@ impl Signals {
             LinkKind::Remote => crate::bridge::signals::handle(libc::SIGHUP, SignalKind::hangup()).map_err(|e| std::io::Error::other(e.to_string()))?,
             LinkKind::Local => None,
         };
-        Ok(Signals::Os { term: signal(SignalKind::terminate())?, int: signal(SignalKind::interrupt())?, hup, drop_transport: signal(SignalKind::from_raw(registry::DROP_TRANSPORT_SIGNAL))? })
+        Ok(Signals::Os {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup,
+            drop_transport: signal(SignalKind::from_raw(registry::DROP_TRANSPORT_SIGNAL))?,
+            migrate: signal(SignalKind::from_raw(registry::MIGRATE_SIGNAL))?,
+        })
     }
 
     /// The next signal (cancel-safe).
     async fn recv(&mut self) -> HostSignal {
         match self {
-            Signals::Os { term, int, hup, drop_transport } => tokio::select! {
+            Signals::Os { term, int, hup, drop_transport, migrate } => tokio::select! {
                 biased;
                 _ = term.recv() => HostSignal::Term,
                 _ = int.recv() => HostSignal::Term,
                 _ = async { match hup { Some(h) => h.recv().await, None => std::future::pending().await } } => HostSignal::Term,
                 _ = drop_transport.recv() => HostSignal::DropTransport,
+                _ = migrate.recv() => HostSignal::Migrate,
             },
             #[cfg(test)]
             Signals::Scripted(rx) => match rx.recv().await {
@@ -1042,19 +1102,6 @@ impl InQueue {
     }
 }
 
-/// One child generation's registry entry (`SessionRow.vms`): the VM and the
-/// spawn a remote generation ran on, from its `Started` to its end.
-#[derive(Debug, Clone, serde::Serialize)]
-struct VmGen {
-    gen: u32,
-    vm: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    spawn: Option<String>,
-    from: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
-}
-
 // ---- the supervisor ----------------------------------------------------------------------
 
 /// The EOF/SIGTERM ladder in progress.
@@ -1095,8 +1142,8 @@ struct Pump {
     link_down: bool,
     /// A respawn's replay deadline waits for the remote generation's `Started`.
     replay_at_start: bool,
-    /// The remote generations' VMs and spawns (the row's `vms`).
-    vms: Vec<VmGen>,
+    /// The remote generations' VMs and spawns (the row's `vms`, S10's `registry::VmEntry`).
+    vms: Vec<registry::VmEntry>,
     /// The one `ai-env-claude:` line the wrapper ends with, printed last (a remote session's).
     final_line: Option<String>,
     /// The host's EOF (or its stdout gone) or the signal that closed the session: the census's `close_ms` counts from it.
@@ -1150,6 +1197,173 @@ struct Pump {
     credential_hold_until: Option<Instant>,
     /// The synthetic `oauth_token_refresh` probe ([`SYNTHETIC_OAUTH_KNOB`]).
     synthetic: Option<Synthetic>,
+    /// S10: the last move (§A): from its start on, through its cut miss's
+    /// retry; the generation it started is `gen_move`'s.
+    moving: Option<Moving>,
+    /// S10 (L5): a loss with no turn in flight, waiting for the next host
+    /// line that is no `keep_alive` to start its move.
+    waiting: Option<Pending>,
+    /// S10: the last top-level `assistant` frame forwarded in the current
+    /// turn, and the leaf a move cuts at: that frame's uuid once a `result`
+    /// followed it (none when the turn forwarded none). A move's start drops
+    /// the dead CLI's partial frame: it is cut away, never a later leaf.
+    last_assistant: Option<String>,
+    leaf: Option<String>,
+    /// S10: the `result`s forwarded since the CLI's session id was adopted (a
+    /// `/clear`'s new session counts from 0: a chat with none is fresh).
+    results: u32,
+    /// S10 (§6.1): the `vms` entries of the session's row as an earlier
+    /// wrapper left it, kept as the prefix of this process's.
+    vms_prefix: Vec<toml::Value>,
+    /// S10: the current generation's start: its `vms` why (the kind that ran
+    /// replaces a move's own at `Started`), the move it is, whether it
+    /// forwarded a `system/init` (a moved CLI's miss comes before one).
+    gen_why: String,
+    gen_move: Option<MoveWhy>,
+    gen_init: bool,
+    /// S10: [`RESUME_MISS_GRACE`] after a moved CLI's first answer (to the
+    /// replayed `initialize`): with no miss by then it resumed the session,
+    /// as at its first init, whichever comes first.
+    move_resumed_by: Option<Instant>,
+    /// S10 §D: the session parked (`ChildEvent::Parked(true)`, no `Parked(false)` since).
+    parked: bool,
+    /// S10 §B: a `keep_alive` went to the parked session so a prepared
+    /// migration can switch (any stdin unparks it); until its `Parked(false)`.
+    unparking: bool,
+    /// S10 §D: the last line forwarded either way other than a `keep_alive`
+    /// (`QuietState::since`), and the last host frame's kind forwarded
+    /// (`QuietState::last_host`).
+    quiet_since: Instant,
+    last_host: Option<&'static str>,
+    /// S10 §B: the chat's migration, from its phase A to its switch's spawn.
+    migration: Option<Migration>,
+    /// S10 §B: no more wall migrations in this process: a phase A failed for
+    /// good, or `MIGRATE_PREP_TRIES` switches fell back to the old VM.
+    wall_off: bool,
+    /// S10 §B: switches that fell back to the old VM.
+    fallbacks: u32,
+    /// S10 §2.7: generation 1 was a reopen's carry, counted in `moves` once
+    /// (`Some(kind)`); a carry off a gone VM is no loss's move
+    /// (`[vm].max_readdress` leaves it out).
+    carried: Option<MoveKind>,
+    /// S10 §B: host lines a switch held when it was called off (the old
+    /// link lost meanwhile), taken as the host's next ones.
+    held_host: VecDeque<Bytes>,
+}
+
+/// S10 §B: a migration as the pump runs it: what started it (the wall, or
+/// `session migrate`'s request), the VM it leaves, when its phase A began,
+/// where it stands.
+#[derive(Debug)]
+struct Migration {
+    trigger: MigrateTrigger,
+    from_vm: String,
+    at: Instant,
+    phase: MigPhase,
+}
+
+/// Where a migration stands.
+#[derive(Debug)]
+enum MigPhase {
+    /// Phase A runs (`LinkFactory::prepare_move`).
+    Preparing,
+    /// Phase A ended `MoveReady`: the switch waits for a quiet point.
+    Ready,
+    /// The switch began at `at`: the old CLI got its EOF, and its
+    /// `detach{final}` (`Sig::Kill`) is due at `detach_at`; the host's lines
+    /// are held, unrecorded, until the moved generation's replay.
+    Switching { at: Instant, detach_at: Option<Instant>, held: VecDeque<Bytes> },
+}
+
+/// S10: a move as the pump runs it (§A, §3.4): what it started as and the
+/// kind that ran (the pipeline may make a `Respawn` a `Readdress`), when it
+/// started (`move_ms`), whether it sent lines again (the census `cut`),
+/// whether its cut miss's one retry ran, its `session_move_end` `done`
+/// while that waits for the moved CLI to show it resumed, and the `done` it
+/// wrote (a miss later than that: no second one for a retry on the same
+/// VM, the values of the generation that failed for its `failed`). S10 §B:
+/// a switch whose new VM never started the moved CLI fell back to the old
+/// VM (`fell_back`, once per switch: the step and code of that failure, its
+/// `stayed` row's, written when the fallback's generation starts).
+#[derive(Debug, Clone)]
+struct Moving {
+    why: MoveWhy,
+    ran: MoveKind,
+    at: Instant,
+    resent: bool,
+    retried: bool,
+    done: Option<MoveDoneRow>,
+    written: Option<MoveDoneRow>,
+    fell_back: Option<(&'static str, i32)>,
+}
+
+/// S10 (§4.2): a move's `session_move_end` `done`, its values taken at the
+/// moved generation's `Started` and written once the moved CLI shows it
+/// resumed: at its first init, or [`RESUME_MISS_GRACE`] after its first
+/// answer (to the replayed `initialize`: a resume or cut miss comes at
+/// start-up, S9's rule) with no miss by then, whichever comes first; else
+/// at that generation's end with nothing failed (the host closed, the link
+/// was lost again), or the wrapper's. A cut miss's retry on the same VM
+/// keeps the first generation's `how`, `seed`, `transcript` and `touchid`,
+/// its own `gen`, `cut` and `ms`; a miss writes `failed` in its place. A
+/// miss later than the grace, still before the CLI's first init (§2.9), is
+/// held all the same, after the `done`: a resume miss writes `failed` after
+/// it; a cut miss's retry on that VM writes no second `done` and no second
+/// note, one on another VM that VM's.
+#[derive(Debug, Clone)]
+struct MoveDoneRow {
+    gen: u32,
+    to_vm: String,
+    how: Option<&'static str>,
+    seed: Option<&'static str>,
+    transcript: Option<&'static str>,
+    cut: Option<&'static str>,
+    touchid: Option<&'static str>,
+    ms: u64,
+}
+
+/// S10 (L5): a lost link that moves with the next host line: the move it
+/// starts, and how many of the dead CLI's requests were withdrawn.
+#[derive(Debug, Clone)]
+struct Pending {
+    kind: MoveKind,
+    cause: LossCause,
+    from_vm: String,
+    from_spawn: Option<crate::wire::frame::SpawnId>,
+    cancelled: usize,
+}
+
+/// The census's `moves` slot of `kind`: readdress, respawn, migrate.
+fn move_slot(kind: MoveKind) -> usize {
+    match kind {
+        MoveKind::Readdress => 0,
+        MoveKind::Respawn => 1,
+        MoveKind::Migrate => 2,
+    }
+}
+
+/// S10 §D: a host frame's kind as `QuietState::last_host` names it (and
+/// `session_unpark.by` after it): `user`, `control_response`,
+/// `control_request`, `control_cancel_request`, `other`.
+fn host_kind(frame: &HostFrame<'_>) -> &'static str {
+    match frame {
+        HostFrame::User { .. } => "user",
+        HostFrame::ControlResponse { .. } => "control_response",
+        HostFrame::ControlRequest { .. } => "control_request",
+        HostFrame::ControlCancel { .. } => "control_cancel_request",
+        HostFrame::KeepAlive | HostFrame::Other => "other",
+    }
+}
+
+/// S10 §B: why a migration's phase A left the chat on its VM, as the note says it.
+fn stayed_why(f: &MoveFailure) -> String {
+    match f.word {
+        "touchid_cancelled" => "the Touch ID was dismissed".to_string(),
+        "touchid_timeout" => "no Touch ID in time".to_string(),
+        "deadline" if f.step == StartStep::TouchId || f.code == 5 => "no Touch ID in time".to_string(),
+        "max_concurrent" => "no VM can start: [vm].max_concurrent".to_string(),
+        word => format!("preparing a new VM failed at {}: {word}", f.step.name()),
+    }
 }
 
 /// The synthetic `oauth_token_refresh` the pump sends the host itself
@@ -1255,6 +1469,25 @@ impl Pump {
             credential,
             credential_hold_until: None,
             synthetic,
+            moving: None,
+            waiting: None,
+            last_assistant: None,
+            leaf: None,
+            results: 0,
+            vms_prefix: Vec::new(),
+            gen_why: String::new(),
+            gen_move: None,
+            gen_init: false,
+            move_resumed_by: None,
+            parked: false,
+            unparking: false,
+            quiet_since: Instant::now(),
+            last_host: None,
+            migration: None,
+            wall_off: false,
+            fallbacks: 0,
+            carried: None,
+            held_host: VecDeque::new(),
             sess,
             plan,
         }
@@ -1334,6 +1567,16 @@ impl Pump {
     fn spawn_next(&mut self, why: StartWhy) -> bool {
         self.gen += 1;
         self.state.begin_gen(self.gen);
+        // S10: what the generation is, for its `vms` entry and a moved CLI's miss; a new spawn is parked nowhere.
+        self.gen_init = false;
+        self.move_resumed_by = None;
+        self.parked = false;
+        self.unparking = false;
+        (self.gen_why, self.gen_move) = match &why {
+            StartWhy::First => ("first".to_string(), None),
+            StartWhy::ResumeRetry { .. } => ("retry".to_string(), None),
+            StartWhy::Move(m) => (m.vms_why(), Some(m.clone())),
+        };
         self.child_exit = None;
         self.exit_seen_at = None;
         self.stdout_eof = false;
@@ -1466,16 +1709,49 @@ impl Pump {
                         return;
                     }
                 }
+                if let Some(Migration { phase: MigPhase::Switching { held, .. }, .. }) = self.migration.as_mut() {
+                    // S10 §B: during the switch the host's lines wait, unrecorded, for the moved generation's replay; a
+                    // keep_alive has no CLI to keep alive.
+                    if !matches!(frame, HostFrame::KeepAlive) {
+                        held.push_back(line.clone());
+                    }
+                    return;
+                }
+                if self.parked && matches!(frame, HostFrame::KeepAlive) && crate::bridge::park::DROP_HOST_KEEP_ALIVE {
+                    // S10 §D (L10): a parked chat's VM is left to idle: Cursor's keep_alive never wakes it.
+                    self.out.ka_dropped += 1;
+                    return;
+                }
+                if self.waiting.is_some() {
+                    // S10 (L5): the lost link's move starts with the next host line that is no keep_alive (dropped: no
+                    // CLI runs); the host's late answer to a withdrawn request is dropped below, and starts nothing.
+                    if matches!(frame, HostFrame::KeepAlive) {
+                        tracing::debug!(gen = self.gen, "a host keep_alive while the moved chat waits for its next line: dropped");
+                        return;
+                    }
+                    let withdrawn = matches!(&frame, HostFrame::ControlResponse { request_id: Some(id) } if self.state.child_cancelled(id));
+                    if !withdrawn {
+                        if let Some(pending) = self.waiting.take() {
+                            self.start_move(pending, Vec::new(), true);
+                        }
+                    }
+                }
                 if let HostFrame::ControlRequest { request_id, subtype, .. } = &frame {
                     // The subtype and id only: request bodies can carry credentials.
                     tracing::debug!(subtype = subtype.as_deref().unwrap_or("-"), id = request_id.as_deref().unwrap_or("-"), "host control_request");
                 }
-                self.state.on_host_frame(&frame, &line);
+                if self.state.on_host_frame(&frame, &line) == HostVerdict::Drop {
+                    // S10: the host's answer to a CLI request withdrawn at a move: the re-run asks again.
+                    tracing::info!(gen = self.gen, "a host answer to a request withdrawn at a move: dropped");
+                    return;
+                }
                 if matches!(frame, HostFrame::User { .. }) && !self.user_line_seen {
                     self.user_line_seen = true;
                     self.maybe_register();
                 }
                 self.in_q.push_back(ChildInput::Line(encode_line(&line)));
+                // S10 §D: the live session's park control reads the chat's quiet after each line.
+                self.tell_quiet(Some(host_kind(&frame)), matches!(frame, HostFrame::KeepAlive));
             }
             Some(HostIn::TooLong(n)) => {
                 self.out.dropped_lines += 1;
@@ -1588,6 +1864,52 @@ impl Pump {
         self.links.drop_transport();
     }
 
+    /// `session migrate` (S10 §7.1): the wrapper takes the request
+    /// `state/sessions/<sid>.migrate.json` of its session (removed whatever it
+    /// holds; one older than `migrate::MIGRATE_REQUEST_FRESH` goes
+    /// unanswered) and moves the chat: phase A at once, whatever
+    /// `migration_due` would say, the switch at its next quiet point. A
+    /// request it cannot take (a migration or a move already under way, the
+    /// session closing, a pinned VM, a session not remote or keeping no
+    /// transcript) is answered `session_move_end` `refused`, with its nonce.
+    fn on_migrate(&mut self) {
+        tracing::info!(gen = self.gen, kind = self.kind.name(), "session migrate signal");
+        let Some(sid) = self.out.session_id.clone().filter(|s| registry::is_uuid(s)) else {
+            tracing::info!("session migrate: no session id yet: no request to take");
+            return;
+        };
+        let request = match crate::bridge::migrate::take_request(&self.sess.paths, &sid) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::info!(session = %sid, "session migrate: no request of this session");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(session = %sid, "session migrate: the request: {e}");
+                return;
+            }
+        };
+        if !request.fresh(crate::wire::time::unix_now()) {
+            tracing::info!(session = %sid, "session migrate: a stale request removed unanswered");
+            return;
+        }
+        let pinned = self.links.snapshot().and_then(|s| s.pinned).is_some();
+        let busy = self.migration.is_some() || self.waiting.is_some() || self.starting || self.move_unconfirmed() || self.child_events.is_none();
+        if self.kind != LinkKind::Remote || self.closing() || pinned || busy || self.sess.session.no_session_persistence {
+            tracing::info!(session = %sid, pinned, busy, "session migrate: the request is refused");
+            let from_vm = self.links.snapshot().and_then(|s| s.vm).unwrap_or_default();
+            let row = crate::bridge::remote::link::MoveEndRow { session: Some(&sid), gen: self.gen, kind: Some(MoveKind::Migrate), outcome: "refused", from_vm: &from_vm, request: Some(&request.nonce), ..Default::default() };
+            row.audit(&self.sess.paths);
+            return;
+        }
+        self.start_migration(MigrateTrigger::Command { nonce: request.nonce });
+    }
+
+    /// Nothing more starts: the host closed, a signal came, the finish is decided or a ladder runs.
+    fn closing(&self) -> bool {
+        self.close_requested || self.host_gone || self.finish.is_some() || self.finish_after_child.is_some() || self.ladder.is_some()
+    }
+
     // -- child → host --------------------------------------------------------------------
 
     fn on_child_event(&mut self, ev: Option<ChildEvent>) {
@@ -1625,6 +1947,9 @@ impl Pump {
             Some(ChildEvent::Rejected { how }) => self.on_rejected(how),
             Some(ChildEvent::Link(up)) => self.on_link(up),
             Some(ChildEvent::Note(text)) => tracing::info!(gen = self.gen, "remote link: {text}"),
+            Some(ChildEvent::MoveReady(r)) => self.on_move_ready(&r),
+            Some(ChildEvent::MoveFailed(f)) => self.on_move_failed(&f),
+            Some(ChildEvent::Parked(on)) => self.on_parked(on),
             None => {
                 // Every task of this child ended.
                 self.stdout_eof = true;
@@ -1668,8 +1993,20 @@ impl Pump {
         tracing::info!(gen = self.gen, spawn = %s.spawn_id, vm_pid = s.vm_pid, ms = now.duration_since(self.spawned_at).as_millis() as u64, "the remote spawn started");
         self.starting = false;
         self.link_down = false;
-        let vm = self.links.snapshot().and_then(|snap| snap.vm).unwrap_or_default();
-        self.vms.push(VmGen { gen: self.gen, vm, spawn: Some(s.spawn_id.to_string()), from: registry::now_rfc3339(), to: None });
+        let snap = self.links.snapshot();
+        let vm = snap.as_ref().and_then(|snap| snap.vm.clone()).unwrap_or_default();
+        // S10 (§6.1): why it started (a move's, the kind that ran), this wrapper's pid; `end` comes with its end.
+        let why = self.started_why(snap.as_ref());
+        self.vms.push(registry::VmEntry { gen: self.gen, vm, spawn: Some(s.spawn_id.to_string()), from: registry::now_rfc3339(), to: None, why, end: None, pid: std::process::id() });
+        if self.gen_move.is_some() {
+            self.move_started(snap.as_ref());
+        }
+        if let Some(c) = snap.as_ref().and_then(|s| s.carried.as_ref()).filter(|_| self.gen == 1 && self.carried.is_none()) {
+            // S10 §2.7: a reopen's carry counts in `moves` (once), never against `[vm].max_readdress`.
+            let kind = if c.left_s.is_some() { MoveKind::Migrate } else { MoveKind::Readdress };
+            self.out.moves[move_slot(kind)] += 1;
+            self.carried = Some(kind);
+        }
         if self.ladder.is_none() {
             if self.gen == 1 {
                 self.delay_until = self.knobs.delay_init.map(|d| now + d);
@@ -1749,10 +2086,32 @@ impl Pump {
             }
             _ => {}
         }
+        // S10 (§2.9): a moved CLI's error result before it showed it resumed (a cut its transcript lacks, a resume it
+        // does not find, any other start-up refusal) is never the host's, nor its cut or resume miss before its first
+        // init however late (the grace past, its move written done): held until the child exits, then the cut miss's
+        // one retry, or the move failed.
+        let start_miss = self.gen_move.is_some() && !self.gen_init && (claude::is_cut_miss(&frame) || claude::is_resume_miss(&frame));
+        if (start_miss || self.move_unconfirmed()) && self.held_miss.is_none() && matches!(frame, ChildFrame::Result { is_error: true, .. }) {
+            tracing::info!(gen = self.gen, cut = claude::is_cut_miss(&frame), resume = claude::is_resume_miss(&frame), late = !self.move_unconfirmed(), "the moved CLI failed before it resumed; holding the result until the child exits");
+            self.held_miss = Some(line.clone());
+            return;
+        }
         if claude::is_resume_miss(&frame) && self.retry_possible() && self.held_miss.is_none() {
             tracing::info!("resume miss reported by generation {}; holding the result until the child exits", self.gen);
             self.held_miss = Some(line.clone());
             return;
+        }
+        if matches!(frame, ChildFrame::Init { .. }) && !self.gen_init {
+            self.gen_init = true;
+            // S10: a moved CLI's first init (swallowed or not): it resumed the session, so the move is done.
+            if self.gen_move.is_some() {
+                self.move_resumed();
+            }
+        }
+        if matches!(frame, ChildFrame::ControlResponse { .. }) && self.move_unconfirmed() && self.move_resumed_by.is_none() {
+            // S10: a moved CLI reading its input is past its start; a miss comes within the grace after its first
+            // answer (S9's rule for a resume), so with none by then the move is done, its turn or not.
+            self.move_resumed_by = Some(Instant::now() + RESUME_MISS_GRACE);
         }
         // Generation 1's answer to the host's `initialize`: its latency, and the start of the token's grace.
         if let ChildFrame::ControlResponse { request_id: Some(id), .. } = &frame {
@@ -1786,6 +2145,10 @@ impl Pump {
             ChildVerdict::Rewritten(b) => self.forward(&b),
             ChildVerdict::Swallow(why) => tracing::debug!(?why, "child frame swallowed"),
         }
+        if forwarded {
+            // S10 §D: the live session's park control reads the chat's quiet after each line.
+            self.tell_quiet(None, matches!(frame, ChildFrame::KeepAlive));
+        }
         if initialized {
             if self.kind == LinkKind::Remote && self.out.init_latency_ms.is_none() {
                 // The first answer the host got, whichever generation gave it (a resume miss's retry
@@ -1804,6 +2167,10 @@ impl Pump {
                             tracing::info!(session = %id, "new session id in the same process");
                             self.close_row(None);
                             self.row = None;
+                            // S10: a move of the new session cuts in its own transcript, fresh until its first result.
+                            self.results = 0;
+                            self.leaf = None;
+                            self.last_assistant = None;
                         } else {
                             tracing::info!(session = %id, cwd = ?cwd, "session id learned");
                         }
@@ -1825,13 +2192,21 @@ impl Pump {
                 self.maybe_register();
             }
             ChildFrame::Result { .. } if forwarded => {
+                // S10: the turn is over: its last top-level assistant frame is the leaf a move cuts at. A turn with
+                // none (stopped before any reply) leaves none: an older leaf would cut away this turn's prompt and
+                // its interruption marker, so the cut is then the view's entry just before the next turn's line.
+                self.results += 1;
+                self.leaf = self.last_assistant.take();
                 if let Err(e) = self.mirror.sync_all() {
                     tracing::warn!("mirror fsync: {e}");
                 }
                 // A remote link's per-result code-out: asked for, never awaited.
                 self.links.on_result();
                 self.touch_registry();
+                // S10 §B: the VM's wall near, a migration's phase A starts.
+                self.maybe_migrate();
             }
+            ChildFrame::Assistant { uuid: Some(uuid), top_level: true } if forwarded => self.last_assistant = Some(uuid.to_string()),
             _ => {}
         }
     }
@@ -1906,6 +2281,9 @@ impl Pump {
             return;
         }
         let Some(session_id) = self.out.session_id.clone().filter(|s| registry::is_uuid(s)) else { return };
+        // S10 (§6.1): an earlier wrapper's history of this session stays, the prefix of this process's entries;
+        // `created` stays this wrapper's registration (`confirm_wrapper` judges a wrapper's start against it).
+        self.vms_prefix = registry::read(&self.sess.paths, &session_id).ok().flatten().map(|r| r.vms).unwrap_or_default();
         let now = registry::now_rfc3339();
         let row = SessionRow {
             v: registry::REGISTRY_SCHEMA_V,
@@ -1971,7 +2349,9 @@ impl Pump {
     /// A remote session's fields of the row (plan §2.4's reserved ones),
     /// from its link: the VM, the spawn, the last stdout seq handed to the
     /// pump, the seeded head, the newest WIP ref fetched, one `vms` entry per
-    /// generation; S9's ([`Pump::s3_fields`]).
+    /// generation (S10: after the earlier wrappers' entries, at most
+    /// `registry::VMS_KEPT` in all, the oldest dropped); S9's
+    /// ([`Pump::s3_fields`]).
     fn fill_remote(&mut self) {
         let Some(row) = self.row.as_mut() else { return };
         let Some(s) = self.links.snapshot() else { return };
@@ -1980,7 +2360,12 @@ impl Pump {
         row.last_acked_seq = s.spawn.is_some().then_some(s.last_acked_seq);
         row.seeded_head = s.seeded_head;
         row.last_wip_fetch = s.last_wip_fetch;
-        row.vms = self.vms.iter().filter_map(|v| toml::Value::try_from(v).ok()).collect();
+        let own = self.vms.iter().filter_map(|v| toml::Value::try_from(v).ok());
+        let mut vms: Vec<toml::Value> = self.vms_prefix.iter().cloned().chain(own).collect();
+        if vms.len() > registry::VMS_KEPT {
+            vms.drain(..vms.len() - registry::VMS_KEPT);
+        }
+        row.vms = vms;
         Self::s3_fields(row, &self.sess.paths, self.plan.slug.as_deref());
     }
 
@@ -2019,17 +2404,96 @@ impl Pump {
         self.child_input = None;
         self.child_signal = None;
         self.in_q.clear();
-        // This generation's end, before a retry moves `gen` on (its row write closes it with it).
+        let closing = self.close_requested || self.finish.is_some() || self.ladder.is_some();
+        // S10: a moved CLI that ended on its own before it showed it resumed, with no error result held (a start-up
+        // refusal on stderr alone: `--session-id`'s `is already in use`), did not resume the session either.
+        let unresumed = self.move_unconfirmed()
+            && self.held_miss.is_none()
+            && !closing
+            && !self.host_gone
+            && self.link_loss.is_none()
+            && self.start_failure.is_none()
+            && !self.detached
+            && self.finish_after_child.is_none();
+        // S10 §B: the old CLI of a switch under way stopped (its exit, or the wrapper's detach): the switch goes on,
+        // unless the host closed or the old link was lost meanwhile (that loss moves the chat as any loss).
+        let switching = matches!(self.migration, Some(Migration { phase: MigPhase::Switching { .. }, .. }));
+        let switched = switching && !closing && !self.host_gone && self.link_loss.is_none() && self.start_failure.is_none() && self.finish_after_child.is_none();
+        // This generation's end, before a retry moves `gen` on (its row write closes it with it); S10: how it ended.
+        let end = if unresumed {
+            "failed".to_string()
+        } else if switched {
+            "moved".to_string()
+        } else {
+            self.generation_end()
+        };
         if let Some(v) = self.vms.last_mut().filter(|v| v.gen == self.gen && v.to.is_none()) {
             v.to = Some(registry::now_rfc3339());
+            v.end = Some(end);
+        }
+        if switched {
+            self.detached = false;
+            self.start_switch_gen();
+            return;
+        }
+        if switching {
+            if let Some(m) = self.migration.take() {
+                self.migration_abandoned(&m, "the switch is off: the host closed, or the old link was lost");
+                if let MigPhase::Switching { held, .. } = m.phase {
+                    if !closing && !self.host_gone {
+                        // Its held lines go on as the host's next ones (a loss's move waits for the next line).
+                        self.held_host.extend(held);
+                    }
+                }
+            }
         }
         if let Some(held) = self.held_miss.take() {
-            if code == Some(1) && self.retry_possible() && !self.close_requested && self.finish.is_none() && self.ladder.is_none() && self.respawn_after_miss() {
-                return;
+            if self.gen_move.is_some() {
+                // S10 (§2.9): a moved CLI's miss never reaches the host: a cut miss gets its one retry on the same VM;
+                // past it, a resume miss, any other start-up refusal, or the host closing meanwhile, the move failed
+                // (its exit 8, or the close's).
+                let frame = claude::classify_child(&held);
+                let retry = claude::is_cut_miss(&frame) && code == Some(1) && !closing && self.moving.as_ref().is_some_and(|m| !m.retried);
+                if retry && self.retry_cut() {
+                    return;
+                }
+                let text = match &frame {
+                    ChildFrame::Result { first_error: Some(e), .. } => e.to_string(),
+                    _ => "the moved claude did not resume the session".to_string(),
+                };
+                let failure = self.move_failed(text);
+                if !closing {
+                    self.end_move_failed(&failure);
+                    return;
+                }
+            } else {
+                if code == Some(1) && self.retry_possible() && !closing && self.respawn_after_miss() {
+                    return;
+                }
+                // No retry: the host gets the error result after all.
+                let _ = self.state.on_child_frame(&claude::classify_child(&held), &held);
+                self.forward(&held);
             }
-            // No retry: the host gets the error result after all.
-            let _ = self.state.on_child_frame(&claude::classify_child(&held), &held);
-            self.forward(&held);
+        }
+        if unresumed {
+            let how = match (code, signal) {
+                (Some(c), _) => format!("exit {c}"),
+                (None, Some(s)) => format!("signal {s}"),
+                (None, None) => "no exit status".to_string(),
+            };
+            let failure = self.move_failed(format!("the moved claude ended ({how}) before it resumed the session"));
+            self.end_move_failed(&failure);
+            return;
+        }
+        // S10: the move's one end row. A cut miss's retry whose start failed was audited `failed` by its pipeline;
+        // a moved generation that ended before its CLI's init with nothing failed (the host closed, the link was lost
+        // again) leaves its move done.
+        if self.start_failure.is_some() && self.gen_move.is_some() {
+            if let Some(m) = self.moving.as_mut() {
+                m.done = None;
+            }
+        } else {
+            self.write_move_done();
         }
         if let Some(fin) = self.finish_after_child.take() {
             self.decide_finish(fin.0, fin.1);
@@ -2040,13 +2504,29 @@ impl Pump {
         // cancelled; a link lost past its budget; the wrapper's own detach.
         let host_closed = self.ladder.map_or(self.host_eof_at.is_some() || self.host_gone, |l| l.host_initiated);
         if let Some(f) = self.start_failure.take() {
+            // S10 §B: a switch whose new VM never started the moved CLI falls back to the old VM (the link leaves its row
+            // to the pump); one the host's EOF or a signal cancelled is given up.
+            let switch = self.gen_move.as_ref().filter(|w| w.kind == MoveKind::Migrate);
+            if let Some(w) = switch.filter(|w| !f.cancelled && f.vm.as_deref().is_some_and(|vm| vm != w.from_vm)) {
+                tracing::info!(gen = self.gen, from = %w.from_vm, "the switch's moved claude never started on its new VM");
+                if self.stay_after_failed_switch(&f, closing) {
+                    return;
+                }
+            } else if let Some(m) = switch.and(self.moving.as_ref()).filter(|_| f.cancelled) {
+                self.move_abandoned(m.why.trigger.as_ref(), &m.why.from_vm, m.at, "the switch's start was cancelled (the host closed, or a signal)");
+            }
             let (exit_code, end) = match (f.cancelled, host_closed) {
                 (true, true) => (0, EndReason::EofTerm),
                 (true, false) => (143, EndReason::SigTerm),
+                // S10: a move's start that failed (its line the move's, `Failure::Move`).
+                (false, _) if self.gen_move.is_some() => (f.code, EndReason::MoveFailed),
                 (false, _) => (f.code, EndReason::SpawnFailed),
             };
             if !f.cancelled {
                 self.out.step = Some(f.step.name());
+            }
+            if let Some(m) = self.moving.as_ref().filter(|_| self.gen_move.is_some()) {
+                self.out.move_ms = Some(m.at.elapsed().as_millis() as u64);
             }
             // A host that closed hears nothing; a signal or a failure ends with the line.
             if !(f.cancelled && host_closed) {
@@ -2056,6 +2536,22 @@ impl Pump {
             return;
         }
         if let Some(l) = self.link_loss.take() {
+            // S10 (§A): a loss that moves (L6: within `[vm].max_readdress`; 0 keeps S9's exit 8).
+            if let Some(kind) = self.move_for(&l) {
+                // S10 §2.7: a reopen's carry off a gone VM is counted in `moves`, but is no loss's move.
+                let carried = u32::from(self.carried == Some(MoveKind::Readdress));
+                let (max, done) = (self.max_readdress(), (self.out.moves[0] + self.out.moves[1]).saturating_sub(carried));
+                if max > 0 && done >= max {
+                    tracing::warn!(gen = self.gen, done, max, "the link was lost past [vm].max_readdress moves: no move");
+                    self.final_line = Some(Failure::MovesExhausted { vm: l.vm.clone(), moves: done }.line());
+                    self.decide_finish(8, EndReason::LinkLost);
+                    return;
+                }
+                if max > 0 {
+                    self.on_moving_loss(l, kind);
+                    return;
+                }
+            }
             self.final_line = Some(l.line);
             self.decide_finish(l.code, EndReason::LinkLost);
             return;
@@ -2136,13 +2632,30 @@ impl Pump {
             return true;
         }
         self.out.respawns += 1;
+        self.replay_into_new_gen(false);
+        true
+    }
+
+    /// The host's state into the generation just started (a resume miss's
+    /// retry, S10's move): `initialize` and the state requests under fresh
+    /// ids, then every outstanding line verbatim (a move's replay sends a
+    /// pending `interrupt` again, last: `HostState::replay_move`, L4); every
+    /// host request no replayed one stands for failed toward the host; the
+    /// replay deadline from the generation's `Started` (a remote start's) or
+    /// now, an earlier generation's disarmed (S10: a move lost again within
+    /// its window, a cut miss's retry); the row touched.
+    fn replay_into_new_gen(&mut self, moving: bool) {
         let mut fresh = || uuid::Uuid::now_v7().to_string();
-        for line in self.state.replay_lines(&mut fresh) {
+        let lines = if moving { self.state.replay_move(&mut fresh) } else { self.state.replay_lines(&mut fresh) };
+        for line in lines {
             self.in_q.push_back(ChildInput::Line(encode_line(&line)));
         }
         for line in self.state.fail_in_flight() {
             self.forward(&line);
         }
+        // The window just opened is this generation's: an earlier one's deadline would expire it.
+        self.replay_deadline = None;
+        self.replay_at_start = false;
         if self.state.replaying() {
             if self.starting {
                 self.replay_at_start = true;
@@ -2151,7 +2664,714 @@ impl Pump {
             }
         }
         self.touch_registry();
+    }
+
+    // -- S10: moves (plans/s10-contracts.md §2.2, §3.4, §4) ----------------------------------
+
+    /// How the current generation ended, its `vms` entry's `end` (§6.1):
+    /// `failed` (its CLI's miss; [`Pump::on_child_gone`] says it too of a
+    /// moved CLI that ended before it showed it resumed), `lost:<cause>`,
+    /// `detached` (the wrapper's own detach), `close` (the session closed
+    /// with it), else `exit`.
+    fn generation_end(&self) -> String {
+        if self.held_miss.is_some() {
+            "failed".to_string()
+        } else if let Some(l) = &self.link_loss {
+            format!("lost:{}", l.cause.word())
+        } else if self.detached {
+            "detached".to_string()
+        } else if self.close_requested || self.ladder.is_some() || self.host_gone {
+            "close".to_string()
+        } else {
+            "exit".to_string()
+        }
+    }
+
+    /// `[vm].max_readdress` (L6): the moves after a lost link this wrapper
+    /// process makes; a session without its bridge.toml, the default.
+    fn max_readdress(&self) -> u32 {
+        self.sess.cfg.as_ref().map_or_else(|| crate::bridge::config::VmCfg::default().max_readdress, |c| c.vm.max_readdress)
+    }
+
+    /// The move a lost link starts, by its cause (§A): only a remote
+    /// session's, nothing closing (the host's EOF, a signal, a finish or a
+    /// ladder decided), its transcript kept (`--no-session-persistence`
+    /// keeps S9's exit 8). A fresh chat's respawn moves as a re-address (its
+    /// VM holds the dead CLI's own transcript, which `--session-id`
+    /// refuses). A pinned session (`AI_ENV_BRIDGE_VM`: its VM or nothing)
+    /// never re-addresses: S9's exit 8, with no note, no wait and no move;
+    /// only a respawn on its VM runs.
+    fn move_for(&self, l: &LinkLoss) -> Option<MoveKind> {
+        let closing = self.close_requested || self.host_gone || self.finish.is_some() || self.finish_after_child.is_some() || self.ladder.is_some();
+        if self.kind != LinkKind::Remote || closing || self.sess.session.no_session_persistence {
+            return None;
+        }
+        let mut kind = l.cause.moves()?;
+        if kind == MoveKind::Respawn && self.fresh_chat() && self.move_session().is_some() && !self.state.outstanding().is_empty() {
+            kind = MoveKind::Readdress;
+        }
+        if kind == MoveKind::Readdress {
+            if let Some(pin) = self.links.snapshot().and_then(|s| s.pinned) {
+                tracing::warn!(gen = self.gen, vm = %pin, cause = l.cause.word(), "the pinned VM's link was lost: a pinned session never moves to another VM");
+                return None;
+            }
+        }
+        Some(kind)
+    }
+
+    /// The session id a moved CLI resumes (§2.2): the one adopted from the
+    /// CLI's init (a `/clear` makes it the newest), else P0's `--resume`.
+    fn move_session(&self) -> Option<String> {
+        self.out.session_id.clone().or_else(|| self.plan.resume.clone())
+    }
+
+    /// A fresh chat (§2.2), per session: no `result` forwarded since its id
+    /// was adopted, and not the session the CLI started with when P0 resumed
+    /// or continued one (`--resume`, `--fork-session` beside it, or
+    /// `--continue`: it carries an earlier conversation, which a
+    /// `--session-id` start would leave behind). A `/clear`'s new session is
+    /// fresh until its first result.
+    fn fresh_chat(&self) -> bool {
+        let carried = self.plan.resume.is_some() || self.sess.session.continue_;
+        let first = self.out.session_id.is_none() || self.out.session_id == self.first_session_id;
+        self.results == 0 && !(carried && first)
+    }
+
+    /// S10 L3: `text` to the host only, as an informational line (level
+    /// warning, a fresh uuid v7), never to a child nor into the transcript;
+    /// to the log too.
+    fn note(&mut self, text: &str) {
+        tracing::info!(gen = self.gen, "{text}");
+        let line = claude::informational_line(text, self.out.session_id.as_deref(), &uuid::Uuid::now_v7().to_string());
+        self.forward(&line);
+    }
+
+    /// The row's status (§6.1), written when it changes (never a closed row's).
+    fn set_status(&mut self, want: &str) {
+        if let Some(row) = self.row.as_mut().filter(|r| r.status != want && r.status != "closed") {
+            row.status = want.to_string();
+            self.write_row();
+        }
+    }
+
+    /// A lost link that moves (§A, L4, L5): the dead CLI's open requests to
+    /// the host withdrawn (`control_cancel_request` each: the extension
+    /// dismisses the prompt, and a late answer is dropped); mid-turn (a line
+    /// outstanding), or while the host waits for its `initialize`'s answer
+    /// (Cursor sends nothing before it, and its window is T0 + 50 s), the
+    /// move starts at once; with no turn in flight it waits for the next host
+    /// line that is no `keep_alive` (the user is there for its Touch ID), the
+    /// row `detached`, the note saying so.
+    fn on_moving_loss(&mut self, l: LinkLoss, kind: MoveKind) {
+        let cancels = self.state.cancel_child_requests();
+        let pending = Pending { kind, cause: l.cause, from_vm: l.vm, from_spawn: l.spawn, cancelled: cancels.len() };
+        let host_waits = self.state.initialize_id().is_some() && self.out.init_latency_ms.is_none();
+        tracing::info!(gen = self.gen, kind = kind.word(), cause = l.cause.word(), vm = %pending.from_vm, outstanding = self.state.outstanding().len(), host_waits, "the link was lost: the chat moves");
+        if !self.state.outstanding().is_empty() || host_waits {
+            self.start_move(pending, cancels, false);
+            return;
+        }
+        // L5: no turn in flight: the move waits for the next host line.
+        self.set_status("detached");
+        let note = match kind {
+            MoveKind::Respawn => note_restart_at_next(&pending.from_vm, l.cause),
+            MoveKind::Readdress | MoveKind::Migrate => note_move_at_next(&pending.from_vm, l.cause),
+        };
+        self.note(&note);
+        for line in &cancels {
+            self.forward(line);
+        }
+        self.waiting = Some(pending);
+    }
+
+    /// A move's start (§A, in this order): counted; the row `migrating`; the
+    /// note (unless the wait said it, `noted`); the dead CLI's requests
+    /// withdrawn (`cancels`); `session_move` audited; the generation started
+    /// (`StartWhy::Move`: the session id the pump adopted, the outstanding
+    /// lines' uuids, the leaf, whether the chat is fresh, whether the host's
+    /// `initialize` was answered), then the host's state replayed into it.
+    fn start_move(&mut self, p: Pending, cancels: Vec<Bytes>, noted: bool) {
+        let outstanding: Vec<String> = self.state.outstanding().iter().filter_map(|l| l.uuid.clone()).collect();
+        let resent = !self.state.outstanding().is_empty();
+        // The dead CLI's partial reply is cut away (or never written): it is never the moved CLI's leaf.
+        self.last_assistant = None;
+        let why = MoveWhy {
+            kind: p.kind,
+            cause: Some(p.cause),
+            trigger: None,
+            from_vm: p.from_vm.clone(),
+            from_spawn: p.from_spawn.clone(),
+            session_id: self.move_session(),
+            outstanding,
+            leaf: self.leaf.clone(),
+            fresh_chat: self.fresh_chat(),
+            init_answered: self.out.init_latency_ms.is_some(),
+        };
+        self.out.moves[move_slot(p.kind)] += 1;
+        self.set_status("migrating");
+        if p.kind == MoveKind::Readdress {
+            if let Some(m) = self.migration.take() {
+                // S10 §B: the chat leaves the VM its migration was to leave, by this move (the link drops phase A, its
+                // dialog with it, and lets the prepared VM go).
+                self.migration_abandoned(&m, "the chat's VM was lost: a re-address moves it");
+            }
+        }
+        if !noted {
+            let note = match p.kind {
+                MoveKind::Respawn => note_restarting(&p.from_vm, p.cause),
+                MoveKind::Readdress | MoveKind::Migrate => note_moving(&p.from_vm, p.cause),
+            };
+            self.note(&note);
+        }
+        for line in &cancels {
+            self.forward(line);
+        }
+        let detail = [
+            ("session", why.session_id.clone().unwrap_or_else(|| "-".to_string())),
+            ("gen", (self.gen + 1).to_string()),
+            ("kind", p.kind.word().to_string()),
+            ("cause", p.cause.word().to_string()),
+            ("from_vm", p.from_vm.clone()),
+            ("outstanding", why.outstanding.len().to_string()),
+            ("cancelled", p.cancelled.to_string()),
+        ];
+        self.audit(audit_event::SESSION_MOVE, &detail);
+        tracing::info!(gen = self.gen + 1, kind = p.kind.word(), cause = p.cause.word(), "the move starts");
+        self.moving = Some(Moving { why: why.clone(), ran: p.kind, at: Instant::now(), resent, retried: false, done: None, written: None, fell_back: None });
+        if !self.spawn_next(StartWhy::Move(why)) {
+            return;
+        }
+        self.replay_into_new_gen(true);
+    }
+
+    /// The `vms` why of the generation that just started: a move's of the
+    /// kind that ran (`RemoteSnapshot.moved`), generation 1's of a reopen's
+    /// carry (§2.7: `migrate:reopen` off a VM near its wall, `readdress:vm_gone`
+    /// off a gone one), else what it started for.
+    fn started_why(&self, snap: Option<&RemoteSnapshot>) -> String {
+        if let (Some(m), Some(done)) = (&self.gen_move, snap.and_then(|s| s.moved.as_ref())) {
+            return MoveWhy { kind: done.kind, ..m.clone() }.vms_why();
+        }
+        match snap.and_then(|s| s.carried.as_ref()).filter(|_| self.gen == 1) {
+            Some(c) if c.left_s.is_some() => "migrate:reopen".to_string(),
+            Some(_) => "readdress:vm_gone".to_string(),
+            None => self.gen_why.clone(),
+        }
+    }
+
+    /// A move's generation started (§3.4, §4): the census counts the kind
+    /// that ran and times the move (`move_ms`, from its start), its `cut`
+    /// when it sent lines again; the row `active`. Its `session_move_end`
+    /// `done` and the note that the chat goes on wait for the moved CLI to
+    /// show it resumed (its first init, or the grace past its first answer:
+    /// [`Pump::move_resumed`]), so a miss writes `failed` alone and a cut
+    /// miss's retry one `done`: this generation's values are kept for it (a
+    /// retry on the same VM keeps the first generation's `how`, `seed`,
+    /// `transcript` and `touchid`). A retry after the move was written done
+    /// (its cut miss later than the grace) keeps none on that VM: its CLI
+    /// is past the move, so nothing more is written or said for it.
+    fn move_started(&mut self, snap: Option<&RemoteSnapshot>) {
+        let Some(m) = self.moving.clone() else { return };
+        let done = snap.and_then(|s| s.moved.clone());
+        if done.as_ref().is_some_and(|d| d.stayed) {
+            self.switch_stayed(&m, snap);
+            return;
+        }
+        let kind = done.as_ref().map_or(m.ran, |d| d.kind);
+        if !m.retried && kind != m.ran {
+            // The census counts the kind that ran (a respawn the pipeline made a re-address).
+            self.out.moves[move_slot(m.ran)] = self.out.moves[move_slot(m.ran)].saturating_sub(1);
+            self.out.moves[move_slot(kind)] += 1;
+        }
+        let landed = snap.and_then(|s| s.vm.as_deref());
+        if let Some(mig) = self.migration.take_if(|mig| landed.is_some_and(|vm| vm != mig.from_vm)) {
+            // S10 §B: the move took the chat off the VM its migration was to leave (a respawn that ran as a re-address).
+            self.migration_abandoned(&mig, "a move took the chat off the VM its migration was to leave");
+        }
+        let ms = u64::try_from(m.at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.out.move_ms = Some(ms);
+        if m.resent {
+            self.out.cut = Some(done.as_ref().map_or("none", |d| d.cut));
+        }
+        self.set_status("active");
+        let own = MoveDoneRow {
+            gen: self.gen,
+            to_vm: snap.and_then(|s| s.vm.clone()).unwrap_or_default(),
+            how: snap.and_then(|s| s.vm_how),
+            seed: done.as_ref().map(|d| d.seed),
+            transcript: snap.and_then(|s| s.transcript),
+            cut: done.as_ref().map(|d| d.cut),
+            touchid: done.as_ref().map(|d| d.touchid),
+            ms,
+        };
+        if let Some(moving) = self.moving.as_mut() {
+            if !m.retried {
+                moving.ran = kind;
+            }
+            moving.done = match moving.done.take().filter(|_| m.retried) {
+                // The cut miss's retry is the same move: on its VM it keeps the first generation's checkout, transcript
+                // and token; on another (that VM was no longer running) that VM's, its Touch ID `asked` if either was.
+                Some(first) if first.to_vm == own.to_vm => Some(MoveDoneRow { gen: own.gen, cut: own.cut, ms: own.ms, ..first }),
+                Some(first) => Some(MoveDoneRow { touchid: if first.touchid == Some("asked") { first.touchid } else { own.touchid }, ..own }),
+                // A cut miss later than the grace: the move is written done on this VM already (one row, one note).
+                None if m.retried && moving.written.as_ref().is_some_and(|w| w.to_vm == own.to_vm) => None,
+                None => Some(own),
+            };
+        }
+    }
+
+    /// S10 §B: a switch that fell back to a respawn on the old VM started
+    /// there (`MoveDone::stayed`: its pipeline wrote `session_move_end`
+    /// `stayed`, or, a fallback after the new VM never started the moved CLI
+    /// ([`Pump::stay_after_failed_switch`]), it is written here, with that
+    /// failure's step and code): no `done` waits for it; the move timed; the
+    /// row `active`; the note that the chat stays (trying again after the
+    /// next turn, or at its wall once `MIGRATE_PREP_TRIES` switches fell
+    /// back; nothing more for `session migrate`, which reports itself).
+    fn switch_stayed(&mut self, m: &Moving, snap: Option<&RemoteSnapshot>) {
+        let ms = u64::try_from(m.at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some((step, code)) = m.fell_back {
+            let done = snap.and_then(|s| s.moved.as_ref());
+            let row = crate::bridge::remote::link::MoveEndRow {
+                session: m.why.session_id.as_deref(),
+                gen: self.gen,
+                kind: Some(MoveKind::Migrate),
+                outcome: "stayed",
+                from_vm: &m.why.from_vm,
+                to_vm: snap.and_then(|s| s.vm.as_deref()),
+                how: snap.and_then(|s| s.vm_how),
+                seed: done.map(|d| d.seed),
+                cut: done.map(|d| d.cut),
+                touchid: done.map(|d| d.touchid),
+                ms,
+                step_code: Some((step, code)),
+                request: request_of(m.why.trigger.as_ref()),
+                ..Default::default()
+            };
+            row.audit(&self.sess.paths);
+        }
+        self.out.move_ms = Some(ms);
+        self.set_status("active");
+        self.fallbacks += 1;
+        self.wall_off |= self.fallbacks >= MIGRATE_PREP_TRIES;
+        if let Some(moving) = self.moving.as_mut() {
+            moving.done = None;
+        }
+        let then = match &m.why.trigger {
+            Some(MigrateTrigger::Command { .. }) => StayedThen::Nothing,
+            _ if self.wall_off => StayedThen::AtWall,
+            _ => StayedThen::Retry,
+        };
+        let vm = snap.and_then(|s| s.vm.clone()).unwrap_or_else(|| m.why.from_vm.clone());
+        tracing::warn!(gen = self.gen, vm = %vm, fallbacks = self.fallbacks, "the switch fell back to the old VM");
+        self.note(&note_stayed(&vm, "the move to the new VM failed after the old claude stopped; it restarted here", then));
+    }
+
+    /// The current generation is a move's whose CLI has not shown yet that
+    /// it resumed the session (S10): its `session_move_end` `done` waits, and
+    /// a miss, a start-up error result or an end on its own fails the move.
+    /// Past it, only a cut or resume miss before the CLI's first init is
+    /// still held ([`Pump::on_child_line`], §2.9).
+    fn move_unconfirmed(&self) -> bool {
+        self.gen_move.is_some() && self.moving.as_ref().is_some_and(|m| m.done.is_some())
+    }
+
+    /// The moved CLI resumed the session (S10: its first init, or
+    /// [`RESUME_MISS_GRACE`] past its first answer with no miss), so the
+    /// move is done: the note that the chat goes on (L3), `session_move_end`
+    /// `done` (§4.2), written once. An error result it gave before its init
+    /// and held was then a turn's, no start-up refusal: the host gets it
+    /// (one held after the move was written done too).
+    fn move_resumed(&mut self) {
+        self.move_resumed_by = None;
+        if let Some(held) = self.held_miss.take() {
+            let _ = self.state.on_child_frame(&claude::classify_child(&held), &held);
+            self.forward(&held);
+        }
+        let Some(to_vm) = self.moving.as_ref().and_then(|m| m.done.as_ref()).map(|d| d.to_vm.clone()) else { return };
+        self.note(&note_continues(&to_vm));
+        self.write_move_done();
+    }
+
+    /// The move's `session_move_end` `done` its generation's `Started` left
+    /// pending, written now (its CLI resumed, or that generation ended with
+    /// nothing failed, or the wrapper did) and kept as the move's written
+    /// one; nothing when none is pending.
+    fn write_move_done(&mut self) {
+        let Some(m) = self.moving.as_mut() else { return };
+        let Some(d) = m.done.take() else { return };
+        let row = crate::bridge::remote::link::MoveEndRow {
+            session: m.why.session_id.as_deref(),
+            gen: d.gen,
+            kind: Some(m.ran),
+            outcome: "done",
+            from_vm: &m.why.from_vm,
+            to_vm: Some(&d.to_vm),
+            how: d.how,
+            seed: d.seed,
+            transcript: d.transcript,
+            cut: d.cut,
+            touchid: d.touchid,
+            ms: d.ms,
+            step_code: None,
+            request: request_of(m.why.trigger.as_ref()),
+        };
+        row.audit(&self.sess.paths);
+        m.written = Some(d);
+    }
+
+    /// The cut miss's one retry (§2.9): the moved generation's CLI found no
+    /// message at its cut, before its init. Its VM again (the token is
+    /// cached there: no Touch ID), plain `--resume` (its `MoveWhy` names no
+    /// outstanding line, so its cut is `None`: `cut_before`), the host's
+    /// state replayed and every outstanding line sent again. `true` once
+    /// started (or its start failed: the finish is decided).
+    fn retry_cut(&mut self) -> bool {
+        let snap = self.links.snapshot();
+        let Some(m) = self.moving.as_mut() else { return false };
+        m.retried = true;
+        let why = MoveWhy {
+            kind: MoveKind::Respawn,
+            cause: Some(LossCause::SpawnGone),
+            trigger: None,
+            from_vm: snap.as_ref().and_then(|s| s.vm.clone()).unwrap_or_else(|| m.why.from_vm.clone()),
+            from_spawn: snap.and_then(|s| s.spawn),
+            session_id: m.why.session_id.clone(),
+            outstanding: Vec::new(),
+            leaf: None,
+            fresh_chat: false,
+            init_answered: self.out.init_latency_ms.is_some(),
+        };
+        tracing::info!(gen = self.gen, vm = %why.from_vm, "the moved CLI missed its cut: one retry on its VM, with no cut");
+        if !self.spawn_next(StartWhy::Move(why)) {
+            return true;
+        }
+        self.replay_into_new_gen(true);
         true
+    }
+
+    /// A moved CLI that did not resume the session (§2.9: a resume miss
+    /// inside a move, a cut miss past its retry, another start-up refusal,
+    /// an end on its own before it showed it resumed; `text` what it said):
+    /// the move failed, its failure the move's (`Failure::Move`, the inner one
+    /// at the spawn, exit 8), timed (`move_ms`) and audited `session_move_end`
+    /// `failed` in place of the `done` its `Started` left pending, or after
+    /// the `done` written already (a miss later than the grace: the written
+    /// row's values when it is this generation's). The host never gets the
+    /// CLI's error result.
+    fn move_failed(&mut self, text: String) -> Failure {
+        let inner = Box::new(Failure::Other { code: 8, step: StartStep::Spawn.name(), first_line: text });
+        let to_vm = self.links.snapshot().and_then(|s| s.vm);
+        let gen = self.gen;
+        let Some(m) = self.moving.as_mut() else {
+            // Never: a moved generation's move is known (`start_move` sets it first). Its own `MoveWhy` then.
+            let why = self.gen_move.as_ref();
+            return Failure::Move { kind: why.map_or(MoveKind::Respawn, |w| w.kind), from_vm: why.map(|w| w.from_vm.clone()).or(to_vm).unwrap_or_default(), cause: why.and_then(|w| w.cause), inner };
+        };
+        let failure = Failure::Move { kind: m.ran, from_vm: m.why.from_vm.clone(), cause: m.why.cause, inner };
+        tracing::warn!(gen = self.gen, "the moved CLI did not resume the session: the move failed");
+        let ms = u64::try_from(m.at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let pending = m.done.take().or_else(|| m.written.clone().filter(|w| w.gen == gen));
+        let row = crate::bridge::remote::link::MoveEndRow {
+            session: m.why.session_id.as_deref(),
+            gen: self.gen,
+            kind: Some(m.ran),
+            outcome: "failed",
+            from_vm: &m.why.from_vm,
+            to_vm: to_vm.as_deref(),
+            how: pending.as_ref().and_then(|d| d.how),
+            seed: pending.as_ref().and_then(|d| d.seed),
+            transcript: pending.as_ref().and_then(|d| d.transcript),
+            cut: pending.as_ref().and_then(|d| d.cut),
+            touchid: pending.as_ref().and_then(|d| d.touchid),
+            ms,
+            step_code: Some((StartStep::Spawn.name(), failure.exit_code())),
+            request: request_of(m.why.trigger.as_ref()),
+        };
+        row.audit(&self.sess.paths);
+        self.out.move_ms = Some(ms);
+        failure
+    }
+
+    /// The wrapper ends with a failed move ([`Pump::move_failed`]): its
+    /// exit (8) and line, `end:move_failed` with `step:spawn`.
+    fn end_move_failed(&mut self, failure: &Failure) {
+        self.out.step = Some(StartStep::Spawn.name());
+        self.final_line = Some(failure.line());
+        self.decide_finish(failure.exit_code(), EndReason::MoveFailed);
+    }
+
+    // -- S10: parks and migrations (plans/s10-contracts.md §2.4, §3.3, §B) --------------------
+
+    /// S10 §D: the chat's quiet after a line forwarded either way, for the
+    /// live session's park control (`LinkFactory::quiet`): the verdict over
+    /// the host state, since the last line other than a `keep_alive`, the
+    /// last host frame's kind (`host`, a host line's; none for the CLI's).
+    fn tell_quiet(&mut self, host: Option<&'static str>, keep_alive: bool) {
+        if self.kind != LinkKind::Remote {
+            return;
+        }
+        if !keep_alive {
+            self.quiet_since = Instant::now();
+            if host.is_some() {
+                self.last_host = host;
+            }
+        }
+        self.links.quiet(QuietState { verdict: crate::bridge::park::verdict(&self.state), since: self.quiet_since, last_host: self.last_host });
+    }
+
+    /// S10 §D: the session parked (`true`) or unparked: the row says
+    /// `parked`, then `active` again; never an exit.
+    fn on_parked(&mut self, on: bool) {
+        tracing::info!(gen = self.gen, parked = on, "the remote session's park");
+        self.parked = on;
+        self.unparking &= on;
+        self.set_status(if on { "parked" } else { "active" });
+    }
+
+    /// S10 §B: after a forwarded `result`, a wall migration when one is due
+    /// (`LinkFactory::migration_due`), unless one runs already, wall
+    /// migrations were given up in this process, the session closes, or it
+    /// keeps no transcript (`--no-session-persistence`: there is nothing to
+    /// resume on a new VM, as a loss's move keeps S9's exit for it).
+    fn maybe_migrate(&mut self) {
+        if self.kind != LinkKind::Remote || self.migration.is_some() || self.wall_off || self.closing() || self.sess.session.no_session_persistence {
+            return;
+        }
+        if let Some(trigger) = self.links.migration_due() {
+            self.start_migration(trigger);
+        }
+    }
+
+    /// S10 §B: a migration's phase A starts: the note (L3), `session_move`
+    /// (the live generation, its trigger, `session migrate`'s nonce), then
+    /// `LinkFactory::prepare_move` (in the background: the chat goes on).
+    fn start_migration(&mut self, trigger: MigrateTrigger) {
+        let from_vm = self.links.snapshot().and_then(|s| s.vm).unwrap_or_default();
+        tracing::info!(gen = self.gen, trigger = trigger.word(), vm = %from_vm, "a migration's phase A starts");
+        self.note(&note_migrating(&from_vm, &trigger));
+        let mut detail = vec![
+            ("session", self.move_session().unwrap_or_else(|| "-".to_string())),
+            ("gen", self.gen.to_string()),
+            ("kind", MoveKind::Migrate.word().to_string()),
+            ("trigger", trigger.word().to_string()),
+            ("from_vm", from_vm.clone()),
+            ("outstanding", self.state.outstanding().len().to_string()),
+            ("cancelled", "0".to_string()),
+        ];
+        if let Some(nonce) = request_of(Some(&trigger)) {
+            detail.push(("request", nonce.to_string()));
+        }
+        self.audit(audit_event::SESSION_MOVE, &detail);
+        self.migration = Some(Migration { trigger: trigger.clone(), from_vm, at: Instant::now(), phase: MigPhase::Preparing });
+        self.links.prepare_move(trigger);
+    }
+
+    /// S10 §B: phase A is done: the switch waits for the first quiet point.
+    fn on_move_ready(&mut self, r: &MoveReady) {
+        match self.migration.as_mut() {
+            Some(m) if matches!(m.phase, MigPhase::Preparing) => {
+                tracing::info!(gen = self.gen, to_vm = %r.to_vm, how = r.how, ms = r.ms, "a migration's VM is prepared: the switch waits for a quiet point");
+                m.phase = MigPhase::Ready;
+            }
+            _ => tracing::info!(gen = self.gen, to_vm = %r.to_vm, "a migration's VM was prepared with no migration waiting for it: left to its hold"),
+        }
+    }
+
+    /// S10 §B, M4: phase A failed: the chat stays on its VM, said (L3:
+    /// trying again after the next turn for a dismissed or unanswered Touch
+    /// ID; else moving at its wall, wall migrations given up in this
+    /// process; nothing more for `session migrate`'s request, which reports
+    /// itself) and audited `session_move_end` `stayed`.
+    fn on_move_failed(&mut self, f: &MoveFailure) {
+        let Some(m) = self.migration.take() else {
+            tracing::info!(gen = self.gen, word = f.word, "a migration's phase A failed with no migration waiting for it");
+            return;
+        };
+        tracing::info!(gen = self.gen, step = f.step.name(), code = f.code, word = f.word, again = f.again, "a migration's phase A failed: the chat stays on its VM");
+        self.wall_off |= !f.again;
+        let then = match (&m.trigger, f.again) {
+            (MigrateTrigger::Command { .. }, _) => StayedThen::Nothing,
+            (MigrateTrigger::Wall { .. }, true) => StayedThen::Retry,
+            (MigrateTrigger::Wall { .. }, false) => StayedThen::AtWall,
+        };
+        self.note(&note_stayed(&m.from_vm, &stayed_why(f), then));
+        let row = crate::bridge::remote::link::MoveEndRow {
+            session: self.out.session_id.as_deref(),
+            gen: self.gen,
+            kind: Some(MoveKind::Migrate),
+            outcome: "stayed",
+            from_vm: &m.from_vm,
+            touchid: Some("asked"),
+            ms: u64::try_from(m.at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            step_code: Some((f.step.name(), f.code)),
+            request: request_of(Some(&m.trigger)),
+            ..Default::default()
+        };
+        row.audit(&self.sess.paths);
+    }
+
+    /// S10 §B: a migration's VM is prepared and the chat is at a quiet point.
+    fn switch_due(&self) -> bool {
+        matches!(self.migration, Some(Migration { phase: MigPhase::Ready, .. })) && self.quiet_point()
+    }
+
+    /// S10 §B (§2.4): a quiet point ([`Pump::settled`]), the session not
+    /// parked: the switch's EOF must reach a CLI that exits at it (a session
+    /// parked with no socket would close parked instead, its claude left on
+    /// the old VM: [`Pump::unpark_due`] unparks it first).
+    fn quiet_point(&self) -> bool {
+        !self.parked && self.settled()
+    }
+
+    /// No outstanding user line, no open request either way, no replay
+    /// window, no ladder; the spawn running on a link that is up, nothing
+    /// queued for it, no move under way.
+    fn settled(&self) -> bool {
+        self.state.outstanding().is_empty()
+            && self.state.pending_len() == 0
+            && self.state.child_requests().is_empty()
+            && !self.state.replaying()
+            && !self.closing()
+            && !self.starting
+            && !self.link_down
+            && self.child_alive()
+            && self.in_q.is_empty()
+            && self.waiting.is_none()
+            && self.held_miss.is_none()
+            && !self.move_unconfirmed()
+    }
+
+    /// S10 §B: a migration's VM is prepared and the chat is quiet but
+    /// parked (an idle chat parks at `park_after`, and nothing but input
+    /// unparks it): it is unparked once ([`Pump::unpark_for_switch`]).
+    fn unpark_due(&self) -> bool {
+        matches!(self.migration, Some(Migration { phase: MigPhase::Ready, .. })) && self.parked && !self.unparking && self.settled()
+    }
+
+    /// S10 §B, §3.3: a `keep_alive` to the parked session, which any stdin
+    /// unparks (with no socket: the VM resumed, the spawn reattached; no
+    /// Touch ID); the switch begins at the quiet point after its
+    /// `Parked(false)`. Never recorded (no host line), and once until then.
+    fn unpark_for_switch(&mut self) {
+        tracing::info!(gen = self.gen, "a migration's VM is prepared while the session is parked: a keep_alive unparks it for the switch");
+        self.unparking = true;
+        self.in_q.push_back(ChildInput::Line(encode_line(br#"{"type":"keep_alive"}"#)));
+    }
+
+    /// S10 §B, phase B begins at a quiet point: the factory keeps the
+    /// prepared VM for the next start and holds the old generation's closing
+    /// suspend off (`LinkFactory::begin_switch`; `false`: its hold ended, the
+    /// prepared VM released: `session_move_end` `abandoned`, and the next due
+    /// migration prepares again); the move counted, the row `migrating`; EOF
+    /// to the old CLI, its `detach{final}` at the remote EOF rung; the host's
+    /// lines held from now ([`Pump::on_host`]).
+    fn begin_switch(&mut self, now: Instant) {
+        if !self.links.begin_switch() {
+            if let Some(m) = self.migration.take() {
+                self.migration_abandoned(&m, "its prepared VM was released (its hold ended)");
+            }
+            return;
+        }
+        let Some(m) = self.migration.as_mut() else { return };
+        tracing::info!(gen = self.gen, vm = %m.from_vm, "the switch begins: the old CLI gets its EOF");
+        m.phase = MigPhase::Switching { at: now, detach_at: Some(now + self.timings.eof_kill_after), held: VecDeque::new() };
+        self.out.moves[move_slot(MoveKind::Migrate)] += 1;
+        self.set_status("migrating");
+        self.in_q.push_back(ChildInput::Eof);
+    }
+
+    /// S10 §B, §4.2: the chat's migration given up (`why`, logged), its
+    /// `session_move_end` `abandoned` (with `session migrate`'s nonce): its
+    /// prepared VM released at its hold's end, a loss's move took the chat
+    /// off the VM it was to leave, the switch called off, or the session's end.
+    fn migration_abandoned(&self, m: &Migration, why: &str) {
+        self.move_abandoned(Some(&m.trigger), &m.from_vm, m.at, why);
+    }
+
+    /// [`Pump::migration_abandoned`]'s row, of a migration off `from_vm`
+    /// begun `at` (its phase A's start, or its switch's).
+    fn move_abandoned(&self, trigger: Option<&MigrateTrigger>, from_vm: &str, at: Instant, why: &str) {
+        tracing::info!(gen = self.gen, vm = %from_vm, trigger = trigger.map_or("-", MigrateTrigger::word), "the migration is given up: {why}");
+        let row = crate::bridge::remote::link::MoveEndRow {
+            session: self.out.session_id.as_deref(),
+            gen: self.gen,
+            kind: Some(MoveKind::Migrate),
+            outcome: "abandoned",
+            from_vm,
+            ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            request: request_of(trigger),
+            ..Default::default()
+        };
+        row.audit(&self.sess.paths);
+    }
+
+    /// S10 §B: a switch whose new VM never started the moved CLI (its
+    /// session refused the spawn there, or `Started` did not come by the
+    /// move's deadline): the move's `session_move_end` is the pump's to
+    /// write (the link leaves it). Not closing, and once per switch, the chat
+    /// falls back to the old VM: the next generation is a `Migrate` start
+    /// again, which finds no VM prepared and respawns on the VM the switch
+    /// left (`pipeline::switch_gen`), the host's state replayed into it; its
+    /// `stayed` row, with this failure's step and code, comes at its `Started`
+    /// ([`Pump::switch_stayed`]). `false`: no fallback (closing, a fallback
+    /// ran already): the row is `failed`, and the session ends as a failed move.
+    fn stay_after_failed_switch(&mut self, f: &SpawnFailure, closing: bool) -> bool {
+        let Some(m) = self.moving.as_mut() else { return false };
+        if closing || self.host_gone || m.fell_back.is_some() {
+            let row = crate::bridge::remote::link::MoveEndRow {
+                session: m.why.session_id.as_deref(),
+                gen: self.gen,
+                kind: Some(MoveKind::Migrate),
+                outcome: "failed",
+                from_vm: &m.why.from_vm,
+                to_vm: f.vm.as_deref(),
+                touchid: Some("asked"),
+                ms: u64::try_from(m.at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                step_code: Some((f.step.name(), f.code)),
+                request: request_of(m.why.trigger.as_ref()),
+                ..Default::default()
+            };
+            row.audit(&self.sess.paths);
+            return false;
+        }
+        tracing::warn!(gen = self.gen, step = f.step.name(), code = f.code, vm = f.vm.as_deref().unwrap_or("-"), "the switch's new VM never started the moved claude: the chat falls back to the old VM");
+        m.fell_back = Some((f.step.name(), f.code));
+        let why = m.why.clone();
+        if self.spawn_next(StartWhy::Move(why)) {
+            self.replay_into_new_gen(true);
+        }
+        true
+    }
+
+    /// S10 §B: the switch's old CLI stopped: the moved generation starts
+    /// (`StartWhy::Move`, `Migrate`: no line outstanding, so no cut), the
+    /// host's state replayed into it, then the lines held during the switch
+    /// (recorded now).
+    fn start_switch_gen(&mut self) {
+        let Some(Migration { trigger, from_vm, phase: MigPhase::Switching { at, held, .. }, .. }) = self.migration.take() else { return };
+        let snap = self.links.snapshot();
+        let why = MoveWhy {
+            kind: MoveKind::Migrate,
+            cause: None,
+            trigger: Some(trigger),
+            from_vm,
+            from_spawn: snap.and_then(|s| s.spawn),
+            session_id: self.move_session(),
+            outstanding: Vec::new(),
+            leaf: self.leaf.clone(),
+            fresh_chat: false,
+            init_answered: self.out.init_latency_ms.is_some(),
+        };
+        tracing::info!(gen = self.gen + 1, vm = %why.from_vm, held = held.len(), "the switch: the moved generation starts");
+        self.moving = Some(Moving { why: why.clone(), ran: MoveKind::Migrate, at, resent: false, retried: false, done: None, written: None, fell_back: None });
+        if !self.spawn_next(StartWhy::Move(why)) {
+            return;
+        }
+        self.replay_into_new_gen(true);
+        for line in held {
+            self.on_host(Some(HostIn::Line(line)));
+        }
     }
 
     // -- deadlines -------------------------------------------------------------------------
@@ -2170,6 +3390,10 @@ impl Pump {
         }
         all.extend(self.delay_until);
         all.extend(self.replay_deadline);
+        all.extend(self.move_resumed_by);
+        if let Some(Migration { phase: MigPhase::Switching { detach_at, .. }, .. }) = &self.migration {
+            all.extend(detach_at.filter(|_| self.child_alive()));
+        }
         all.extend(self.credential_hold_until);
         all.extend(self.synthetic.as_ref().and_then(Synthetic::deadline));
         if self.finish.is_some() {
@@ -2217,6 +3441,23 @@ impl Pump {
         if self.delay_until.is_some_and(|t| now >= t) {
             self.delay_until = None;
         }
+        let detach = match self.migration.as_mut() {
+            Some(Migration { phase: MigPhase::Switching { detach_at, .. }, .. }) if detach_at.is_some_and(|t| now >= t) => detach_at.take().is_some(),
+            _ => false,
+        };
+        if detach && self.child_alive() {
+            // S10 §B: the old CLI did not end at its EOF within the remote rung: `detach{final}` (the shim's ladder ends it).
+            tracing::info!(gen = self.gen, "the switch: the old CLI did not exit at its EOF in time: detach{{final}}");
+            self.signal_child(Sig::Kill);
+        }
+        if self.move_resumed_by.is_some_and(|t| now >= t) {
+            self.move_resumed_by = None;
+            // S10: no miss within the grace after the moved CLI's first answer: it resumed the session. A miss held,
+            // or a child gone, is the child's end's to decide.
+            if self.held_miss.is_none() && self.child_exit.is_none() {
+                self.move_resumed();
+            }
+        }
         if self.credential_hold_until.is_some_and(|t| now >= t) {
             self.credential_hold_until = None;
             // A miss already held, or a child already gone, settles at the respawn or the finish.
@@ -2261,6 +3502,10 @@ impl Pump {
             // A remote session's S7 `credential:` part: where its token came from.
             out.credential = snap.credential;
             out.remote = snap.census_parts();
+        }
+        if self.kind == LinkKind::Remote {
+            // S10: what the swallow rules did, the census's `inits` and `echoes`.
+            out.dups = Some(self.state.counts());
         }
         out
     }
@@ -2322,6 +3567,17 @@ impl Pump {
                 self.on_child_gone();
                 continue;
             }
+            // S10 §B: a migration's switch begins at the first quiet point once its VM is prepared (a parked session
+            // unparked for it first); the lines a switch held when it was called off are the host's next.
+            if self.switch_due() {
+                self.begin_switch(now);
+            } else if self.unpark_due() {
+                self.unpark_for_switch();
+            }
+            if let Some(line) = self.held_host.pop_front() {
+                self.on_host(Some(HostIn::Line(line)));
+                continue;
+            }
             if let Some((code, _)) = self.finish {
                 let flushed = self.out_q.is_empty();
                 if flushed || self.finish_deadline.is_some_and(|t| now >= t) {
@@ -2344,7 +3600,8 @@ impl Pump {
             // The caps count `in_q` alone (the line that crosses the bytes' cap stays whole),
             // beside the link's CHANNEL_CAP slots, which the queue fills first (TIMING-4).
             let starting_room = self.starting && self.in_q.len() < PENDING_IN_LINES && self.in_q.bytes < PENDING_IN_BYTES;
-            let read_host = self.host_open && (self.finish.is_some() || (self.child_input.is_some() && (self.in_q.len() < 2 || starting_room)));
+            // S10 (L5): a lost link's move waits for the next host line: the host is read with no child.
+            let read_host = self.host_open && (self.finish.is_some() || self.waiting.is_some() || (self.child_input.is_some() && (self.in_q.len() < 2 || starting_room)));
             let write_out = !self.out_q.is_empty() && !self.host_gone;
             let write_in = !self.in_q.is_empty() && self.child_input.is_some();
             let wake = tokio::select! {
@@ -2375,6 +3632,7 @@ impl Pump {
             match wake {
                 Wake::Signal(HostSignal::Term) => self.on_sigterm(),
                 Wake::Signal(HostSignal::DropTransport) => self.on_drop_transport(),
+                Wake::Signal(HostSignal::Migrate) => self.on_migrate(),
                 Wake::Deadline => self.on_deadline(Instant::now()),
                 Wake::Sent => {}
                 Wake::HostOutClosed => {
@@ -2431,6 +3689,14 @@ impl Pump {
         let now = registry::now_rfc3339();
         for v in self.vms.iter_mut().filter(|v| v.to.is_none()) {
             v.to = Some(now.clone());
+            v.end.get_or_insert_with(|| "close".to_string());
+        }
+        // S10: so does a move whose CLI never reached its init: nothing failed, so it was done.
+        self.write_move_done();
+        if let Some(m) = self.migration.take() {
+            // S10 §B: a migration still preparing, prepared and never switched to, or switching, ends with the session
+            // (its phase A dropped and its prepared VM released by the link's close).
+            self.migration_abandoned(&m, "the session ends");
         }
         self.close_row(Some(code));
         if !self.ignored_sigterm_row {
@@ -3297,6 +4563,11 @@ mod tests {
             close_ms: None,
             pid_rewrite: None,
             init_id_refused: 0,
+            moves: [0; 3],
+            move_ms: None,
+            cut: None,
+            dups: None,
+            ka_dropped: 0,
         };
         let row = end_row(&start_row(), &out, 9_000);
         assert_eq!((row.end, row.exit, row.pid, row.start), (Some(9_000), Some(3), 42, 1_000), "paired with the start row on (pid, start)");
@@ -3416,9 +4687,45 @@ mod tests {
             (EndReason::SpawnFailed, "spawn_failed"),
             (EndReason::LinkLost, "link_lost"),
             (EndReason::CredentialRejected, "credential_rejected"),
+            (EndReason::MoveFailed, "move_failed"),
         ];
         for (r, n) in all {
             assert_eq!(r.name(), n);
+        }
+    }
+
+    /// S10 (§4.1): a remote end row's parts after S9's, in order: the moves
+    /// (once one started) with the last one's ms and cut, the swallow rules'
+    /// `inits` and `echoes`, `ka_dropped` when above 0, then `step` and the
+    /// link's parts; without any of them a row is S9's.
+    #[test]
+    fn end_row_writes_the_s10_parts_after_s9s() {
+        let dups = DupCounts { inits_forwarded: 3, inits_swallowed: 1, echoes_forwarded: 2, echoes_swallowed: 1, ..DupCounts::default() };
+        let out = Outcome {
+            code: Some(8),
+            end: Some(EndReason::MoveFailed),
+            init_id_refused: 1,
+            moves: [2, 1, 0],
+            move_ms: Some(4200),
+            cut: Some("at"),
+            dups: Some(dups),
+            ka_dropped: 7,
+            step: Some("spawn"),
+            remote: vec!["vm:microvm-2".into(), "link_drops:0".into()],
+            ..Outcome::default()
+        };
+        let note = end_row(&start_row(), &out, 9_000).note.unwrap();
+        assert!(
+            note.ends_with("; init_id_refused:1; moves:readdress=2,respawn=1,migrate=0; move_ms:4200; cut:at; inits:3/1; echoes:2/1; ka_dropped:7; step:spawn; vm:microvm-2; link_drops:0"),
+            "{note}"
+        );
+        assert!(note.contains("; end:move_failed; "), "{note}");
+        // No move, nothing dropped: a remote row's inits and echoes alone; a local row (no counts) as S9's.
+        let quiet = end_row(&start_row(), &Outcome { dups: Some(DupCounts::default()), ..Outcome::default() }, 9_000).note.unwrap();
+        assert!(quiet.ends_with("; oauth_refresh_answered:0; inits:0/0; echoes:0/0"), "{quiet}");
+        let local = end_row(&start_row(), &Outcome::default(), 9_000).note.unwrap();
+        for part in ["moves:", "move_ms:", "cut:", "inits:", "echoes:", "ka_dropped:"] {
+            assert!(!local.contains(part), "{part}: {local}");
         }
     }
 
@@ -3442,9 +4749,13 @@ mod tests {
             ChildEvent::Rejected { how: "text" },
             ChildEvent::Link(false),
             ChildEvent::Note("reattached".into()),
+            // S10's three.
+            ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 900 }),
+            ChildEvent::MoveFailed(MoveFailure { step: StartStep::TouchId, code: 3, word: "touchid_cancelled", again: true }),
+            ChildEvent::Parked(true),
         ];
         let kinds: Vec<&str> = events.iter().map(ChildEvent::kind).collect();
-        assert_eq!(kinds, ["started", "spawn_failed", "lost", "detached", "rejected", "link", "note"]);
+        assert_eq!(kinds, ["started", "spawn_failed", "lost", "detached", "rejected", "link", "note", "move_ready", "move_failed", "parked"]);
         for ev in events {
             pump.on_child_event(Some(ev));
         }
@@ -3821,12 +5132,13 @@ mod tests {
     }
 
     /// The wrapper's handlers by link kind: every piped mode answers
-    /// `registry::DROP_TRANSPORT_SIGNAL` (whose default would end the
-    /// wrapper), a remote session alone listens to SIGHUP, as a SIGTERM, and
-    /// a local one leaves SIGHUP as it found it. In a child run of this test
-    /// binary, its SIGHUP and SIGUSR2 at their defaults: tokio's handlers are
-    /// never removed, and in the library's test process they would swallow
-    /// the signals meant for `cargo test`.
+    /// `registry::DROP_TRANSPORT_SIGNAL` and (S10) `registry::MIGRATE_SIGNAL`
+    /// (whose defaults would end the wrapper), a remote session alone
+    /// listens to SIGHUP, as a SIGTERM, and a local one leaves SIGHUP as it
+    /// found it. In a child run of this test binary, its SIGHUP, SIGUSR1 and
+    /// SIGUSR2 at their defaults: tokio's handlers are never removed, and in
+    /// the library's test process they would swallow the signals meant for
+    /// `cargo test`.
     #[test]
     fn the_handlers_answer_drop_transport_everywhere_and_sighup_when_remote() {
         use std::os::unix::process::CommandExt as _;
@@ -3844,6 +5156,7 @@ mod tests {
             cmd.pre_exec(|| {
                 libc::signal(libc::SIGHUP, libc::SIG_DFL);
                 libc::signal(registry::DROP_TRANSPORT_SIGNAL, libc::SIG_DFL);
+                libc::signal(registry::MIGRATE_SIGNAL, libc::SIG_DFL);
                 Ok(())
             });
         }
@@ -3878,10 +5191,13 @@ mod tests {
             assert!(matches!(local, Signals::Os { hup: None, .. }), "a local session has no SIGHUP listener");
             assert_eq!(disposition(libc::SIGHUP), hup_before, "a local session leaves SIGHUP as it found it");
             assert_ne!(disposition(registry::DROP_TRANSPORT_SIGNAL), libc::SIG_DFL, "every piped mode answers the drop-transport signal");
+            assert_ne!(disposition(registry::MIGRATE_SIGNAL), libc::SIG_DFL, "every piped mode answers session migrate's signal");
             drop(local);
             let mut remote = Signals::install(LinkKind::Remote).unwrap();
             raise(registry::DROP_TRANSPORT_SIGNAL);
             assert_eq!(tokio::time::timeout(Duration::from_secs(5), remote.recv()).await.unwrap(), HostSignal::DropTransport);
+            raise(registry::MIGRATE_SIGNAL);
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), remote.recv()).await.unwrap(), HostSignal::Migrate);
             if crate::bridge::signals::ignored(libc::SIGHUP) {
                 eprintln!("SIGHUP was ignored when this run started: it stays ignored");
                 return;
@@ -3932,6 +5248,24 @@ mod tests {
             format!(r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"{SID}","user_message_uuid":"{n:08x}-0000-4000-8000-{n:012x}"}}"#)
         }
 
+        /// S10: user line `n`'s uuid, its echo (`--replay-user-messages`), a
+        /// top-level assistant frame, and the loss of a terminated VM.
+        fn uuid_of(n: u32) -> String {
+            format!("{n:08x}-0000-4000-8000-{n:012x}")
+        }
+
+        fn echo(n: u32) -> String {
+            format!(r#"{{"type":"user","uuid":"{}","isReplay":true,"message":{{"role":"user","content":"line {n}"}}}}"#, uuid_of(n))
+        }
+
+        fn assistant(uuid: &str) -> String {
+            format!(r#"{{"type":"assistant","uuid":"{uuid}","parent_tool_use_id":null,"message":{{"role":"assistant","content":[]}}}}"#)
+        }
+
+        fn gone(vm: &str) -> ChildEvent {
+            ChildEvent::Lost(LinkLoss::of(&crate::bridge::errors::BridgeError::Terminated(format!("{vm} is TERMINATED")), vm, None))
+        }
+
         /// One generation's far end, as the hand factory started it.
         struct Far {
             gen: u32,
@@ -3980,6 +5314,15 @@ mod tests {
             results: u32,
             drops: u32,
             snap: RemoteSnapshot,
+            /// S10 §B: what `migration_due` answers (while set), how often it was asked, the phase A
+            /// triggers asked for, what `begin_switch` answers and how often it was called.
+            due: Option<MigrateTrigger>,
+            asked_due: u32,
+            prepares: Vec<MigrateTrigger>,
+            switch: bool,
+            switches: u32,
+            /// S10 §D: the quiet the pump told after each line.
+            quiet: Vec<QuietState>,
         }
 
         struct HandLinks(Rc<RefCell<Hand>>);
@@ -4014,6 +5357,26 @@ mod tests {
 
             fn drop_transport(&mut self) {
                 self.0.borrow_mut().drops += 1;
+            }
+
+            fn quiet(&mut self, q: QuietState) {
+                self.0.borrow_mut().quiet.push(q);
+            }
+
+            fn migration_due(&mut self) -> Option<MigrateTrigger> {
+                let mut h = self.0.borrow_mut();
+                h.asked_due += 1;
+                h.due.clone()
+            }
+
+            fn prepare_move(&mut self, trigger: MigrateTrigger) {
+                self.0.borrow_mut().prepares.push(trigger);
+            }
+
+            fn begin_switch(&mut self) -> bool {
+                let mut h = self.0.borrow_mut();
+                h.switches += 1;
+                h.switch
             }
         }
 
@@ -4141,7 +5504,7 @@ mod tests {
             let cases = [
                 (StartStep::TouchId, Failure::TouchIdCancelled, 3),
                 (StartStep::TouchId, Failure::TouchIdTimeout { secs: 47 }, 5),
-                (StartStep::SelectVm, Failure::MaxConcurrent { running: 3 }, 9),
+                (StartStep::SelectVm, Failure::MaxConcurrent { running: 3, parked: Vec::new() }, 9),
                 (StartStep::SelectVm, Failure::Select { code: 8, first_line: "microvm not found".into() }, 8),
                 (StartStep::Workspace, Failure::Finding { finding: "untracked .env: rule env-file-plaintext".into() }, 9),
                 (StartStep::Spawn, Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }, 7),
@@ -4263,8 +5626,10 @@ mod tests {
         }
 
         /// M08: a link that goes down is not an exit (the row says
-        /// `detached`, then `active` again); one lost past its budget ends
-        /// the wrapper with the loss's code and line (`end:link_lost`).
+        /// `detached`, then `active` again); one lost past its budget for a
+        /// cause no move takes (`NotMovable`) ends the wrapper with the
+        /// loss's code and line (`end:link_lost`). S10: one lost with its VM
+        /// gone (`VmGone`) is no exit either: it starts a move.
         #[test]
         fn a_lost_link_is_not_an_exit() {
             let d = tempfile::tempdir().unwrap();
@@ -4286,6 +5651,7 @@ mod tests {
                 host.wait_for("the result", |v| v["type"] == "result").await;
                 assert_eq!(status(d.path()).as_deref(), Some("active"));
                 let loss = LinkLoss::from_failure(&Failure::LinkLost { vm: "microvm-1".into() });
+                assert_eq!(loss.cause, LossCause::NotMovable);
                 far.send(ChildEvent::Lost(loss.clone())).await;
                 let (code, mut pump) = ended(task).await;
                 assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::LinkLost)));
@@ -4293,6 +5659,27 @@ mod tests {
                 pump.conclude(code);
                 assert!(end_note(&pump).contains("end:link_lost"));
                 assert_eq!(registry_row(&pump, SID).status, "closed");
+                assert_eq!(hand.borrow().whys, [StartWhy::First], "no move");
+            });
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut far1 = far(&hand).await;
+                far1.started().await;
+                handshake(&host, &mut far1, SID).await;
+                host.send(&user(1)).await;
+                assert!(far1.next_input().await.is_some());
+                far1.send(gone("microvm-1")).await;
+                let mut far2 = far(&hand).await;
+                assert!(matches!(&hand.borrow().whys[..], [StartWhy::First, StartWhy::Move(m)] if m.kind == MoveKind::Readdress && m.cause == Some(LossCause::VmGone)), "{:?}", hand.borrow().whys);
+                assert!(!task.is_finished(), "a lost VM is no exit");
+                far2.started().await;
+                host.eof().await;
+                while far2.next_input().await.is_some() {}
+                far2.exit(0).await;
+                let (code, _) = ended(task).await;
+                assert_eq!(code, 0);
             });
         }
 
@@ -5102,6 +6489,1547 @@ mod tests {
                     after_close(&mut pump);
                     assert_eq!(registry_row(&pump, SID).last_wip_fetch, Some(wip("20261018T100200Z-2")), "{vm} at {at}: {newest}");
                 }
+            });
+        }
+
+        // ---- S10 (C1): a lost VM or spawn moves the chat (plans/s10-contracts.md §A, §3.4, §6.1) ----
+
+        /// The audit rows of `event` the pump wrote, oldest first.
+        fn audit_rows(pump: &Pump, event: &str) -> Vec<Value> {
+            crate::bridge::audit::read_rows(&pump.sess.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == event).collect()
+        }
+
+        /// The informational notes the host got, their texts in order.
+        fn notes(host: &Host) -> Vec<String> {
+            host.json().into_iter().filter(|v| v["type"] == "system" && v["subtype"] == "informational").map(|v| v["content"].as_str().unwrap_or_default().to_string()).collect()
+        }
+
+        /// The moved generation's start, as its pipeline reports it (`RemoteSnapshot.moved`).
+        fn moved_to(hand: &Rc<RefCell<Hand>>, vm: &str, kind: MoveKind, cut: &'static str) {
+            let mut h = hand.borrow_mut();
+            h.snap.vm = Some(vm.into());
+            h.snap.moved = Some(crate::bridge::remote::link::MoveDone { kind, cut, touchid: "asked", seed: "box", stayed: false });
+        }
+
+        /// A mid-turn loss of a terminated VM moves the chat at once: the
+        /// next generation starts as a re-address (`whys == [First,
+        /// Move(Readdress …)]`, the adopted session id, the outstanding
+        /// line's uuid, the leaf, not fresh, `initialize` answered); the host
+        /// gets one note and the dead CLI's open prompt withdrawn (one
+        /// `control_cancel_request`); generation 2's input is `initialize`
+        /// and the mode under fresh ids, then the line verbatim; its answers,
+        /// its init and its echo are swallowed, so the host sees one init and
+        /// one echo per turn and one result for the line. The census counts
+        /// the move, its time and its cut; `session_move` and
+        /// `session_move_end` `done` are audited; the row went `migrating`,
+        /// then `active`.
+        #[test]
+        fn a_vm_gone_loss_moves_with_the_host_state_replayed() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                gen1.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                host.wait_for("the initialize answer", |v| v["response"]["request_id"] == "i1").await;
+                let mode = r#"{"type":"control_request","request_id":"m1","request":{"subtype":"set_permission_mode","mode":"plan"}}"#;
+                host.send(mode).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(mode));
+                gen1.line(&answer("m1", "{}")).await;
+                // Turn 1, its last assistant frame the leaf; then turn 2 in flight, its prompt open.
+                host.send(&user(1)).await;
+                assert_eq!(gen1.next_input().await, Some(user(1)));
+                for line in [init_frame(SID), echo(1), assistant("a-1"), result_for(1)] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+                host.send(&user(2)).await;
+                assert_eq!(gen1.next_input().await, Some(user(2)));
+                let ask = r#"{"type":"control_request","request_id":"c1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}"#;
+                for line in [init_frame(SID), echo(2), ask.to_string()] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("the prompt", |v| v["request_id"] == "c1").await;
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                let want = MoveWhy {
+                    kind: MoveKind::Readdress,
+                    cause: Some(LossCause::VmGone),
+                    trigger: None,
+                    from_vm: "microvm-1".into(),
+                    from_spawn: None,
+                    session_id: Some(SID.into()),
+                    outstanding: vec![uuid_of(2)],
+                    leaf: Some("a-1".into()),
+                    fresh_chat: false,
+                    init_answered: true,
+                };
+                assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::Move(want)]);
+                host.wait_for("the withdrawn prompt", |v| v["type"] == "control_cancel_request").await;
+                assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone)], "one note");
+                assert_eq!(registry::read(&Paths::from_root_and_env(d.path().join("bridge"), None), SID).unwrap().map(|r| r.status).as_deref(), Some("migrating"));
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "at");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                let mode2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed mode")).unwrap();
+                assert_eq!((init2["request"]["subtype"].as_str(), mode2["request"]["mode"].as_str()), (Some("initialize"), Some("plan")));
+                assert!(init2["request_id"] != "i1" && mode2["request_id"] != "m1", "fresh ids: {init2} {mode2}");
+                assert_eq!(gen2.next_input().await, Some(user(2)), "the line again, verbatim");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                gen2.line(&answer(mode2["request_id"].as_str().unwrap(), "{}")).await;
+                for line in [init_frame(SID), echo(2), assistant("a-2"), result_for(2)] {
+                    gen2.line(&line).await;
+                }
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                let out = host.json();
+                let count = |pred: &dyn Fn(&Value) -> bool| out.iter().filter(|v| pred(v)).count();
+                assert_eq!(count(&|v| v["type"] == "system" && v["subtype"] == "init"), 2, "one init per turn");
+                assert_eq!(count(&|v| v["type"] == "user" && v["uuid"] == uuid_of(2).as_str()), 1, "one echo of the line");
+                assert_eq!(count(&|v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()), 1, "one result");
+                assert_eq!(count(&|v| v["type"] == "control_response"), 2, "the host's two requests, answered once");
+                assert_eq!(count(&|v| v["type"] == "control_cancel_request" && v["request_id"] == "c1"), 1);
+                assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone), note_continues("microvm-2")]);
+                pump.conclude(code);
+                let note = end_note(&pump);
+                for part in ["moves:readdress=1,respawn=0,migrate=0", "cut:at", "inits:2/1", "echoes:2/1"] {
+                    assert!(note.split("; ").any(|p| p == part), "{part} in {note}");
+                }
+                assert!(note.split("; ").any(|p| p.starts_with("move_ms:")), "{note}");
+                let started = audit_rows(&pump, "session_move");
+                assert_eq!(started.len(), 1, "{started:?}");
+                let d1 = &started[0]["detail"];
+                assert_eq!((d1["gen"].as_str(), d1["kind"].as_str(), d1["cause"].as_str(), d1["from_vm"].as_str(), d1["outstanding"].as_str(), d1["cancelled"].as_str()), (Some("2"), Some("readdress"), Some("vm_gone"), Some("microvm-1"), Some("1"), Some("1")));
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.len(), 1, "{ends:?}");
+                let d2 = &ends[0]["detail"];
+                assert_eq!((d2["outcome"].as_str(), d2["to_vm"].as_str(), d2["cut"].as_str(), d2["touchid"].as_str(), d2["seed"].as_str()), (Some("done"), Some("microvm-2"), Some("at"), Some("asked"), Some("box")));
+                let row = registry_row(&pump, SID);
+                let whys: Vec<_> = row.vms.iter().map(|v| (v["gen"].as_integer(), v["why"].as_str().map(str::to_string), v.get("end").and_then(|e| e.as_str()).map(str::to_string))).collect();
+                assert_eq!(whys, [(Some(1), Some("first".into()), Some("lost:vm_gone".into())), (Some(2), Some("readdress:vm_gone".into()), Some("close".into()))]);
+            });
+        }
+
+        /// §2.9: the leaf moves with every result. A turn that forwarded no
+        /// top-level assistant frame (stopped before any reply) leaves none,
+        /// so a move in the next turn cuts just before that turn's own line
+        /// (`MoveWhy.leaf` none), never at an older reply, which would cut
+        /// the stopped turn and its marker away. A move's start drops the
+        /// dead CLI's partial frame: the moved CLI's turn with no reply of
+        /// its own leaves no leaf either.
+        #[test]
+        fn a_turn_with_no_reply_leaves_no_leaf() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                // Turn 1 replies (a-1); turn 2 is stopped before any reply: its result alone.
+                host.send(&user(1)).await;
+                assert_eq!(gen1.next_input().await, Some(user(1)));
+                for line in [echo(1), assistant("a-1"), result_for(1)] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("turn 1's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(1).as_str()).await;
+                host.send(&user(2)).await;
+                assert_eq!(gen1.next_input().await, Some(user(2)));
+                for line in [echo(2), result_for(2)] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                // Turn 3 is lost mid-turn, a partial reply forwarded.
+                host.send(&user(3)).await;
+                assert_eq!(gen1.next_input().await, Some(user(3)));
+                for line in [echo(3), assistant("a-partial")] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("the partial reply", |v| v["uuid"] == "a-partial").await;
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                let moved = |n: u32, from: &str| MoveWhy {
+                    kind: MoveKind::Readdress,
+                    cause: Some(LossCause::VmGone),
+                    trigger: None,
+                    from_vm: from.into(),
+                    from_spawn: None,
+                    session_id: Some(SID.into()),
+                    outstanding: vec![uuid_of(n)],
+                    leaf: None,
+                    fresh_chat: false,
+                    init_answered: true,
+                };
+                assert_eq!(hand.borrow().whys.last(), Some(&StartWhy::Move(moved(3, "microvm-1"))), "turn 2 forwarded no reply: no leaf");
+                // The moved CLI runs turn 3 again with no reply of its own; turn 4 is lost mid-turn.
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(init2["request"]["subtype"], "initialize");
+                assert_eq!(gen2.next_input().await, Some(user(3)), "the line again, verbatim");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                for line in [init_frame(SID), echo(3), result_for(3)] {
+                    gen2.line(&line).await;
+                }
+                host.wait_for("turn 3's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(3).as_str()).await;
+                host.send(&user(4)).await;
+                assert_eq!(gen2.next_input().await, Some(user(4)));
+                gen2.line(&echo(4)).await;
+                gen2.send(gone("microvm-2")).await;
+                let mut gen3 = far(&hand).await;
+                assert_eq!(hand.borrow().whys.last(), Some(&StartWhy::Move(moved(4, "microvm-2"))), "the dead CLI's partial reply is never a leaf");
+                moved_to(&hand, "microvm-3", MoveKind::Readdress, "none");
+                gen3.started().await;
+                let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(gen3.next_input().await, Some(user(4)));
+                gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
+                for line in [init_frame(SID), echo(4), assistant("a-4"), result_for(4)] {
+                    gen3.line(&line).await;
+                }
+                host.wait_for("turn 4's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(4).as_str()).await;
+                host.eof().await;
+                assert_eq!(gen3.next_input().await, None);
+                gen3.exit(0).await;
+                let (code, _pump) = ended(task).await;
+                assert_eq!(code, 0);
+            });
+        }
+
+        /// L5: a loss with no turn in flight waits: no generation starts,
+        /// the row says `detached`, the host gets the note that the chat moves
+        /// with the next message; a host `keep_alive` starts nothing (and
+        /// never reaches a CLI); the next user line starts the move, then
+        /// reaches the moved CLI after the replayed `initialize` (sent once,
+        /// not resent: no `cut` part), and that CLI's own init starts the
+        /// turn. A host that closes while the chat waits ends it, exit 0,
+        /// with no move.
+        #[test]
+        fn a_loss_while_idle_waits_for_the_next_line() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                gen1.send(gone("microvm-1")).await;
+                host.wait_for("the note", |v| v["subtype"] == "informational").await;
+                let status = || registry::read(&Paths::from_root_and_env(d.path().join("bridge"), None), SID).unwrap().map(|r| r.status);
+                assert_eq!(status().as_deref(), Some("detached"));
+                assert_eq!(notes(&host), [note_move_at_next("microvm-1", LossCause::VmGone)]);
+                host.send(r#"{"type":"keep_alive"}"#).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(hand.borrow().fars.is_empty() && hand.borrow().whys == [StartWhy::First], "nothing moves before the next line");
+                assert!(!task.is_finished());
+                host.send(&user(2)).await;
+                let mut gen2 = far(&hand).await;
+                assert!(matches!(&hand.borrow().whys[..], [StartWhy::First, StartWhy::Move(m)] if m.kind == MoveKind::Readdress && m.outstanding.is_empty() && !m.fresh_chat), "{:?}", hand.borrow().whys);
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(init2["request"]["subtype"], "initialize");
+                assert_eq!(gen2.next_input().await, Some(user(2)), "the next line, after the replay; no keep_alive");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                for line in [init_frame(SID), echo(2), result_for(2)] {
+                    gen2.line(&line).await;
+                }
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                assert_eq!(status().as_deref(), Some("active"));
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                assert_eq!(host.json().iter().filter(|v| v["type"] == "system" && v["subtype"] == "init").count(), 2, "the moved CLI's init starts turn 2");
+                assert_eq!(notes(&host).len(), 2, "the wait's note, then the chat's continuing: {:?}", notes(&host));
+                pump.conclude(code);
+                let note = end_note(&pump);
+                assert!(note.contains("moves:readdress=1,respawn=0,migrate=0") && !note.contains("cut:"), "{note}");
+            });
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                gen1.send(gone("microvm-1")).await;
+                host.wait_for("the note", |v| v["subtype"] == "informational").await;
+                host.eof().await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (0, Some(EndReason::EofTerm)));
+                assert_eq!(hand.borrow().whys, [StartWhy::First], "a closed chat never moves");
+                pump.conclude(code);
+                assert!(!end_note(&pump).contains("moves:"), "{}", end_note(&pump));
+            });
+        }
+
+        /// L6: `[vm].max_readdress` moves per wrapper process; the loss past
+        /// them ends the wrapper 8 with `MovesExhausted`'s line, and with 0
+        /// a lost VM is S9's exit 8 with the loss's own line, no move.
+        #[test]
+        fn past_max_readdress_the_exit_is_8() {
+            for max in [1, 0] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (mut pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let mut cfg = BridgeConfig::default();
+                    cfg.vm.max_readdress = max;
+                    pump.sess.cfg = Some(cfg);
+                    let task = supervise(pump, io);
+                    let mut gen = far(&hand).await;
+                    gen.started().await;
+                    handshake(&host, &mut gen, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(gen.next_input().await.is_some());
+                    for n in 0..max {
+                        let vm = format!("microvm-{}", n + 1);
+                        gen.send(gone(&vm)).await;
+                        gen = far(&hand).await;
+                        moved_to(&hand, &format!("microvm-{}", n + 2), MoveKind::Readdress, "none");
+                        gen.started().await;
+                    }
+                    let last = format!("microvm-{}", max + 1);
+                    gen.send(gone(&last)).await;
+                    let (code, mut pump) = ended(task).await;
+                    assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::LinkLost)), "max {max}");
+                    let line = if max == 0 { Failure::LinkLost { vm: last.clone() }.line() } else { Failure::MovesExhausted { vm: last.clone(), moves: max }.line() };
+                    assert_eq!(pump.final_line.as_deref(), Some(line.as_str()), "max {max}");
+                    assert_eq!(hand.borrow().whys.len(), 1 + max as usize, "max {max}: one move each");
+                    pump.conclude(code);
+                    let note = end_note(&pump);
+                    assert!(note.contains("end:link_lost"), "{note}");
+                    assert_eq!(note.contains("moves:readdress=1,"), max == 1, "{note}");
+                });
+            }
+        }
+
+        /// A move whose start fails (here M1's Touch ID dismissed) ends the
+        /// wrapper with that failure's code and line (`Failure::Move`),
+        /// `end:move_failed` naming the step, the census counting the move
+        /// and timing it; the row closed.
+        #[test]
+        fn a_failed_move_start_ends_move_failed() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.send(gone("microvm-1")).await;
+                let gen2 = far(&hand).await;
+                let failure = Failure::Move { kind: MoveKind::Readdress, from_vm: "microvm-1".into(), cause: Some(LossCause::VmGone), inner: Box::new(Failure::TouchIdCancelled) };
+                gen2.send(ChildEvent::SpawnFailed(SpawnFailure::from_failure(StartStep::TouchId, &failure, None))).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (3, Some(EndReason::MoveFailed)));
+                assert_eq!(pump.final_line.as_deref(), Some(failure.line().as_str()));
+                assert!(failure.line().contains("moving the chat to a new VM failed"), "{}", failure.line());
+                pump.conclude(code);
+                let note = end_note(&pump);
+                for part in ["end:move_failed", "step:touchid", "moves:readdress=1,respawn=0,migrate=0"] {
+                    assert!(note.split("; ").any(|p| p == part), "{part} in {note}");
+                }
+                assert!(note.split("; ").any(|p| p.starts_with("move_ms:")), "{note}");
+                assert_eq!(registry_row(&pump, SID).status, "closed");
+                assert!(!host.json().iter().any(|v| v["type"] == "result"), "the host never got an error result");
+            });
+        }
+
+        /// L4: the dead CLI's open prompt is withdrawn at the move
+        /// (`control_cancel_request` to the host); the host's late answer to
+        /// it is dropped, never sent to the moved CLI, whose own request is
+        /// answered as usual. A late answer while the chat waits for its
+        /// next line (L5) starts no move.
+        #[test]
+        fn a_late_answer_to_a_withdrawn_prompt_is_dropped() {
+            let late = |id: &str| format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"behavior":"allow"}}}}}}"#);
+            let ask = |id: &str, sub: &str| format!(r#"{{"type":"control_request","request_id":"{id}","request":{{"subtype":"{sub}"}}}}"#);
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.line(&ask("c1", "can_use_tool")).await;
+                host.wait_for("the prompt", |v| v["request_id"] == "c1").await;
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                host.wait_for("the withdrawn prompt", |v| v["type"] == "control_cancel_request" && v["request_id"] == "c1").await;
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(gen2.next_input().await, Some(user(1)));
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                host.send(&late("c1")).await;
+                gen2.line(&ask("c2", "can_use_tool")).await;
+                host.wait_for("the new prompt", |v| v["request_id"] == "c2").await;
+                host.send(&late("c2")).await;
+                assert_eq!(gen2.next_input().await, Some(late("c2")), "the late answer to c1 never reached the moved CLI");
+                gen2.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, pump) = ended(task).await;
+                assert_eq!(code, 0);
+                let counts = pump.state.counts();
+                assert_eq!((counts.requests_cancelled, counts.answers_dropped), (1, 1));
+            });
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                gen1.line(&ask("e1", "elicitation")).await;
+                host.wait_for("the request", |v| v["request_id"] == "e1").await;
+                gen1.send(gone("microvm-1")).await;
+                host.wait_for("the withdrawn request", |v| v["type"] == "control_cancel_request" && v["request_id"] == "e1").await;
+                host.send(&late("e1")).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(hand.borrow().whys, [StartWhy::First], "a late answer starts no move");
+                host.send(&user(1)).await;
+                let mut gen2 = far(&hand).await;
+                assert_eq!(hand.borrow().whys.len(), 2);
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(init2["request"]["subtype"], "initialize");
+                assert_eq!(gen2.next_input().await, Some(user(1)), "the line, never the late answer");
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, _) = ended(task).await;
+                assert_eq!(code, 0);
+            });
+        }
+
+        /// §2.9: a moved CLI that misses its cut before its init gets one
+        /// retry on its VM with no cut (`Respawn` for `SpawnGone`, nothing
+        /// outstanding, so plain `--resume`; no new move counted, the census
+        /// `cut:none`), the host's state and the line replayed again; the
+        /// miss never reaches the host. The move has one `session_move_end`,
+        /// `done` once the retry's CLI resumed (its init), keeping the first
+        /// generation's Touch ID and seed with `cut` `none`, and one note
+        /// that the chat goes on. A resume miss inside a move fails it: exit 8
+        /// with the move's line, `end:move_failed` at `step:spawn`, its one
+        /// `session_move_end` `failed`, no note that the chat goes on; the
+        /// host never gets the error result.
+        #[test]
+        fn a_cut_miss_retries_once_and_a_resume_miss_fails_the_move() {
+            let miss = |text: &str| format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["{text}"]}}"#);
+            for cut in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    handshake(&host, &mut gen1, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    for line in [assistant("a-1"), result_for(1)] {
+                        gen1.line(&line).await;
+                    }
+                    host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+                    host.send(&user(2)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    gen1.send(gone("microvm-1")).await;
+                    let mut gen2 = far(&hand).await;
+                    moved_to(&hand, "microvm-2", MoveKind::Readdress, "at");
+                    gen2.started().await;
+                    assert!(gen2.next_input().await.is_some_and(|l| l.contains("\"initialize\"")));
+                    assert_eq!(gen2.next_input().await, Some(user(2)));
+                    assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone)], "nothing says the chat goes on before its CLI resumed");
+                    let text = if cut { format!("No message found with message.uuid of: {}", "a-1") } else { format!("No conversation found with session ID: {SID}") };
+                    gen2.line(&miss(&text)).await;
+                    gen2.exit(1).await;
+                    if !cut {
+                        let (code, mut pump) = ended(task).await;
+                        assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::MoveFailed)));
+                        let line = pump.final_line.clone().unwrap_or_default();
+                        assert!(line.starts_with("the chat's VM microvm-1 was lost (it was terminated); moving the chat to a new VM failed: ") && line.contains(&text), "{line}");
+                        assert_eq!(hand.borrow().whys.len(), 2, "no retry");
+                        pump.conclude(code);
+                        assert!(end_note(&pump).contains("end:move_failed") && end_note(&pump).contains("; step:spawn"), "{}", end_note(&pump));
+                        let ends = audit_rows(&pump, "session_move_end");
+                        assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("failed")], "the move's one end row: {ends:?}");
+                        assert_eq!((ends[0]["detail"]["to_vm"].as_str(), ends[0]["detail"]["cut"].as_str(), ends[0]["detail"]["code"].as_str()), (Some("microvm-2"), Some("at"), Some("8")));
+                        assert!(!host.json().iter().any(|v| v["is_error"] == true), "the host never got the miss");
+                        assert_eq!(notes(&host).len(), 1, "no note that the chat goes on: {:?}", notes(&host));
+                        assert_eq!(registry_row(&pump, SID).vms.last().and_then(|v| v.get("end")).and_then(|e| e.as_str()), Some("failed"));
+                        return;
+                    }
+                    let mut gen3 = far(&hand).await;
+                    let want = MoveWhy {
+                        kind: MoveKind::Respawn,
+                        cause: Some(LossCause::SpawnGone),
+                        trigger: None,
+                        from_vm: "microvm-2".into(),
+                        from_spawn: None,
+                        session_id: Some(SID.into()),
+                        outstanding: Vec::new(),
+                        leaf: None,
+                        fresh_chat: false,
+                        init_answered: true,
+                    };
+                    assert_eq!(hand.borrow().whys.last(), Some(&StartWhy::Move(want)));
+                    // The retry on the same VM: its own seed kept, its token the VM's copy.
+                    hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false });
+                    gen3.started().await;
+                    let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
+                    assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
+                    gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
+                    for line in [init_frame(SID), result_for(2)] {
+                        gen3.line(&line).await;
+                    }
+                    host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    host.eof().await;
+                    assert_eq!(gen3.next_input().await, None);
+                    gen3.exit(0).await;
+                    let (code, mut pump) = ended(task).await;
+                    assert_eq!(code, 0);
+                    assert!(!host.json().iter().any(|v| v["is_error"] == true), "the host never got the miss");
+                    assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone), note_continues("microvm-2")], "one note that the chat goes on");
+                    pump.conclude(code);
+                    let note = end_note(&pump);
+                    assert!(note.contains("moves:readdress=1,respawn=0,migrate=0") && note.contains("; cut:none"), "{note}");
+                    let ends = audit_rows(&pump, "session_move_end");
+                    assert_eq!(ends.len(), 1, "the move's one end row: {ends:?}");
+                    let d = &ends[0]["detail"];
+                    let got = [&d["outcome"], &d["gen"], &d["kind"], &d["to_vm"], &d["cut"], &d["touchid"], &d["seed"]].map(|v| v.as_str().unwrap_or_default().to_string());
+                    assert_eq!(got, ["done", "3", "readdress", "microvm-2", "none", "asked", "box"], "{d}");
+                });
+            }
+        }
+
+        /// §2.9: a moved CLI's cut or resume miss before its first init is
+        /// held however late it comes. Past `RESUME_MISS_GRACE` after its
+        /// answer to the replayed `initialize` (its MCP servers slow to
+        /// start, say) the move is written done and the note says the chat
+        /// goes on; a miss after that still never reaches the host. A cut
+        /// miss gets its one retry with no cut (the census `cut:none`): on the
+        /// same VM it writes no second `done` and says nothing more; on
+        /// another VM (the moved one no longer running) that VM's `done` and
+        /// note. A resume miss fails the move: exit 8 with the move's line,
+        /// `end:move_failed` at `step:spawn`, `failed` after the `done`, with
+        /// the values of the generation that failed.
+        #[test]
+        fn a_miss_later_than_the_grace_is_held_until_the_init() {
+            let miss = |text: &str| format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["{text}"]}}"#);
+            let row_of = |r: &Value| {
+                let d = &r["detail"];
+                [&d["outcome"], &d["gen"], &d["to_vm"], &d["cut"], &d["touchid"], &d["seed"]].map(|v| v.as_str().unwrap_or_default().to_string())
+            };
+            for (cut, retry_vm) in [(true, "microvm-2"), (true, "microvm-3"), (false, "")] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    handshake(&host, &mut gen1, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    for line in [assistant("a-1"), result_for(1)] {
+                        gen1.line(&line).await;
+                    }
+                    host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+                    host.send(&user(2)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    gen1.send(gone("microvm-1")).await;
+                    let mut gen2 = far(&hand).await;
+                    moved_to(&hand, "microvm-2", MoveKind::Readdress, "at");
+                    gen2.started().await;
+                    let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                    assert_eq!(gen2.next_input().await, Some(user(2)));
+                    gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                    let continues = note_continues("microvm-2");
+                    host.wait_for("the note that the chat goes on", |v| v["content"] == continues.as_str()).await;
+                    let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+                    let ends_now: Vec<_> = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap().iter().filter(|r| r["event"] == "session_move_end").map(row_of).collect();
+                    assert_eq!(ends_now, [["done", "2", "microvm-2", "at", "asked", "box"]], "the grace wrote the move done");
+                    let text = if cut { format!("No message found with message.uuid of: {}", "a-1") } else { format!("No conversation found with session ID: {SID}") };
+                    gen2.line(&miss(&text)).await;
+                    gen2.exit(1).await;
+                    if !cut {
+                        let (code, mut pump) = ended(task).await;
+                        assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::MoveFailed)));
+                        let line = pump.final_line.clone().unwrap_or_default();
+                        assert!(line.starts_with("the chat's VM microvm-1 was lost (it was terminated); moving the chat to a new VM failed: ") && line.contains(&text), "{line}");
+                        assert_eq!(hand.borrow().whys.len(), 2, "no retry");
+                        assert!(!host.json().iter().any(|v| v["is_error"] == true), "the host never got the miss");
+                        pump.conclude(code);
+                        let note = end_note(&pump);
+                        assert!(note.contains("end:move_failed") && note.contains("; step:spawn"), "{note}");
+                        let ends = audit_rows(&pump, "session_move_end");
+                        assert_eq!(ends.iter().map(row_of).collect::<Vec<_>>(), [["done", "2", "microvm-2", "at", "asked", "box"], ["failed", "2", "microvm-2", "at", "asked", "box"]], "{ends:?}");
+                        assert_eq!(ends[1]["detail"]["code"].as_str(), Some("8"));
+                        assert_eq!(registry_row(&pump, SID).vms.last().and_then(|v| v.get("end")).and_then(|e| e.as_str()), Some("failed"));
+                        return;
+                    }
+                    let mut gen3 = far(&hand).await;
+                    assert!(matches!(hand.borrow().whys.last(), Some(StartWhy::Move(m)) if m.kind == MoveKind::Respawn && m.from_vm == "microvm-2" && m.outstanding.is_empty()), "{:?}", hand.borrow().whys);
+                    if retry_vm == "microvm-2" {
+                        hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false });
+                    } else {
+                        moved_to(&hand, retry_vm, MoveKind::Readdress, "none");
+                    }
+                    gen3.started().await;
+                    let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
+                    assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
+                    gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
+                    for line in [init_frame(SID), result_for(2)] {
+                        gen3.line(&line).await;
+                    }
+                    host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    host.eof().await;
+                    assert_eq!(gen3.next_input().await, None);
+                    gen3.exit(0).await;
+                    let (code, mut pump) = ended(task).await;
+                    assert_eq!(code, 0, "{retry_vm}");
+                    assert!(!host.json().iter().any(|v| v["is_error"] == true), "the host never got the miss");
+                    let mut want = vec![note_moving("microvm-1", LossCause::VmGone), note_continues("microvm-2")];
+                    let mut rows = vec![["done", "2", "microvm-2", "at", "asked", "box"]];
+                    if retry_vm != "microvm-2" {
+                        want.push(note_continues(retry_vm));
+                        rows.push(["done", "3", retry_vm, "none", "asked", "box"]);
+                    }
+                    assert_eq!(notes(&host), want, "{retry_vm}");
+                    pump.conclude(code);
+                    let note = end_note(&pump);
+                    assert!(note.contains("moves:readdress=1,respawn=0,migrate=0") && note.contains("; cut:none"), "{note}");
+                    let ends = audit_rows(&pump, "session_move_end");
+                    assert_eq!(ends.iter().map(row_of).collect::<Vec<_>>(), rows, "{retry_vm}: {ends:?}");
+                });
+            }
+        }
+
+        /// §2.2's fresh chat: one begun here with no result yet moves fresh
+        /// (its cut `Fresh`: `--session-id`, nothing restored); a
+        /// `--continue` chat never does, nor a `--resume` one whose CLI forked
+        /// the session under a new id, their CLI having carried on an earlier
+        /// conversation.
+        #[test]
+        fn only_a_chat_begun_here_moves_fresh() {
+            const FORK: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+            let resume = format!("--resume={SID}");
+            for (extra, sid, fresh) in [(vec![], SID, true), (vec!["--continue"], SID, false), (vec![resume.as_str(), "--fork-session"], FORK, false)] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &extra);
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    handshake(&host, &mut gen1, sid).await;
+                    host.send(&user(1)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    gen1.send(gone("microvm-1")).await;
+                    let mut gen2 = far(&hand).await;
+                    assert!(matches!(&hand.borrow().whys[..], [StartWhy::First, StartWhy::Move(m)] if m.fresh_chat == fresh && m.outstanding == [uuid_of(1)] && m.session_id.as_deref() == Some(sid)), "{extra:?}: {:?}", hand.borrow().whys);
+                    host.eof().await;
+                    assert_eq!(gen2.next_signal().await, Some(Sig::Term), "the host's EOF cancels the pending move");
+                    gen2.send(ChildEvent::SpawnFailed(SpawnFailure::stopped(StartStep::TouchId, None))).await;
+                    let (code, _) = ended(task).await;
+                    assert_eq!(code, 0, "{extra:?}");
+                });
+            }
+        }
+
+        /// A `/clear` (a new session id from the same CLI) begins a fresh
+        /// session (§2.2, per session): lost in its first turn, the chat moves
+        /// fresh under the new id, with no leaf of the old session's.
+        #[test]
+        fn a_cleared_chats_new_session_moves_fresh() {
+            const CLEARED: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                for line in [assistant("a-1"), result_for(1)] {
+                    gen1.line(&line).await;
+                }
+                host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+                host.send(&user(2)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.line(&init_frame(CLEARED)).await;
+                host.wait_for("the new session's init", |v| v["session_id"] == CLEARED).await;
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                assert!(matches!(&hand.borrow().whys[..], [StartWhy::First, StartWhy::Move(m)] if m.fresh_chat && m.session_id.as_deref() == Some(CLEARED) && m.outstanding == [uuid_of(2)] && m.leaf.is_none()), "{:?}", hand.borrow().whys);
+                host.eof().await;
+                assert_eq!(gen2.next_signal().await, Some(Sig::Term), "the host's EOF cancels the pending move");
+                gen2.send(ChildEvent::SpawnFailed(SpawnFailure::stopped(StartStep::TouchId, None))).await;
+                let (code, _) = ended(task).await;
+                assert_eq!(code, 0);
+            });
+        }
+
+        /// The VM lost while the host's `initialize` waits for its answer
+        /// (Cursor sends nothing else meanwhile): the move starts at once,
+        /// with no host line, its note the move's, in the host's window
+        /// (`init_answered` false: T0 + 50 s); the moved CLI's answer to the
+        /// replayed `initialize` reaches the host under the host's id, the
+        /// wrapper's pid in it, and times the session's `init_ms`. No turn
+        /// runs, so no init comes: with no miss within `RESUME_MISS_GRACE`
+        /// of that answer the CLI resumed, and the move is done (its note
+        /// that the chat goes on, its one `session_move_end` `done`).
+        #[test]
+        fn a_loss_before_the_initialize_answer_moves_at_once() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                assert!(matches!(&hand.borrow().whys[..], [StartWhy::First, StartWhy::Move(m)] if m.kind == MoveKind::Readdress && !m.init_answered && m.outstanding.is_empty() && m.session_id.as_deref() == Some(SID)), "{:?}", hand.borrow().whys);
+                assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone)], "the move's note, not the wait's");
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(init2["request"]["subtype"], "initialize");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                let answered = host.wait_for("the initialize answer", |v| v["type"] == "control_response").await;
+                assert_eq!((answered["response"]["request_id"].as_str(), answered["response"]["response"]["pid"].as_u64()), (Some("i1"), Some(u64::from(std::process::id()))));
+                assert_eq!(notes(&host).len(), 1, "within the grace nothing says the chat goes on");
+                let continues = note_continues("microvm-2");
+                host.wait_for("the note that the chat goes on", |v| v["content"] == continues.as_str()).await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                let out = pump.conclude(code);
+                assert!(out.init_latency_ms.is_some(), "the moved CLI's answer is the session's init_ms");
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("done")], "{ends:?}");
+            });
+        }
+
+        /// A moved CLI that does not resume the session fails the move, and
+        /// the host never hears it: one that ends before its first init with
+        /// nothing on stdout (`--session-id`'s `is already in use` is on its
+        /// stderr alone), and one whose start-up error result comes before
+        /// that init (held, never forwarded). Exit 8 with the move's line,
+        /// `end:move_failed` at `step:spawn`, the move's one
+        /// `session_move_end` `failed`, the generation's `vms` entry `failed`.
+        #[test]
+        fn a_moved_cli_that_never_resumes_fails_the_move() {
+            for said in [None, Some("Error: a start-up refusal")] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    handshake(&host, &mut gen1, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    gen1.send(gone("microvm-1")).await;
+                    let gen2 = far(&hand).await;
+                    moved_to(&hand, "microvm-2", MoveKind::Readdress, "fresh");
+                    gen2.started().await;
+                    if let Some(text) = said {
+                        gen2.line(&format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"{SID}","errors":["{text}"]}}"#)).await;
+                    }
+                    gen2.exit(1).await;
+                    let (code, mut pump) = ended(task).await;
+                    assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::MoveFailed)), "{said:?}");
+                    let line = pump.final_line.clone().unwrap_or_default();
+                    let inner = said.unwrap_or("the moved claude ended (exit 1) before it resumed the session");
+                    assert!(line.starts_with("the chat's VM microvm-1 was lost (it was terminated); moving the chat to a new VM failed: ") && line.contains(inner), "{line}");
+                    assert!(!host.json().iter().any(|v| v["type"] == "result"), "the host never got a result: {:?}", host.json());
+                    pump.conclude(code);
+                    let note = end_note(&pump);
+                    assert!(note.contains("end:move_failed") && note.contains("; step:spawn"), "{note}");
+                    let ends = audit_rows(&pump, "session_move_end");
+                    assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("failed")], "{ends:?}");
+                    assert_eq!(registry_row(&pump, SID).vms.last().and_then(|v| v.get("end")).and_then(|e| e.as_str()), Some("failed"));
+                });
+            }
+        }
+
+        /// A pinned session (`AI_ENV_BRIDGE_VM`: its VM or nothing) never
+        /// moves to another VM: its VM lost mid-turn is S9's exit 8 with the
+        /// loss's own line, no note, no `session_move`, no move counted; its
+        /// spawn gone on the pinned VM restarts there (a respawn).
+        #[test]
+        fn a_pinned_session_never_moves_to_another_vm() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                hand.borrow_mut().snap.pinned = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.send(gone("microvm-1")).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (8, Some(EndReason::LinkLost)));
+                assert_eq!(pump.final_line.as_deref(), Some(Failure::LinkLost { vm: "microvm-1".into() }.line().as_str()));
+                assert_eq!(hand.borrow().whys, [StartWhy::First], "no move");
+                assert!(notes(&host).is_empty(), "{:?}", notes(&host));
+                pump.conclude(code);
+                assert!(audit_rows(&pump, "session_move").is_empty());
+                assert!(!end_note(&pump).contains("moves:"), "{}", end_note(&pump));
+            });
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                hand.borrow_mut().snap.pinned = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                host.send(&user(2)).await;
+                assert!(gen1.next_input().await.is_some());
+                let spawn_gone = LinkLoss::of(&crate::bridge::errors::BridgeError::SpawnGone("the spawn is not on microvm-1".into()), "microvm-1", None);
+                gen1.send(ChildEvent::Lost(spawn_gone)).await;
+                let mut gen2 = far(&hand).await;
+                assert!(matches!(&hand.borrow().whys[..], [StartWhy::First, StartWhy::Move(m)] if m.kind == MoveKind::Respawn && m.cause == Some(LossCause::SpawnGone)), "{:?}", hand.borrow().whys);
+                host.eof().await;
+                assert_eq!(gen2.next_signal().await, Some(Sig::Term), "the host's EOF cancels the pending move");
+                gen2.send(ChildEvent::SpawnFailed(SpawnFailure::stopped(StartStep::TouchId, None))).await;
+                let (code, _) = ended(task).await;
+                assert_eq!(code, 0);
+            });
+        }
+
+        /// A move lost again inside its replay window, a host `interrupt`
+        /// pending (L4 replays it): the next move's window is its own, so
+        /// no earlier generation's deadline fails the `interrupt` while
+        /// generation 3's start is pending, and generation 3's answer reaches
+        /// the host under the host's id; no `replay_timeout` is audited.
+        #[test]
+        fn a_move_lost_in_its_replay_window_leaves_the_next_its_own() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (mut pump, hand, host, io) = remote_pump(d.path(), &[]);
+                pump.knobs.replay_deadline = Some(Duration::from_millis(200));
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                let interrupt = r#"{"type":"control_request","request_id":"x1","request":{"subtype":"interrupt"}}"#;
+                host.send(interrupt).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(interrupt));
+                gen1.send(gone("microvm-1")).await;
+                let gen2 = far(&hand).await;
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                gen2.started().await;
+                gen2.send(gone("microvm-2")).await;
+                let mut gen3 = far(&hand).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                assert!(!host.json().iter().any(|v| v["type"] == "control_response" && v["response"]["request_id"] == "x1"), "nothing answered the interrupt while generation 3's start was pending: {:?}", host.json());
+                moved_to(&hand, "microvm-3", MoveKind::Readdress, "none");
+                gen3.started().await;
+                let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(gen3.next_input().await, Some(user(1)), "the line again");
+                let int3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed interrupt, last")).unwrap();
+                assert_eq!((init3["request"]["subtype"].as_str(), int3["request"]["subtype"].as_str()), (Some("initialize"), Some("interrupt")));
+                gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4545}"#)).await;
+                gen3.line(&answer(int3["request_id"].as_str().unwrap(), "{}")).await;
+                let answered = host.wait_for("the interrupt's answer", |v| v["response"]["request_id"] == "x1").await;
+                assert_eq!(answered["response"]["subtype"], "success", "{answered}");
+                host.eof().await;
+                while gen3.next_input().await.is_some() {}
+                gen3.exit(0).await;
+                let (code, pump) = ended(task).await;
+                assert_eq!(code, 0);
+                assert!(audit_rows(&pump, "replay_timeout").is_empty(), "{:?}", audit_rows(&pump, "replay_timeout"));
+            });
+        }
+
+        /// §6.1's prefix rule: a reopened session's row keeps the `vms`
+        /// entries an earlier wrapper left (its own after them, each with its
+        /// why, its end and this wrapper's pid), at most `VMS_KEPT`, the
+        /// oldest dropped; `created` is this wrapper's registration.
+        #[test]
+        fn the_vms_history_survives_a_reopen() {
+            for earlier in [2_usize, registry::VMS_KEPT] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let resume = format!("--resume={SID}");
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                    hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                    let paths = pump.sess.paths.clone();
+                    let old = |n: usize| registry::VmEntry { gen: 1, vm: format!("microvm-old-{n}"), spawn: None, from: "2026-10-01T00:00:00Z".into(), to: Some("2026-10-01T01:00:00Z".into()), why: "first".into(), end: Some("close".into()), pid: 1 };
+                    let row = SessionRow {
+                        v: registry::REGISTRY_SCHEMA_V,
+                        session_id: SID.into(),
+                        created: "2026-10-01T00:00:00Z".into(),
+                        last_seen: "2026-10-01T01:00:00Z".into(),
+                        status: "closed".into(),
+                        mode: "remote".into(),
+                        pid: 1,
+                        vms: (0..earlier).map(|n| toml::Value::try_from(old(n)).unwrap()).collect(),
+                        ..SessionRow::default()
+                    };
+                    registry::write(&paths, &row).unwrap();
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    handshake(&host, &mut gen1, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    gen1.send(gone("microvm-1")).await;
+                    let mut gen2 = far(&hand).await;
+                    moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                    gen2.started().await;
+                    host.eof().await;
+                    while gen2.next_input().await.is_some() {}
+                    gen2.exit(0).await;
+                    let (code, mut pump) = ended(task).await;
+                    pump.conclude(code);
+                    let row = registry_row(&pump, SID);
+                    assert_ne!(row.created, "2026-10-01T00:00:00Z", "created is this wrapper's registration");
+                    let vms: Vec<registry::VmEntry> = row.vms.iter().map(|v| registry::VmEntry::from_value(v).expect("a vms entry")).collect();
+                    assert_eq!(vms.len(), (earlier + 2).min(registry::VMS_KEPT), "{vms:?}");
+                    let own = &vms[vms.len() - 2..];
+                    assert_eq!((own[0].gen, own[0].vm.as_str(), own[0].why.as_str(), own[0].end.as_deref(), own[0].pid), (1, "microvm-1", "first", Some("lost:vm_gone"), std::process::id()));
+                    assert_eq!((own[1].gen, own[1].vm.as_str(), own[1].why.as_str(), own[1].end.as_deref(), own[1].pid), (2, "microvm-2", "readdress:vm_gone", Some("close"), std::process::id()));
+                    let kept: Vec<&str> = vms[..vms.len() - 2].iter().map(|v| v.vm.as_str()).collect();
+                    let first_kept = earlier + 2 - vms.len();
+                    let want: Vec<String> = (first_kept..earlier).map(|n| format!("microvm-old-{n}")).collect();
+                    assert_eq!(kept, want.iter().map(String::as_str).collect::<Vec<_>>(), "the earlier entries, the oldest dropped past VMS_KEPT");
+                });
+            }
+        }
+
+        // ---- S10 (C3): migrations (§B), parks (§D), `session migrate`'s request (§7.1) ----------
+
+        const WALL: MigrateTrigger = MigrateTrigger::Wall { left_s: 600 };
+
+        /// Until `pred` holds of the hand factory.
+        async fn until_hand(hand: &Rc<RefCell<Hand>>, what: &str, pred: impl Fn(&Hand) -> bool) {
+            let until = Instant::now() + T;
+            while !pred(&hand.borrow()) {
+                assert!(Instant::now() < until, "the hand factory never saw {what}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// A started session on `microvm-1` whose wall comes near with turn 1's
+        /// result: phase A asked for (the hand's `due` taken back once asked).
+        async fn migrating(hand: &Rc<RefCell<Hand>>, host: &Host, gen1: &mut Far) {
+            hand.borrow_mut().snap.vm = Some("microvm-1".into());
+            gen1.started().await;
+            handshake(host, gen1, SID).await;
+            hand.borrow_mut().due = Some(WALL);
+            host.send(&user(1)).await;
+            assert_eq!(gen1.next_input().await, Some(user(1)));
+            for line in [echo(1), assistant("a-1"), result_for(1)] {
+                gen1.line(&line).await;
+            }
+            host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+            until_hand(hand, "phase A", |h| h.prepares.len() == 1).await;
+            hand.borrow_mut().due = None;
+            assert_eq!(hand.borrow().prepares, [WALL]);
+        }
+
+        /// §B: a due migration's phase A runs while the chat goes on, said
+        /// first (`note_migrating`, `session_move` with the live generation
+        /// and its trigger); its prepared VM waits for a quiet point: never
+        /// while a line is outstanding. At the first quiet point the switch
+        /// begins: the old CLI gets its EOF; the host's line meanwhile is
+        /// held, unrecorded, until the moved generation (`Move(Migrate)`: no
+        /// line outstanding, so no cut) read the replayed `initialize`, then
+        /// it comes. The move is counted and done once the moved CLI resumed;
+        /// the row's `vms` say `moved`, then `migrate:wall`.
+        #[test]
+        fn a_migration_switches_only_at_a_quiet_point() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                migrating(&hand, &host, &mut gen1).await;
+                assert_eq!(notes(&host), [note_migrating("microvm-1", &WALL)], "phase A is said once");
+                // Turn 2 starts; phase A ends while it runs: no switch before its result.
+                host.send(&user(2)).await;
+                assert_eq!(gen1.next_input().await, Some(user(2)));
+                hand.borrow_mut().switch = true;
+                gen1.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                gen1.line(&echo(2)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                assert_eq!(hand.borrow().switches, 0, "a line is outstanding: no quiet point");
+                gen1.line(&result_for(2)).await;
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                // The quiet point: the switch, the old CLI's EOF; the host's next line is held meanwhile.
+                assert_eq!(gen1.next_input().await, None, "the old CLI's EOF");
+                assert_eq!(hand.borrow().switches, 1);
+                host.send(&user(3)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                gen1.exit(0).await;
+                let mut gen2 = far(&hand).await;
+                // Turn 2 forwarded no assistant frame: no leaf (turn 1's would cut turn 2 away).
+                let want = MoveWhy {
+                    kind: MoveKind::Migrate,
+                    cause: None,
+                    trigger: Some(WALL),
+                    from_vm: "microvm-1".into(),
+                    from_spawn: None,
+                    session_id: Some(SID.into()),
+                    outstanding: Vec::new(),
+                    leaf: None,
+                    fresh_chat: false,
+                    init_answered: true,
+                };
+                assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::Move(want)]);
+                assert_eq!(registry::read(&Paths::from_root_and_env(d.path().join("bridge"), None), SID).unwrap().map(|r| r.status).as_deref(), Some("migrating"));
+                moved_to(&hand, "microvm-2", MoveKind::Migrate, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(init2["request"]["subtype"], "initialize");
+                assert_eq!(gen2.next_input().await, Some(user(3)), "the held line, after the replay");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                host.wait_for("the chat goes on", |v| v["subtype"] == "informational" && v["content"] == note_continues("microvm-2").as_str()).await;
+                for line in [init_frame(SID), echo(3), result_for(3)] {
+                    gen2.line(&line).await;
+                }
+                host.wait_for("turn 3's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(3).as_str()).await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                assert_eq!(host.json().iter().filter(|v| v["type"] == "control_response").count(), 1, "the host's initialize answered once");
+                pump.conclude(code);
+                assert!(end_note(&pump).split("; ").any(|p| p == "moves:readdress=0,respawn=0,migrate=1"), "{}", end_note(&pump));
+                let moved = audit_rows(&pump, "session_move");
+                assert_eq!(moved.len(), 1, "{moved:?}");
+                let m = &moved[0]["detail"];
+                assert_eq!((m["gen"].as_str(), m["kind"].as_str(), m["trigger"].as_str(), m["from_vm"].as_str()), (Some("1"), Some("migrate"), Some("wall"), Some("microvm-1")));
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.len(), 1, "{ends:?}");
+                assert_eq!((ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["to_vm"].as_str(), ends[0]["detail"]["kind"].as_str()), (Some("done"), Some("microvm-2"), Some("migrate")));
+                let row = registry_row(&pump, SID);
+                let whys: Vec<_> = row.vms.iter().map(|v| (v["why"].as_str().map(str::to_string), v.get("end").and_then(|e| e.as_str()).map(str::to_string))).collect();
+                assert_eq!(whys, [(Some("first".into()), Some("moved".into())), (Some("migrate:wall".into()), Some("close".into()))]);
+            });
+        }
+
+        /// M4: a phase A whose Touch ID went unanswered leaves the chat on its
+        /// VM: said (it tries again after the next turn), audited
+        /// `session_move_end` `stayed` with its step and code, nothing
+        /// started; the next turn's result asks for phase A again.
+        #[test]
+        fn a_failed_prepare_stays_on_the_old_vm() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                migrating(&hand, &host, &mut gen1).await;
+                gen1.send(ChildEvent::MoveFailed(MoveFailure { step: StartStep::TouchId, code: 5, word: "touchid_timeout", again: true })).await;
+                let stayed = note_stayed("microvm-1", "no Touch ID in time", StayedThen::Retry);
+                host.wait_for("the stayed note", |v| v["subtype"] == "informational" && v["content"] == stayed.as_str()).await;
+                hand.borrow_mut().switch = true;
+                hand.borrow_mut().due = Some(MigrateTrigger::Wall { left_s: 500 });
+                host.send(&user(2)).await;
+                assert_eq!(gen1.next_input().await, Some(user(2)));
+                gen1.line(&result_for(2)).await;
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                until_hand(&hand, "phase A again", |h| h.prepares.len() == 2).await;
+                assert_eq!(hand.borrow().prepares[1], MigrateTrigger::Wall { left_s: 500 }, "asked again after the next turn (M4)");
+                assert_eq!((hand.borrow().switches, hand.borrow().whys.len()), (0, 1), "nothing prepared, nothing switched");
+                host.eof().await;
+                assert_eq!(gen1.next_input().await, None);
+                gen1.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.len(), 2, "{ends:?}");
+                let e = &ends[0]["detail"];
+                assert_eq!((e["outcome"].as_str(), e["kind"].as_str(), e["step"].as_str(), e["code"].as_str(), e["from_vm"].as_str()), (Some("stayed"), Some("migrate"), Some("touchid"), Some("5"), Some("microvm-1")));
+                // The second phase A, still running when the session ended, is given up with it.
+                assert_eq!((ends[1]["detail"]["outcome"].as_str(), ends[1]["detail"]["kind"].as_str()), (Some("abandoned"), Some("migrate")), "{ends:?}");
+                assert_eq!(audit_rows(&pump, "session_move").len(), 2, "each phase A's start");
+                assert!(!end_note(&pump).contains("moves:"), "no move: {}", end_note(&pump));
+            });
+        }
+
+        /// §2.4: a phase A that failed for good (here SELECT_VM refused at
+        /// `[vm].max_concurrent`, no Touch ID to answer) ends wall migrations
+        /// in this process: said (the chat moves when the VM reaches its
+        /// wall), and no later result asks for one again.
+        #[test]
+        fn a_prepare_refused_for_good_ends_wall_migrations() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                migrating(&hand, &host, &mut gen1).await;
+                gen1.send(ChildEvent::MoveFailed(MoveFailure { step: StartStep::SelectVm, code: 9, word: "max_concurrent", again: false })).await;
+                let stayed = note_stayed("microvm-1", "no VM can start: [vm].max_concurrent", StayedThen::AtWall);
+                host.wait_for("the stayed note", |v| v["subtype"] == "informational" && v["content"] == stayed.as_str()).await;
+                let asked = hand.borrow().asked_due;
+                hand.borrow_mut().due = Some(WALL);
+                for n in 2..=3 {
+                    host.send(&user(n)).await;
+                    assert_eq!(gen1.next_input().await, Some(user(n)));
+                    gen1.line(&result_for(n)).await;
+                    host.wait_for("the result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(n).as_str()).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!((hand.borrow().asked_due, hand.borrow().prepares.len()), (asked, 1), "no wall migration is asked for again");
+                host.eof().await;
+                assert_eq!(gen1.next_input().await, None);
+                gen1.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.iter().map(|r| (r["detail"]["outcome"].clone(), r["detail"]["code"].clone())).collect::<Vec<_>>(), [(Value::from("stayed"), Value::from("9"))]);
+            });
+        }
+
+        /// §B: a switch that fell back to a respawn on the old VM (its
+        /// pipeline wrote `stayed`) writes no `done`: the chat stays, said;
+        /// at the second such fallback (`MIGRATE_PREP_TRIES`) wall migrations
+        /// are over in this process, so no later result asks for one.
+        #[test]
+        fn a_switch_that_fell_back_stays_and_counts_toward_the_tries() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen = far(&hand).await;
+                migrating(&hand, &host, &mut gen).await;
+                hand.borrow_mut().switch = true;
+                for n in 1..=MIGRATE_PREP_TRIES {
+                    gen.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                    assert_eq!(gen.next_input().await, None, "the old CLI's EOF");
+                    gen.exit(0).await;
+                    gen = far(&hand).await;
+                    hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Migrate, cut: "none", touchid: "cached", seed: "kept", stayed: true });
+                    gen.started().await;
+                    let init: Value = serde_json::from_str(&gen.next_input().await.expect("the replayed initialize")).unwrap();
+                    gen.line(&answer(init["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                    let then = if n < MIGRATE_PREP_TRIES { StayedThen::Retry } else { StayedThen::AtWall };
+                    let stayed = note_stayed("microvm-1", "the move to the new VM failed after the old claude stopped; it restarted here", then);
+                    host.wait_for("the stayed note", |v| v["content"] == stayed.as_str()).await;
+                    if n < MIGRATE_PREP_TRIES {
+                        hand.borrow_mut().due = Some(WALL);
+                        host.send(&user(10 + n)).await;
+                        assert_eq!(gen.next_input().await, Some(user(10 + n)));
+                        gen.line(&result_for(10 + n)).await;
+                        until_hand(&hand, "phase A again", |h| h.prepares.len() == n as usize + 1).await;
+                        hand.borrow_mut().due = None;
+                    }
+                }
+                let asked = hand.borrow().asked_due;
+                hand.borrow_mut().due = Some(WALL);
+                host.send(&user(20)).await;
+                assert_eq!(gen.next_input().await, Some(user(20)));
+                gen.line(&result_for(20)).await;
+                host.wait_for("the result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(20).as_str()).await;
+                assert_eq!(hand.borrow().asked_due, asked, "no wall migration after MIGRATE_PREP_TRIES fallbacks");
+                host.eof().await;
+                while gen.next_input().await.is_some() {}
+                gen.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                assert!(audit_rows(&pump, "session_move_end").iter().all(|r| r["detail"]["outcome"] != "done"), "{:?}", audit_rows(&pump, "session_move_end"));
+                assert!(!notes(&host).iter().any(|n| n.contains("continues on")), "{:?}", notes(&host));
+            });
+        }
+
+        /// §7.1 at the pump: `session migrate`'s signal takes its session's
+        /// fresh request (removed) and starts phase A at once with its nonce
+        /// (`Command`), whatever `migration_due` says; a stale one is removed
+        /// unanswered; one while a migration runs is answered `refused`.
+        #[test]
+        fn a_session_migrate_request_starts_phase_a_at_once_or_is_refused() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                let now = crate::wire::time::unix_now();
+                let write = |age: u64, nonce: &str| {
+                    std::fs::create_dir_all(paths.sessions()).unwrap();
+                    let req = crate::bridge::migrate::MigrateRequest { v: 1, nonce: nonce.into(), requested_at: crate::wire::time::rfc3339_utc(now - age), by_pid: 1 };
+                    std::fs::write(paths.session_migrate_request(SID), serde_json::to_string(&req).unwrap()).unwrap();
+                };
+                write(120, "stale-nonce");
+                host.signal(HostSignal::Migrate);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(!paths.session_migrate_request(SID).exists() && hand.borrow().prepares.is_empty(), "a stale request: removed, unanswered");
+                write(0, "nonce-1");
+                host.signal(HostSignal::Migrate);
+                until_hand(&hand, "the command's phase A", |h| h.prepares.len() == 1).await;
+                assert_eq!(hand.borrow().prepares, [MigrateTrigger::Command { nonce: "nonce-1".into() }]);
+                assert!(!paths.session_migrate_request(SID).exists(), "taken");
+                host.wait_for("the note", |v| v["content"] == note_migrating("microvm-1", &MigrateTrigger::Command { nonce: "nonce-1".into() }).as_str()).await;
+                write(0, "nonce-2");
+                host.signal(HostSignal::Migrate);
+                let until = Instant::now() + T;
+                while !crate::bridge::audit::read_rows(&paths.audit(), None).unwrap().iter().any(|r| r["event"] == "session_move_end" && r["detail"]["request"] == "nonce-2") {
+                    assert!(Instant::now() < until, "the second request was never answered");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                host.eof().await;
+                assert_eq!(gen1.next_input().await, None);
+                gen1.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                // The second request refused at once; the first, its phase A still running at the session's end, given up then.
+                assert_eq!(
+                    ends.iter().map(|r| (r["detail"]["outcome"].clone(), r["detail"]["request"].clone())).collect::<Vec<_>>(),
+                    [(Value::from("refused"), Value::from("nonce-2")), (Value::from("abandoned"), Value::from("nonce-1"))]
+                );
+                let moved = audit_rows(&pump, "session_move");
+                assert_eq!((moved.len(), moved[0]["detail"]["trigger"].as_str(), moved[0]["detail"]["request"].as_str()), (1, Some("command"), Some("nonce-1")));
+                assert_eq!(hand.borrow().prepares.len(), 1);
+            });
+        }
+
+        /// §7.1, C3: a pinned session (`AI_ENV_BRIDGE_VM`: its VM or nothing,
+        /// `RemoteSnapshot.pinned`) never migrates: `session migrate`'s
+        /// fresh request is taken (removed) and answered `refused` with its
+        /// nonce at once; no phase A starts, nothing is said to the host.
+        #[test]
+        fn a_pinned_sessions_migrate_request_is_refused() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                {
+                    let mut h = hand.borrow_mut();
+                    h.snap.vm = Some("microvm-1".into());
+                    h.snap.pinned = Some("microvm-1".into());
+                }
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                gen1.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                std::fs::create_dir_all(paths.sessions()).unwrap();
+                let req = crate::bridge::migrate::MigrateRequest { v: 1, nonce: "nonce-pinned".into(), requested_at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()), by_pid: 1 };
+                std::fs::write(paths.session_migrate_request(SID), serde_json::to_string(&req).unwrap()).unwrap();
+                host.signal(HostSignal::Migrate);
+                let until = Instant::now() + T;
+                while !crate::bridge::audit::read_rows(&paths.audit(), None).unwrap().iter().any(|r| r["event"] == "session_move_end" && r["detail"]["request"] == "nonce-pinned") {
+                    assert!(Instant::now() < until, "the pinned session's request was never answered");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(!paths.session_migrate_request(SID).exists(), "taken");
+                assert!(hand.borrow().prepares.is_empty(), "no phase A: {:?}", hand.borrow().prepares);
+                host.eof().await;
+                assert_eq!(gen1.next_input().await, None);
+                gen1.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.iter().map(|r| (r["detail"]["outcome"].clone(), r["detail"]["request"].clone(), r["detail"]["kind"].clone())).collect::<Vec<_>>(), [(Value::from("refused"), Value::from("nonce-pinned"), Value::from("migrate"))]);
+                assert!(audit_rows(&pump, "session_move").is_empty(), "no move started");
+                assert!(notes(&host).is_empty(), "nothing said: {:?}", notes(&host));
+            });
+        }
+
+        /// §D at the pump: after each line forwarded either way the link gets
+        /// the chat's quiet (the verdict, since the last line that was no
+        /// `keep_alive`, the last host frame's kind); a parked session's row
+        /// says `parked`, then `active`; while parked the host's `keep_alive`
+        /// is dropped and counted (`ka_dropped`), any other line forwarded.
+        #[test]
+        fn a_parked_session_drops_the_hosts_keep_alive_and_the_link_hears_the_quiet() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert!(gen1.next_input().await.is_some());
+                {
+                    let h = hand.borrow();
+                    let last = h.quiet.last().expect("the quiet after the user line");
+                    assert_eq!((last.verdict, last.last_host), (crate::bridge::park::Verdict::Busy, Some("user")), "a line outstanding");
+                }
+                gen1.line(&result_for(1)).await;
+                host.wait_for("the result", |v| v["type"] == "result").await;
+                until_hand(&hand, "an idle quiet", |h| h.quiet.last().is_some_and(|q| q.verdict == crate::bridge::park::Verdict::Idle)).await;
+                let status = || registry::read(&Paths::from_root_and_env(d.path().join("bridge"), None), SID).unwrap().map(|r| r.status);
+                gen1.send(ChildEvent::Parked(true)).await;
+                let until = Instant::now() + T;
+                while status().as_deref() != Some("parked") {
+                    assert!(Instant::now() < until, "the row never said parked");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                let told = hand.borrow().quiet.len();
+                for _ in 0..3 {
+                    host.send(r#"{"type":"keep_alive"}"#).await;
+                }
+                host.send(&user(2)).await;
+                assert_eq!(gen1.next_input().await, Some(user(2)), "the user's line passes, the keep_alives never");
+                gen1.send(ChildEvent::Parked(false)).await;
+                let until = Instant::now() + T;
+                while status().as_deref() != Some("active") {
+                    assert!(Instant::now() < until, "the row never said active again");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                assert_eq!(hand.borrow().quiet.len(), told + 1, "only the forwarded line told");
+                host.send(r#"{"type":"keep_alive"}"#).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(r#"{"type":"keep_alive"}"#), "unparked: a keep_alive goes through");
+                host.eof().await;
+                assert_eq!(gen1.next_input().await, None);
+                gen1.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                assert!(end_note(&pump).split("; ").any(|p| p == "ka_dropped:3"), "{}", end_note(&pump));
+            });
+        }
+
+        // ---- S10 (C3's review): a parked chat's switch, a loss during a migration, a switch's spawn that failed ----
+
+        /// `session migrate`'s request of `nonce` for the session (fresh), and its signal.
+        fn request(paths: &Paths, host: &Host, nonce: &str) {
+            std::fs::create_dir_all(paths.sessions()).unwrap();
+            let req = crate::bridge::migrate::MigrateRequest { v: 1, nonce: nonce.into(), requested_at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()), by_pid: 1 };
+            std::fs::write(paths.session_migrate_request(SID), serde_json::to_string(&req).unwrap()).unwrap();
+            host.signal(HostSignal::Migrate);
+        }
+
+        /// §B, §3.3: a migration whose VM is prepared while the idle chat is
+        /// parked is no quiet point yet (a switch's EOF to a session parked
+        /// with no socket would close it parked, its claude left on the old
+        /// VM): one `keep_alive` unparks it (any stdin does; never a second
+        /// one), and the switch begins at the quiet point after its
+        /// `Parked(false)`: the old CLI's EOF, the moved generation.
+        #[test]
+        fn a_migration_prepared_while_parked_unparks_the_chat_then_switches() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                migrating(&hand, &host, &mut gen1).await;
+                gen1.send(ChildEvent::Parked(true)).await;
+                hand.borrow_mut().switch = true;
+                gen1.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(r#"{"type":"keep_alive"}"#), "the unpark");
+                assert!(tokio::time::timeout(Duration::from_millis(150), gen1.input.recv()).await.is_err(), "one keep_alive, no EOF while parked");
+                assert_eq!(hand.borrow().switches, 0, "parked: no switch yet");
+                gen1.send(ChildEvent::Parked(false)).await;
+                assert_eq!(gen1.next_input().await, None, "the quiet point after the unpark: the old CLI's EOF");
+                assert_eq!(hand.borrow().switches, 1);
+                gen1.exit(0).await;
+                let mut gen2 = far(&hand).await;
+                assert!(matches!(hand.borrow().whys.last(), Some(StartWhy::Move(m)) if m.kind == MoveKind::Migrate && m.from_vm == "microvm-1"), "{:?}", hand.borrow().whys);
+                moved_to(&hand, "microvm-2", MoveKind::Migrate, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                host.wait_for("the chat goes on", |v| v["subtype"] == "informational" && v["content"] == note_continues("microvm-2").as_str()).await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("done")], "{ends:?}");
+            });
+        }
+
+        /// §A, §B: a lost VM's move while a migration's VM is prepared moves
+        /// the chat as any loss (a re-address, at once mid-turn) and gives the
+        /// migration up: `session_move_end` `abandoned` with `session
+        /// migrate`'s nonce (its command answered at once); no switch comes
+        /// at the next quiet point, a late `MoveReady` included.
+        #[test]
+        fn a_loss_while_a_migration_is_prepared_gives_the_migration_up() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let paths = pump.sess.paths.clone();
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                gen1.started().await;
+                handshake(&host, &mut gen1, SID).await;
+                host.send(&user(1)).await;
+                assert_eq!(gen1.next_input().await, Some(user(1)));
+                gen1.line(&result_for(1)).await;
+                host.wait_for("turn 1's result", |v| v["type"] == "result").await;
+                request(&paths, &host, "nonce-1");
+                until_hand(&hand, "the command's phase A", |h| h.prepares.len() == 1).await;
+                // Turn 2 runs when the VM is prepared, then the platform ends the VM mid-turn.
+                host.send(&user(2)).await;
+                assert_eq!(gen1.next_input().await, Some(user(2)));
+                hand.borrow_mut().switch = true;
+                gen1.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                gen1.send(gone("microvm-1")).await;
+                let mut gen2 = far(&hand).await;
+                assert!(matches!(hand.borrow().whys.last(), Some(StartWhy::Move(m)) if m.kind == MoveKind::Readdress), "{:?}", hand.borrow().whys);
+                let given_up = |p: &Paths| crate::bridge::audit::read_rows(&p.audit(), None).unwrap().into_iter().filter(|r| r["event"] == "session_move_end" && r["detail"]["outcome"] == "abandoned").count();
+                assert_eq!(given_up(&paths), 1, "the migration is given up as the re-address starts");
+                moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                gen2.started().await;
+                let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                assert_eq!(gen2.next_input().await, Some(user(2)), "the line again");
+                gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                // A phase A end that comes late finds no migration: nothing switches at the quiet point.
+                gen2.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                for line in [init_frame(SID), echo(2), result_for(2)] {
+                    gen2.line(&line).await;
+                }
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!((hand.borrow().switches, hand.borrow().whys.len()), (0, 2), "no switch, no third generation");
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                let got: Vec<_> = ends.iter().map(|r| (r["detail"]["outcome"].clone(), r["detail"]["kind"].clone(), r["detail"]["request"].clone())).collect();
+                assert_eq!(got, [(Value::from("abandoned"), Value::from("migrate"), Value::from("nonce-1")), (Value::from("done"), Value::from("readdress"), Value::Null)], "{ends:?}");
+            });
+        }
+
+        /// §2.7: a switch whose new VM never started the moved CLI (its
+        /// session refused the spawn there) falls back to the old VM: one
+        /// more `Move(Migrate)` generation (the pipeline finds no VM prepared
+        /// and respawns on the VM the switch left), the host's state replayed
+        /// into it; at its `Started` the move's one end row, `stayed`, with
+        /// that failure's step and code; the chat goes on there, said.
+        #[test]
+        fn a_switch_whose_new_vm_refuses_the_spawn_falls_back_to_the_old_vm() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                migrating(&hand, &host, &mut gen1).await;
+                hand.borrow_mut().switch = true;
+                gen1.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                assert_eq!(gen1.next_input().await, None, "the old CLI's EOF");
+                gen1.exit(0).await;
+                let gen2 = far(&hand).await;
+                hand.borrow_mut().snap.vm = Some("microvm-2".into());
+                let refused = SpawnFailure { code: 7, step: StartStep::Spawn, line: Some("the spawn was refused".into()), cancelled: false, vm: Some("microvm-2".into()) };
+                gen2.send(ChildEvent::SpawnFailed(refused)).await;
+                let mut gen3 = far(&hand).await;
+                let whys = hand.borrow().whys.clone();
+                assert!(matches!(&whys[..], [StartWhy::First, StartWhy::Move(a), StartWhy::Move(b)] if a == b && b.kind == MoveKind::Migrate && b.from_vm == "microvm-1"), "{whys:?}");
+                hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Migrate, cut: "none", touchid: "asked", seed: "kept", stayed: true });
+                gen3.started().await;
+                let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
+                gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                let stayed = note_stayed("microvm-1", "the move to the new VM failed after the old claude stopped; it restarted here", StayedThen::Retry);
+                host.wait_for("the stayed note", |v| v["content"] == stayed.as_str()).await;
+                host.send(&user(2)).await;
+                assert_eq!(gen3.next_input().await, Some(user(2)));
+                gen3.line(&result_for(2)).await;
+                host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                host.eof().await;
+                assert_eq!(gen3.next_input().await, None);
+                gen3.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0, "the chat went on");
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.len(), 1, "{ends:?}");
+                let e = &ends[0]["detail"];
+                assert_eq!(
+                    (e["outcome"].as_str(), e["kind"].as_str(), e["to_vm"].as_str(), e["step"].as_str(), e["code"].as_str(), e["touchid"].as_str()),
+                    (Some("stayed"), Some("migrate"), Some("microvm-1"), Some("spawn"), Some("7"), Some("asked")),
+                    "{ends:?}"
+                );
+            });
+        }
+
+        /// C3-E: a switch the old link's loss calls off is given up
+        /// (`abandoned`), and so is a migration still preparing at the
+        /// session's end: every migration's `session_move` has its end row.
+        #[test]
+        fn a_switch_called_off_by_a_loss_is_given_up() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                migrating(&hand, &host, &mut gen1).await;
+                hand.borrow_mut().switch = true;
+                gen1.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;
+                assert_eq!(gen1.next_input().await, None, "the old CLI's EOF");
+                // The old link is lost before the old CLI's exit: the switch is off, the loss moves the chat at its next line.
+                gen1.send(gone("microvm-1")).await;
+                host.wait_for("the move waits for the next line", |v| v["content"] == note_move_at_next("microvm-1", LossCause::VmGone).as_str()).await;
+                host.eof().await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                pump.conclude(code);
+                let ends = audit_rows(&pump, "session_move_end");
+                assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("abandoned")], "{ends:?}");
+                assert_eq!(hand.borrow().whys.len(), 1, "no generation after the called-off switch");
             });
         }
     }

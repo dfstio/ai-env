@@ -1097,7 +1097,8 @@ fn sync_commits_a_base_then_segments_and_hands_the_tail() {
 
 /// A rewritten file (shorter than committed) is generation 2's base, the
 /// old keys superseded; the next sync deletes them (delete markers) and the
-/// manifest forgets them.
+/// manifest forgets them. S10 (R1): so is the tail generation 1's last sync
+/// handed (the manifest records it), which no restore follows any more.
 #[test]
 fn a_rewritten_file_starts_a_generation_and_supersedes_the_old_keys() {
     let r = Remote::new();
@@ -1107,13 +1108,15 @@ fn a_rewritten_file_starts_a_generation_and_supersedes_the_old_keys() {
     r.sync().unwrap();
     let old: Vec<String> = r.w.manifest().unwrap().parts.iter().map(|p| p.key.clone()).collect();
     assert_eq!(old.len(), 2);
+    let tail = r.key_of(S3Key::Tail { session: SID.into(), gen: 1, offset: 700 });
+    assert_eq!(r.w.manifest().unwrap().tails.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), [tail.as_str()], "the tail the last sync handed, recorded");
     let rewritten = line("compacted", 250);
     r.vm.set(|s| s.file = Some(rewritten.clone()));
     let rep = r.sync().unwrap();
     let g2 = r.key_of(S3Key::Base { session: SID.into(), gen: 2 });
     assert_eq!(rep.pushed.as_ref().map(|p| (p.kind, p.key.clone())), Some(("base", g2.clone())));
     let m = r.w.manifest().unwrap();
-    assert_eq!((m.gen, m.committed, m.superseded.clone()), (2, 250, old.clone()));
+    assert_eq!((m.gen, m.committed, m.superseded.clone()), (2, 250, [old.clone(), vec![tail]].concat()));
     assert_eq!(r.w.s3.get(&g2).as_deref(), Some(rewritten.as_slice()));
     r.sync().unwrap();
     assert!(r.w.manifest().unwrap().superseded.is_empty(), "deleted at the next sync");
@@ -1125,7 +1128,7 @@ fn a_rewritten_file_starts_a_generation_and_supersedes_the_old_keys() {
 /// A segment S3 refuses — 412 (its key holds an object of a generation the
 /// manifest does not know) or 400 `BadDigest` (the VM's bytes changed under
 /// the stat) — starts a new generation: a full copy, the old keys
-/// superseded.
+/// superseded (S10, R1: the tail generation 1 recorded too).
 #[test]
 fn a_refused_segment_starts_a_generation() {
     let r = Remote::new();
@@ -1137,7 +1140,8 @@ fn a_refused_segment_starts_a_generation() {
     let rep = r.sync().unwrap();
     assert_eq!(rep.pushed.as_ref().map(|p| (p.kind, p.len)), Some(("base", 400)), "412: a new generation");
     let m = r.w.manifest().unwrap();
-    assert_eq!((m.gen, m.committed, m.superseded.clone()), (2, 400, vec![seg.clone(), r.key_of(S3Key::Base { session: SID.into(), gen: 1 })]), "the refused segment's key and the old base go");
+    let old = vec![seg.clone(), r.key_of(S3Key::Base { session: SID.into(), gen: 1 }), r.key_of(S3Key::Tail { session: SID.into(), gen: 1, offset: 300 })];
+    assert_eq!((m.gen, m.committed, m.superseded.clone()), (2, 400, old), "the refused segment's key, the old base and generation 1's tail go");
     assert!(r.w.rows("transcript_push").iter().any(|row| row["detail"]["s3_status"] == "412"));
     // BadDigest on the next segment (the superseded key's delete goes first, then the segment's PUT).
     r.sync().unwrap();
@@ -1368,6 +1372,8 @@ fn restore_sends_a_mac_begun_chat_up_inline() {
     assert_eq!(r.restore_subtree().unwrap().pulled, 1);
     assert_eq!(r.vm.st.lock().unwrap().subtree, vec![(format!("{SLUG}/{SID}/subagents/a.jsonl"), sub)]);
     assert_eq!(r.w.rows("transcript_stage")[0]["detail"]["outcome"], "staged");
+    // S10 F5: the inline stage writes its rate, as `session stage` does, since something went up.
+    assert!(r.w.rows("transcript_stage")[0]["detail"]["rate"].as_str().is_some_and(|v| v.parse::<u64>().is_ok()), "{:?}", r.w.rows("transcript_stage")[0]);
     // A gen-0 manifest's tail: the shim pushed it under g1 (the sync hands it so), the restore finds it there.
     let tail = line("suspended", 60);
     r.w.s3.put(&r.key_of(S3Key::Tail { session: SID.into(), gen: 1, offset: chat.len() as u64 }), &tail);
@@ -1775,7 +1781,7 @@ async fn the_five_transfer_requests_go_as_the_shim_reads_them() {
     assert_eq!((got.status, got.body), (200, Some(push_reply)));
     // POST /transcript/pull (201)
     let get = presign(ai_env_cli::bridge::s3::S3Method::Get, S3Key::Base { session: SID.into(), gen: 1 }.render(), Vec::new());
-    let pull = TranscriptPull { rel: rel.clone(), parts: vec![ai_env_cli::wire::workspace::PullPart { url: get, len: 3787, sha256: Some("b".repeat(64)) }], sha256: None, owner: LAB_OWNER.into(), proxy: None };
+    let pull = TranscriptPull { rel: rel.clone(), parts: vec![ai_env_cli::wire::workspace::PullPart { url: get, len: 3787, sha256: Some("b".repeat(64)) }], sha256: None, owner: LAB_OWNER.into(), proxy: None, share: 1 };
     let got = dp.transcript_pull(&agent, &token, &pull).await.unwrap();
     assert_eq!((got.status, got.body), (201, Some(pull_reply)));
     // GET /transcript/view?rel=&n=
@@ -1847,7 +1853,7 @@ async fn a_subtree_files_tail_is_refused_before_any_request() {
     assert!(m.starts_with("POST /transcript/tail: the request") && m.contains("a tail is only ever the session's main transcript"), "{m}");
     let file = S3Key::File { session: SID.into(), sha256: "d".repeat(64) };
     let parts = vec![PullPart { url: presign(S3Method::Get, file, Vec::new()), len: 4096, sha256: Some("d".repeat(64)) }, PullPart { url: presign(S3Method::Get, tail_key, Vec::new()), len: 10, sha256: None }];
-    let pull = TranscriptPull { rel: sub, parts, sha256: None, owner: LAB_OWNER.into(), proxy: None };
+    let pull = TranscriptPull { rel: sub, parts, sha256: None, owner: LAB_OWNER.into(), proxy: None, share: 1 };
     let m = config(dp.transcript_pull(&agent, &token, &pull).await.err());
     assert!(m.starts_with("POST /transcript/pull: the request") && m.contains("a tail (part number 1)"), "{m}");
     assert!(seen.lock().unwrap().is_empty(), "nothing reached the VM");
@@ -2189,4 +2195,732 @@ fn migrate_s9_lists_and_migrates_a_running_s8_image_vm_alike() {
     let mut with_cap = found[0].clone();
     with_cap.vm.as_mut().and_then(|v| v.caps.as_mut()).unwrap().push(CAP_TRANSCRIPT_S3_V1.into());
     assert_eq!(would_migrate(&with_cap).from, "live_vm", "the same rule names a VM with the cap");
+}
+
+// ---- S10 (F1, F3a, F5): the forget of several sessions, `--warm` without reuse, the client's waits and retries ----
+
+mod followups {
+    use super::*;
+    use ai_env_cli::bridge::s3::client::Waits;
+    use ai_env_cli::bridge::workspace::transcript::FileDigest;
+    use std::time::Duration;
+
+    /// The stall wait of these tests (the contract's is a minute); the
+    /// answer's waits stay the contract's, which no answer of the fake S3
+    /// (a debug build hashing what it stores) ever nears.
+    const STALL: Waits = Waits { stall: Duration::from_millis(500), ..Waits::DEFAULT };
+
+    /// A transcript of `n` lines of 1 MiB at `<SLUG>/<SID>.jsonl`, digested in `part`-byte parts: its path, digest and key.
+    fn chat_of(w: &World, n: usize, part: u64) -> (PathBuf, FileDigest, String) {
+        let bytes: Vec<u8> = (0..n).flat_map(|i| line(&format!("turn {i}"), 1 << 20)).collect();
+        let path = w.plant(&format!("{SID}.jsonl"), &bytes);
+        let d = digest_file(&Rules::defaults(), &path, bytes.len() as u64, part).unwrap();
+        let key = S3Key::Mac { session: SID.into(), sha256: d.sha256.clone() }.render();
+        (path, d, key)
+    }
+
+    /// The statuses S3 answered each request `pick` takes, in order (0: no answer went out).
+    fn statuses(w: &World, pick: impl Fn(&fake_s3::S3Request) -> bool) -> Vec<u16> {
+        w.s3.requests().iter().filter(|r| pick(r)).map(|r| r.status).collect()
+    }
+
+    fn is_complete(r: &fake_s3::S3Request) -> bool {
+        r.method == "POST" && r.query_names.iter().any(|n| n == "uploadId")
+    }
+
+    /// F5 (stall): a part whose body stops being taken (the fake S3 reads 64
+    /// KiB of its 16 MiB, then nothing: an uplink gone) is given up once no
+    /// chunk was handed for the stall wait, never after a budget of the whole
+    /// (S9's: 30 s plus the parts in flight at 1 MB/s, a minute a try here,
+    /// 567 s for a live 64 MiB part beside seven others): at each of its
+    /// three tries, the stage fails (exit 7) naming the part, the tries and
+    /// how much of it went before it stopped, never the URL; `stage.toml`
+    /// keeps the other part. Run again with one stall, the part is sent again
+    /// after it and the upload completes, S3 holding the chat's bytes.
+    #[test]
+    fn a_stalled_part_is_given_up_without_progress_and_sent_again() {
+        let w = World::new(FakeS3::start());
+        let part = 16u64 << 20;
+        let (path, d, key) = chat_of(&w, 32, part);
+        assert_eq!(d.parts.len(), 2);
+        let client = w.client().with_waits(STALL);
+        w.s3.script_part(1, vec![S3Action::Stall { after: 64 << 10 }; 3]);
+        let t = std::time::Instant::now();
+        let e = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, part)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(30), "three tries, each given up after its stall: {:?}", t.elapsed());
+        let text = e.to_string();
+        let sent = text.strip_prefix(&format!("aws s3 upload part: part 1 of {key}: no answer in 3 tries: sent ")).unwrap_or_else(|| panic!("{text}"));
+        let (n, rest) = sent.split_once(' ').unwrap();
+        assert!(n.parse::<u64>().is_ok_and(|n| n < part) && rest == format!("of {part} bytes, no progress for 500 ms"), "{text}");
+        for never in ["http", &w.s3.addr().to_string(), LAB_BUCKET, "X-Amz", "redacted"] {
+            assert!(!text.contains(never), "{never:?} in {text}");
+        }
+        assert_eq!(ai_env_cli::errors::CliError::from(e).exit_code(), 7);
+        assert_eq!(statuses(&w, |r| r.part == Some(1)), [0; 3], "three tries, none answered");
+        assert_eq!(s3stage::read_stage(&w.paths, SID).unwrap().expect("the stage file stays").parts.iter().map(|p| p.number).collect::<Vec<_>>(), [2]);
+        // Run again: one stall, then the part goes through.
+        w.s3.script_part(1, vec![S3Action::Stall { after: 64 << 10 }]);
+        let up = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, part)).unwrap();
+        assert!(up.resumed && !up.existed && up.sent == part, "part 1 alone sent again: {up:?}");
+        assert_eq!(statuses(&w, |r| r.part == Some(1)), [0, 0, 0, 0, 200]);
+        assert_eq!(w.s3.get(&key).as_deref(), Some(std::fs::read(&path).unwrap().as_slice()), "S3 holds the chat's bytes");
+    }
+
+    /// F5 (409s): S3's two transient 409s, `OperationAborted` and
+    /// `ConditionalRequestConflict`, are sent again as a 500 or a 503 are
+    /// (S9 took every 409 for final): a PutObject's (two of them, then 200),
+    /// a part's and a CompleteMultipartUpload's; any other 409 is final at
+    /// its first answer (exit 7, its code named).
+    #[test]
+    fn s3s_two_transient_409s_are_sent_again_and_no_other_409() {
+        let w = World::new(FakeS3::start());
+        let client = w.client();
+        let body = line("one turn", 4096);
+        let file = w._tmp.path().join("body");
+        std::fs::write(&file, &body).unwrap();
+        let put = |key: &str| w.rt().block_on(client.put_object(key, Body::File { path: file.clone(), offset: 0, len: body.len() as u64 }, body.len() as u64, &sha(&body)));
+        let base = S3Key::Base { session: SID.into(), gen: 1 }.render();
+        w.s3.script_put(vec![S3Action::Status { status: 409, code: "OperationAborted" }, S3Action::Status { status: 409, code: "ConditionalRequestConflict" }]);
+        assert!(matches!(put(&base).unwrap(), Written::Stored(_)));
+        assert_eq!(statuses(&w, |r| r.method == "PUT" && r.key == base), [409, 409, 200]);
+        let other = S3Key::Base { session: SID.into(), gen: 2 }.render();
+        w.s3.script_put(vec![S3Action::Status { status: 409, code: "InvalidBucketState" }]);
+        match put(&other).unwrap_err() {
+            BridgeError::S3 { op: "put", status: 409, code } => assert_eq!(code.as_deref(), Some("InvalidBucketState")),
+            e => panic!("not the 409: {e:?}"),
+        }
+        assert_eq!(statuses(&w, |r| r.method == "PUT" && r.key == other), [409], "one try");
+        // A part's and the Complete's.
+        let (path, d, key) = chat_of(&w, 3, 1 << 20);
+        w.s3.script_part(2, vec![S3Action::Status { status: 409, code: "ConditionalRequestConflict" }]);
+        w.s3.script_complete(vec![S3Action::Status { status: 409, code: "OperationAborted" }]);
+        let up = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, 1 << 20)).unwrap();
+        assert!(!up.existed && up.parts == 3, "{up:?}");
+        assert_eq!((statuses(&w, |r| r.part == Some(2)), statuses(&w, is_complete)), (vec![409, 200], vec![409, 200]));
+        assert_eq!(w.s3.get(&key).as_deref(), Some(std::fs::read(&path).unwrap().as_slice()));
+    }
+
+    /// F5 (head): a PutObject whose body S3 took whole and never answered is
+    /// given up once its head wait passed after the body's end (a test's
+    /// second; the contract's two minutes), not after a budget of the whole,
+    /// and sent again: stored at the second try.
+    #[test]
+    fn a_put_never_answered_is_given_up_after_its_head_wait_and_sent_again() {
+        let w = World::new(FakeS3::start());
+        let client = w.client().with_waits(Waits { head: Duration::from_secs(1), ..Waits::DEFAULT });
+        let body = line("one turn", 4096);
+        let file = w._tmp.path().join("body");
+        std::fs::write(&file, &body).unwrap();
+        let key = S3Key::Base { session: SID.into(), gen: 1 }.render();
+        w.s3.script_put(vec![S3Action::Silent]);
+        let t = std::time::Instant::now();
+        let stored = w.rt().block_on(client.put_object(&key, Body::File { path: file, offset: 0, len: body.len() as u64 }, body.len() as u64, &sha(&body))).unwrap();
+        assert!(matches!(stored, Written::Stored(_)) && t.elapsed() >= Duration::from_secs(1), "{stored:?} in {:?}", t.elapsed());
+        assert_eq!(statuses(&w, |r| r.method == "PUT"), [0, 200]);
+        assert_eq!(w.s3.get(&key).as_deref(), Some(body.as_slice()));
+    }
+
+    /// F5 (Complete): CompleteMultipartUpload goes up to three times (S9:
+    /// once). Its first try completes the upload and loses its answer, its
+    /// second meets `NoSuchUpload`: a listing of the key at the file's
+    /// length then says the object is there (the key is its sha256),
+    /// `Exists`, `stage.toml` gone, S3 holding the bytes. And a run cut after
+    /// a Complete whose every answer was lost (the object made, `stage.toml`
+    /// left): the next run's ListParts meets `NoSuchUpload`, the listing
+    /// finds the object, and no part, CreateMultipartUpload or Complete goes
+    /// again.
+    #[test]
+    fn a_completes_lost_answer_is_checked_against_a_listing() {
+        let w = World::new(FakeS3::start());
+        let client = w.client();
+        let (path, d, key) = chat_of(&w, 3, 1 << 20);
+        w.s3.script_complete(vec![S3Action::Drop]);
+        let up = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, 1 << 20)).unwrap();
+        assert!(up.existed && up.version_id.is_empty() && up.parts == 3, "{up:?}");
+        assert_eq!(statuses(&w, is_complete), [0, 404], "lost, then NoSuchUpload");
+        let lists = |w: &World| w.s3.requests().iter().filter(|r| r.method == "GET" && r.query_names.iter().any(|n| n == "list-type")).count();
+        assert_eq!(lists(&w), 1, "one listing of the key");
+        assert_eq!(w.s3.get(&key).as_deref(), Some(std::fs::read(&path).unwrap().as_slice()));
+        assert!(s3stage::read_stage(&w.paths, SID).unwrap().is_none(), "the stage file is gone");
+        // Every answer of a Complete lost: the run fails, its stage file left; the next one finds the object.
+        let w = World::new(FakeS3::start());
+        let client = w.client();
+        let (path, d, key) = chat_of(&w, 3, 1 << 20);
+        w.s3.script_complete(vec![S3Action::Drop; 3]);
+        let e = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, 1 << 20)).unwrap_err();
+        assert!(e.to_string().contains("no answer in 3 tries"), "{e}");
+        assert!(w.s3.get(&key).is_some() && s3stage::read_stage(&w.paths, SID).unwrap().is_some(), "made, and the stage file left");
+        let from = w.s3.requests().len();
+        let up = w.rt().block_on(s3stage::upload_file(&client, &w.paths, SID, &key, &path, &d, 1 << 20)).unwrap();
+        assert!(up.resumed && up.existed && up.sent == 0, "{up:?}");
+        let again: Vec<fake_s3::S3Request> = w.s3.requests()[from..].to_vec();
+        let asks = |r: &fake_s3::S3Request, name: &str| r.method == "GET" && r.query_names.iter().any(|n| n == name);
+        assert_eq!(again.len(), 2, "ListParts, then the listing: {again:?}");
+        assert!(asks(&again[0], "uploadId") && again[0].status == 404 && asks(&again[1], "list-type") && again[1].status == 200, "{again:?}");
+        assert!(s3stage::read_stage(&w.paths, SID).unwrap().is_none());
+    }
+
+    /// F5 (pace): an upload is judged against `dataplane::MIN_RATE` as its
+    /// files land, a few requests' latency allowed: one that falls below it
+    /// is `slow` (it warned) and its rate is its bytes over its time; a fast
+    /// one is not.
+    #[test]
+    fn an_upload_below_min_rate_is_slow_and_a_fast_one_is_not() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let main = [cwd_line(&repo), line("turn 0", 100_000)].concat();
+        w.plant(&format!("{SID}.jsonl"), &main);
+        let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+        let digests = s3stage::scan_chat(&Rules::defaults(), &chat, MULTIPART_PART).unwrap();
+        let client = w.client();
+        let fast = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-20T09:00:00.000Z")).unwrap();
+        assert!(!fast.slow && fast.sent == main.len() as u64, "{fast:?}");
+        let w = World::new(FakeS3::start());
+        w.plant(&format!("{SID}.jsonl"), &main);
+        let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+        w.s3.script_put(vec![S3Action::Delay(Duration::from_millis(2600))]);
+        let client = w.client();
+        let slow = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-20T09:00:00.000Z")).unwrap();
+        assert!(slow.slow && slow.ms >= 2600 && slow.rate() < ai_env_cli::bridge::dataplane::MIN_RATE, "{slow:?}");
+        assert_eq!(slow.rate(), slow.sent * 1000 / slow.ms);
+    }
+
+    /// F5 (pace, parts side by side): a multipart upload is judged by what
+    /// the connections took, its parts in flight too, never by the parts S3
+    /// answered alone. Eight 1 MiB parts that the fake S3 reads at 256 KiB/s
+    /// each (2 MiB/s in all, over `MIN_RATE`) are answered after some 4 s:
+    /// by the answers, the first one's 1 MiB over those 4 s would be below 1
+    /// MB/s past the slack. Not `slow` (no warning), its rate its bytes over
+    /// its time, S3 holding the chat's bytes.
+    #[test]
+    fn parts_side_by_side_are_paced_by_what_they_sent() {
+        let w = World::new(FakeS3::start());
+        let part = 1u64 << 20;
+        let bytes: Vec<u8> = (0..8).flat_map(|i| line(&format!("turn {i}"), 1 << 20)).collect();
+        w.plant(&format!("{SID}.jsonl"), &bytes);
+        let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+        let digests = s3stage::scan_chat(&Rules::defaults(), &chat, part).unwrap();
+        assert_eq!(digests[0].parts.len(), ai_env_cli::wire::s3::MULTIPART_PARALLEL, "as many parts as go side by side");
+        for n in 1..=8 {
+            w.s3.script_part(n, vec![S3Action::Throttle { per_s: 256 << 10 }]);
+        }
+        let client = w.client();
+        let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, part, "2026-10-20T09:00:00.000Z")).unwrap();
+        assert!(up.ms > 3000 && up.sent == bytes.len() as u64 && up.parts == 8, "{up:?}");
+        assert!(!up.slow && up.rate() > ai_env_cli::bridge::dataplane::MIN_RATE, "{up:?}");
+        assert_eq!(w.s3.get(&up.key).as_deref(), Some(bytes.as_slice()));
+    }
+
+    /// F5 (pace): a stage that sends nothing, S3 holding every object of the
+    /// chat already (a run cut after its upload, before its manifest),
+    /// records no `rate`: neither its report nor its `transcript_stage` row
+    /// (a 0 would read as an uplink that stalled).
+    #[test]
+    fn a_stage_that_sent_nothing_records_no_rate() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let main = [cwd_line(&repo), line("turn 0", 300)].concat();
+        w.plant(&format!("{SID}.jsonl"), &main);
+        w.s3.put(&S3Key::Mac { session: SID.into(), sha256: sha(&main) }.render(), &main);
+        let unseal = || async { Ok(FakeMicrovmApi::new()) };
+        let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, MULTIPART_PART, &builder, unseal)).unwrap();
+        assert_eq!((report.outcome, report.rate), ("staged", None));
+        assert!(w.s3.requests().iter().all(|r| r.method != "PUT" && r.method != "POST"), "nothing sent: {:?}", w.s3.requests());
+        let rows = w.rows("transcript_stage");
+        assert!(rows.len() == 1 && rows[0]["detail"]["outcome"] == "staged" && rows[0]["detail"].get("rate").is_none(), "{rows:?}");
+    }
+
+    /// The rig's Mac (`common::remote`): its chat `sid` begun in its
+    /// workspace (`<HOME>/.claude/projects/<slug>/<sid>.jsonl`, three user
+    /// lines naming the work directory) and `subagents` subagent files: the
+    /// chat's bytes.
+    fn rig_chat(p: &common::Prepared, sid: &str, subagents: usize) -> Vec<u8> {
+        let cwd = p.work();
+        let lines: Vec<String> = (0..3).map(|i| serde_json::json!({"type": "user", "uuid": common::uuid(0xa110 + i), "sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": format!("turn {i}")}}).to_string()).collect();
+        let main = p.plant_transcript(sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+        for k in 0..subagents {
+            p.plant_project_file(&format!("{sid}/subagents/agent-{k}.jsonl"), &format!("{{\"type\":\"user\",\"isSidechain\":true,\"n\":{k}}}\n"));
+        }
+        std::fs::read(main).unwrap()
+    }
+
+    /// F5 (pace), end to end: `session stage` of a chat of three files whose
+    /// PutObjects S3 answers 1.2 s each (a slow uplink) warns once on stderr,
+    /// as soon as the stage falls below `MIN_RATE` (at the second file),
+    /// never again; its `transcript_stage` row records the upload's `rate`,
+    /// below the 1 MB/s. The stage itself completes (exit 0).
+    #[test]
+    fn a_stage_below_min_rate_warns_once_and_records_its_rate() {
+        let mut p = common::Harness::prepare();
+        let sid = common::uuid(0xa100);
+        rig_chat(&p, &sid, 2);
+        let rig = p.rig();
+        rig.s3().script_put(vec![S3Action::Delay(Duration::from_millis(1200)); 3]);
+        let o = rig.run(&["session", "stage", &sid], None);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{err}");
+        let warned: Vec<&str> = err.lines().filter(|l| l.contains("), below the 1000 kB/s ai-env's transfer budgets assume")).collect();
+        assert_eq!(warned.len(), 1, "once: {err}");
+        assert!(warned[0].starts_with(&format!("ai-env: warning: the upload of {sid} runs at ")) && warned[0].ends_with("; it goes on"), "{err}");
+        let audit = std::fs::read_to_string(Paths::from_root_and_env(rig.bridge(), None).audit()).unwrap();
+        let rows: Vec<serde_json::Value> = audit.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["event"] == "transcript_stage").collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let rate: u64 = rows[0]["detail"]["rate"].as_str().and_then(|r| r.parse().ok()).unwrap_or_else(|| panic!("a rate: {rows:?}"));
+        assert!(rate > 0 && rate < ai_env_cli::bridge::dataplane::MIN_RATE, "{rows:?}");
+        assert_eq!(rig.s3().requests().iter().filter(|r| r.method == "PUT").count(), 3, "three files, one PutObject each");
+    }
+
+    /// F3a: `session stage --warm` with `[vm] reuse_per_workspace = false`
+    /// is refused (exit 9) naming the switch, right after bridge.toml is
+    /// read: no Touch ID, no call of the fake API, no request to S3, the
+    /// chat where it was. Without `--warm` the chat stages as before (one
+    /// Touch ID).
+    #[test]
+    fn stage_warm_with_reuse_off_is_refused_before_any_touch_id() {
+        let mut p = common::Harness::prepare();
+        let sid = common::uuid(0xa200);
+        let bytes = rig_chat(&p, &sid, 0);
+        let main = p.mac_projects().join(p.slug()).join(format!("{sid}.jsonl"));
+        let rig = p.rig();
+        let config = rig.bridge().join("bridge.toml");
+        let mut toml = std::fs::read_to_string(&config).unwrap();
+        toml.push_str("\n[vm]\nreuse_per_workspace = false\n");
+        std::fs::write(&config, toml).unwrap();
+        let (decrypts, calls) = (rig.decrypts(), rig.fake_calls().len());
+        let o = rig.run(&["session", "stage", &sid, "--warm"], None);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(9), "{err}");
+        assert!(err.contains("[vm] reuse_per_workspace is off") && err.contains("set it to true in bridge.toml") && err.contains("nothing was staged or warmed"), "{err}");
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (decrypts, calls), "no Touch ID, no AWS call");
+        assert!(rig.s3().requests().is_empty(), "nothing sent to S3");
+        assert_eq!(std::fs::read(&main).unwrap(), bytes, "the chat where it was");
+        let o = rig.run(&["session", "stage", &sid], None);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(rig.decrypts() - decrypts, 1, "the stage's own Touch ID");
+    }
+
+    /// F1: `session forget A B C --purge` purges each session's objects
+    /// with one Touch ID for all (S9 asked one per session): A's and B's
+    /// objects (each with a manifest of this Mac's chat, its state and its
+    /// view) get delete markers, another session's stay; C (a row with no
+    /// trace of the store) needs no S3; every row goes, one line each.
+    #[test]
+    fn forget_purges_several_sessions_with_one_touch_id() {
+        let mut p = common::Harness::prepare();
+        let rig = p.rig();
+        let paths = Paths::from_root_and_env(rig.bridge(), None);
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab(rig.s3().addr()) };
+        let (a, b, c, other) = (common::uuid(0xa301), common::uuid(0xa302), common::uuid(0xa303), common::uuid(0xa304));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut keys = Vec::new();
+        for sid in [&a, &b] {
+            let key = S3Key::Mac { session: sid.clone(), sha256: sha(sid.as_bytes()) }.render();
+            rig.s3().put(&key, sid.as_bytes());
+            let mut m = Manifest::new(sid, &target, manifest::ORIGIN_MAC, &format!("{SLUG}/{sid}.jsonl"), "2026-10-01T00:00:00Z");
+            m.parts.push(manifest::ManifestPart { key: key.clone(), version_id: "fv1".into(), from: 0, len: 36, sha256: sha(sid.as_bytes()) });
+            m.committed = 36;
+            rt.block_on(async {
+                let _h = manifest::lock(&paths, sid).await.unwrap();
+                manifest::write(&paths, &m).unwrap();
+            });
+            keys.push(key);
+        }
+        let kept = S3Key::Base { session: other.clone(), gen: 1 }.render();
+        rig.s3().put(&kept, b"another session");
+        for sid in [&a, &b, &c] {
+            let row = ai_env_cli::bridge::registry::SessionRow { session_id: sid.clone(), mode: "remote".into(), status: "closed".into(), ..ai_env_cli::bridge::registry::SessionRow::default() };
+            ai_env_cli::bridge::registry::write(&paths, &row).unwrap();
+        }
+        let before = rig.decrypts();
+        let o = rig.run(&["session", "forget", &a, &b, &c, "--purge"], None);
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(rig.decrypts() - before, 1, "one Touch ID for both purges");
+        for key in &keys {
+            assert!(rig.s3().get(key).is_none() && rig.s3().objects().iter().any(|o| o.key == *key && o.delete_marker && o.current), "{key}");
+        }
+        assert_eq!(rig.s3().get(&kept).as_deref(), Some(&b"another session"[..]), "another session's stay");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with(&format!("forgot {a}")) && lines[0].ends_with("and purged its transcript"), "{out}");
+        assert!(lines[1].starts_with(&format!("forgot {b}")) && lines[1].ends_with("and purged its transcript"), "{out}");
+        assert!(lines[2].starts_with(&format!("forgot {c}")) && !lines[2].contains("purged"), "{out}");
+        for sid in [&a, &b, &c] {
+            assert!(ai_env_cli::bridge::registry::read(&paths, sid).unwrap().is_none() && !paths.transcript_dir(sid).exists(), "{sid}");
+        }
+    }
+}
+
+// ---- S10 (R1, plans/s10-contracts.md §1.4): the chain of tail keys ----
+
+mod tail_chain {
+    use super::*;
+    use ai_env_cli::bridge::s3::TAIL_CHAIN_MAX;
+    use std::time::{Duration, Instant};
+
+    fn tail_at(from: u64) -> String {
+        S3Key::Tail { session: SID.into(), gen: 1, offset: from }.render()
+    }
+
+    /// The tail URLs the VM in miniature was handed, in order: key and start.
+    fn handed(r: &Remote) -> Vec<(String, u64)> {
+        r.vm.st.lock().unwrap().tails.clone()
+    }
+
+    /// The shim's push of a tail at a hook: `[from, size)` stored at its key (`If-None-Match: *` held: never over one).
+    fn pushed(r: &Remote, from: u64, bytes: &[u8]) {
+        assert!(r.w.s3.get(&tail_at(from)).is_none(), "a tail's key is written once");
+        r.w.s3.put(&tail_at(from), bytes);
+    }
+
+    /// A move's drop of the chain (`SyncCtx::drop_chain`).
+    fn drop_chain(r: &Remote) -> Result<(), BridgeError> {
+        r.w.rt().block_on(r.ctx().drop_chain(SID))
+    }
+
+    /// R1: the sync hands the tail at the committed length; once `/suspend`
+    /// pushed it, the next hand (an unpark's `retail`, a turn's) lists the
+    /// session's tails once and hands the one where the chain ends, never
+    /// one S3 holds (a 412 that S9 met there); each tail handed is recorded
+    /// once in the manifest. A restore into a new VM pulls the parts, then
+    /// the chain from the committed length (a tail off it, past a gap, left
+    /// out); the commit that covers the chain supersedes every tail below
+    /// the new committed length, and the sync after it deletes them.
+    #[test]
+    fn the_next_tail_is_handed_where_the_chain_ends_and_a_restore_follows_it() {
+        let r = Remote::new();
+        r.vm.set(|s| s.file = Some(line("turn 0", 300)));
+        r.sync().unwrap();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(300), 300)), "the sync's, at the committed length");
+        let late = line("after the sync", 120);
+        pushed(&r, 300, &late);
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(420), 420)), "past the first link, not at it");
+        let later = line("after the unpark", 80);
+        pushed(&r, 420, &later);
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(500), 500)));
+        r.hand_fresh_tail();
+        let m = r.w.manifest().unwrap();
+        assert_eq!(m.tails.iter().map(|t| (t.key.as_str(), t.gen, t.from)).collect::<Vec<_>>(), [(tail_at(300).as_str(), 1, 300), (tail_at(420).as_str(), 1, 420), (tail_at(500).as_str(), 1, 500)], "each recorded once");
+        assert_eq!((m.committed, m.superseded.clone()), (300, vec![tail_at(0)]), "no commit since the first (S9's rule: the tail from 0)");
+        // A tail off the chain (past a gap) is no link of it.
+        r.w.s3.put(&tail_at(900), b"off the chain\n");
+        let synced = r.vm.file().unwrap();
+        r.vm.set(|s| s.file = None);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 3, bytes: 500 });
+        assert_eq!(r.vm.file().unwrap(), [synced, late.clone(), later.clone()].concat(), "the base, then the chain");
+        // The next turn's commit covers the chain: its tails are superseded, then deleted.
+        r.vm.set(|s| s.file.as_mut().unwrap().extend_from_slice(&line("turn 1", 100)));
+        let rep = r.sync().unwrap();
+        assert_eq!(rep.pushed.as_ref().map(|p| (p.kind, p.from, p.len)), Some(("segment", 300, 300)), "the chain's bytes and the turn's, as one segment");
+        let m = r.w.manifest().unwrap();
+        assert_eq!(m.superseded, [tail_at(300), tail_at(420), tail_at(500)]);
+        assert_eq!(m.tails.iter().map(|t| t.from).collect::<Vec<_>>(), [600], "the tail handed after the commit");
+        r.sync().unwrap();
+        assert!(r.w.manifest().unwrap().superseded.is_empty());
+        assert!(r.w.s3.get(&tail_at(300)).is_none() && r.w.s3.get(&tail_at(420)).is_none(), "deleted");
+        assert_eq!(r.w.s3.get(&tail_at(900)).as_deref(), Some(&b"off the chain\n"[..]), "past the committed length: left as it is");
+    }
+
+    /// R1: a restore follows at most `TAIL_CHAIN_MAX` links, and no tail is
+    /// handed past them (none would be restored), nor at an empty object
+    /// ending the chain (its key is S3's already); a listing that fails
+    /// hands the tail at the committed length, as S9 did.
+    #[test]
+    fn no_tail_past_the_longest_chain_and_the_committed_ones_when_s3_cannot_list() {
+        let r = Remote::new();
+        r.vm.set(|s| s.file = Some(line("turn 0", 300)));
+        r.sync().unwrap();
+        let max = TAIL_CHAIN_MAX as u64;
+        for i in 0..max {
+            pushed(&r, 300 + 10 * i, &[b'x'; 10]);
+        }
+        let before = handed(&r).len();
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).len(), before, "no tail past the longest chain");
+        r.vm.set(|s| s.file = None);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 1 + TAIL_CHAIN_MAX as u32, bytes: 300 + 10 * max });
+        // One link more: left out.
+        pushed(&r, 300 + 10 * max, b"past the chain\n");
+        r.vm.set(|s| s.file = None);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 1 + TAIL_CHAIN_MAX as u32, bytes: 300 + 10 * max });
+        // An empty object at the chain's end: no tail there.
+        let r = Remote::new();
+        r.vm.set(|s| s.file = Some(line("turn 0", 300)));
+        r.sync().unwrap();
+        pushed(&r, 300, b"");
+        let before = handed(&r).len();
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).len(), before, "S3 holds that key already");
+        // S3 cannot be listed: the tail at the committed length.
+        let r = Remote::new();
+        r.vm.set(|s| s.file = Some(line("turn 0", 300)));
+        r.sync().unwrap();
+        r.w.s3.script(vec![S3Action::Status { status: 500, code: "InternalError" }]);
+        let before = handed(&r).len();
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r)[before..], [(tail_at(300), 300)]);
+        assert_eq!(r.w.s3.requests().last().map(|q| (q.method.as_str(), q.status)), Some(("GET", 500)), "the listing that failed");
+    }
+
+    /// R1 for a chat closed before its first sync (no manifest: nothing to
+    /// record a tail in): the hands follow the chain from 0, the restore
+    /// pulls it whole, and once the first sync made a manifest, the next
+    /// hand finds the links no manifest recorded below the committed length
+    /// and supersedes them with S9's tail from 0; the sync after deletes both.
+    /// A session S3 holds nothing of that no row says S3 keeps (a chat begun
+    /// on this Mac goes up before its spawn) gets the tail from 0 with no
+    /// request to S3, as in S9.
+    #[test]
+    fn a_chat_closed_before_its_first_sync_restores_its_chain_and_then_supersedes_it() {
+        let unknown = Remote::new();
+        unknown.hand_fresh_tail();
+        assert_eq!((handed(&unknown), unknown.w.s3.requests().len()), (vec![(tail_at(0), 0)], 0), "no chain listed");
+        let r = Remote::new();
+        r.remote_row();
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r), [(tail_at(0), 0)]);
+        let first = line("before the first sync", 300);
+        pushed(&r, 0, &first);
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(300), 300)), "past the tail from 0");
+        assert!(r.w.manifest().is_none(), "no manifest to record it in");
+        let second = line("after the unpark", 100);
+        pushed(&r, 300, &second);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 2, bytes: 400 });
+        assert_eq!(r.vm.file().unwrap(), [first, second].concat(), "the chain from 0");
+        let rep = r.sync().unwrap();
+        assert_eq!(rep.pushed.as_ref().map(|p| (p.kind, p.len)), Some(("base", 400)));
+        assert_eq!(r.w.manifest().unwrap().superseded, [tail_at(0)], "S9's rule: the tail from 0");
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(400), 400)));
+        let m = r.w.manifest().unwrap();
+        assert_eq!(m.superseded, [tail_at(0), tail_at(300)], "the link no manifest recorded, below the committed length");
+        assert_eq!(m.tails.iter().map(|t| t.from).collect::<Vec<_>>(), [400]);
+        r.sync().unwrap();
+        assert!(r.w.s3.get(&tail_at(0)).is_none() && r.w.s3.get(&tail_at(300)).is_none(), "deleted");
+    }
+
+    /// R1 for a chat begun on this Mac (a gen-0 manifest, its tails handed
+    /// under generation 1): once its VM file is rewritten, the rebase is
+    /// generation 2, past the tails, so every generation 1 tail goes with
+    /// the old parts, the one at the new length too; the next tail is
+    /// generation 2's, at a key S3 holds nothing at (no 412 for the new
+    /// bytes), and a restore pulls the new base alone, never the old file's
+    /// tail spliced after it. So is the rebase after S3 refuses its first VM
+    /// segment (400 `BadDigest`: the bytes changed under the stat), which
+    /// the sync decides, not `plan_push`.
+    #[test]
+    fn a_mac_begun_chats_rebase_is_past_the_generation_of_its_tails() {
+        let r = Remote::new();
+        let chat = line("mac 0", 500);
+        r.w.plant(&format!("{SID}.jsonl"), &chat);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Staged { bytes: 500 });
+        assert_eq!(r.w.manifest().map(|m| (m.gen, m.committed)), Some((0, 500)));
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(500), 500)), "a gen-0 manifest's tails: generation 1's");
+        pushed(&r, 500, &line("old 0", 300));
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(800), 800)));
+        pushed(&r, 800, &line("old 1", 100));
+        // The VM's file rewritten (a compaction), 800 bytes: the old file's tail at 800 continues none of it.
+        let rewritten = line("compacted", 800);
+        r.vm.set(|s| s.file = Some(rewritten.clone()));
+        let rep = r.sync().unwrap();
+        let g2 = S3Key::Base { session: SID.into(), gen: 2 }.render();
+        assert_eq!(rep.pushed.as_ref().map(|p| (p.kind, p.key.clone())), Some(("base", g2)));
+        let m = r.w.manifest().unwrap();
+        assert_eq!((m.gen, m.committed), (2, 800));
+        assert!(m.superseded.contains(&tail_at(500)) && m.superseded.contains(&tail_at(800)), "{:?}", m.superseded);
+        let next = S3Key::Tail { session: SID.into(), gen: 2, offset: 800 }.render();
+        assert_eq!(handed(&r).last(), Some(&(next.clone(), 800)), "generation 2's tail");
+        assert_eq!(m.tails.iter().map(|t| t.key.as_str()).collect::<Vec<_>>(), [next.as_str()]);
+        r.vm.set(|s| s.file = None);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 1, bytes: 800 });
+        assert_eq!(r.vm.file().unwrap(), rewritten, "the new base alone");
+        // S3 refuses the first VM segment (400 `BadDigest`): the sync's own rebase is generation 2 as well.
+        let r = Remote::new();
+        r.w.plant(&format!("{SID}.jsonl"), &chat);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Staged { bytes: 500 });
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(500), 500)));
+        r.vm.set(|s| s.file.as_mut().unwrap().extend_from_slice(&line("vm 0", 300)));
+        assert!(r.w.manifest().unwrap().superseded.is_empty(), "the segment's PUT is the sync's first request to S3");
+        r.w.s3.script(vec![S3Action::Status { status: 400, code: "BadDigest" }]);
+        let rep = r.sync().unwrap();
+        assert!(r.w.rows("transcript_push").iter().any(|row| row["detail"]["kind"] == "segment" && row["detail"]["s3_status"] == "400"), "the refused segment");
+        let g2 = S3Key::Base { session: SID.into(), gen: 2 }.render();
+        assert_eq!(rep.pushed.as_ref().map(|p| (p.kind, p.key.clone())), Some(("base", g2)));
+        let m = r.w.manifest().unwrap();
+        assert_eq!((m.gen, m.committed), (2, 800));
+        assert!(m.superseded.contains(&tail_at(500)), "{:?}", m.superseded);
+        let next = S3Key::Tail { session: SID.into(), gen: 2, offset: 800 }.render();
+        assert_eq!(handed(&r).last(), Some(&(next, 800)), "generation 2's tail");
+    }
+
+    /// R1 and a move that restarts the transcript (a fresh chat's `Fresh`
+    /// cut: a new file on the new VM, nothing restored): `drop_chain`
+    /// deletes the chain S3 holds from the committed length at once, and its
+    /// records, so the new VM's first tail starts there again and, with no
+    /// manifest, a restore follows the new file alone, never the old file's
+    /// bytes before it (with one, the committed parts still come first: no
+    /// move restarts the file of such a chat); a tail below the committed
+    /// length is left for the sync to supersede. A delete S3 refuses is the
+    /// error, that tail's record kept; the others are deleted all the same.
+    #[test]
+    fn a_dropped_chain_is_gone_and_the_next_tail_starts_over() {
+        // A chat closed before its first sync (no manifest): the lost VM's chain from 0.
+        let r = Remote::new();
+        r.remote_row();
+        r.hand_fresh_tail();
+        pushed(&r, 0, &line("the lost VM's first turn", 300));
+        r.hand_fresh_tail();
+        pushed(&r, 300, &line("its /terminate", 100));
+        drop_chain(&r).unwrap();
+        assert!(r.w.s3.get(&tail_at(0)).is_none() && r.w.s3.get(&tail_at(300)).is_none(), "deleted at once");
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(0), 0)), "the new file's first tail");
+        let new = line("the new VM's file", 200);
+        pushed(&r, 0, &new);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 1, bytes: 200 });
+        assert_eq!(r.vm.file().unwrap(), new, "the new file alone");
+        // With a manifest: the chain from the committed length goes, its records too (one S3 never got among
+        // them); a tail below it stays. A delete S3 refuses is the error, that tail's record kept; the others go.
+        let r = Remote::new();
+        r.vm.set(|s| s.file = Some(line("turn 0", 300)));
+        r.sync().unwrap();
+        pushed(&r, 300, &line("late", 100));
+        r.hand_fresh_tail();
+        pushed(&r, 400, &line("later", 100));
+        r.hand_fresh_tail();
+        pushed(&r, 100, b"below the committed length\n");
+        let recorded = || r.w.manifest().unwrap().tails.iter().map(|t| t.from).collect::<Vec<_>>();
+        assert_eq!(recorded(), [300, 400, 500]);
+        r.w.s3.script(vec![S3Action::Delay(Duration::ZERO), S3Action::Status { status: 403, code: "AccessDenied" }]);
+        assert!(drop_chain(&r).is_err(), "the refused delete");
+        assert_eq!(recorded(), [300], "the record of the tail S3 still holds");
+        assert!(r.w.s3.get(&tail_at(300)).is_some() && r.w.s3.get(&tail_at(400)).is_none());
+        drop_chain(&r).unwrap();
+        assert!(recorded().is_empty());
+        assert!(r.w.s3.get(&tail_at(300)).is_none(), "deleted at once");
+        assert_eq!(r.w.s3.get(&tail_at(100)).as_deref(), Some(&b"below the committed length\n"[..]), "the sync's to supersede");
+        r.hand_fresh_tail();
+        assert_eq!(handed(&r).last(), Some(&(tail_at(300), 300)), "at the committed length again");
+    }
+
+    /// R1's hand before a turn's fetch is bounded, where S9's made no
+    /// request to S3 and took no lock: a manifest lock held elsewhere leaves
+    /// the tail handed, unrecorded, after a moment (never the lock's 120 s);
+    /// a listing S3 does not answer hands the tail at the committed length,
+    /// as S9 did, once `TAIL_LIST_WAIT` (10 s) passed (never the client's
+    /// 120 s).
+    #[test]
+    fn the_hand_before_a_turn_waits_neither_for_a_held_lock_nor_for_a_silent_listing() {
+        let r = Remote::new();
+        r.vm.set(|s| s.file = Some(line("turn 0", 300)));
+        r.sync().unwrap();
+        pushed(&r, 300, &line("late", 100));
+        let held = r.w.rt().block_on(manifest::lock(&r.w.paths, SID)).unwrap();
+        let t0 = Instant::now();
+        r.hand_fresh_tail();
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        assert_eq!(handed(&r).last(), Some(&(tail_at(400), 400)), "handed");
+        assert_eq!(r.w.manifest().unwrap().tails.iter().map(|t| t.from).collect::<Vec<_>>(), [300], "not recorded");
+        drop(held);
+        r.w.s3.script(vec![S3Action::Silent]);
+        let t0 = Instant::now();
+        r.hand_fresh_tail();
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_secs(10) && took < Duration::from_secs(30), "{took:?}");
+        assert_eq!(handed(&r).last(), Some(&(tail_at(300), 300)), "the tail at the committed length");
+        assert_eq!(r.w.s3.requests().last().map(|q| q.method.clone()), Some("GET".to_string()), "the listing S3 never answered");
+    }
+}
+
+// ---- S10 I2 (the lead): no sync before a VM's end rolls S3 back ----------------------------------
+
+/// The general guard of `s3::commands::sync_before_terminate` (S10 I2, C3's
+/// finding), end to end through the remote rig: a chat whose copy on the VM
+/// that ends is behind S3 (it moved to another VM, which committed more) is
+/// never synced from it.
+mod moved_chats {
+    use super::common::remote::{toml_table, Req};
+    use super::common::{is_init, is_response_to, is_result_for, Harness, Link};
+    use ai_env_cli::bridge::config::Paths;
+    use ai_env_cli::bridge::registry;
+    use ai_env_cli::bridge::s3::manifest;
+    use ai_env_cli::wire::s3::S3Key;
+    use ai_env_cli::wire::workspace::APP_PORT;
+    use std::time::Duration;
+
+    /// Upper bound for a step of a session.
+    const T: Duration = Duration::from_secs(30);
+
+    /// A chat's turn on a first VM is synced (the manifest's committer that
+    /// VM), and the chat closes; the VM keeps running (no closing suspend).
+    /// The chat goes on on a second VM, whose copy holds the first's and a
+    /// line more, and a sync there commits it (`session sync`: the committer
+    /// now the second VM). The chat's row then names the first VM again, as
+    /// a wrapper that died before writing its row after a move leaves it,
+    /// and `vm terminate` ends the first VM. Its sync before the end leaves
+    /// the chat alone: nothing pushed from the first VM, no warning, and
+    /// S3's manifest as the second VM left it. Without the guard the first
+    /// VM's shorter copy would go up as a new base (`shrank`), its line lost
+    /// from what a reopen restores.
+    #[test]
+    fn terminate_never_syncs_a_chat_another_vm_committed_since() {
+        let mut p = Harness::prepare();
+        p.rig().config(|doc| {
+            toml_table(doc, "vm").insert("suspend_on_close".into(), toml::Value::Boolean(false));
+        });
+        let mut h = p.spawn_on(Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
+        let init = h.send_initialize();
+        h.expect_out(|v| is_response_to(v, &init), T);
+        let sid = h.expect_out(is_init, T)["session_id"].as_str().expect("the session id").to_string();
+        let u = h.send_user("hello");
+        h.expect_out(|v| is_result_for(v, &u), T);
+        h.wait_until("the turn's transcript synced to S3 and its view written", T, |h| {
+            h.audit_events("transcript_view").iter().any(|r| r["detail"]["session"] == sid.as_str() && r["detail"]["outcome"] == "written")
+        });
+        h.close_stdin();
+        let (status, _) = h.wait(T);
+        assert_eq!(status.code(), Some(0), "{}", h.transcript());
+        let rig = h.rig();
+        let paths = Paths::from_root_and_env(rig.bridge(), None);
+        let vm1 = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the first VM").to_string();
+        let rel = format!("{}/{sid}.jsonl", h.slug());
+        let first = std::fs::read(rig.vm_projects_of(&vm1).join(&rel)).expect("the first VM's copy");
+        let synced = manifest::read(&paths, &sid).unwrap().expect("the turn's manifest");
+        assert_eq!(synced.vm.as_deref(), Some(vm1.as_str()), "{synced:?}");
+        // The chat goes on on a second VM (a shim and a disk of its own), whose copy holds a line more, committed there.
+        let vm2 = rig.start_new_vm();
+        // Its `/health` read (as a session's P2 reads it) records its caps in its row: the transcript store's among them.
+        let o = rig.run(&["vm", "health", &vm2], None);
+        assert!(o.status.success(), "vm health of the second VM: {}", String::from_utf8_lossy(&o.stderr));
+        let token = rig.mint(&vm2, APP_PORT);
+        assert_eq!(rig.send(&vm2, &Req::get("/health", APP_PORT, &token)).status, 200, "the second VM runs");
+        let later = format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"a turn on the second VM"}}}}"#, super::common::uuid(0x5e55_0901));
+        let second = [first.clone(), later.into_bytes(), b"\n".to_vec()].concat();
+        let copy = rig.vm_projects_of(&vm2).join(&rel);
+        std::fs::create_dir_all(copy.parent().expect("the project directory")).expect("the second VM's project directory");
+        std::fs::write(&copy, &second).expect("the second VM's copy");
+        let mut row = registry::read(&paths, &sid).unwrap().expect("the chat's row");
+        row.microvm_id = Some(vm2.clone());
+        registry::write(&paths, &row).unwrap();
+        let o = rig.run(&["session", "sync", &sid, "--json"], None);
+        assert!(o.status.success(), "session sync on the second VM: {}", String::from_utf8_lossy(&o.stderr));
+        let moved = manifest::read(&paths, &sid).unwrap().expect("the manifest");
+        assert_eq!((moved.committed, moved.vm.as_deref()), (second.len() as u64, Some(vm2.as_str())), "the second VM committed its copy: {moved:?}");
+        // The row names the first VM again, as a wrapper that died after the move, before writing its row, leaves it.
+        row.microvm_id = Some(vm1.clone());
+        registry::write(&paths, &row).unwrap();
+        let pushes = h.audit_events("transcript_push").len();
+        let o = rig.run(&["vm", "terminate", &vm1, "--yes"], None);
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "vm terminate: {stderr}");
+        assert!(rig.fake().vms.get(&vm1).is_some_and(|v| v.state.is_terminal()), "the first VM ended");
+        assert!(!stderr.contains("not synced"), "the chat is left alone, not failed: {stderr}");
+        assert_eq!(h.audit_events("transcript_push").len(), pushes, "nothing pushed from the first VM: {:?}", h.audit_events("transcript_push"));
+        assert_eq!(manifest::read(&paths, &sid).unwrap().expect("the manifest"), moved, "S3's manifest as the second VM left it");
+        assert!(rig.s3().get(&S3Key::Base { session: sid.clone(), gen: moved.gen + 1 }.render()).is_none(), "no new base from the first VM's shorter copy");
+    }
 }

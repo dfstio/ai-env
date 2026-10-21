@@ -28,7 +28,9 @@
 //!
 //! The ops (D7: a manifest line and a shallow pack each way, never a bundle):
 //! * `seed-state`: the workspace as D3 decides on it (`SeedState`), given the
-//!   shim's record of the last seed (`--record`);
+//!   shim's record of the last seed (`--record`); from S10 with the ids its
+//!   `.git/shallow` lists (at most `SHALLOW_REPORT_MAX`, else none), and so
+//!   in the payload form ([`answer_payload`]: 4096 ids pass a head line);
 //! * `seed-apply`: stdin is the `PUT /seed` body, a `SeedManifest` line then
 //!   the pack, staged under the agent's `HOME/.cache/ai-env/inbox` first.
 //!   `clone`: `git init` (no template, the branch, the object format), the
@@ -83,6 +85,7 @@ use crate::wire::workspace::{
     WIP_REF_PREFIX,
 };
 use crate::wire::workspace::{GitCgiReply, JsonPayloadReply, TranscriptWriteReply, JSON_PAYLOAD_MAX};
+use crate::wire::workspace::SHALLOW_REPORT_MAX;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -338,7 +341,8 @@ fn dispatch(ctx: &Ctx, op: &ShimIoOp, input: &mut dyn BufRead, out: &mut dyn Wri
     match op {
         ShimIoOp::SeedState { path, record } => {
             let record = parse_record(record.as_deref())?;
-            answer(out, ctx.seed_state(path, record.as_ref()))
+            // S10: in the payload form: its `.git/shallow` (up to SHALLOW_REPORT_MAX ids) can pass a head line.
+            answer_payload(out, ctx.seed_state(path, record.as_ref()))
         }
         ShimIoOp::SeedApply { path, mode, branch, detached, expect, len, record } => {
             let mode = match mode.as_str() {
@@ -394,7 +398,8 @@ fn answer<T: Serialize>(out: &mut dyn Write, step: Step<T>) -> Result<()> {
 }
 
 /// [`answer`] for an op whose reply can pass `HEAD_LINE_MAX` (S9: the view,
-/// a subtree stat): the head is a [`JsonPayloadReply`] (the reply's compact
+/// a subtree stat; S10: the seed's state, with its shallow list): the head
+/// is a [`JsonPayloadReply`] (the reply's compact
 /// JSON's sha256) with its `len`, then exactly those bytes, at most
 /// [`JSON_PAYLOAD_MAX`] (more is the helper's exit 1); a refusal is an
 /// ordinary refusal head.
@@ -1250,6 +1255,26 @@ fn format_of(id: &str) -> Option<ObjectFormat> {
     ObjectFormat::of_id(id)
 }
 
+/// `.git/shallow` as `GET /seed` reports it (S10, `SeedState.shallow`):
+/// its ids sorted, each once, when they are at most [`SHALLOW_REPORT_MAX`]
+/// and every line is an id of `format`; `None` past the cap, for a line
+/// that is not, or without the file (a seed always writes one): the Mac
+/// then takes its row's list.
+fn shallow_report(bytes: Option<&[u8]>, format: ObjectFormat) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(bytes?).ok()?;
+    let mut ids = BTreeSet::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !format.is_id(line) {
+            return None;
+        }
+        ids.insert(line.to_string());
+        if ids.len() > SHALLOW_REPORT_MAX {
+            return None;
+        }
+    }
+    Some(ids.into_iter().collect())
+}
+
 // ---- the seed ------------------------------------------------------------------------------
 
 /// What a code-out answers: the manifest, and the staged pack with its size
@@ -1273,7 +1298,9 @@ impl Ctx {
         let repo = Repo { ctx: self, dir: walked.path, budget: budget::SEED_STATE };
         let facts = repo.facts()?;
         let pristine = facts.tip.as_deref() == Some(record.head.as_str()) && facts.branch == record.branch && repo.unchanged_since(record)?;
-        Ok(SeedState { record: Some(record.clone()), tip: facts.tip, branch: facts.branch, clean: facts.clean, pristine })
+        // S10: the VM's own shallow boundary (the Mac's prefers it); one it cannot read is none.
+        let shallow = repo.read_shallow().ok().and_then(|(_, bytes)| shallow_report(bytes.as_deref(), record.object_format));
+        Ok(SeedState { record: Some(record.clone()), tip: facts.tip, branch: facts.branch, clean: facts.clean, pristine, shallow })
     }
 
     /// `PUT /seed`'s work (module doc): the reply and the workspace's state after it.
@@ -1377,7 +1404,7 @@ impl Ctx {
         };
         let repo = Repo { ctx: self, dir: walked.path, budget: q.mode.budget() };
         let facts = repo.facts()?;
-        let state = |pristine: bool| SeedState { record: Some(record.clone()), tip: facts.tip.clone(), branch: facts.branch.clone(), clean: facts.clean, pristine };
+        let state = |pristine: bool| SeedState { record: Some(record.clone()), tip: facts.tip.clone(), branch: facts.branch.clone(), clean: facts.clean, pristine, shallow: None };
         let Some(tip) = facts.tip.clone() else {
             return Err(Stop::refused(WsRefusal::new(refusal::CHANGED, "the VM's checkout has no commit any more").with_state(state(false))));
         };
@@ -1631,7 +1658,7 @@ impl Ctx {
             at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()),
         };
         let clean = record.wip_tree.is_none() && record.index_tree.is_none() && repo.clean()?;
-        let state = SeedState { record: Some(record), tip: Some(m.head.clone()), branch: q.branch.clone(), clean, pristine: true };
+        let state = SeedState { record: Some(record), tip: Some(m.head.clone()), branch: q.branch.clone(), clean, pristine: true, shallow: None };
         let reply = SeedReply { outcome, head: m.head.clone(), branch: q.branch.clone(), wip: m.wip.clone(), index: m.index.clone(), ms: self.ms() };
         Ok((reply, state))
     }
@@ -3560,6 +3587,47 @@ mod tests {
         assert!(record.wip_tree.is_none() && record.index_tree.is_none());
         let st = w.ctx.seed_state(WS, Some(&record)).unwrap();
         assert!(st.clean && st.pristine && st.branch.is_none(), "{st:?}");
+        // S10: the VM's own shallow boundary, the seeded head.
+        assert_eq!(st.shallow, Some(vec![m.head.clone()]));
+    }
+
+    /// S10: `.git/shallow` as `GET /seed` reports it: sorted, once each, at
+    /// most `SHALLOW_REPORT_MAX` ids of the repository's format; past the
+    /// cap, with a line that is no such id, or without the file, none.
+    #[test]
+    fn the_shallow_report_is_capped_and_strict() {
+        let id = |n: usize| format!("{n:040x}");
+        let text = format!("{}\n{}\n\n{}\n", id(2), id(1), id(2));
+        assert_eq!(shallow_report(Some(text.as_bytes()), ObjectFormat::Sha1), Some(vec![id(1), id(2)]));
+        let full: String = (0..SHALLOW_REPORT_MAX).map(|n| format!("{}\n", id(n))).collect();
+        assert_eq!(shallow_report(Some(full.as_bytes()), ObjectFormat::Sha1).map(|v| v.len()), Some(SHALLOW_REPORT_MAX), "the cap itself");
+        let over = format!("{full}{}\n", id(SHALLOW_REPORT_MAX));
+        assert_eq!(shallow_report(Some(over.as_bytes()), ObjectFormat::Sha1), None, "past the cap");
+        assert_eq!(shallow_report(Some(b"not-an-id\n"), ObjectFormat::Sha1), None);
+        assert_eq!(shallow_report(Some(id(1).as_bytes()), ObjectFormat::Sha256), None, "another format's id");
+        assert_eq!(shallow_report(Some(b"\xff\n"), ObjectFormat::Sha1), None, "not UTF-8");
+        assert_eq!(shallow_report(Some(b""), ObjectFormat::Sha1), Some(vec![]), "an empty file lists nothing");
+        assert_eq!(shallow_report(None, ObjectFormat::Sha1), None, "no file");
+    }
+
+    /// S10: `seed-state` answers in the payload form (4096 shallow ids pass
+    /// a head line): a `JsonPayloadReply` head naming the length and the
+    /// sha256 of the `SeedState` that follows, its `shallow` the seeded head.
+    #[test]
+    fn seed_state_answers_in_the_payload_form() {
+        let w = World::new();
+        let (m, body) = clone_body(&w.mac(), Some("main"));
+        let (_, state) = apply(&w, &query(SeedMode::Clone, Some("main"), None), &body, None).unwrap();
+        let record = serde_json::to_string(&state.record.expect("a record")).unwrap();
+        let mut out = Vec::new();
+        dispatch(&w.ctx, &ShimIoOp::SeedState { path: WS.into(), record: Some(record) }, &mut Cursor::new(Vec::new()), &mut out).unwrap();
+        let end = out.iter().position(|b| *b == b'\n').expect("a head line");
+        let head: HelperHead<JsonPayloadReply> = crate::wire::workspace::parse_head(&out[..end]).unwrap();
+        let (sums, len) = head.outcome().expect("a reply").expect("no refusal");
+        let payload = &out[end + 1..];
+        assert_eq!((len, sums.sha256), (Some(payload.len() as u64), hex::encode(Sha256::digest(payload))));
+        let st: SeedState = serde_json::from_slice(payload).unwrap();
+        assert!(st.pristine && st.shallow == Some(vec![m.head.clone()]), "{st:?}");
     }
 
     /// A bad pack, refs the pack lacks, a manifest that does not parse or does

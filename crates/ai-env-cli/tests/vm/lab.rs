@@ -858,7 +858,7 @@ fn probe_rows_of_the_old_schema_parse_in_lab_list() {
     let list: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     let entry = list.as_array().unwrap().iter().find(|r| r["probe"] == "entrypoint").unwrap();
     assert_eq!(entry["last_verdict"], "claude-vscode");
-    assert_eq!(list.as_array().unwrap().len(), 32, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4, S9 2");
+    assert_eq!(list.as_array().unwrap().len(), 33, "S1/S3 3, S4 9, S5 2, S6 7, S7 5, S8 4, S9 2, S10 1");
 }
 
 #[test]

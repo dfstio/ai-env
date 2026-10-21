@@ -62,6 +62,14 @@ pub enum BridgeError {
     ShimUnavailable(String),
     /// `ResourceNotFound` for a MicroVM id: it is gone (or never was).
     VmNotFound(String),
+    /// S10: the shim no longer holds the session's spawn (`hello_ok` resumed
+    /// it as unknown once it had gone out): it ended, or its detach grace ran
+    /// out while no socket carried it. The message names the spawn and the VM.
+    SpawnGone(String),
+    /// S10: the VM stayed suspended past `[transport].suspend_wait_s` after
+    /// `event hook_suspend` (`vm exec`, `vm attach`, a wrapper session that
+    /// does not park): the message names `ai-env vm resume` and `ai-env vm attach`.
+    StayedSuspended(String),
     // exit 9
     Tripwire(String),
     SettingsWidening(String),
@@ -127,6 +135,57 @@ impl BridgeError {
     pub fn egress_mismatch(id: &str, expected: Vec<String>, echoed: Vec<String>, terminated: bool) -> BridgeError {
         BridgeError::EgressMismatch(Box::new(EgressMismatch { id: id.to_string(), expected, echoed, terminated }))
     }
+
+    /// The exit code of this error's class, without taking it (S10:
+    /// `remote::link::LinkLoss::of` reads a lost link's error by reference).
+    /// `From<BridgeError> for CliError` (below) keeps its own match with the
+    /// same classes: a new variant goes in the same class in both.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            BridgeError::Sdk { .. }
+            | BridgeError::Quota(_)
+            | BridgeError::Validation(_)
+            | BridgeError::Http { .. }
+            | BridgeError::Conflict(_)
+            | BridgeError::Throttled(_)
+            | BridgeError::AccessDenied(_)
+            | BridgeError::TokenRejected { .. }
+            | BridgeError::Endpoint(_)
+            | BridgeError::Ambiguous { .. }
+            | BridgeError::EndpointThrottled { .. }
+            | BridgeError::NoAgent(_)
+            | BridgeError::NoCapability { .. }
+            | BridgeError::S3 { .. } => 7,
+            BridgeError::CredentialsUnavailable(_) | BridgeError::CredentialMissing(_) => 5,
+            BridgeError::Cancelled => 3,
+            BridgeError::Transport(_)
+            | BridgeError::Terminated(_)
+            | BridgeError::Gap { .. }
+            | BridgeError::Protocol(_)
+            | BridgeError::VmNotFound(_)
+            | BridgeError::HelloRefused { .. }
+            | BridgeError::Superseded(_)
+            | BridgeError::ShimUnavailable(_)
+            | BridgeError::SpawnGone(_)
+            | BridgeError::StayedSuspended(_) => 8,
+            BridgeError::Tripwire(_)
+            | BridgeError::SettingsWidening(_)
+            | BridgeError::EgressRequired
+            | BridgeError::EgressMismatch(_)
+            | BridgeError::OutsideRoots(_)
+            | BridgeError::PayloadTooLarge(_)
+            | BridgeError::MaxConcurrent(_)
+            | BridgeError::Policy(_)
+            | BridgeError::WorkspaceRefused { .. }
+            | BridgeError::TranscriptTooLarge { .. }
+            | BridgeError::TranscriptPullTooLarge { .. } => 9,
+            BridgeError::Config(_) | BridgeError::Busy(_) | BridgeError::SpawnRefused { .. } | BridgeError::WorkspaceFailed { .. } => 1,
+            BridgeError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe => 0,
+            BridgeError::Io(_) => 1,
+            BridgeError::Cli(e) => e.exit_code(),
+        }
+    }
 }
 
 impl fmt::Display for BridgeError {
@@ -188,6 +247,7 @@ impl fmt::Display for BridgeError {
             BridgeError::Superseded(m) => write!(f, "superseded: another client attached {m}"),
             BridgeError::ShimUnavailable(m) => write!(f, "the shim does not answer: {m}"),
             BridgeError::VmNotFound(m) => write!(f, "microvm not found: {m}"),
+            BridgeError::SpawnGone(m) | BridgeError::StayedSuspended(m) => f.write_str(m),
             BridgeError::Tripwire(m) => write!(f, "tripwire: {m}"),
             BridgeError::SettingsWidening(m) => write!(f, "repo settings widen permissions: {m}"),
             // At most 160 characters, so the remote wrapper's P0 line (`remote::Failure::Refused`) keeps the fix whole.
@@ -262,7 +322,9 @@ impl From<BridgeError> for CliError {
             | BridgeError::VmNotFound(_)
             | BridgeError::HelloRefused { .. }
             | BridgeError::Superseded(_)
-            | BridgeError::ShimUnavailable(_) => CliError::VmLost(text),
+            | BridgeError::ShimUnavailable(_)
+            | BridgeError::SpawnGone(_)
+            | BridgeError::StayedSuspended(_) => CliError::VmLost(text),
             BridgeError::Tripwire(_)
             | BridgeError::SettingsWidening(_)
             | BridgeError::EgressRequired
@@ -453,12 +515,28 @@ mod tests {
             (BridgeError::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1 << 30 }, 9),
             (not_built("box review", "S9 wave 1: G3"), 1),
             (BridgeError::NoCapability { cap: crate::wire::frame::CAP_GIT_HTTP_V1, message: "microvm-1 names no git_http_v1 in its caps".into() }, 7),
+            // S10: a spawn the shim no longer holds, a VM that stayed suspended; a broken pipe is S2's success.
+            (BridgeError::SpawnGone("spawn s is not on microvm-1 (it ended, or its detach grace ran out while disconnected)".into()), 8),
+            (BridgeError::StayedSuspended("microvm-1 stayed suspended for 5 s".into()), 8),
+            (BridgeError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe")), 0),
         ];
         for (e, code) in cases {
             let text = e.to_string();
+            assert_eq!(e.exit_code(), code, "by reference: {text}");
             let c: CliError = e.into();
             assert_eq!(c.exit_code(), code, "{text}");
         }
+    }
+
+    /// S10 (§2.6): the two exit-8 errors that were `Transport` show their
+    /// message alone, S9's text, and nothing matches on it.
+    #[test]
+    fn the_s10_errors_show_their_message() {
+        let gone = BridgeError::SpawnGone("spawn s1 is not on microvm-1 (it ended, or its detach grace ran out while disconnected)".into());
+        assert_eq!(gone.to_string(), "spawn s1 is not on microvm-1 (it ended, or its detach grace ran out while disconnected)");
+        let stayed = BridgeError::StayedSuspended("microvm-1 stayed suspended for 5 s: resume it with `ai-env vm resume microvm-1`".into());
+        assert!(stayed.to_string().starts_with("microvm-1 stayed suspended"), "{stayed}");
+        assert_eq!((CliError::from(gone).exit_code(), CliError::from(stayed).exit_code()), (8, 8));
     }
 
     #[test]

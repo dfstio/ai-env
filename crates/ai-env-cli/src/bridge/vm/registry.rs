@@ -158,8 +158,16 @@ pub struct VmRow {
     /// S6.
     pub spawns: Vec<toml::Value>,
     pub terminated_at: Option<u64>,
-    /// `operator` | `gc-expired` | `gc-orphan` | `smoke` | `test` | `probe` | `timeout` | `platform` | `policy` (the S5 egress gate).
+    /// `operator` | `gc-expired` | `gc-orphan` | `smoke` | `test` | `probe` | `timeout` | `platform` | `policy` (the S5 egress gate);
+    /// S10: `readdress` (a lost VM a move left) | `migrate` (the VM a migration moved its chat off).
     pub terminated_by: Option<String>,
+    /// S10 §B: the VM a migration moved this VM's chat to (written after the
+    /// new generation's `Started`): `reuse_candidate` takes no such row.
+    pub leaving_for: Option<String>,
+    /// S10: when `leaving_for` was written (unix seconds).
+    pub leaving_since: Option<u64>,
+    /// S10: the guest's `MemTotal` its `/health` named, in MiB.
+    pub mem_total_mib: Option<u32>,
 }
 
 impl std::fmt::Debug for VmRow {

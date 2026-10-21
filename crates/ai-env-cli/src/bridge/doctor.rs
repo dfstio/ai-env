@@ -984,6 +984,24 @@ fn quota_args() -> [&'static str; 10] {
     ["service-quotas", "get-service-quota", "--service-code", "lambda", "--quota-code", MICROVM_MEMORY_QUOTA_CODE, "--region", REGION, "--output", "json"]
 }
 
+/// What `[vm].memory_mib`, the baseline, is to the platform (S10 F8, AWS's
+/// Lambda pricing page): the image's `minimumMemoryInMiB`, billed per second
+/// while a VM runs; a VM bursts to 4× it (the guest's `MemTotal` shows that
+/// ceiling), the extra billed only while used. Whether the memory quota
+/// counts bursts is part B's to read.
+const MEMORY_BASELINE: &str = "the image's minimum; bursts to 4×, billed while used";
+
+/// The guest's memory as the VM rows show it (S10 F8): the newest row (by
+/// `created`, any status: the figure is the platform's and the image's, as
+/// caps are) whose `/health` named the guest's `MemTotal`, as
+/// `the guest's MemTotal <n> MiB on <id>, image <version>`; `None` before
+/// any VM named one.
+fn guest_memory(vms: &[VmRow]) -> Option<String> {
+    let row = vms.iter().filter(|r| !r.id.is_empty() && r.mem_total_mib.is_some()).max_by(|a, b| a.created.cmp(&b.created))?;
+    let image = if row.image_version.is_empty() { String::new() } else { format!(", image {}", row.image_version) };
+    Some(format!("the guest's MemTotal {} MiB on {}{image}", row.mem_total_mib?, row.id))
+}
+
 /// `mib` as gigabytes for a row (`6`, `1.5`).
 fn gib(mib: u64) -> String {
     if mib.is_multiple_of(1024) {
@@ -994,7 +1012,8 @@ fn gib(mib: u64) -> String {
 }
 
 /// The MicroVM memory quota against what `[vm]` may run at once
-/// (`max_concurrent × memory_mib`). `q` is the output of [`quota_args`]:
+/// (`max_concurrent × memory_mib`, a sum of baselines: S10 F8,
+/// `MEMORY_BASELINE`). `q` is the output of [`quota_args`]:
 /// `None` when not run (no operator identity, `[-  ]`); `Some(Err)` when the call
 /// failed (`[!! ]` with the reason: no verdict); otherwise the quota's
 /// `Quota.Value` in Gigabytes: `[ok ]` when `value × 1024 ≥ max_concurrent ×
@@ -1013,7 +1032,7 @@ pub fn row_microvm_quota(q: Option<Result<&str, &str>>, max_concurrent: u32, mem
         return DoctorLine::row(Tag::Warn, format!("{name} not checked: no Quota.Value in the get-service-quota output"));
     };
     let need_mib = u64::from(max_concurrent) * u64::from(memory_mib);
-    let need = format!("[vm] max_concurrent {max_concurrent} × {memory_mib} MiB = {} GB", gib(need_mib));
+    let need = format!("[vm] max_concurrent {max_concurrent} × {memory_mib} MiB baseline = {} GB", gib(need_mib));
     if gb * 1024.0 >= need_mib as f64 {
         DoctorLine::row(Tag::Ok, format!("{name} {gb} GB in {REGION} covers {need}"))
     } else {
@@ -1026,9 +1045,11 @@ pub fn row_microvm_quota(q: Option<Result<&str, &str>>, max_concurrent: u32, mem
 /// commands refuse to start; the wrapper is unaffected). The suspended
 /// duration shown is the one sent, `min([vm].suspended_s, max duration)`
 /// (plan D8); a larger configured value is named as capped (it applies to a
-/// run with a longer `--max-duration`).
+/// run with a longer `--max-duration`). The memory is the image's minimum,
+/// the baseline (S10 F8, `MEMORY_BASELINE`), with the guest's `MemTotal`
+/// beside it once a VM's `/health` recorded one (`guest_memory` of `vms`).
 #[must_use]
-pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
+pub fn row_vm_config(vm: &VmCfg, vms: &[VmRow]) -> DoctorLine {
     match vm.validate() {
         Ok(()) => {
             let suspended = vm.suspended_s.unwrap_or(vm.max_duration_s).min(vm.max_duration_s);
@@ -1037,9 +1058,10 @@ pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
                 Some(s) if s > vm.max_duration_s => format!(" ([vm].suspended_s {s} capped at the max duration)"),
                 Some(_) => String::new(),
             };
+            let guest = guest_memory(vms).map(|g| format!("; {g}")).unwrap_or_default();
             DoctorLine::row(
                 Tag::Ok,
-                format!("[vm] max_concurrent {}, memory {} MiB, max duration {} s, idle {} s, suspended {suspended} s{note}", vm.max_concurrent, vm.memory_mib, vm.max_duration_s, vm.max_idle_s),
+                format!("[vm] max_concurrent {}, memory {} MiB baseline ({MEMORY_BASELINE}{guest}), max duration {} s, idle {} s, suspended {suspended} s{note}", vm.max_concurrent, vm.memory_mib, vm.max_duration_s, vm.max_idle_s),
             )
         }
         Err(e) => DoctorLine::row(Tag::No, format!("{e}  <- fix [vm] in bridge.toml (ai-env vm and lab refuse it)")),
@@ -1047,7 +1069,7 @@ pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
 }
 
 /// The rows that read `bridge.toml` itself — [`row_execution_role`],
-/// [`row_vm_config`], [`row_microvm_quota`] (`quota` as there),
+/// [`row_vm_config`] (`vms` as there), [`row_microvm_quota`] (`quota` as there),
 /// [`row_egress`] (`state` as there), [`row_dns_acceptance`] (`dns_path` as
 /// there) — only for a file that parsed: for an absent or unparseable one
 /// they would describe the built-in defaults as if configured, so one `[-  ]`
@@ -1056,6 +1078,7 @@ pub fn row_vm_config(vm: &VmCfg) -> DoctorLine {
 #[must_use]
 pub fn rows_bridge_settings(
     loaded: &Result<Option<BridgeConfig>, BridgeError>,
+    vms: &[VmRow],
     quota: Option<Result<&str, &str>>,
     state: &Result<Option<InfraState>, BridgeError>,
     dns_path: &Result<Option<(String, String)>, String>,
@@ -1067,7 +1090,7 @@ pub fn rows_bridge_settings(
             let newest = dns_path.as_ref().map(|r| r.as_ref().map(|(v, _)| v.clone())).map_err(Clone::clone);
             return vec![
                 row_execution_role(&cfg.aws),
-                row_vm_config(&cfg.vm),
+                row_vm_config(&cfg.vm, vms),
                 row_microvm_quota(quota, cfg.vm.max_concurrent, cfg.vm.memory_mib),
                 row_egress(&cfg.egress, &cfg.aws, state),
                 row_dns_acceptance(&cfg.egress, dns_path),
@@ -1687,12 +1710,13 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             let dns_path = crate::bridge::egress::newest_dns_path_row(paths);
             // The recorded passing checks the credential gate rests on (S7): read once, for the gate row.
             let verified = EgressVerified::load(paths);
-            lines.extend(rows_bridge_settings(loaded, quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state, &dns_path, &verified, unix_now()));
+            // The VM rows: their registry row below, and the guest's memory beside [vm]'s (S10 F8).
+            let vms = list_rows(paths);
+            lines.extend(rows_bridge_settings(loaded, vms.as_deref().unwrap_or_default(), quota.as_ref().map(|r| r.as_deref().map_err(String::as_str)), &state, &dns_path, &verified, unix_now()));
             // S5: the egress row reads only the state file; the proxy row
             // adds one operator call, for a recorded proxy and an identity.
             let described = op.and_then(|op| proxy_call(true, recorded).map(|id| aws_cmd_as("ec2", &proxy_describe_args(id), op).and_then(|cmd| run_capture_cmd(cmd, None, Duration::from_secs(15)))));
             lines.push(row_proxy(cfg.aws.proxy_private_ip.as_deref(), &state, described.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
-            let vms = list_rows(paths);
             lines.push(match &vms {
                 Ok(vms) => row_vm_registry(vms, unix_now()),
                 Err(e) => DoctorLine::row(Tag::Warn, format!("vm registry unreadable: {e}")),
@@ -1908,11 +1932,11 @@ mod tests {
     fn row_microvm_quota_compares_gigabytes_with_max_concurrent_times_memory() {
         let (tag, t) = text(&row_microvm_quota(Some(Ok(&quota_json("400.0"))), 3, 2048));
         assert_eq!(tag, Tag::Ok, "{t}");
-        assert_eq!(t, "microvm memory quota L-CD1C0CC4 400 GB in eu-central-1 covers [vm] max_concurrent 3 × 2048 MiB = 6 GB");
+        assert_eq!(t, "microvm memory quota L-CD1C0CC4 400 GB in eu-central-1 covers [vm] max_concurrent 3 × 2048 MiB baseline = 6 GB");
         assert_eq!(text(&row_microvm_quota(Some(Ok(&quota_json("6.0"))), 3, 2048)).0, Tag::Ok, "exactly enough is enough");
         let (tag, t) = text(&row_microvm_quota(Some(Ok(&quota_json("4"))), 3, 2048));
         assert_eq!(tag, Tag::Warn, "{t}");
-        assert!(t.starts_with("microvm memory quota L-CD1C0CC4 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB  <- lower [vm].max_concurrent"), "{t}");
+        assert!(t.starts_with("microvm memory quota L-CD1C0CC4 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB baseline = 6 GB  <- lower [vm].max_concurrent"), "{t}");
         assert_eq!(t.matches("<- ").count(), 1, "one hint: {t}");
         let (tag, t) = text(&row_microvm_quota(Some(Ok(&quota_json("5.5"))), 11, 512));
         assert!(tag == Tag::Ok && t.contains("5.5 GB") && t.ends_with("= 5.5 GB"), "fractions on both sides: {t}");
@@ -1971,17 +1995,17 @@ mod tests {
 
     #[test]
     fn row_vm_config_summarises_or_names_the_bad_key() {
-        let (tag, t) = text(&row_vm_config(&VmCfg::default()));
+        let (tag, t) = text(&row_vm_config(&VmCfg::default(), &[]));
         assert_eq!(tag, Tag::Ok);
-        assert_eq!(t, "[vm] max_concurrent 3, memory 2048 MiB, max duration 28800 s, idle 300 s, suspended 28800 s (the max duration)");
+        assert_eq!(t, format!("[vm] max_concurrent 3, memory 2048 MiB baseline ({MEMORY_BASELINE}), max duration 28800 s, idle 300 s, suspended 28800 s (the max duration)"));
         let set = VmCfg { max_concurrent: 1, memory_mib: 4096, max_duration_s: 900, max_idle_s: 600, suspended_s: Some(900), ..VmCfg::default() };
-        assert_eq!(text(&row_vm_config(&set)), (Tag::Ok, "[vm] max_concurrent 1, memory 4096 MiB, max duration 900 s, idle 600 s, suspended 900 s".to_string()));
+        assert_eq!(text(&row_vm_config(&set, &[])), (Tag::Ok, format!("[vm] max_concurrent 1, memory 4096 MiB baseline ({MEMORY_BASELINE}), max duration 900 s, idle 600 s, suspended 900 s")));
         let below = VmCfg { suspended_s: Some(600), ..set.clone() };
-        assert!(text(&row_vm_config(&below)).1.ends_with("idle 600 s, suspended 600 s"), "{:?}", text(&row_vm_config(&below)));
+        assert!(text(&row_vm_config(&below, &[])).1.ends_with("idle 600 s, suspended 600 s"), "{:?}", text(&row_vm_config(&below, &[])));
         // `vm run` sends min([vm].suspended_s, max duration) (plan D8): never the larger value.
-        let (tag, t) = text(&row_vm_config(&VmCfg { suspended_s: Some(28_800), ..set }));
+        let (tag, t) = text(&row_vm_config(&VmCfg { suspended_s: Some(28_800), ..set }, &[]));
         assert_eq!(tag, Tag::Ok, "valid: a longer --max-duration uses it");
-        assert_eq!(t, "[vm] max_concurrent 1, memory 4096 MiB, max duration 900 s, idle 600 s, suspended 900 s ([vm].suspended_s 28800 capped at the max duration)");
+        assert_eq!(t, format!("[vm] max_concurrent 1, memory 4096 MiB baseline ({MEMORY_BASELINE}), max duration 900 s, idle 600 s, suspended 900 s ([vm].suspended_s 28800 capped at the max duration)"));
         for (bad, key) in [
             (VmCfg { max_concurrent: 0, ..VmCfg::default() }, "[vm].max_concurrent: must be at least 1"),
             (VmCfg { max_idle_s: 60, ..VmCfg::default() }, "[vm].max_idle_s: must be 300..=28800"),
@@ -1989,12 +2013,41 @@ mod tests {
             (VmCfg { suspended_s: Some(0), ..VmCfg::default() }, "[vm].suspended_s: must be 1..=28800"),
             (VmCfg { memory_mib: 0, ..VmCfg::default() }, "[vm].memory_mib: must be positive"),
         ] {
-            let row = row_vm_config(&bad);
+            let row = row_vm_config(&bad, &[]);
             let (tag, t) = text(&row);
             assert_eq!(tag, Tag::No, "{t}");
             assert!(t.starts_with(&format!("config: {key}")) && t.ends_with("  <- fix [vm] in bridge.toml (ai-env vm and lab refuse it)"), "{t}");
             assert_eq!(crate::commands::doctor_exit_code(&[row], false), 1);
         }
+    }
+
+    /// S10 F8: the memory rows say what the platform bills (AWS's Lambda
+    /// pricing): `[vm].memory_mib` is the image's minimum, the baseline billed
+    /// while a VM runs, which bursts to 4× and bills the extra only while
+    /// used; the quota row sums baselines. Once a VM's `/health` recorded the
+    /// guest's `MemTotal` (`mem_total_mib`), the `[vm]` row names the newest
+    /// such row's beside it, whatever its status; a row without one, a pending
+    /// row and a bad `[vm]` show none.
+    #[test]
+    fn the_memory_rows_name_the_baseline_and_the_guests_memory() {
+        assert_eq!(MEMORY_BASELINE, "the image's minimum; bursts to 4×, billed while used");
+        let (tag, t) = text(&row_vm_config(&VmCfg::default(), &[]));
+        assert_eq!((tag, t.as_str()), (Tag::Ok, "[vm] max_concurrent 3, memory 2048 MiB baseline (the image's minimum; bursts to 4×, billed while used), max duration 28800 s, idle 300 s, suspended 28800 s (the max duration)"));
+        let (_, t) = text(&row_microvm_quota(Some(Ok(&quota_json("400.0"))), 3, 2048));
+        assert!(t.ends_with(" covers [vm] max_concurrent 3 × 2048 MiB baseline = 6 GB"), "{t}");
+        let row = |id: &str, status: RowStatus, created: &str, version: &str, mem: Option<u32>| VmRow { image_version: version.into(), mem_total_mib: mem, ..vm(id, status, created) };
+        let vms = [
+            row("microvm-11", RowStatus::Running, "2026-10-19T08:00:00.000Z", "11.0", Some(7_900)),
+            row("microvm-12", RowStatus::Terminated, "2026-10-20T08:00:00.000Z", "12.0", Some(7_987)),
+            row("microvm-12b", RowStatus::Running, "2026-10-20T09:00:00.000Z", "12.0", None),
+            row("", RowStatus::Pending, "2026-10-20T10:00:00.000Z", "12.0", None),
+        ];
+        let (tag, t) = text(&row_vm_config(&VmCfg::default(), &vms));
+        assert_eq!(tag, Tag::Ok);
+        assert_eq!(t, "[vm] max_concurrent 3, memory 2048 MiB baseline (the image's minimum; bursts to 4×, billed while used; the guest's MemTotal 7987 MiB on microvm-12, image 12.0), max duration 28800 s, idle 300 s, suspended 28800 s (the max duration)");
+        assert!(!text(&row_vm_config(&VmCfg::default(), &vms[2..])).1.contains("MemTotal"), "no row named one");
+        let bad = text(&row_vm_config(&VmCfg { memory_mib: 0, ..VmCfg::default() }, &vms));
+        assert!(bad.0 == Tag::No && !bad.1.contains("MemTotal"), "{bad:?}");
     }
 
     /// S7: only `loggedIn` is read; an answer without it, or a failed run,
@@ -2038,10 +2091,10 @@ mod tests {
         let none = Ok(EgressVerified::default());
         let now = unix_now();
         let settings = |loaded: &Result<Option<BridgeConfig>, BridgeError>, q: Option<Result<&str, &str>>, st: &Result<Option<InfraState>, BridgeError>, dp: &Result<Option<(String, String)>, String>| {
-            rows_bridge_settings(loaded, q, st, dp, &none, now).iter().map(text).collect::<Vec<(Tag, String)>>()
+            rows_bridge_settings(loaded, &[], q, st, dp, &none, now).iter().map(text).collect::<Vec<(Tag, String)>>()
         };
         for (loaded, why) in [(Ok(None), "no bridge.toml"), (Err(BridgeError::Config("[vm].max_concurrent: invalid type".into())), "bridge.toml unparseable")] {
-            let rows = rows_bridge_settings(&loaded, Some(Ok(&quota)), &active, &newest, &none, now);
+            let rows = rows_bridge_settings(&loaded, &[], Some(Ok(&quota)), &active, &newest, &none, now);
             let got: Vec<(Tag, String)> = rows.iter().map(text).collect();
             assert_eq!(got, [(Tag::Skip, format!("execution role, [vm], microvm memory quota, egress connector, DNS acceptance, [creds] and the credential gate not checked ({why})"))]);
             assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0, "the default [egress].require never fails a doctor without bridge.toml");
@@ -2050,8 +2103,13 @@ mod tests {
         let got = settings(&Ok(Some(cfg.clone())), Some(Ok(&quota)), &active, &newest);
         assert_eq!(got.len(), 8, "{got:?}");
         assert_eq!(got[0], text(&row_execution_role(&cfg.aws)));
-        assert_eq!(got[1], text(&row_vm_config(&cfg.vm)));
-        assert!(got[2].0 == Tag::Warn && got[2].1.contains(" 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB = 6 GB"), "{got:?}");
+        assert_eq!(got[1], text(&row_vm_config(&cfg.vm, &[])));
+        // S10 F8: the VM rows reach the [vm] row (the guest's memory beside the baseline).
+        let guest = [VmRow { mem_total_mib: Some(7_987), image_version: "12.0".into(), ..vm("microvm-12", RowStatus::Running, "2026-10-20T08:00:00.000Z") }];
+        let with = rows_bridge_settings(&Ok(Some(cfg.clone())), &guest, None, &active, &newest, &none, now);
+        assert_eq!(text(&with[1]), text(&row_vm_config(&cfg.vm, &guest)));
+        assert!(text(&with[1]).1.contains("; the guest's MemTotal 7987 MiB on microvm-12, image 12.0), max duration"), "{:?}", text(&with[1]));
+        assert!(got[2].0 == Tag::Warn && got[2].1.contains(" 4 GB in eu-central-1 < [vm] max_concurrent 3 × 2048 MiB baseline = 6 GB"), "{got:?}");
         assert_eq!(got[3], text(&row_egress(&cfg.egress, &cfg.aws, &active)));
         assert_eq!(got[3].0, Tag::No, "the defaults: require on, no connector: {got:?}");
         assert_eq!(got[4], text(&row_dns_acceptance(&cfg.egress, &newest)));

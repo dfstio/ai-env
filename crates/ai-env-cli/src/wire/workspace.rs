@@ -44,6 +44,11 @@
 //! [`TranscriptTail`], their presigned URLs `wire::s3::PresignedUrl`s whose
 //! keys must fit the bytes they move. A helper whose reply can pass
 //! [`HEAD_LINE_MAX`] answers a [`JsonPayloadReply`] head, then the reply.
+//!
+//! S10 (plans/s10-contracts.md §1.3) adds two fields a reader may ignore, so
+//! no cap: [`SeedState::shallow`] (the VM's `.git/shallow`) and
+//! [`TranscriptPull::share`] (the pulls that run at once), and the one pull
+//! budget both ends and the presigned lifetime use ([`budget::pull_budget`]).
 use crate::wire::mirror::mirror_key;
 use crate::wire::redact::scrub;
 use crate::wire::s3::{is_account_id, proxy_check, PresignedUrl, S3Key, PULL_PARTS_MAX, PUSH_MAX, SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT, SIGNED_HEADERS_TAIL};
@@ -164,6 +169,9 @@ pub const PULL_MAX: u64 = PUSH_MAX;
 pub const SUBTREE_FILES_MAX: usize = 256;
 /// Their bytes, hashed.
 pub const SUBTREE_BYTES_MAX: u64 = 256 * MIB;
+/// S10: the most shallow commits a [`SeedState`] reports; a VM with more
+/// reports none (`shallow` is `None`).
+pub const SHALLOW_REPORT_MAX: usize = 4096;
 /// A helper's JSON payload ([`JsonPayloadReply`]), the Mac's `dataplane::MAX_JSON`: a view's reply
 /// (`VIEW_FILE_MAX` of text escaped at most 6 bytes per byte, plus its capped fields: under 1.6 MiB),
 /// a subtree stat (`SUBTREE_FILES_MAX` rels of at most `REL_MAX` bytes: under 1.1 MiB).
@@ -204,6 +212,24 @@ pub mod budget {
     pub const TRANSCRIPT_VIEW: Duration = Duration::from_secs(30);
     /// One tail push at `/suspend` or `/terminate`.
     pub const TRANSCRIPT_TAIL: Duration = Duration::from_secs(8);
+
+    /// What a pull's transfer gets beside [`TRANSCRIPT_PULL`].
+    const PULL_BASE: Duration = Duration::from_secs(30);
+    /// Bytes per second a pull is given at least, shared by the pulls that run at once.
+    const PULL_RATE: u64 = 1_000_000;
+
+    /// S10: one pull's budget, the same on both ends and for its presigned
+    /// GETs: [`TRANSCRIPT_PULL`] plus 30 s, plus `bytes` times `share` (the
+    /// pulls that run at once, `TranscriptPull::share`; 0 counts as 1) at
+    /// 1 MB/s, rounded up, saturating. At share 1 it is S9's figure: the
+    /// Mac's request timeout (`dataplane::request_timeout(bytes,
+    /// TRANSCRIPT_PULL)`) and, at whole megabytes, the shim's deadline
+    /// (`TRANSCRIPT_PULL` plus `asagent::transfer(bytes)`).
+    #[must_use]
+    pub fn pull_budget(bytes: u64, share: u32) -> Duration {
+        let shared = bytes.saturating_mul(u64::from(share.max(1)));
+        TRANSCRIPT_PULL.saturating_add(PULL_BASE).saturating_add(Duration::from_secs(shared.div_ceil(PULL_RATE)))
+    }
 }
 
 // ---- refusals ----------------------------------------------------------------------------
@@ -820,8 +846,9 @@ impl SeedManifest {
     }
 }
 
-/// What the shim recorded when it seeded the VM (in memory: it survives a
-/// suspend, not a new VM).
+/// What the shim recorded when it seeded the VM (in memory, and from S10 in
+/// the VM's `/var/lib/ai-env/seed-record.json`: it survives a suspend and a
+/// shim restart, not a new VM).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedRecord {
     /// The workspace's VM path (one workspace per VM).
@@ -869,6 +896,11 @@ pub struct SeedState {
     /// and index trees are the ones the seed left (what `replace` needs).
     #[serde(default)]
     pub pristine: bool,
+    /// S10: the commits the VM's `.git/shallow` lists, when it lists at most
+    /// [`SHALLOW_REPORT_MAX`]; `None` past that, and from an older shim. The
+    /// Mac's boundary prefers it (a reader may ignore it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shallow: Option<Vec<String>>,
 }
 
 /// What a `PUT /seed` did.
@@ -1204,6 +1236,20 @@ pub struct TranscriptPull {
     pub owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// S10: the pulls that run at once and share the link, this one included
+    /// (1 to [`TRANSFERS_MAX`]): its budget is [`budget::pull_budget`] at
+    /// this share. Left out at 1, so S9's pull is written as before; a shim
+    /// that predates it reads every pull as share 1.
+    #[serde(default = "share_one", skip_serializing_if = "is_one")]
+    pub share: u32,
+}
+
+fn share_one() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 impl TranscriptPull {
@@ -1214,7 +1260,7 @@ impl TranscriptPull {
     /// the rel's session (a `Tail` only in a pull of the main transcript:
     /// a tail is never another file's, [`TranscriptTail`]), each part's
     /// sha256 64 lowercase hex (only a tail's may be unknown); the whole
-    /// file's sha256, the owner, the proxy.
+    /// file's sha256, the owner, the proxy; a share of 1 to [`TRANSFERS_MAX`].
     pub fn check(&self) -> Result<(), String> {
         let session = transfer_rel(&self.rel)?;
         if self.parts.is_empty() || self.parts.len() > PULL_PARTS_MAX {
@@ -1223,6 +1269,9 @@ impl TranscriptPull {
         let total = self.parts.iter().try_fold(0u64, |sum, p| sum.checked_add(p.len));
         if total.is_none_or(|t| t > PULL_MAX) {
             return Err(format!("pulls more than {PULL_MAX} bytes in all"));
+        }
+        if !(1..=TRANSFERS_MAX).contains(&(self.share as usize)) {
+            return Err(format!("names a share of {} (1 to {TRANSFERS_MAX} pulls at once)", self.share));
         }
         if self.sha256.as_deref().is_some_and(|s| !is_sha256_hex(s)) {
             return Err("names a sha256 that is not 64 lowercase hex digits".into());
@@ -1367,7 +1416,8 @@ pub struct GitCgiReply {
     pub git_version: String,
 }
 
-/// The head `reply` of an op whose own reply can pass [`HEAD_LINE_MAX`] (`transcript-view`; `transcript-stat --subtree`):
+/// The head `reply` of an op whose own reply can pass [`HEAD_LINE_MAX`] (`transcript-view`; `transcript-stat --subtree`;
+/// S10: `seed-state`, whose `SeedState.shallow` lists up to [`SHALLOW_REPORT_MAX`] ids):
 /// that reply follows the head as exactly `len` bytes (at most [`JSON_PAYLOAD_MAX`]) of its compact JSON, whose sha256
 /// (lowercase hex) this is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2136,8 +2186,13 @@ mod tests {
         /// Read a document back into its type and write it again.
         type RoundTrip = fn(&str) -> String;
         let text = include_str!("../../tests/fixtures/wire/codeport-golden.json");
+        // S9's 38 documents stay byte-identical (S10 §1.6): the file's lines 2..=39, each without its separating
+        // comma. A type change and a matching edit of its document move both ends together and pass the round trip;
+        // only this pin catches what an S9 VM or Mac would no longer read.
+        let s9: Vec<&str> = text.lines().skip(1).take(38).map(|l| l.trim_end_matches(',')).collect();
+        assert_eq!(sha256_hex(s9.join("\n").as_bytes()), "99479d4fa86a4fe3492a297131875371e1e6930ee7bd821a119642f5accbf001", "an S9 codeport document changed");
         let all: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).unwrap();
-        let cases: [(&str, RoundTrip); 38] = [
+        let cases: [(&str, RoundTrip); 40] = [
             ("path_query", again::<PathQuery>),
             ("rel_query", again::<RelQuery>),
             ("seed_query_clone", again::<SeedQuery>),
@@ -2177,6 +2232,9 @@ mod tests {
             ("helper_head_transcript_write", again::<HelperHead<TranscriptWriteReply>>),
             ("helper_head_git_cgi", again::<HelperHead<GitCgiReply>>),
             ("helper_head_json_payload", again::<HelperHead<JsonPayloadReply>>),
+            // S10 (plans/s10-contracts.md §1.6).
+            ("seed_state_shallow", again::<SeedState>),
+            ("transcript_pull_shared", again::<TranscriptPull>),
         ];
         let names: BTreeSet<&str> = cases.iter().map(|(n, _)| *n).collect();
         assert_eq!(all.keys().map(String::as_str).collect::<BTreeSet<_>>(), names, "one case per document");
@@ -2223,6 +2281,75 @@ mod tests {
         assert_eq!((stat.sha256, stat.end_fp.as_deref(), stat.subtree.len()), (None, Some(D_ALL), 1), "no whole-file sha256 with from");
         let push: TranscriptPush = serde_json::from_str(doc("transcript_push")).unwrap();
         assert!(!format!("{push:?}").contains("X-Amz-Signature"), "a URL is never printed");
+        // S10: S9's pull carries no share (1); the shared one is S9's with `"share":4` last; two shallow ids.
+        let pull: TranscriptPull = serde_json::from_str(doc("transcript_pull")).unwrap();
+        let shared: TranscriptPull = serde_json::from_str(doc("transcript_pull_shared")).unwrap();
+        assert!(!doc("transcript_pull").contains("share"), "S9's document stays as it was");
+        assert_eq!((pull.share, shared.share, shared.check()), (1, 4, Ok(())));
+        assert_eq!(TranscriptPull { share: 1, ..shared }, pull, "the same pull at another share");
+        assert_eq!(doc("transcript_pull_shared"), format!("{},\"share\":4}}", doc("transcript_pull").trim_end_matches('}')));
+        let shallow: SeedState = serde_json::from_str(doc("seed_state_shallow")).unwrap();
+        let ids = shallow.shallow.clone().unwrap_or_default();
+        assert!(ids.len() == 2 && ids.iter().all(|id| ObjectFormat::Sha1.is_id(id)), "{ids:?}");
+        assert_eq!(SeedState { shallow: None, ..shallow }, serde_json::from_str::<SeedState>(doc("seed_state_seeded")).unwrap(), "the seeded state, with its shallow list");
+    }
+
+    /// S10 (§1.3): `SeedState.shallow` and `TranscriptPull.share` need no
+    /// cap. Left out when unset (no list; share 1), so an S9 document reads
+    /// and is written as before, and an S9 reader's view of an S10 one is
+    /// unchanged but for the field it ignores. A pull's share is 1 to
+    /// `TRANSFERS_MAX`; the shallow list's cap is the plan's.
+    #[test]
+    fn the_s10_seed_and_pull_fields_are_additive() {
+        let old = r#"{"tip":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0","clean":true,"pristine":false}"#;
+        let state: SeedState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.shallow, None);
+        assert_eq!(serde_json::to_string(&state).unwrap(), old, "byte-identical for an S9 reader");
+        let with = SeedState { shallow: Some(vec![H.into(), W.into()]), ..state };
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(json, format!(r#"{{"tip":"{H}","clean":true,"pristine":false,"shallow":["{H}","{W}"]}}"#));
+        assert_eq!(serde_json::from_str::<SeedState>(&json).unwrap(), with);
+        assert_eq!(SHALLOW_REPORT_MAX, 4096);
+        let rel = format!("{SLUG}/{ID}.jsonl");
+        let url = presigned(&format!("v1/{ID}/vm/g1/base"), "versionId=fv1&", SIGNED_HEADERS_GET);
+        let pull = TranscriptPull { rel, parts: vec![PullPart { url, len: 48213, sha256: Some(D_BASE.into()) }], sha256: None, owner: "123456789012".into(), proxy: None, share: 1 };
+        let s9 = serde_json::to_string(&pull).unwrap();
+        assert!(!s9.contains("share"), "share 1 is left out: {s9}");
+        assert_eq!(serde_json::from_str::<TranscriptPull>(&s9).unwrap().share, 1, "a pull without it is share 1");
+        for share in 1..=TRANSFERS_MAX as u32 {
+            let p = TranscriptPull { share, ..pull.clone() };
+            assert_eq!(p.check(), Ok(()), "share {share}");
+            assert_eq!(serde_json::from_str::<TranscriptPull>(&serde_json::to_string(&p).unwrap()).unwrap(), p);
+        }
+        for share in [0, TRANSFERS_MAX as u32 + 1, u32::MAX] {
+            let e = TranscriptPull { share, ..pull.clone() }.check().unwrap_err();
+            assert!(e.contains(&format!("a share of {share} (1 to 4 pulls at once)")), "{e}");
+        }
+    }
+
+    /// S10 (§1.3): one pull budget on both ends. At share 1 it is S9's: the
+    /// Mac's request timeout (30 s, the bytes at 1 MB/s rounded up, the
+    /// helper's 60 s) and, at whole megabytes, the shim's deadline (60 s,
+    /// 30 s and the bytes at 1 MB/s). The bytes count `share` times; a
+    /// share of 0 counts as 1; nothing overflows.
+    #[test]
+    fn pull_budget_is_todays_at_share_1_and_scales_with_it() {
+        let s9_mac = |bytes: u64| Duration::from_secs(30) + Duration::from_secs(bytes.div_ceil(1_000_000)) + budget::TRANSCRIPT_PULL;
+        let s9_shim = |bytes: u64| budget::TRANSCRIPT_PULL + Duration::from_secs(30) + Duration::from_secs(bytes / 1_000_000);
+        for bytes in [0, 1, 999_999, 1_000_000, 1_000_001, 52_000, 64 << 20, 256 << 20, PULL_MAX] {
+            assert_eq!(budget::pull_budget(bytes, 1), s9_mac(bytes), "{bytes} bytes");
+            assert_eq!(budget::pull_budget(bytes, 0), budget::pull_budget(bytes, 1), "share 0 counts as 1");
+        }
+        for megabytes in [0, 1, 64, 4096] {
+            let bytes = megabytes * 1_000_000;
+            assert_eq!(budget::pull_budget(bytes, 1), s9_shim(bytes), "{megabytes} MB");
+        }
+        assert_eq!(budget::pull_budget(0, 4), Duration::from_secs(90), "the base alone");
+        assert_eq!(budget::pull_budget(10_000_000, 4), Duration::from_secs(90 + 40));
+        assert_eq!(budget::pull_budget(52_000, 4), Duration::from_secs(91), "208 kB rounds up to a second");
+        assert_eq!(budget::pull_budget(PULL_MAX, 4), budget::pull_budget(PULL_MAX * 4, 1));
+        assert!(budget::pull_budget(PULL_MAX, 4) > budget::pull_budget(PULL_MAX, 1));
+        assert_eq!(budget::pull_budget(u64::MAX, u32::MAX), Duration::from_secs(90 + u64::MAX.div_ceil(1_000_000)), "saturating");
     }
 
     /// The four digests of §1.9's documents: `[0, 48213)`, `[48213, 52000)`, the whole 52000 bytes, the subagent file.
@@ -2295,6 +2422,7 @@ mod tests {
             sha256: Some(D_ALL.into()),
             owner: "123456789012".into(),
             proxy: None,
+            share: 1,
         };
         assert_eq!(pull.check(), Ok(()));
         for (bad, why) in [

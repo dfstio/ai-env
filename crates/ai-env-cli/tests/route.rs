@@ -5,7 +5,7 @@
 //! it, and without a config. Nothing here touches the process environment.
 use ai_env_cli::bridge::config::BridgeConfig;
 use ai_env_cli::bridge::route::{cwd_under_roots, decide};
-use ai_env_cli::wire::argv::{LocalReason, Route, FIXTURE_EXT_VERSION, FIXTURE_NAMES};
+use ai_env_cli::wire::argv::{LocalReason, Route, FIXTURE_EXT_VERSION, FIXTURE_NAMES, KEPT_FIXTURES};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -82,12 +82,33 @@ fn fixture_directory_equals_fixture_names() {
     assert_eq!(on_disk, declared, "tests/fixtures/argv/*.json and wire::argv::FIXTURE_NAMES disagree (left: disk, right: declared)");
 }
 
+/// Whether fixture `name`'s `ext_version` holds: `FIXTURE_EXT_VERSION`; for
+/// a kept fixture (S10 F10, `KEPT_FIXTURES`, which a re-capture rewrites
+/// only from a row of its shape) it or an older N.N.N, the one of its own
+/// capture or tag.
+fn tag_holds(name: &str, ext_version: &str) -> bool {
+    fn version(v: &str) -> Option<[u32; 3]> {
+        let mut parts = v.split('.').map(|p| Some(p).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).and_then(|p| p.parse::<u32>().ok()));
+        let out = [parts.next()??, parts.next()??, parts.next()??];
+        parts.next().is_none().then_some(out)
+    }
+    ext_version == FIXTURE_EXT_VERSION || (KEPT_FIXTURES.contains(&name) && version(ext_version).zip(version(FIXTURE_EXT_VERSION)).is_some_and(|(v, at)| v <= at))
+}
+
+/// Every fixture is tagged with the extension it was captured from,
+/// `FIXTURE_EXT_VERSION`; a kept one (S10 F10) with it or an older N.N.N, so
+/// moving `FIXTURE_EXT_VERSION` after a re-capture that found no row of a
+/// kept shape fails nothing; never a newer or a malformed one.
 #[test]
 fn every_fixture_is_tagged_with_the_captured_extension_version() {
     let all = load_fixtures();
     assert!(!all.is_empty());
     for f in &all {
-        assert_eq!(f.ext_version, FIXTURE_EXT_VERSION, "fixture {} was captured from another extension version", f.name);
+        assert!(tag_holds(&f.name, &f.ext_version), "fixture {} was captured from another extension version ({}, not {FIXTURE_EXT_VERSION})", f.name, f.ext_version);
+    }
+    assert!(tag_holds("version", "2.1.278") && tag_holds("version", FIXTURE_EXT_VERSION) && tag_holds("session", FIXTURE_EXT_VERSION));
+    for (name, tag) in [("session", "2.1.278"), ("version", "99.0.0"), ("version", "2.1"), ("version", "2.1.x"), ("version", "2.1.278.1"), ("version", "")] {
+        assert!(!tag_holds(name, tag), "{name} tagged {tag:?}");
     }
 }
 
@@ -411,6 +432,15 @@ fn row_args(row: &serde_json::Value) -> Option<Vec<String>> {
     (argv.len() >= 2).then(|| argv.iter().skip(2).filter_map(|a| a.as_str().map(str::to_string)).collect())
 }
 
+/// Whether census arguments carry a thinking budget the census masked: S9's
+/// census masked every `--max-thinking-tokens=` (`[redacted:len=5]` for
+/// 31999), S10's (F7) only a value that is not 1 to 7 digits, in either
+/// spelling. Such a row stands for no fixture: the session fixtures'
+/// hand-owned `sanitised` holds the number, which its argv would lack.
+fn budget_masked(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| a.starts_with("--max-thinking-tokens=[redacted:") || (a == "--max-thinking-tokens" && args.get(i + 1).is_some_and(|v| v.starts_with("[redacted:"))))
+}
+
 /// Offline, the capture's tools: every fixture has a shape of its own (so a
 /// census row stands for one fixture at most), a fixture rewritten with its
 /// own argv and version is byte for byte itself, and a rewrite changes the
@@ -437,16 +467,125 @@ fn argv_shapes_tell_the_fixtures_apart_and_a_rewrite_keeps_the_rest() {
     assert_eq!(row_args(&serde_json::json!({"argv": ["/w/ai-env-claude"]})), None);
 }
 
+/// What the capture makes of each fixture (S10 F10): `found`, each one
+/// rewritten from a census row (its name, its new text, the row's pid and
+/// time); `kept`, the ones of [`KEPT_FIXTURES`] no row of that extension
+/// has the shape of (shapes it makes no more), left as they are; `missing`,
+/// the others no row has the shape of.
+#[derive(Debug, Default)]
+struct Capture {
+    found: Vec<(&'static str, String, String)>,
+    kept: Vec<&'static str>,
+    missing: Vec<&'static str>,
+}
+
+/// The capture's plan, offline: `fixtures` holds each fixture's name and
+/// file text, in `FIXTURE_NAMES`' order, and `rows` the census rows (oldest
+/// first); only rows of extension `ext` count, and none whose thinking
+/// budget the census masked ([`budget_masked`]: an S9 census's row, written
+/// before S10 F7). Each fixture takes the newest row of its shape
+/// ([`argv_shape`]), its `argv` and `ext_version` rewritten
+/// ([`rewritten`]); with none, a kept fixture (a shape `ext` makes no more)
+/// stays as it is and any other is missing, left as it is too.
+fn capture(fixtures: &[(&'static str, String)], rows: &[serde_json::Value], ext: &str) -> Capture {
+    let mut out = Capture::default();
+    for (name, text) in fixtures {
+        let fixture: Fixture = serde_json::from_str(text).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        let want = argv_shape(&fixture.argv);
+        let Some((row, args)) = rows.iter().rev().filter(|r| r["ext"] == ext).find_map(|r| row_args(r).filter(|a| argv_shape(a) == want && !budget_masked(a)).map(|a| (r, a))) else {
+            if KEPT_FIXTURES.contains(name) {
+                out.kept.push(name);
+            } else {
+                out.missing.push(name);
+            }
+            continue;
+        };
+        let new = rewritten(text, ext, &args);
+        let parsed: Fixture = serde_json::from_str(&new).unwrap_or_else(|e| panic!("{name}: the rewrite does not parse ({e})"));
+        assert_eq!((parsed.ext_version.as_str(), &parsed.argv, parsed.route.as_str()), (ext, &args, fixture.route.as_str()), "{name}: the rewrite");
+        out.found.push((name, new, format!("pid {} at {}", row["pid"], row["ts"].as_str().unwrap_or("?"))));
+    }
+    out
+}
+
+/// S10 F10: the capture looks for every fixture's shape, the kept ones'
+/// too (`version`, `bare`, `not_stream_json`, `session_chrome_mcp`: shapes
+/// extension 2.1.303 makes no more). A kept fixture no row of that
+/// extension has the shape of is reported as kept, never missing, and left
+/// as it is; one a row has the shape of is rewritten as any other, so a
+/// shape the extension makes again is captured, never kept stale. Every
+/// other fixture is rewritten from the newest row of its shape at that
+/// extension, or missing. A row whose thinking budget the census masked
+/// (S9's census, before S10 F7) stands for no fixture, so it never undoes
+/// F7's fixtures.
+#[test]
+fn the_capture_reports_the_kept_fixtures_as_kept_never_missing() {
+    let fixtures: Vec<(&'static str, String)> = FIXTURE_NAMES.iter().map(|name| (*name, std::fs::read_to_string(Path::new(FIXTURE_DIR).join(format!("{name}.json"))).unwrap())).collect();
+    let others: Vec<&str> = FIXTURE_NAMES.iter().copied().filter(|n| !KEPT_FIXTURES.contains(n)).collect();
+    assert_eq!(others.len(), FIXTURE_NAMES.len() - 4);
+    let names = |found: &[(&'static str, String, String)]| found.iter().map(|(n, _, _)| *n).collect::<Vec<_>>();
+    let none = capture(&fixtures, &[], "9.9.9");
+    assert!(none.found.is_empty());
+    assert_eq!((none.kept.as_slice(), none.missing.as_slice()), (&KEPT_FIXTURES[..], others.as_slice()), "no census row: the kept ones are kept, the others missing");
+    // A row of each fixture's shape at that extension, the i-th fixture's with pid 100 + i.
+    let row_of = |i: usize, text: &str| {
+        let f: Fixture = serde_json::from_str(text).unwrap();
+        let argv: Vec<String> = ["/w/ai-env-claude".to_string(), "/b/claude".to_string()].into_iter().chain(f.argv).collect();
+        serde_json::json!({"ext": "9.9.9", "pid": 100 + i, "ts": "2026-10-20T10:00:00Z", "argv": argv})
+    };
+    // The census of 2.1.303's kind: no row of a kept shape.
+    let made: Vec<serde_json::Value> = fixtures.iter().enumerate().filter(|(_, (n, _))| !KEPT_FIXTURES.contains(n)).map(|(i, (_, text))| row_of(i, text)).collect();
+    let some = capture(&fixtures, &made, "9.9.9");
+    assert_eq!(names(&some.found), others, "every other fixture is found");
+    assert_eq!((some.kept.as_slice(), some.missing.len()), (&KEPT_FIXTURES[..], 0), "the kept ones are kept, none missing");
+    // S10 F7: a row of S9's census, its thinking budget masked (either spelling), stands for no fixture: a session
+    // fixture with no other row of its shape is missing and left with its number; a newer such row hides no older one.
+    let budget = "\"--max-thinking-tokens=31999\"";
+    let sessions: Vec<(usize, &(&'static str, String))> = fixtures.iter().enumerate().filter(|(_, (_, text))| text.contains(budget)).collect();
+    assert_eq!(sessions.iter().map(|(_, (n, _))| *n).collect::<Vec<_>>(), ["session", "session_resume", "session_multiroot"]);
+    let masked: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|(i, (name, text))| row_of(*i, &text.replace(budget, if *name == "session" { "\"--max-thinking-tokens\", \"[redacted:len=8]\"" } else { "\"--max-thinking-tokens=[redacted:len=5]\"" })))
+        .collect();
+    for (row, (_, (name, text))) in masked.iter().zip(&sessions) {
+        let args = row_args(row).unwrap();
+        assert!(args.iter().any(|a| a.contains("[redacted:")) && argv_shape(&args) == argv_shape(&serde_json::from_str::<Fixture>(text).unwrap().argv), "{name}: its shape, its budget masked");
+    }
+    let s9 = capture(&fixtures, &masked, "9.9.9");
+    assert!(s9.found.is_empty(), "{s9:?}");
+    assert_eq!((s9.kept.as_slice(), s9.missing.as_slice()), (&KEPT_FIXTURES[..], others.as_slice()), "S9's rows count for none: the session fixtures are missing");
+    let both: Vec<serde_json::Value> = made.iter().cloned().chain(masked).collect();
+    let s10 = capture(&fixtures, &both, "9.9.9");
+    assert_eq!(names(&s10.found), others, "the older rows of S10's census are taken");
+    assert!(s10.found.iter().filter(|(n, _, _)| n.starts_with("session")).all(|(_, new, _)| new.contains(budget)), "{s10:?}");
+    // A row of every fixture's shape, the kept ones' too (and one at another, newer, extension, which counts for nothing).
+    let mut rows: Vec<serde_json::Value> = fixtures.iter().enumerate().map(|(i, (_, text))| row_of(i, text)).collect();
+    rows.push(serde_json::json!({"ext": "9.9.8", "pid": 1, "ts": "2026-10-20T11:00:00Z", "argv": ["/w/ai-env-claude", "/b/claude", "--version"]}));
+    let every = capture(&fixtures, &rows, "9.9.9");
+    assert_eq!(names(&every.found), FIXTURE_NAMES.to_vec(), "every fixture is found, a kept one too: a shape the extension makes again is captured");
+    assert!(every.kept.is_empty() && every.missing.is_empty(), "{every:?}");
+    for (name, new, row) in &every.found {
+        let text = &fixtures.iter().find(|(n, _)| n == name).unwrap().1;
+        let own = serde_json::from_str::<Fixture>(text).unwrap().ext_version;
+        assert_eq!(new, &text.replace(&format!("\"ext_version\": \"{own}\""), "\"ext_version\": \"9.9.9\""), "{name}: its own argv, the new version");
+        assert!(row.ends_with(" at 2026-10-20T10:00:00Z"), "{name}: {row}");
+    }
+    let other = capture(&fixtures, &rows, "9.9.7");
+    assert_eq!((other.found.len(), other.kept.as_slice(), other.missing.as_slice()), (0, &KEPT_FIXTURES[..], others.as_slice()), "another extension's rows count for nothing");
+}
+
 /// S9 M7 (`make argv-fixtures EXT=2.1.302`; gated: AI_ENV_ARGV_CAPTURE=1
 /// and AI_ENV_ARGV_EXT, never part of `make test`): for each fixture of
-/// `wire::argv::FIXTURE_NAMES`, the newest of the operator's census rows
-/// (`ai-env wrapper census --json`) of extension EXT whose argv has the
-/// fixture's shape ([`argv_shape`]) rewrites that fixture's `argv` and
-/// `ext_version`, in place and nothing else ([`rewritten`]): `route`,
+/// `wire::argv::FIXTURE_NAMES` ([`capture`]), the newest of the operator's
+/// census rows (`ai-env wrapper census --json`) of extension EXT whose argv
+/// has the fixture's shape ([`argv_shape`]) rewrites that fixture's `argv`
+/// and `ext_version`, in place and nothing else ([`rewritten`]): `route`,
 /// `reason`, `session` and `sanitised` stay hand-owned, so the known-answer
-/// tests still check the new argv. It prints the fixtures found and the
-/// ones missing (part B's Cursor checklist makes them); then
-/// `FIXTURE_EXT_VERSION` moves to EXT by hand.
+/// tests still check the new argv. It prints the fixtures found, the ones
+/// kept (S10 F10: `KEPT_FIXTURES` with no row of their shape, shapes the
+/// extension makes no more, which keep their tag) and the ones missing
+/// (part B's Cursor checklist makes them); then `FIXTURE_EXT_VERSION` moves
+/// to EXT by hand.
 #[test]
 #[ignore = "S9 M7: make argv-fixtures EXT=N.N.N (rewrites tests/fixtures/argv/*.json from the census)"]
 fn capture_argv_fixtures_from_the_census() {
@@ -467,24 +606,18 @@ fn capture_argv_fixtures_from_the_census() {
     }
     let out = cmd.output().expect("ai-env wrapper census --json");
     assert!(out.status.success(), "ai-env wrapper census --json: {}", String::from_utf8_lossy(&out.stderr));
-    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).filter(|r: &serde_json::Value| r["ext"] == ext.as_str()).collect();
-    let (mut found, mut missing) = (Vec::new(), Vec::new());
-    for name in FIXTURE_NAMES {
-        let path = Path::new(FIXTURE_DIR).join(format!("{name}.json"));
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let fixture: Fixture = serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-        let want = argv_shape(&fixture.argv);
-        let Some((row, args)) = rows.iter().rev().find_map(|r| row_args(r).filter(|a| argv_shape(a) == want).map(|a| (r, a))) else {
-            missing.push(name);
-            continue;
-        };
-        let new = rewritten(&text, &ext, &args);
-        let parsed: Fixture = serde_json::from_str(&new).unwrap_or_else(|e| panic!("{name}: the rewrite does not parse ({e})"));
-        assert_eq!((parsed.ext_version.as_str(), &parsed.argv, parsed.route.as_str()), (ext.as_str(), &args, fixture.route.as_str()), "{name}: the rewrite");
-        std::fs::write(&path, new).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        found.push(format!("{name} (pid {} at {})", row["pid"], row["ts"].as_str().unwrap_or("?")));
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let path = |name: &str| Path::new(FIXTURE_DIR).join(format!("{name}.json"));
+    let fixtures: Vec<(&'static str, String)> = FIXTURE_NAMES.iter().map(|name| (*name, std::fs::read_to_string(path(name)).unwrap_or_else(|e| panic!("read {}: {e}", path(name).display())))).collect();
+    let plan = capture(&fixtures, &rows, &ext);
+    let mut found = Vec::new();
+    for (name, new, row) in &plan.found {
+        std::fs::write(path(name), new).unwrap_or_else(|e| panic!("write {}: {e}", path(name).display()));
+        found.push(format!("{name} ({row})"));
     }
+    let listed = |names: &[&str]| if names.is_empty() { "none".to_string() } else { names.join(", ") };
     println!("argv-fixtures: {} of {} rewritten from extension {ext}'s census rows: {}", found.len(), FIXTURE_NAMES.len(), found.join(", "));
-    println!("argv-fixtures: missing (no {ext} row of their shape: make them in Cursor, part B's checklist, then run this again): {}", if missing.is_empty() { "none".to_string() } else { missing.join(", ") });
-    println!("argv-fixtures: then FIXTURE_EXT_VERSION (wire/argv.rs) moves to {ext} with its pins, and make test checks the hand-owned fields against the new argv");
+    println!("argv-fixtures: kept as they are (no {ext} row of their shape, one the extension makes no more: wire::argv::KEPT_FIXTURES): {}", listed(&plan.kept));
+    println!("argv-fixtures: missing, left as they are (no {ext} row of their shape, a row of S9's census, its thinking budget masked, counting for none: make them in Cursor, part B's checklist, then run this again): {}", listed(&plan.missing));
+    println!("argv-fixtures: then FIXTURE_EXT_VERSION (wire/argv.rs) moves to {ext} with its pins (a kept fixture keeps its own tag), and make test checks the hand-owned fields against the new argv");
 }

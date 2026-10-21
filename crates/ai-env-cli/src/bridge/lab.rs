@@ -121,9 +121,9 @@ pub fn pump_knobs() -> PumpKnobs {
 // ---- S4: `ai-env vm` / `lab` knobs ---------------------------------------------------
 
 /// The S4 knob names (and S6's agent address, S7's unseal budget, S9's
-/// loopback S3 and code-token minutes), for the banner and the test
-/// harnesses' scrub lists.
-pub const VM_KNOBS: [&str; 7] = [
+/// loopback S3 and code-token minutes, S10's park quiet), for the banner and
+/// the test harnesses' scrub lists.
+pub const VM_KNOBS: [&str; 8] = [
     "AI_ENV_BRIDGE_LAB_FAKE_API",
     "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
     "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
@@ -131,7 +131,11 @@ pub const VM_KNOBS: [&str; 7] = [
     crate::bridge::pump::UNSEAL_TIMEOUT_KNOB,
     "AI_ENV_BRIDGE_LAB_S3_ADDR",
     "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
+    "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS",
 ];
+
+/// `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS`'s range (S10 §9): 1 ms to an hour.
+const PARK_AFTER_MS_MAX: u64 = 3_600_000;
 
 /// The S4 knobs `ai-env vm` and `ai-env lab` honour (debug builds only).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -167,6 +171,11 @@ pub struct VmKnobs {
     /// minutes for `dataplane::MintingTokens` (the live re-mint test), 1 to
     /// 15; honoured without the fake API. See [`VmKnobs::code_token_minutes`].
     pub code_token_minutes: Option<u16>,
+    /// `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS=<n>` (S10 §9): a parking session's
+    /// quiet before it parks, in place of `[vm].park_after_s`
+    /// (`park::ParkPolicy::from_cfg`), 1 to 3 600 000 ms; honoured without
+    /// the fake API.
+    pub park_after: Option<Duration>,
 }
 
 impl VmKnobs {
@@ -196,6 +205,9 @@ impl VmKnobs {
         }
         if self.code_token_minutes.is_some() {
             out.push(VM_KNOBS[6]);
+        }
+        if self.park_after.is_some() {
+            out.push(VM_KNOBS[7]);
         }
         out
     }
@@ -263,7 +275,15 @@ pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: 
         unseal_timeout: None,
         s3_addr: None,
         code_token_minutes: None,
+        park_after: None,
     }
+}
+
+/// `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS`'s value (S10): 1 to 3 600 000 ms;
+/// anything else (unset, blank, 0, garbage, over an hour) is no knob.
+#[must_use]
+pub fn parse_park_after(value: Option<&str>) -> Option<Duration> {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| (1..=PARK_AFTER_MS_MAX).contains(ms)).map(Duration::from_millis)
 }
 
 /// The VM knobs from the environment (debug builds only).
@@ -276,6 +296,7 @@ pub fn vm_knobs() -> VmKnobs {
         unseal_timeout: crate::bridge::pump::parse_ms_knob(get(VM_KNOBS[4]).as_deref()),
         s3_addr: get(VM_KNOBS[5]).filter(|v| !v.trim().is_empty()),
         code_token_minutes: get(VM_KNOBS[6]).and_then(|v| v.trim().parse::<u16>().ok()),
+        park_after: parse_park_after(get(VM_KNOBS[7]).as_deref()),
         ..parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref())
     }
 }
@@ -397,6 +418,23 @@ mod tests {
         assert_eq!((minutes(1), minutes(15), minutes(0), minutes(16)), (Some(1), Some(15), None, None));
         assert_eq!(VmKnobs { code_token_minutes: Some(2), ..VmKnobs::default() }.active(), vec![VM_KNOBS[6]], "honoured, and announced, without the fake API");
         assert_eq!((parse_vm_knobs(None, None, None).s3_addr, parse_vm_knobs(None, None, None).code_token_minutes), (None, None), "set by vm_knobs alone");
+    }
+
+    /// S10's knob (§9): the park's quiet in ms, 1 to an hour, honoured and
+    /// announced without the fake API; anything else is no knob; never set
+    /// by `parse_vm_knobs`.
+    #[test]
+    fn the_s10_park_after_knob_is_ms_up_to_an_hour_and_announced() {
+        assert_eq!(VM_KNOBS[7], "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS");
+        assert_eq!(parse_park_after(Some("1")), Some(Duration::from_millis(1)));
+        assert_eq!(parse_park_after(Some(" 250 ")), Some(Duration::from_millis(250)));
+        assert_eq!(parse_park_after(Some("3600000")), Some(Duration::from_secs(3600)));
+        for off in [None, Some(""), Some("0"), Some("3600001"), Some("-5"), Some("1s")] {
+            assert_eq!(parse_park_after(off), None, "{off:?}");
+        }
+        let k = VmKnobs { park_after: Some(Duration::from_millis(250)), ..VmKnobs::default() };
+        assert_eq!(k.active(), vec![VM_KNOBS[7]], "announced, without the fake API");
+        assert_eq!(parse_vm_knobs(None, None, None).park_after, None, "set by vm_knobs alone");
     }
 
     #[cfg(debug_assertions)]

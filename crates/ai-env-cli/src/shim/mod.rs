@@ -112,6 +112,9 @@ pub struct ShimArgs {
     /// The curl the transcript transfers run as ai-env-net (S9; native tests point it at a fake)
     #[arg(long, value_name = "PATH", hide = true, default_value = health::CURL_DEFAULT)]
     pub curl: PathBuf,
+    /// The cold-start warm (S10, chosen from B0's numbers): off (the image's default), read or run
+    #[arg(long, value_enum, hide = true, default_value_t = health::ColdWarm::Off)]
+    pub cold_warm: health::ColdWarm,
     /// Worker role: the init that spawned us (exit when it dies)
     #[arg(long, value_name = "PID", hide = true)]
     pub init_pid: Option<u32>,
@@ -244,6 +247,7 @@ async fn serve(args: ShimArgs) -> Result<()> {
         curl: args.curl.clone(),
         net_uid: health::NET_UID,
         net_gid: health::NET_GID,
+        cold_warm: args.cold_warm,
     };
     let probe = health::ProbeSpec::for_agent(args.uid, args.gid);
     let state = Arc::new(health::ShimState::with(args.claude.clone(), opts, probe, Arc::new(sys::RealSys)));

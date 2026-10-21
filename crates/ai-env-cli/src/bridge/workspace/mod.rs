@@ -425,6 +425,9 @@ pub struct PreparedSeed {
     notes: Vec<String>,
     /// `HEAD`, `wip` and `index` as a finding names them, with their trees.
     labels: Vec<(String, String)>,
+    /// S10: where the seed comes from: `mac` (this Mac's HEAD and WIP:
+    /// [`prepare`]) or `box` (a dead VM's last fetch: [`prepare_from_box`]).
+    source: &'static str,
 }
 
 /// What [`PreparedSeed::summary`] shows (`box seed --dry-run --json`).
@@ -459,6 +462,13 @@ pub struct WipSummary {
 }
 
 impl PreparedSeed {
+    /// S10: where the seed comes from, `mac` or `box` (the `seed` audit row's
+    /// `source` on a move, and its `session_move_end`'s `seed`).
+    #[must_use]
+    pub fn source(&self) -> &'static str {
+        self.source
+    }
+
     /// What the seed carries, for the CLI.
     #[must_use]
     pub fn summary(&self) -> PreparedSummary {
@@ -620,6 +630,26 @@ fn prepare_inner(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, lim: &See
     // The rules before the snapshot: a cap's refusal shows a path they match as a finding does.
     let set = blobscan::ScanSet::load(paths, cfg, ws)?;
     let wip = if with_wip && ws.seed_branch.is_none() { snapshot::snapshot(ws, &scratch, lim, &set)? } else { None };
+    scanned(paths, scratch, Seeding { head, branch, wip, set, source: "mac" }, lim)
+}
+
+/// What a seed checks out, before its objects are listed and scanned
+/// ([`scanned`]): the commit and its branch, the WIP on it, the rules, and
+/// where it comes from (`mac`, `box`).
+struct Seeding {
+    head: String,
+    branch: Option<String>,
+    wip: Option<snapshot::Wip>,
+    set: blobscan::ScanSet,
+    source: &'static str,
+}
+
+/// A seed's first objects listed (D7: the head and its WIP, no history) and
+/// scanned (the tripwires, D8's repo settings over each tree, L9's dotenv
+/// rule over what the WIP adds) in `scratch`, the clean-object cache read:
+/// the seed [`ensure_workspace`] sends, or the scans' refusal.
+fn scanned(paths: &Paths, mut scratch: snapshot::Scratch, seeding: Seeding, lim: &SeedLimits) -> Result<PreparedSeed, BridgeError> {
+    let Seeding { head, branch, wip, set, source } = seeding;
     let git = scratch.git();
     let head_tree = line(&git.output(["rev-parse", "--verify", &format!("{head}^{{tree}}")]).map_err(git_failed("git rev-parse of the head's tree"))?);
     let list = pack::first_seed_objects(&scratch, &head, wip.as_ref())?;
@@ -632,13 +662,15 @@ fn prepare_inner(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, lim: &See
             labels.push(("index".into(), w.index_tree.clone()));
         }
     }
-    let mut cache = blobscan::CleanCache::open(paths, &set.digest, *object_format);
+    let mut cache = blobscan::CleanCache::open(paths, &set.digest, scratch.format());
     let mut scan = blobscan::scan_objects(&git, &list.objects, &set, &mut cache, lim.max_blob_bytes, &labels)?;
     let mut trees = Vec::new();
     for (label, tree) in &labels {
         trees.push((label.clone(), blobscan::tree_entries(&git, tree)?));
     }
-    blobscan::scan_settings(&git, &trees, &set, &|_| false, &mut scan)?;
+    // Bounded (S10 phase 4b, F4-WALK-2): a settings file over the cap is sized, never read; its `blob-too-large`
+    // repeats the objects' scan's for the same object, which the retain below keeps once.
+    blobscan::scan_settings_within(&git, &trees, &set, &|_| false, lim.max_blob_bytes, &mut scan)?;
     if let Some(w) = &wip {
         for (label, entries) in trees.iter().filter(|(l, _)| l != "HEAD") {
             blobscan::scan_dotenv(&git, &set, label, entries, &w.added, &mut scan)?;
@@ -654,7 +686,82 @@ fn prepare_inner(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, lim: &See
     notes.extend(scan.notes.iter().cloned());
     // The cancel covered the preparation; the sends that follow are the caller's to bound.
     scratch.cancel_on(None);
-    Ok(PreparedSeed { scratch, head, branch, wip, list, set, scan, notes, labels })
+    Ok(PreparedSeed { scratch, head, branch, wip, list, set, scan, notes, labels, source })
+}
+
+/// Where a move's or a reopen's seed comes from (S10 L7, §6.3), as
+/// [`carry_source`] decides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarrySource {
+    /// This Mac's HEAD and WIP ([`prepare`]); `note`: why the dead VM's work
+    /// is not carried, when it is not.
+    Mac { note: Option<String> },
+    /// The dead VM's last fetch ([`prepare_from_box`]); `note`: this Mac's
+    /// HEAD has commits the record lacks.
+    Box { record: rows::VmFetchRow, note: Option<String> },
+}
+
+/// Where the seed of a chat moving off `dead_vm` comes from (S10 L7, §6.3):
+/// its workspace row's record of that VM's last fetch
+/// (`WsRow.vm[<vm>].fetched`, ids the code-out promoted into this Mac's
+/// store). No record: this Mac, with a note (the VM's work was never
+/// fetched). A record without WIP whose head is this Mac's HEAD or an
+/// ancestor of it: this Mac (it holds everything). Anything else: the box
+/// record, noted when this Mac's HEAD has commits the record lacks. A record
+/// whose commits this Mac's store lacks is this Mac's, noted. Local only
+/// (git on this Mac): run it off the runtime's thread.
+#[must_use]
+pub fn carry_source(paths: &Paths, ws: &WorkspaceRef, dead_vm: &str) -> CarrySource {
+    let record = rows::row_of(paths, ws).ok().flatten().and_then(|r| r.vm.get(dead_vm).and_then(|v| v.fetched.clone())).filter(|f| !f.head.is_empty());
+    let Some(record) = record else {
+        return CarrySource::Mac { note: Some(format!("{dead_vm}'s work was never fetched: the moved chat's checkout is this Mac's HEAD and uncommitted changes")) };
+    };
+    let WsKind::Git { object_format, .. } = &ws.kind;
+    let git = GitRun::mac(&ws.root);
+    let holds = |id: &str| object_format.is_id(id) && holds_commit(&git, id).unwrap_or(false);
+    if !holds(&record.head) || record.wip.as_deref().is_some_and(|w| !holds(w)) {
+        return CarrySource::Mac { note: Some(format!("{dead_vm}'s last fetch is not in this Mac's repository: the moved chat's checkout is this Mac's HEAD and uncommitted changes")) };
+    }
+    let mac = ws.head.sha();
+    let ancestor = |a: &str, b: &str| a == b || git.succeeds(["merge-base", "--is-ancestor", a, b]).unwrap_or(false);
+    if record.wip.is_none() && ancestor(&record.head, mac) {
+        return CarrySource::Mac { note: None };
+    }
+    let note = (!ancestor(mac, &record.head)).then(|| format!("this Mac's HEAD has commits {dead_vm}'s last fetch lacks: the moved chat's checkout is that VM's work, without them"));
+    CarrySource::Box { record, note }
+}
+
+/// S10 (L7, §6.3): the seed of a moved chat's new VM from the dead VM's last
+/// fetch (`record`, as [`carry_source`] picked it): its head and branch
+/// (one `branch_check` refuses is left detached), its `refs/wip/*` snapshot
+/// as the WIP (`snapshot::box_wip`: the VM's worktree as the tree, the
+/// index from its second parent, the same shape as this Mac's WIP), in a
+/// scratch repository whose alternates read the user's object store, which
+/// holds what the code-out imported; then listed and scanned as [`prepare`]'s
+/// seed is (`source` `box`). No AWS call. Refused as `prepare` refuses (a
+/// cap, a finding), audited as it audits; a record whose commits this Mac's
+/// store lacks fails (`git_failed`).
+pub fn prepare_from_box(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, lim: &SeedLimits, record: &rows::VmFetchRow) -> Result<PreparedSeed, BridgeError> {
+    let result = prepare_box_inner(paths, cfg, ws, lim, record);
+    if let Err(BridgeError::WorkspaceRefused { code, .. }) = &result {
+        audit(paths, audit_event::SEED_REFUSED, &[("workspace", ws.cwd.display().to_string()), ("code", (*code).to_string()), ("step", "prepare".into()), ("source", "box".into())]);
+    }
+    result
+}
+
+fn prepare_box_inner(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, lim: &SeedLimits, record: &rows::VmFetchRow) -> Result<PreparedSeed, BridgeError> {
+    let WsKind::Git { common_dir, object_format, .. } = &ws.kind;
+    if !object_format.is_id(&record.head) || record.wip.as_deref().is_some_and(|w| !object_format.is_id(w)) {
+        return Err(BridgeError::WorkspaceFailed { code: refusal::GIT_FAILED, message: "the dead VM's fetch record names no commit id of the workspace's format".into() });
+    }
+    let scratch = snapshot::Scratch::new(paths, "seed", &common_dir.join("objects"), *object_format)?;
+    let branch = record.branch.clone().filter(|b| branch_check(b).is_ok());
+    let set = blobscan::ScanSet::load(paths, cfg, ws)?;
+    let wip = match &record.wip {
+        Some(w) => snapshot::box_wip(&scratch, &record.head, w, lim, &set)?,
+        None => None,
+    };
+    scanned(paths, scratch, Seeding { head: record.head.clone(), branch, wip, set, source: "box" }, lim)
 }
 
 // `prepare` runs on a blocking thread and its seed comes back to the runtime (the wrapper's P1, `vm warm`).
@@ -679,7 +786,8 @@ pub struct EnsureCtx<'a, A, D, T> {
     /// [`SeedLimits::wrapper`] in the wrapper, [`SeedLimits::cli`] elsewhere.
     pub lim: SeedLimits,
     /// Back by then (the wrapper's T0 + 50 s): a seed that cannot make it is
-    /// `WorkspaceFailed { code::TOO_SLOW_FOR_INIT }`, naming `vm warm` and `box seed`.
+    /// `WorkspaceFailed { code::TOO_SLOW_FOR_INIT }`, naming `vm warm` and `box seed`
+    /// (S10: a carry seed in a move's window is refused, `too_large`, naming `session migrate`).
     pub deadline: Option<tokio::time::Instant>,
     /// Where each step is reported (the CLI prints, the wrapper logs).
     pub progress: &'a (dyn Fn(SeedProgress) + Sync),
@@ -692,6 +800,9 @@ pub enum SeedWant {
     Auto,
     /// `box seed --replace`: check the VM out anew (a pristine VM only, else 409 `not_pristine`).
     Replace,
+    /// S10 (§6.3): a move's or a reopen's carry seed: a VM never seeded gets a clone, a pristine one a
+    /// replace (its checkout anew), any other keeps its state (another chat moved here first).
+    Carry,
 }
 
 /// A step of a seed, as it happens.
@@ -744,6 +855,8 @@ pub enum KeptReason {
     Ahead,
     /// Neither is an ancestor of the other.
     Diverged,
+    /// S10: a carry seed found the VM seeded and no longer pristine: another chat moved here first.
+    Occupied,
 }
 
 impl KeptReason {
@@ -754,6 +867,7 @@ impl KeptReason {
             KeptReason::Dirty => "dirty",
             KeptReason::Ahead => "ahead",
             KeptReason::Diverged => "diverged",
+            KeptReason::Occupied => "occupied",
         }
     }
 }
@@ -767,7 +881,11 @@ pub const SEED_LOCK_BUDGET: Duration = Duration::from_secs(600);
 /// The note D3's kept state shows (plan §5), naming why.
 #[must_use]
 pub fn kept_note(reason: KeptReason) -> String {
-    format!("the VM keeps its state ({}): ai-env box fetch shows what changed", reason.word())
+    let why = match reason {
+        KeptReason::Occupied => "another chat moved here first",
+        other => other.word(),
+    };
+    format!("the VM keeps its state ({why}): ai-env box fetch shows what changed")
 }
 
 /// The Mac's side of D3: what a seed would check out.
@@ -822,7 +940,9 @@ pub enum Decision {
 /// nothing uncommitted: up to date); anything else is kept: a VM with changes
 /// of its own (a VM seeded with a WIP is one) is `dirty`, one whose tip the
 /// Mac lacks or that M is an ancestor of is `ahead`, any other (another
-/// branch, no common line) `diverged`.
+/// branch, no common line) `diverged`. S10's carry ([`SeedWant::Carry`]):
+/// the same seed is up to date, a pristine VM is replaced, any other kept
+/// (`occupied`: another chat moved here first).
 #[must_use]
 pub fn decide(state: &SeedState, mac: &MacSeed<'_>, ancestry: &Ancestry, want: SeedWant) -> Decision {
     let Some(record) = &state.record else {
@@ -838,6 +958,13 @@ pub fn decide(state: &SeedState, mac: &MacSeed<'_>, ancestry: &Ancestry, want: S
             Some(_) if same && state.pristine => Decision::UpToDate,
             Some(tip) if state.pristine => Decision::Replace { tip },
             _ => Decision::Refuse { code: refusal::NOT_PRISTINE, message: "the VM's checkout changed since its seed: --replace takes only a VM unchanged since then (ai-env box fetch shows what changed)".into() },
+        };
+    }
+    if want == SeedWant::Carry {
+        return match tip {
+            _ if same => Decision::UpToDate,
+            Some(tip) if state.pristine => Decision::Replace { tip },
+            _ => Decision::Kept(KeptReason::Occupied),
         };
     }
     if same {
@@ -874,7 +1001,8 @@ pub fn decide(state: &SeedState, mac: &MacSeed<'_>, ancestry: &Ancestry, want: S
 /// runs before a byte leaves the Mac. Refused: a finding
 /// (`WorkspaceRefused { code::FINDING }`, exit 9), uncommitted changes over a
 /// cap (`code::WIP_TOO_LARGE`, exit 9), the VM's refusals by the shim's code
-/// (`dataplane::verdict`); failed: a seed the deadline cannot fit
+/// (`dataplane::verdict`), S10's carry seed over its cap or the move's window
+/// (`too_large`, exit 9); failed: a seed the deadline cannot fit
 /// (`WorkspaceFailed { code::TOO_SLOW_FOR_INIT }`, exit 1), a git run (the
 /// wire's `git_failed` or `timeout`, exit 1). Held under the workspace's
 /// seed lock (never `<slug>.lock`); a 409 `changed` reads the state once
@@ -923,7 +1051,7 @@ pub async fn ensure_workspace<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: 
             }
             Decision::Kept(reason) => {
                 let event = seed_event(ctx, &prepared, "kept", 0, &state, Some(*reason));
-                return Ok(kept(ctx, event, *reason).await);
+                return Ok(kept(ctx, event, *reason, want).await);
             }
             Decision::Refuse { code, message } => return Err(refused(ctx, BridgeError::WorkspaceRefused { code, message: message.clone() })),
             Decision::Clone => (SeedMode::Clone, None),
@@ -932,9 +1060,11 @@ pub async fn ensure_workspace<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: 
         };
         let (paths, lim, ws, vm) = (ctx.paths.clone(), ctx.lim, ctx.ws.clone(), ctx.target.vm_id.clone());
         let d = decision.clone();
+        // S10 §6.3: the VM's own `.git/shallow` report first, the row's list otherwise.
+        let reported = state.shallow.clone();
         let (p, built) = blocking(move || {
             let built = match &d {
-                Decision::Update { tip, seeded } => prepared.update_body(&paths, tip, seeded, &rows::boundary(&paths, &ws, &vm, tip, seeded), &lim),
+                Decision::Update { tip, seeded } => prepared.update_body(&paths, tip, seeded, &rows::boundary_reported(reported.as_deref(), &paths, &ws, &vm, tip, seeded), &lim),
                 _ => prepared.first_body(lim.max_bytes).map(|b| b.map_or(Built::OverCap, Built::Body)),
             };
             (prepared, built)
@@ -943,18 +1073,18 @@ pub async fn ensure_workspace<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: 
         prepared = p;
         let body = match built? {
             Built::Body(b) => b,
-            Built::OverCap => return Err(refused(ctx, over_cap(ctx))),
+            Built::OverCap => return Err(refused(ctx, over_cap(ctx, want))),
             Built::Refused(e) => return Err(refused(ctx, e)),
             Built::NoUpdate => {
                 let event = seed_event(ctx, &prepared, "kept", 0, &state, Some(KeptReason::Diverged));
-                return Ok(kept(ctx, event, KeptReason::Diverged).await);
+                return Ok(kept(ctx, event, KeptReason::Diverged, want).await);
             }
         };
         (ctx.progress)(SeedProgress::Packed { bytes: body.len });
         if let Some(deadline) = ctx.deadline {
             let need = Duration::from_millis(body.len.saturating_mul(1000) / SEED_RATE);
             if tokio::time::Instant::now() + need > deadline {
-                return Err(too_slow(ctx, body.len));
+                return Err(refused(ctx, too_slow(ctx, body.len, want)));
             }
         }
         let query = SeedQuery { path: ctx.ws.vm_root.clone(), mode, branch: prepared.branch.clone(), detached: prepared.branch.is_none(), expect: expect.clone() };
@@ -981,13 +1111,18 @@ pub async fn ensure_workspace<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: 
                 // The boundary the VM's `.git/shallow` gained, and the seed it was planned on: the next update walks its graph.
                 let event = rows::SeedEvent { shallow: body.manifest.shallow.clone(), base: state.record.as_ref().map(|r| r.head.clone()), ..seed_event(ctx, &prepared, mode.name(), len, &state, None) };
                 record(ctx, event).await;
-                audit(ctx.paths, audit_event::SEED, &[("vm", ctx.target.vm_id.clone()), ("outcome", outcome.word().into()), ("mode", mode.name().into()), ("bytes", len.to_string()), ("ms", ms.to_string()), ("workspace", ctx.ws.cwd.display().to_string())]);
+                let mut pairs = vec![("vm", ctx.target.vm_id.clone()), ("outcome", outcome.word().into()), ("mode", mode.name().into()), ("bytes", len.to_string()), ("ms", ms.to_string()), ("workspace", ctx.ws.cwd.display().to_string())];
+                // S10: a carry seed says where it came from.
+                if want == SeedWant::Carry {
+                    pairs.push(("source", prepared.source.into()));
+                }
+                audit(ctx.paths, audit_event::SEED, &pairs);
                 return Ok(outcome);
             }
             Ok((reply, Verdict::Kept { reason, state: vm })) => {
                 let _ = reply;
                 let event = seed_event(ctx, &prepared, "kept", 0, &vm.unwrap_or(state), Some(reason));
-                return Ok(kept(ctx, event, reason).await);
+                return Ok(kept(ctx, event, reason, want).await);
             }
             Ok((_, Verdict::Reread { error })) if !reread => {
                 tracing::info!("PUT /seed: {error}; reading the VM's state again");
@@ -1010,11 +1145,16 @@ async fn seed_state<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &EnsureCtx
     }
 }
 
-/// D3's kept outcome: recorded (`event`, the VM's state's), audited, its note.
-async fn kept<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, event: rows::SeedEvent, reason: KeptReason) -> EnsureOutcome {
+/// D3's kept outcome: recorded (`event`, the VM's state's), audited (S10: a
+/// carry seed's row says `source` `kept`), its note.
+async fn kept<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, event: rows::SeedEvent, reason: KeptReason, want: SeedWant) -> EnsureOutcome {
     let vm_head = event.vm_head.clone().unwrap_or_default();
     record(ctx, event).await;
-    audit(ctx.paths, audit_event::SEED, &[("vm", ctx.target.vm_id.clone()), ("outcome", "kept".into()), ("kept", reason.word().into()), ("workspace", ctx.ws.cwd.display().to_string())]);
+    let mut pairs = vec![("vm", ctx.target.vm_id.clone()), ("outcome", "kept".into()), ("kept", reason.word().into()), ("workspace", ctx.ws.cwd.display().to_string())];
+    if want == SeedWant::Carry {
+        pairs.push(("source", "kept".into()));
+    }
+    audit(ctx.paths, audit_event::SEED, &pairs);
     EnsureOutcome::Kept { reason, vm_head, note: kept_note(reason) }
 }
 
@@ -1027,19 +1167,29 @@ fn refused<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, e: BridgeError) -> BridgeError
 }
 
 /// A seed body over its cap: the wrapper's (a deadline bounds it) is left to
-/// `vm warm` and `box seed`; the CLI's names its flag.
-fn over_cap<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>) -> BridgeError {
+/// `vm warm` and `box seed`; the CLI's names its flag; S10's carry seed (a
+/// move's, within its window) is refused as the CLI's is (exit 9: a failed
+/// move's seed step is 7, 8 or 9), naming `ai-env session migrate`, which
+/// moves a chat with no deadline.
+fn over_cap<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, want: SeedWant) -> BridgeError {
     let cap = snapshot::human_bytes(ctx.lim.max_bytes);
     let ws = ctx.ws.cwd.display();
-    if ctx.deadline.is_some() {
+    if want == SeedWant::Carry {
+        BridgeError::WorkspaceRefused { code: refusal::TOO_LARGE, message: format!("the carry seed is over {cap}: ai-env session migrate moves the chat without that cap") }
+    } else if ctx.deadline.is_some() {
         BridgeError::WorkspaceFailed { code: code::TOO_SLOW_FOR_INIT, message: format!("the seed is over {cap} ([seed].wrapper_inline_mib): `ai-env vm warm {ws}` or `ai-env box seed {ws}` from a terminal seeds it") }
     } else {
         BridgeError::WorkspaceRefused { code: refusal::TOO_LARGE, message: format!("the seed is over {cap} (box seed --max-mib, [seed].max_mib)") }
     }
 }
 
-/// A seed the wrapper's deadline cannot fit at [`SEED_RATE`].
-fn too_slow<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, bytes: u64) -> BridgeError {
+/// A seed the wrapper's deadline cannot fit at [`SEED_RATE`] (S10: a carry
+/// seed's, the move's window: refused, exit 9, naming `ai-env session
+/// migrate`).
+fn too_slow<A, D, T>(ctx: &EnsureCtx<'_, A, D, T>, bytes: u64, want: SeedWant) -> BridgeError {
+    if want == SeedWant::Carry {
+        return BridgeError::WorkspaceRefused { code: refusal::TOO_LARGE, message: format!("the carry seed of {} does not fit the move's window: ai-env session migrate moves the chat without it", snapshot::human_bytes(bytes)) };
+    }
     let ws = ctx.ws.cwd.display();
     BridgeError::WorkspaceFailed {
         code: code::TOO_SLOW_FOR_INIT,

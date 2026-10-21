@@ -340,7 +340,7 @@ impl FakeVm {
         let head_tree = git(&self.dir, &["rev-parse", "HEAD^{tree}"]);
         let index_tree = git(&self.dir, &["write-tree"]);
         let pristine = tip == record.head && self.worktree_tree() == record.wip_tree.clone().unwrap_or_else(|| head_tree.clone()) && index_tree == record.index_tree.clone().unwrap_or(head_tree);
-        SeedState { record: Some(record), tip: Some(tip), branch, clean, pristine }
+        SeedState { record: Some(record), tip: Some(tip), branch, clean, pristine, shallow: None }
     }
 
     /// Leave the WIP of `m` uncommitted: the worktree the WIP's tree, the

@@ -58,7 +58,44 @@
 //! - **Suspend.** After `event hook_suspend` the session never dials on its
 //!   own: it polls GetMicrovm every 3 s and reattaches once RUNNING, or gives
 //!   up after `suspend_wait` naming `ai-env vm resume` and `ai-env vm attach`
-//!   (exit 8). `event hook_terminate` is `Terminated`.
+//!   (exit 8, `StayedSuspended`): `vm exec`, `vm attach`, and a wrapper
+//!   session without a park control. A parking session parks instead (below).
+//!   `event hook_terminate` is `Terminated`.
+//! - **Park** (S10 §D, a wrapper session with a `park::ParkCtl`,
+//!   [`super::run_spawn_parked`]). On a socket whose `hello_ok` names
+//!   `park_v1`, with the spawn attached, no rotation in flight, nothing queued
+//!   (stdin, a signal, a detach, EOF), everything delivered marked consumed
+//!   and acked, the pump's verdict (`park::QuietState`) `Idle` or `Prompt`
+//!   for the policy's `after`, the session's own stdio quiet as long, and the
+//!   code-out trigger quiet, the session sends `park` and waits
+//!   `answer_wait` for the answer (none: the socket is lost). Parked, it
+//!   sends nothing on that socket: no ping, no WebSocket Ping, no keep-alive,
+//!   no rotation, no re-mint, and its dead-socket and sleep checks are off.
+//!   The next `park` waits `after` past the last one, refused or unanswered
+//!   (`session_park_refused` at most once per `PARK_REFUSED_LOG_EVERY`), and
+//!   a socket lost before its `park` was answered starts a new reconnect
+//!   episode: a shim that never answers costs a reconnect per `after`.
+//!   Input, or output on the open socket, unparks: `unpark` and a `ping`, the
+//!   socket lost unless a `pong` or a `stdin_ack` comes within `probe`;
+//!   input during the handshake waits for the answer and unparks right after
+//!   `parked`. The parked socket's end (the shim or the endpoint closed it)
+//!   leaves the spawn parked with no socket, and so does `event hook_suspend`
+//!   once the spawn ran (no `suspend_wait`, no exit 8): the next input asks
+//!   GetMicrovm (TERMINATED: `Terminated`), dials (the endpoint's
+//!   auto-resume, or one ResumeMicrovm), resumes the spawn with `hello` and
+//!   sends the queue; no Touch ID. A suspend of a spawn the shim had not
+//!   parked (its detach grace runs again once the VM runs) also reattaches
+//!   once GetMicrovm, asked from 3 s on, doubling to every 60 s, says
+//!   RUNNING: idle, it is parked `suspended`; a turn at work, or a shim
+//!   without `park_v1`, reports no park but its link down, as S9's suspend
+//!   does, with no limit. The host's
+//!   EOF ends a session parked with no socket at once (`parked_close`, exit
+//!   0, no dial, no GetMicrovm): its claude stays on the VM for the next
+//!   start there to reap. A signal waits for the next socket, a detach ends
+//!   the session at once. Each step is a `SpawnEvent::Park` and an audit row
+//!   (`session_park`, `session_unpark`, `session_park_refused`); without
+//!   `park_v1` the session never parks, keeps the VM awake as S9's does, and
+//!   says `Off { no_cap }` once.
 //! - **End.** `exit` is delivered as `SpawnEvent::Exit`; once the consumer
 //!   marked every chunk this session delivered (at most `dead_after`) the
 //!   exit's seq is acked, which releases the spawn, and the socket is closed 1000.
@@ -110,9 +147,17 @@ use futures_util::future::BoxFuture;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+// S10 §D: the park.
+use super::ParkReport;
+use crate::bridge::park::{ParkCtl, Verdict, PARK_REFUSED_LOG_EVERY};
+use crate::bridge::remote::audit_event::{SESSION_PARK, SESSION_PARK_REFUSED, SESSION_UNPARK};
+use crate::wire::frame::{ParkRefusal, CAP_PARK_V1};
 
-/// [`super::run_spawn`]'s body (see the module doc).
-pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo, delivery: Option<Delivery>) -> Result<SpawnOutcome, BridgeError> {
+/// [`super::run_spawn`]'s body (see the module doc). `park` (S10 §D): a
+/// wrapper session's park control ([`super::run_spawn_parked`]): with it the
+/// session parks when idle and resumes a suspended VM at the next input;
+/// without it, it runs as S9's.
+pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, start: Start, io: SpawnIo, delivery: Option<Delivery>, park: Option<crate::bridge::park::ParkCtl>) -> Result<SpawnOutcome, BridgeError> {
     // D1, for every caller (`vm exec` and `vm attach` refuse such rows before any call too).
     if env.target.shell {
         return Err(BridgeError::Policy(format!(
@@ -129,7 +174,21 @@ pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, sta
     }
     crate::wire::redact::register_secret(env.target.session_token.expose());
     let token = mint_token(env).await?;
-    let mut session = Session { env, io, trace: Trace::from_env(env.paths), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery, cred_retried: false, cred_suspended: false, claude: None };
+    let mut session = Session {
+        env,
+        io,
+        trace: Trace::from_env(env.paths),
+        token,
+        st: State::new(start),
+        attached: false,
+        paused: false,
+        control_open: true,
+        delivery,
+        cred_retried: false,
+        cred_suspended: false,
+        claude: None,
+        park: park.map(Parking::new),
+    };
     session.run().await
 }
 
@@ -143,6 +202,88 @@ enum End {
     Suspended,
     /// The consumer's `detach` went out.
     Detached,
+    /// S10 §D: the spawn stays parked with no socket until the next input:
+    /// the parked socket ended, or (`frozen`) the VM was suspended under the
+    /// session (`event hook_suspend`). `watch`: the shim had not parked the
+    /// spawn, whose detach grace runs again once the VM runs, so the VM
+    /// RUNNING again is reattached too (GetMicrovm from 3 s on, doubling to
+    /// every 60 s); `down`: no park was reported but the link down, and the
+    /// reattach is a reconnect.
+    Parked { frozen: bool, watch: bool, down: bool },
+}
+
+// ---- S10 §D: the park ------------------------------------------------------------------
+
+/// Where a parking session's park stands on the socket that carries the spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Park {
+    /// Not parked: the session keeps the VM awake as S9's does.
+    No,
+    /// `park` went out: its answer is awaited until `until`. `why` and
+    /// `quiet_ms` are the park's; `woke` is the first input, or output, that
+    /// came meanwhile: it waits for the answer, and unparks right after `parked`.
+    Asking { until: Instant, why: &'static str, quiet_ms: u64, woke: Option<&'static str> },
+    /// Parked: the socket stays open, and silent.
+    Parked,
+}
+
+/// An unpark under way: since when, why (`session_unpark.by`), and the VM's
+/// state then. Reported once a socket carries the spawn again.
+#[derive(Debug, Clone, Copy)]
+struct Unparking {
+    since: Instant,
+    by: &'static str,
+    vm_state: &'static str,
+}
+
+/// A parking session's control ([`ParkCtl`]) and its bookkeeping.
+struct Parking {
+    ctl: ParkCtl,
+    /// The last `hello_ok` named `park_v1`.
+    served: bool,
+    /// `ParkReport::Off` went out (once a session).
+    off_said: bool,
+    at: Park,
+    /// When the session's own stdin, stdout or stderr last moved.
+    last_io: Instant,
+    /// No park before this: `after` past the last `park` sent, or past its refusal.
+    not_before: Option<Instant>,
+    /// When the last `session_park_refused` row went out.
+    refused_logged: Option<Instant>,
+    unparking: Option<Unparking>,
+    /// The open socket's unpark probe: lost unless a `pong` or a `stdin_ack` comes by then.
+    probe_until: Option<Instant>,
+}
+
+impl Parking {
+    fn new(ctl: ParkCtl) -> Parking {
+        Parking { ctl, served: false, off_said: false, at: Park::No, last_io: Instant::now(), not_before: None, refused_logged: None, unparking: None, probe_until: None }
+    }
+}
+
+/// `session_unpark.vm_state` of a VM in `state` (a VM on its way back from a suspend counts as suspended).
+fn vm_state_word(state: &VmState) -> &'static str {
+    match state {
+        VmState::Suspended | VmState::Pending => "suspended",
+        VmState::Suspending => "suspending",
+        _ => "running",
+    }
+}
+
+/// `park_refused.reason`'s word (the census's and the audit's).
+fn refusal_word(reason: ParkRefusal) -> &'static str {
+    match reason {
+        ParkRefusal::Busy => "busy",
+        ParkRefusal::Output => "output",
+        ParkRefusal::Unacked => "unacked",
+        ParkRefusal::NotAttached => "not_attached",
+        ParkRefusal::Other => "other",
+    }
+}
+
+/// `d` in whole milliseconds.
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What a socket's reader task reports.
@@ -559,6 +700,8 @@ struct Session<'e, 'a, A: MicrovmApi, E: EndpointClient> {
     /// carries it when `spawned` (or a reattach) names none (S8: the remote
     /// link compares it with `authwatch::AUTH_TIMERS`).
     claude: Option<String>,
+    /// S10 §D: a wrapper session's park (none: S9's session, which never parks).
+    park: Option<Parking>,
 }
 
 impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
@@ -580,6 +723,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 self.link(true);
                 self.audit("agent_reconnect", &[("reason", why), ("ms", ms)]);
             }
+            // S10: an unpark that had to dial is done once a socket carries the spawn again.
+            self.unparked();
             match self.serve(&mut link).await? {
                 End::Exited(seq, exit) => return Ok(self.finish(link, seq, exit).await),
                 End::Detached => {
@@ -587,7 +732,10 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     return Err(BridgeError::Transport(format!("detached from spawn {}", self.st.id)));
                 }
                 End::Lost(why) => {
-                    if carried.elapsed() >= self.env.policy.stable_after {
+                    // S10: a socket lost to its park's handshake starts a new episode however short it lived
+                    // (`send_park` spaces those losses by `after`); its dials still count against the budget.
+                    let handshake = self.park.as_ref().is_some_and(|p| matches!(p.at, Park::Asking { .. }));
+                    if handshake || carried.elapsed() >= self.env.policy.stable_after {
                         retry = Retry::new(&self.env.policy);
                     }
                     drop(link);
@@ -604,6 +752,17 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     self.wait_resumed().await?;
                     retry = Retry::new(&self.env.policy);
                     lost = Some((Instant::now(), "suspended".into()));
+                }
+                End::Parked { frozen, watch, down } => {
+                    link.close(CLOSE_NORMAL).await;
+                    if let Some(outcome) = self.wait_parked(frozen, watch, down).await? {
+                        return Ok(outcome);
+                    }
+                    retry = Retry::new(&self.env.policy);
+                    // A suspend that reported no park took the link down: its reattach is a reconnect, as after S9's.
+                    if down {
+                        lost = Some((Instant::now(), "suspended".into()));
+                    }
                 }
             }
         }
@@ -639,6 +798,10 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     let mut link = Link::start(conn);
                     // A rotation in flight when the last socket was lost died with it.
                     (self.attached, self.paused) = (false, false);
+                    // S10: a hello that resumes the spawn unparks it on the shim; a park in flight died with its socket.
+                    if let Some(p) = &mut self.park {
+                        (p.at, p.probe_until) = (Park::No, None);
+                    }
                     self.adopt(&ok, &mut link).await?;
                     match link.broken.take() {
                         None => return Ok(link),
@@ -810,7 +973,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 Err(e) => tracing::warn!("vm {id}: GetMicrovm while suspended: {e}"),
             }
             if start.elapsed() >= env.policy.suspend_wait {
-                return Err(BridgeError::Transport(format!(
+                return Err(BridgeError::StayedSuspended(format!(
                     "{id} stayed suspended for {}: resume it with `ai-env vm resume {id}`, then reattach with `ai-env vm attach {id} --spawn {}`",
                     secs(env.policy.suspend_wait),
                     self.st.id
@@ -819,10 +982,154 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         }
     }
 
+    /// S10 §D: parked with no socket (`frozen`: the VM was suspended under
+    /// the session). Nothing goes out until input comes: a detach ends the
+    /// session at once, a signal waits for the next socket, and the host's
+    /// EOF ends it at once too (`parked_close`, exit 0: nothing dialed, no
+    /// GetMicrovm; its claude stays on the VM for the next start there to
+    /// reap, or its grace to end). A stdin chunk unparks: GetMicrovm (a VM
+    /// gone is the session's `Terminated` or `VmNotFound`, which the pump
+    /// moves), then `Ok(None)`: the caller dials (the endpoint's
+    /// auto-resume, or one ResumeMicrovm), resumes the spawn with `hello`
+    /// and sends the queue. No Touch ID: the runtime key is in memory, and
+    /// claude keeps its token. An unpark that was under way as the VM was
+    /// suspended, or stdin the shim never acknowledged, is input there
+    /// already: the VM is resumed at once. With `watch` (a spawn the shim
+    /// had not parked) GetMicrovm is asked meanwhile, never a dial: 3 s after
+    /// the suspend, then twice as long each time up to 60 s (3, 9, 21, 45, 93
+    /// s, then every 60 s: a chat left open after a suspend costs no poll
+    /// every 3 s until its wall); the VM RUNNING again (someone resumed it) is
+    /// `Ok(None)` too, well within the spawn's detach grace (900 s, which runs
+    /// only once the VM runs), and a VM gone ends the session.
+    /// With `down` no park was reported, so no unpark is either: the
+    /// caller's reattach is a reconnect.
+    async fn wait_parked(&mut self, frozen: bool, watch: bool, down: bool) -> Result<Option<SpawnOutcome>, BridgeError> {
+        let there = self.park.as_ref().is_some_and(|p| p.unparking.is_some()) || !self.st.pending.is_empty();
+        let id = self.vm().to_string();
+        // The watch's GetMicrovm backs off: 3 units, doubling to 60.
+        let (mut every, cap) = (units(&self.env.policy, 3), units(&self.env.policy, 60));
+        let mut look = tokio::time::Instant::now() + every;
+        let eof = loop {
+            if self.st.eof.is_some() {
+                break true;
+            }
+            if there {
+                break false;
+            }
+            let input = tokio::select! {
+                m = self.io.control.recv(), if self.control_open => match m {
+                    Some(input) => input,
+                    None => {
+                        self.control_open = false;
+                        continue;
+                    }
+                },
+                m = self.io.input.recv(), if self.st.wants_input() => match m {
+                    Some(input) => input,
+                    // The host's stdin ended: its EOF.
+                    None => {
+                        self.st.input_open = false;
+                        SpawnInput::StdinEof
+                    }
+                },
+                () = tokio::time::sleep_until(look), if watch => {
+                    every = every.saturating_mul(2).min(cap);
+                    look = tokio::time::Instant::now() + every;
+                    match self.env.api.get(&id).await {
+                        Ok(vm) if vm.state == VmState::Running => {
+                            self.ran_again(&id, down);
+                            return Ok(None);
+                        }
+                        Ok(vm) if vm.state.is_terminal() => return Err(terminated(&vm)),
+                        Ok(_) => {}
+                        Err(e @ BridgeError::VmNotFound(_)) => return Err(e),
+                        Err(e) => tracing::warn!("vm {id}: GetMicrovm while suspended: {e}"),
+                    }
+                    continue;
+                },
+                // Nothing more can come (stdin's window full, the control channel gone): the queue goes out.
+                else => break false,
+            };
+            match input {
+                SpawnInput::Detach { .. } => return Err(self.detached_while_disconnected()),
+                // No socket to drop.
+                SpawnInput::DropSocket => {}
+                SpawnInput::Stdin(_) => {
+                    self.st.take(input);
+                    break false;
+                }
+                // A signal waits for the next socket; the EOF is judged at the loop's top.
+                other => self.st.take(other),
+            }
+        };
+        if eof {
+            return Ok(Some(self.parked_close()));
+        }
+        let since = Instant::now();
+        let vm_state = match self.env.api.get(&id).await {
+            Ok(vm) if vm.state.is_terminal() => return Err(terminated(&vm)),
+            Ok(vm) => vm_state_word(&vm.state),
+            Err(e @ BridgeError::VmNotFound(_)) => return Err(e),
+            // The dial asks again, by the reconnect rules.
+            Err(e) => {
+                tracing::warn!("vm {id}: GetMicrovm before an unpark: {e}");
+                if frozen {
+                    "suspended"
+                } else {
+                    "running"
+                }
+            }
+        };
+        if down {
+            self.note(format!("input for spawn {} while {id} is {vm_state}: reconnecting", self.st.id));
+            return Ok(None);
+        }
+        let by = self.input_word();
+        // An unpark under way keeps its start and its cause; the VM's state is the one now.
+        let unparking = match self.park.as_ref().and_then(|p| p.unparking) {
+            Some(u) => Unparking { vm_state, ..u },
+            None => Unparking { since, by, vm_state },
+        };
+        if let Some(p) = &mut self.park {
+            p.unparking = Some(unparking);
+        }
+        self.note(format!("unparking spawn {} ({}): {id} is {vm_state}", self.st.id, unparking.by));
+        Ok(None)
+    }
+
+    /// With no socket, the VM runs again and no input came (someone resumed
+    /// it): the spawn is reattached before its detach grace runs out. A park
+    /// that was reported is unparked by it (`by` `other`, the VM `running`);
+    /// with `down` the reattach is a reconnect.
+    fn ran_again(&mut self, id: &str, down: bool) {
+        self.note(format!("{id} runs again: reattaching spawn {}", self.st.id));
+        if let Some(p) = self.park.as_mut().filter(|_| !down) {
+            p.unparking = Some(Unparking { since: Instant::now(), by: "other", vm_state: "running" });
+        }
+    }
+
+    /// The host's EOF while parked with no socket (S10 §3.3): the session
+    /// ends at once, exit 0, nothing dialed. Its claude stays on the VM,
+    /// frozen with it while it is suspended (parked under its owner when the
+    /// shim had parked it), until the next start there reaps it or its grace
+    /// ends.
+    fn parked_close(&self) -> SpawnOutcome {
+        self.note(format!("closed while parked: spawn {} stays on {} (the next start there reaps it, or its grace ends it)", self.st.id, self.vm()));
+        SpawnOutcome { spawn_id: self.st.id.clone(), exit: RemoteExit { code: Some(0), signal: None, stderr_dropped: self.st.err_dropped, stdout_truncated: false }, parked_close: true }
+    }
+
     /// A `hello_ok`: the spawn goes out (again), or what became of it.
     async fn adopt(&mut self, ok: &HelloOk, link: &mut Link) -> Result<(), BridgeError> {
         if ok.claude_version.is_some() {
             self.claude.clone_from(&ok.claude_version);
+        }
+        // S10: whether this shim parks; a parking session on one that does not says so once.
+        if let Some(p) = &mut self.park {
+            p.served = ok.caps.iter().any(|c| c == CAP_PARK_V1);
+            if !p.served && !std::mem::replace(&mut p.off_said, true) {
+                tracing::info!("vm {}: no {CAP_PARK_V1} in hello_ok: this session never parks", self.env.target.vm_id);
+                let _ = self.io.events.send(SpawnEvent::Park(ParkReport::Off { why: "no_cap" }));
+            }
         }
         if self.st.phase == Phase::ToSpawn {
             self.no_pending_detach()?;
@@ -872,7 +1179,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 self.send_spawn(link).await;
                 Ok(())
             }
-            ResumeStatus::Unknown => Err(BridgeError::Transport(format!("spawn {} is not on {} (it ended, or its detach grace ran out while disconnected)", self.st.id, self.vm()))),
+            ResumeStatus::Unknown => Err(BridgeError::SpawnGone(format!("spawn {} is not on {} (it ended, or its detach grace ran out while disconnected)", self.st.id, self.vm()))),
         }
     }
 
@@ -991,8 +1298,11 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                             return Ok(end);
                         }
                     }
+                    // S10: the parked socket's end is no loss: the spawn stays parked, with no socket.
+                    Some(Inbound::Ended(why)) if self.parked_here() => return Ok(self.parked_socket_gone(link.n, &why)),
                     Some(Inbound::Ended(why)) => return Ok(End::Lost(why)),
                     Some(Inbound::Bad(m)) => return Err(BridgeError::Protocol(m)),
+                    None if self.parked_here() => return Ok(self.parked_socket_gone(link.n, "the socket's reader stopped")),
                     None => return Ok(End::Lost("the socket's reader stopped".into())),
                 },
                 r = pending_or(&mut rot.step) => {
@@ -1025,6 +1335,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     }
                 },
                 m = self.io.control.recv(), if self.control_open => match m {
+                    // S10: a parked socket dropped leaves the spawn parked, with no socket.
+                    Some(SpawnInput::DropSocket) if self.parked_here() => return Ok(self.parked_socket_gone(link.n, "dropped by session drop-transport")),
                     // S8 `session drop-transport`: this socket goes as a lost one would, the spawn stays.
                     Some(SpawnInput::DropSocket) if self.attached => return Ok(End::Lost("dropped by session drop-transport".into())),
                     Some(input) => self.on_input(input, link).await,
@@ -1044,18 +1356,26 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     }
                 },
                 _ = tick.tick() => {
+                    // S10: parked, the socket is silent by design: neither check below holds then, nor
+                    // while an unpark's probe (a `pong` or a `stdin_ack` within `probe`) judges the socket.
+                    let quiet = self.parked_here() || self.probing();
                     // A laptop sleep stops Instant but not the wall clock: the socket did not survive it.
                     let asleep = wall_now().saturating_sub(clock.1).saturating_sub(clock.0.elapsed());
                     clock = (Instant::now(), wall_now());
-                    if asleep > p.dead_after {
+                    if asleep > p.dead_after && !quiet {
                         return Ok(End::Lost(format!("woke after {} asleep", secs(asleep))));
                     }
                     let idle = link.activity.idle();
-                    if idle > p.dead_after {
+                    if idle > p.dead_after && !quiet {
                         return Ok(End::Lost(format!("no frame for {}", secs(idle))));
                     }
+                    // S10: no answer to the park, or to the unpark's ping: the socket counts as lost.
+                    if let Some(why) = self.park_overdue() {
+                        return Ok(End::Lost(why));
+                    }
                     self.ack(link, true).await;
-                    if self.attached {
+                    // S10: from the park's request on, nothing keeps the VM awake (no ping, no keep-alive, no rotation).
+                    if self.attached && self.unparked_here() {
                         if pinged.elapsed() >= p.ping {
                             link.send(&Frame::Ping { ts: crate::wire::time::unix_now_ms() }).await;
                             pinged = Instant::now();
@@ -1074,13 +1394,263 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                             rot.after = None;
                         }
                     }
-                    // A failed mint never ends a live socket: the next reconnect mints again.
-                    if rot.step.is_none() && remint_after.is_none_or(|t| Instant::now() >= t) && self.freshen().await?.is_some() {
+                    // S10: a park, once everything says the chat is quiet.
+                    if let Some((why, quiet_ms)) = self.park_due(rot.step.is_some()) {
+                        self.send_park(link, why, quiet_ms).await;
+                    }
+                    // A failed mint never ends a live socket: the next reconnect mints again. Parked, nothing is minted.
+                    if rot.step.is_none() && !self.parked_here() && remint_after.is_none_or(|t| Instant::now() >= t) && self.freshen().await?.is_some() {
                         remint_after = Some(Instant::now() + p.backoff_max);
                     }
                 }
             }
         }
+    }
+
+    // ---- S10 §D: the park on this socket --------------------------------------------------
+
+    /// Parked on the socket that carries the spawn.
+    fn parked_here(&self) -> bool {
+        self.park.as_ref().is_some_and(|p| p.at == Park::Parked)
+    }
+
+    /// Neither parked nor asking to: the session keeps the VM awake (S9's behaviour).
+    fn unparked_here(&self) -> bool {
+        self.park.as_ref().is_none_or(|p| p.at == Park::No)
+    }
+
+    /// An unpark's probe runs on this socket.
+    fn probing(&self) -> bool {
+        self.park.as_ref().is_some_and(|p| p.probe_until.is_some())
+    }
+
+    /// No answer to the park within `answer_wait`, or neither a `pong` nor a
+    /// `stdin_ack` within `probe` of an unpark: why the socket counts as lost.
+    fn park_overdue(&self) -> Option<String> {
+        let p = self.park.as_ref()?;
+        let now = Instant::now();
+        if let Park::Asking { until, .. } = p.at {
+            if now >= until {
+                return Some(format!("no answer to park within {}", secs(p.ctl.policy.answer_wait)));
+            }
+        }
+        p.probe_until.filter(|t| now >= *t).map(|_| format!("no pong or stdin_ack within {} of the unpark", secs(p.ctl.policy.probe)))
+    }
+
+    /// Whether the session parks now (S10 §3.3), and why (`idle`, `prompt`)
+    /// with the quiet before it: `park_v1` named and the spawn attached; no
+    /// rotation in flight (`rotating`); nothing queued (stdin unacked, a
+    /// signal, a detach, EOF); everything delivered marked consumed and
+    /// acked; the pump's verdict `Idle` or `Prompt` since at least `after`;
+    /// the session's own stdio as quiet; the code-out trigger quiet; and no
+    /// back-off (`after` past the last park asked, or its refusal) or unpark
+    /// under way.
+    fn park_due(&self, rotating: bool) -> Option<(&'static str, u64)> {
+        let p = self.park.as_ref()?;
+        if !p.served || p.at != Park::No || p.probe_until.is_some() || p.unparking.is_some() || p.not_before.is_some_and(|t| Instant::now() < t) {
+            return None;
+        }
+        let st = &self.st;
+        if !self.attached || self.paused || rotating || st.phase != Phase::Running {
+            return None;
+        }
+        if !st.pending.is_empty() || !st.signals.is_empty() || st.detach.is_some() || st.eof.is_some() {
+            return None;
+        }
+        let (out, err) = self.io.consumed.seqs();
+        if out < st.delivered.0 || err < st.delivered.1 || st.acked != (out.min(st.out), err.min(st.err)) {
+            return None;
+        }
+        let q = *p.ctl.quiet.borrow();
+        let why = match q.verdict {
+            Verdict::Idle => "idle",
+            Verdict::Prompt => "prompt",
+            Verdict::Busy => return None,
+        };
+        let quiet = q.since.elapsed().min(p.last_io.elapsed());
+        (quiet >= p.ctl.policy.after && p.ctl.trigger.quiet()).then_some((why, ms(quiet)))
+    }
+
+    /// `park` for the spawn, with the policy's terms and this wrapper as its
+    /// owner; its answer is awaited. The next park waits `after` past this
+    /// one whatever comes of it: a shim that never answers, or drops the
+    /// socket on a `park`, costs one reconnect per `after`, never a loop
+    /// through the reconnect budget (`run` starts a new reconnect episode at
+    /// a socket lost to its park's handshake, however short it lived).
+    async fn send_park(&mut self, link: &mut Link, why: &'static str, quiet_ms: u64) {
+        let Some(p) = &mut self.park else { return };
+        let pol = p.ctl.policy;
+        let frame = Frame::Park { spawn_id: self.st.id.clone(), grace_s: pol.grace_s, min_quiet_s: pol.min_quiet_s, cpu_busy_ms: pol.cpu_busy_ms, hold_output: pol.hold_output, owner: p.ctl.owner };
+        if link.send(&frame).await {
+            tracing::info!("vm {}: asking to park spawn {} ({why}, quiet {quiet_ms} ms, socket {})", self.env.target.vm_id, self.st.id, link.n);
+            let now = Instant::now();
+            (p.at, p.not_before) = (Park::Asking { until: now + pol.answer_wait, why, quiet_ms, woke: None }, Some(now + pol.after));
+        }
+    }
+
+    /// `parked`: no frame goes out on this socket until an unpark. Input that
+    /// came during the handshake unparks at once.
+    async fn on_parked(&mut self, link: &mut Link, quiet_s: u32, procs: u32) {
+        let Some(Park::Asking { why, quiet_ms, woke, .. }) = self.park.as_ref().map(|p| p.at) else {
+            tracing::info!(quiet_s, procs, "vm {}: a parked answer to no park: ignored", self.vm());
+            return;
+        };
+        if let Some(p) = &mut self.park {
+            p.at = Park::Parked;
+        }
+        self.parked(why, quiet_ms, &format!("socket {}, the shim's quiet {quiet_s} s, {procs} more processes", link.n));
+        if let Some(by) = woke {
+            self.unpark_open(link, by).await;
+            self.flush(link).await;
+        }
+    }
+
+    /// `park_refused`: tried again `after` later; what came meanwhile goes out.
+    async fn on_park_refused(&mut self, link: &mut Link, reason: ParkRefusal, quiet_s: u32, procs: u32, cpu_ms: u64) {
+        let word = refusal_word(reason);
+        let Some(p) = self.park.as_mut().filter(|p| matches!(p.at, Park::Asking { .. })) else {
+            tracing::info!(reason = word, "vm {}: a park_refused answer to no park: ignored", self.env.target.vm_id);
+            return;
+        };
+        let now = Instant::now();
+        p.at = Park::No;
+        p.not_before = Some(now + p.ctl.policy.after);
+        let log = p.refused_logged.is_none_or(|at| now.duration_since(at) >= PARK_REFUSED_LOG_EVERY);
+        if log {
+            p.refused_logged = Some(now);
+        }
+        tracing::info!("vm {}: the shim refused to park spawn {} ({word}: quiet {quiet_s} s, {procs} more processes, busiest sample {cpu_ms} ms)", self.env.target.vm_id, self.st.id);
+        let _ = self.io.events.send(SpawnEvent::Park(ParkReport::Refused { reason: word }));
+        if log {
+            self.park_audit(SESSION_PARK_REFUSED, &[("reason", word.to_string()), ("procs", procs.to_string()), ("cpu_ms", cpu_ms.to_string())]);
+        }
+        self.flush(link).await;
+    }
+
+    /// The spawn parked (`why`: `idle`, `prompt`, `suspended`): its report, its row, a note.
+    fn parked(&mut self, why: &'static str, quiet_ms: u64, detail: &str) {
+        let _ = self.io.events.send(SpawnEvent::Park(ParkReport::Parked { why, quiet_ms }));
+        self.park_audit(SESSION_PARK, &[("why", why.to_string()), ("quiet_ms", quiet_ms.to_string())]);
+        self.note(format!("parked spawn {} ({why} for {}; {detail})", self.st.id, secs(Duration::from_millis(quiet_ms))));
+    }
+
+    /// The quiet before a park that came with a suspend (the pump's clock or the session's own, the shorter).
+    fn quiet_ms(&self) -> u64 {
+        self.park.as_ref().map_or(0, |p| ms(p.ctl.quiet.borrow().since.elapsed().min(p.last_io.elapsed())))
+    }
+
+    /// Input (`by`) or output while parked, or during the handshake: an
+    /// unpark on the open socket, or one right after `parked`.
+    async fn wake(&mut self, link: &mut Link, by: &'static str) {
+        match self.park.as_ref().map(|p| p.at) {
+            Some(Park::Parked) => self.unpark_open(link, by).await,
+            Some(Park::Asking { .. }) => {
+                if let Some(Park::Asking { woke, .. }) = self.park.as_mut().map(|p| &mut p.at) {
+                    woke.get_or_insert(by);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `unpark` and a `ping` on the open socket: it carries the spawn again
+    /// once a `pong` or a `stdin_ack` comes, within `probe` (else it is lost).
+    async fn unpark_open(&mut self, link: &mut Link, by: &'static str) {
+        let id = self.st.id.clone();
+        if let Some(p) = &mut self.park {
+            let now = Instant::now();
+            (p.at, p.probe_until, p.unparking) = (Park::No, Some(now + p.ctl.policy.probe), Some(Unparking { since: now, by, vm_state: "running" }));
+        }
+        tracing::info!("vm {}: unparking spawn {id} ({by}) on socket {}", self.vm(), link.n);
+        link.send(&Frame::Unpark { spawn_id: id }).await;
+        link.send(&Frame::Ping { ts: crate::wire::time::unix_now_ms() }).await;
+    }
+
+    /// A `pong` or a `stdin_ack`: an unpark's probe is answered.
+    fn probe_answered(&mut self) {
+        if let Some(p) = self.park.as_mut().filter(|p| p.probe_until.is_some()) {
+            p.probe_until = None;
+            self.unparked();
+        }
+    }
+
+    /// An unpark is done (a socket carries the spawn again): its report, its row, a note.
+    fn unparked(&mut self) {
+        let Some(u) = self.park.as_mut().and_then(|p| p.unparking.take()) else { return };
+        let took = ms(u.since.elapsed());
+        let _ = self.io.events.send(SpawnEvent::Park(ParkReport::Unparked { by: u.by, vm_state: u.vm_state, ms: took }));
+        self.park_audit(SESSION_UNPARK, &[("by", u.by.to_string()), ("vm_state", u.vm_state.to_string()), ("ms", took.to_string())]);
+        self.note(format!("unparked spawn {} ({}; the VM was {}) in {took} ms", self.st.id, u.by, u.vm_state));
+    }
+
+    /// The parked socket ended (the shim or the endpoint closed it, or a drop-transport): parked with no socket.
+    fn parked_socket_gone(&self, n: u64, why: &str) -> End {
+        self.note(format!("the parked socket {n} ended ({why}); spawn {} stays parked until the next input", self.st.id));
+        End::Parked { frozen: false, watch: false, down: false }
+    }
+
+    /// `event hook_suspend`. A parking session whose spawn ran waits with no
+    /// socket, never on `suspend_wait` and never exit 8; the next input
+    /// resumes the VM. A spawn the shim holds parked lives its park grace,
+    /// and input alone ends the wait. One it does not hold parked lives its
+    /// detach grace once the VM runs again, so RUNNING again ends the wait
+    /// too (`watch`): idle (`park_v1` named, the pump's verdict `Idle` or
+    /// `Prompt`), it is parked `suspended`; a turn at work, or a shim without
+    /// `park_v1`, reports no park but its link down (`down`), as S9's
+    /// suspend does. An unpark under way stays one: its input is there
+    /// already, and the next socket carries it. Before the spawn ran, and
+    /// without a park control, the session waits for RUNNING (S9).
+    fn on_hook_suspend(&mut self) -> End {
+        let Some(p) = self.park.as_ref().filter(|_| self.st.started) else {
+            return End::Suspended;
+        };
+        let watch = !self.parked_here() && p.unparking.is_none();
+        let idle = p.served && p.ctl.quiet.borrow().verdict != Verdict::Busy;
+        let down = watch && !idle;
+        if watch && idle {
+            let quiet_ms = self.quiet_ms();
+            self.parked("suspended", quiet_ms, "the VM was suspended under it");
+        }
+        if let Some(p) = &mut self.park {
+            (p.at, p.probe_until) = (Park::No, None);
+        }
+        let vm = self.vm();
+        if down {
+            self.note(format!("{vm} was suspended under spawn {}: not reconnecting until it runs again or input comes (`ai-env vm resume {vm}`)", self.st.id));
+            self.link(false);
+        } else {
+            self.note(format!("{vm} was suspended: spawn {} stays parked until the next input{}", self.st.id, if watch { ", or until the VM runs again" } else { "" }));
+        }
+        End::Parked { frozen: true, watch, down }
+    }
+
+    /// The pump's last forwarded host kind (`session_unpark.by` for input).
+    fn input_word(&self) -> &'static str {
+        self.park.as_ref().and_then(|p| p.ctl.quiet.borrow().last_host).unwrap_or("other")
+    }
+
+    /// Input's `session_unpark.by` (`None`: none unparks).
+    fn wake_word(&self, input: &SpawnInput) -> Option<&'static str> {
+        match input {
+            SpawnInput::Stdin(_) => Some(self.input_word()),
+            SpawnInput::StdinEof => Some("eof"),
+            SpawnInput::Signal(_) | SpawnInput::Detach { .. } => Some("signal"),
+            SpawnInput::DropSocket => None,
+        }
+    }
+
+    /// The session's own stdio moved (a park waits for `after` of quiet).
+    fn moved(&mut self) {
+        if let Some(p) = &mut self.park {
+            p.last_io = Instant::now();
+        }
+    }
+
+    /// A park row: the VM, the spawn, then `pairs` (§4.2).
+    fn park_audit(&self, event: &str, pairs: &[(&str, String)]) {
+        let mut all = vec![("vm", self.vm().to_string()), ("spawn", self.st.id.to_string())];
+        all.extend(pairs.iter().cloned());
+        audit_event(self.env.paths, event, &all);
     }
 
     /// One frame from the shim; `Some` when it ends this socket's service.
@@ -1160,12 +1730,30 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 }
                 return Err(BridgeError::Protocol(format!("the shim refused spawn {spawn_id} ({}): {}", wire_name(&code), scrub(&message))));
             }
-            Frame::Stdout { seq, data, .. } => self.deliver_out(seq, &data)?,
-            Frame::Stderr { seq, data, dropped, .. } => self.deliver_err(seq, &data, dropped)?,
+            // S10: new output is the session's own stdio moving, and it unparks (`output`).
+            Frame::Stdout { seq, data, .. } => {
+                let before = self.st.out;
+                self.deliver_out(seq, &data)?;
+                if self.st.out != before {
+                    self.moved();
+                    self.wake(link, "output").await;
+                }
+            }
+            Frame::Stderr { seq, data, dropped, .. } => {
+                let before = self.st.err;
+                self.deliver_err(seq, &data, dropped)?;
+                if self.st.err != before {
+                    self.moved();
+                    self.wake(link, "output").await;
+                }
+            }
             Frame::StdinAck { seq, .. } => {
                 self.st.stdin_acked(seq);
+                // S10: a `stdin_ack` proves the socket after an unpark.
+                self.probe_answered();
                 self.flush(link).await;
             }
+            Frame::Pong { .. } => self.probe_answered(),
             Frame::Exit { seq, code, signal, stderr_dropped, stdout_truncated, .. } => {
                 if self.st.out_known && seq > self.st.out + 1 {
                     return Err(BridgeError::Protocol(format!("spawn {} exited at stdout seq {seq} but its stdout stopped at {}", self.st.id, self.st.out)));
@@ -1174,7 +1762,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 let _ = self.io.events.send(SpawnEvent::Exit(exit));
                 return Ok(Some(End::Exited(seq, exit)));
             }
-            Frame::Event { kind: EventKind::HookSuspend, .. } => return Ok(Some(End::Suspended)),
+            Frame::Event { kind: EventKind::HookSuspend, .. } => return Ok(Some(self.on_hook_suspend())),
             Frame::Event { kind: EventKind::HookTerminate, .. } => return Err(BridgeError::Terminated(format!("{} is terminating (event hook_terminate)", self.vm()))),
             Frame::Error { code: ErrorCode::Superseded, .. } if self.paused => *superseded = true,
             Frame::Error { code: ErrorCode::Superseded, .. } => return Err(BridgeError::Superseded(format!("spawn {} of {}", self.st.id, self.vm()))),
@@ -1183,6 +1771,9 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             Frame::Error { code: ErrorCode::Draining, .. } => return Err(BridgeError::Terminated(format!("{} is draining", self.vm()))),
             Frame::Error { code: ErrorCode::UnknownFrame | ErrorCode::Other, message, .. } => tracing::info!("vm {}: the shim reported: {}", self.vm(), scrub(&message)),
             Frame::Error { code, message, .. } => return Err(BridgeError::Protocol(format!("the shim reported {}: {}", wire_name(&code), scrub(&message)))),
+            // S10 §D: the park's answers; outside a handshake they are logged and ignored.
+            Frame::Parked { quiet_s, procs, .. } => self.on_parked(link, quiet_s, procs).await,
+            Frame::ParkRefused { reason, quiet_s, procs, cpu_ms, .. } => self.on_park_refused(link, reason, quiet_s, procs, cpu_ms).await,
             other => tracing::debug!("vm {}: ignoring {other:?}", self.vm()),
         }
         Ok(None)
@@ -1232,12 +1823,18 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
     }
 
     async fn on_input(&mut self, input: SpawnInput, link: &mut Link) {
+        // S10: input unparks; during the park's handshake it waits for the answer.
+        if let Some(by) = self.wake_word(&input) {
+            self.wake(link, by).await;
+        }
         self.st.take(input);
         self.flush(link).await;
     }
 
+    /// The socket carries the spawn and may say so: not while a rotation's
+    /// hello is out, and (S10) not from a park's request until an unpark.
     fn can_send(&self) -> bool {
-        self.attached && !self.paused
+        self.attached && !self.paused && self.unparked_here()
     }
 
     /// Everything that waits for a socket carrying the spawn: stdin within
@@ -1254,12 +1851,14 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             }
             self.st.sent_in = seq;
             self.st.inflight += len;
+            self.moved();
         }
         if let Some(seq) = self.st.eof.filter(|eof| !self.st.eof_sent && self.st.sent_in >= *eof) {
             if !link.send(&Frame::StdinEof { spawn_id: self.st.id.clone(), seq }).await {
                 return;
             }
             self.st.eof_sent = true;
+            self.moved();
         }
         while let Some(&sig) = self.st.signals.front() {
             if !link.send(&Frame::Signal { spawn_id: self.st.id.clone(), sig, scope: Scope::Group }).await {
@@ -1339,7 +1938,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             tracing::info!("vm {}: spawn {} exited; the consumer did not confirm its output, so the exit stays unacked (the shim keeps it for its grace)", self.vm(), self.st.id);
         }
         link.close(CLOSE_NORMAL).await;
-        SpawnOutcome { spawn_id: self.st.id.clone(), exit }
+        SpawnOutcome { spawn_id: self.st.id.clone(), exit, parked_close: false }
     }
 
     // ---- waiting while disconnected -----------------------------------------------------
@@ -1840,6 +2439,8 @@ mod tests {
                 SpawnEvent::Note(n) => self.notes.push(n),
                 SpawnEvent::Link(up) => self.links.push(up),
                 SpawnEvent::Exit(e) => self.exit = Some(e),
+                // S10: no session here parks.
+                SpawnEvent::Park(_) => {}
             }
         }
     }
@@ -1933,7 +2534,7 @@ mod tests {
     /// A session as `run` builds it (a fresh token), before its first socket.
     async fn session<'e, 'a>(env: &'e AgentEnv<'a, FakeMicrovmApi, FakeMicrovmApi>, io: SpawnIo, start: Start) -> Session<'e, 'a, FakeMicrovmApi, FakeMicrovmApi> {
         let token = mint_token(env).await.unwrap();
-        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None }
+        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None, park: None }
     }
 
     /// A socket to the rig's endpoint with the session's token, and the endpoint's end of it.
@@ -2605,6 +3206,9 @@ mod tests {
             let text = e.to_string();
             let vm = &rig.vm.id;
             assert!(text.contains(&format!("ai-env vm resume {vm}")) && text.contains(&format!("ai-env vm attach {vm} --spawn {id}")), "{text}");
+            // S10: `vm exec`'s policy (no park control): `StayedSuspended`, the one loss the pump never moves.
+            assert!(matches!(e, BridgeError::StayedSuspended(_)), "{e:?}");
+            assert_eq!(crate::bridge::remote::link::LossCause::of(&e), crate::bridge::remote::link::LossCause::Suspended);
             assert_eq!(CliError::from(e).exit_code(), 8);
             assert_eq!(rig.endpoint.attempts().len(), 1);
         })
@@ -2626,6 +3230,9 @@ mod tests {
             let (result, _, _ws) = tokio::join!(run_spawn(&env, Start::New(cat_spec()), sio), consume(cio, None, Duration::ZERO), shim);
             let e = result.unwrap_err();
             assert!(matches!(e, BridgeError::Terminated(_)), "{e}");
+            // S10: `vm exec` exits 8 on it; a wrapper's pump moves the chat to a new VM (`VmGone`).
+            assert_eq!(crate::bridge::remote::link::LossCause::of(&e), crate::bridge::remote::link::LossCause::VmGone);
+            assert_eq!(CliError::from(e).exit_code(), 8);
         })
         .await;
     }
@@ -2917,6 +3524,8 @@ mod tests {
             let (result, _) = cat_session(&rig, &cat, policy(), lines(5), Duration::from_millis(2)).await;
             let e = result.unwrap_err();
             assert!(matches!(e, BridgeError::Terminated(_)), "{e}");
+            // S10: a wrapper's pump moves the chat to a new VM (`VmGone`); `vm exec` exits 8.
+            assert_eq!(crate::bridge::remote::link::LossCause::of(&e), crate::bridge::remote::link::LossCause::VmGone);
             assert_eq!(CliError::from(e).exit_code(), 8);
         })
         .await;
@@ -4273,11 +4882,11 @@ mod tests {
                 super::super::Delivery::new(&crate::bridge::egress::GatePass::for_tests("microvm-other", now), "microvm-other", now, parts(Some(cred_value()), false)).unwrap()
             };
             let (sio, _cio) = spawn_channels(8);
-            let e = super::run(&env, Start::New(cat_spec()), sio, Some(other())).await.unwrap_err();
+            let e = super::run(&env, Start::New(cat_spec()), sio, Some(other()), None).await.unwrap_err();
             assert!(matches!(&e, BridgeError::Policy(m) if m.contains("microvm-other")), "{e}");
             let (sio, _cio) = spawn_channels(8);
             let attach = Start::Attach { spawn_id: SpawnId::new_v7(), from_seq: None, err_from_seq: None };
-            let e = super::run(&env, attach, sio, Some(delivery(&rig, Some(cred_value()), false))).await.unwrap_err();
+            let e = super::run(&env, attach, sio, Some(delivery(&rig, Some(cred_value()), false)), None).await.unwrap_err();
             assert!(matches!(&e, BridgeError::Policy(m) if m.contains("new spawn")), "{e}");
             let e = super::super::credential::deliver_only(&env, other()).await.unwrap_err();
             assert!(matches!(&e, BridgeError::Policy(m) if m.contains("microvm-other")), "{e}");
@@ -4424,5 +5033,1048 @@ mod tests {
             assert_value_off_disk(&throttled);
         })
         .await;
+    }
+
+    /// S10 §D, against the scripted shim: a parking session's handshake,
+    /// what it sends while parked (nothing), its unparks on the open socket
+    /// and after a redial, the suspend and the close while parked, the park
+    /// golden, and `agent::stop_spawn`.
+    mod p_tests {
+        use super::*;
+        use crate::bridge::agent::{run_spawn_parked, stop_spawn, ParkReport};
+        use crate::bridge::codeout::{CodeoutCtx, CodeoutTrigger};
+        use crate::bridge::config::BridgeConfig;
+        use crate::bridge::park::{ParkCtl, ParkPolicy, QuietState, Verdict};
+        use crate::wire::frame::{ParkOwner, ParkRefusal, CAP_PARK_V1};
+        use tokio::sync::watch;
+
+        /// The wrapper every `park` names here (the golden's).
+        const OWNER: ParkOwner = ParkOwner { pid: 51_234, started: 1_792_483_200 };
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        /// The park's terms here: the golden's grace, window, threshold and
+        /// owner; a quiet of `after` ms; a 500 ms probe and a 2 s answer wait.
+        fn terms(after: u64) -> ParkPolicy {
+            ParkPolicy { after: ms(after), grace_s: 30_600, min_quiet_s: 30, cpu_busy_ms: 500, hold_output: false, probe: ms(500), answer_wait: Duration::from_secs(2) }
+        }
+
+        /// The test's side of a parking control: the pump's quiet, and the
+        /// generation's code-out trigger (idle unless asked).
+        struct Pump {
+            quiet: watch::Sender<QuietState>,
+            trigger: CodeoutTrigger,
+            fetch_lock: std::path::PathBuf,
+        }
+
+        impl Pump {
+            /// The pump forwarded a line: `verdict` from now on, `last_host` the last host frame's kind.
+            fn line(&self, verdict: Verdict, last_host: Option<&'static str>) {
+                self.quiet.send_replace(QuietState { verdict, since: tokio::time::Instant::now(), last_host });
+            }
+        }
+
+        /// A parking control on `rig`'s VM under `policy`, idle since now.
+        fn park_ctl(rig: &Rig, policy: ParkPolicy) -> (ParkCtl, Pump) {
+            use crate::bridge::workspace::{Head, WorkspaceRef, WsKind};
+            let (tx, rx) = watch::channel(QuietState { verdict: Verdict::Idle, since: tokio::time::Instant::now(), last_host: None });
+            let ws = WorkspaceRef {
+                cwd: "/nonexistent/park".into(),
+                root: "/nonexistent/park".into(),
+                vm_cwd: "/nonexistent/park".into(),
+                vm_root: "/nonexistent/park".into(),
+                slug: "-nonexistent-park".into(),
+                kind: WsKind::Git { git_dir: "/nonexistent/park/.git".into(), common_dir: "/nonexistent/park/.git".into(), object_format: crate::wire::workspace::ObjectFormat::Sha1 },
+                head: Head::Detached { sha: "a".repeat(40) },
+                seed_branch: None,
+            };
+            let fetch_lock = rig.paths.workspace_fetch_lock(&ws.slug);
+            let target = AgentTarget { vm_id: rig.vm.id.clone(), endpoint: "x".into(), session_token: Secret::new("t".into()), vpc: true, shell: false };
+            let (dp, tokens) = (Arc::new(crate::bridge::dataplane::Unreached), Arc::new(crate::bridge::dataplane::Unreached));
+            let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: rig.api.clone(), dp, tokens, paths: rig.paths.clone(), cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false, transcript: None });
+            (ParkCtl { quiet: rx, trigger: trigger.watch(), policy, owner: OWNER }, Pump { quiet: tx, trigger, fetch_lock })
+        }
+
+        /// What a parking session told its consumer, as it came.
+        #[derive(Debug, Default)]
+        struct Told {
+            stdout: Vec<u8>,
+            notes: Vec<String>,
+            links: Vec<bool>,
+            parks: Vec<ParkReport>,
+            exit: Option<RemoteExit>,
+        }
+
+        impl Told {
+            /// The parks reported so far.
+            fn parked(&self) -> usize {
+                self.parks.iter().filter(|r| matches!(r, ParkReport::Parked { .. })).count()
+            }
+        }
+
+        /// Every event into `told` until the session ends, stdout marked consumed as it comes.
+        async fn consume_into(events: &mut mpsc::UnboundedReceiver<SpawnEvent>, consumed: &Consumed, told: &Mutex<Told>) {
+            while let Some(ev) = events.recv().await {
+                let mut t = told.lock().unwrap();
+                match ev {
+                    SpawnEvent::Stdout { seq, bytes } => {
+                        t.stdout.extend(bytes);
+                        consumed.stdout_done(seq);
+                    }
+                    SpawnEvent::Stderr { seq, .. } => consumed.stderr_done(seq),
+                    SpawnEvent::Note(n) => t.notes.push(n),
+                    SpawnEvent::Link(up) => t.links.push(up),
+                    SpawnEvent::Park(r) => t.parks.push(r),
+                    SpawnEvent::Exit(e) => t.exit = Some(e),
+                    SpawnEvent::Started { .. } => {}
+                }
+            }
+        }
+
+        /// Until `f` holds of what the consumer was told (within `LIMIT`).
+        async fn until(told: &Mutex<Told>, what: &str, f: impl Fn(&Told) -> bool) {
+            let deadline = Instant::now() + LIMIT;
+            while !f(&told.lock().unwrap()) {
+                assert!(Instant::now() < deadline, "{what}: {:?}", told.lock().unwrap());
+                tokio::time::sleep(ms(5)).await;
+            }
+        }
+
+        /// The next text frame, app pings included (WebSocket Pings and Pongs skipped).
+        async fn next_frame(ws: &mut Ws) -> Frame {
+            loop {
+                match tokio::time::timeout(LIMIT, ws.next()).await.expect("a frame in time").expect("open").expect("readable") {
+                    Message::Text(t) => return Frame::from_json(t.as_str()).unwrap(),
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+
+        /// The next frame that is no ack (acks of what the consumer marked may come any time).
+        async fn next_but_acks(ws: &mut Ws) -> Frame {
+            loop {
+                match next_frame(ws).await {
+                    Frame::Ack { .. } => continue,
+                    f => return f,
+                }
+            }
+        }
+
+        /// Everything that reaches the shim within `d`: every frame and every WebSocket Ping or Pong.
+        async fn arrivals_within(ws: &mut Ws, d: Duration) -> Vec<String> {
+            let until = tokio::time::Instant::now() + d;
+            let mut got = Vec::new();
+            while let Ok(Some(m)) = tokio::time::timeout_at(until, ws.next()).await {
+                got.push(match m {
+                    Ok(Message::Text(t)) => t.as_str().to_string(),
+                    Ok(other) => format!("{other:?}"),
+                    Err(e) => format!("the socket failed: {e}"),
+                });
+            }
+            got
+        }
+
+        /// A `hello_ok` of a shim that parks (and caches credentials), with these spawns and answers to the resume.
+        fn hello_ok_parks(spawns: Vec<SpawnStatus>, resumed: Vec<Resumed>) -> Frame {
+            let Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, credential, .. } = hello_ok(vec![], vec![]) else { unreachable!() };
+            Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, caps: vec![CAP_CREDENTIAL_CACHE.to_string(), CAP_PARK_V1.to_string()], credential }
+        }
+
+        /// hello → hello_ok (a shim that parks) → spawn → spawned: the spawn's id.
+        async fn start_parking(ws: &mut Ws) -> SpawnId {
+            assert!(matches!(next_frame(ws).await, Frame::Hello { .. }));
+            put(ws, &hello_ok_parks(vec![], vec![])).await;
+            let Frame::Spawn { spawn_id, .. } = next_frame(ws).await else { panic!("no spawn") };
+            put(ws, &Frame::Spawned { spawn_id: spawn_id.clone(), pid: 4242, pgid: 4242, claude_version: None }).await;
+            spawn_id
+        }
+
+        /// The session's `park`, as these tests' terms make it.
+        fn park(id: &SpawnId) -> Frame {
+            Frame::Park { spawn_id: id.clone(), grace_s: 30_600, min_quiet_s: 30, cpu_busy_ms: 500, hold_output: false, owner: OWNER }
+        }
+
+        fn parked(id: &SpawnId) -> Frame {
+            Frame::Parked { spawn_id: id.clone(), quiet_s: 1, procs: 0 }
+        }
+
+        /// The `ts` of an unpark's probe (`unpark`, then a `ping`), answered `pong`.
+        async fn answer_unpark(ws: &mut Ws, id: &SpawnId) {
+            assert_eq!(next_but_acks(ws).await, Frame::Unpark { spawn_id: id.clone() }, "an unpark first");
+            let Frame::Ping { ts } = next_frame(ws).await else { panic!("a ping beside the unpark") };
+            put(ws, &Frame::Pong { ts }).await;
+        }
+
+        /// stdin `seq` (`text`) is acked and echoed as stdout `seq`.
+        async fn echo(ws: &mut Ws, id: &SpawnId, seq: u64, text: &str) {
+            match next_but_acks(ws).await {
+                Frame::Stdin { spawn_id, seq: got, data } => assert_eq!((spawn_id, got, decode(&data).unwrap()), (id.clone(), seq, text.as_bytes().to_vec())),
+                other => panic!("stdin {seq}, got {other:?}"),
+            }
+            put(ws, &Frame::StdinAck { spawn_id: id.clone(), seq }).await;
+            put(ws, &Frame::Stdout { spawn_id: id.clone(), seq, data: Chunk { text: Some(text.into()), b64: None } }).await;
+        }
+
+        /// The host's EOF (stdin seq `eof`) is answered with the exit (`exit_seq`), whose ack follows.
+        async fn exit_on_eof(ws: &mut Ws, id: &SpawnId, eof: u64, exit_seq: u64) {
+            assert_eq!(next_but_acks(ws).await, Frame::StdinEof { spawn_id: id.clone(), seq: eof });
+            put(ws, &exit0(id, exit_seq)).await;
+            loop {
+                if let Frame::Ack { seq, .. } = next_frame(ws).await {
+                    if seq == exit_seq {
+                        break;
+                    }
+                }
+            }
+        }
+
+        /// The platform's `/suspend` under the socket `ws`: the VM SUSPENDED,
+        /// then `event hook_suspend` and Close 1001, as the shim sends them.
+        async fn suspend_under(rig: &Rig, ws: &mut Ws) {
+            rig.api.set_state(&rig.vm.id, VmState::Suspended);
+            put(ws, &Frame::Event { kind: EventKind::HookSuspend, at: "2026-10-20T12:00:00Z".into(), reference: None }).await;
+            ws.close(Some(CloseFrame { code: CloseCode::from(CLOSE_GOING_AWAY), reason: "suspend".into() })).await.unwrap();
+        }
+
+        /// The session's redial once someone resumed its VM: within 5 s (its
+        /// GetMicrovm poll, 3 s doubling to 60 s, is 30 ms doubling to 600
+        /// ms here), else the test fails then.
+        async fn redialed(rig: &Rig) -> Ws {
+            tokio::time::timeout(Duration::from_secs(5), rig.endpoint.next()).await.expect("a redial within the poll once the VM ran again")
+        }
+
+        /// The park golden's probe `ts` (the Mac's clock: the session's own is put in).
+        const GOLDEN_TS: &str = "\"ts\":1792484100000";
+
+        /// What the golden's reader heard of the session so far: the probe's `ts`, the last ack.
+        #[derive(Default)]
+        struct Heard {
+            ts: Option<u64>,
+            last_ack: Option<String>,
+        }
+
+        /// The session's frames up to the golden's next shim line (as many as
+        /// `want` holds), as the golden spells them: its host (`host`, this
+        /// Mac's, put back) and its probe `ts`. A reattach's ack of what the
+        /// old socket acked (S6's, no golden line) is skipped.
+        async fn golden_read(ws: &mut Ws, want: &[String], host: &str, heard: &mut Heard) -> Vec<String> {
+            let mut got = Vec::new();
+            while got.len() < want.len() {
+                let Message::Text(t) = ws.next().await.unwrap().unwrap() else { continue };
+                let mut text = t.as_str().replace(host, "\"host\":\"mike@mbp\"");
+                match Frame::from_json(&text).unwrap() {
+                    Frame::Ping { ts } => {
+                        heard.ts = Some(ts);
+                        text = text.replace(&format!("\"ts\":{ts}"), GOLDEN_TS);
+                    }
+                    Frame::Ack { .. } if heard.last_ack.as_deref() == Some(text.as_str()) && !want.contains(&text) => continue,
+                    Frame::Ack { .. } => heard.last_ack = Some(text.clone()),
+                    _ => {}
+                }
+                got.push(text);
+            }
+            got
+        }
+
+        /// tests/fixtures/wire/park-golden.jsonl from the Mac's end (as
+        /// `the_golden_conversation_both_directions` replays the exec golden):
+        /// the session's frames between two shim lines equal the golden's Mac
+        /// lines (in any order; the host and the probe's `ts` put in), and the
+        /// golden's shim lines bring its answers. The pump's verdict stays
+        /// idle, so the session's own stdio times its parks: the first, `after`
+        /// past the first turn's output, is refused (`busy`), the second
+        /// `after` past the refusal is parked. The host's line then unparks
+        /// it on the open socket (`unpark`, the probe's `ping`, the line); a
+        /// third park follows its echo. The shim closes that parked socket;
+        /// the host's next input redials (here a chunk that brings no stdin of
+        /// its own, so the golden's next frame is the EOF that follows it: a
+        /// bare EOF while parked with no socket would end the session, no
+        /// dial): the second socket's `hello` resumes the spawn and carries
+        /// the EOF; the exit's ack, then Close 1000. A reattach acks again what
+        /// the old socket acked (S6): that ack is no golden line.
+        #[tokio::test]
+        async fn the_park_golden_replays_against_the_session() {
+            bounded(async {
+                let rig = rig(true).await;
+                let mut env = rig.env(policy());
+                env.target.session_token = Secret::new("golden-session-token".into());
+                let (ctl, pump) = park_ctl(&rig, terms(150));
+                let golden_id = "0192f1e0-2b7c-7c3a-9a1b-4d5e6f708196";
+                let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(900), id: Some(SpawnId(golden_id.into())) };
+                let host = format!("\"host\":{}", serde_json::to_string(&crate::bridge::vm::owner()).unwrap());
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                input.send(SpawnInput::Stdin(b"hello\n".to_vec())).await.unwrap();
+                let shim = async {
+                    let check = |want: &mut Vec<String>, got: Vec<String>| {
+                        let mut got = got;
+                        got.sort();
+                        want.sort();
+                        assert_eq!(&got, want);
+                        want.clear();
+                    };
+                    let mut ws: Option<Ws> = None;
+                    let (mut want, mut heard): (Vec<String>, Heard) = (Vec::new(), Heard::default());
+                    for line in include_str!("../../../tests/fixtures/wire/park-golden.jsonl").lines() {
+                        let raw = line.split_once(",\"frame\":").and_then(|(_, f)| f.strip_suffix('}')).unwrap();
+                        if line.starts_with("{\"dir\":\"mac\"") {
+                            want.push(raw.to_string());
+                            continue;
+                        }
+                        if want.first().is_some_and(|w| w.contains("\"t\":\"unpark\"")) {
+                            // The host's next line unparks the parked session.
+                            until(&told, "the park after the refusal", |t| t.parked() == 1).await;
+                            pump.line(Verdict::Idle, Some("user"));
+                            input.send(SpawnInput::Stdin(b"again\n".to_vec())).await.unwrap();
+                        }
+                        if want.first().is_some_and(|w| w.contains("\"t\":\"hello\"")) {
+                            if let Some(mut parked_socket) = ws.take() {
+                                // The shim closes the parked socket; the host's next input redials.
+                                until(&told, "the third park", |t| t.parked() == 2).await;
+                                parked_socket.close(None).await.unwrap();
+                                until(&told, "parked with no socket", |t| t.notes.iter().any(|n| n.contains("stays parked until the next input"))).await;
+                                input.send(SpawnInput::Stdin(Vec::new())).await.unwrap();
+                            }
+                            ws = Some(rig.endpoint.next().await);
+                        }
+                        if want.first().is_some_and(|w| w.contains("\"t\":\"stdin_eof\"")) {
+                            input.send(SpawnInput::StdinEof).await.unwrap();
+                        }
+                        let w = ws.as_mut().expect("a socket");
+                        let got = golden_read(w, &want, &host, &mut heard).await;
+                        check(&mut want, got);
+                        let answer = match heard.ts {
+                            Some(sent) => raw.replace(GOLDEN_TS, &format!("\"ts\":{sent}")),
+                            None => raw.to_string(),
+                        };
+                        w.send(Message::text(answer)).await.unwrap();
+                    }
+                    let w = ws.as_mut().expect("a socket");
+                    let got = golden_read(w, &want, &host, &mut heard).await;
+                    check(&mut want, got);
+                    assert!(matches!(w.next().await, Some(Ok(Message::Close(Some(f)))) if f.code == CloseCode::from(CLOSE_NORMAL)), "closed 1000 after the final ack");
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(spec), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                let out = result.unwrap();
+                assert_eq!((out.exit.status(), out.parked_close), (0, false));
+                let t = told.lock().unwrap();
+                assert_eq!(t.stdout, b"hello\nagain\n");
+                let words: Vec<String> = t
+                    .parks
+                    .iter()
+                    .map(|r| match r {
+                        ParkReport::Parked { why, .. } => format!("parked:{why}"),
+                        ParkReport::Refused { reason } => format!("refused:{reason}"),
+                        ParkReport::Unparked { by, vm_state, .. } => format!("unparked:{by}:{vm_state}"),
+                        ParkReport::Off { why } => format!("off:{why}"),
+                    })
+                    .collect();
+                assert_eq!(words, ["refused:busy", "parked:idle", "unparked:user:running", "parked:idle", "unparked:user:running"]);
+                assert!(t.links.is_empty(), "a park's socket going is no lost link: {:?}", t.links);
+                drop(pump);
+            })
+            .await;
+        }
+
+        /// From the park's request on, a parking session sends nothing that
+        /// would keep the VM awake: the park goes out once the chat was quiet
+        /// for `after` (with the policy's terms and this wrapper as its
+        /// owner); parked, a whole second passes with no frame (no `ping`), no
+        /// WebSocket Ping, no keep-alive `GET /health`, no token minted and no
+        /// redial, though pings, WebSocket Pings and keep-alives ran every
+        /// 40 ms before it and the dead-socket check would fire at 300 ms. The
+        /// host's EOF then unparks it on that socket (`by` `eof`).
+        #[tokio::test]
+        async fn parks_after_park_after_then_sends_no_ping_or_keep_alive() {
+            bounded(async {
+                let rig = rig(true).await;
+                let p = RunPolicy { ping: ms(40), ws_ping: ms(40), keepalive: Keepalive::Http, keepalive_every: ms(40), dead_after: ms(300), ..policy() };
+                let env = rig.env(p);
+                let (ctl, _pump) = park_ctl(&rig, terms(400));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                // The session's quiet starts with it: no stdio moved since.
+                let began = Instant::now();
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws).await;
+                    let (mut pings, mut ws_pings) = (0, 0);
+                    let asked = loop {
+                        match tokio::time::timeout(LIMIT, ws.next()).await.unwrap().unwrap().unwrap() {
+                            Message::Ping(_) => ws_pings += 1,
+                            Message::Text(t) => match Frame::from_json(t.as_str()).unwrap() {
+                                Frame::Ping { ts } => {
+                                    pings += 1;
+                                    put(&mut ws, &Frame::Pong { ts }).await;
+                                }
+                                f @ Frame::Park { .. } => break f,
+                                Frame::Ack { .. } => {}
+                                other => panic!("{other:?}"),
+                            },
+                            _ => {}
+                        }
+                    };
+                    assert!(began.elapsed() >= ms(400), "the park waited for `after`: {:?}", began.elapsed());
+                    assert!(pings >= 2 && ws_pings >= 2, "the session kept the VM awake until then: {pings} pings, {ws_pings} WebSocket Pings");
+                    assert_eq!(asked, park(&id));
+                    put(&mut ws, &parked(&id)).await;
+                    // A keep-alive in flight at the park ends at once (the fake answers it).
+                    tokio::time::sleep(ms(50)).await;
+                    let (health, tokens) = (rig.calls(|c| matches!(c, Call::Health { .. })), rig.calls(|c| matches!(c, Call::Token { .. })));
+                    assert!(health >= 2, "keep-alives ran before the park");
+                    let heard = arrivals_within(&mut ws, Duration::from_secs(1)).await;
+                    assert!(heard.is_empty(), "parked, nothing goes out: {heard:?}");
+                    assert_eq!((rig.calls(|c| matches!(c, Call::Health { .. })), rig.calls(|c| matches!(c, Call::Token { .. }))), (health, tokens), "no keep-alive and no mint while parked");
+                    assert_eq!(rig.endpoint.attempts().len(), 1, "no redial: the dead-socket check is off while parked");
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    answer_unpark(&mut ws, &id).await;
+                    exit_on_eof(&mut ws, &id, 0, 1).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { why: "idle", quiet_ms }, ParkReport::Unparked { by: "eof", vm_state: "running", .. }] if *quiet_ms >= 400), "{:?}", t.parks);
+                let parks = rig.audit("session_park");
+                assert_eq!(parks.len(), 1, "{parks:?}");
+                assert_eq!((parks[0]["detail"]["vm"].as_str(), parks[0]["detail"]["why"].as_str()), (Some(rig.vm.id.as_str()), Some("idle")));
+                assert!(parks[0]["detail"]["spawn"].as_str().is_some_and(|s| s.len() == 36) && parks[0]["detail"]["quiet_ms"].as_str().is_some_and(|q| q.parse::<u64>().unwrap() >= 400), "{parks:?}");
+                let unparks = rig.audit("session_unpark");
+                assert_eq!(unparks.len(), 1, "{unparks:?}");
+                assert_eq!((unparks[0]["detail"]["by"].as_str(), unparks[0]["detail"]["vm_state"].as_str()), (Some("eof"), Some("running")));
+                assert!(unparks[0]["detail"]["ms"].as_str().is_some_and(|m| m.parse::<u64>().is_ok()));
+            })
+            .await;
+        }
+
+        /// A refused park is tried again `after` past the refusal, each time
+        /// (`busy`, then `output`, then parked): each refusal is a report, and
+        /// one `session_park_refused` row stands for both (one per
+        /// `PARK_REFUSED_LOG_EVERY`), with what the busy check saw. The exit
+        /// that comes while parked ends the session as any exit does.
+        #[tokio::test]
+        async fn park_refused_backs_off() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (ctl, _pump) = park_ctl(&rig, terms(150));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input: _input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws).await;
+                    let mut refused: Option<Instant> = None;
+                    for (reason, procs, cpu_ms) in [(ParkRefusal::Busy, 1, 2350), (ParkRefusal::Output, 0, 0)] {
+                        assert_eq!(next_but_acks(&mut ws).await, park(&id));
+                        if let Some(at) = refused {
+                            assert!(at.elapsed() >= ms(150), "tried again only `after` past the refusal: {:?}", at.elapsed());
+                        }
+                        put(&mut ws, &Frame::ParkRefused { spawn_id: id.clone(), reason, quiet_s: 3, procs, cpu_ms }).await;
+                        refused = Some(Instant::now());
+                    }
+                    assert_eq!(next_but_acks(&mut ws).await, park(&id));
+                    let waited = refused.map(|at| at.elapsed()).unwrap_or_default();
+                    assert!(waited >= ms(150), "tried again only `after` past the refusal: {waited:?}");
+                    put(&mut ws, &parked(&id)).await;
+                    until(&told, "parked", |t| t.parked() == 1).await;
+                    put(&mut ws, &exit0(&id, 1)).await;
+                    assert_eq!(next_frame(&mut ws).await, Frame::Ack { spawn_id: id, seq: 1, err_seq: 0 });
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(matches!(&t.parks[..], [ParkReport::Refused { reason: "busy" }, ParkReport::Refused { reason: "output" }, ParkReport::Parked { why: "idle", .. }]), "{:?}", t.parks);
+                let rows = rig.audit("session_park_refused");
+                assert_eq!(rows.len(), 1, "one row per PARK_REFUSED_LOG_EVERY: {rows:?}");
+                let d = &rows[0]["detail"];
+                assert_eq!((d["vm"].as_str(), d["reason"].as_str(), d["procs"].as_str(), d["cpu_ms"].as_str()), (Some(rig.vm.id.as_str()), Some("busy"), Some("1"), Some("2350")));
+            })
+            .await;
+        }
+
+        /// A third of a second of a socket whose shim does not park: its
+        /// pings answered, and nothing else but acks; how many came.
+        async fn pings_only(ws: &mut Ws) -> usize {
+            let until = tokio::time::Instant::now() + ms(350);
+            let mut pings = 0;
+            while let Ok(Some(m)) = tokio::time::timeout_at(until, ws.next()).await {
+                let Ok(Message::Text(t)) = m else { continue };
+                match Frame::from_json(t.as_str()).unwrap() {
+                    Frame::Ping { ts } => {
+                        pings += 1;
+                        put(ws, &Frame::Pong { ts }).await;
+                    }
+                    Frame::Ack { .. } => {}
+                    other => panic!("no park without park_v1: {other:?}"),
+                }
+            }
+            pings
+        }
+
+        /// A shim without `park_v1` (an older image) gets no `park`: the
+        /// session says `Off { no_cap }` once (not again after a reconnect)
+        /// and keeps the VM awake as S9's does, pinging all along. A suspend
+        /// under it is no park either: the link goes down, and the VM
+        /// running again (resumed by someone else) is reattached within the
+        /// GetMicrovm poll, past `suspend_wait` and with no exit 8.
+        #[tokio::test]
+        async fn no_cap_no_park() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(RunPolicy { ping: ms(50), suspend_wait: ms(200), ..policy() });
+                let (ctl, _pump) = park_ctl(&rig, terms(100));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input: _input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_spawn(&mut ws).await;
+                    assert!(pings_only(&mut ws).await >= 3, "pinged all along");
+                    // A reconnect: the second hello_ok names no park_v1 either.
+                    drop(ws);
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(matches!(next_frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    assert!(pings_only(&mut ws).await >= 3, "pinged all along");
+                    // A suspend: no park, the link down until the VM runs again.
+                    suspend_under(&rig, &mut ws).await;
+                    tokio::time::sleep(ms(400)).await;
+                    assert_eq!(rig.endpoint.attempts().len(), 2, "no dial while the VM stays suspended");
+                    rig.api.set_state(&rig.vm.id, VmState::Running);
+                    let mut ws = redialed(&rig).await;
+                    assert!(matches!(next_frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    assert!(pings_only(&mut ws).await >= 3, "pinged all along");
+                    put(&mut ws, &exit0(&id, 1)).await;
+                    loop {
+                        if let Frame::Ack { seq: 1, .. } = next_frame(&mut ws).await {
+                            break;
+                        }
+                    }
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert_eq!(t.parks, [ParkReport::Off { why: "no_cap" }], "once a session, and no park at the suspend");
+                assert_eq!(t.links, [false, true, false, true], "the drop, then the suspend");
+                assert!(rig.audit("session_park").is_empty());
+                let reconnects = rig.audit("agent_reconnect");
+                assert_eq!(reconnects.len(), 2, "{reconnects:?}");
+                assert_eq!(reconnects[1]["detail"]["reason"], "suspended");
+            })
+            .await;
+        }
+
+        /// A chat parked at a permission prompt (the pump's verdict
+        /// `Prompt`: a `can_use_tool` open, nothing else) parks `prompt`; the
+        /// host's answer is the pump's last host frame, a `control_response`,
+        /// and it unparks the session on its socket (`by` `control_response`)
+        /// and reaches claude.
+        #[tokio::test]
+        async fn a_prompt_park_unparks_on_the_answer() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (ctl, pump) = park_ctl(&rig, terms(150));
+                pump.line(Verdict::Prompt, Some("user"));
+                let answer = "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"perm-1-1\",\"response\":{\"behavior\":\"allow\"}}}\n";
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws).await;
+                    assert_eq!(next_but_acks(&mut ws).await, park(&id));
+                    put(&mut ws, &parked(&id)).await;
+                    until(&told, "parked", |t| t.parked() == 1).await;
+                    pump.line(Verdict::Busy, Some("control_response"));
+                    input.send(SpawnInput::Stdin(answer.as_bytes().to_vec())).await.unwrap();
+                    answer_unpark(&mut ws, &id).await;
+                    echo(&mut ws, &id, 1, answer).await;
+                    until(&told, "the answer's echo", |t| t.stdout == answer.as_bytes()).await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws, &id, 1, 2).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { why: "prompt", .. }, ParkReport::Unparked { by: "control_response", vm_state: "running", .. }]), "{:?}", t.parks);
+                assert_eq!(rig.audit("session_park")[0]["detail"]["why"], "prompt");
+                assert_eq!(rig.audit("session_unpark")[0]["detail"]["by"], "control_response");
+            })
+            .await;
+        }
+
+        /// A laptop sleep while parked (the wall clock 6 s ahead of
+        /// `Instant`, past a 300 ms `dead_after`, and no frame for longer
+        /// than that) loses nothing: the parked socket is silent by design,
+        /// so the session neither redials nor drops it, and the next input
+        /// unparks on that same socket.
+        #[tokio::test]
+        async fn a_wall_clock_jump_while_parked_is_no_loss() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(RunPolicy { dead_after: ms(300), ..policy() });
+                let (ctl, pump) = park_ctl(&rig, terms(100));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws).await;
+                    assert_eq!(next_but_acks(&mut ws).await, park(&id));
+                    put(&mut ws, &parked(&id)).await;
+                    until(&told, "parked", |t| t.parked() == 1).await;
+                    WALL_AHEAD.with(|w| w.set(Duration::from_secs(6)));
+                    let heard = arrivals_within(&mut ws, ms(800)).await;
+                    assert!(heard.is_empty(), "{heard:?}");
+                    assert_eq!(rig.endpoint.attempts().len(), 1, "no redial");
+                    pump.line(Verdict::Busy, Some("user"));
+                    input.send(SpawnInput::Stdin(b"after the sleep\n".to_vec())).await.unwrap();
+                    answer_unpark(&mut ws, &id).await;
+                    echo(&mut ws, &id, 1, "after the sleep\n").await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws, &id, 1, 2).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                WALL_AHEAD.with(|w| w.set(Duration::ZERO));
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert_eq!(t.stdout, b"after the sleep\n");
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { .. }, ParkReport::Unparked { by: "user", vm_state: "running", .. }]), "{:?}", t.parks);
+                assert!(!t.notes.iter().any(|n| n.starts_with("lost the connection")) && t.links.is_empty(), "{:?} {:?}", t.notes, t.links);
+                assert_eq!(rig.endpoint.attempts().len(), 1, "one socket throughout");
+            })
+            .await;
+        }
+
+        /// A parked socket that died silently is found by the unpark's probe:
+        /// the input's `unpark`, `ping` and stdin go into it, neither a `pong`
+        /// nor a `stdin_ack` comes within `probe` (500 ms), so the socket is
+        /// lost; the reconnect resumes the spawn and sends its stdin again
+        /// above the shim's `in_seq`; the unpark is reported once the new
+        /// socket carries the spawn.
+        #[tokio::test]
+        async fn a_dead_parked_socket_is_caught_within_the_probe() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (ctl, pump) = park_ctl(&rig, terms(100));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws1).await;
+                    assert_eq!(next_but_acks(&mut ws1).await, park(&id));
+                    put(&mut ws1, &parked(&id)).await;
+                    until(&told, "parked", |t| t.parked() == 1).await;
+                    // From here on the first socket answers nothing.
+                    pump.line(Verdict::Busy, Some("user"));
+                    let typed = Instant::now();
+                    input.send(SpawnInput::Stdin(b"x\n".to_vec())).await.unwrap();
+                    let mut ws2 = rig.endpoint.next().await;
+                    let waited = typed.elapsed();
+                    assert!(waited >= ms(500) && waited < Duration::from_secs(5), "lost once the probe ran out: {waited:?}");
+                    let Frame::Hello { resume, .. } = next_frame(&mut ws2).await else { panic!("no hello") };
+                    assert_eq!(resume, vec![ResumePoint { spawn_id: id.clone(), from_seq: Some(1), err_from_seq: Some(1) }]);
+                    put(&mut ws2, &hello_ok_parks(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    echo(&mut ws2, &id, 1, "x\n").await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws2, &id, 1, 2).await;
+                    drop(ws1);
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert_eq!(t.stdout, b"x\n");
+                assert!(t.notes.iter().any(|n| n.starts_with("lost the connection") && n.contains("no pong or stdin_ack within")), "{:?}", t.notes);
+                assert_eq!(t.links, [false, true], "a lost socket, then the reattach");
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { .. }, ParkReport::Unparked { by: "user", ms, .. }] if *ms >= 500), "{:?}", t.parks);
+            })
+            .await;
+        }
+
+        /// Input that comes while the park's answer is awaited waits for it
+        /// (no frame meanwhile); `parked` then unparks at once: `unpark`, the
+        /// probe's `ping`, then the input.
+        #[tokio::test]
+        async fn input_during_the_handshake_unparks_right_after_parked() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (ctl, pump) = park_ctl(&rig, terms(100));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws).await;
+                    assert_eq!(next_but_acks(&mut ws).await, park(&id));
+                    pump.line(Verdict::Busy, Some("user"));
+                    input.send(SpawnInput::Stdin(b"meanwhile\n".to_vec())).await.unwrap();
+                    let heard = arrivals_within(&mut ws, ms(200)).await;
+                    assert!(heard.is_empty(), "the input waits for the answer: {heard:?}");
+                    put(&mut ws, &parked(&id)).await;
+                    answer_unpark(&mut ws, &id).await;
+                    echo(&mut ws, &id, 1, "meanwhile\n").await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws, &id, 1, 2).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { why: "idle", .. }, ParkReport::Unparked { by: "user", .. }]), "{:?}", t.parks);
+            })
+            .await;
+        }
+
+        /// No answer to a `park` within `answer_wait`: the socket counts as
+        /// lost and the session reconnects with the resume (a hello that
+        /// unparks a parked spawn on the shim). The next `park` waits
+        /// `after` past the last one whatever came of it, here a second
+        /// socket that drops on its `park` and a third that parks: a shim
+        /// that never answers costs one reconnect per `after`, never a loop
+        /// through the reconnect budget into a move: no socket here lives
+        /// `stable_after`, and the budget is shorter than `after`, so only
+        /// the new reconnect episode at each socket lost to its park's
+        /// handshake keeps the session from giving up.
+        #[tokio::test]
+        async fn no_answer_to_a_park_loses_the_socket() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(RunPolicy { stable_after: Duration::from_secs(5), reconnect_budget: ms(500), ..policy() });
+                let (ctl, _pump) = park_ctl(&rig, ParkPolicy { answer_wait: ms(200), ..terms(600) });
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input: _input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let resumed = |id: &SpawnId| hello_ok_parks(vec![status(id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }]);
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws1).await;
+                    assert_eq!(next_but_acks(&mut ws1).await, park(&id));
+                    let asked = Instant::now();
+                    let mut ws2 = tokio::time::timeout(Duration::from_secs(5), rig.endpoint.next()).await.expect("a reconnect after the unanswered park: the session gave up");
+                    assert!(asked.elapsed() >= ms(190), "lost once answer_wait ran out: {:?}", asked.elapsed());
+                    let Frame::Hello { resume, .. } = next_frame(&mut ws2).await else { panic!("no hello") };
+                    assert_eq!(resume[0].spawn_id, id, "the reconnect resumes the spawn");
+                    put(&mut ws2, &resumed(&id)).await;
+                    assert_eq!(next_but_acks(&mut ws2).await, park(&id));
+                    assert!(asked.elapsed() >= ms(550), "the next park waited `after` past the unanswered one: {:?}", asked.elapsed());
+                    let asked = Instant::now();
+                    // This one drops the socket on its park.
+                    drop(ws2);
+                    let mut ws3 = tokio::time::timeout(Duration::from_secs(5), rig.endpoint.next()).await.expect("a reconnect after the dropped park: the session gave up");
+                    assert!(matches!(next_frame(&mut ws3).await, Frame::Hello { .. }));
+                    put(&mut ws3, &resumed(&id)).await;
+                    assert_eq!(next_but_acks(&mut ws3).await, park(&id));
+                    assert!(asked.elapsed() >= ms(550), "the next park waited `after` past the dropped one: {:?}", asked.elapsed());
+                    put(&mut ws3, &parked(&id)).await;
+                    until(&told, "parked", |t| t.parked() == 1).await;
+                    put(&mut ws3, &exit0(&id, 1)).await;
+                    loop {
+                        if let Frame::Ack { seq: 1, .. } = next_frame(&mut ws3).await {
+                            break;
+                        }
+                    }
+                    drop(ws1);
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(t.notes.iter().any(|n| n.starts_with("lost the connection") && n.contains("no answer to park within")), "{:?}", t.notes);
+                assert_eq!(t.links, [false, true, false, true], "two lost sockets, each reattached");
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { why: "idle", .. }]), "only the third socket's park: {:?}", t.parks);
+            })
+            .await;
+        }
+
+        /// A park waits for the code-out trigger: while a fetch is asked
+        /// for and held (here at the workspace's fetch lock) no `park` goes
+        /// out however quiet the chat; once the fetch ended, it does.
+        #[tokio::test]
+        async fn a_park_waits_for_the_code_out_trigger() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (ctl, pump) = park_ctl(&rig, terms(100));
+                let held = crate::bridge::vm::lock::try_lock_exclusive(&pump.fetch_lock).unwrap().expect("the test holds the fetch lock");
+                pump.trigger.request();
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input: _input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws).await;
+                    let heard: Vec<String> = arrivals_within(&mut ws, ms(500)).await.into_iter().filter(|f| f.contains("\"t\":\"park\"")).collect();
+                    assert!(heard.is_empty(), "a fetch runs: no park {heard:?}");
+                    drop(held);
+                    assert_eq!(next_but_acks(&mut ws).await, park(&id), "the fetch ended: the park");
+                    put(&mut ws, &parked(&id)).await;
+                    put(&mut ws, &exit0(&id, 1)).await;
+                    loop {
+                        if let Frame::Ack { seq: 1, .. } = next_frame(&mut ws).await {
+                            break;
+                        }
+                    }
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                assert_eq!(told.lock().unwrap().parked(), 1);
+            })
+            .await;
+        }
+
+        /// `event hook_suspend` under an idle parking session (not parked
+        /// yet) parks it with no socket (`suspended`): no `suspend_wait`, no
+        /// exit 8, no dial and no ResumeMicrovm, only GetMicrovm asked (the
+        /// shim holds the spawn under its detach grace, not parked); the next
+        /// input dials, the endpoint's auto-resume wakes the VM, and the
+        /// spawn is resumed and gets the line (`vm_state` `suspended`).
+        #[tokio::test]
+        async fn hook_suspend_while_active_parks_with_no_socket() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(RunPolicy { suspend_wait: ms(200), ..policy() });
+                let (ctl, pump) = park_ctl(&rig, terms(60_000));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws1).await;
+                    rig.api.set_state(&rig.vm.id, VmState::Suspended);
+                    put(&mut ws1, &Frame::Event { kind: EventKind::HookSuspend, at: "2026-10-20T12:00:00Z".into(), reference: None }).await;
+                    ws1.close(Some(CloseFrame { code: CloseCode::from(CLOSE_GOING_AWAY), reason: "suspend".into() })).await.unwrap();
+                    until(&told, "parked by the suspend", |t| t.parked() == 1).await;
+                    let gets = rig.calls(|c| matches!(c, Call::Get(_)));
+                    tokio::time::sleep(ms(500)).await;
+                    assert_eq!(rig.endpoint.attempts().len(), 1, "no dial past suspend_wait");
+                    assert!(rig.calls(|c| matches!(c, Call::Get(_))) > gets, "GetMicrovm watches for the VM running again");
+                    assert_eq!(rig.calls(|c| matches!(c, Call::Resume(_))), 0, "never resumed without input");
+                    pump.line(Verdict::Busy, Some("user"));
+                    input.send(SpawnInput::Stdin(b"wake\n".to_vec())).await.unwrap();
+                    let mut ws2 = rig.endpoint.next().await;
+                    let Frame::Hello { resume, .. } = next_frame(&mut ws2).await else { panic!("no hello") };
+                    assert_eq!(resume[0].spawn_id, id);
+                    put(&mut ws2, &hello_ok_parks(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    echo(&mut ws2, &id, 1, "wake\n").await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws2, &id, 1, 2).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { why: "suspended", .. }, ParkReport::Unparked { by: "user", vm_state: "suspended", .. }]), "{:?}", t.parks);
+                assert!(t.links.is_empty(), "{:?}", t.links);
+                assert_eq!(rig.calls(|c| matches!(c, Call::Resume(_))), 0, "the endpoint's auto-resume woke it");
+                assert_eq!(rig.api.state().vms[&rig.vm.id].state, VmState::Running);
+            })
+            .await;
+        }
+
+        /// The shim holds a spawn it never parked under its detach grace,
+        /// which runs again once the VM runs. So when someone else resumes
+        /// the VM of an idle session suspended before its park (no input
+        /// here), the session reattaches within its GetMicrovm poll (3 s
+        /// doubling to 60 s; 30 ms doubling to 600 ms here), past
+        /// `suspend_wait` and with no exit 8, never resuming the VM itself;
+        /// its `suspended` park is unparked (`by` `other`, the VM `running`).
+        #[tokio::test]
+        async fn an_idle_suspend_reattaches_once_the_vm_runs_again() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(RunPolicy { suspend_wait: ms(200), ..policy() });
+                let (ctl, _pump) = park_ctl(&rig, terms(60_000));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws1).await;
+                    suspend_under(&rig, &mut ws1).await;
+                    until(&told, "parked by the suspend", |t| t.parked() == 1).await;
+                    tokio::time::sleep(ms(400)).await;
+                    assert_eq!(rig.endpoint.attempts().len(), 1, "no dial while the VM stays suspended");
+                    rig.api.set_state(&rig.vm.id, VmState::Running);
+                    let mut ws2 = redialed(&rig).await;
+                    let Frame::Hello { resume, .. } = next_frame(&mut ws2).await else { panic!("no hello") };
+                    assert_eq!(resume[0].spawn_id, id);
+                    put(&mut ws2, &hello_ok_parks(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    until(&told, "the unpark", |t| t.parks.len() == 2).await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws2, &id, 0, 1).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(matches!(&t.parks[..], [ParkReport::Parked { why: "suspended", .. }, ParkReport::Unparked { by: "other", vm_state: "running", .. }]), "{:?}", t.parks);
+                assert!(t.links.is_empty(), "{:?}", t.links);
+                assert_eq!(rig.calls(|c| matches!(c, Call::Resume(_))), 0, "someone else resumed it");
+                assert_eq!((rig.audit("session_park")[0]["detail"]["why"].as_str(), rig.audit("session_unpark")[0]["detail"]["by"].as_str()), (Some("suspended"), Some("other")));
+            })
+            .await;
+        }
+
+        /// A suspend mid-turn (the pump's verdict `Busy`: a line
+        /// outstanding) is no park: the link goes down, as under S9's
+        /// suspend, but with no `suspend_wait` and no exit 8. The poll backs
+        /// off (3 s doubling to 60 s; 30 ms doubling to 600 ms here: a few
+        /// GetMicrovm in 400 ms, never one every 30 ms). When someone else
+        /// resumes the VM (no input), the session reattaches at its next
+        /// poll, before the spawn's detach grace could run out: the link up
+        /// again, an `agent_reconnect` (`suspended`), and the rest of the
+        /// turn's output.
+        #[tokio::test]
+        async fn a_suspend_mid_turn_reattaches_once_the_vm_runs_again() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(RunPolicy { suspend_wait: ms(200), ..policy() });
+                let (ctl, pump) = park_ctl(&rig, terms(100));
+                pump.line(Verdict::Busy, Some("user"));
+                let (sio, cio) = spawn_channels(8);
+                let ConsumerIo { input, control: _control, mut events, consumed } = cio;
+                let told = Mutex::new(Told::default());
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    let id = start_parking(&mut ws1).await;
+                    suspend_under(&rig, &mut ws1).await;
+                    until(&told, "the suspend's report", |t| !t.links.is_empty() || !t.parks.is_empty()).await;
+                    {
+                        let t = told.lock().unwrap();
+                        assert!(t.links == [false] && t.parks.is_empty(), "the link down, no park: {:?} {:?}", t.links, t.parks);
+                    }
+                    let gets = rig.calls(|c| matches!(c, Call::Get(_)));
+                    tokio::time::sleep(ms(400)).await;
+                    assert_eq!(rig.endpoint.attempts().len(), 1, "no dial while the VM stays suspended");
+                    let watched = rig.calls(|c| matches!(c, Call::Get(_))) - gets;
+                    assert!(watched > 0, "GetMicrovm watches for the VM running again");
+                    // At 30, 90 and 210 ms (then 450): at most a few, never one every 30 ms (about 13).
+                    assert!(watched <= 5, "the watch's poll backs off: {watched} GetMicrovm in 400 ms");
+                    rig.api.set_state(&rig.vm.id, VmState::Running);
+                    let mut ws2 = redialed(&rig).await;
+                    let Frame::Hello { resume, .. } = next_frame(&mut ws2).await else { panic!("no hello") };
+                    assert_eq!(resume[0].spawn_id, id);
+                    put(&mut ws2, &hello_ok_parks(vec![status(&id, 1, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    put(&mut ws2, &Frame::Stdout { spawn_id: id.clone(), seq: 1, data: Chunk { text: Some("the rest of the turn\n".into()), b64: None } }).await;
+                    until(&told, "the turn's output", |t| t.stdout == b"the rest of the turn\n").await;
+                    input.send(SpawnInput::StdinEof).await.unwrap();
+                    exit_on_eof(&mut ws2, &id, 0, 2).await;
+                };
+                let (result, (), ()) = tokio::join!(run_spawn_parked(&env, Start::New(cat_spec()), sio, None, ctl), consume_into(&mut events, &consumed, &told), shim);
+                assert_eq!(result.unwrap().exit.status(), 0);
+                let t = told.lock().unwrap();
+                assert!(t.parks.is_empty(), "a turn at work is no park: {:?}", t.parks);
+                assert_eq!(t.links, [false, true], "down while suspended, up once reattached");
+                assert!(rig.audit("session_park").is_empty());
+                let reconnects = rig.audit("agent_reconnect");
+                assert_eq!(reconnects.len(), 1, "{reconnects:?}");
+                assert_eq!(reconnects[0]["detail"]["reason"], "suspended");
+                assert_eq!(rig.calls(|c| matches!(c, Call::Resume(_))), 0, "someone else resumed it");
+            })
+            .await;
+        }
+
+        /// `stop_spawn` attaches with the resume (from the oldest output
+        /// retained, which it drops), sends `signal TERM` to the group, and
+        /// takes the spawn's `exit`, acked (the shim then releases it), for
+        /// its end: `true`.
+        #[tokio::test]
+        async fn stop_spawn_attaches_signals_and_takes_the_exit() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let id = SpawnId::new_v7();
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    let Frame::Hello { resume, .. } = next_frame(&mut ws).await else { panic!("no hello") };
+                    assert_eq!(resume, vec![ResumePoint { spawn_id: id.clone(), from_seq: None, err_from_seq: None }], "from the oldest retained");
+                    put(&mut ws, &hello_ok(vec![status(&id, 2, 5)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    for seq in 1..=2 {
+                        put(&mut ws, &Frame::Stdout { spawn_id: id.clone(), seq, data: Chunk { text: Some("old\n".into()), b64: None } }).await;
+                    }
+                    assert_eq!(next_but_acks(&mut ws).await, Frame::Signal { spawn_id: id.clone(), sig: Sig::Term, scope: Scope::Group });
+                    put(&mut ws, &exit0(&id, 3)).await;
+                    loop {
+                        if let Frame::Ack { seq: 3, .. } = next_frame(&mut ws).await {
+                            break;
+                        }
+                    }
+                };
+                let (stopped, ()) = tokio::join!(stop_spawn(&env, &id, Duration::from_secs(3)), shim);
+                assert!(stopped.unwrap(), "its exit came and was acked");
+            })
+            .await;
+        }
+
+        /// A spawn that ignores TERM gets KILL at half the bound and is
+        /// gone at its exit (`true`); one that outlives the bound gets
+        /// `detach{final}` (the shim's ladder ends it) and the answer is
+        /// `false`, within the bound and the detach's close; a spawn the VM
+        /// does not hold (`unknown`) is gone already (`true`).
+        #[tokio::test]
+        async fn stop_spawn_kills_at_half_its_bound_and_gives_up_at_it() {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let id = SpawnId::new_v7();
+                let within = ms(600);
+                let began = Instant::now();
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(matches!(next_frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    assert!(matches!(next_but_acks(&mut ws).await, Frame::Signal { sig: Sig::Term, .. }));
+                    assert!(matches!(next_but_acks(&mut ws).await, Frame::Signal { sig: Sig::Kill, .. }));
+                    assert!(began.elapsed() >= ms(300), "KILL at half the bound: {:?}", began.elapsed());
+                    put(&mut ws, &exit0(&id, 1)).await;
+                    loop {
+                        if let Frame::Ack { seq: 1, .. } = next_frame(&mut ws).await {
+                            break;
+                        }
+                    }
+                };
+                let (stopped, ()) = tokio::join!(stop_spawn(&env, &id, within), shim);
+                assert!(stopped.unwrap(), "KILL ended it");
+
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(matches!(next_frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    let mut got = Vec::new();
+                    loop {
+                        match next_frame(&mut ws).await {
+                            Frame::Detach { is_final, .. } => {
+                                got.push(format!("detach final={is_final}"));
+                                break;
+                            }
+                            Frame::Signal { sig, .. } => got.push(format!("{sig:?}")),
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(got, ["Term", "Kill", "detach final=true"]);
+                    ws
+                };
+                let t = Instant::now();
+                let (stopped, _ws) = tokio::join!(stop_spawn(&env, &id, within), shim);
+                assert!(!stopped.unwrap(), "no exit within the bound: not known gone");
+                assert!(t.elapsed() < within + Duration::from_secs(3), "{:?}", t.elapsed());
+
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(matches!(next_frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok(vec![], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Unknown }])).await;
+                    ws
+                };
+                let (stopped, _ws) = tokio::join!(stop_spawn(&env, &id, within), shim);
+                assert!(stopped.unwrap(), "not on the VM: gone");
+            })
+            .await;
+        }
     }
 }

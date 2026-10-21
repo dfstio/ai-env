@@ -9,7 +9,10 @@
 //! This module freezes what those builders share (S8 phase 0): the close and
 //! grace budgets (C7), the census and audit names (C6), and what Cursor shows
 //! when a remote session fails — an exit code and one `ai-env-claude:` line
-//! naming the fix ([`Failure`], C5).
+//! naming the fix ([`Failure`], C5). S10 (phase 0) adds the moves' budgets
+//! ([`MOVE_WINDOW`] …), their census parts and audit events, their failures
+//! ([`Failure::Move`], [`Failure::MovesExhausted`]) and the notes the chat
+//! shows when it moves ([`note_moving`] …).
 pub mod env;
 pub mod link;
 pub mod pipeline;
@@ -18,7 +21,7 @@ pub mod prewarm;
 use crate::bridge::config::BridgeConfig;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::pump::{INITIALIZE_WINDOW, INIT_FAIL_FAST};
-use crate::bridge::remote::link::StartStep;
+use crate::bridge::remote::link::{LossCause, MigrateTrigger, MoveKind, StartStep};
 use crate::errors::CliError;
 use crate::wire::frame::{DETACH_GRACE_SESSION_S, IDLE_DEFAULT_S, MAX_SPAWNS};
 use crate::wire::redact::scrub;
@@ -71,6 +74,38 @@ pub fn session_grace(cfg: &BridgeConfig, vm_max_idle_s: Option<u32>) -> u32 {
     DETACH_GRACE_SESSION_S.max(idle.saturating_add(IDLE_DEFAULT_S).saturating_add(GRACE_MARGIN_S))
 }
 
+// ---- S10: the moves' budgets (plans/s10-contracts.md §10) --------------------------------
+
+/// A move's window from its start (once the host's `initialize` was
+/// answered; before it, a move keeps T0 + 50 s): its Touch ID, its gate and
+/// its spawn within it.
+pub const MOVE_WINDOW: Duration = Duration::from_secs(180);
+/// How long a migration's prepared VM is held for the switch (kept running
+/// meanwhile, [`move_hold_ping`]); then it is released.
+pub const MOVE_HOLD: Duration = Duration::from_secs(15 * 60);
+/// A `VmGone` move waits this long for the old VM's TERMINATED, so
+/// `/terminate`'s tail lands before the restore.
+pub const MOVE_OLD_VM_WAIT: Duration = Duration::from_secs(15);
+/// An `Unreachable` move's best-effort sync of the old VM before its terminate.
+pub const MOVE_SYNC_BUDGET: Duration = Duration::from_secs(10);
+/// The reaper's wait for each leftover or orphan spawn it stops (`agent::stop_spawn`).
+pub const REAP_WAIT: Duration = Duration::from_secs(2);
+/// A reopen's carry runs P2 beside the old VM's resume, fetch and sync only
+/// with at least this much of T0 + 50 s left.
+pub const CARRY_P2_MIN_LEFT: Duration = Duration::from_secs(25);
+/// Phase B's fallbacks to the old VM: at the second, no more wall
+/// migrations in this process (the wall's re-address is the backstop).
+pub const MIGRATE_PREP_TRIES: u32 = 2;
+/// The most of a failed move's inner failure line its own line keeps, in characters.
+pub const MOVE_INNER_MAX: usize = 100;
+
+/// How often a `GET /health` keeps a migration's prepared VM running while
+/// it is held: a third of the VM's `max_idle_s` (100 s at the default).
+#[must_use]
+pub fn move_hold_ping(max_idle_s: u32) -> Duration {
+    Duration::from_secs(u64::from(max_idle_s / 3))
+}
+
 // ---- C6: census and audit names (W1 and W2 write the values) -----------------------------
 
 /// The parts a remote session adds to the census rows (`name:value`, joined
@@ -107,8 +142,63 @@ pub mod census_part {
     pub const PID_REWRITE: &str = "pid_rewrite";
     /// The start row's `prewarm:spawned(<pid>)` or `prewarm:skipped(<why>)`.
     pub const PREWARM: &str = "prewarm";
-    /// Every part: the end row's, then the start row's.
-    pub const ALL: [&str; 14] = [VM, VM_HOW, SPAWN, VM_PID, CLAUDE, LEGS, SEED, TRANSCRIPT, FETCH, CLOSE_MS, LINK_DROPS, AUTH_TIMERS, PID_REWRITE, PREWARM];
+    /// S10: `moves:readdress=<n>,respawn=<n>,migrate=<n>`, once a move started (the pump).
+    pub const MOVES: &str = "moves";
+    /// S10: `move_ms:<ms>`, with `moves`: the last move's, to its generation's `Started` or its failure.
+    pub const MOVE_MS: &str = "move_ms";
+    /// S10: `cut:none`, `cut:at` or `cut:fresh`: the last move that sent lines again.
+    pub const CUT: &str = "cut";
+    /// S10: `inits:<forwarded>/<swallowed>`, every remote end row (`HostState::counts`).
+    pub const INITS: &str = "inits";
+    /// S10: `echoes:<forwarded>/<swallowed>`, every remote end row.
+    pub const ECHOES: &str = "echoes";
+    /// S10: `ka_dropped:<n>` when n > 0: the host's `keep_alive` lines dropped while parked.
+    pub const KA_DROPPED: &str = "ka_dropped";
+    /// S10: `park:<n>`, `park:off(no_cap)`, `park:off(config)` or `park:off(no_owner)` (the link).
+    pub const PARK: &str = "park";
+    /// S10: `park_refused:<n>` when n > 0.
+    pub const PARK_REFUSED: &str = "park_refused";
+    /// S10: `parked_s:<s>` when parks > 0: the seconds parked in all.
+    pub const PARKED_S: &str = "parked_s";
+    /// S10: `unpark_ms:<ms>` when an unpark happened: the longest.
+    pub const UNPARK_MS: &str = "unpark_ms";
+    /// S10: `unpark_resumed:<n>` when n > 0: unparks that found the VM suspended.
+    pub const UNPARK_RESUMED: &str = "unpark_resumed";
+    /// S10: `close_parked:1`: the session closed parked with no socket.
+    pub const CLOSE_PARKED: &str = "close_parked";
+    /// S10: `carried:readdress` (the `--resume` row's VM was gone) or `carried:migrate` (it was near its wall): a
+    /// reopen's P0 to P4 carried the chat off that VM (`RemoteSnapshot.carried`, generation 1's), counted in `moves` too.
+    pub const CARRIED: &str = "carried";
+    /// Every part: the end row's, then the start row's, then S10's (all the end row's).
+    pub const ALL: [&str; 27] = [
+        VM,
+        VM_HOW,
+        SPAWN,
+        VM_PID,
+        CLAUDE,
+        LEGS,
+        SEED,
+        TRANSCRIPT,
+        FETCH,
+        CLOSE_MS,
+        LINK_DROPS,
+        AUTH_TIMERS,
+        PID_REWRITE,
+        PREWARM,
+        MOVES,
+        MOVE_MS,
+        CUT,
+        INITS,
+        ECHOES,
+        KA_DROPPED,
+        PARK,
+        PARK_REFUSED,
+        PARKED_S,
+        UNPARK_MS,
+        UNPARK_RESUMED,
+        CLOSE_PARKED,
+        CARRIED,
+    ];
 }
 
 /// `vm_how`'s words: a VM the session started, one it reused running, one it
@@ -117,8 +207,8 @@ pub const VM_HOW_WORDS: [&str; 4] = ["started", "reused", "resumed", "pinned"];
 /// The legs of `legs`, in order (each `<leg>=<ms>`); also the steps a
 /// [`Failure::Deadline`] names.
 pub const LEG_NAMES: [&str; 5] = ["touchid", "select", "workspace", "gate", "spawn"];
-/// The `end:` words a remote session adds to `pump::EndReason`'s.
-pub const END_WORDS: [&str; 2] = ["link_lost", "credential_rejected"];
+/// The `end:` words a remote session adds to `pump::EndReason`'s (S10: a move's start that failed).
+pub const END_WORDS: [&str; 3] = ["link_lost", "credential_rejected", "move_failed"];
 /// The start row's mode notes: from `AI_ENV_BRIDGE_MODE`, from `[wrapper].mode`.
 pub const MODE_NOTES: [&str; 2] = ["mode:remote", "mode:remote(config)"];
 
@@ -170,8 +260,29 @@ pub mod audit_event {
     pub const TRANSCRIPT_GC: &str = "transcript_gc";
     /// `session migrate-s9`, per session: `session`, `from`, `outcome`, `bytes`.
     pub const TRANSCRIPT_MIGRATE: &str = "transcript_migrate";
+    /// S10: a move starts (the pump; a migration's phase A; a reopen's carry): `session`, `gen`, `kind`,
+    /// `cause` or `trigger`, `from_vm`, `outstanding`, `cancelled`, `request` (a nonce, when one).
+    pub const SESSION_MOVE: &str = "session_move";
+    /// S10: a move ended: `session`, `gen`, `kind`, `outcome` (`done`, `failed`, `stayed`, `abandoned`,
+    /// `refused`), `from_vm`, `to_vm`, `how`, `seed`, `transcript`, `cut`, `touchid`, `ms`, then `step` and
+    /// `code` (`failed`, `stayed`), then `request`.
+    pub const SESSION_MOVE_END: &str = "session_move_end";
+    /// S10: `session migrate`'s request: `session`, `nonce`, `how` (`live`, `offline`), `wrapper_pid` (live only).
+    pub const SESSION_MIGRATE_REQUEST: &str = "session_migrate_request";
+    /// S10: a session parked: `vm`, `spawn`, `why` (`idle`, `prompt`, `suspended`), `quiet_ms`.
+    pub const SESSION_PARK: &str = "session_park";
+    /// S10: a session unparked: `vm`, `spawn`, `by`, `vm_state`, `ms`.
+    pub const SESSION_UNPARK: &str = "session_unpark";
+    /// S10: the shim refused a park (at most one per `park::PARK_REFUSED_LOG_EVERY`): `vm`, `spawn`,
+    /// `reason`, `procs`, `cpu_ms`.
+    pub const SESSION_PARK_REFUSED: &str = "session_park_refused";
+    /// S10: the reaper stopped a spawn before a start: `session`, `vm`, `spawn`, `why` (`leftover`,
+    /// `orphan`), `wrapper_pid`, `outcome` (`ended`, `gone`, `failed`), `ms`.
+    pub const SESSION_REAP: &str = "session_reap";
+    /// S10: a wrapper's gc reconcile: `marked`, `removed`, `closed`, `ms`.
+    pub const VM_GC_RECONCILE: &str = "vm_gc_reconcile";
     /// Every event above (never a URL, a query, a credential or a transcript byte in any detail).
-    pub const ALL: [&str; 21] = [
+    pub const ALL: [&str; 29] = [
         SESSION_REMOTE_START,
         SESSION_REMOTE_END,
         SESSION_REMOTE_FAILED,
@@ -193,6 +304,14 @@ pub mod audit_event {
         TRANSCRIPT_STAGE,
         TRANSCRIPT_GC,
         TRANSCRIPT_MIGRATE,
+        SESSION_MOVE,
+        SESSION_MOVE_END,
+        SESSION_MIGRATE_REQUEST,
+        SESSION_PARK,
+        SESSION_UNPARK,
+        SESSION_PARK_REFUSED,
+        SESSION_REAP,
+        VM_GC_RECONCILE,
     ];
 }
 
@@ -247,8 +366,10 @@ pub enum Failure {
     TouchIdTimeout { secs: u64 },
     /// P2, exit 9: `running` VMs run already (`[vm].max_concurrent`; a
     /// closed chat's suspended VM counts, and `vm gc --yes` keeps every live
-    /// one, so the line names `vm terminate`).
-    MaxConcurrent { running: u32 },
+    /// one, so the line names `vm terminate`). S10: `parked`, the suspended
+    /// VMs of the workspace's image that no open chat holds (the pipeline
+    /// fills it at P2), which the line names in place of `ai-env vm list`.
+    MaxConcurrent { running: u32, parked: Vec<String> },
     /// P2, exit `code` (7, 8 or 9; any other is taken as 7): SELECT_VM failed
     /// (an SDK error, a quota, not RUNNING in time, an egress mismatch).
     Select { code: i32, first_line: String },
@@ -273,8 +394,10 @@ pub enum Failure {
     /// keeps it. P0 refuses from local state alone, before any Touch ID; P3
     /// before any pull. `reuse_off`: `[vm].reuse_per_workspace` is off and
     /// no VM is pinned, so every reopen starts a new VM and `--warm` warms
-    /// yet another: the line asks for the switch first.
-    TranscriptPullTooLarge { session: String, bytes: u64, reuse_off: bool },
+    /// yet another: the line asks for the switch first. S10 (F3b): `pinned`,
+    /// the VM `AI_ENV_BRIDGE_VM` pins, which lacks the chat: the line asks
+    /// to unset the pin first.
+    TranscriptPullTooLarge { session: String, bytes: u64, reuse_off: bool, pinned: Option<String> },
     /// P0 or P3, exit `code` (1, 7, 8 or 9; any other is taken as 1): the
     /// workspace step was refused or failed (`first_line` of the error):
     /// `resolve`'s unsupported repository or roots, the VM's refusal of the
@@ -302,6 +425,12 @@ pub enum Failure {
     TokenRefused,
     /// Running, exit 8: the link stayed lost past its budget.
     LinkLost { vm: String },
+    /// S10, exit the inner failure's: a move of the chat off `from_vm` (a
+    /// loss's re-address or respawn, by `cause`, or a migration) failed to
+    /// start: `inner` is what failed.
+    Move { kind: MoveKind, from_vm: String, cause: Option<LossCause>, inner: Box<Failure> },
+    /// S10, exit 8: a loss past `[vm].max_readdress` moves in this wrapper process.
+    MovesExhausted { vm: String, moves: u32 },
     /// Any step, exit `code` (the error's own; 0 is taken as 1): an error no
     /// other kind names (`first_line`): a keystore key missing or not this
     /// Mac's (4), a corrupt file (6), a credential the runtime principal is
@@ -312,7 +441,7 @@ pub enum Failure {
 
 impl Failure {
     /// Every kind's [`Failure::word`].
-    pub const WORDS: [&'static str; 24] = [
+    pub const WORDS: [&'static str; 26] = [
         "config",
         "no_token",
         "no_runtime_key",
@@ -336,6 +465,8 @@ impl Failure {
         "stopped",
         "token_refused",
         "link_lost",
+        "move",
+        "moves_exhausted",
         "other",
     ];
 
@@ -366,6 +497,8 @@ impl Failure {
             Failure::Stopped => "stopped",
             Failure::TokenRefused => "token_refused",
             Failure::LinkLost { .. } => "link_lost",
+            Failure::Move { .. } => "move",
+            Failure::MovesExhausted { .. } => "moves_exhausted",
             Failure::Other { .. } => "other",
         }
     }
@@ -379,7 +512,8 @@ impl Failure {
             Failure::TouchIdCancelled => 3,
             Failure::NoToken { .. } | Failure::NoRuntimeKey { .. } | Failure::TouchIdTimeout { .. } | Failure::TokenRefused => 5,
             Failure::OldImage { .. } => 7,
-            Failure::PinGone { .. } | Failure::HelloRefused { .. } | Failure::LinkLost { .. } => 8,
+            Failure::PinGone { .. } | Failure::HelloRefused { .. } | Failure::LinkLost { .. } | Failure::MovesExhausted { .. } => 8,
+            Failure::Move { inner, .. } => inner.exit_code(),
             Failure::NotGitRepo | Failure::Refused { .. } | Failure::MaxConcurrent { .. } | Failure::Finding { .. } | Failure::TranscriptTooLarge { .. } | Failure::TranscriptPullTooLarge { .. } | Failure::GateRefused { .. } | Failure::SpawnLimit { .. } => 9,
             Failure::Select { code, .. } if matches!(code, 7..=9) => *code,
             Failure::Deadline { code, .. } if matches!(code, 5 | 7 | 8) => *code,
@@ -414,12 +548,12 @@ impl Failure {
         let vm = || vm.unwrap_or("the VM").to_string();
         match &e {
             BridgeError::Cancelled | BridgeError::Cli(CliError::Cancelled) => return Failure::TouchIdCancelled,
-            BridgeError::MaxConcurrent(running) => return Failure::MaxConcurrent { running: *running },
+            BridgeError::MaxConcurrent(running) => return Failure::MaxConcurrent { running: *running, parked: Vec::new() },
             BridgeError::Tripwire(m) | BridgeError::SettingsWidening(m) | BridgeError::WorkspaceRefused { code: ws::FINDING, message: m } => return Failure::Finding { finding: m.clone() },
             BridgeError::WorkspaceRefused { code: ws::NOT_A_GIT_REPO, .. } => return Failure::NotGitRepo,
             BridgeError::NoCapability { cap, .. } => return Failure::OldImage { vm: vm(), cap },
             BridgeError::TranscriptTooLarge { session, bytes } => return Failure::TranscriptTooLarge { session: session.clone(), bytes: *bytes, s8_mirror: false },
-            BridgeError::TranscriptPullTooLarge { session, bytes } => return Failure::TranscriptPullTooLarge { session: session.clone(), bytes: *bytes, reuse_off: false },
+            BridgeError::TranscriptPullTooLarge { session, bytes } => return Failure::TranscriptPullTooLarge { session: session.clone(), bytes: *bytes, reuse_off: false, pinned: None },
             BridgeError::SpawnRefused { code: "limit", .. } => return Failure::SpawnLimit { vm: vm(), limit: MAX_SPAWNS as u32 },
             BridgeError::HelloRefused { code, .. } => return Failure::HelloRefused { code: code.clone() },
             _ => {}
@@ -453,8 +587,16 @@ impl Failure {
             Failure::PinGone { vm } => format!("the pinned VM {} ({PIN_KNOB}) is gone or has no row: unset {PIN_KNOB}, or pin a VM ai-env vm list shows", part(vm, SHORT_MAX)),
             Failure::TouchIdCancelled => "Touch ID was cancelled: nothing was started; reopen the chat to try again".to_string(),
             Failure::TouchIdTimeout { secs } => format!("no Touch ID within {secs} s (Cursor's 60 s window): nothing was started; ai-env vm warm prepares the VM ahead"),
-            Failure::MaxConcurrent { running: 1 } => "1 VM already runs ([vm].max_concurrent, suspended ones included): ai-env vm list names them; ai-env vm terminate ID frees a slot, then reopen the chat".to_string(),
-            Failure::MaxConcurrent { running } => format!("{running} VMs already run ([vm].max_concurrent, suspended ones included): ai-env vm list names them; ai-env vm terminate ID frees a slot, then reopen the chat"),
+            Failure::MaxConcurrent { running, parked } => {
+                let run = if *running == 1 { "1 VM already runs".to_string() } else { format!("{running} VMs already run") };
+                // S10: the suspended VMs no open chat holds are the ones to free.
+                let which = match parked.split_first() {
+                    None => "ai-env vm list names them; ".to_string(),
+                    Some((first, [])) => format!("parked with no open chat: {}; ", part(first, SHORT_MAX)),
+                    Some((first, more)) => format!("parked with no open chat: {} (+{} more); ", part(first, SHORT_MAX), more.len()),
+                };
+                format!("{run} ([vm].max_concurrent, suspended ones included): {which}ai-env vm terminate ID frees a slot, then reopen the chat")
+            }
             Failure::Select { first_line, .. } => format!("{}; ai-env doctor checks the setup", part(first_line, PART_MAX)),
             Failure::Finding { finding } if finding.starts_with("transcript:") => format!("the chat's transcript would carry {}: none of it was sent; AI_ENV_BRIDGE_LOCAL=1 reopens the chat on this Mac, or start a new one", part(finding, FINDING_MAX)),
             // `box seed` lists an update's findings too (its history: after its Touch ID); the dry run plans a first seed only.
@@ -470,7 +612,15 @@ impl Failure {
                     format!("the chat's transcript is {size} (over the {inline} MiB a reopen carries inline): run ai-env session stage {} --warm in a terminal, then reopen the chat", part(session, SHORT_MAX))
                 }
             }
-            Failure::TranscriptPullTooLarge { session, bytes, reuse_off } => {
+            // S10 (F3b): the pinned VM lacks the chat: the pin goes first, then --warm restores it into the workspace's VM.
+            Failure::TranscriptPullTooLarge { session, bytes, pinned: Some(vm), .. } => format!(
+                "the chat's transcript in S3 is {}, over the {} MiB a reopen pulls inline, and the pinned VM {} lacks it: unset {PIN_KNOB}, run ai-env session stage {} --warm, then reopen the chat",
+                crate::bridge::workspace::snapshot::human_bytes(*bytes),
+                crate::wire::s3::INLINE_MAX >> 20,
+                part(vm, VM_ID_MAX),
+                part(session, UUID_MAX)
+            ),
+            Failure::TranscriptPullTooLarge { session, bytes, reuse_off, pinned: None } => {
                 // With reuse off a reopen never takes the VM `--warm` warmed: the switch first.
                 let reuse = if *reuse_off { ", and [vm] reuse_per_workspace is off: set it to true," } else { ":" };
                 format!(
@@ -496,10 +646,102 @@ impl Failure {
             Failure::Stopped => "stopped before the session started: nothing was started; reopen the chat to start it".to_string(),
             Failure::TokenRefused => "Anthropic refused the delivered setup-token (HTTP 401): the session was stopped and is not started again; seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`".to_string(),
             Failure::LinkLost { vm } => format!("lost the VM {}: reopen the chat from the picker", part(vm, SHORT_MAX)),
+            Failure::Move { kind, from_vm, cause, inner } => {
+                let (vm, inner) = (part(from_vm, SHORT_MAX), part(&inner.line(), MOVE_INNER_MAX));
+                match kind {
+                    MoveKind::Readdress => format!("the chat's VM {vm} was lost ({}); moving the chat to a new VM failed: {inner}; reopen the chat from the picker", cause_text(*cause)),
+                    MoveKind::Respawn => format!("the chat's claude on {vm} was lost ({}); restarting it there failed: {inner}; reopen the chat from the picker", cause_text(*cause)),
+                    MoveKind::Migrate => format!("moving the chat off {vm} failed: {inner}; reopen the chat from the picker"),
+                }
+            }
+            Failure::MovesExhausted { vm, moves } => format!("lost the VM {} after {moves} moves in this session ([vm] max_readdress): reopen the chat from the picker", part(vm, SHORT_MAX)),
             Failure::Other { step, first_line, .. } => format!("{} (at {step}); ai-env doctor checks the setup; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally", part(first_line, PART_MAX)),
         };
         cut(&text, LINE_MAX - PREFIX.len())
     }
+}
+
+/// The most of a MicroVM id a line keeps (`microvm-<uuid>`'s length, S10 F3b).
+const VM_ID_MAX: usize = 44;
+/// The most of a session id a line keeps (a uuid's length).
+const UUID_MAX: usize = 36;
+
+/// What ended a moved chat's link, as its lines and notes read it inside
+/// their parentheses (`was lost (<cause text>)`), whatever the move's kind (a
+/// `Respawn` the pipeline turned into a `Readdress` keeps its cause).
+fn cause_text(cause: Option<LossCause>) -> &'static str {
+    match cause {
+        Some(LossCause::VmGone) => "it was terminated",
+        Some(LossCause::Unreachable) => "it stopped answering",
+        Some(LossCause::Gap) => "a replay gap",
+        Some(LossCause::SpawnGone) => "its spawn is gone",
+        Some(LossCause::Suspended) => "it stayed suspended",
+        Some(LossCause::NotMovable) | None => "its link ended",
+    }
+}
+
+// ---- S10 L3: the note the user sees in the chat (§3.4) --------------------------------------
+
+/// What [`note_stayed`] says comes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StayedThen {
+    /// A retry is due (§2.4): `; it tries again after the next turn`.
+    Retry,
+    /// No more wall migrations in this process: `; it moves when the VM reaches its wall`.
+    AtWall,
+    /// A `session migrate` request, which reports itself: nothing.
+    Nothing,
+}
+
+/// A re-address starts with a turn in flight.
+#[must_use]
+pub fn note_moving(vm: &str, cause: LossCause) -> String {
+    format!("ai-env: this chat's VM {} was lost ({}); moving the chat to a new VM (Touch ID for the setup token); the interrupted message is sent again; files are as of the last turn's end", part(vm, SHORT_MAX), cause_text(Some(cause)))
+}
+
+/// A re-address waits for the next input (L5).
+#[must_use]
+pub fn note_move_at_next(vm: &str, cause: LossCause) -> String {
+    format!("ai-env: this chat's VM {} was lost ({}); the chat moves to a new VM with your next message (Touch ID for the setup token)", part(vm, SHORT_MAX), cause_text(Some(cause)))
+}
+
+/// A respawn starts with a turn in flight.
+#[must_use]
+pub fn note_restarting(vm: &str, cause: LossCause) -> String {
+    format!("ai-env: this chat's claude on {} was lost ({}); restarting it there; the interrupted message is sent again", part(vm, SHORT_MAX), cause_text(Some(cause)))
+}
+
+/// A respawn waits for the next input (L5).
+#[must_use]
+pub fn note_restart_at_next(vm: &str, cause: LossCause) -> String {
+    format!("ai-env: this chat's claude on {} was lost ({}); it restarts there with your next message", part(vm, SHORT_MAX), cause_text(Some(cause)))
+}
+
+/// The moved generation's `Started`.
+#[must_use]
+pub fn note_continues(vm: &str) -> String {
+    format!("ai-env: the chat continues on {}; background tasks and MCP servers did not survive the move", part(vm, SHORT_MAX))
+}
+
+/// A migration's phase A starts.
+#[must_use]
+pub fn note_migrating(vm: &str, trigger: &MigrateTrigger) -> String {
+    let why = match trigger {
+        MigrateTrigger::Wall { .. } => "its 8-hour wall",
+        MigrateTrigger::Command { .. } => "ai-env session migrate",
+    };
+    format!("ai-env: moving the chat off {} ({why}): Touch ID for the setup token; the chat goes on meanwhile", part(vm, SHORT_MAX))
+}
+
+/// A migration's phase A failed, or its switch fell back: the chat stays on `vm`.
+#[must_use]
+pub fn note_stayed(vm: &str, why: &str, then: StayedThen) -> String {
+    let then = match then {
+        StayedThen::Retry => "; it tries again after the next turn",
+        StayedThen::AtWall => "; it moves when the VM reaches its wall",
+        StayedThen::Nothing => "",
+    };
+    format!("ai-env: the chat stays on {} ({}){then}", part(vm, SHORT_MAX), part(why, PART_MAX))
 }
 
 /// The first line of `text`, scrubbed, control characters blanked, at most
@@ -602,7 +844,11 @@ mod tests {
         for w in END_WORDS {
             assert!(snake(w) && !ends.contains(&w), "{w}");
         }
-        assert_eq!([EndReason::LinkLost, EndReason::CredentialRejected].map(EndReason::name), END_WORDS, "the reasons the pump gained (C3)");
+        assert_eq!([EndReason::LinkLost, EndReason::CredentialRejected, EndReason::MoveFailed].map(EndReason::name), END_WORDS, "the reasons the pump gained (C3, S10)");
+        // S10: no part is one the pump or the link writes under its own name.
+        for own in [crate::bridge::pump::INIT_ID_REFUSED_PART, crate::bridge::pump::MIRROR_DROPPED_PART, crate::bridge::remote::link::STEP_PART] {
+            assert!(!census_part::ALL.contains(&own), "{own}");
+        }
         let earlier = [
             // S8's resume upload, gone at S9's S3 cut-over: its name is never written again.
             "transcript_put",
@@ -660,6 +906,7 @@ mod tests {
             Failure::Finding { .. } => "ai-env box seed lists the findings",
             Failure::TranscriptTooLarge { s8_mirror: true, .. } => "run ai-env session migrate-s9 --yes, then ai-env session stage",
             Failure::TranscriptTooLarge { .. } => "ai-env session stage",
+            Failure::TranscriptPullTooLarge { pinned: Some(_), .. } => "unset AI_ENV_BRIDGE_VM, run ai-env session stage",
             Failure::TranscriptPullTooLarge { reuse_off: true, .. } => "[vm] reuse_per_workspace is off: set it to true, run ai-env session stage",
             Failure::TranscriptPullTooLarge { .. } => "--warm in a terminal, then reopen the chat",
             Failure::Workspace { .. } => "ai-env box seed --dry-run shows the plan",
@@ -669,7 +916,7 @@ mod tests {
             Failure::HelloRefused { .. } => "ai-env vm terminate",
             Failure::Stopped => "reopen the chat",
             Failure::TokenRefused => "ai-env creds setup-token",
-            Failure::LinkLost { .. } => "reopen the chat from the picker",
+            Failure::LinkLost { .. } | Failure::Move { .. } | Failure::MovesExhausted { .. } => "reopen the chat from the picker",
             Failure::Other { .. } => "ai-env doctor checks the setup",
         }
     }
@@ -693,8 +940,9 @@ mod tests {
             (Failure::PinGone { vm: vm.clone() }, 8),
             (Failure::TouchIdCancelled, 3),
             (Failure::TouchIdTimeout { secs: 47 }, 5),
-            (Failure::MaxConcurrent { running: 3 }, 9),
-            (Failure::MaxConcurrent { running: 1 }, 9),
+            (Failure::MaxConcurrent { running: 3, parked: Vec::new() }, 9),
+            (Failure::MaxConcurrent { running: 1, parked: Vec::new() }, 9),
+            (Failure::MaxConcurrent { running: 3, parked: vec![vm.clone(), "microvm-2".into(), format!("microvm-{token}")] }, 9),
             (Failure::Select { code: 7, first_line: long.clone() }, 7),
             (Failure::Select { code: 8, first_line: "microvm not found: microvm-x".into() }, 8),
             (Failure::Select { code: 9, first_line: "egress mismatch".into() }, 9),
@@ -703,9 +951,10 @@ mod tests {
             (Failure::Finding { finding: "transcript:0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl line 2: rule aws-access-key-id".into() }, 9),
             (Failure::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1_870_000_000, s8_mirror: false }, 9),
             (Failure::TranscriptTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: 70 << 20, s8_mirror: true }, 9),
-            (Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1 << 30, reuse_off: false }, 9),
-            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: 70 << 20, reuse_off: false }, 9),
-            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: u64::MAX, reuse_off: true }, 9),
+            (Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 1 << 30, reuse_off: false, pinned: None }, 9),
+            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: 70 << 20, reuse_off: false, pinned: None }, 9),
+            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: u64::MAX, reuse_off: true, pinned: None }, 9),
+            (Failure::TranscriptPullTooLarge { session: format!("{token}{}", "s".repeat(300)), bytes: u64::MAX, reuse_off: false, pinned: Some(format!("{vm}{token}")) }, 9),
             (Failure::Workspace { code: 9, first_line: format!("workspace refused (symlink_component): PUT /seed: {token}") }, 9),
             (Failure::Workspace { code: 1, first_line: long.clone() }, 1),
             (Failure::Workspace { code: 8, first_line: "microvm terminated: gone".into() }, 8),
@@ -721,6 +970,13 @@ mod tests {
             (Failure::Stopped, 143),
             (Failure::TokenRefused, 5),
             (Failure::LinkLost { vm: vm.clone() }, 8),
+            // S10: a failed move exits as what failed inside it; past max_readdress, 8.
+            (Failure::Move { kind: MoveKind::Readdress, from_vm: vm.clone(), cause: Some(LossCause::VmGone), inner: Box::new(Failure::TouchIdCancelled) }, 3),
+            (Failure::Move { kind: MoveKind::Readdress, from_vm: vm.clone(), cause: Some(LossCause::Unreachable), inner: Box::new(Failure::TouchIdTimeout { secs: 59 }) }, 5),
+            (Failure::Move { kind: MoveKind::Respawn, from_vm: vm.clone(), cause: Some(LossCause::Gap), inner: Box::new(Failure::Select { code: 7, first_line: long.clone() }) }, 7),
+            (Failure::Move { kind: MoveKind::Migrate, from_vm: vm.clone(), cause: None, inner: Box::new(Failure::Deadline { code: 8, step: "spawn" }) }, 8),
+            (Failure::Move { kind: MoveKind::Readdress, from_vm: vm.clone(), cause: Some(LossCause::VmGone), inner: Box::new(Failure::MaxConcurrent { running: 3, parked: vec!["microvm-2".into()] }) }, 9),
+            (Failure::MovesExhausted { vm: vm.clone(), moves: 3 }, 8),
             (Failure::Other { code: 4, step: "touchid", first_line: long.clone() }, 4),
             (Failure::Other { code: 6, step: "touchid", first_line: format!("corrupt: {key_id}") }, 6),
             (Failure::Other { code: 0, step: "spawn", first_line: "broken pipe".into() }, 1),
@@ -744,18 +1000,49 @@ mod tests {
         // S9: the old image names the stage its cap needs (workspace_v1's text unchanged); one VM is singular (F5).
         assert_eq!(Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_WORKSPACE_V1 }.line(), "microvm-1 runs an image older than S8 (no workspace_v1): run make deploy, then reopen the chat");
         assert_eq!(Failure::OldImage { vm: "microvm-1".into(), cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1 }.line(), "microvm-1 runs an image older than S9 (no transcript_s3_v1): run make deploy, then reopen the chat");
-        assert!(Failure::MaxConcurrent { running: 1 }.line().starts_with("1 VM already runs ("));
-        assert!(Failure::MaxConcurrent { running: 2 }.line().starts_with("2 VMs already run ("));
+        assert!(Failure::MaxConcurrent { running: 1, parked: Vec::new() }.line().starts_with("1 VM already runs ("));
+        assert!(Failure::MaxConcurrent { running: 2, parked: Vec::new() }.line().starts_with("2 VMs already run ("));
+        // S10: the parked VMs no open chat holds, named in place of `vm list` (the count only when more).
+        assert_eq!(
+            Failure::MaxConcurrent { running: 3, parked: vec!["microvm-1".into()] }.line(),
+            "3 VMs already run ([vm].max_concurrent, suspended ones included): parked with no open chat: microvm-1; ai-env vm terminate ID frees a slot, then reopen the chat"
+        );
+        assert!(Failure::MaxConcurrent { running: 3, parked: vec!["microvm-1".into(), "microvm-2".into(), "microvm-3".into()] }.line().contains(": parked with no open chat: microvm-1 (+2 more); ai-env vm terminate ID"));
+        assert_eq!(
+            Failure::MaxConcurrent { running: 3, parked: Vec::new() }.line(),
+            "3 VMs already run ([vm].max_concurrent, suspended ones included): ai-env vm list names them; ai-env vm terminate ID frees a slot, then reopen the chat",
+            "S9's text without any"
+        );
+        let pinned = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: false, pinned: Some("microvm-00000000-0000-4000-8000-000000000001".into()) };
+        assert_eq!(
+            pinned.line(),
+            "the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline, and the pinned VM microvm-00000000-0000-4000-8000-000000000001 lacks it: unset AI_ENV_BRIDGE_VM, run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm, then reopen the chat"
+        );
+        // S10: a failed move names the VM, the cause inside its parentheses, what failed, and the picker.
+        let inner = || Box::new(Failure::TouchIdCancelled);
+        let moved = |kind, cause| Failure::Move { kind, from_vm: "microvm-1".into(), cause, inner: inner() }.line();
+        assert_eq!(
+            moved(MoveKind::Readdress, Some(LossCause::VmGone)),
+            "the chat's VM microvm-1 was lost (it was terminated); moving the chat to a new VM failed: Touch ID was cancelled: nothing was started; reopen the chat to try again; reopen the chat from the picker"
+        );
+        assert_eq!(moved(MoveKind::Respawn, Some(LossCause::Gap)), "the chat's claude on microvm-1 was lost (a replay gap); restarting it there failed: Touch ID was cancelled: nothing was started; reopen the chat to try again; reopen the chat from the picker");
+        assert_eq!(moved(MoveKind::Migrate, None), "moving the chat off microvm-1 failed: Touch ID was cancelled: nothing was started; reopen the chat to try again; reopen the chat from the picker");
+        assert!(moved(MoveKind::Readdress, Some(LossCause::Unreachable)).contains("was lost (it stopped answering)"));
+        assert!(moved(MoveKind::Readdress, Some(LossCause::SpawnGone)).contains("was lost (its spawn is gone)"), "a respawn turned re-address keeps its cause");
+        assert_eq!(
+            Failure::MovesExhausted { vm: "microvm-1".into(), moves: 3 }.line(),
+            "lost the VM microvm-1 after 3 moves in this session ([vm] max_readdress): reopen the chat from the picker"
+        );
         let big = Failure::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, s8_mirror: false };
         assert_eq!(big.line(), "the chat's transcript is 70.0 MiB (over the 64 MiB a reopen carries inline): run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm in a terminal, then reopen the chat");
         let mirror = Failure::TranscriptTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, s8_mirror: true };
         // Migrated, a mirror over the cap is a chat S3 holds over what a reopen pulls inline: --warm after it.
         assert!(mirror.line().ends_with("inline): run ai-env session migrate-s9 --yes, then ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm, in a terminal, then reopen the chat"), "{}", mirror.line());
         // R5-AWS-1: a chat S3 holds, over what a reopen pulls within Cursor's window, names the --warm restore.
-        let pull = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: false };
+        let pull = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: false, pinned: None };
         assert_eq!(pull.line(), "the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline: run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm in a terminal, then reopen the chat");
         // With reuse off every reopen starts a new VM, and --warm warms yet another: the switch first.
-        let off = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: true };
+        let off = Failure::TranscriptPullTooLarge { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), bytes: 70 << 20, reuse_off: true, pinned: None };
         assert_eq!(off.line(), "the chat's transcript in S3 is 70.0 MiB, over the 64 MiB a reopen pulls inline, and [vm] reuse_per_workspace is off: set it to true, run ai-env session stage 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b --warm in a terminal, then reopen the chat");
     }
 
@@ -777,16 +1064,33 @@ mod tests {
             (Failure::OldImage { vm: long.clone(), cap: crate::wire::frame::CAP_GIT_HTTP_V1 }, "run make deploy, then reopen the chat"),
             (Failure::TranscriptTooLarge { session: long.clone(), bytes: u64::MAX, s8_mirror: false }, "in a terminal, then reopen the chat"),
             (Failure::TranscriptTooLarge { session: long.clone(), bytes: u64::MAX, s8_mirror: true }, " --warm, in a terminal, then reopen the chat"),
-            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: false }, " --warm in a terminal, then reopen the chat"),
-            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: true }, " --warm in a terminal, then reopen the chat"),
+            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: false, pinned: None }, " --warm in a terminal, then reopen the chat"),
+            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: true, pinned: None }, " --warm in a terminal, then reopen the chat"),
+            // S10 (F3b): the pinned VM's line, its VM and session at their cuts (294 characters with the prefix).
+            (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: true, pinned: Some(long.clone()) }, " --warm, then reopen the chat"),
             (Failure::SpawnLimit { vm: long.clone(), limit: 8 }, " --detail"),
             (Failure::HelloRefused { code: long.clone() }, "ai-env vm terminate it, then reopen the chat"),
             (Failure::LinkLost { vm: long.clone() }, ": reopen the chat from the picker"),
+            (Failure::MovesExhausted { vm: long.clone(), moves: u32::MAX }, ": reopen the chat from the picker"),
+            (Failure::MaxConcurrent { running: u32::MAX, parked: vec![long.clone(), long.clone()] }, "; ai-env vm terminate ID frees a slot, then reopen the chat"),
         ];
         for step in StartStep::ALL {
             cases.push((Failure::Other { code: 1, step: step.name(), first_line: long.clone() }, "; ai-env doctor checks the setup; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally"));
             cases.push((Failure::Deadline { code: 7, step: step.name() }, ": ai-env vm warm prepares the VM ahead"));
         }
+        // S10: each move's kind with every cause, its VM and its inner failure at their longest (the longest, a
+        // re-address that stopped answering, is 296 characters with the prefix).
+        let causes = [Some(LossCause::VmGone), Some(LossCause::Gap), Some(LossCause::SpawnGone), Some(LossCause::Unreachable), Some(LossCause::Suspended), Some(LossCause::NotMovable), None];
+        for kind in [MoveKind::Readdress, MoveKind::Respawn, MoveKind::Migrate] {
+            for cause in causes {
+                let inner = Box::new(Failure::Config { first_line: long.clone() });
+                cases.push((Failure::Move { kind, from_vm: long.clone(), cause, inner }, "; reopen the chat from the picker"));
+            }
+        }
+        let longest = Failure::Move { kind: MoveKind::Readdress, from_vm: long.clone(), cause: Some(LossCause::Unreachable), inner: Box::new(Failure::Config { first_line: long.clone() }) };
+        assert_eq!(format!("{PREFIX}{}", longest.line()).chars().count(), 296, "{}", longest.line());
+        let pinned = Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: false, pinned: Some(long.clone()) };
+        assert_eq!(format!("{PREFIX}{}", pinned.line()).chars().count(), 294, "{}", pinned.line());
         for (f, trailer) in cases {
             let line = f.line();
             assert!(line.ends_with(trailer), "{}: {line}", f.word());
@@ -841,6 +1145,10 @@ mod tests {
             (Spawn, BridgeError::SpawnRefused { code: "cwd", message: "no such directory".into() }, "other", 1),
             (Spawn, BridgeError::Transport("socket closed".into()), "other", 8),
             (Spawn, BridgeError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe")), "other", 1),
+            // S10 (§2.6): the two exit-8 errors that were `Transport`, mapped by step as before.
+            (Spawn, BridgeError::SpawnGone("spawn s is not on microvm-1 (it ended, or its detach grace ran out while disconnected)".into()), "other", 8),
+            (Spawn, BridgeError::StayedSuspended("microvm-1 stayed suspended for 5 s".into()), "other", 8),
+            (SelectVm, BridgeError::StayedSuspended("microvm-1 stayed suspended for 5 s".into()), "select", 8),
         ];
         for (step, e, word, code) in cases {
             let shown = e.to_string();
@@ -850,9 +1158,43 @@ mod tests {
             assert!(printed.chars().count() <= LINE_MAX && !printed.contains('\n') && !printed.contains(&token), "{printed}");
         }
         assert!(Failure::from_error(Spawn, BridgeError::SpawnRefused { code: "limit", message: String::new() }, vm).line().starts_with("microvm-1 runs 8 commands already"));
+        assert_eq!(Failure::from_error(SelectVm, BridgeError::MaxConcurrent(3), vm), Failure::MaxConcurrent { running: 3, parked: Vec::new() }, "S10: the pipeline fills the parked VMs at P2");
+        assert!(matches!(Failure::from_error(Workspace, BridgeError::TranscriptPullTooLarge { session: "s".into(), bytes: 1 }, vm), Failure::TranscriptPullTooLarge { pinned: None, .. }));
         assert!(Failure::from_error(Workspace, BridgeError::NoCapability { cap: "workspace_v1", message: String::new() }, None).line().starts_with("the VM runs an image older than S8"));
         let other = Failure::from_error(TouchId, BridgeError::Cli(CliError::NoKey("keystore key ai-env absent".into())), None);
         assert_eq!(other.line(), "keystore key ai-env absent (at touchid); ai-env doctor checks the setup; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally");
+    }
+
+    /// S10 L3 (§3.4): the notes the chat shows when it moves, as written:
+    /// each names the VM and, for a loss, its cause inside the parentheses;
+    /// a stay says what comes next, or nothing for a `session migrate`.
+    #[test]
+    fn the_move_notes_read_as_written() {
+        assert_eq!(
+            note_moving("microvm-1", LossCause::VmGone),
+            "ai-env: this chat's VM microvm-1 was lost (it was terminated); moving the chat to a new VM (Touch ID for the setup token); the interrupted message is sent again; files are as of the last turn's end"
+        );
+        assert_eq!(note_move_at_next("microvm-1", LossCause::Unreachable), "ai-env: this chat's VM microvm-1 was lost (it stopped answering); the chat moves to a new VM with your next message (Touch ID for the setup token)");
+        assert_eq!(note_restarting("microvm-1", LossCause::Gap), "ai-env: this chat's claude on microvm-1 was lost (a replay gap); restarting it there; the interrupted message is sent again");
+        assert_eq!(note_restart_at_next("microvm-1", LossCause::SpawnGone), "ai-env: this chat's claude on microvm-1 was lost (its spawn is gone); it restarts there with your next message");
+        assert_eq!(note_continues("microvm-2"), "ai-env: the chat continues on microvm-2; background tasks and MCP servers did not survive the move");
+        assert_eq!(note_migrating("microvm-1", &MigrateTrigger::Wall { left_s: 1100 }), "ai-env: moving the chat off microvm-1 (its 8-hour wall): Touch ID for the setup token; the chat goes on meanwhile");
+        assert_eq!(note_migrating("microvm-1", &MigrateTrigger::Command { nonce: "n".into() }), "ai-env: moving the chat off microvm-1 (ai-env session migrate): Touch ID for the setup token; the chat goes on meanwhile");
+        assert_eq!(note_stayed("microvm-1", "Touch ID was cancelled", StayedThen::Retry), "ai-env: the chat stays on microvm-1 (Touch ID was cancelled); it tries again after the next turn");
+        assert_eq!(note_stayed("microvm-1", "3 VMs already run", StayedThen::AtWall), "ai-env: the chat stays on microvm-1 (3 VMs already run); it moves when the VM reaches its wall");
+        assert_eq!(note_stayed("microvm-1", "the gate refused it", StayedThen::Nothing), "ai-env: the chat stays on microvm-1 (the gate refused it)");
+        let token = format!("{}-{}-{}-{}", "sk", "ant", "oat01", "d".repeat(60));
+        assert!(!note_stayed("microvm-1", &format!("a failure that quoted {token}"), StayedThen::Nothing).contains(&token), "a why is scrubbed");
+    }
+
+    /// S10 (§10): the moves' budgets.
+    #[test]
+    fn the_move_budgets_are_the_contracts() {
+        let s = Duration::from_secs;
+        assert_eq!((MOVE_WINDOW, MOVE_HOLD, MOVE_OLD_VM_WAIT, MOVE_SYNC_BUDGET, REAP_WAIT, CARRY_P2_MIN_LEFT), (s(180), s(900), s(15), s(10), s(2), s(25)));
+        assert_eq!((MIGRATE_PREP_TRIES, MOVE_INNER_MAX), (2, 100));
+        assert_eq!((move_hold_ping(300), move_hold_ping(28_800)), (s(100), s(9600)), "a third of max_idle_s");
+        assert!(move_hold_ping(300) < MOVE_HOLD && MOVE_WINDOW > INIT_DEADLINE);
     }
 
     /// A P0 refusal's fix is in the error's own text (`Refused` adds none):

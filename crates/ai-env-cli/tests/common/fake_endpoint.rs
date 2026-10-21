@@ -29,10 +29,23 @@
 //! scripted failure looks like one undone since (the fake records each call
 //! before its failure): it is still posted, and the look at the state that
 //! follows posts the move back, so the shim gets both hooks. Before a request
-//! is checked, every hook its VM is owed has been answered, as the platform's
-//! are; between requests the bridge looks every [`BRIDGE_TICK`] (a test can
-//! stop that, [`FakeEndpoint::ticking`]). One shim stands for one VM: a
-//! second VM's `/run` gets the shim's 409.
+//! is checked, every hook the fake's state owes any VM has been answered (one
+//! look for all VMs: a request to one VM also waits for another's hooks,
+//! which the platform never does); between requests the bridge looks every
+//! [`BRIDGE_TICK`] (a test can stop that, [`FakeEndpoint::ticking`]). One
+//! shim stands for one VM: a second VM's `/run` gets the shim's 409.
+//!
+//! Per VM (S10, [`FakeEndpoint::start_per_vm`]): each VM gets listeners of
+//! its own, a shim and a disk, built by the test's [`VmFactory`] at the VM's
+//! first request that passes the check (on a blocking thread: the factory
+//! may block on its own runtime), its `/run` posted to its own hooks. A
+//! checked request then goes by its VM and its port (8080 to that VM's app
+//! listener, 9418 to its code listener, any other the proxy's 502), every
+//! hook to that VM's hooks, and every attempt records its VM. With the fake's
+//! `enforce_wall` the bridge also plays the platform's wall: a VM past it in
+//! the bridge's copy of the state is ended by one locked look
+//! (`FileFakeMicrovmApi::settled`), so its `/terminate` goes out at that
+//! tick, as nothing else may look at a quiet VM.
 //!
 //! Per-port routing (S8, [`FakeEndpoint::start_routed`]): after the token
 //! check, a request goes to the upstream its `x-aws-proxy-port` names (the
@@ -50,6 +63,7 @@
 use ai_env_cli::bridge::api::{AuthToken, Call, FakeState, VmState, TOKEN_HEADER};
 use ai_env_cli::bridge::vm::fake_file::FileFakeMicrovmApi;
 use ai_env_cli::wire::redact::Secret;
+use ai_env_cli::wire::workspace::{APP_PORT, CODE_PORT};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -63,6 +77,10 @@ use tokio::net::TcpStream;
 const HEAD_MAX: usize = 64 * 1024;
 /// How long a head, an upstream connect or a hook's post may take.
 const STEP_LIMIT: Duration = Duration::from_secs(10);
+/// How long the shim's answer head to a `/transcript/pull` may take: it
+/// answers once the pull is done, and a 64 MiB chat takes 9 to 14 s in a
+/// debug build on a loaded Mac.
+const PULL_HEAD_LIMIT: Duration = Duration::from_secs(60);
 /// The runtime hooks' path (the shim's `hooks::PREFIX`; this file also builds without the `shim` feature).
 const HOOKS_PREFIX: &str = "/aws/lambda-microvms/runtime/v1";
 /// How often the hook bridge reads the fake's state for VMs that moved.
@@ -120,11 +138,28 @@ pub struct Attempt {
     pub hooks: usize,
     /// The request's `x-aws-proxy-port`; 0 when it named none (or no head came).
     pub port: u16,
+    /// The VM the check named (S10); `None` when the request was answered
+    /// before the check or refused by it.
+    pub vm: Option<String>,
 }
 
-/// One runtime hook the endpoint posted to the shim as the platform
-/// ([`FakeEndpoint::start_platform`]): auto-run's `run`, the hook bridge's
-/// `suspend`, `resume` and `terminate`.
+/// One fake VM's listeners (S10, [`FakeEndpoint::start_per_vm`]): its
+/// runtime hooks, its app port's and its code port's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmRoutes {
+    pub hooks: SocketAddr,
+    pub app: SocketAddr,
+    pub code: SocketAddr,
+}
+
+/// Builds a VM's shim and disk at its auto-run (`enter`), run under
+/// `spawn_blocking`: its listeners, or why there are none (its requests then
+/// get the proxy's 502, and its next one asks again).
+pub type VmFactory = Arc<dyn Fn(&str) -> std::io::Result<VmRoutes> + Send + Sync>;
+
+/// One runtime hook the endpoint posted to a shim as the platform
+/// ([`FakeEndpoint::start_platform`], [`FakeEndpoint::start_per_vm`]):
+/// auto-run's `run`, the hook bridge's `suspend`, `resume` and `terminate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hook {
     pub vm: String,
@@ -156,21 +191,34 @@ impl Told {
     }
 }
 
-/// The platform's hook client for the shim at `hooks`: the VMs it ran and
-/// what each was told since, and how far the fake's recorded calls were read.
-struct Platform {
+/// One VM the platform's hook client ran: what its shim was told since, and
+/// where that shim's hooks listen.
+struct Ran {
+    told: Told,
     hooks: SocketAddr,
-    vms: BTreeMap<String, Told>,
+}
+
+/// The platform's hook client: the one shim's hooks (`None` per VM, S10:
+/// each VM's come with its routes), the VMs it ran, and how far the fake's
+/// recorded calls were read.
+struct Platform {
+    shim: Option<SocketAddr>,
+    vms: BTreeMap<String, Ran>,
     replayed: usize,
 }
 
 impl Platform {
-    /// The hooks `st` owes the shim, in order: each suspend, resume and
-    /// terminate the fake recorded for a VM it ran since the last look (a
-    /// terminate only if the VM is terminating or gone now: the fake records
-    /// a call before its scripted failure), then what moved without a call.
-    /// Each VM's told state is moved along.
-    fn owed(&mut self, st: &FakeState) -> Vec<(String, &'static str)> {
+    fn new(shim: Option<SocketAddr>) -> Platform {
+        Platform { shim, vms: BTreeMap::new(), replayed: 0 }
+    }
+
+    /// The hooks `st` owes the shims, in order, each with where its VM's
+    /// hooks listen: each suspend, resume and terminate the fake recorded for
+    /// a VM it ran since the last look (a terminate only if the VM is
+    /// terminating or gone now: the fake records a call before its scripted
+    /// failure), then what moved without a call. Each VM's told state is
+    /// moved along.
+    fn owed(&mut self, st: &FakeState) -> Vec<(String, &'static str, SocketAddr)> {
         let mut out = Vec::new();
         // A test that cleared the calls: nothing left to replay; the states below still count.
         let from = self.replayed.min(st.calls.len());
@@ -181,12 +229,14 @@ impl Platform {
                 Call::Terminate(vm) if st.vms.get(vm).is_none_or(|v| v.state.is_terminal()) => (vm, Told::Terminated),
                 _ => continue,
             };
-            if let Some(hook) = self.vms.get_mut(vm).and_then(|told| told.step(to)) {
-                out.push((vm.clone(), hook));
+            if let Some(ran) = self.vms.get_mut(vm) {
+                if let Some(hook) = ran.told.step(to) {
+                    out.push((vm.clone(), hook, ran.hooks));
+                }
             }
         }
         self.replayed = st.calls.len();
-        for (vm, told) in &mut self.vms {
+        for (vm, ran) in &mut self.vms {
             let now = match st.vms.get(vm).map(|v| &v.state) {
                 Some(VmState::Running) => Told::Running,
                 Some(VmState::Suspending | VmState::Suspended) => Told::Suspended,
@@ -194,8 +244,8 @@ impl Platform {
                 None => Told::Terminated,
                 Some(_) => continue,
             };
-            if let Some(hook) = told.step(now) {
-                out.push((vm.clone(), hook));
+            if let Some(hook) = ran.told.step(now) {
+                out.push((vm.clone(), hook, ran.hooks));
             }
         }
         out
@@ -211,13 +261,25 @@ enum Upstream {
     One(SocketAddr),
     /// Each port to its own listener; any other port has none (502).
     Ports(BTreeMap<u16, SocketAddr>),
+    /// S10: each VM's own listeners, built by `factory` at its first request.
+    PerVm { routes: Mutex<BTreeMap<String, VmRoutes>>, factory: VmFactory },
 }
 
 impl Upstream {
-    fn for_port(&self, port: u16) -> Option<SocketAddr> {
+    /// Where a checked request for `vm` to `port` goes; `None`: nothing
+    /// listens there (the proxy's 502).
+    fn route(&self, vm: &str, port: u16) -> Option<SocketAddr> {
         match self {
             Upstream::One(addr) => Some(*addr),
             Upstream::Ports(routes) => routes.get(&port).copied(),
+            Upstream::PerVm { routes, .. } => {
+                let r = routes.lock().unwrap().get(vm).copied()?;
+                match port {
+                    APP_PORT => Some(r.app),
+                    CODE_PORT => Some(r.code),
+                    _ => None,
+                }
+            }
         }
     }
 }
@@ -268,7 +330,7 @@ impl FakeEndpoint {
     /// hook bridge, each hook recorded ([`FakeEndpoint::hooks`]).
     #[must_use]
     pub fn start_platform(fake: &Path, upstream: SocketAddr, hooks: SocketAddr) -> FakeEndpoint {
-        FakeEndpoint::launch(fake, Upstream::One(upstream), Some(hooks))
+        FakeEndpoint::launch(fake, Upstream::One(upstream), Some(Platform::new(Some(hooks))))
     }
 
     /// The S8 endpoint: [`FakeEndpoint::start`] with a request routed, once
@@ -278,10 +340,21 @@ impl FakeEndpoint {
     /// platform's hook client for that shim ([`FakeEndpoint::start_platform`]).
     #[must_use]
     pub fn start_routed(fake: &Path, routes: &[(u16, SocketAddr)], hooks: Option<SocketAddr>) -> FakeEndpoint {
-        FakeEndpoint::launch(fake, Upstream::Ports(routes.iter().copied().collect()), hooks)
+        FakeEndpoint::launch(fake, Upstream::Ports(routes.iter().copied().collect()), hooks.map(|h| Platform::new(Some(h))))
     }
 
-    fn launch(fake: &Path, upstream: Upstream, hooks: Option<SocketAddr>) -> FakeEndpoint {
+    /// The S10 endpoint (the module doc's "Per VM"): each VM gets its own
+    /// listeners from `factory` at its first request that passes the check,
+    /// its `/run` on its own hooks; a request then goes by its VM and its
+    /// port (8080 to the VM's app listener, 9418 to its code listener, any
+    /// other 502 `BAD_GATEWAY`), and the platform's hook client posts each
+    /// VM's hooks to that VM's listener.
+    #[must_use]
+    pub fn start_per_vm(fake: &Path, factory: VmFactory) -> FakeEndpoint {
+        FakeEndpoint::launch(fake, Upstream::PerVm { routes: Mutex::new(BTreeMap::new()), factory }, Some(Platform::new(None)))
+    }
+
+    fn launch(fake: &Path, upstream: Upstream, platform: Option<Platform>) -> FakeEndpoint {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake endpoint");
         listener.set_nonblocking(true).expect("nonblocking listener");
         let addr = listener.local_addr().expect("the endpoint's address");
@@ -296,7 +369,7 @@ impl FakeEndpoint {
             resumes: Mutex::new(0),
             accepted: Mutex::new(0),
             held: Mutex::new(0),
-            platform: hooks.map(|hooks| tokio::sync::Mutex::new(Platform { hooks, vms: BTreeMap::new(), replayed: 0 })),
+            platform: platform.map(tokio::sync::Mutex::new),
             hooks: Mutex::new(Vec::new()),
             before_hook: Mutex::new(None),
             ticking: AtomicBool::new(true),
@@ -352,6 +425,14 @@ impl FakeEndpoint {
         self.shared.port_scripts.lock().unwrap().entry(port).or_default().extend(actions);
     }
 
+    /// Drop what [`FakeEndpoint::script_port`] queued for `port` that no
+    /// request took yet (S10, phase 4b V-6: a VM unreachable for one chat
+    /// until it gave up, then reachable again): that port's next requests
+    /// take [`FakeEndpoint::script`]'s actions again, else `Forward`.
+    pub fn unscript_port(&self, port: u16) {
+        self.shared.port_scripts.lock().unwrap().remove(&port);
+    }
+
     /// Every connection so far, in order.
     #[must_use]
     pub fn attempts(&self) -> Vec<Attempt> {
@@ -391,6 +472,16 @@ impl FakeEndpoint {
     #[must_use]
     pub fn hooks(&self) -> Vec<Hook> {
         self.shared.hooks.lock().unwrap().clone()
+    }
+
+    /// The listeners the factory built for `vm` ([`FakeEndpoint::start_per_vm`]);
+    /// `None` before its first request, and on an endpoint of one shim.
+    #[must_use]
+    pub fn routes_of(&self, vm: &str) -> Option<VmRoutes> {
+        match &self.shared.upstream {
+            Upstream::PerVm { routes, .. } => routes.lock().unwrap().get(vm).copied(),
+            Upstream::One(_) | Upstream::Ports(_) => None,
+        }
     }
 
     /// Call `f(vm, hook)` on the endpoint's thread just before each platform
@@ -474,6 +565,11 @@ impl Head {
 
 /// Read up to the end of a head (`\r\n\r\n`), at most [`HEAD_MAX`] bytes.
 async fn read_head(s: &mut (impl AsyncRead + Unpin)) -> Option<(Vec<u8>, Vec<u8>)> {
+    read_head_within(s, STEP_LIMIT).await
+}
+
+/// [`read_head`], each read allowed `limit`.
+async fn read_head_within(s: &mut (impl AsyncRead + Unpin), limit: Duration) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -484,7 +580,7 @@ async fn read_head(s: &mut (impl AsyncRead + Unpin)) -> Option<(Vec<u8>, Vec<u8>
         if buf.len() > HEAD_MAX {
             return None;
         }
-        match tokio::time::timeout(STEP_LIMIT, s.read(&mut chunk)).await {
+        match tokio::time::timeout(limit, s.read(&mut chunk)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
         }
@@ -499,8 +595,8 @@ fn parse(raw: Vec<u8>, rest: Vec<u8>) -> Head {
     Head { raw, path, headers, rest }
 }
 
-fn record(shared: &Shared, status: u16, path: &str, port: u16, hooks: usize) {
-    shared.attempts.lock().unwrap().push(Attempt { at: Instant::now(), status, path: path.to_string(), hooks, port });
+fn record(shared: &Shared, status: u16, path: &str, port: u16, hooks: usize, vm: Option<&str>) {
+    shared.attempts.lock().unwrap().push(Attempt { at: Instant::now(), status, path: path.to_string(), hooks, port, vm: vm.map(str::to_string) });
 }
 
 /// The action for a request to `port`: that port's script first, then the
@@ -597,32 +693,78 @@ async fn post_platform_hook(shared: &Shared, hooks: SocketAddr, vm: &str, hook: 
     shared.hooks.lock().unwrap().push(Hook { vm: vm.to_string(), name: hook, status });
 }
 
-/// The hook bridge: post every hook the fake's state owes the shim
-/// ([`Platform::owed`]), in order, each answered before the next.
+/// The hook bridge: post every hook the fake's state owes the shims
+/// ([`Platform::owed`]), in order, each answered before the next. With the
+/// wall asked for (S10, `FakeState::enforce_wall`), a VM past it in this
+/// copy is first ended by one locked look ([`settle_locked`]), so its
+/// `/terminate` is among them.
 async fn sync(shared: &Shared, p: &mut Platform) {
-    let Some(st) = read_state(&shared.fake).await else { return };
-    for (vm, hook) in p.owed(&st) {
-        post_platform_hook(shared, p.hooks, &vm, hook, "{}").await;
+    let Some(mut st) = read_state(&shared.fake).await else { return };
+    if st.wall_due() {
+        if let Some(looked) = settle_locked(&shared.fake).await {
+            st = looked;
+        }
+    }
+    for (vm, hook, hooks) in p.owed(&st) {
+        post_platform_hook(shared, hooks, &vm, hook, "{}").await;
     }
 }
 
-/// A request for `vm` passed the check. Auto-run: a VM the shim was never
-/// told of gets `/run` first, with the payload its RunMicrovm carried. A VM
-/// the shim was told is suspended was just resumed by the check (the
-/// platform's auto-resume): `/resume` goes first, as the platform's hold
-/// posts it before the request goes on.
+/// One look at the fake's state under its lock, saved
+/// (`FileFakeMicrovmApi::settled`): the state after it, `None` when it
+/// cannot be read.
+async fn settle_locked(fake: &Path) -> Option<FakeState> {
+    let fake = fake.to_path_buf();
+    tokio::task::spawn_blocking(move || FileFakeMicrovmApi::open(&fake).and_then(|api| api.settled()).ok()).await.ok().flatten()
+}
+
+/// A request for `vm` passed the check. Auto-run: a VM the platform never
+/// ran gets `/run` first, with the payload its RunMicrovm carried, on the
+/// one shim, or (S10, per VM) on the listeners the factory builds for it
+/// now. A VM whose shim was told it is suspended was just resumed by the
+/// check (the platform's auto-resume): `/resume` goes first, as the
+/// platform's hold posts it before the request goes on.
 async fn enter(shared: &Shared, p: &mut Platform, vm: &str) {
-    let hooks = p.hooks;
-    if let Some(told) = p.vms.get_mut(vm) {
-        if let Some(hook) = told.step(Told::Running) {
+    if let Some(ran) = p.vms.get_mut(vm) {
+        if let Some(hook) = ran.told.step(Told::Running) {
+            let hooks = ran.hooks;
             post_platform_hook(shared, hooks, vm, hook, "{}").await;
         }
         return;
     }
+    let Some(hooks) = hooks_for(shared, p, vm).await else { return };
     let payload = read_state(&shared.fake).await.and_then(|st| run_payload(&st, vm));
     let body = serde_json::json!({ "microvmId": vm, "runHookPayload": payload }).to_string();
-    p.vms.insert(vm.to_string(), Told::Running);
+    p.vms.insert(vm.to_string(), Ran { told: Told::Running, hooks });
     post_platform_hook(shared, hooks, vm, "run", &body).await;
+}
+
+/// Where the shim of `vm`, which the platform never ran, listens for its
+/// hooks: the one shim's, or (S10, per VM) the listeners the factory builds
+/// for it now, kept for its requests. `None` when the factory failed: said
+/// on stderr, the VM's requests get the proxy's 502 until a later one finds
+/// its listeners built.
+async fn hooks_for(shared: &Shared, p: &Platform, vm: &str) -> Option<SocketAddr> {
+    let Upstream::PerVm { routes, factory } = &shared.upstream else { return p.shim };
+    let built = routes.lock().unwrap().get(vm).copied();
+    if let Some(r) = built {
+        return Some(r.hooks);
+    }
+    let (factory, id) = (factory.clone(), vm.to_string());
+    match tokio::task::spawn_blocking(move || factory(&id)).await {
+        Ok(Ok(r)) => {
+            routes.lock().unwrap().insert(vm.to_string(), r);
+            Some(r.hooks)
+        }
+        Ok(Err(e)) => {
+            eprintln!("fake endpoint: no listeners for {vm}: {e}");
+            None
+        }
+        Err(e) => {
+            eprintln!("fake endpoint: building the listeners of {vm} failed: {e}");
+            None
+        }
+    }
 }
 
 /// How a forwarded request ends besides both sides' own end ([`Action`]).
@@ -640,7 +782,7 @@ struct Cuts {
 
 async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
     let Some((raw, rest)) = read_head(&mut client).await else {
-        record(&shared, 0, "", 0, posted(&shared));
+        record(&shared, 0, "", 0, posted(&shared), None);
         return;
     };
     let head = parse(raw, rest);
@@ -649,7 +791,7 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
     let mut cuts = Cuts::default();
     match action {
         Action::Respond { status, headers, body } => {
-            record(&shared, status, &head.path, port, posted(&shared));
+            record(&shared, status, &head.path, port, posted(&shared), None);
             answer(&mut client, status, &headers, &body).await;
             return;
         }
@@ -664,8 +806,8 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
         Action::CutResponseAfter { bytes } => cuts.response_bytes = Some(bytes),
         Action::Forward | Action::HoldThenResume { .. } => {}
     }
-    // As the platform: the hooks the fake's state owes the shim go before the check, and its
-    // auto-resume or a VM's first request before the request goes on.
+    // As the platform, but in one look for every VM (the module doc): the hooks the fake's state owes the shims go
+    // before the check, and its auto-resume or a VM's first request before the request goes on.
     let mut platform = match &shared.platform {
         Some(p) => Some(p.lock().await),
         None => None,
@@ -676,7 +818,7 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
     let vm = match check(&shared, &head).await {
         Ok(vm) => vm,
         Err((status, proxy_error)) => {
-            record(&shared, status, &head.path, port, posted(&shared));
+            record(&shared, status, &head.path, port, posted(&shared), None);
             answer(&mut client, status, &[("x-aws-proxy-error".into(), proxy_error)], "").await;
             return;
         }
@@ -692,28 +834,29 @@ async fn serve(mut client: TcpStream, shared: Arc<Shared>) {
         }
     }
     // A port nothing listens on, or a listener that is gone: the proxy's 502.
-    let connected = match shared.upstream.for_port(port) {
+    let connected = match shared.upstream.route(&vm, port) {
         Some(target) => tokio::time::timeout(STEP_LIMIT, TcpStream::connect(target)).await.ok().and_then(Result::ok),
         None => None,
     };
     let Some(mut upstream) = connected else {
-        record(&shared, 502, &head.path, port, answered);
+        record(&shared, 502, &head.path, port, answered, Some(&vm));
         answer(&mut client, 502, &[("x-aws-proxy-error".into(), "BAD_GATEWAY".into())], "").await;
         return;
     };
     let _ = upstream.set_nodelay(true);
-    forward(&mut client, &mut upstream, &head, &shared, (port, answered), &cuts).await;
+    forward(&mut client, &mut upstream, &head, &shared, (port, answered, &vm), &cuts).await;
     // Dropping both streams cuts the connection on both sides.
 }
 
-/// Forward one checked request (`at`: its port and the hooks answered
-/// before it went on) to `upstream`: its head, stripped, and its body as it
-/// comes while the answer's head is awaited; that head back (its status is
-/// the attempt's); then both ways until both sides ended (`until`: until
-/// either did) or a cut: one of `cuts`, or [`FakeEndpoint::cut_all`] once the
-/// answer's head was back.
-async fn forward(client: &mut TcpStream, upstream: &mut TcpStream, head: &Head, shared: &Shared, at: (u16, usize), cuts: &Cuts) {
-    let (port, answered) = at;
+/// Forward one checked request (`at`: its port, the hooks answered before
+/// it went on, and its VM) to `upstream`: its head, stripped, and its body
+/// as it comes while the answer's head is awaited; that head back (its
+/// status is the attempt's); then both ways until both sides ended
+/// (`until`: until either did) or a cut: one of `cuts`, or
+/// [`FakeEndpoint::cut_all`] once the answer's head was back.
+async fn forward(client: &mut TcpStream, upstream: &mut TcpStream, head: &Head, shared: &Shared, at: (u16, usize, &str), cuts: &Cuts) {
+    let (port, answered, vm) = at;
+    let vm = Some(vm);
     let path = head.path.as_str();
     let mut up_left = cuts.request_bytes;
     let rest = match up_left {
@@ -723,13 +866,13 @@ async fn forward(client: &mut TcpStream, upstream: &mut TcpStream, head: &Head, 
     let mut sent = head.stripped();
     sent.extend_from_slice(rest);
     if upstream.write_all(&sent).await.is_err() {
-        record(shared, 0, path, port, answered);
+        record(shared, 0, path, port, answered, vm);
         return;
     }
     if let Some(left) = up_left.as_mut() {
         *left -= rest.len() as u64;
         if *left == 0 {
-            record(shared, 0, path, port, answered);
+            record(shared, 0, path, port, answered, vm);
             return;
         }
     }
@@ -740,13 +883,14 @@ async fn forward(client: &mut TcpStream, upstream: &mut TcpStream, head: &Head, 
     let mut up_end = None;
     // The upstream's answer head goes back first: its status is the attempt's.
     let reply = {
-        let mut reply = std::pin::pin!(read_head(&mut from_upstream));
+        let limit = if path.starts_with("/transcript/pull") { PULL_HEAD_LIMIT } else { STEP_LIMIT };
+        let mut reply = std::pin::pin!(read_head_within(&mut from_upstream, limit));
         loop {
             tokio::select! {
                 h = &mut reply => break h,
                 e = &mut up, if up_end.is_none() => {
                     if e == End::Cut {
-                        record(shared, 0, path, port, answered);
+                        record(shared, 0, path, port, answered, vm);
                         return;
                     }
                     up_end = Some(e);
@@ -755,11 +899,11 @@ async fn forward(client: &mut TcpStream, upstream: &mut TcpStream, head: &Head, 
         }
     };
     let Some((reply, more)) = reply else {
-        record(shared, 0, path, port, answered);
+        record(shared, 0, path, port, answered, vm);
         return;
     };
     let status = String::from_utf8_lossy(&reply).split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    record(shared, status, path, port, answered);
+    record(shared, status, path, port, answered, vm);
     let mut down_left = cuts.response_bytes;
     let more = match down_left {
         Some(n) => &more[..more.len().min(usize::try_from(n).unwrap_or(usize::MAX))],

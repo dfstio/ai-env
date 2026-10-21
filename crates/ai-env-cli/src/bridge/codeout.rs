@@ -383,8 +383,33 @@ fn clashes(name: &str, existing: &BTreeMap<String, String>) -> bool {
 /// (exit 9), as the helper answers. With no ref passing all three, the pack
 /// is not read and none of this runs. The user's branches, index and
 /// working tree are never touched. First, the incoming refs a process that
-/// is gone left are deleted (`sweep_incoming`).
+/// is gone left are deleted (`sweep_incoming`). S10 (F4): the refs' new
+/// objects are listed and scanned as one, their settings read from one walk
+/// of their trees, and a ref's own listing and scan run only once that scan
+/// found something ([`scan_batch`]); the clean cache is saved once.
 pub fn import(i: &Import<'_>) -> Result<Imported, BridgeError> {
+    import_with(i, ScanMode::Batch)
+}
+
+/// [`import`] with S9's scans: each ref's own listing, scan and tree
+/// listing, one ref after another ([`scan_per_ref`]). What the batch is held
+/// equal to (S10 F4, the equivalence fixture of `tests/workspace/codeout.rs`);
+/// nothing else runs it.
+pub fn import_per_ref(i: &Import<'_>) -> Result<Imported, BridgeError> {
+    import_with(i, ScanMode::PerRef)
+}
+
+/// How [`import`] scans the refs it takes (S10 F4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    /// [`scan_batch`].
+    Batch,
+    /// [`scan_per_ref`], S9's.
+    PerRef,
+}
+
+/// [`import`], its refs scanned by `mode`.
+fn import_with(i: &Import<'_>, mode: ScanMode) -> Result<Imported, BridgeError> {
     let WsKind::Git { common_dir, object_format, .. } = &i.ws.kind;
     let user = GitRun::mac(&i.ws.root);
     sweep_incoming(&user);
@@ -462,7 +487,7 @@ pub fn import(i: &Import<'_>) -> Result<Imported, BridgeError> {
         args.push(format!("+refs/box/{suffix}:{incoming}{suffix}"));
     }
     let fetched = user.output(&args);
-    let result = fetched.map_err(git_failed("git fetch of the code-out")).and_then(|_| promote(i, &set, &user, &incoming, &wanted, &existing, out));
+    let result = fetched.map_err(git_failed("git fetch of the code-out")).and_then(|_| promote(i, &set, &user, &incoming, &wanted, &existing, out, mode));
     if result.is_err() {
         // Nothing of this import is left behind: its incoming refs go.
         if let Ok(left) = refs_under(&user, &incoming) {
@@ -473,46 +498,34 @@ pub fn import(i: &Import<'_>) -> Result<Imported, BridgeError> {
     result
 }
 
-/// [`import`] after the fetch: the scans per ref (`set`'s), then the one transaction.
-fn promote(i: &Import<'_>, set: &ScanSet, user: &GitRun, incoming: &str, wanted: &BTreeMap<String, String>, existing: &BTreeMap<String, String>, mut out: Imported) -> Result<Imported, BridgeError> {
-    use crate::bridge::workspace::blobscan::{scan_objects, scan_settings, tree_entries, CleanCache};
+/// [`import`] after the fetch: the scans (`set`'s, by `mode`; the clean
+/// cache saved once, after the last), then the one transaction.
+#[allow(clippy::too_many_arguments)]
+fn promote(i: &Import<'_>, set: &ScanSet, user: &GitRun, incoming: &str, wanted: &BTreeMap<String, String>, existing: &BTreeMap<String, String>, mut out: Imported, mode: ScanMode) -> Result<Imported, BridgeError> {
+    use crate::bridge::workspace::blobscan::CleanCache;
     let WsKind::Git { object_format, .. } = &i.ws.kind;
     let mut cache = CleanCache::open(i.paths, &set.digest, *object_format);
-    let haves: Vec<&String> = i.haves.iter().filter(|h| crate::bridge::workspace::holds_commit(user, h).unwrap_or(false)).collect();
-    // The Mac's HEAD tree: a settings file the VM did not change is not read again.
-    let head_entries: BTreeMap<String, String> = match user.output(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"]) {
-        Ok(tree) => tree_entries(user, String::from_utf8_lossy(&tree).trim())?.into_iter().map(|e| (e.path, e.id)).collect(),
-        Err(_) => BTreeMap::new(),
+    let haves = held_commits(user, *object_format, i.haves);
+    let refs: Vec<(String, String)> = wanted.iter().map(|(suffix, id)| (format!("{BOX_REFS}{suffix}"), id.clone())).collect();
+    let found = match mode {
+        ScanMode::Batch => scan_batch(user, set, &mut cache, &refs, &haves, i.max_blob, *object_format)?,
+        ScanMode::PerRef => scan_per_ref(user, set, &mut cache, &refs, &haves, i.max_blob, *object_format)?,
     };
-    let unchanged = |e: &crate::bridge::workspace::blobscan::TreeEntry| head_entries.get(&e.path) == Some(&e.id);
+    // Once, every scan having run to its end (S9 wrote the whole file after each ref's).
+    if let Err(e) = cache.save() {
+        tracing::warn!("scan: the clean-object cache was not written: {e}");
+    }
     let mut moves: Vec<(String, String)> = Vec::new();
-    for (suffix, id) in wanted {
-        let mut args = vec!["rev-list".to_string(), "--objects".into(), id.clone(), "--not".into()];
-        args.extend(haves.iter().map(|h| (*h).clone()));
-        let listed = user.output(&args).map_err(git_failed("git rev-list of a fetched ref"))?;
-        let list: Vec<crate::bridge::workspace::pack::Listed> = String::from_utf8_lossy(&listed)
-            .lines()
-            .filter_map(|l| {
-                let (oid, path) = match l.split_once(' ') {
-                    Some((o, p)) => (o, Some(p.to_string())),
-                    None => (l, None),
-                };
-                object_format.is_id(oid).then(|| crate::bridge::workspace::pack::Listed { id: oid.to_string(), path })
-            })
-            .collect();
+    for ((suffix, id), findings) in wanted.iter().zip(found) {
         let box_name = format!("{BOX_REFS}{suffix}");
-        let tree = format!("{id}^{{tree}}");
-        let mut report = scan_objects(user, &list, set, &mut cache, i.max_blob, &[(box_name.clone(), tree.clone())])?;
-        let entries = tree_entries(user, &tree)?;
-        scan_settings(user, &[(box_name.clone(), entries)], set, &unchanged, &mut report)?;
-        if report.findings.is_empty() {
+        if findings.is_empty() {
             out.promoted.insert(box_name.clone(), id.clone());
             moves.push((box_name, id.clone()));
         } else {
             let name = format!("{BOX_QUARANTINE_REFS}{suffix}");
             out.quarantined.insert(name.clone(), id.clone());
             moves.push((name, id.clone()));
-            out.findings.extend(report.findings);
+            out.findings.extend(findings);
         }
     }
     // The newest `keep_wip` snapshots stay, this fetch's own always among them. An older one
@@ -541,6 +554,168 @@ fn promote(i: &Import<'_>, set: &ScanSet, user: &GitRun, incoming: &str, wanted:
     Ok(out)
 }
 
+/// The haves `git`'s repository holds as commits (a tag of one counts), in
+/// their order, by one `cat-file --batch-check` of each `<id>^{commit}` (S10
+/// F4; S9 ran `workspace::holds_commit` once per have, up to `HAVES_MAX`). An
+/// id of another format is no have; when the check cannot run, none is (the
+/// listings then take the refs' whole history, as S9's did on a failed check).
+fn held_commits(git: &GitRun, format: crate::wire::workspace::ObjectFormat, haves: &[String]) -> Vec<String> {
+    let asked: Vec<&String> = haves.iter().filter(|h| format.is_id(h)).collect();
+    if asked.is_empty() {
+        return Vec::new();
+    }
+    let input: String = asked.iter().map(|h| format!("{h}^{{commit}}\n")).collect();
+    let held = git.output_stdin(["cat-file", "--batch-check=%(objectname)"], input.as_bytes()).map(|out| String::from_utf8_lossy(&out).lines().map(|l| format.is_id(l)).collect::<Vec<bool>>());
+    match held {
+        Ok(held) if held.len() == asked.len() => asked.into_iter().zip(held).filter(|(_, h)| *h).map(|(id, _)| id.clone()).collect(),
+        Ok(_) => {
+            tracing::warn!("code-out: git cat-file answered another count of lines than haves asked: no haves");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!("code-out: the haves could not be checked ({e}): no haves");
+            Vec::new()
+        }
+    }
+}
+
+/// `rev-list --objects`' lines as listed objects: an id of `format`, and
+/// the path after its first space when the line has one (a commit has none,
+/// a root tree an empty one).
+fn listing(bytes: &[u8], format: crate::wire::workspace::ObjectFormat) -> Vec<crate::bridge::workspace::pack::Listed> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|l| {
+            let (oid, path) = match l.split_once(' ') {
+                Some((o, p)) => (o, Some(p.to_string())),
+                None => (l, None),
+            };
+            format.is_id(oid).then(|| crate::bridge::workspace::pack::Listed { id: oid.to_string(), path })
+        })
+        .collect()
+}
+
+/// One ref's own listing, S9's: `rev-list --objects <id> --not <haves…>`.
+fn ref_listing(git: &GitRun, id: &str, haves: &[String], format: crate::wire::workspace::ObjectFormat) -> Result<Vec<crate::bridge::workspace::pack::Listed>, BridgeError> {
+    let mut args = vec!["rev-list".to_string(), "--objects".into(), id.to_string(), "--not".into()];
+    args.extend(haves.iter().cloned());
+    let listed = git.output(&args).map_err(git_failed("git rev-list of a fetched ref"))?;
+    Ok(listing(&listed, format))
+}
+
+/// The tree of each of `refs`' commits, in their order, and the Mac's
+/// HEAD's (`None`: an unborn branch), by one `cat-file --batch-check`.
+fn tip_trees(git: &GitRun, refs: &[(String, String)], format: crate::wire::workspace::ObjectFormat) -> Result<(Vec<String>, Option<String>), BridgeError> {
+    let mut input: String = refs.iter().map(|(_, id)| format!("{id}^{{tree}}\n")).collect();
+    input.push_str("HEAD^{tree}\n");
+    let out = git.output_stdin(["cat-file", "--batch-check=%(objectname)"], input.as_bytes()).map_err(git_failed("git cat-file of the fetched refs' trees"))?;
+    let text = String::from_utf8_lossy(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    let unread = || BridgeError::WorkspaceFailed { code: refusal::GIT_FAILED, message: "git cat-file could not read the tree of a fetched ref".into() };
+    let Some((head, trees)) = lines.split_last().filter(|(_, trees)| trees.len() == refs.len()) else { return Err(unread()) };
+    if !trees.iter().all(|t| format.is_id(t)) {
+        return Err(unread());
+    }
+    Ok((trees.iter().map(|t| (*t).to_string()).collect(), Some(*head).filter(|h| format.is_id(h)).map(str::to_string)))
+}
+
+/// S10 F4: the findings of each of `refs` (`(box name, commit)`), the new
+/// objects of all of them scanned as one. One `rev-list --objects --stdin`
+/// lists every tip's objects the Mac lacks (`haves` excluded), and one scan
+/// reads that union ([`scan_listed`]: the cache not saved here, no finding's
+/// place looked up). D8 reads each ref's settings from one walk of the tips'
+/// trees ([`settings_of_trees`]): tree-based, never from the union, which
+/// leaves out a blob the Mac holds (a permissive fixture of its history) that
+/// the VM copied to `.claude/settings.json`. A union with no finding needs no
+/// git run per ref. Only on one, S9's exact per-ref pass decides which refs
+/// it concerns and where it is: each ref's own listing, then S9's scan of it
+/// (its tree the label `locate` names a place by) wherever that listing
+/// holds an object the union found dirty, one the union did not list (a
+/// boundary of another ref's walk hid it there: the Mac holds it), or a path
+/// that trips a rule. Each ref's findings: its objects', then its settings',
+/// S9's order. So a ref is quarantined, with the same findings, wherever
+/// S9's scan quarantined it, but for two cases S9 decided by its own walk
+/// alone: an object the Mac holds already that the union left out, and a
+/// whole path tripping a rule across its `/` at a path other than the one
+/// the union listed its object at (each name of it is read either way).
+/// S10 phase 4: the settings within the import's bounds (a walk past its
+/// caps refuses the import; a settings blob over `max_blob` is
+/// `blob-too-large`, never read; a tip's settings findings capped), and
+/// appended as the per-ref pass appends them ([`extend_settings`]).
+///
+/// [`extend_settings`]: crate::bridge::workspace::blobscan::extend_settings
+fn scan_batch(user: &GitRun, set: &ScanSet, cache: &mut crate::bridge::workspace::blobscan::CleanCache, refs: &[(String, String)], haves: &[String], max_blob: u64, format: crate::wire::workspace::ObjectFormat) -> Result<Vec<Vec<crate::bridge::workspace::blobscan::Finding>>, BridgeError> {
+    use crate::bridge::workspace::blobscan::{extend_settings, scan_listed, settings_of_trees};
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tips: BTreeSet<&String> = refs.iter().map(|(_, id)| id).collect();
+    let mut input = String::new();
+    for id in tips {
+        input.push_str(id);
+        input.push('\n');
+    }
+    for h in haves {
+        input.push('^');
+        input.push_str(h);
+        input.push('\n');
+    }
+    let listed = user.output_stdin(["rev-list", "--objects", "--stdin"], input.as_bytes()).map_err(git_failed("git rev-list of the fetched refs"))?;
+    let union = listing(&listed, format);
+    let scanned = scan_listed(user, &union, set, cache, max_blob, None)?;
+    let (trees, head) = tip_trees(user, refs, format)?;
+    let labelled: Vec<(String, String)> = refs.iter().zip(trees).map(|((name, _), tree)| (name.clone(), tree)).collect();
+    let settings = settings_of_trees(user, set, &labelled, head.as_deref(), max_blob)?;
+    let mut found = vec![Vec::new(); refs.len()];
+    if !scanned.report.findings.is_empty() {
+        let in_union: std::collections::HashSet<&str> = union.iter().map(|o| o.id.as_str()).collect();
+        let trips = |p: &str| !p.is_empty() && !set.rules.scan_bytes(p.as_bytes()).is_empty();
+        for ((name, id), at) in refs.iter().zip(found.iter_mut()) {
+            let list = ref_listing(user, id, haves, format)?;
+            if list.iter().any(|o| scanned.dirty.contains(&o.id) || !in_union.contains(o.id.as_str()) || o.path.as_deref().is_some_and(trips)) {
+                *at = scan_listed(user, &list, set, cache, max_blob, Some(&[(name.clone(), format!("{id}^{{tree}}"))]))?.report.findings;
+            }
+        }
+    }
+    for (at, of_settings) in found.iter_mut().zip(settings) {
+        extend_settings(at, of_settings);
+    }
+    Ok(found)
+}
+
+/// S9's scan of `refs`, one after another ([`import_per_ref`]): the Mac's
+/// HEAD tree listed whole; then each ref's own listing, its scan (its tree
+/// the label `locate` names a place by), its tree listed whole (`ls-tree
+/// -r`) and D8 on its settings files, skipping a file whose blob HEAD holds
+/// at that path: S10 phase 4, within the import's bounds as the batch reads
+/// them ([`scan_settings_within`]: a blob over `max_blob` never read, a
+/// ref's settings findings capped), appended alike ([`extend_settings`]).
+/// The cache is not saved here.
+///
+/// [`scan_settings_within`]: crate::bridge::workspace::blobscan::scan_settings_within
+/// [`extend_settings`]: crate::bridge::workspace::blobscan::extend_settings
+fn scan_per_ref(user: &GitRun, set: &ScanSet, cache: &mut crate::bridge::workspace::blobscan::CleanCache, refs: &[(String, String)], haves: &[String], max_blob: u64, format: crate::wire::workspace::ObjectFormat) -> Result<Vec<Vec<crate::bridge::workspace::blobscan::Finding>>, BridgeError> {
+    use crate::bridge::workspace::blobscan::{extend_settings, scan_listed, scan_settings_within, tree_entries, ScanReport, TreeEntry};
+    // The Mac's HEAD tree: a settings file the VM did not change is not read again.
+    let head_entries: BTreeMap<String, String> = match user.output(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"]) {
+        Ok(tree) => tree_entries(user, String::from_utf8_lossy(&tree).trim())?.into_iter().map(|e| (e.path, e.id)).collect(),
+        Err(_) => BTreeMap::new(),
+    };
+    let unchanged = |e: &TreeEntry| head_entries.get(&e.path) == Some(&e.id);
+    let mut found = Vec::with_capacity(refs.len());
+    for (name, id) in refs {
+        let list = ref_listing(user, id, haves, format)?;
+        let tree = format!("{id}^{{tree}}");
+        let mut findings = scan_listed(user, &list, set, cache, max_blob, Some(&[(name.clone(), tree.clone())]))?.report.findings;
+        let entries = tree_entries(user, &tree)?;
+        let mut d8 = ScanReport::default();
+        scan_settings_within(user, &[(name.clone(), entries)], set, &unchanged, max_blob, &mut d8)?;
+        extend_settings(&mut findings, d8.findings);
+        found.push(findings);
+    }
+    Ok(found)
+}
+
 /// One code-out fetch (plan §7): `begin_fetch` (the workspace's fetch
 /// lock, a real remote named `box` refused, the haves, the scratch); `POST
 /// /codeout` with the haves ([`haves_of`]) into the scratch's file; then
@@ -560,11 +735,11 @@ pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx
     })
     .await?;
     let body = match (reply.status, verdict, reply.body) {
-        (204, _, _) => return Ok(nothing_new(ctx, begun, Via::Codeout)),
+        (204, _, _) => return Ok(nothing_new(ctx, begun, Via::Codeout).await),
         (_, Verdict::Done, Some(body)) => body,
         (status, _, _) => return Err(BridgeError::Protocol(format!("POST /codeout answered HTTP {status} where a pack was due"))),
     };
-    finish_fetch(ctx, begun, Received { manifest: body.manifest, pack_bytes: body.pack_bytes }, Via::Codeout).await
+    finish_fetch(ctx, begun, Received { manifest: body.manifest, pack_bytes: body.pack_bytes, snapshot: opts.wip }, Via::Codeout).await
 }
 
 /// `box fetch --smart-http` (S9 plan §2, §4.3): [`fetch`] through git
@@ -598,14 +773,14 @@ pub async fn fetch_smart_http<A: MicrovmApi, D: crate::bridge::gitsmart::GitHttp
     let manifest = manifest_of(&client.ls_refs(&advert).await?, advert.object_format)?;
     let wants = wants_of(&manifest, &ScanSet::load(&ctx.paths, &ctx.cfg, &ctx.ws)?.rules);
     if all_had(&manifest, &begun.haves) {
-        return Ok(nothing_new(ctx, begun, Via::SmartHttp));
+        return Ok(nothing_new(ctx, begun, Via::SmartHttp).await);
     }
     if wants.is_empty() {
         // Every ref kept out: the import takes none and reads no pack, so none is asked for.
-        return finish_fetch(ctx, begun, Received { manifest, pack_bytes: 0 }, Via::SmartHttp).await;
+        return finish_fetch(ctx, begun, Received { manifest, pack_bytes: 0, snapshot: false }, Via::SmartHttp).await;
     }
     let pack_bytes = client.fetch_pack(&advert, &wants, &begun.haves, &begun.pack(), opts.max_bytes).await?;
-    finish_fetch(ctx, begun, Received { manifest, pack_bytes }, Via::SmartHttp).await
+    finish_fetch(ctx, begun, Received { manifest, pack_bytes, snapshot: false }, Via::SmartHttp).await
 }
 
 /// Whether every tip `manifest` lists is one of `haves`: the helper's rule
@@ -679,6 +854,11 @@ impl Begun {
 pub(crate) struct Received {
     pub manifest: CodeoutManifest,
     pub pack_bytes: u64,
+    /// S10 (L7): the fetch asked for a snapshot of the VM's uncommitted work
+    /// (`--wip`), so the manifest's snapshot, or none, is what its worktree
+    /// held; without one (`box fetch` without `--wip`, a smart-HTTP fetch)
+    /// the fetch said nothing of the worktree ([`rows::note_fetch`]).
+    pub snapshot: bool,
 }
 
 /// Milliseconds since `started`.
@@ -716,19 +896,27 @@ pub(crate) async fn begin_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>) -> Result<Be
 /// runtime's thread (the scratch directory then removed); the report, which
 /// names what was skipped, kept out, not snapshotted or quarantined; the
 /// workspace row and the audit ([`record_fetch`], `via`); then the fetch
-/// lock let go.
+/// lock let go. S10 (L7): the manifest's HEAD, branch and snapshot go to
+/// the VM's fetch record ([`fetch_record`]), the snapshot's first parent
+/// read in the Mac's repository right after the import, when it was
+/// promoted; a fetch that asked for no snapshot keeps the record's snapshot
+/// at the same HEAD (`Received::snapshot`).
 pub(crate) async fn finish_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, received: Received, via: Via) -> Result<FetchReport, BridgeError> {
     let dest = begun.pack();
     let Begun { lock, started, haves, scratch } = begun;
-    let Received { manifest, pack_bytes } = received;
+    let Received { manifest, pack_bytes, snapshot } = received;
     let wip_skipped = manifest.wip_skipped.clone();
+    let checkout = Checkout::of(&manifest);
     let (paths, cfg, ws) = (ctx.paths.clone(), ctx.cfg.clone(), ctx.ws.clone());
     let keep = cfg.seed.keep_wip_refs as usize;
     let max_blob = u64::from(cfg.seed.max_blob_mib) * MIB;
-    let imported = blocking(move || {
+    let seen = checkout.clone();
+    let (imported, wip_parent) = blocking(move || -> Result<(Imported, Option<String>), BridgeError> {
         let imported = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &dest, haves: &haves, max_blob, keep_wip: keep });
         drop(scratch);
-        imported
+        let imported = imported?;
+        let parent = seen.promoted_wip(&imported).and_then(|wip| first_parent(&GitRun::mac(&ws.root), wip));
+        Ok((imported, parent))
     })
     .await??;
     let mut notes: Vec<String> = imported.skipped.iter().map(|s| format!("skipped {s}")).collect();
@@ -754,18 +942,88 @@ pub(crate) async fn finish_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begu
         ms: ms_since(started),
         note: (!notes.is_empty()).then(|| notes.join("; ")),
     };
-    record_fetch(ctx, &report, &imported, via).await;
+    let fetched = fetch_record(&checkout, &imported, wip_parent.as_deref(), unix_now());
+    record_fetch(ctx, &report, &imported, via, fetched, snapshot).await;
     drop(lock);
     Ok(report)
 }
 
 /// A fetch with nothing new (the code-out's 204; a smart-HTTP fetch whose
-/// listed tips the haves hold): its report and its `codeout_fetch` row; the
+/// listed tips the haves hold): its report and its `codeout_fetch` row; S10
+/// (L7): the VM's fetch record says when it ended, when it has one
+/// (`rows::refresh_fetch`, off the runtime's thread, best effort); the
 /// scratch directory and the lock go with `begun`.
-fn nothing_new<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, via: Via) -> FetchReport {
+async fn nothing_new<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, via: Via) -> FetchReport {
     let report = FetchReport { at: rfc3339_utc(unix_now()), ok: true, ms: ms_since(begun.started), ..FetchReport::default() };
+    let (paths, ws, vm, now) = (ctx.paths.clone(), ctx.ws.clone(), ctx.target.vm_id.clone(), unix_now());
+    if let Err(e) = rows::write_off_thread(move || rows::refresh_fetch(&paths, &ws, &vm, now)).await {
+        tracing::info!(vm = %ctx.target.vm_id, "code-out: the VM's fetch record not refreshed: {e}");
+    }
     audit(&ctx.paths, audit_event::CODEOUT_FETCH, &[("vm", ctx.target.vm_id.clone()), ("via", via.word().into()), ("outcome", "nothing_new".into()), ("ms", report.ms.to_string())]);
     report
+}
+
+/// What a code-out's manifest says of the VM's checkout (S10 L7), for its
+/// fetch record: its HEAD, the branch checked out (`None`: detached), and
+/// the snapshot this fetch asked for, by its ref and commit. VM-chosen
+/// names, which the record takes only through refs the import promoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Checkout {
+    head: String,
+    branch: Option<String>,
+    wip: Option<(String, String)>,
+}
+
+impl Checkout {
+    fn of(manifest: &CodeoutManifest) -> Checkout {
+        let wip = manifest.wip_ref.as_ref().and_then(|w| manifest.refs.get(w).map(|id| (w.clone(), id.clone())));
+        Checkout { head: manifest.head.clone(), branch: manifest.branch.clone(), wip }
+    }
+
+    /// The ref that checks the HEAD out: the branch's, or `HEAD` when detached.
+    fn head_ref(&self) -> String {
+        self.branch.as_ref().map_or_else(|| "HEAD".to_string(), |b| format!("{HEADS_PREFIX}{b}"))
+    }
+
+    /// Whether `imported` promoted `vm_ref` at `id`: its box name moved
+    /// there (a name the import took, so never one [`credential_shaped`]
+    /// keeps out), not quarantined.
+    fn promoted(imported: &Imported, vm_ref: &str, id: &str) -> bool {
+        box_ref_of(vm_ref).is_some_and(|name| imported.promoted.get(&name).is_some_and(|got| got == id))
+    }
+
+    /// The snapshot's commit, when `imported` promoted it under the ref the
+    /// import kept ([`Imported::wip_ref`]).
+    fn promoted_wip<'a>(&'a self, imported: &Imported) -> Option<&'a str> {
+        let (wip_ref, id) = self.wip.as_ref()?;
+        (imported.wip_ref.as_deref() == Some(wip_ref.as_str()) && Checkout::promoted(imported, wip_ref, id)).then_some(id.as_str())
+    }
+}
+
+/// The first parent of `commit` in `git`'s repository (`rev-parse
+/// <commit>^1`); `None` for a root commit, or when git cannot tell.
+fn first_parent(git: &GitRun, commit: &str) -> Option<String> {
+    let out = git.output(["rev-parse", "--verify", "--quiet", &format!("{commit}^1")]).ok()?;
+    Some(String::from_utf8_lossy(&out).trim().to_string()).filter(|p| !p.is_empty())
+}
+
+/// The fetch record of the VM a fetch reached (S10 L7, plans/s10-contracts.md
+/// §6.3): ids the import promoted, never refs (another VM's fetch can move
+/// `box/*`). Its HEAD, only when this fetch promoted the ref that checks it
+/// out there (the branch's box ref, or `box/HEAD` when detached), with that
+/// branch; the snapshot this fetch made, only when it was promoted too and
+/// its first parent (`wip_parent`, read in the Mac's repository) is that
+/// HEAD (tree the worktree, parents the HEAD and the index commit: what a
+/// seed carries uncommitted), with its ref for the logs. `None` when the
+/// HEAD was not promoted (quarantined, kept out, skipped): the VM's record
+/// then says only when this fetch ended ([`rows::note_fetch`]).
+fn fetch_record(checkout: &Checkout, imported: &Imported, wip_parent: Option<&str>, at: u64) -> Option<rows::VmFetchRow> {
+    if !Checkout::promoted(imported, &checkout.head_ref(), &checkout.head) {
+        return None;
+    }
+    let wip = checkout.promoted_wip(imported).filter(|_| wip_parent == Some(checkout.head.as_str()));
+    let wip_ref = wip.and(checkout.wip.as_ref().map(|(r, _)| r.clone()));
+    Some(rows::VmFetchRow { at, head: checkout.head.clone(), branch: checkout.branch.clone(), wip: wip.map(str::to_string), wip_ref })
 }
 
 /// `git <args>`' lines, none when it exits 1 (`config --get-regexp` without a match).
@@ -779,7 +1037,10 @@ fn refs_or_none(git: &GitRun, args: &[&str]) -> Result<Vec<String>, BridgeError>
 
 /// The workspace row (off the runtime's thread, within `rows::ROWS_WAIT`)
 /// and the audit of one fetch (best effort), `via` the way it reached the VM.
-async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, imported: &Imported, via: Via) {
+/// S10 (L7): the VM's own fetch record in the row (`WsRow.vm[<vm>].fetched`,
+/// [`rows::note_fetch`]): `fetched` ([`fetch_record`]), else only when it
+/// ended; `snapshot`: the fetch asked for one (`Received::snapshot`).
+async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, imported: &Imported, via: Via, fetched: Option<rows::VmFetchRow>, snapshot: bool) {
     let now = unix_now();
     let newest_wip = report.promoted.keys().filter(|n| n.starts_with(&format!("{BOX_REFS}wip/"))).max().cloned();
     let (paths, ws, vm, tips) = (ctx.paths.clone(), ctx.ws.clone(), ctx.target.vm_id.clone(), imported.tips.clone());
@@ -787,6 +1048,7 @@ async fn record_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, report: &FetchReport, 
     let result = rows::write_off_thread(move || {
         rows::update(&paths, &ws, |row| {
             row.last_fetch_at = Some(now);
+            rows::note_fetch(row, &vm, fetched, now, snapshot);
             row.last_fetch_vm = Some(vm);
             if newest_wip.is_some() {
                 row.last_wip = newest_wip;
@@ -861,7 +1123,9 @@ mod g2_tests {
 /// fetch still queued), a turn's after each fetch of each session named when
 /// it was asked for; a capture running as the trigger closes is given up at
 /// once, never waited for inside the close budget. [`Self::watch`] hands
-/// out what the session's closing suspend waits on ([`TriggerWatch`]).
+/// out what the session's closing suspend waits on ([`TriggerWatch`]). S10
+/// (R1): [`Self::retail`] hands the VM the chain's next tail, as
+/// non-blocking and coalescing as a fetch's request.
 #[derive(Debug)]
 pub struct CodeoutTrigger {
     shared: Arc<TriggerShared>,
@@ -895,6 +1159,9 @@ struct TriggerState {
     /// The session named last has had no transcript step of its own yet (S9
     /// phase 4): its placeholder view, a tail URL, its subtree restored.
     begin_due: bool,
+    /// S10 (R1): a tail was asked for ([`CodeoutTrigger::retail`]) since the
+    /// task last handed one.
+    retail_due: bool,
     /// The task runs a piece of work: a fetch and its turn's captures, or a
     /// start capture.
     busy: bool,
@@ -943,6 +1210,15 @@ impl TriggerWatch {
     pub fn done(&self) -> bool {
         let st = self.shared.state();
         st.over || (st.closed && !st.busy)
+    }
+
+    /// S10 §D: no fetch is pending and none runs (nor a capture or a
+    /// transcript step: the task is idle). A parking session parks only then,
+    /// so no fetch reaches a parked VM.
+    #[must_use]
+    pub fn quiet(&self) -> bool {
+        let st = self.shared.state();
+        !st.pending && !st.busy
     }
 
     /// Until [`TriggerWatch::done`] (cancel-safe); the caller bounds it.
@@ -1034,12 +1310,31 @@ impl CodeoutTrigger {
         self.shared.state().last.clone()
     }
 
-    /// At the wrapper's close: no new fetch starts; a running one gets at
-    /// most `within` ([`CLOSE_WAIT`]), then is abandoned (logged): its
-    /// promotion is one transaction, so the box refs never move half-way,
-    /// and what an import cut short by the process's exit leaves (its
-    /// incoming refs, its scratch directories) the next import removes. Once
-    /// it ended, or is abandoned, the trigger is done ([`TriggerWatch`]). The
+    /// S10 (R1): hand the VM the chain's next tail URL (the link calls it at
+    /// every unpark, plans/s10-contracts.md §3.3): returns at once, as
+    /// [`Self::request`] does, and coalesces (asked again before the task
+    /// took it, it is one). The task lists the named session's tails and
+    /// hands the one at the end of their chain (`SyncCtx::hand_fresh_tail`),
+    /// before any fetch still queued, given up at once at the close. Nothing
+    /// without a transcript sync (`ctx.transcript`), or before a session is
+    /// named; the session's first transcript step hands one anyway.
+    pub fn retail(&self) {
+        if self.task.is_none() {
+            return;
+        }
+        self.shared.state().retail_due = true;
+        self.shared.wake.notify_one();
+    }
+
+    /// At the wrapper's close: no new fetch starts; a running one is waited
+    /// for at most `within` ([`CLOSE_WAIT`]), then abandoned (logged): left to
+    /// run to its end, which the process's exit may cut (its promotion is one
+    /// transaction, so the box refs never move half-way, and what an import
+    /// cut short leaves, its incoming refs and its scratch directories, the
+    /// next import removes). S10 (D5): an abandoned fetch is no longer
+    /// aborted, so the trigger is done ([`TriggerWatch`]) only once it ended:
+    /// the closing suspend waits for it (within its bound), and no
+    /// SuspendMicrovm goes out while its request may still reach the VM. The
     /// last report.
     pub async fn close(mut self, within: Duration) -> Option<FetchReport> {
         self.shared.state().closed = true;
@@ -1048,8 +1343,7 @@ impl CodeoutTrigger {
         self.shared.changed.notify_waiters();
         if let Some(mut task) = self.task.take() {
             if tokio::time::timeout(within, &mut task).await.is_err() {
-                tracing::info!(within_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX), "code-out: the fetch still running at the close was given up");
-                task.abort();
+                tracing::info!(within_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX), "code-out: the fetch still running at the close was given up (left to its end)");
             }
         }
         self.last()
@@ -1071,6 +1365,8 @@ enum Work {
     /// The first transcript step of this session (S9 phase 4,
     /// [`transcript_begin`]).
     Begin(String),
+    /// S10 (R1): the next tail of this session's chain ([`CodeoutTrigger::retail`]).
+    Retail(String),
     /// A fetch, then a turn's capture of each session it was asked for.
     Fetch(Vec<String>),
 }
@@ -1106,11 +1402,13 @@ async fn capture_session_settings<A, D: DataPlane, T: TokenSource>(ctx: &Codeout
 /// The first transcript step of a session the trigger is told of (S9 phase
 /// 4), before any fetch still queued: a placeholder view when nothing is at
 /// its path (`s3::sync::write_placeholder_view`: a chat closed before its
-/// first sync is still listed), a tail URL (`hand_fresh_tail`: from 0 when
-/// S3 holds nothing of it, so `/suspend` and `/terminate` push its bytes
-/// even before a sync), then its subtree's files restored into the VM
-/// (`workspace::transcript::restore_subtree`, out of P3's deadline). Never
-/// fatal (logged), given up at once when the trigger closes.
+/// first sync is still listed), its subtree's files restored into the VM
+/// (`workspace::transcript::restore_subtree`, out of P3's deadline), then a
+/// tail URL (`hand_fresh_tail`: from 0 when S3 holds nothing of it, so
+/// `/suspend` and `/terminate` push its bytes even before a sync). The
+/// subtree goes first: the tail's listing of S3 (S10 R1) may wait up to its
+/// own bound, and a short session would close before the subtree came.
+/// Never fatal (logged), given up at once when the trigger closes.
 async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: &str) {
     let sctx = crate::bridge::s3::sync::SyncCtx { api: &*ctx.api, dp: &*ctx.dp, tokens: &*ctx.tokens, paths: &ctx.paths, target: &ctx.target, sync, rules, deadline: None };
     let begin = async {
@@ -1119,7 +1417,6 @@ async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlan
             Ok(None) => {}
             Err(e) => tracing::info!(session, "placeholder view not written: {e}"),
         }
-        sctx.hand_fresh_tail(session).await;
         match crate::bridge::workspace::transcript::restore_subtree(&sctx, session).await {
             Ok(r) => tracing::info!(session, pulled = r.pulled, kept = r.kept, unnamed = r.unnamed, "transcript subtree restored"),
             Err(e) => {
@@ -1127,6 +1424,7 @@ async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlan
                 voice::warn(&format!("the subagent and tool files of {session} were not restored into the VM: {e}"));
             }
         }
+        sctx.hand_fresh_tail(session).await;
     };
     tokio::select! {
         biased;
@@ -1137,7 +1435,8 @@ async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlan
 
 /// A fresh tail URL for `session` before its turn's fetch (S9 phase 4:
 /// the bytes between a result and the sync that commits them always have
-/// one); given up at once when the trigger closes.
+/// one), and at an unpark (S10 R1, [`CodeoutTrigger::retail`]): the chain's
+/// next; given up at once when the trigger closes.
 async fn tail_before_turn<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: &str) {
     let sctx = crate::bridge::s3::sync::SyncCtx { api: &*ctx.api, dp: &*ctx.dp, tokens: &*ctx.tokens, paths: &ctx.paths, target: &ctx.target, sync, rules, deadline: None };
     tokio::select! {
@@ -1170,7 +1469,9 @@ async fn sync_transcript<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane
 
 /// The trigger's task: a session's start capture once it is named, one
 /// fetch per wake while asked (then a turn's capture, then with
-/// `ctx.transcript` the transcript's sync), until closed. Each piece of work
+/// `ctx.transcript` the transcript's sync), until closed; S10 (R1), with
+/// `ctx.transcript`, the chain's next tail when [`CodeoutTrigger::retail`]
+/// asked, before a fetch. Each piece of work
 /// is `busy` from its taking (under the state's lock, so a close sees it or
 /// none starts) to its end.
 async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, T>, shared: Arc<TriggerShared>) {
@@ -1203,7 +1504,16 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
                 if std::mem::take(&mut st.begin_due) && ctx.transcript.is_some() && rules.is_some() {
                     if let Some(id) = st.session.clone() {
                         st.busy = true;
+                        // S10 (R1): its tail is the chain's next already.
+                        st.retail_due = false;
                         break Work::Begin(id);
+                    }
+                }
+                // S10 (R1): an unpark's tail before any fetch still queued.
+                if std::mem::take(&mut st.retail_due) && ctx.transcript.is_some() && rules.is_some() {
+                    if let Some(id) = st.session.clone() {
+                        st.busy = true;
+                        break Work::Retail(id);
                     }
                 }
                 if st.pending {
@@ -1228,6 +1538,13 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
             Work::Begin(id) => {
                 if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
                     transcript_begin(&ctx, &shared, sync, rules, &id).await;
+                }
+                shared.idle(false);
+                continue;
+            }
+            Work::Retail(id) => {
+                if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
+                    tail_before_turn(&ctx, &shared, sync, rules, &id).await;
                 }
                 shared.idle(false);
                 continue;
@@ -1274,6 +1591,280 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
             }
         }
         shared.idle(false);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod c2_tests {
+    use super::*;
+    use crate::bridge::api::FakeMicrovmApi;
+    use crate::bridge::dataplane::Unreached;
+    use crate::bridge::workspace::Head;
+    use crate::wire::redact::Secret;
+    use crate::wire::workspace::ObjectFormat;
+
+    const SESSION: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    const VM1: &str = "microvm-00000000-0000-4000-8000-000000000001";
+    const VM2: &str = "microvm-00000000-0000-4000-8000-000000000002";
+
+    fn ws() -> WorkspaceRef {
+        WorkspaceRef {
+            cwd: "/w".into(),
+            root: "/w".into(),
+            vm_cwd: "/w".into(),
+            vm_root: "/w".into(),
+            slug: "-w".into(),
+            kind: WsKind::Git { git_dir: "/w/.git".into(), common_dir: "/w/.git".into(), object_format: ObjectFormat::Sha1 },
+            head: Head::Detached { sha: "a".repeat(40) },
+            seed_branch: None,
+        }
+    }
+
+    fn target(vm: &str) -> AgentTarget {
+        AgentTarget { vm_id: vm.into(), endpoint: "x".into(), session_token: Secret::new("t".into()), vpc: true, shell: false }
+    }
+
+    /// A fetch's context on `dir`'s bridge root, against `vm` (no request reaches it).
+    fn ctx_of(dir: &Path, vm: &str) -> CodeoutCtx<FakeMicrovmApi, Unreached, Unreached> {
+        CodeoutCtx {
+            api: Arc::new(FakeMicrovmApi::new()),
+            dp: Arc::new(Unreached),
+            tokens: Arc::new(Unreached),
+            paths: Paths::from_root_and_env(dir.to_path_buf(), None),
+            cfg: Arc::new(BridgeConfig::default()),
+            target: target(vm),
+            ws: ws(),
+            capture_settings: false,
+            transcript: None,
+        }
+    }
+
+    fn id(n: u32) -> String {
+        format!("{n:040x}")
+    }
+
+    /// Box names (past `BOX_REFS`) to their commits.
+    fn promoted(refs: &[(&str, String)]) -> BTreeMap<String, String> {
+        refs.iter().map(|(name, id)| (format!("{BOX_REFS}{name}"), id.clone())).collect()
+    }
+
+    /// S10 (L7, plans/s10-contracts.md §6.3): each VM a fetch reaches keeps
+    /// its own record in the workspace row (`WsRow.vm[<vm>].fetched`), of
+    /// ids the import promoted only: the HEAD when the ref that checks it
+    /// out was promoted at it (the branch's box ref, `box/HEAD` when
+    /// detached), with that branch; the snapshot this fetch made when it was
+    /// promoted too and its first parent is that HEAD, with its ref. A fetch
+    /// whose HEAD was not promoted (quarantined) leaves the record's ids and
+    /// dates it; a snapshot made before the HEAD moved, or one the import
+    /// kept out, is no wip; a branch whose name looks like a credential is
+    /// kept out by the import, so its HEAD is no promoted id and its name
+    /// never reaches the row. A fetch that asked for no snapshot (`box
+    /// fetch` without `--wip`, a smart-HTTP fetch) keeps the record's
+    /// snapshot at the same HEAD; one that asked and got none (a clean
+    /// worktree) records none.
+    #[tokio::test]
+    async fn record_fetch_keeps_promoted_ids_per_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let report = FetchReport { at: rfc3339_utc(unix_now()), ok: true, ..FetchReport::default() };
+        let record = |vm: &str| rows::row_of(&paths, &ws()).unwrap().and_then(|r| r.vm.get(vm).and_then(|e| e.fetched.clone()));
+        let snapshot = "refs/wip/20261020T100000Z-1";
+        // VM 1 on main: its HEAD and this fetch's snapshot (first parent the HEAD) promoted.
+        let on_main = Checkout { head: id(1), branch: Some("main".into()), wip: Some((snapshot.into(), id(2))) };
+        let imported = Imported { promoted: promoted(&[("main", id(1)), ("wip/20261020T100000Z-1", id(2))]), wip_ref: Some(snapshot.into()), ..Imported::default() };
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, fetch_record(&on_main, &imported, Some(&id(1)), 100), true).await;
+        let first = rows::VmFetchRow { at: 100, head: id(1), branch: Some("main".into()), wip: Some(id(2)), wip_ref: Some(snapshot.into()) };
+        assert_eq!(record(VM1), Some(first.clone()));
+        // VM 2, detached: its HEAD promoted as box/HEAD, its snapshot quarantined.
+        let detached = Checkout { head: id(3), branch: None, wip: Some(("refs/wip/y".into(), id(4))) };
+        let imported = Imported {
+            promoted: promoted(&[("HEAD", id(3))]),
+            quarantined: BTreeMap::from([(format!("{BOX_QUARANTINE_REFS}wip/y"), id(4))]),
+            wip_ref: Some("refs/wip/y".into()),
+            ..Imported::default()
+        };
+        record_fetch(&ctx_of(dir.path(), VM2), &report, &imported, Via::Codeout, fetch_record(&detached, &imported, Some(&id(3)), 200), true).await;
+        assert_eq!(record(VM2), Some(rows::VmFetchRow { at: 200, head: id(3), branch: None, wip: None, wip_ref: None }));
+        assert_eq!(record(VM1), Some(first.clone()), "each VM its own record");
+        // VM 1's next HEAD quarantined: the ids it promoted before stay, dated by this fetch.
+        let moved = Checkout { head: id(5), branch: Some("main".into()), wip: None };
+        let imported = Imported { quarantined: BTreeMap::from([(format!("{BOX_QUARANTINE_REFS}main"), id(5))]), ..Imported::default() };
+        assert_eq!(fetch_record(&moved, &imported, None, 300), None);
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, None, true).await;
+        let kept = record(VM1).expect("VM 1's record");
+        assert_eq!((kept.head.as_str(), kept.wip.as_deref(), kept.branch.as_deref()), (id(1).as_str(), Some(id(2).as_str()), Some("main")));
+        assert!(kept.at > 300, "dated by the last fetch: {}", kept.at);
+        // A snapshot whose first parent is not the HEAD (made before a commit, sent again): the HEAD alone.
+        let stale = Checkout { head: id(6), branch: Some("main".into()), wip: Some(("refs/wip/old".into(), id(7))) };
+        let imported = Imported { promoted: promoted(&[("main", id(6)), ("wip/old", id(7))]), wip_ref: Some("refs/wip/old".into()), ..Imported::default() };
+        assert_eq!(fetch_record(&stale, &imported, Some(&id(1)), 400), Some(rows::VmFetchRow { at: 400, head: id(6), branch: Some("main".into()), wip: None, wip_ref: None }));
+        assert_eq!(fetch_record(&stale, &imported, None, 400).and_then(|f| f.wip), None, "no first parent read");
+        // A branch whose name looks like a credential (the setup-token's shape, built here): the import kept it out.
+        let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
+        let hidden = Checkout { head: id(8), branch: Some(format!("x-{token}")), wip: None };
+        let imported = Imported { promoted: promoted(&[("dev", id(8))]), hidden: 1, ..Imported::default() };
+        let fetched = fetch_record(&hidden, &imported, None, 500);
+        assert_eq!(fetched, None, "the ref that checks the HEAD out was not promoted");
+        record_fetch(&ctx_of(dir.path(), VM2), &report, &imported, Via::Codeout, fetched, true).await;
+        assert_eq!(record(VM2).map(|f| f.head), Some(id(3)), "VM 2's ids stay");
+        let text = std::fs::read_to_string(paths.workspace_row("-w")).unwrap();
+        assert!(!text.contains(&token), "no credential-shaped name in the row");
+        // A snapshot ref the import kept out: no wip, no ref.
+        let wip_hidden = Checkout { head: id(9), branch: Some("main".into()), wip: Some((format!("refs/wip/{token}"), id(10))) };
+        let imported = Imported { promoted: promoted(&[("main", id(9))]), hidden: 1, ..Imported::default() };
+        assert_eq!(fetch_record(&wip_hidden, &imported, Some(&id(9)), 600).map(|f| (f.head, f.wip, f.wip_ref)), Some((id(9), None, None)));
+        // VM 1 fetched with no snapshot asked, its HEAD promoted at the same commit (another branch moved): it said
+        // nothing of the worktree, so the record's snapshot stays; a snapshot asked and none made: none.
+        let no_wip = Checkout { head: id(1), branch: Some("main".into()), wip: None };
+        let imported = Imported { promoted: promoted(&[("main", id(1)), ("topic", id(11))]), ..Imported::default() };
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::SmartHttp, fetch_record(&no_wip, &imported, None, 700), false).await;
+        assert_eq!(record(VM1), Some(rows::VmFetchRow { at: 700, ..first }), "the snapshot kept");
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, fetch_record(&no_wip, &imported, None, 800), true).await;
+        assert_eq!(record(VM1), Some(rows::VmFetchRow { at: 800, head: id(1), branch: Some("main".into()), wip: None, wip_ref: None }), "a clean worktree");
+    }
+
+    /// The snapshot's first parent, as the Mac's repository reads it after
+    /// the import: none for a root commit, or an id the repository lacks.
+    #[test]
+    fn a_snapshots_first_parent_is_read_in_the_macs_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitRun::mac(dir.path());
+        let run = |args: &[&str]| String::from_utf8_lossy(&git.output(args).unwrap_or_else(|e| panic!("git {args:?}: {e}"))).trim().to_string();
+        run(&["init", "-q"]);
+        let tree = run(&["write-tree"]);
+        let commit = |parents: &[&str], msg: &str| {
+            let mut args = vec!["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgSign=false", "commit-tree", tree.as_str()];
+            for p in parents {
+                args.extend(["-p", p]);
+            }
+            args.extend(["-m", msg]);
+            run(&args)
+        };
+        let head = commit(&[], "head");
+        let index = commit(&[&head], "index");
+        let wip = commit(&[&head, &index], "wip");
+        assert_eq!(first_parent(&git, &wip).as_deref(), Some(head.as_str()), "a snapshot's first parent: the HEAD it was made on");
+        assert_eq!(first_parent(&git, &index).as_deref(), Some(head.as_str()));
+        assert_eq!(first_parent(&git, &head), None, "a root commit");
+        assert_eq!(first_parent(&git, &"0".repeat(40)), None, "an id the repository lacks");
+    }
+
+    /// A VM that takes every tail URL it is handed (`POST /transcript/tail`,
+    /// 204) and records its key and start; nothing else is served.
+    #[derive(Default)]
+    struct TailVm {
+        handed: std::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    impl TailVm {
+        fn handed(&self) -> Vec<(String, u64)> {
+            self.handed.lock().unwrap().clone()
+        }
+    }
+
+    impl TokenSource for TailVm {
+        async fn token(&self, port: u16) -> Result<crate::bridge::api::AuthToken, BridgeError> {
+            Ok(crate::bridge::api::AuthToken { headers: BTreeMap::new(), port, expires_at_unix: u64::MAX })
+        }
+    }
+
+    impl DataPlane for TailVm {
+        async fn seed_state(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &str) -> Result<crate::bridge::dataplane::DpReply<crate::wire::workspace::SeedState>, BridgeError> {
+            Err(BridgeError::Endpoint("unreached".into()))
+        }
+
+        async fn put_seed(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &crate::wire::workspace::SeedQuery, _: &Path, _: u64) -> Result<crate::bridge::dataplane::DpReply<crate::wire::workspace::SeedReply>, BridgeError> {
+            Err(BridgeError::Endpoint("unreached".into()))
+        }
+
+        async fn post_codeout(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &CodeoutRequest, _: &Path, _: u64) -> Result<crate::bridge::dataplane::DpReply<crate::bridge::dataplane::CodeoutBody>, BridgeError> {
+            Err(BridgeError::Endpoint("unreached".into()))
+        }
+
+        async fn transcript_stat(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &str) -> Result<crate::bridge::dataplane::DpReply<crate::wire::workspace::TranscriptStat>, BridgeError> {
+            Err(BridgeError::Endpoint("unreached".into()))
+        }
+
+        async fn get_settings(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, _: &str) -> Result<crate::bridge::dataplane::DpReply<crate::wire::workspace::SettingsCapture>, BridgeError> {
+            Err(BridgeError::Endpoint("unreached".into()))
+        }
+
+        async fn transcript_tail(&self, _: &AgentTarget, _: &crate::bridge::api::AuthToken, req: &crate::wire::workspace::TranscriptTail) -> Result<crate::bridge::dataplane::DpReply<()>, BridgeError> {
+            req.check().map_err(BridgeError::Config)?;
+            self.handed.lock().unwrap().push((req.url.key().to_string(), req.from));
+            Ok(crate::bridge::dataplane::DpReply::status(204))
+        }
+    }
+
+    /// The trigger's context on `dir`'s bridge root with a transcript sync
+    /// whose S3 nobody listens at (a request to it fails), the tails going
+    /// to `vm`.
+    fn tail_ctx(dir: &Path, vm: Arc<TailVm>) -> CodeoutCtx<FakeMicrovmApi, TailVm, TailVm> {
+        use crate::bridge::s3::{S3Endpoint, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
+        let s3 = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab("127.0.0.1:9".parse().unwrap()) };
+        CodeoutCtx {
+            api: Arc::new(FakeMicrovmApi::new()),
+            dp: vm.clone(),
+            tokens: vm,
+            paths: Paths::from_root_and_env(dir.to_path_buf(), None),
+            cfg: Arc::new(BridgeConfig::default()),
+            target: target(VM1),
+            ws: ws(),
+            capture_settings: false,
+            transcript: Some(TranscriptSync { target: s3, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: dir.join("projects"), proxy: None, view_messages: 10 }),
+        }
+    }
+
+    /// Until `done`, at most 20 s.
+    async fn until(mut done: impl FnMut() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while !done() && std::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// S10 (R1, §1.4, §3.3): `retail` returns at once and coalesces as a
+    /// fetch's request does: three unparks before the task looked hand one
+    /// tail of the named session (here the one from 0: S3 holds nothing of
+    /// it, and no row says S3 keeps it, so no chain is listed), and the
+    /// session's first transcript step's tail stands for a retail asked
+    /// before it ran. Before any session is named, and without a transcript
+    /// sync, nothing is handed; the watch is quiet again once it was. No
+    /// fetch runs for it.
+    #[tokio::test]
+    async fn retail_hands_the_named_sessions_next_tail_once_however_often_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = Arc::new(TailVm::default());
+        let trigger = CodeoutTrigger::spawn(tail_ctx(dir.path(), vm.clone()));
+        let watch = trigger.watch();
+        trigger.retail();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(vm.handed().is_empty() && watch.quiet(), "no session named: nothing to tail");
+        trigger.set_session(SESSION);
+        trigger.retail();
+        until(|| !vm.handed().is_empty() && watch.quiet()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let tail0 = crate::wire::s3::S3Key::Tail { session: SESSION.into(), gen: 1, offset: 0 }.render();
+        assert_eq!(vm.handed(), [(tail0.clone(), 0)], "the first step's tail, which the retail asked meanwhile is");
+        for _ in 0..3 {
+            trigger.retail();
+        }
+        until(|| vm.handed().len() >= 2 && watch.quiet()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(vm.handed(), [(tail0.clone(), 0), (tail0, 0)], "three unparks, one tail");
+        assert!(trigger.last().is_none(), "no fetch ran");
+        let _ = trigger.close(CLOSE_WAIT).await;
+        // Without a transcript sync: nothing to hand, whatever is asked.
+        let plain = Arc::new(TailVm::default());
+        let mut ctx = tail_ctx(dir.path(), plain.clone());
+        ctx.transcript = None;
+        let trigger = CodeoutTrigger::spawn(ctx);
+        trigger.set_session(SESSION);
+        trigger.retail();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(plain.handed().is_empty() && trigger.watch().quiet());
+        let _ = trigger.close(CLOSE_WAIT).await;
     }
 }
 
@@ -1618,8 +2209,9 @@ mod tests {
     /// it closed and nothing of it runs. Idle but open it is not (a result
     /// still on its way may ask for a fetch), nor while a fetch runs (here
     /// held at the workspace's fetch lock, which the test holds); closed with
-    /// the fetch running, it is done once the fetch ends, or at `CLOSE_WAIT`
-    /// when the fetch is given up. Without a runtime it is done from the start.
+    /// the fetch running, it is done once the fetch ends, also one the close
+    /// gave up at `CLOSE_WAIT` (S10 D5: left to its end, so the closing
+    /// suspend waits for it). Without a runtime it is done from the start.
     #[tokio::test]
     async fn the_watch_is_done_once_the_trigger_closed_and_its_fetch_ended_or_was_given_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -1634,17 +2226,21 @@ mod tests {
         let _ = idle.close(CLOSE_WAIT).await;
         tokio::time::timeout(quick, watch.wait_done()).await.expect("closed with nothing running: done at once");
         assert!(t.elapsed() < CLOSE_WAIT);
-        // A fetch held at the lock, given up at the close's bound.
+        // A fetch held at the lock, given up at the close's bound: S10 (D5) it runs on, so the watch is done only at
+        // its end (the closing suspend waits for it), here once the test lets the lock go.
         let held = crate::bridge::vm::lock::try_lock_exclusive(&lock).unwrap().expect("the test holds the fetch lock");
         let trigger = CodeoutTrigger::spawn(ctx);
         let watch = trigger.watch();
         trigger.request();
         assert!(tokio::time::timeout(quick, watch.wait_done()).await.is_err(), "a fetch runs: not done");
         let t = std::time::Instant::now();
-        let (done, _) = tokio::join!(tokio::time::timeout(bound, watch.wait_done()), trigger.close(CLOSE_WAIT));
-        assert!(done.is_ok(), "the fetch given up: done (a task gone marks it)");
-        assert!(t.elapsed() >= CLOSE_WAIT && t.elapsed() < CLOSE_WAIT + Duration::from_secs(2), "done once the fetch was given up: {:?}", t.elapsed());
+        let report = trigger.close(CLOSE_WAIT).await;
+        assert!(report.is_none() && t.elapsed() >= CLOSE_WAIT && t.elapsed() < CLOSE_WAIT + Duration::from_secs(2), "the close gives the fetch up at its bound: {:?}", t.elapsed());
+        assert!(tokio::time::timeout(quick, watch.wait_done()).await.is_err(), "the abandoned fetch runs on: not done");
+        drop(held);
+        tokio::time::timeout(bound, watch.wait_done()).await.expect("the abandoned fetch ended: done");
         assert!(watch.done());
+        let held = crate::bridge::vm::lock::try_lock_exclusive(&lock).unwrap().expect("the test holds the fetch lock again");
         // A fetch held at the lock that ends once the lock goes: done at its end, before `CLOSE_WAIT`.
         let trigger = CodeoutTrigger::spawn(settings_ctx(dir.path(), Arc::new(settings_vm(false))));
         let watch = trigger.watch();
@@ -1664,6 +2260,34 @@ mod tests {
         // No runtime: nothing ever runs.
         let lone = settings_ctx(dir.path(), Arc::new(settings_vm(false)));
         assert!(std::thread::spawn(move || CodeoutTrigger::spawn(lone).watch().done()).join().unwrap());
+    }
+
+    /// S10 §D: the watch is quiet while no fetch is pending or running (a
+    /// park waits for it): an idle trigger is; one whose fetch is held at the
+    /// workspace's fetch lock is not, until that fetch ended. `retail`
+    /// without a transcript sync hands nothing.
+    #[tokio::test]
+    async fn the_watch_is_quiet_while_no_fetch_is_pending_or_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = settings_ctx(dir.path(), Arc::new(settings_vm(false)));
+        let lock = ctx.paths.workspace_fetch_lock(&ctx.ws.slug);
+        let trigger = CodeoutTrigger::spawn(ctx);
+        let watch = trigger.watch();
+        assert!(watch.quiet(), "idle");
+        trigger.retail();
+        assert!(watch.quiet(), "no transcript sync: retail hands nothing");
+        let held = crate::bridge::vm::lock::try_lock_exclusive(&lock).unwrap().expect("the test holds the fetch lock");
+        trigger.request();
+        assert!(!watch.quiet(), "a fetch asked for");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!watch.quiet(), "a fetch running (held at the lock)");
+        drop(held);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !watch.quiet() && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(watch.quiet(), "the fetch ended");
+        let _ = trigger.close(CLOSE_WAIT).await;
     }
 
     const SESSION: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";

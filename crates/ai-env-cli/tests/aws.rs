@@ -510,6 +510,9 @@ fn live_world() -> Live {
         }
     }
     let cfg = BridgeConfig::load(&paths).unwrap().expect("bridge.toml");
+    if LIVE_CREDS.get().is_none() {
+        announce_touch_id("the test process", "its runtime key, once for every live test it runs");
+    }
     let creds = LIVE_CREDS
         .get_or_init(|| {
             let store = ai_env_cli::store::Keystore::resolve(None).expect("keystore");
@@ -1064,7 +1067,8 @@ async fn agent_exec<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, 
                     err.extend_from_slice(&bytes);
                     consumed.stderr_done(seq);
                 }
-                SpawnEvent::Note(_) | SpawnEvent::Link(_) | SpawnEvent::Exit(_) => {}
+                // S10: no park in a test's own spawn.
+                SpawnEvent::Note(_) | SpawnEvent::Link(_) | SpawnEvent::Exit(_) | SpawnEvent::Park(_) => {}
             }
         }
         (out, err, pid)
@@ -1854,7 +1858,10 @@ async fn live_credential_never_enters_an_internet_vm() {
 // then one per wrapper process (D1) and one per `ai-env vm` or `box` command,
 // with a current combined.env. Each fixture's chat keeps its transcript in S3
 // (S9) and its view where Cursor's file would be
-// (`~/.claude/projects/<the fixture's slug>/`).
+// (`~/.claude/projects/<the fixture's slug>/`); each test purges its chats'
+// S3 objects at its end, all of them in one `session forget <ids...> --purge`
+// (one Touch ID more, none for a test with no chat registered:
+// `PurgeTranscripts`, S10 F1).
 // `live_wrapper_smoke` is `make s8-smoke`'s body; the API-host test needs
 // AI_ENV_AWS_SLOW=1 as well (about four minutes).
 
@@ -2036,7 +2043,10 @@ impl Drop for SessionVms {
 
 /// One turn of a live chat: its `result` line, the tools claude asked
 /// permission for (each allowed), the tools it used, what those returned, and
-/// how long the turn took.
+/// how long the turn took. S10: its user line's uuid, how many of that line's
+/// echoes, `system/init` lines and results the host was given, ai-env's
+/// informational lines (a move's notes, L3) and the requests claude withdrew
+/// (`control_cancel_request`, L4).
 #[derive(Default)]
 struct LiveTurn {
     result: serde_json::Value,
@@ -2044,21 +2054,44 @@ struct LiveTurn {
     used: Vec<String>,
     tool_output: String,
     ms: u128,
+    uuid: String,
+    echoes: u32,
+    inits: u32,
+    results: u32,
+    notes: Vec<String>,
+    cancels: Vec<String>,
+}
+
+/// How [`Chat::read_until`] answers claude's `can_use_tool` requests (S10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asks {
+    /// Each allowed as asked, at once, as the permission prompt's button would.
+    AllowAll,
+    /// Each left unanswered and handed back: the test answers it ([`Chat::answer_permission`]).
+    Hold,
 }
 
 /// One Cursor chat the test plays on the real `ai-env-claude` in remote mode:
 /// the extension's argv and entrypoint, its stream-json on the wrapper's stdio
-/// (each stdout line read on a thread), the test's temporary bridge root.
+/// (each stdout line read on a thread, its stderr kept as it comes on
+/// another), the test's temporary bridge root.
 struct Chat {
     test: &'static str,
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     lines: std::sync::mpsc::Receiver<String>,
-    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// The wrapper's stderr so far ([`Chat::stderr_now`]).
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Its reader, joined once the wrapper exited.
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     /// Every stdout line so far, for the sweep.
     stdout: Vec<u8>,
     /// The session id of the newest `system/init`.
     session: Option<String>,
+    /// S10: what the chat said since the newest [`Chat::send_user`] ([`Chat::turn_to_result`] hands it over).
+    turn: LiveTurn,
+    /// When that user line was sent.
+    turn_from: Instant,
 }
 
 impl Chat {
@@ -2066,7 +2099,6 @@ impl Chat {
     /// entrypoint; the lab knobs and every other `CLAUDE_CODE_` name of this shell removed. argv[1] names no file: in
     /// remote mode no Mac binary runs, and a local run of it fails at once.
     fn open(test: &'static str, live: &Live, cwd: &std::path::Path, extra: &[&str]) -> Chat {
-        use std::io::BufRead as _;
         assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{test}: interrupted before a chat opened");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env-claude"));
         cmd.arg(live.paths.root.join("no-claude-on-this-mac").join("claude")).args(CURSOR_CHAT).args(extra).current_dir(cwd);
@@ -2082,7 +2114,14 @@ impl Chat {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().expect("ai-env-claude runs");
+        let child = cmd.spawn().expect("ai-env-claude runs");
+        announce_touch_id(test, &format!("ai-env-claude (pid {}) in {}", child.id(), cwd.display()));
+        Chat::over(test, child)
+    }
+
+    /// A chat over `child`, its stdio piped: each stdout line read on a thread, its stderr kept as it comes by another.
+    fn over(test: &'static str, mut child: std::process::Child) -> Chat {
+        use std::io::BufRead as _;
         let (tx, lines) = std::sync::mpsc::channel();
         let out = child.stdout.take().expect("piped stdout");
         std::thread::spawn(move || {
@@ -2093,13 +2132,20 @@ impl Chat {
             }
         });
         let mut err = child.stderr.take().expect("piped stderr");
-        let stderr = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut err, &mut buf);
-            buf
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&stderr);
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut err, &mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
         });
-        eprintln!("{test}: ai-env-claude (pid {}) in {}: answer its Touch ID", child.id(), cwd.display());
-        Chat { test, stdin: child.stdin.take(), child, lines, stderr: Some(stderr), stdout: Vec::new(), session: None }
+        Chat { test, stdin: child.stdin.take(), child, lines, stderr, stderr_reader: Some(stderr_reader), stdout: Vec::new(), session: None, turn: LiveTurn::default(), turn_from: Instant::now() }
     }
 
     fn pid(&self) -> u32 {
@@ -2168,57 +2214,208 @@ impl Chat {
     /// [`Chat::turn`] answered within `limit` (S9: the first turn of a
     /// reopened 1 GiB chat, which claude may parse whole first).
     fn turn_within(&mut self, text: &str, limit: Duration) -> LiveTurn {
-        let t = Instant::now();
-        self.send(&serde_json::json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null, "session_id": "", "uuid": uuid::Uuid::now_v7().to_string()}));
-        let mut turn = LiveTurn::default();
+        let uuid = self.send_user(text);
+        self.turn_to_result(&uuid, limit)
+    }
+
+    /// S10: one user message (a fresh uuid v7): its uuid. What the chat says from now on is this turn's, until the
+    /// next one is sent.
+    fn send_user(&mut self, text: &str) -> String {
+        let uuid = uuid::Uuid::now_v7().to_string();
+        self.turn = LiveTurn { uuid: uuid.clone(), ..LiveTurn::default() };
+        self.turn_from = Instant::now();
+        self.send(&serde_json::json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null, "session_id": "", "uuid": uuid}));
+        uuid
+    }
+
+    /// S10: the chat's lines, each recorded into the turn ([`LiveTurn`]), until `stop` takes one, which is handed
+    /// back; under [`Asks::Hold`] a `can_use_tool` request is handed back too, unanswered, whatever `stop` says.
+    /// Under [`Asks::AllowAll`] each is allowed as asked; any other request of claude's is answered with an error.
+    /// `None` past `limit` from now, or at the wrapper's EOF.
+    fn read_until(&mut self, limit: Duration, asks: Asks, mut stop: impl FnMut(&serde_json::Value) -> bool) -> Option<serde_json::Value> {
+        let until = Instant::now() + limit;
         loop {
-            let Some(v) = self.next(t + limit) else {
-                let test = self.test;
-                panic!("{test}: no result within {limit:?} (tools used: {:?}, asked for: {:?}); the wrapper's stderr: {}", turn.used, turn.asked, self.stderr_now());
-            };
-            match v["type"].as_str() {
-                Some("control_request") => {
-                    let (id, request) = (v["request_id"].clone(), &v["request"]);
-                    let answer = if request["subtype"] == "can_use_tool" {
-                        turn.asked.push(request["tool_name"].as_str().unwrap_or("?").to_string());
-                        serde_json::json!({"subtype": "success", "request_id": id, "response": {"behavior": "allow", "updatedInput": request["input"]}})
-                    } else {
-                        serde_json::json!({"subtype": "error", "request_id": id, "error": "the live test answers no such request"})
-                    };
-                    self.send(&serde_json::json!({"type": "control_response", "response": answer}));
-                }
-                Some("assistant") => {
-                    let blocks = v["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default();
-                    turn.used.extend(blocks.iter().filter(|b| b["type"] == "tool_use").filter_map(|b| b["name"].as_str().map(str::to_string)));
-                }
-                Some("user") => {
-                    for block in v["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter(|b| b["type"] == "tool_result") {
-                        match &block["content"] {
-                            serde_json::Value::String(s) => turn.tool_output.push_str(s),
-                            serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).for_each(|s| turn.tool_output.push_str(s)),
-                            _ => {}
-                        }
-                        turn.tool_output.push('\n');
-                    }
-                }
-                Some("result") => {
-                    turn.result = v;
-                    turn.ms = t.elapsed().as_millis();
-                    return turn;
-                }
-                _ => {}
+            let v = self.next(until)?;
+            if self.record(&v, asks) || stop(&v) {
+                return Some(v);
             }
         }
     }
 
-    /// The wrapper's stderr once it exited (empty while it runs: its reader holds it).
-    fn stderr_now(&mut self) -> String {
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
-            if let Some(h) = self.stderr.take() {
-                return no_account(&scrub(&String::from_utf8_lossy(&h.join().unwrap_or_default())));
+    /// One line into the turn, a request of claude's answered as `asks` says: whether it is a `can_use_tool` held.
+    fn record(&mut self, v: &serde_json::Value, asks: Asks) -> bool {
+        match v["type"].as_str() {
+            Some("control_request") if v["request"]["subtype"] == "can_use_tool" => {
+                self.turn.asked.push(v["request"]["tool_name"].as_str().unwrap_or("?").to_string());
+                if asks == Asks::Hold {
+                    return true;
+                }
+                self.answer_permission(v, true);
+            }
+            Some("control_request") => {
+                self.send(&serde_json::json!({"type": "control_response", "response": {"subtype": "error", "request_id": v["request_id"], "error": "the live test answers no such request"}}));
+            }
+            Some("control_cancel_request") => self.turn.cancels.push(v["request_id"].as_str().unwrap_or("?").to_string()),
+            Some("assistant") => {
+                let blocks = v["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default();
+                self.turn.used.extend(blocks.iter().filter(|b| b["type"] == "tool_use").filter_map(|b| b["name"].as_str().map(str::to_string)));
+            }
+            Some("user") => {
+                if v["isReplay"] == true && !self.turn.uuid.is_empty() && v["uuid"] == self.turn.uuid.as_str() {
+                    self.turn.echoes += 1;
+                }
+                for block in v["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter(|b| b["type"] == "tool_result") {
+                    match &block["content"] {
+                        serde_json::Value::String(s) => self.turn.tool_output.push_str(s),
+                        serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).for_each(|s| self.turn.tool_output.push_str(s)),
+                        _ => {}
+                    }
+                    self.turn.tool_output.push('\n');
+                }
+            }
+            Some("system") if v["subtype"] == "init" => self.turn.inits += 1,
+            // ai-env's own (every note of L3's starts so); claude writes the subtype too.
+            Some("system") if v["subtype"] == "informational" => {
+                if let Some(note) = v["content"].as_str().filter(|c| c.starts_with("ai-env: ")) {
+                    self.turn.notes.push(note.to_string());
+                }
+            }
+            Some("result") => {
+                self.turn.results += 1;
+                self.turn.ms = self.turn_from.elapsed().as_millis();
+                self.turn.result = v.clone();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// S10: under [`Asks::Hold`], the turn's next `can_use_tool` request, left unanswered; the test fails past
+    /// `limit` from now, or when the turn ends asking none.
+    fn held_permission(&mut self, limit: Duration) -> serde_json::Value {
+        let test = self.test;
+        match self.read_until(limit, Asks::Hold, |v| v["type"] == "result") {
+            Some(v) if v["type"] == "control_request" => v,
+            Some(v) => panic!("{test}: the turn ended asking no permission: {v}"),
+            None => {
+                let err = self.stderr_now();
+                panic!("{test}: no permission request within {limit:?}; the wrapper's stderr: {err}")
             }
         }
-        "(still running)".to_string()
+    }
+
+    /// S10: the answer to claude's `can_use_tool` request `req`: allowed as asked, or denied.
+    fn answer_permission(&mut self, req: &serde_json::Value, allow: bool) {
+        let decision = if allow { serde_json::json!({"behavior": "allow", "updatedInput": req["request"]["input"]}) } else { serde_json::json!({"behavior": "deny", "message": "the live test denies it"}) };
+        self.send(&serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": req["request_id"], "response": decision}}));
+    }
+
+    /// S10: the turn of the user line `uuid` (the newest [`Chat::send_user`]'s) to its `result`, within `limit` of
+    /// now, each `can_use_tool` allowed as asked: the turn, its time from the send.
+    fn turn_to_result(&mut self, uuid: &str, limit: Duration) -> LiveTurn {
+        let test = self.test;
+        assert_eq!(self.turn.uuid, uuid, "{test}: the turn read is the newest user line's");
+        if self.turn.results == 0 && self.read_until(limit, Asks::AllowAll, |v| v["type"] == "result").is_none() {
+            let (used, asked) = (self.turn.used.clone(), self.turn.asked.clone());
+            let err = self.stderr_now();
+            panic!("{test}: no result within {limit:?} (tools used: {used:?}, asked for: {asked:?}); the wrapper's stderr: {err}");
+        }
+        std::mem::take(&mut self.turn)
+    }
+
+    /// S10: [`wait_for`] with the chat open: its lines read between the probes (each recorded, a request answered
+    /// as `asks` says), the wrapper alive throughout; the probe's answer.
+    fn wait_for<T>(&mut self, what: &str, limit: Duration, asks: Asks, mut probe: impl FnMut() -> Option<T>) -> T {
+        let (test, t) = (self.test, Instant::now());
+        loop {
+            if let Some(found) = probe() {
+                eprintln!("{test}: {what}: after {} ms", t.elapsed().as_millis());
+                return found;
+            }
+            if t.elapsed() >= limit {
+                let err = self.stderr_now();
+                panic!("{test}: {what}: not within {limit:?}; the wrapper's stderr: {err}");
+            }
+            self.pause(LIVE_SYNC_POLL, asks, what);
+        }
+    }
+
+    /// S10: the chat's lines for `dur` (each recorded, every `can_use_tool` allowed), the wrapper alive throughout.
+    fn idle(&mut self, dur: Duration) {
+        self.pause(dur, Asks::AllowAll, "a pause between turns");
+    }
+
+    /// The chat's lines for `dur`, a request answered as `asks` says; the test fails at once when the wrapper exits
+    /// meanwhile (`what` is what it waited for).
+    fn pause(&mut self, dur: Duration, asks: Asks, what: &str) {
+        let until = Instant::now() + dur;
+        loop {
+            let _ = self.read_until(until.saturating_duration_since(Instant::now()), asks, |_| false);
+            if let Ok(Some(status)) = self.child.try_wait() {
+                let test = self.test;
+                let err = self.stderr_now();
+                panic!("{test}: the wrapper exited ({status}) while the test waited for {what}; its stderr: {err}");
+            }
+            if Instant::now() >= until {
+                return;
+            }
+            // At the wrapper's EOF `read_until` returns at once.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// S10: the VM the chat's session row names now (`microvm_id`: the newest generation's).
+    fn session_vm(&self, live: &Live) -> String {
+        let test = self.test;
+        let session = self.session.as_deref().unwrap_or_else(|| panic!("{test}: no session id yet"));
+        ai_env_cli::bridge::registry::read(&live.paths, session).unwrap().and_then(|r| r.microvm_id).unwrap_or_else(|| panic!("{test}: the session row of {session} names no VM"))
+    }
+
+    /// S10: `ai-env vm terminate <vm> --yes` with the chat open, mid-turn or idle: the chat's lines wait on their
+    /// thread meanwhile. Its Touch ID is announced first, then `then`'s when given: one the terminate sets off at
+    /// once (a move mid-turn asks M1's as soon as the wrapper sees the loss, while the command still waits up to
+    /// 30 s for TERMINATED). Exit 0 asserted; its output, for the sweep.
+    fn terminate_mid_turn(&self, live: &Live, vm: &str, then: Option<&str>) -> std::process::Output {
+        announce_touch_id(self.test, &format!("vm terminate {vm}"));
+        if let Some(then) = then {
+            announce_touch_id(self.test, then);
+        }
+        let out = ai_env_live(live, &["vm", "terminate", vm, "--yes"]);
+        assert_eq!(out.status.code(), Some(0), "{}: vm terminate {vm}", self.test);
+        out
+    }
+
+    /// S10, a closed lid's stand-in: the wrapper stopped (SIGSTOP) for `dur`, then continued (SIGCONT). Its
+    /// socket goes silent while the VM and its turn go on. A caught signal cuts the stop short and fails the test
+    /// (the drop continues the wrapper before it ends it).
+    fn stop_for(&mut self, dur: Duration) {
+        self.signal(libc::SIGSTOP);
+        let t = Instant::now();
+        while t.elapsed() < dur && CRED_SIGNAL.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(dur.saturating_sub(t.elapsed()).min(Duration::from_millis(100)));
+        }
+        self.signal(libc::SIGCONT);
+        assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{}: interrupted while the wrapper was stopped", self.test);
+    }
+
+    /// `sig` to the wrapper, while it is not reaped.
+    fn signal(&mut self, sig: libc::c_int) {
+        if let (Ok(None), Ok(pid)) = (self.child.try_wait(), i32::try_from(self.child.id())) {
+            // SAFETY: kill(2) on our own child, which try_wait just saw unreaped.
+            unsafe { libc::kill(pid, sig) };
+        }
+    }
+
+    /// The wrapper's stderr so far, all of it once the wrapper exited (S10 reads it live), setup-tokens and
+    /// account ids masked.
+    fn stderr_now(&mut self) -> String {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Some(h) = self.stderr_reader.take() {
+                let _ = h.join();
+            }
+        }
+        let bytes = self.stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        no_account(&scrub(&String::from_utf8_lossy(&bytes)))
     }
 
     /// Close the wrapper's stdin (the extension's `stdin.end()`), then its exit: the code, and how long after the close
@@ -2256,24 +2453,32 @@ impl Chat {
     /// What the chat put out, for [`sweep_live`]: its stdout lines and its stderr, once it exited.
     fn output(&mut self) -> std::process::Output {
         let status = self.child.wait().expect("ai-env-claude exited");
-        let stderr = self.stderr.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+        if let Some(h) = self.stderr_reader.take() {
+            let _ = h.join();
+        }
+        let stderr = self.stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         std::process::Output { status, stdout: self.stdout.clone(), stderr }
     }
-}
 
-impl Drop for Chat {
-    fn drop(&mut self) {
+    /// The wrapper ended if it still runs: continued first (a wrapper [`Chat::stop_for`] left stopped would never
+    /// take the TERM), then SIGTERM (it detaches its spawn on its own), then SIGKILL 3 s later: its exit.
+    fn end(&mut self) -> Option<std::process::ExitStatus> {
         if matches!(self.child.try_wait(), Ok(None)) {
-            // SIGTERM first: the wrapper detaches its spawn on its own; then SIGKILL.
-            // SAFETY: kill(2) on our own child, which try_wait just saw running (not reaped).
-            unsafe { libc::kill(i32::try_from(self.child.id()).unwrap_or(0), libc::SIGTERM) };
+            self.signal(libc::SIGCONT);
+            self.signal(libc::SIGTERM);
             let t = Instant::now();
             while matches!(self.child.try_wait(), Ok(None)) && t.elapsed() < Duration::from_secs(3) {
                 std::thread::sleep(Duration::from_millis(20));
             }
             let _ = self.child.kill();
-            let _ = self.child.wait();
         }
+        self.child.wait().ok()
+    }
+}
+
+impl Drop for Chat {
+    fn drop(&mut self) {
+        let _ = self.end();
     }
 }
 
@@ -2329,9 +2534,10 @@ fn assert_closed_well(test: &str, live: &Live, chat: &Chat, code: Option<i32>, c
 /// at its identical path; a Bash tool call (allowed, as the permission prompt's
 /// button would) prints aarch64, uid 1000 and that path; `initialize` came
 /// within the cold budget, and the wrapper exits 0 within 1.5 s of its stdin's
-/// close; no setup-token in the clear anywhere.
+/// close; no setup-token in the clear anywhere. Two Touch IDs: the chat, and
+/// the purge of its S3 objects ([`PurgeTranscripts`], S10 F1).
 #[test]
-#[ignore = "live, starts a MicroVM and asks the model (one Touch ID): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+#[ignore = "live, starts a MicroVM and asks the model (two Touch IDs: the chat, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
 fn live_wrapper_session_answers_ok_on_a_fresh_vm() {
     const TEST: &str = "live_wrapper_session_answers_ok_on_a_fresh_vm";
     if !cred_live() {
@@ -2339,6 +2545,7 @@ fn live_wrapper_session_answers_ok_on_a_fresh_vm() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-fresh");
     let mut chat = Chat::open(TEST, &live, &ws, &[]);
@@ -2365,10 +2572,11 @@ fn live_wrapper_session_answers_ok_on_a_fresh_vm() {
 /// running: `[vm] suspend_on_close = false`) and its token: one delivery for
 /// both, the second spawn naming the VM's copy (the census's `credential:`
 /// of the second is `cached`, though a current combined.env's one Touch ID
-/// brought the token along with the runtime key: it went unused). Two Touch
-/// IDs (one per wrapper process, D1).
+/// brought the token along with the runtime key: it went unused). Three Touch
+/// IDs: one per wrapper process (D1), and the purge of both chats' S3 objects
+/// (one `session forget --purge` of them all, S10 F1).
 #[test]
-#[ignore = "live, starts a MicroVM and asks the model (two Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+#[ignore = "live, starts a MicroVM and asks the model (three Touch IDs: two chats, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
 fn live_wrapper_warm_session_reuses_the_vm_and_its_token() {
     const TEST: &str = "live_wrapper_warm_session_reuses_the_vm_and_its_token";
     if !cred_live() {
@@ -2376,6 +2584,7 @@ fn live_wrapper_warm_session_reuses_the_vm_and_its_token() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false)), ("reuse_per_workspace", toml::Value::Boolean(true))]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-warm");
     let mut rows = Vec::new();
@@ -2405,9 +2614,9 @@ fn live_wrapper_warm_session_reuses_the_vm_and_its_token() {
 /// (`vm exec`, so the result is the test's, not the model's) come to the Mac
 /// with `box fetch --wip`: `refs/remotes/box/main` at the VM's commit, a
 /// `box/wip/*` ref holding the edit, the Mac's HEAD and worktree untouched.
-/// Three Touch IDs: the chat, `vm exec`, `box fetch`.
+/// Four Touch IDs: the chat, `vm exec`, `box fetch`, the purge (S10 F1).
 #[test]
-#[ignore = "live, starts a MicroVM and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+#[ignore = "live, starts a MicroVM and asks the model (four Touch IDs: the chat, vm exec, box fetch, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
 fn live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip() {
     const TEST: &str = "live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip";
     if !cred_live() {
@@ -2415,6 +2624,7 @@ fn live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-codeout");
     let mac_head = fixture_git(&ws, &["rev-parse", "HEAD"]);
@@ -2446,9 +2656,10 @@ fn live_wrapper_box_fetch_sees_a_vm_commit_and_its_wip() {
 /// the reopened chat (`--resume` of its session) starts a new VM, its
 /// transcript is restored there from S3 before the spawn
 /// (`transcript:restored`, a `transcript_pull` audit row written), and the
-/// conversation goes on. Three Touch IDs: two chats and the terminate.
+/// conversation goes on. Four Touch IDs: two chats, the terminate and the
+/// purge (S10 F1).
 #[test]
-#[ignore = "live, starts two MicroVMs and asks the model (three Touch IDs): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
+#[ignore = "live, starts two MicroVMs and asks the model (four Touch IDs: two chats, the terminate, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
 fn live_wrapper_resume_into_a_new_vm_continues_the_conversation() {
     const TEST: &str = "live_wrapper_resume_into_a_new_vm_continues_the_conversation";
     if !cred_live() {
@@ -2456,6 +2667,7 @@ fn live_wrapper_resume_into_a_new_vm_continues_the_conversation() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[("suspend_on_close", toml::Value::Boolean(false))]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-resume");
     let word = format!("lantern{}", uuid::Uuid::now_v7().simple().to_string().chars().rev().take(4).collect::<String>());
@@ -2489,7 +2701,8 @@ fn live_wrapper_resume_into_a_new_vm_continues_the_conversation() {
 /// removed on every path, `RemoveOnDrop`) refuses the seed at P1, the wrapper
 /// exits 9 with the finding's line (never the value), and no VM was asked for
 /// (no RunMicrovm: no VM row, no `vm_run`). At most one Touch ID (the dialog
-/// may close with the refusal).
+/// may close with the refusal); no session was registered, so nothing is
+/// purged ([`PurgeTranscripts`] runs no command).
 #[test]
 #[ignore = "live, no VM expected (at most one Touch ID): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make test-aws CRED=1"]
 fn live_wrapper_seed_refuses_a_planted_secret_before_any_vm() {
@@ -2499,6 +2712,7 @@ fn live_wrapper_seed_refuses_a_planted_secret_before_any_vm() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-secret");
     // The planted value never outlives the test: the fixture goes on every path, after the chat (made later) ended.
@@ -2523,9 +2737,11 @@ fn live_wrapper_seed_refuses_a_planted_secret_before_any_vm() {
 /// `make s8-smoke`'s body (T8.2's gate): three live chats in a fixture
 /// workspace, each seeding (or keeping) the VM, one turn, its code-out fetch
 /// recorded before the close, and the wrapper's exit 0 within 1.5 s; each
-/// pass's record appended to `target/s8/smoke.jsonl`. One Touch ID per pass.
+/// pass's record appended to `target/s8/smoke.jsonl`. One Touch ID per pass,
+/// the test process's own, and one for the three chats' S3 objects, purged at
+/// the end by one `session forget --purge` of them all (S10 F1): five.
 #[test]
-#[ignore = "live, starts a MicroVM and asks the model three times (four Touch IDs: the test process's runtime key, then one per pass): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make s8-smoke"]
+#[ignore = "live, starts a MicroVM and asks the model three times (five Touch IDs: the test process's runtime key, one per pass, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 make s8-smoke"]
 fn live_wrapper_smoke() {
     const TEST: &str = "live_wrapper_smoke";
     if !cred_live() {
@@ -2533,6 +2749,7 @@ fn live_wrapper_smoke() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-smoke");
     let records = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/s8")).unwrap().join("smoke.jsonl");
@@ -2629,12 +2846,13 @@ impl Drop for ApiHostSuspended {
 /// mid-session (`egress suspend`, lifted on every path), a turn ends by the
 /// CLI's own retries within the budget, as an error result while the session
 /// lives on (nothing was refused: never exit 5 or `credential_rejected`).
-/// With AI_ENV_AWS_SLOW=1 too (about four minutes; three Touch IDs: the
-/// chat's, then the ops key's for the suspension and again for its restore,
-/// each `egress suspend` its own process; under `ai-env as ops` or
-/// `ai-env as deployer` the chat's alone).
+/// With AI_ENV_AWS_SLOW=1 too (about four minutes; four Touch IDs: the
+/// chat's, the purge of its S3 objects (S10 F1), then the ops key's for the
+/// suspension and again for its restore, each `egress suspend` its own
+/// process; under `ai-env as ops` or `ai-env as deployer` the chat's and the
+/// purge's alone, two).
 #[test]
-#[ignore = "live, about four minutes, denies api.anthropic.com on the proxy meanwhile (three Touch IDs: the chat's, the ops key's for the suspension and for its restore; the chat's alone under ai-env as ops or as deployer): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws CRED=1 SLOW=1"]
+#[ignore = "live, about four minutes, denies api.anthropic.com on the proxy meanwhile (four Touch IDs: the chat's, the purge, the ops key's for the suspension and for its restore; the chat's and the purge alone, two, under ai-env as ops or as deployer): AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws CRED=1 SLOW=1"]
 fn live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget() {
     const TEST: &str = "live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget";
     if !cred_live() {
@@ -2646,6 +2864,7 @@ fn live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget() {
     }
     let _signals = Interrupts::catch();
     let live = wrapper_world(&[]);
+    let _purge = PurgeTranscripts(&live);
     let _vms = SessionVms::new(&live);
     let ws = s8_fixture(&live, "live-wrapper-api-host");
     let mut chat = Chat::open(TEST, &live, &ws, &[]);
@@ -2691,8 +2910,8 @@ fn live_wrapper_suspended_api_host_ends_the_turn_within_the_auth_fail_budget() {
 // (restored into the VM its reopen takes) and round-trips (its rates printed,
 // and claude's memory with it open); the Mac cannot read the VM's objects,
 // nor write one.
-// Each purges its chat's objects at its end (`session forget --purge`, one
-// Touch ID more: `PurgeTranscripts`).
+// Each purges its chats' objects at its end (one `session forget <ids...>
+// --purge` of them all, one Touch ID more: `PurgeTranscripts`, S10 F1).
 
 use ai_env_cli::bridge::dataplane::{HttpsEndpoint as DataEndpoint, MintingTokens, TokenSource};
 use ai_env_cli::bridge::gitsmart::Client as SmartHttp;
@@ -3117,24 +3336,9 @@ fn wait_for_sync_takes_only_a_part_of_the_vm_past_what_was_committed() {
     m.committed = 100;
     m.commit_segment(part(S3Key::Segment { session: sid.clone(), gen: 1, offset: 100 }, "", 100, 50), &fp, None, "microvm-1", at);
     // The wrapper: `cat`, its lines read as `Chat::open` reads ai-env-claude's.
-    let mut child = std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("cat runs");
-    let (tx, lines) = std::sync::mpsc::channel();
-    let out = child.stdout.take().expect("piped stdout");
-    std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        for line in std::io::BufReader::new(out).lines().map_while(std::result::Result::ok) {
-            if tx.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut err = child.stderr.take().expect("piped stderr");
-    let stderr = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut err, &mut buf);
-        buf
-    });
-    let mut chat = Chat { test: TEST, stdin: child.stdin.take(), child, lines, stderr: Some(stderr), stdout: Vec::new(), session: Some(sid.clone()) };
+    let child = std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("cat runs");
+    let mut chat = Chat::over(TEST, child);
+    chat.session = Some(sid.clone());
     // A wait whose bound has passed: what it names.
     let fails = |chat: &mut Chat, after: u64| {
         let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chat.wait_for_sync_within(&live, after, Duration::ZERO))).expect_err("a bound already passed fails the wait");
@@ -3210,40 +3414,54 @@ fn s3_target(live: &Live) -> ai_env_cli::bridge::s3::S3Target {
 }
 
 /// The S3 transcripts of a test's chats, purged when the test ends, passed or
-/// failed: `session forget <sid> --purge` in the test's root (one Touch ID
-/// each) for every session it keeps transcript state of
-/// (`state/transcripts/<sid>/`) or whose row keeps its transcript in S3 (a
-/// chat whose sync never committed: no manifest, and S3 may hold its tail).
-/// That deletes the objects under `v1/<sid>/`, which only the temporary
-/// root's manifests name (no later `session gc --remote` would find them),
-/// and the view. Made before [`SessionVms`]: it runs once the chats closed
-/// and their VMs ended, so a tail a VM's `/terminate` pushed is purged with
-/// the rest. Interrupted, or when a purge fails, the prefix to delete by
-/// hand is printed.
+/// failed: one `session forget <sid>... --purge` in the test's root for every
+/// session it keeps transcript state of ([`purged_sessions`]), one Touch ID
+/// for them all (S10 F1: one unseal), none when there is none. That deletes
+/// the objects under `v1/<sid>/`, which only the temporary root's manifests
+/// name (no later `session gc --remote` would find them), and the views.
+/// Made before [`SessionVms`]: it runs once the chats closed and their VMs
+/// ended, so a tail a VM's `/terminate` pushed is purged with the rest.
+/// Interrupted, or when the purge fails, the prefixes to delete by hand are
+/// printed.
 struct PurgeTranscripts<'a>(&'a Live);
+
+/// The sessions [`PurgeTranscripts`] purges, sorted, each once: those the
+/// root keeps transcript state of (`state/transcripts/<sid>/`), and those
+/// whose row keeps the transcript in S3 (a chat whose sync never committed:
+/// no manifest, and S3 may hold its tail).
+fn purged_sessions(paths: &Paths) -> Vec<String> {
+    let mut sessions: Vec<String> = std::fs::read_dir(paths.transcripts()).map(|dir| dir.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| ai_env_cli::bridge::registry::is_uuid(n)).collect()).unwrap_or_default();
+    // A chat whose sync never committed has no directory there; its row names S3, a trace `forget --purge` takes.
+    sessions.extend(ai_env_cli::bridge::registry::list(paths).unwrap_or_default().into_iter().filter(|r| r.transcript_home.is_some()).map(|r| r.session_id));
+    sessions.sort();
+    sessions.dedup();
+    sessions
+}
+
+/// The one command that purges `sessions` (S10 F1): `session forget <sid>... --purge`; none for none.
+fn purge_args(sessions: &[String]) -> Option<Vec<String>> {
+    (!sessions.is_empty()).then(|| ["session", "forget"].iter().map(|w| (*w).to_string()).chain(sessions.iter().cloned()).chain(std::iter::once("--purge".to_string())).collect())
+}
 
 impl Drop for PurgeTranscripts<'_> {
     fn drop(&mut self) {
         let live = self.0;
-        let mut sessions: Vec<String> = std::fs::read_dir(live.paths.transcripts()).map(|dir| dir.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| ai_env_cli::bridge::registry::is_uuid(n)).collect()).unwrap_or_default();
-        // A chat whose sync never committed has no directory there; its row names S3, a trace `forget --purge` takes.
-        sessions.extend(ai_env_cli::bridge::registry::list(&live.paths).unwrap_or_default().into_iter().filter(|r| r.transcript_home.is_some()).map(|r| r.session_id));
-        sessions.sort();
-        sessions.dedup();
-        for sid in sessions {
-            let by_hand = format!("its objects under v1/{sid}/ in the transcripts bucket are left: delete them by hand");
-            let said = if CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
-                format!("guard: interrupted, session forget {sid} --purge not run: {by_hand}")
-            } else {
-                // A panic of the command's runner (stopped past its limit) is caught: a drop never panics.
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ai_env_live(live, &["session", "forget", &sid, "--purge"]))) {
-                    Ok(out) if out.status.success() => format!("guard: purged the transcript of {sid}"),
-                    Ok(out) => format!("guard: session forget {sid} --purge exited {:?}: {by_hand}", out.status.code()),
-                    Err(_) => format!("guard: session forget {sid} --purge did not finish: {by_hand}"),
-                }
-            };
-            let _ = writeln!(std::io::stderr(), "{said}");
-        }
+        let sessions = purged_sessions(&live.paths);
+        let Some(args) = purge_args(&sessions) else { return };
+        let by_hand = format!("the objects under v1/<sid>/ in the transcripts bucket are left for each of {}: delete them by hand", sessions.join(", "));
+        let said = if CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
+            format!("guard: interrupted, session forget --purge not run: {by_hand}")
+        } else {
+            announce_touch_id("guard", &format!("session forget --purge of {} session(s): their S3 objects", sessions.len()));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            // A panic of the command's runner (stopped past its limit) is caught: a drop never panics.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ai_env_live(live, &args))) {
+                Ok(out) if out.status.success() => format!("guard: purged the transcripts of {}", sessions.join(", ")),
+                Ok(out) => format!("guard: session forget --purge exited {:?}: {by_hand}", out.status.code()),
+                Err(_) => format!("guard: session forget --purge did not finish: {by_hand}"),
+            }
+        };
+        let _ = writeln!(std::io::stderr(), "{said}");
     }
 }
 
@@ -3374,8 +3592,14 @@ fn live_s3_reopen_new_vm_restores() {
 
 /// The audit row of `event` whose detail's `session` is `session`, the newest: (bytes, ms) as numbers.
 fn timed_row(test: &str, live: &Live, event: &str, session: &str) -> (u64, u64) {
+    timed_row_of(test, live, event, session, None)
+}
+
+/// [`timed_row`] of the newest row whose `kind` is `kind`, when one is given (S10: the sync's base push, beside
+/// the subtree's files).
+fn timed_row_of(test: &str, live: &Live, event: &str, session: &str, kind: Option<&str>) -> (u64, u64) {
     let rows = live_audit(live, event);
-    let row = rows.iter().rev().find(|r| r["detail"]["session"] == session).unwrap_or_else(|| panic!("{test}: no {event} row of {session}: {rows:?}"));
+    let row = rows.iter().rev().find(|r| r["detail"]["session"] == session && kind.is_none_or(|k| r["detail"]["kind"] == k)).unwrap_or_else(|| panic!("{test}: no {event} row of {session}: {rows:?}"));
     let num = |k: &str| row["detail"][k].as_str().and_then(|v| v.parse().ok()).or_else(|| row["detail"][k].as_u64()).unwrap_or_else(|| panic!("{test}: {event}'s {k}: {row}"));
     let bytes = if row["detail"].get("bytes").is_some() { num("bytes") } else { num("len") };
     (bytes, num("ms"))
@@ -3386,8 +3610,104 @@ fn rate(bytes: u64, ms: u64) -> f64 {
     bytes as f64 / 1_000_000.0 / (ms.max(1) as f64 / 1000.0)
 }
 
+/// The synthetic chat's shape for [`live_s3_gib_round_trip_timing`] (S10
+/// F12): its main transcript's MiB, and its subtree's MiB in `files`
+/// subagent files. AI_ENV_S3_CHAT gives it as
+/// `main=<MiB>,subtree=<MiB>,files=<n>` (`make test-aws S3=1 CHAT=dev`: the
+/// development chat's, from its file names and sizes alone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatShape {
+    main_mib: u64,
+    subtree_mib: u64,
+    files: u64,
+}
+
+impl ChatShape {
+    /// S9's gib: 1024 MiB of transcript, no subtree.
+    const GIB: ChatShape = ChatShape { main_mib: 1024, subtree_mib: 0, files: 0 };
+
+    /// AI_ENV_S3_CHAT's value: unset, [`ChatShape::GIB`]; else exactly
+    /// `main=<MiB>,subtree=<MiB>,files=<n>` in that order, decimal, a main of
+    /// 1 MiB or more, a subtree with files and files with a subtree, the whole
+    /// at most what `session stage` takes (`STAGE_MAX`). Anything else is
+    /// refused naming the form it should have.
+    fn parse(value: Option<&str>) -> Result<ChatShape, String> {
+        let Some(text) = value else { return Ok(ChatShape::GIB) };
+        let bad = || format!("AI_ENV_S3_CHAT={text:?} is not main=<MiB>,subtree=<MiB>,files=<n> (make test-aws S3=1 CHAT=dev sets it from S3_CHAT_DEV)");
+        let mut nums = [0u64; 3];
+        let mut parts = text.split(',');
+        for (slot, key) in nums.iter_mut().zip(["main", "subtree", "files"]) {
+            let digits = parts.next().and_then(|p| p.strip_prefix(key)).and_then(|p| p.strip_prefix('=')).filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())).ok_or_else(bad)?;
+            *slot = digits.parse().map_err(|_| bad())?;
+        }
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        let [main_mib, subtree_mib, files] = nums;
+        let max_mib = ai_env_cli::bridge::s3::stage::STAGE_MAX >> 20;
+        if main_mib == 0 || (subtree_mib == 0) != (files == 0) || main_mib.saturating_add(subtree_mib) > max_mib {
+            return Err(format!("{}: a main of 1 MiB or more, a subtree with files (and files with a subtree), {max_mib} MiB at most in all", bad()));
+        }
+        Ok(ChatShape { main_mib, subtree_mib, files })
+    }
+
+    /// The main transcript's bytes (written to just past them).
+    fn main_bytes(self) -> u64 {
+        self.main_mib << 20
+    }
+
+    /// Each subtree file's bytes: the subtree's split evenly, the remainder in the last.
+    fn file_sizes(self) -> Vec<u64> {
+        let total = self.subtree_mib << 20;
+        (0..self.files).map(|k| total / self.files + if k + 1 == self.files { total % self.files } else { 0 }).collect()
+    }
+}
+
+/// Offline (S10 F12): AI_ENV_S3_CHAT's shapes. Unset is S9's gib; the
+/// development chat's form parses, its subtree split over its files to the
+/// byte; every other form is refused naming the one it should have.
+#[test]
+fn chat_shape_reads_main_subtree_files_or_defaults_to_s9s_gib() {
+    assert_eq!(ChatShape::parse(None), Ok(ChatShape::GIB));
+    assert_eq!((ChatShape::GIB.main_bytes(), ChatShape::GIB.file_sizes()), (1 << 30, Vec::new()), "S9's 1 GiB, no subtree");
+    let dev = ChatShape::parse(Some("main=215,subtree=1650,files=40")).unwrap();
+    assert_eq!(dev, ChatShape { main_mib: 215, subtree_mib: 1650, files: 40 });
+    assert_eq!(dev.main_bytes(), 215 << 20);
+    let sizes = dev.file_sizes();
+    assert_eq!((sizes.len(), sizes.iter().sum::<u64>()), (40, 1650 << 20));
+    assert_eq!(ChatShape::parse(Some("main=1,subtree=1,files=3")).unwrap().file_sizes(), [349_525, 349_525, 349_526], "the remainder in the last");
+    assert_eq!(ChatShape::parse(Some("main=1024,subtree=0,files=0")), Ok(ChatShape::GIB));
+    for bad in [
+        "",
+        "main=215",
+        "main=215,subtree=1650",
+        "main=215,subtree=1650,files=40,x=1",
+        "subtree=1650,main=215,files=40",
+        "main=215,subtree=1.6G,files=40",
+        "main=,subtree=0,files=0",
+        "main=+5,subtree=0,files=0",
+        " main=215,subtree=0,files=0",
+        "main=0,subtree=0,files=0",
+        "main=215,subtree=0,files=4",
+        "main=215,subtree=10,files=0",
+        "main=4096,subtree=1,files=1",
+        "main=99999999999999999999,subtree=0,files=0",
+    ] {
+        let e = ChatShape::parse(Some(bad)).expect_err(bad);
+        assert!(e.contains("is not main=<MiB>,subtree=<MiB>,files=<n>"), "{bad}: {e}");
+    }
+}
+
 /// T9 S3 live (B6): a 1 GiB chat begun on the Mac round-trips through S3,
-/// and claude's memory with it open is read. A synthetic transcript (never
+/// and claude's memory with it open is read. S10 (F12): AI_ENV_S3_CHAT gives
+/// the chat another shape, `main=<MiB>,subtree=<MiB>,files=<n>` ([`ChatShape`],
+/// `make test-aws S3=1 CHAT=dev`: the development chat's, from its names and
+/// sizes alone): the main transcript that large, and `files` subagent files
+/// of the subtree's MiB in all under `<sid>/subagents/`; unset, S9's gib (1024
+/// MiB, no subtree). A subtree goes up with the stage, the reopen keeps the
+/// main transcript (`transcript:kept`) and pulls only the subtree's files
+/// after its spawn (`restore_subtree`, one `transcript_pull` row each, its
+/// `too_large` path past 256 MiB). A synthetic transcript (never
 /// the development chat: JSONL of plain prompts and replies, written here
 /// under the fixture's project directory and removed on every path) ends
 /// with a compaction as 2.1.302 writes one and a short exchange after it:
@@ -3422,16 +3742,18 @@ fn rate(bytes: u64, ms: u64) -> f64 {
 /// them), and `reuse_per_workspace` is set on: the reopen takes the warmed
 /// VM only through SELECT_VM's reuse.
 #[test]
-#[ignore = "live, S9's S3 store, a 1 GiB chat round trip through a warmed MicroVM and claude's memory with it open (about half an hour; eight Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
+#[ignore = "live, S9's S3 store, a 1 GiB chat (or AI_ENV_S3_CHAT's shape: make test-aws S3=1 CHAT=dev) round trip through a warmed MicroVM and claude's memory with it open (about half an hour; eight Touch IDs): AI_ENV_AWS_TESTS=1 make test-aws S3=1"]
 fn live_s3_gib_round_trip_timing() {
     const TEST: &str = "live_s3_gib_round_trip_timing";
-    const GIB: u64 = 1 << 30;
     const TRANSFER_LIMIT: Duration = Duration::from_secs(1800);
     // The reopen's initialize and its first turn: claude may parse the whole file before it answers either.
     const TURN_LIMIT: Duration = Duration::from_secs(600);
     if !s3_live() {
         return;
     }
+    let shape = ChatShape::parse(std::env::var("AI_ENV_S3_CHAT").ok().as_deref()).unwrap_or_else(|e| panic!("{TEST}: {e}"));
+    let (main, subtree) = (shape.main_bytes(), shape.file_sizes().iter().sum::<u64>());
+    eprintln!("{TEST}: the chat's shape: {shape:?} ({main} bytes of transcript, {subtree} of subtree)");
     let _signals = Interrupts::catch();
     // The stage command's two transfers and the warm between them; then the warmed VM's wall, which starts after
     // the upload: past every bound from the stage to the sync (the reopen, the turn, two `vm exec`, the close).
@@ -3451,7 +3773,7 @@ fn live_s3_gib_round_trip_timing() {
     std::fs::create_dir_all(&dir).unwrap();
     let session = uuid::Uuid::now_v7().to_string();
     // The synthetic chat, as the view fixture's tails are written (tests/fixtures/view/tails/branched.jsonl): one
-    // chain of prompts and replies of 64 KiB of plain words each to just past 1 GiB, ending on a reply (a reply's
+    // chain of prompts and replies of 64 KiB of plain words each to just past the shape's main, ending on a reply (a reply's
     // content an array of one text block); then a compaction (the boundary, with no parent, its logical parent the
     // chain's last reply; the summary, in no view) and one short exchange after it, the newest leaf. Its times are
     // the hour before now, the compaction half an hour after the chain: the chat's own turn comes after them all.
@@ -3470,7 +3792,7 @@ fn live_s3_gib_round_trip_timing() {
             text.len() as u64
         };
         let (mut written, mut parent, mut n) = (0u64, serde_json::Value::Null, 0u64);
-        while written < GIB || n % 2 == 1 {
+        while written < main || n % 2 == 1 {
             let uuid = uuid::Uuid::now_v7().to_string();
             let text = format!("{n} {filler}");
             let line = if n % 2 == 0 { entry("user", &uuid, parent, n, serde_json::json!(text)) } else { entry("assistant", &uuid, parent, n, serde_json::json!([{"type": "text", "text": text}])) };
@@ -3494,6 +3816,28 @@ fn live_s3_gib_round_trip_timing() {
         put(&entry("user", &prompt, serde_json::json!(summary), 1_860_000, serde_json::json!("A short question after the compaction")));
         put(&entry("assistant", &uuid::Uuid::now_v7().to_string(), serde_json::json!(prompt), 1_865_000, serde_json::json!([{"type": "text", "text": "A short answer after the compaction"}])));
         w.flush().unwrap();
+        // The subtree: each file a subagent's sidechain of the same words, prompt and reply in turn, to just past
+        // its size (one line at least).
+        let agents = dir.join(&session).join("subagents");
+        for (k, size) in shape.file_sizes().into_iter().enumerate() {
+            std::fs::create_dir_all(&agents).unwrap();
+            let mut f = std::io::BufWriter::new(std::fs::File::create(agents.join(format!("agent-{k:04}.jsonl"))).unwrap());
+            let agent = format!("{:08x}", k + 1);
+            let (mut written, mut parent, mut n) = (0u64, serde_json::Value::Null, 0u64);
+            while written < size || n == 0 {
+                let uuid = uuid::Uuid::now_v7().to_string();
+                let kind = if n % 2 == 0 { "user" } else { "assistant" };
+                let mut line = entry(kind, &uuid, parent, 60_000 + n, serde_json::json!([{"type": "text", "text": format!("{n} {filler}")}]));
+                line["isSidechain"] = serde_json::Value::Bool(true);
+                line["agentId"] = serde_json::Value::String(agent.clone());
+                let text = format!("{line}\n");
+                f.write_all(text.as_bytes()).unwrap();
+                written += text.len() as u64;
+                parent = serde_json::Value::String(uuid);
+                n += 1;
+            }
+            f.flush().unwrap();
+        }
     }
     // Staged with --warm: the Mac's upload, then the workspace's VM warmed and the chat restored from S3 into it with
     // no deadline (a reopen pulls at most 64 MiB inline; P0 refuses this one when no VM of the workspace lives).
@@ -3503,14 +3847,14 @@ fn live_s3_gib_round_trip_timing() {
     assert_eq!(staged.status.code(), Some(0), "{TEST}: session stage --warm");
     let v: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap_or_else(|e| panic!("{TEST}: session stage --warm --json: {e}"));
     assert_eq!(v["outcome"].as_str(), Some("staged"), "{TEST}: {v}");
-    assert!(v["bytes"].as_u64().is_some_and(|b| b >= GIB), "{TEST}: the whole chat went up: {v}");
+    assert!(v["bytes"].as_u64().is_some_and(|b| b >= main + subtree), "{TEST}: the whole chat went up, its subtree too: {v}");
     assert_eq!(v["view"].as_str(), Some(format!("{slug}/{session}.jsonl").as_str()), "{TEST}: the view (the exchange after the compaction) in the chat's place: {v}");
     let (up, up_ms) = timed_row(TEST, &live, "transcript_stage", &session);
     let vm = v["restore"]["vm"].as_str().unwrap_or_else(|| panic!("{TEST}: the warm restored nothing: {v}")).to_string();
     // The pull's own bytes and ms, from its audit row; the command's `restore` says the same bytes (its ms is the whole restore's).
     let (down, down_ms) = timed_row(TEST, &live, "transcript_pull", &session);
     assert_eq!((v["restore"]["outcome"].as_str(), v["restore"]["bytes"].as_u64()), (Some("restored"), Some(down)), "{TEST}: the chat restored into {vm}: {v}");
-    assert!(down >= GIB, "{TEST}: the whole chat came down: {down} bytes");
+    assert!(down >= main, "{TEST}: the whole chat came down: {down} bytes");
     let pulled = || live_audit(&live, "transcript_pull").into_iter().filter(|r| r["detail"]["session"] == session.as_str()).collect::<Vec<_>>();
     let pulls = pulled();
     assert!(pulls.iter().any(|r| r["detail"]["vm"] == vm.as_str() && r["detail"]["outcome"] == "written"), "{TEST}: the pull into {vm}: {pulls:?}");
@@ -3546,7 +3890,10 @@ fn live_s3_gib_round_trip_timing() {
         (Some(vm.as_str()), Some("reused"), Some("kept")),
         "{TEST}: the reopen took the warmed VM, running, and kept the chat it holds"
     );
-    assert_eq!(pulled(), pulls, "{TEST}: no pull at the reopen");
+    // No pull of the transcript at the reopen; a subtree's files follow it, one pull each at most.
+    let later = pulled().len().saturating_sub(pulls.len());
+    eprintln!("{TEST}: {later} pull(s) after the reopen, for the subtree's {} file(s)", shape.files);
+    assert!(pulled().starts_with(&pulls) && later as u64 <= shape.files, "{TEST}: no pull of the transcript at the reopen: {:?}", pulled());
     // The VM's copy rewritten in place (a new inode): the sync pushes it whole.
     let file = format!("$HOME/.claude/projects/{slug}/{session}.jsonl");
     let exec = ai_env_live(&live, &["vm", "exec", &vm, "--", "sh", "-c", &format!("cp \"{file}\" \"{file}.copy\" && mv \"{file}.copy\" \"{file}\"")]);
@@ -3555,11 +3902,12 @@ fn live_s3_gib_round_trip_timing() {
     assert_eq!(synced.status.code(), Some(0), "{TEST}: session sync");
     let v: serde_json::Value = serde_json::from_slice(&synced.stdout).unwrap_or_else(|e| panic!("{TEST}: session sync --json: {e}"));
     assert_eq!((v["outcome"].as_str(), v["pushed"]["kind"].as_str()), (Some("synced"), Some("base")), "{TEST}: a new generation's base: {v}");
-    // The newest push is the sync's: the turn's own step may have pushed a segment before it.
-    let (full, full_ms) = timed_row(TEST, &live, "transcript_push", &session);
-    assert!(full >= GIB, "{TEST}: the whole copy went up: {full} bytes");
+    // The newest base push is the sync's: the turn's own step may have pushed a segment before it, and the subtree's
+    // files are pushed beside it.
+    let (full, full_ms) = timed_row_of(TEST, &live, "transcript_push", &session, Some("base"));
+    assert!(full >= main, "{TEST}: the whole copy went up: {full} bytes");
     eprintln!(
-        "{TEST}: the Mac's stage {up} bytes in {up_ms} ms ({:.1} MB/s), the VM's pull at the warm {down} bytes in {down_ms} ms ({:.1} MB/s; session stage --warm took {stage_ms} ms in all), the reopen's initialize on {vm} {} ms (Cursor waits {} s), the VM's full upload {full} bytes in {full_ms} ms ({:.1} MB/s); with the chat open, after a turn of {} ms: {memory}",
+        "{TEST}: {shape:?}: the Mac's stage {up} bytes in {up_ms} ms ({:.1} MB/s), the VM's pull at the warm {down} bytes in {down_ms} ms ({:.1} MB/s; session stage --warm took {stage_ms} ms in all), the reopen's initialize on {vm} {} ms (Cursor waits {} s), the VM's full upload {full} bytes in {full_ms} ms ({:.1} MB/s); with the chat open, after a turn of {} ms: {memory}",
         rate(up, up_ms),
         rate(down, down_ms),
         init.as_millis(),
@@ -3629,4 +3977,1062 @@ fn live_s3_mac_cannot_read_vm_objects() {
     }
     let out = chat.output();
     sweep_live(&live, &[&out], &[]);
+}
+
+// ---- S10: session continuity, live (part B: B3, `make test-aws S10=1`) ------------------------
+//
+// S10 wave 1c (L1). Chats of the real `ai-env-claude` in remote mode on S8's
+// rig (`wrapper_world`, `Chat`; the setup-token sealed) against image 12.0,
+// each in a fixture under this checkout's `target/s8/` (never the
+// development chat): a close, a reopen and a closed lid (T10.2); a VM
+// terminated mid-turn (T10.3) and after an edit past the last turn (T10.4
+// (c)); a park at a permission prompt, then subagents across a move
+// (T10.5); `session migrate` of a live chat (§C). With AI_ENV_AWS_SLOW=1 too
+// (`make test-aws S10=1 SLOW=1`) the three wall tests: a migration between
+// turns (T10.4 (a)), a reopen near the wall and one after it (T10.4 (b), the
+// platform's wall recorded), a quarter of an hour each or a little more. The
+// tests play the chat a step at a time (`Chat::send_user`,
+// `read_until`, `held_permission`, `answer_permission`, `turn_to_result`),
+// read the wrapper's stderr live, end a VM under a turn
+// (`Chat::terminate_mid_turn`), stand in for a closed lid
+// (`Chat::stop_for`), and ring the terminal's bell before each Touch ID
+// they expect (`announce_touch_id`): one per chat and per `vm` command, one
+// more per move to a new VM (M1), the test process's runtime key, once per
+// process, when the first test builds its world (`live_world`, `LIVE_CREDS`;
+// each test's count below includes it, as when it runs alone), and one per
+// test for its chats' S3 objects (`PurgeTranscripts`). The evidence is read
+// by the contracts' names (`remote::census_part`, `remote::audit_event`, the
+// notes `remote::note_*` build). A test that needs neither the wall nor a
+// migration runs its VMs with `max_duration_s = 1800` and
+// `migrate_before_wall_s = 0` (`s10_world`): no wall and no migration's
+// Touch ID inside it.
+
+use ai_env_cli::bridge::migrate::MIGRATE_WAIT;
+use ai_env_cli::bridge::registry::VmEntry;
+use ai_env_cli::bridge::remote::link::{LossCause, MigrateTrigger};
+use ai_env_cli::bridge::remote::{self, audit_event, census_part};
+use ai_env_cli::wire::time::unix_now;
+
+/// How long a turn that moves the chat may take: the move (its Touch ID, a
+/// VM, the seed and the restore, within `MOVE_WINDOW`), then the turn.
+const LIVE_MOVE_TURN_LIMIT: Duration = Duration::from_secs(480);
+/// How long the wrapper's note of a loss may take once the VM is gone.
+const LIVE_LOSS_NOTE_LIMIT: Duration = Duration::from_secs(120);
+/// How long an old VM may take to end once the chat moved off it (its sync,
+/// the terminate, TERMINATED).
+const LIVE_OLD_VM_LIMIT: Duration = Duration::from_secs(180);
+
+/// Whether S10's live tests run: [`live`], and AI_ENV_S10_TESTS=1 (`make test-aws S10=1`).
+fn s10_live() -> bool {
+    if !live() {
+        return false;
+    }
+    if std::env::var("AI_ENV_S10_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_S10_TESTS=1 too (make test-aws S10=1) for S10's chats");
+    false
+}
+
+/// [`s10_live`], and AI_ENV_AWS_SLOW=1 (`make test-aws S10=1 SLOW=1`): the three wall tests.
+fn s10_slow_live() -> bool {
+    if !s10_live() {
+        return false;
+    }
+    if std::env::var("AI_ENV_AWS_SLOW").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_AWS_SLOW=1 too (make test-aws S10=1 SLOW=1) for the wall tests");
+    false
+}
+
+/// [`wrapper_world`] for an S10 test that needs neither the wall nor a
+/// migration: `[vm] max_duration_s = 1800` (no VM reaches its wall inside a
+/// test) and `migrate_before_wall_s = 0` (no migration asks a Touch ID
+/// nobody expects; `session migrate` still moves a chat), then `vm`'s keys.
+fn s10_world(vm: &[(&str, toml::Value)]) -> Live {
+    let mut keys = vec![("max_duration_s", toml::Value::Integer(1800)), ("migrate_before_wall_s", toml::Value::Integer(0))];
+    keys.extend(vm.iter().cloned());
+    wrapper_world(&keys)
+}
+
+/// The line [`announce_touch_id`] prints: the terminal's bell first.
+fn touch_id_line(who: &str, why: &str) -> String {
+    format!("\u{7}{who}: answer the Touch ID now: {why}")
+}
+
+/// Says on stderr, with the terminal's bell, that a Touch ID is due now and
+/// why (S10, plan §G): a long test asks at moments the operator cannot
+/// guess, and the dialog closes unanswered after 48 s.
+fn announce_touch_id(who: &str, why: &str) {
+    let _ = writeln!(std::io::stderr(), "{}", touch_id_line(who, why));
+}
+
+/// A word a chat is told and later asked for: `stem` and four characters of a fresh uuid.
+fn live_word(stem: &str) -> String {
+    format!("{stem}{}", uuid::Uuid::now_v7().simple().to_string().chars().rev().take(4).collect::<String>())
+}
+
+/// Whether `v` is claude's `can_use_tool` request for `tool`.
+fn is_permission_for(v: &serde_json::Value, tool: &str) -> bool {
+    v["type"] == "control_request" && v["request"]["subtype"] == "can_use_tool" && v["request"]["tool_name"] == tool
+}
+
+/// Whether `v` is ai-env's informational line `text` (L3: `wire::claude::informational_line`).
+fn is_note(v: &serde_json::Value, text: &str) -> bool {
+    v["type"] == "system" && v["subtype"] == "informational" && v["content"] == text
+}
+
+/// The `moves` part's value (`readdress=<n>,respawn=<n>,migrate=<n>`,
+/// contracts §4.1) as its three counts, in that order.
+fn moves_of(value: &str) -> Option<[u32; 3]> {
+    let mut counts = [0u32; 3];
+    let mut parts = value.split(',');
+    for (slot, kind) in counts.iter_mut().zip(["readdress", "respawn", "migrate"]) {
+        *slot = parts.next()?.strip_prefix(kind)?.strip_prefix('=')?.parse().ok()?;
+    }
+    parts.next().is_none().then_some(counts)
+}
+
+/// `<forwarded>/<swallowed>` (the `inits` and `echoes` parts) as its two counts.
+fn counts_of(value: &str) -> Option<(u32, u32)> {
+    let (forwarded, swallowed) = value.split_once('/')?;
+    Some((forwarded.parse().ok()?, swallowed.parse().ok()?))
+}
+
+/// A census row's moves ([`moves_of`]); `None` when no move started.
+fn row_moves(row: &serde_json::Value) -> Option<[u32; 3]> {
+    note_part(row, census_part::MOVES).as_deref().and_then(moves_of)
+}
+
+/// The audit rows of `event` the process `pid` wrote in the test's root (a wrapper's own).
+fn audit_of(live: &Live, event: &str, pid: u32) -> Vec<serde_json::Value> {
+    live_audit(live, event).into_iter().filter(|r| r["pid"].as_u64() == Some(u64::from(pid))).collect()
+}
+
+/// The `vms[]` of `session`'s row, oldest first ([`VmEntry`], read leniently).
+fn vm_entries(test: &str, live: &Live, session: &str) -> Vec<VmEntry> {
+    let row = ai_env_cli::bridge::registry::read(&live.paths, session).unwrap().unwrap_or_else(|| panic!("{test}: no session row of {session}"));
+    row.vms.iter().filter_map(VmEntry::from_value).collect()
+}
+
+/// The move of `session` that the wrapper `pid` audited (contracts §4.2):
+/// its `session_move` (`kind`, `why`'s key and word: `cause` or `trigger`,
+/// from `vms.0`) and its `session_move_end` (`done`, from `vms.0` to
+/// `vms.1`), both said and handed back for more checks.
+fn moved_rows(test: &str, live: &Live, pid: u32, session: &str, kind: &str, why: (&str, &str), vms: (&str, &str)) -> (serde_json::Value, serde_json::Value) {
+    let ((key, word), (from, to)) = (why, vms);
+    let starts = audit_of(live, audit_event::SESSION_MOVE, pid);
+    let start = starts
+        .iter()
+        .find(|r| r["detail"]["session"] == session && r["detail"]["kind"] == kind && r["detail"][key] == word && r["detail"]["from_vm"] == from)
+        .cloned()
+        .unwrap_or_else(|| panic!("{test}: no session_move ({kind}, {key} {word}, from {from}): {starts:?}"));
+    let ends = audit_of(live, audit_event::SESSION_MOVE_END, pid);
+    let end = ends
+        .iter()
+        .find(|r| r["detail"]["session"] == session && r["detail"]["kind"] == kind && r["detail"]["outcome"] == "done" && r["detail"]["from_vm"] == from && r["detail"]["to_vm"] == to)
+        .cloned()
+        .unwrap_or_else(|| panic!("{test}: no session_move_end ({kind}, done, from {from} to {to}): {ends:?}"));
+    eprintln!("{test}: session_move {}\n{test}: session_move_end {}", start["detail"], end["detail"]);
+    (start, end)
+}
+
+/// S10: polls `probe` every [`LIVE_SYNC_POLL`] until it answers, at most
+/// `limit`: its answer. The test fails past it naming `what`, and at once on
+/// a caught signal.
+fn wait_for<T>(test: &str, what: &str, limit: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let t = Instant::now();
+    loop {
+        assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{test}: interrupted while waiting for {what}");
+        if let Some(found) = probe() {
+            eprintln!("{test}: {what}: after {} ms", t.elapsed().as_millis());
+            return found;
+        }
+        assert!(t.elapsed() < limit, "{test}: {what}: not within {limit:?}");
+        std::thread::sleep(LIVE_SYNC_POLL);
+    }
+}
+
+/// S10: sleeps until the unix second `at` (a wall test waiting for its VM's
+/// age), saying how long first; a caught signal fails the test at once.
+fn sleep_until_unix(test: &str, what: &str, at: u64) {
+    eprintln!("{test}: waiting {} s for {what}", at.saturating_sub(unix_now()));
+    while unix_now() < at {
+        assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{test}: interrupted while waiting for {what}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// GetMicrovm through the test process's runtime key, from a synchronous
+/// test (S10: the closing suspend's SUSPENDED, a parked VM's, an old VM's
+/// TERMINATED).
+struct PlatformView {
+    rt: tokio::runtime::Runtime,
+    api: SdkMicrovmApi,
+}
+
+impl PlatformView {
+    fn new(live: &Live) -> PlatformView {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let api = rt.block_on(connect(&live.creds));
+        PlatformView { rt, api }
+    }
+
+    /// `vm`'s state as the platform says it: `TERMINATED` for one it no
+    /// longer knows, the error (account ids masked) when it could not say.
+    fn state(&self, vm: &str) -> String {
+        match self.info(vm) {
+            Ok(Some(info)) => info.state.as_str().to_string(),
+            Ok(None) => VmState::Terminated.as_str().to_string(),
+            Err(e) => format!("unknown: {e}"),
+        }
+    }
+
+    /// `vm` as the platform says it, its `stateReason` and end time with
+    /// it (T10.4: the wall's); `None` for one it no longer knows, the error
+    /// (account ids masked) when it could not say.
+    fn info(&self, vm: &str) -> Result<Option<ai_env_cli::bridge::api::VmInfo>, String> {
+        match self.rt.block_on(self.api.get(vm)) {
+            Ok(info) => Ok(Some(info)),
+            Err(BridgeError::VmNotFound(_)) => Ok(None),
+            Err(e) => Err(no_account(&e.to_string())),
+        }
+    }
+}
+
+/// Offline (S10): the census readers the live tests judge a move by, on
+/// the parts as the pump writes them; and the Touch ID's bell.
+#[test]
+fn the_move_parts_read_as_the_census_writes_them() {
+    assert_eq!(moves_of("readdress=1,respawn=0,migrate=2"), Some([1, 0, 2]));
+    for bad in ["", "readdress=1", "readdress=1,respawn=0", "readdress=1,respawn=0,migrate=2,x=1", "respawn=0,readdress=1,migrate=2", "readdress=a,respawn=0,migrate=0", "readdress1,respawn=0,migrate=0"] {
+        assert_eq!(moves_of(bad), None, "{bad}");
+    }
+    assert_eq!((counts_of("3/1"), counts_of("0/0")), (Some((3, 1)), Some((0, 0))));
+    for bad in ["", "3", "3/", "/1", "a/1", "3/1/2"] {
+        assert_eq!(counts_of(bad), None, "{bad}");
+    }
+    let row = serde_json::json!({"note": "vm:microvm-2; vm_how:started; moves:readdress=1,respawn=0,migrate=0; move_ms:5123; cut:at; inits:3/1; echoes:3/1; link_drops:0; carried:migrate"});
+    assert_eq!(row_moves(&row), Some([1, 0, 0]), "the moves, never move_ms");
+    assert_eq!(note_part(&row, census_part::MOVE_MS).as_deref(), Some("5123"));
+    assert_eq!((note_part(&row, census_part::INITS).as_deref().and_then(counts_of), note_part(&row, census_part::ECHOES).as_deref().and_then(counts_of)), (Some((3, 1)), Some((3, 1))));
+    assert_eq!(note_part(&row, census_part::CARRIED).as_deref(), Some("migrate"));
+    assert_eq!(row_moves(&serde_json::json!({"note": "vm:microvm-1; link_drops:0"})), None, "no move started");
+    let line = touch_id_line("t", "vm terminate microvm-1");
+    assert!(line.starts_with('\u{7}') && line.ends_with("t: answer the Touch ID now: vm terminate microvm-1"), "{line:?}");
+}
+
+/// Offline (S10 F1): the purge is one `session forget <sid>... --purge` of
+/// every session a test's root keeps transcript state of or whose row
+/// keeps its transcript in S3, each once and sorted, and no command at all
+/// for none; a local chat's row and a directory that names no session are
+/// left out.
+#[test]
+fn the_purge_is_one_forget_of_every_session_or_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+    assert!(purged_sessions(&paths).is_empty() && purge_args(&[]).is_none(), "no session: no command");
+    let (a, b, c, d) = ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5a", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d");
+    // a: transcript state and a row naming S3; b: the state alone; c: the row alone (its sync never committed).
+    for sid in [a, b] {
+        std::fs::create_dir_all(paths.transcript_dir(sid)).unwrap();
+    }
+    std::fs::create_dir_all(paths.transcripts().join("not-a-session")).unwrap();
+    for (sid, home) in [(a, Some("s3")), (c, Some("s3")), (d, None)] {
+        let row = ai_env_cli::bridge::registry::SessionRow { session_id: sid.to_string(), transcript_home: home.map(str::to_string), ..ai_env_cli::bridge::registry::SessionRow::default() };
+        ai_env_cli::bridge::registry::write(&paths, &row).unwrap();
+    }
+    let sessions = purged_sessions(&paths);
+    assert_eq!(sessions, [b, c, a], "each once, sorted; the local chat's row left out");
+    assert_eq!(purge_args(&sessions).unwrap(), ["session", "forget", b, c, a, "--purge"], "one command for them all");
+}
+
+/// Offline (S10): the chat played a step at a time over a wrapper that is
+/// `cat` (each line the test sends comes back as the wrapper's own, after a
+/// line on stderr). The user line goes out with its uuid; `read_until`
+/// records the turn (the line's echo but not the line itself, an init,
+/// ai-env's note but not an informational line of claude's own, a withdrawn
+/// request, a tool's use and its output) and answers
+/// claude's requests (a `can_use_tool` allowed as asked under `AllowAll`,
+/// any other with an error: both answers come back through `cat`); under
+/// `Hold` a `can_use_tool` is handed back unanswered (`held_permission`)
+/// until `answer_permission` denies it; `turn_to_result` ends at the result,
+/// at once when it was read already; the stderr reads while the wrapper runs.
+#[test]
+fn the_split_chat_records_answers_and_holds_as_asked() {
+    const TEST: &str = "the_split_chat_records_answers_and_holds_as_asked";
+    let wait = Duration::from_secs(10);
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "echo 'said on stderr first' >&2; exec cat"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh runs");
+    let mut chat = Chat::over(TEST, child);
+    let t = Instant::now();
+    while !chat.stderr_now().contains("said on stderr first") {
+        assert!(t.elapsed() < wait, "the stderr is read while the wrapper runs: {:?}", chat.stderr_now());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(matches!(chat.child.try_wait(), Ok(None)), "still running");
+    let uuid = chat.send_user("hello");
+    let bash = serde_json::json!({"type": "control_request", "request_id": "r-1", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}}});
+    for line in [
+        serde_json::json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+        serde_json::json!({"type": "user", "isReplay": true, "uuid": uuid, "message": {"role": "user", "content": "hello"}}),
+        serde_json::json!({"type": "system", "subtype": "informational", "level": "warning", "content": "ai-env: a note"}),
+        serde_json::json!({"type": "system", "subtype": "informational", "level": "info", "content": "a notice of claude's own"}),
+        bash.clone(),
+        serde_json::json!({"type": "control_request", "request_id": "r-2", "request": {"subtype": "mcp_message"}}),
+        serde_json::json!({"type": "control_cancel_request", "request_id": "r-3"}),
+        serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t-1", "name": "Bash", "input": {}}]}}),
+        serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t-1", "content": "out-1"}]}}),
+    ] {
+        chat.send(&line);
+    }
+    // The answers come back through `cat` after the lines sent before them.
+    let answered = chat.read_until(wait, Asks::AllowAll, |v| v["type"] == "control_response" && v["response"]["request_id"] == "r-2").expect("the error's answer comes back");
+    assert_eq!(answered["response"]["subtype"], "error", "{answered}");
+    let allowed = chat.stdout.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok()).find(|v| v["type"] == "control_response" && v["response"]["request_id"] == "r-1").expect("the allow came back");
+    assert_eq!((allowed["response"]["subtype"].as_str(), allowed["response"]["response"]["behavior"].as_str(), &allowed["response"]["response"]["updatedInput"]), (Some("success"), Some("allow"), &bash["request"]["input"]), "{allowed}");
+    assert!(is_permission_for(&bash, "Bash") && !is_permission_for(&bash, "Read"));
+    // Held: handed back unanswered, then denied.
+    let ask = serde_json::json!({"type": "control_request", "request_id": "r-4", "request": {"subtype": "can_use_tool", "tool_name": "Write", "input": {"file_path": "x"}}});
+    chat.send(&ask);
+    let held = chat.held_permission(wait);
+    assert_eq!(held["request_id"], "r-4");
+    let to_r4 = |v: &serde_json::Value| v["type"] == "control_response" && v["response"]["request_id"] == "r-4";
+    assert!(chat.read_until(Duration::from_millis(300), Asks::Hold, to_r4).is_none(), "nothing answered the held request");
+    chat.answer_permission(&held, false);
+    let denied = chat.read_until(wait, Asks::Hold, to_r4).expect("the denial comes back");
+    assert_eq!((denied["response"]["subtype"].as_str(), denied["response"]["response"]["behavior"].as_str()), (Some("success"), Some("deny")), "{denied}");
+    chat.send(&serde_json::json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"}));
+    let turn = chat.turn_to_result(&uuid, wait);
+    assert_eq!((turn.uuid.as_str(), turn.result["result"].as_str(), turn.results, turn.echoes, turn.inits), (uuid.as_str(), Some("done"), 1, 1, 1), "the echo counted, the line itself not");
+    assert_eq!((turn.asked, turn.used, turn.tool_output, turn.notes, turn.cancels), (vec!["Bash".to_string(), "Write".to_string()], vec!["Bash".to_string()], "out-1\n".to_string(), vec!["ai-env: a note".to_string()], vec!["r-3".to_string()]));
+    assert_eq!(chat.session.as_deref(), Some("s-1"), "the newest init's session id");
+    assert!(is_note(&serde_json::json!({"type": "system", "subtype": "informational", "content": "ai-env: a note"}), "ai-env: a note"));
+    // A result read already: the turn ends at once.
+    let again = chat.send_user("again");
+    chat.send(&serde_json::json!({"type": "result", "subtype": "success", "is_error": false, "result": "twice"}));
+    chat.read_until(wait, Asks::AllowAll, |v| v["type"] == "result").expect("the result");
+    assert_eq!(chat.turn_to_result(&again, Duration::ZERO).result["result"], "twice");
+    let (code, _) = chat.close();
+    assert_eq!(code, Some(0), "cat ends at its stdin's close");
+}
+
+/// Offline (S10): the lid's stand-in stops the wrapper for its time and
+/// continues it after; a chat whose wrapper is stopped still ends it by its
+/// SIGTERM, continued first (a stopped process takes no TERM: the SIGKILL 3
+/// s later would be all it got).
+#[test]
+fn a_stopped_wrapper_is_continued_then_ended_by_its_term() {
+    use std::os::unix::process::ExitStatusExt as _;
+    const TEST: &str = "a_stopped_wrapper_is_continued_then_ended_by_its_term";
+    /// `ps`'s state letters of `pid` (`T` first: stopped).
+    fn state(pid: u32) -> String {
+        let o = std::process::Command::new("/bin/ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().expect("ps runs");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+    let child = std::process::Command::new("/bin/cat").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("cat runs");
+    let mut chat = Chat::over(TEST, child);
+    let pid = chat.pid();
+    let during = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        state(pid)
+    });
+    let t = Instant::now();
+    chat.stop_for(Duration::from_millis(900));
+    assert!(t.elapsed() >= Duration::from_millis(900), "{:?}", t.elapsed());
+    let during = during.join().unwrap();
+    assert!(during.starts_with('T'), "stopped meanwhile: {during:?}");
+    assert!(!state(pid).starts_with('T'), "continued after: {:?}", state(pid));
+    chat.send(&serde_json::json!({"type": "system", "subtype": "status"}));
+    assert!(chat.read_until(Duration::from_secs(10), Asks::AllowAll, |v| v["subtype"] == "status").is_some(), "the wrapper runs on");
+    chat.signal(libc::SIGSTOP);
+    let t = Instant::now();
+    while !state(pid).starts_with('T') {
+        assert!(t.elapsed() < Duration::from_secs(5), "stopped again: {:?}", state(pid));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let t = Instant::now();
+    let status = chat.end().expect("its exit");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "ended by its TERM, not the KILL: {status}");
+    assert!(t.elapsed() < Duration::from_secs(2), "well before the KILL's 3 s: {:?}", t.elapsed());
+}
+
+/// T10.2 live: a chat lives through its close, its reopen and a closed lid.
+/// A chat told a word closes (exit 0 within 1.5 s; its closing suspend
+/// fired: `vm_suspend` by `close`, `fired`), and its VM goes to SUSPENDED
+/// (GetMicrovm, the states on the way said). The reopen (`--resume`)
+/// resumes that VM (`vm_how:resumed`, `transcript:kept`, `init_ms` under
+/// 15 s) and recalls the word. Then a turn's Bash call (`sleep 30`) runs
+/// while the wrapper is stopped for three minutes (SIGSTOP, then SIGCONT:
+/// [`Chat::stop_for`], the lid's stand-in): the wrapper finds its socket
+/// gone and reattaches (an `agent_reconnect` row of its own, `link_drops`
+/// of 1 or more), and the turn's result comes through whole; the close is
+/// exit 0 within 1.5 s again. Four Touch IDs: two chats, the test process's
+/// runtime key, the purge. About six minutes.
+#[test]
+#[ignore = "live, S10, a close, a reopen and a closed lid's stand-in on one MicroVM (about six minutes; four Touch IDs: two chats, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 make test-aws S10=1"]
+fn live_s10_close_reopen_and_sleep() {
+    const TEST: &str = "live_s10_close_reopen_and_sleep";
+    // T10.2's lid, closed three minutes.
+    const LID: Duration = Duration::from_secs(180);
+    // The platform's suspend after the close, and the reopen's budget (plan T10.2: under 15 s).
+    const SUSPEND_LIMIT: Duration = Duration::from_secs(90);
+    const REOPEN_BUDGET_MS: u128 = 15_000;
+    if !s10_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s10_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let platform = PlatformView::new(&live);
+    let ws = s8_fixture(&live, "live-s10-close-reopen");
+    let word = live_word("meadow");
+    let mut first = Chat::open(TEST, &live, &ws, &[]);
+    first.initialize();
+    let told = first.turn(&format!("Remember this word for later: {word}. Reply with exactly OK"));
+    assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
+    let (code, close) = first.close();
+    let row = assert_closed_well(TEST, &live, &first, code, close);
+    let (vm, session) = (note_part(&row, census_part::VM).expect("the chat's VM"), first.session.clone().expect("the chat's session id"));
+    let suspends: Vec<serde_json::Value> = audit_of(&live, "vm_suspend", first.pid()).into_iter().filter(|r| r["detail"]["by"] == "close" && r["detail"]["id"] == vm.as_str()).collect();
+    assert!(suspends.iter().any(|r| r["detail"]["outcome"] == "fired"), "{TEST}: the closing suspend fired: {suspends:?}");
+    let mut seen: Vec<String> = Vec::new();
+    wait_for(TEST, &format!("{vm} SUSPENDED after the close"), SUSPEND_LIMIT, || {
+        let state = platform.state(&vm);
+        if seen.last() != Some(&state) {
+            seen.push(state.clone());
+        }
+        (state == VmState::Suspended.as_str()).then_some(())
+    });
+    eprintln!("{TEST}: {vm} after the close: {}", seen.join(" > "));
+    assert!(!seen.iter().any(|s| s == VmState::Terminating.as_str() || s == VmState::Terminated.as_str()), "{TEST}: the close only suspends: {seen:?}");
+    let resume = format!("--resume={session}");
+    let mut second = Chat::open(TEST, &live, &ws, &[&resume]);
+    second.initialize();
+    let recall = second.turn("Which word did I ask you to remember? Reply with the word only.");
+    let answer = recall.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer {answer:?} lacks the word");
+    // The lid: the wrapper stopped once the Bash call is allowed, the sleep running in the VM.
+    let uuid = second.send_user("Run exactly this command with your Bash tool, then reply with its output only: sleep 30; echo slept");
+    if second.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash")).is_none() {
+        let err = second.stderr_now();
+        panic!("{TEST}: no Bash call within {LIVE_TURN_LIMIT:?}; the wrapper's stderr: {err}");
+    }
+    // The allow reaches the VM and the sleep runs there: the lid closes on it.
+    second.idle(Duration::from_secs(5));
+    eprintln!("{TEST}: the Bash call allowed and running: the wrapper stopped for {LID:?}, the lid's stand-in");
+    second.stop_for(LID);
+    let slept = second.turn_to_result(&uuid, LIVE_TURN_LIMIT);
+    assert_eq!(slept.result["is_error"], false, "{TEST}: the turn through the lid: {}", slept.result);
+    assert!(slept.tool_output.contains("slept"), "{TEST}: the tool's output: {}", slept.tool_output);
+    let (code, close) = second.close();
+    let row = assert_closed_well(TEST, &live, &second, code, close);
+    assert_eq!(
+        (note_part(&row, census_part::VM).as_deref(), note_part(&row, census_part::VM_HOW).as_deref(), note_part(&row, census_part::TRANSCRIPT).as_deref()),
+        (Some(vm.as_str()), Some("resumed"), Some("kept")),
+        "{TEST}: the reopen resumed the chat's VM and kept its transcript"
+    );
+    let init_ms: u128 = note_part(&row, "init_ms").and_then(|ms| ms.parse().ok()).expect("init_ms");
+    assert!(init_ms < REOPEN_BUDGET_MS, "{TEST}: the reopen's initialize took {init_ms} ms (budget {REOPEN_BUDGET_MS} ms; the legs: {:?})", note_part(&row, census_part::LEGS));
+    let drops: u32 = note_part(&row, census_part::LINK_DROPS).and_then(|n| n.parse().ok()).unwrap_or(0);
+    let reconnects = audit_of(&live, "agent_reconnect", second.pid());
+    eprintln!("{TEST}: link_drops:{drops}; the reconnects' reasons: {:?}", reconnects.iter().map(|r| r["detail"]["reason"].clone()).collect::<Vec<_>>());
+    assert!(drops >= 1 && !reconnects.is_empty(), "{TEST}: the wrapper reattached after the stop: link_drops:{drops}, {reconnects:?}");
+    let (a, b) = (first.output(), second.output());
+    sweep_live(&live, &[&a, &b], &[]);
+}
+
+/// T10.3 live: a VM terminated mid-turn moves its chat to a new one (a
+/// re-address, M1's one Touch ID more). A chat told a word runs a Bash
+/// `sleep 90` (under the Bash tool's 2-minute default timeout, which its
+/// second run must not reach); once the call is allowed and running, `vm
+/// terminate` ends the VM under the turn, both Touch IDs announced before
+/// it. The wrapper tells the chat (`note_moving`, L3), moves it
+/// (`note_continues`) and sends the interrupted line again: claude runs the
+/// turn again (the tool is idempotent), and the host gets one echo and one
+/// result of that line. The census counts the move
+/// (`moves:readdress=1,respawn=0,migrate=0`, `move_ms`) and one swallowed
+/// init and echo (`inits:<n>/1`, `echoes:<n>/1`); the audit has
+/// `session_move` (`readdress`, `vm_gone`, from the old VM) and
+/// `session_move_end` (`done`, to the new VM, `touchid` `asked`); the
+/// session row's `vms[]` gains the new VM (`readdress:vm_gone`); and the
+/// next turn, on the new VM, recalls the word. Five Touch IDs: the chat, the
+/// test process's runtime key, the terminate, the move, the purge. About
+/// eight minutes.
+#[test]
+#[ignore = "live, S10, a MicroVM terminated mid-turn and its chat moved to a new one (about eight minutes; five Touch IDs: the chat, the test process's runtime key, the terminate, the move, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 make test-aws S10=1"]
+fn live_s10_terminate_mid_turn_readdresses() {
+    const TEST: &str = "live_s10_terminate_mid_turn_readdresses";
+    // The sleep's turn: its first run cut by the terminate, the move, then its second run whole.
+    const SLEEP_TURN_LIMIT: Duration = Duration::from_secs(600);
+    if !s10_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s10_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s10-terminate-mid-turn");
+    let word = live_word("lighthouse");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let told = chat.turn(&format!("Remember this word for later: {word}. Reply with exactly OK"));
+    assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
+    let vm1 = chat.session_vm(&live);
+    let uuid = chat.send_user("Run exactly this command with your Bash tool, then reply with its output only: sleep 90; echo slept");
+    if chat.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash")).is_none() {
+        let err = chat.stderr_now();
+        panic!("{TEST}: no Bash call within {LIVE_TURN_LIMIT:?}; the wrapper's stderr: {err}");
+    }
+    // The sleep runs in the VM: the VM ends under it.
+    chat.idle(Duration::from_secs(5));
+    let terminate = chat.terminate_mid_turn(&live, &vm1, Some(&format!("right after vm terminate's: the move off {vm1}, the setup-token for the new VM (M1)")));
+    let turn = chat.turn_to_result(&uuid, SLEEP_TURN_LIMIT);
+    let vm2 = chat.session_vm(&live);
+    eprintln!(
+        "{TEST}: the turn ended after {} ms on {vm2}: notes {:?}, asked {:?}, withdrawn {:?}, echoes {}, inits {}, results {}; the wrapper's stderr so far:\n{}",
+        turn.ms,
+        turn.notes,
+        turn.asked,
+        turn.cancels,
+        turn.echoes,
+        turn.inits,
+        turn.results,
+        chat.stderr_now()
+    );
+    assert_eq!(turn.result["is_error"], false, "{TEST}: the turn sent again: {}", turn.result);
+    assert!(turn.tool_output.contains("slept"), "{TEST}: the tool's second run: {}", turn.tool_output);
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    assert_eq!(turn.notes, [remote::note_moving(&vm1, LossCause::VmGone), remote::note_continues(&vm2)], "{TEST}: the move's notes");
+    assert_eq!((turn.echoes, turn.results), (1, 1), "{TEST}: one echo and one result of the line sent again");
+    let recall = chat.turn("Which word did I ask you to remember? Reply with the word only.");
+    let answer = recall.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer on the new VM {answer:?} lacks the word");
+    assert_eq!(chat.session_vm(&live), vm2, "{TEST}: the next turn ran on the new VM");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([1, 0, 0]), "{TEST}: one re-address in the census");
+    assert!(note_part(&row, census_part::MOVE_MS).is_some(), "{TEST}: the move's time in the census");
+    let swallowed = |part: &str| note_part(&row, part).as_deref().and_then(counts_of).map(|(_, s)| s);
+    assert_eq!((swallowed(census_part::INITS), swallowed(census_part::ECHOES)), (Some(1), Some(1)), "{TEST}: the second init and echo of the line sent again were swallowed");
+    let session = chat.session.clone().expect("the chat's session id");
+    let (_, end) = moved_rows(TEST, &live, chat.pid(), &session, "readdress", ("cause", "vm_gone"), (&vm1, &vm2));
+    assert_eq!(end["detail"]["touchid"].as_str(), Some("asked"), "{TEST}: the move asked its Touch ID (M1)");
+    let entries = vm_entries(TEST, &live, &session);
+    assert!(entries.iter().any(|e| e.vm == vm1) && entries.iter().any(|e| e.vm == vm2 && e.why == "readdress:vm_gone"), "{TEST}: the row's vms[]: {entries:?}");
+    let out = chat.output();
+    sweep_live(&live, &[&out, &terminate], &[]);
+}
+
+/// T10.4 (c) live: an edit made after the last turn is the documented loss
+/// (L6, L7). A turn appends to README.md in the VM (Bash), and its code-out
+/// fetch records the edit (a `box/wip/*` ref on the Mac); then `vm exec`
+/// writes `late.txt` there and, 10 s later, `vm terminate` ends the VM with
+/// the chat idle: the wrapper tells the chat it moves with the next message
+/// (`note_move_at_next`, L5), and the next message moves it
+/// (`note_continues`; `session_move_end` `done`, its seed `box`: the dead
+/// VM's fetch record). On the new VM README.md holds the turn's edit and
+/// `late.txt` is absent, as in the Mac's newest `box/wip/*`: files are as of
+/// the last turn's end. Six Touch IDs: the chat, the test process's runtime
+/// key, `vm exec`, the terminate, the move, the purge. About six minutes.
+#[test]
+#[ignore = "live, S10, a MicroVM terminated after an edit made past the last turn (about six minutes; six Touch IDs: the chat, the test process's runtime key, vm exec, the terminate, the move, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 make test-aws S10=1"]
+fn live_s10_terminate_after_edit() {
+    const TEST: &str = "live_s10_terminate_after_edit";
+    if !s10_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s10_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s10-terminate-after-edit");
+    let path = ws.display().to_string();
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let fetched = live_audit(&live, audit_event::CODEOUT_FETCH).len();
+    let edit = chat.turn("Run exactly this command with your Bash tool, then reply with its output only: printf 'edited in the turn\\n' >> README.md && tail -n 1 README.md");
+    assert_eq!(edit.result["is_error"], false, "{TEST}: {}", edit.result);
+    assert!(edit.tool_output.contains("edited in the turn"), "{TEST}: the turn's edit: {}", edit.tool_output);
+    // The turn's code-out fetch records the edit before anything else happens in the VM.
+    chat.wait_for("the turn's codeout_fetch row", LIVE_SYNC_LIMIT, Asks::AllowAll, || (live_audit(&live, audit_event::CODEOUT_FETCH).len() > fetched).then_some(()));
+    let newest_wip = || fixture_git(&ws, &["for-each-ref", "--sort=-refname", "--format=%(refname)", "refs/remotes/box/wip/"]).lines().next().map(str::to_string);
+    let wip = newest_wip().unwrap_or_else(|| panic!("{TEST}: no box/wip ref after the turn's fetch"));
+    assert!(fixture_git(&ws, &["show", &format!("{wip}:README.md")]).contains("edited in the turn"), "{TEST}: {wip} holds the turn's edit");
+    let vm1 = chat.session_vm(&live);
+    announce_touch_id(TEST, &format!("vm exec in {vm1}: late.txt, after the last turn"));
+    let (_, late) = vm_sh(TEST, &live, &vm1, &path, "printf 'written after the turn\\n' > late.txt");
+    chat.idle(Duration::from_secs(10));
+    let terminate = chat.terminate_mid_turn(&live, &vm1, None);
+    // Idle: the move waits for the next message (L5), and the note says so.
+    let note = remote::note_move_at_next(&vm1, LossCause::VmGone);
+    if chat.read_until(LIVE_LOSS_NOTE_LIMIT, Asks::AllowAll, |v| is_note(v, &note)).is_none() {
+        let err = chat.stderr_now();
+        panic!("{TEST}: no note within {LIVE_LOSS_NOTE_LIMIT:?} that the chat moves with the next message ({note:?}); the wrapper's stderr: {err}");
+    }
+    announce_touch_id(TEST, &format!("the move off {vm1} with the next message: the setup-token for the new VM (M1)"));
+    let look = chat.turn_within("Run exactly this command with your Bash tool, then reply with its output only: tail -n 1 README.md; ls", LIVE_MOVE_TURN_LIMIT);
+    assert_eq!(look.result["is_error"], false, "{TEST}: {}", look.result);
+    let vm2 = chat.session_vm(&live);
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    assert!(look.notes.contains(&remote::note_continues(&vm2)), "{TEST}: the notes: {:?}", look.notes);
+    assert!(look.tool_output.contains("edited in the turn"), "{TEST}: the turn's edit is on the new VM: {}", look.tool_output);
+    assert!(!look.tool_output.lines().any(|l| l.trim() == "late.txt"), "{TEST}: late.txt, written after the last turn, is the documented loss: {}", look.tool_output);
+    let newest = newest_wip().unwrap_or_else(|| panic!("{TEST}: no box/wip ref"));
+    assert!(!fixture_git(&ws, &["ls-tree", "-r", "--name-only", &newest]).lines().any(|n| n == "late.txt"), "{TEST}: the Mac's newest wip ({newest}) lacks late.txt");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([1, 0, 0]), "{TEST}: one re-address in the census");
+    let session = chat.session.clone().expect("the chat's session id");
+    let (_, end) = moved_rows(TEST, &live, chat.pid(), &session, "readdress", ("cause", "vm_gone"), (&vm1, &vm2));
+    assert_eq!((end["detail"]["seed"].as_str(), end["detail"]["touchid"].as_str()), (Some("box"), Some("asked")), "{TEST}: the seed is the dead VM's fetch record (L7); the move asked its Touch ID (M1)");
+    let out = chat.output();
+    sweep_live(&live, &[&out, &late, &terminate], &[]);
+}
+
+/// T10.5 live: a chat parked at a permission prompt, then subagents across a
+/// move. With `[vm] park_after_s = 30` (M5's floor), a turn's Bash call is
+/// left unanswered: the session parks at the prompt (`session_park`, `why`
+/// `prompt`), and the platform suspends the silent VM after its
+/// `max_idle_s` (GetMicrovm: SUSPENDED, the prompt still open). The answer
+/// unparks the session (`session_unpark` by `control_response`, the VM found
+/// `suspended`; no Touch ID) and the tool runs. A turn that starts a
+/// subagent lands its files in S3 (the Mac's manifest lists
+/// `<sid>/subagents/…`; none is on the Mac). `vm terminate`, then the next
+/// message moves the chat (a note of the loss, at it or at that message as
+/// the session was parked or not, then `note_continues`; M1's Touch ID);
+/// the subagents' files are pulled into the new VM after its spawn (a
+/// `transcript_pull` row each), and the chat's own `ls` lists them there. A
+/// reopen (`--resume`) keeps the transcript on that VM (`transcript:kept`).
+/// Six Touch IDs: two chats, the test process's runtime key, the terminate,
+/// the move, the purge. About fourteen minutes.
+#[test]
+#[ignore = "live, S10, a chat parked at a permission prompt on a suspended MicroVM, then subagents across a move (about fourteen minutes; six Touch IDs: two chats, the test process's runtime key, the terminate, the move, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 make test-aws S10=1"]
+fn live_s10_parked_at_prompt_then_subagents() {
+    const TEST: &str = "live_s10_parked_at_prompt_then_subagents";
+    // M5's floor (30..=3600): the park comes half a minute after the prompt.
+    const PARK_AFTER_S: u32 = 30;
+    if !s10_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s10_world(&[("park_after_s", toml::Value::Integer(i64::from(PARK_AFTER_S)))]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let platform = PlatformView::new(&live);
+    let ws = s8_fixture(&live, "live-s10-parked-prompt");
+    let slug = ai_env_cli::wire::slug::project_dir_name(&ws).expect("the fixture's project directory name");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let pid = chat.pid();
+    let uuid = chat.send_user("Run exactly this command with your Bash tool, then reply with its output only: touch parked.txt && ls parked.txt");
+    let asked = chat.held_permission(LIVE_TURN_LIMIT);
+    let vm1 = chat.session_vm(&live);
+    eprintln!("{TEST}: the Bash call on {vm1} left unanswered: the session parks at the prompt, then the platform suspends the VM");
+    let parked = chat.wait_for("the park at the prompt", Duration::from_secs(u64::from(PARK_AFTER_S) + 120), Asks::Hold, || {
+        audit_of(&live, audit_event::SESSION_PARK, pid).into_iter().find(|r| r["detail"]["why"] == "prompt" && r["detail"]["vm"] == vm1.as_str())
+    });
+    eprintln!("{TEST}: {}", parked["detail"]);
+    let suspend_limit = Duration::from_secs(u64::from(live.cfg.vm.max_idle_s) + 180);
+    chat.wait_for(&format!("{vm1} SUSPENDED with the prompt open"), suspend_limit, Asks::Hold, || (platform.state(&vm1) == VmState::Suspended.as_str()).then_some(()));
+    chat.answer_permission(&asked, true);
+    let ran = chat.turn_to_result(&uuid, LIVE_TURN_LIMIT);
+    assert_eq!(ran.result["is_error"], false, "{TEST}: the turn once answered: {}", ran.result);
+    assert!(ran.tool_output.lines().any(|l| l.trim() == "parked.txt"), "{TEST}: the tool ran once answered: {}", ran.tool_output);
+    let unparks = audit_of(&live, audit_event::SESSION_UNPARK, pid);
+    assert!(unparks.iter().any(|r| r["detail"]["by"] == "control_response" && r["detail"]["vm_state"] == "suspended"), "{TEST}: the answer unparked the session from a suspended VM: {unparks:?}");
+    // A subagent: its files land in S3 with the turn's sync, never on the Mac.
+    let session = chat.session.clone().expect("the chat's session id");
+    let task = chat.turn("Use your Task tool once: start one general-purpose subagent whose only job is to reply with exactly the word READY. Then reply with exactly DONE.");
+    assert_eq!(task.result["is_error"], false, "{TEST}: the subagent's turn: {}", task.result);
+    eprintln!("{TEST}: the subagent's turn used {:?}", task.used);
+    let subagents = format!("{session}/subagents/");
+    let files = chat.wait_for("the subagents' files in the Mac's manifest", LIVE_SYNC_LIMIT, Asks::AllowAll, || {
+        let m = ai_env_cli::bridge::s3::manifest::read(&live.paths, &session).ok().flatten()?;
+        let names: Vec<String> = m.files.iter().filter(|f| f.rel.contains(&subagents)).filter_map(|f| f.rel.rsplit('/').next().map(str::to_string)).collect();
+        (!names.is_empty()).then_some(names)
+    });
+    assert!(!mac_projects().join(&slug).join(&session).exists(), "{TEST}: the subagents' files never reach the Mac (S9 M2)");
+    let terminate = chat.terminate_mid_turn(&live, &vm1, None);
+    // Idle, the loss's note comes at once (L5); parked, at the next message, which unparks into the gone VM.
+    chat.idle(Duration::from_secs(15));
+    let mut notes = std::mem::take(&mut chat.turn.notes);
+    announce_touch_id(TEST, &format!("the move off {vm1} with the next message: the setup-token for the new VM (M1)"));
+    let moved = chat.turn_within("Reply with exactly OK", LIVE_MOVE_TURN_LIMIT);
+    assert_eq!(moved.result["is_error"], false, "{TEST}: the turn that moved the chat: {}", moved.result);
+    notes.extend(moved.notes.iter().cloned());
+    let vm2 = chat.session_vm(&live);
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    let lost = [remote::note_move_at_next(&vm1, LossCause::VmGone), remote::note_moving(&vm1, LossCause::VmGone)];
+    assert!(notes.iter().any(|n| lost.contains(n)) && notes.contains(&remote::note_continues(&vm2)), "{TEST}: the move's notes: {notes:?}");
+    // The subagents' files follow the chat: pulled into the new VM after its spawn, one row each beside the transcript's.
+    let pulls_into = |vm: &str| live_audit(&live, audit_event::TRANSCRIPT_PULL).into_iter().filter(|r| r["detail"]["session"] == session.as_str() && r["detail"]["vm"] == vm && r["detail"]["outcome"] == "written").count();
+    chat.wait_for("the subagents' files pulled into the new VM", LIVE_OLD_VM_LIMIT, Asks::AllowAll, || (pulls_into(&vm2) > files.len()).then_some(()));
+    let listing = chat.turn(&format!("Run exactly this command with your Bash tool, then reply with its output only: ls \"$HOME/.claude/projects/{slug}/{session}/subagents\""));
+    for name in &files {
+        assert!(listing.tool_output.lines().any(|l| l.trim() == name), "{TEST}: {name} on the new VM: {}", listing.tool_output);
+    }
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([1, 0, 0]), "{TEST}: the move in the census");
+    eprintln!(
+        "{TEST}: the census's parks: park:{:?} parked_s:{:?} unpark_ms:{:?} unpark_resumed:{:?} close_parked:{:?}",
+        note_part(&row, census_part::PARK),
+        note_part(&row, census_part::PARKED_S),
+        note_part(&row, census_part::UNPARK_MS),
+        note_part(&row, census_part::UNPARK_RESUMED),
+        note_part(&row, census_part::CLOSE_PARKED)
+    );
+    let resume = format!("--resume={session}");
+    let mut again = Chat::open(TEST, &live, &ws, &[&resume]);
+    again.initialize();
+    let ok = again.turn("Reply with exactly OK");
+    assert_eq!(ok.result["is_error"], false, "{TEST}: the reopened chat's turn: {}", ok.result);
+    let (code, close) = again.close();
+    let reopened = assert_closed_well(TEST, &live, &again, code, close);
+    assert_eq!(
+        (note_part(&reopened, census_part::VM).as_deref(), note_part(&reopened, census_part::TRANSCRIPT).as_deref()),
+        (Some(vm2.as_str()), Some("kept")),
+        "{TEST}: the reopen kept the moved chat on its VM"
+    );
+    let (a, b) = (chat.output(), again.output());
+    sweep_live(&live, &[&a, &b, &terminate], &[]);
+}
+
+/// `session migrate` live (§C, contracts §7.1): a live chat moved to a new
+/// VM on request. A chat told a word appends to README.md in the VM (Bash),
+/// its code-out fetch done; then `ai-env session migrate <sid> --json`
+/// signals its wrapper, which prepares a new VM (`note_migrating`, the
+/// setup-token's Touch ID there) and switches at once, the chat being idle:
+/// the command answers `done` (`how` `live`, from the old VM to the new);
+/// the audit has the request (`session_migrate_request`, `live`, the
+/// wrapper's pid) and the move by its nonce (`session_move` `migrate`,
+/// `command`; `session_move_end` `done`, `touchid` `asked`); the wrapper
+/// ends the old VM (`terminated_by` `migrate`, its row `leaving_for` the
+/// new); the row's `vms[]` gains `migrate:command`; the census says
+/// `moves:readdress=0,respawn=0,migrate=1`; and the next turn, on the new
+/// VM, recalls the word and finds the edit. The wall's migration is off
+/// here ([`s10_world`]), which never stops a command's. Four Touch IDs: the
+/// chat, the test process's runtime key, the move's in its wrapper, the
+/// purge. About five minutes.
+#[test]
+#[ignore = "live, S10, session migrate of a live chat to a new MicroVM (about five minutes; four Touch IDs: the chat, the test process's runtime key, the move's in its wrapper, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 make test-aws S10=1"]
+fn live_s10_session_migrate() {
+    const TEST: &str = "live_s10_session_migrate";
+    if !s10_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s10_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s10-session-migrate");
+    let word = live_word("compass");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let fetched = live_audit(&live, audit_event::CODEOUT_FETCH).len();
+    let told = chat.turn(&format!("Remember this word for later: {word}. Then run exactly this command with your Bash tool: printf 'edited before the move\\n' >> README.md. Reply with exactly OK"));
+    assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
+    chat.wait_for("the turn's codeout_fetch row", LIVE_SYNC_LIMIT, Asks::AllowAll, || (live_audit(&live, audit_event::CODEOUT_FETCH).len() > fetched).then_some(()));
+    let (vm1, session) = (chat.session_vm(&live), chat.session.clone().expect("the chat's session id"));
+    announce_touch_id(TEST, &format!("session migrate {session}: its wrapper (pid {}) asks for the setup-token of the new VM", chat.pid()));
+    let migrated = ai_env_live_within(&live, &["session", "migrate", &session, "--json"], MIGRATE_WAIT + Duration::from_secs(60));
+    assert_eq!(migrated.status.code(), Some(0), "{TEST}: session migrate: {}", String::from_utf8_lossy(&migrated.stdout));
+    let v: serde_json::Value = serde_json::from_slice(&migrated.stdout).unwrap_or_else(|e| panic!("{TEST}: session migrate --json ({e}): {}", String::from_utf8_lossy(&migrated.stdout)));
+    assert_eq!((v["session"].as_str(), v["outcome"].as_str(), v["how"].as_str(), v["from_vm"].as_str()), (Some(session.as_str()), Some("done"), Some("live"), Some(vm1.as_str())), "{TEST}: {v}");
+    let vm2 = v["to_vm"].as_str().unwrap_or_else(|| panic!("{TEST}: no to_vm: {v}")).to_string();
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    // The chat's lines meanwhile: phase A's note, then the moved generation's.
+    chat.idle(Duration::from_secs(5));
+    let notes = std::mem::take(&mut chat.turn.notes);
+    let asked = MigrateTrigger::Command { nonce: String::new() };
+    assert!(notes.contains(&remote::note_migrating(&vm1, &asked)) && notes.contains(&remote::note_continues(&vm2)), "{TEST}: the move's notes: {notes:?}");
+    let requests: Vec<serde_json::Value> = live_audit(&live, audit_event::SESSION_MIGRATE_REQUEST).into_iter().filter(|r| r["detail"]["session"] == session.as_str()).collect();
+    let [request] = requests.as_slice() else { panic!("{TEST}: one request: {requests:?}") };
+    let wrapper = chat.pid().to_string();
+    assert_eq!((request["detail"]["how"].as_str(), request["detail"]["wrapper_pid"].as_str()), (Some("live"), Some(wrapper.as_str())), "{TEST}: {request}");
+    let nonce = request["detail"]["nonce"].as_str().unwrap_or_default().to_string();
+    let (start, end) = moved_rows(TEST, &live, chat.pid(), &session, "migrate", ("trigger", "command"), (&vm1, &vm2));
+    assert_eq!(
+        (start["detail"]["request"].as_str(), end["detail"]["request"].as_str(), end["detail"]["touchid"].as_str()),
+        (Some(nonce.as_str()), Some(nonce.as_str()), Some("asked")),
+        "{TEST}: the move answers the request by its nonce, its Touch ID asked in the wrapper"
+    );
+    let old = chat.wait_for(&format!("{vm1} terminated by the migration"), LIVE_OLD_VM_LIMIT, Asks::AllowAll, || vm_rows::read_row(&live.paths, &vm1).ok().flatten().filter(|r| r.status == RowStatus::Terminated));
+    assert_eq!((old.terminated_by.as_deref(), old.leaving_for.as_deref()), (Some("migrate"), Some(vm2.as_str())), "{TEST}: the old VM's row");
+    let look = chat.turn("Which word did I ask you to remember? Then run exactly this command with your Bash tool: tail -n 1 README.md. Reply with the word and that line.");
+    let answer = look.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer on the new VM {answer:?} lacks the word");
+    assert!(look.tool_output.contains("edited before the move"), "{TEST}: the edit came along: {}", look.tool_output);
+    assert_eq!(chat.session_vm(&live), vm2, "{TEST}: the next turn ran on the new VM");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([0, 0, 1]), "{TEST}: one migration in the census");
+    let entries = vm_entries(TEST, &live, &session);
+    assert!(entries.iter().any(|e| e.vm == vm2 && e.why == "migrate:command"), "{TEST}: the row's vms[]: {entries:?}");
+    let out = chat.output();
+    sweep_live(&live, &[&out, &migrated], &[]);
+}
+
+/// T10.4 (a) live, SLOW: the wall migration between turns. In
+/// [`wrapper_world`]'s 900 s wall with 300 s before it
+/// (`[vm].migrate_before_wall_s`), a chat told a word appends to README.md
+/// in the VM (uncommitted), then takes a short turn every two minutes. Once
+/// the VM has less than 300 s of its wall left, a turn's result starts the
+/// migration (`note_migrating`; its Touch ID announced), which switches
+/// with the chat idle: `session_move` (`migrate`, `wall`) and
+/// `session_move_end` (`done`, `touchid` `asked`), every turn's result
+/// whole before it; the old VM ends (`terminated_by` `migrate`,
+/// `leaving_for` the new; the platform: TERMINATED); the row's `vms[]`
+/// gains `migrate:wall`; the census says
+/// `moves:readdress=0,respawn=0,migrate=1`; and the next turn, on the new
+/// VM, recalls the word and finds the edit. Four Touch IDs: the chat, the
+/// migration's, the test process's runtime key, the purge. About thirteen
+/// minutes.
+#[test]
+#[ignore = "live, S10, a wall migration between turns (about thirteen minutes; four Touch IDs: the chat, the migration, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws S10=1 SLOW=1"]
+fn live_s10_wall_migration() {
+    const TEST: &str = "live_s10_wall_migration";
+    // A short turn this often until the migration starts.
+    const EVERY: Duration = Duration::from_secs(120);
+    if !s10_slow_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let margin = live.cfg.vm.migrate_margin().expect("wrapper_world's [vm] migrates 300 s before its 900 s wall");
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let platform = PlatformView::new(&live);
+    let ws = s8_fixture(&live, "live-s10-wall-migration");
+    let word = live_word("harvest");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let told = chat.turn(&format!("Remember this word for later: {word}. Then run exactly this command with your Bash tool: printf 'edited before the wall\\n' >> README.md. Reply with exactly OK"));
+    assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
+    let (vm1, session, pid) = (chat.session_vm(&live), chat.session.clone().expect("the chat's session id"), chat.pid());
+    let wall = vm_rows::read_row(&live.paths, &vm1).unwrap().and_then(|r| r.wall_deadline).unwrap_or_else(|| panic!("{TEST}: {vm1}'s row names no wall"));
+    eprintln!("{TEST}: {vm1}'s wall in {} s; the migration is due in its last {margin} s", wall.saturating_sub(unix_now()));
+    // A turn's result starts phase A once the wall is near: its note first, then its Touch ID.
+    let note = remote::note_migrating(&vm1, &MigrateTrigger::Wall { left_s: 0 });
+    let mut n = 0u32;
+    loop {
+        n += 1;
+        assert!(unix_now() < wall, "{TEST}: {vm1}'s wall passed with no migration");
+        let turn = chat.turn(&format!("Reply with exactly OK {n}"));
+        assert_eq!(turn.result["is_error"], false, "{TEST}: turn {n}, whole whatever the wall: {}", turn.result);
+        if turn.notes.contains(&note) || chat.read_until(Duration::from_secs(5), Asks::AllowAll, |v| is_note(v, &note)).is_some() {
+            break;
+        }
+        chat.idle(EVERY);
+        // A note later than that came during the pause: the next turn would start its record over.
+        if chat.turn.notes.contains(&note) {
+            break;
+        }
+    }
+    announce_touch_id(TEST, &format!("the migration off {vm1} before its wall: the setup-token for the new VM (M1)"));
+    let ended = chat.wait_for("the migration's end", remote::MOVE_WINDOW + Duration::from_secs(120), Asks::AllowAll, || {
+        audit_of(&live, audit_event::SESSION_MOVE_END, pid).into_iter().find(|r| r["detail"]["kind"] == "migrate")
+    });
+    let vm2 = ended["detail"]["to_vm"].as_str().unwrap_or_default().to_string();
+    let (_, end) = moved_rows(TEST, &live, pid, &session, "migrate", ("trigger", "wall"), (&vm1, &vm2));
+    assert_eq!(end["detail"]["touchid"].as_str(), Some("asked"), "{TEST}: the migration asked its Touch ID (M1)");
+    let old = chat.wait_for(&format!("{vm1} terminated by the migration"), LIVE_OLD_VM_LIMIT, Asks::AllowAll, || vm_rows::read_row(&live.paths, &vm1).ok().flatten().filter(|r| r.status == RowStatus::Terminated));
+    assert_eq!((old.terminated_by.as_deref(), old.leaving_for.as_deref()), (Some("migrate"), Some(vm2.as_str())), "{TEST}: the old VM's row");
+    // The note goes out just before its `session_move_end`, which the waits above may have found before reading it (I2).
+    let continues = remote::note_continues(&vm2);
+    if !chat.turn.notes.contains(&continues) {
+        let _ = chat.read_until(LIVE_LOSS_NOTE_LIMIT, Asks::AllowAll, |v| is_note(v, &continues));
+    }
+    let notes = std::mem::take(&mut chat.turn.notes);
+    assert!(notes.contains(&continues), "{TEST}: the notes since the last turn: {notes:?}");
+    wait_for(TEST, &format!("{vm1} TERMINATED on the platform"), LIVE_OLD_VM_LIMIT, || (platform.state(&vm1) == VmState::Terminated.as_str()).then_some(()));
+    let look = chat.turn("Which word did I ask you to remember? Then run exactly this command with your Bash tool: tail -n 1 README.md. Reply with the word and that line.");
+    let answer = look.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer on the new VM {answer:?} lacks the word");
+    assert!(look.tool_output.contains("edited before the wall"), "{TEST}: the uncommitted edit came along: {}", look.tool_output);
+    assert_eq!(chat.session_vm(&live), vm2, "{TEST}: the next turn ran on the new VM");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([0, 0, 1]), "{TEST}: one migration in the census");
+    let entries = vm_entries(TEST, &live, &session);
+    assert!(entries.iter().any(|e| e.vm == vm2 && e.why == "migrate:wall"), "{TEST}: the row's vms[]: {entries:?}");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
+}
+
+/// T10.4 (b) live, SLOW: a reopen near the wall carries the chat to a new
+/// VM first. In [`wrapper_world`]'s 900 s wall with 300 s before it, a chat
+/// told a word appends to README.md in the VM (uncommitted; its code-out
+/// fetch records it) and closes; once its VM has a minute less than that
+/// margin left, the chat reopens (`--resume`): P0 to P4 carry it to a new
+/// VM (`carried:migrate` and `moves:readdress=0,respawn=0,migrate=1` in the
+/// census; `session_move` `migrate`, `reopen`, generation 1;
+/// `session_move_end` `done`; `vms[]` `migrate:reopen`), the turn on the new
+/// VM recalls the word and finds the edit (the last turn's WIP), and the old
+/// VM is ended with the chat still open (`terminated_by` `migrate`, in the
+/// wrapper's background as phase B does; the platform: TERMINATED). The
+/// plan's reopen after the wall is [`live_s10_reopen_after_wall`]'s.
+/// Four Touch IDs: two chats, the test process's runtime key, the purge.
+/// About thirteen minutes.
+#[test]
+#[ignore = "live, S10, a reopen near the wall carried to a new MicroVM (about thirteen minutes; four Touch IDs: two chats, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws S10=1 SLOW=1"]
+fn live_s10_reopen_near_wall() {
+    const TEST: &str = "live_s10_reopen_near_wall";
+    // How far inside the margin the reopen comes: room for the carry's resume, fetch and sync of the old VM.
+    const INSIDE_S: u64 = 60;
+    if !s10_slow_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let margin = u64::from(live.cfg.vm.migrate_margin().expect("wrapper_world's [vm] migrates 300 s before its 900 s wall"));
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let platform = PlatformView::new(&live);
+    let ws = s8_fixture(&live, "live-s10-reopen-near-wall");
+    let word = live_word("orchard");
+    let mut first = Chat::open(TEST, &live, &ws, &[]);
+    first.initialize();
+    let fetched = live_audit(&live, audit_event::CODEOUT_FETCH).len();
+    let told = first.turn(&format!("Remember this word for later: {word}. Then run exactly this command with your Bash tool: printf 'edited before the close\\n' >> README.md. Reply with exactly OK"));
+    assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
+    first.wait_for("the turn's codeout_fetch row", LIVE_SYNC_LIMIT, Asks::AllowAll, || (live_audit(&live, audit_event::CODEOUT_FETCH).len() > fetched).then_some(()));
+    let (code, close) = first.close();
+    let row = assert_closed_well(TEST, &live, &first, code, close);
+    let (vm1, session) = (note_part(&row, census_part::VM).expect("the chat's VM"), first.session.clone().expect("the chat's session id"));
+    let wall = vm_rows::read_row(&live.paths, &vm1).unwrap().and_then(|r| r.wall_deadline).unwrap_or_else(|| panic!("{TEST}: {vm1}'s row names no wall"));
+    let inside = margin.saturating_sub(INSIDE_S);
+    sleep_until_unix(TEST, &format!("{vm1} to come within {inside} s of its wall"), wall.saturating_sub(inside));
+    let left = wall.saturating_sub(unix_now());
+    assert!(left > INSIDE_S / 2 && left < margin, "{TEST}: {left} s of {vm1}'s wall left at the reopen: near it, not past it");
+    let resume = format!("--resume={session}");
+    let mut second = Chat::open(TEST, &live, &ws, &[&resume]);
+    second.initialize();
+    let look = second.turn("Which word did I ask you to remember? Then run exactly this command with your Bash tool: tail -n 1 README.md. Reply with the word and that line.");
+    let answer = look.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer on the new VM {answer:?} lacks the word");
+    assert!(look.tool_output.contains("edited before the close"), "{TEST}: the last turn's WIP came along: {}", look.tool_output);
+    // The carry ends the old VM in the wrapper's background after its Started, as phase B does: the chat stays open until it has.
+    let old = second.wait_for(&format!("{vm1} terminated after the carry"), LIVE_OLD_VM_LIMIT, Asks::AllowAll, || vm_rows::read_row(&live.paths, &vm1).ok().flatten().filter(|r| r.status == RowStatus::Terminated));
+    assert_eq!(old.terminated_by.as_deref(), Some("migrate"), "{TEST}: the old VM's row");
+    let (code, close) = second.close();
+    let row = assert_closed_well(TEST, &live, &second, code, close);
+    let vm2 = note_part(&row, census_part::VM).expect("the reopen's VM");
+    assert_ne!(vm2, vm1, "{TEST}: the reopen carried the chat to a new VM");
+    assert_eq!((note_part(&row, census_part::CARRIED).as_deref(), row_moves(&row)), (Some("migrate"), Some([0, 0, 1])), "{TEST}: the carry in the census");
+    let (start, _) = moved_rows(TEST, &live, second.pid(), &session, "migrate", ("trigger", "reopen"), (&vm1, &vm2));
+    assert_eq!(start["detail"]["gen"].as_str(), Some("1"), "{TEST}: the carry is the reopen's generation 1");
+    let entries = vm_entries(TEST, &live, &session);
+    assert!(entries.iter().any(|e| e.vm == vm2 && e.why == "migrate:reopen"), "{TEST}: the row's vms[]: {entries:?}");
+    wait_for(TEST, &format!("{vm1} TERMINATED on the platform"), LIVE_OLD_VM_LIMIT, || (platform.state(&vm1) == VmState::Terminated.as_str()).then_some(()));
+    let (a, b) = (first.output(), second.output());
+    sweep_live(&live, &[&a, &b], &[]);
+}
+
+/// T10.4 (b) live, SLOW, as the plan has it: a reopen after the wall
+/// re-addresses the chat first, and the platform's wall is recorded. In
+/// [`wrapper_world`]'s 900 s wall, a chat told a word appends to README.md in
+/// the VM (uncommitted; its code-out fetch records it) and closes, well
+/// before the migration's margin (the plan's minute 8: the closing suspend
+/// leaves the VM SUSPENDED either way). GetMicrovm follows the VM across its
+/// wall: each new state is said with its `stateReason` and end time (the
+/// platform's wall semantics, which `api::FAKE_WALL_REASON` only stands in
+/// for), and the VM must end there (TERMINATED, or unknown to the platform).
+/// A minute past the wall (the plan's minute 16) the chat reopens
+/// (`--resume`): P0 to P4 re-address it to a new VM (`carried:readdress` and
+/// `moves:readdress=1,respawn=0,migrate=0` in the census; `session_move`
+/// `readdress`, `vm_gone`, generation 1; `session_move_end` `done`, its seed
+/// `box`: the dead VM's fetch record, L7; `vms[]` `readdress:vm_gone`), and
+/// the turn on the new VM recalls the word and finds the edit: the last
+/// turn's WIP. The reopen's `transcript_pull` rows are said beside the Mac's
+/// manifest of before: a part more than the manifest held may be a tail the
+/// VM pushed at a `/terminate` the wall posted. Four Touch IDs: two chats, the
+/// test process's runtime key, the purge. About seventeen minutes.
+#[test]
+#[ignore = "live, S10, a reopen after the wall re-addressed to a new MicroVM, the platform's wall recorded (about seventeen minutes; four Touch IDs: two chats, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S10_TESTS=1 AI_ENV_AWS_SLOW=1 make test-aws S10=1 SLOW=1"]
+fn live_s10_reopen_after_wall() {
+    const TEST: &str = "live_s10_reopen_after_wall";
+    // GetMicrovm from this long before the wall, so that the state before it is said too.
+    const BEFORE_S: u64 = 30;
+    // The reopen this long past the wall: the plan's minute 16 of a 15-minute wall.
+    const PAST_S: u64 = 60;
+    if !s10_slow_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = wrapper_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let platform = PlatformView::new(&live);
+    let ws = s8_fixture(&live, "live-s10-reopen-after-wall");
+    let word = live_word("quarry");
+    let mut first = Chat::open(TEST, &live, &ws, &[]);
+    first.initialize();
+    let fetched = live_audit(&live, audit_event::CODEOUT_FETCH).len();
+    let told = first.turn(&format!("Remember this word for later: {word}. Then run exactly this command with your Bash tool: printf 'edited before the close\\n' >> README.md. Reply with exactly OK"));
+    assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
+    first.wait_for("the turn's codeout_fetch row", LIVE_SYNC_LIMIT, Asks::AllowAll, || (live_audit(&live, audit_event::CODEOUT_FETCH).len() > fetched).then_some(()));
+    let (code, close) = first.close();
+    let row = assert_closed_well(TEST, &live, &first, code, close);
+    let (vm1, session) = (note_part(&row, census_part::VM).expect("the chat's VM"), first.session.clone().expect("the chat's session id"));
+    let wall = vm_rows::read_row(&live.paths, &vm1).unwrap().and_then(|r| r.wall_deadline).unwrap_or_else(|| panic!("{TEST}: {vm1}'s row names no wall"));
+    sleep_until_unix(TEST, &format!("{BEFORE_S} s before {vm1}'s wall"), wall.saturating_sub(BEFORE_S));
+    // The platform across the wall: each new look said, until it ended the VM.
+    let from_wall = |now: u64| if now >= wall { format!("+{} s", now - wall) } else { format!("-{} s", wall - now) };
+    let mut seen: Vec<String> = Vec::new();
+    let t = Instant::now();
+    let ended = loop {
+        assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{TEST}: interrupted while following {vm1} across its wall");
+        let look = platform.info(&vm1);
+        let said = match &look {
+            Ok(Some(info)) => format!("{} (reason {:?}, terminated at {:?})", info.state.as_str(), info.state_reason, info.terminated_at_unix),
+            Ok(None) => "not found".to_string(),
+            Err(e) => format!("unknown: {e}"),
+        };
+        if seen.last() != Some(&said) {
+            eprintln!("{TEST}: {vm1} at its wall {}: {said}", from_wall(unix_now()));
+            seen.push(said);
+        }
+        match look {
+            Ok(Some(info)) if info.state == VmState::Terminated => break true,
+            Ok(None) => break true,
+            _ if t.elapsed() >= Duration::from_secs(BEFORE_S) + LIVE_OLD_VM_LIMIT => break false,
+            _ => std::thread::sleep(LIVE_SYNC_POLL),
+        }
+    };
+    eprintln!("{TEST}: {vm1} across its wall: {}", seen.join(" > "));
+    assert!(ended, "{TEST}: the platform did not end {vm1} within {LIVE_OLD_VM_LIMIT:?} of its wall: {seen:?}");
+    let parts_before = ai_env_cli::bridge::s3::manifest::read(&live.paths, &session).ok().flatten().map(|m| {
+        eprintln!("{TEST}: the Mac's manifest before the reopen: {} part(s), {} bytes, from {:?} at {}", m.parts.len(), m.committed, m.vm, m.at);
+        m.parts.len()
+    });
+    sleep_until_unix(TEST, &format!("{PAST_S} s past {vm1}'s wall"), wall.saturating_add(PAST_S));
+    let resume = format!("--resume={session}");
+    let mut second = Chat::open(TEST, &live, &ws, &[&resume]);
+    second.initialize();
+    let look = second.turn("Which word did I ask you to remember? Then run exactly this command with your Bash tool: tail -n 1 README.md. Reply with the word and that line.");
+    let answer = look.result["result"].as_str().unwrap_or_default().to_string();
+    assert!(answer.contains(&word), "{TEST}: the answer on the new VM {answer:?} lacks the word");
+    assert!(look.tool_output.contains("edited before the close"), "{TEST}: the last turn's WIP came along: {}", look.tool_output);
+    let (code, close) = second.close();
+    let row = assert_closed_well(TEST, &live, &second, code, close);
+    let vm2 = note_part(&row, census_part::VM).expect("the reopen's VM");
+    assert_ne!(vm2, vm1, "{TEST}: the reopen re-addressed the chat to a new VM");
+    assert_eq!((note_part(&row, census_part::CARRIED).as_deref(), row_moves(&row)), (Some("readdress"), Some([1, 0, 0])), "{TEST}: the carry in the census");
+    let (start, end) = moved_rows(TEST, &live, second.pid(), &session, "readdress", ("cause", "vm_gone"), (&vm1, &vm2));
+    assert_eq!((start["detail"]["gen"].as_str(), end["detail"]["seed"].as_str()), (Some("1"), Some("box")), "{TEST}: the carry is the reopen's generation 1, seeded from the dead VM's fetch record (L7)");
+    let entries = vm_entries(TEST, &live, &session);
+    assert!(entries.iter().any(|e| e.vm == vm2 && e.why == "readdress:vm_gone"), "{TEST}: the row's vms[]: {entries:?}");
+    let pulls: Vec<serde_json::Value> = live_audit(&live, audit_event::TRANSCRIPT_PULL).into_iter().filter(|r| r["detail"]["session"] == session.as_str() && r["detail"]["vm"] == vm2.as_str()).map(|r| r["detail"].clone()).collect();
+    eprintln!("{TEST}: the reopen's transcript_pull rows into {vm2} (the Mac's manifest held {parts_before:?} part(s) before it; a part more may be a tail the VM pushed at a /terminate the wall posted): {pulls:?}");
+    let (a, b) = (first.output(), second.output());
+    sweep_live(&live, &[&a, &b], &[]);
 }

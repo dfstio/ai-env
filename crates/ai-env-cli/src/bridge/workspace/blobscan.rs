@@ -23,6 +23,16 @@
 //! claude reads after a merge, so the repo mode reads it; harmless on a seed,
 //! whose VM compares names exactly. A `.claude` that is a symlink is a
 //! finding wherever it points (the settings read through it are elsewhere).
+//!
+//! S10 (F4): the code-out's import scans every fetched ref's new objects as
+//! one ([`scan_listed`], which leaves the cache's save to its caller: once
+//! per import) and reads D8's settings files of every tip from one walk of
+//! the trees ([`settings_of_trees`]: each tree read once, level by level),
+//! with the findings, and their order, that [`scan_settings_within`], the
+//! per-ref twin, gives per tree. Phase 4 bounds that walk and what it makes:
+//! its nodes and its paths' bytes, a settings blob over the cap (never read:
+//! `blob-too-large`), and the settings findings a tip keeps (the twin bounds
+//! the last two alike).
 use super::pack::Listed;
 use super::{git_failed, workspace_cfg, WorkspaceRef};
 use crate::bridge::config::{BridgeConfig, Paths};
@@ -59,6 +69,23 @@ pub const BLOB_TOO_LARGE: &str = "blob-too-large";
 /// D8's rule for a link where the repo mode would read a settings file: one
 /// at a settings file's name, or a `.claude` directory that is one.
 pub const SETTINGS_SYMLINK: &str = "settings-symlink";
+/// S10 phase 4 (F4-WALK-1): the most kept nodes one walk of the settings
+/// visits ([`each_setting`]: a subtree entered, an entry reached, one it
+/// skips among them). Past it the import is refused: 41 trees whose every
+/// level names the one below twice route 2^40 paths to one settings file.
+pub const SETTINGS_WALK_MAX: usize = 1 << 16;
+/// ... and the most bytes of paths one walk builds: each subtree's name it
+/// enters, each whole path it hands on (300 levels of 3000-byte names over
+/// a `.claude` of names that fold to `settings.json` would build gigabytes
+/// from a pack of kilobytes).
+pub const SETTINGS_WALK_BYTES: usize = 1 << 22;
+/// S10 phase 4 (F4-WALK-1): the settings findings one tip of the import
+/// keeps (one label of [`scan_settings_within`]): the first this many, and
+/// past them the first of each rule not among them, so every rule still
+/// reaches the report and the audit. Nothing shows or keeps more of them
+/// ([`finding_lines`], `rows::FINDINGS_KEPT`), while a blob's findings
+/// copied to every path that names it would grow without bound.
+pub const SETTINGS_FINDINGS_MAX: usize = FINDINGS_MAX;
 
 /// The rules one scan runs with (`Debug` names the rule ids only).
 #[derive(Debug)]
@@ -520,6 +547,29 @@ fn tree_names(bytes: &[u8], raw: usize) -> Vec<&[u8]> {
 /// commits name a finding's place ([`Finding::location`]). Clean objects go
 /// into `cache`, which is saved once the scan ran to its end.
 pub fn scan_objects(git: &GitRun, list: &[Listed], set: &ScanSet, cache: &mut CleanCache, max_blob: u64, labels: &[(String, String)]) -> Result<ScanReport, BridgeError> {
+    let scanned = scan_listed(git, list, set, cache, max_blob, Some(labels))?;
+    if let Err(e) = cache.save() {
+        tracing::warn!("scan: the clean-object cache was not written: {e}");
+    }
+    Ok(scanned.report)
+}
+
+/// What [`scan_listed`] read and found: its report, and the ids it found
+/// dirty (a hit in a blob's or a commit's bytes or in a tree's entry names,
+/// or a blob over the cap), which no cache ever holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scanned {
+    pub report: ScanReport,
+    pub dirty: BTreeSet<String>,
+}
+
+/// [`scan_objects`] without saving `cache` (S10 F4: a caller that runs
+/// several scans saves it once, after the last ran to its end), with the ids
+/// it found dirty. `labels` `None`: no finding's place is looked up (no git
+/// run for it): a finding names its listed path as [`shown_path`] shows it,
+/// else `an object`, which serves where only whether there is one counts
+/// (the import's one scan of every fetched ref's objects at once).
+pub fn scan_listed(git: &GitRun, list: &[Listed], set: &ScanSet, cache: &mut CleanCache, max_blob: u64, labels: Option<&[(String, String)]>) -> Result<Scanned, BridgeError> {
     let mut report = ScanReport::default();
     let ids: Vec<String> = list.iter().map(|o| o.id.clone()).collect();
     let checked = check(git, &ids)?;
@@ -589,10 +639,13 @@ pub fn scan_objects(git: &GitRun, list: &[Listed], set: &ScanSet, cache: &mut Cl
         }
     })?;
     for (id, path, line, rule) in found {
-        let location = match &path {
-            Some(p) => locate(git, labels, &commits, &id, p, &shown_path(set, p)),
-            None => "an object".to_string(),
+        let location = match (&path, labels) {
+            (Some(p), Some(labels)) => locate(git, labels, &commits, &id, p, &shown_path(set, p)),
+            (Some(p), None) => shown_path(set, p),
+            (None, _) => "an object".to_string(),
         };
+        // A blob over the cap is never read, so never cached: dirty as one with a hit.
+        dirty.insert(id.clone());
         report.findings.push(Finding { location, object: Some(short(&id)), line, rule, key: None });
     }
     report.findings.extend(commit_findings);
@@ -601,14 +654,12 @@ pub fn scan_objects(git: &GitRun, list: &[Listed], set: &ScanSet, cache: &mut Cl
             cache.insert(id);
         }
     }
-    if let Err(e) = cache.save() {
-        tracing::warn!("scan: the clean-object cache was not written: {e}");
-    }
-    Ok(report)
+    Ok(Scanned { report, dirty })
 }
 
 /// D8 on the settings files of the trees the VM checks out (`trees`:
-/// `(label, entries)`): each `.claude/settings.json` and
+/// `(label, entries)`), within the import's bounds (S10 phase 4) as
+/// [`settings_of_trees`] reads each tip: each `.claude/settings.json` and
 /// `.claude/settings.local.json` ([`settings_name`]: any depth, names
 /// compared as the Mac's disk does) through the repo mode (a blob read once
 /// however many trees hold it), a symlink at either name
@@ -618,10 +669,24 @@ pub fn scan_objects(git: &GitRun, list: &[Listed], set: &ScanSet, cache: &mut Cl
 /// settings read through it are not at a path this scan reads. A gitlink is
 /// noted (a submodule is never carried), its path as [`shown_path`] shows
 /// it, scrubbed. Nothing when the workspace trusts its repo settings, but
-/// the notes.
-pub fn scan_settings(git: &GitRun, trees: &[(String, Vec<TreeEntry>)], set: &ScanSet, unchanged: &dyn Fn(&TreeEntry) -> bool, report: &mut ScanReport) -> Result<(), BridgeError> {
+/// the notes. A settings file whose blob is over `max_blob` is never read, a
+/// [`BLOB_TOO_LARGE`] finding at its path instead (F4-WALK-2: one the Mac
+/// already holds, which no scan of the objects lists, among them), and each
+/// label keeps at most [`SETTINGS_FINDINGS_MAX`] settings findings, past
+/// them the first of each rule not among them (F4-WALK-1). The seed, `box
+/// review` and the per-ref import all take it; S9's unbounded
+/// `scan_settings` (every blob read whole, every finding kept) is gone, so
+/// no caller can pick it (phase 4b follow-up, VF-3).
+pub fn scan_settings_within(git: &GitRun, trees: &[(String, Vec<TreeEntry>)], set: &ScanSet, unchanged: &dyn Fn(&TreeEntry) -> bool, max_blob: u64, report: &mut ScanReport) -> Result<(), BridgeError> {
     let mut read: BTreeSet<(String, String)> = BTreeSet::new();
     for (label, entries) in trees {
+        // What this label keeps of its findings.
+        let mut keep = SettingsKept::default();
+        let mut push = |report: &mut ScanReport, f: Finding| {
+            if keep.admit(&f.rule) {
+                report.findings.push(f);
+            }
+        };
         for e in entries {
             if e.mode == "160000" {
                 // The path as the other notes name theirs: shown, then scrubbed alone (a bare k=v value runs to the
@@ -638,7 +703,7 @@ pub fn scan_settings(git: &GitRun, trees: &[(String, Vec<TreeEntry>)], set: &Sca
             let at = || format!("{label}:{}", shown_path(set, &e.path));
             if e.mode == "120000" && is_claude_dir(&e.path) {
                 if read.insert((e.id.clone(), e.path.clone())) {
-                    report.findings.push(Finding { location: at(), object: Some(short(&e.id)), line: 0, rule: SETTINGS_SYMLINK.into(), key: None });
+                    push(report, Finding { location: at(), object: Some(short(&e.id)), line: 0, rule: SETTINGS_SYMLINK.into(), key: None });
                 }
                 continue;
             }
@@ -647,21 +712,414 @@ pub fn scan_settings(git: &GitRun, trees: &[(String, Vec<TreeEntry>)], set: &Sca
                 continue;
             }
             if e.mode == "120000" {
-                report.findings.push(Finding { location: at(), object: Some(short(&e.id)), line: 0, rule: SETTINGS_SYMLINK.into(), key: None });
+                push(report, Finding { location: at(), object: Some(short(&e.id)), line: 0, rule: SETTINGS_SYMLINK.into(), key: None });
+                continue;
+            }
+            // F4-WALK-2: sized first, never read past the cap (a miss here must never pass for a clean file).
+            if check(git, std::slice::from_ref(&e.id))?.iter().any(|c| c.size > max_blob) {
+                push(report, Finding { location: at(), object: Some(short(&e.id)), line: 0, rule: BLOB_TOO_LARGE.into(), key: None });
                 continue;
             }
             report.settings_files += 1;
             let mut findings = Vec::new();
             read_objects(git, std::slice::from_ref(&e.id), |_, bytes| findings = settings_findings_mode(name, bytes, &[], SettingsMode::Repo))?;
             for f in findings {
-                // A key path that trips a tripwire (a token as a JSON key) is never shown, nor one cut short (a cut can
-                // leave part of a token that no longer matches): the seed's, the code-out's and the review's reports.
-                let key = Some(f.key).filter(|k| !k.is_empty() && !k.ends_with('\u{2026}') && set.rules.scan_bytes(k.as_bytes()).is_empty());
-                report.findings.push(Finding { location: at(), object: Some(short(&e.id)), line: f.line, rule: f.rule.to_string(), key });
+                push(report, settings_finding(set, at(), &e.id, f));
             }
         }
     }
     Ok(())
+}
+
+/// What one tip (one label) keeps of its settings findings, in their order
+/// ([`SETTINGS_FINDINGS_MAX`]): whether the next one, of `rule`, is kept.
+#[derive(Debug, Default)]
+struct SettingsKept {
+    kept: usize,
+    rules: HashSet<String>,
+}
+
+impl SettingsKept {
+    /// Keep the next finding, of `rule`: while fewer than the cap are kept,
+    /// and past it when no kept one has its rule.
+    fn admit(&mut self, rule: &str) -> bool {
+        let new = !self.rules.contains(rule);
+        if self.kept >= SETTINGS_FINDINGS_MAX && !new {
+            return false;
+        }
+        self.kept += 1;
+        if new {
+            self.rules.insert(rule.to_string());
+        }
+        true
+    }
+
+    /// One file's findings cut to what a fresh tip keeps of them: no tip,
+    /// whatever it kept before, keeps another of them (once one is passed
+    /// over, its rule is kept and the cap reached).
+    fn kept_of(all: Vec<crate::bridge::scan::SettingsFinding>) -> Vec<crate::bridge::scan::SettingsFinding> {
+        let mut fresh = SettingsKept::default();
+        all.into_iter().filter(|f| fresh.admit(f.rule)).collect()
+    }
+}
+
+/// `settings` (one ref's settings findings) after `findings` (its
+/// objects'), S10 phase 4 (F4-WALK-2): a blob over the cap the objects'
+/// scan named at the same place (`blob-too-large`) is not named again. The
+/// import's two modes append so alike.
+pub fn extend_settings(findings: &mut Vec<Finding>, settings: Vec<Finding>) {
+    for f in settings {
+        if f.rule != BLOB_TOO_LARGE || !findings.contains(&f) {
+            findings.push(f);
+        }
+    }
+}
+
+/// One finding of D8's repo mode in the settings file `id` at `at`. A key
+/// path that trips a tripwire (a token as a JSON key) is never shown, nor one
+/// cut short (a cut can leave part of a token that no longer matches): the
+/// seed's, the code-out's and the review's reports.
+fn settings_finding(set: &ScanSet, at: String, id: &str, f: crate::bridge::scan::SettingsFinding) -> Finding {
+    let key = Some(f.key).filter(|k| !k.is_empty() && !k.ends_with('\u{2026}') && set.rules.scan_bytes(k.as_bytes()).is_empty());
+    Finding { location: at, object: Some(short(id)), line: f.line, rule: f.rule.to_string(), key }
+}
+
+/// One entry of a tree object as git wrote it: its mode as `ls-tree` shows
+/// it ([`canon_mode`]), its name, its id.
+struct RawEntry {
+    mode: &'static str,
+    name: Vec<u8>,
+    id: String,
+}
+
+/// The mode of a tree entry as git's tree walk makes it (`canon_mode`), so
+/// as `ls-tree` shows it: a regular file `100644` or `100755` by its owner's
+/// execute bit, a link `120000`, a tree `40000`, anything else a gitlink
+/// `160000`. Read as git's `get_mode` reads it: octal digits summed in an
+/// unsigned int that wraps, so `40000100644` is a regular file (a mode past
+/// 32 bits, which fsck lets through, never hides an entry). `None` for an
+/// empty mode or a byte that is no octal digit, which git refuses too.
+fn canon_mode(text: &[u8]) -> Option<&'static str> {
+    if text.is_empty() || !text.iter().all(|b| (b'0'..=b'7').contains(b)) {
+        return None;
+    }
+    let mode = text.iter().fold(0u32, |m, b| (m << 3) | u32::from(b - b'0'));
+    Some(match mode & 0o170_000 {
+        0o100_000 if mode & 0o100 != 0 => "100755",
+        0o100_000 => "100644",
+        0o120_000 => "120000",
+        0o040_000 => "40000",
+        _ => "160000",
+    })
+}
+
+/// The entries of a tree object's bytes (`<mode> <name>\0<id>` each, the id
+/// `raw` bytes), in their order. `None` for a tree git refuses to walk (its
+/// `ls-tree` dies on it): an entry whose mode `canon_mode` cannot read, an
+/// empty name, a cut entry or a tail that is no entry. Never one entry left
+/// out: the walk of the settings reads every entry git reads, or none.
+fn raw_entries(bytes: &[u8], raw: usize) -> Option<Vec<RawEntry>> {
+    let mut entries = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let sp = rest.iter().position(|b| *b == b' ')?;
+        let mode = canon_mode(&rest[..sp])?;
+        let entry = &rest[sp + 1..];
+        let nul = entry.iter().position(|b| *b == 0).filter(|n| *n > 0)?;
+        let id = entry.get(nul + 1..nul + 1 + raw)?;
+        entries.push(RawEntry { mode, name: entry[..nul].to_vec(), id: hex::encode(id) });
+        rest = &entry[nul + 1 + raw..];
+    }
+    Some(entries)
+}
+
+/// What a settings entry of a tree is to D8 ([`scan_settings_within`]'s cases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsKind {
+    /// A link whose name is `.claude` ([`is_claude_dir`]): `settings-symlink`, changed or not.
+    ClaudeLink,
+    /// A settings file D8 reads ([`settings_name`]'s name).
+    File(&'static str),
+    /// An entry of this very tree named as a settings file: D8's only where this tree is a `.claude` directory,
+    /// which the tree that names it decides.
+    Named(&'static str),
+}
+
+/// What the walk of the settings keeps of one tree (S10 F4), in its order:
+/// each subtree below which D8 reads an entry, by its name and what that
+/// subtree keeps, and each entry of this very tree D8 may read. What a
+/// subtree keeps is shared, never copied into the trees above it with its
+/// paths: a tree keeps its own entries' names alone, so the walk holds what
+/// the trees it read hold, whatever their depth (a copy per level grows with
+/// the depth's square: 300 levels of 100-character names over 100 settings
+/// files, a pack of some 60 KB, would hold some 450 MB of paths).
+#[derive(Debug)]
+enum Kept {
+    /// A subtree and what it keeps.
+    Tree { name: String, below: std::rc::Rc<Vec<Kept>> },
+    /// A `.claude` link ([`SettingsKind::ClaudeLink`]), or a file or a link named as a settings file ([`SettingsKind::Named`]).
+    Entry { name: String, mode: &'static str, id: String, kind: SettingsKind },
+}
+
+/// What the tree `id` keeps ([`Kept`]; `trees`: every tree read, by id),
+/// each tree's computed once (`memo`), its subtrees' first: children first
+/// through an explicit stack, so no depth of nesting recurses. A tree not in
+/// `trees` keeps nothing; a subtree is kept only when D8 reads an entry below
+/// it there (a settings-named one only right below a `.claude` directory).
+fn kept_of(id: &str, trees: &std::collections::HashMap<String, Vec<RawEntry>>, memo: &mut std::collections::HashMap<String, std::rc::Rc<Vec<Kept>>>) {
+    let mut stack: Vec<(String, usize)> = vec![(id.to_string(), 0)];
+    while let Some(top) = stack.len().checked_sub(1) {
+        let (tree, at) = stack[top].clone();
+        if memo.contains_key(&tree) {
+            stack.pop();
+            continue;
+        }
+        let entries = trees.get(&tree).map_or(&[][..], Vec::as_slice);
+        // The next subtree whose own is not known yet: it goes first.
+        if let Some(skip) = entries[at..].iter().position(|e| e.mode == "40000" && !memo.contains_key(&e.id) && !stack.iter().any(|(t, _)| *t == e.id)) {
+            stack[top].1 = at + skip + 1;
+            stack.push((entries[at + skip].id.clone(), 0));
+            continue;
+        }
+        let mut kept = Vec::new();
+        for e in entries {
+            let name = String::from_utf8_lossy(&e.name);
+            match e.mode {
+                "40000" => {
+                    let claude = folds_to(&name, ".claude");
+                    if let Some(below) = memo.get(&e.id).filter(|b| b.iter().any(|k| claude || !matches!(k, Kept::Entry { kind: SettingsKind::Named(_), .. }))) {
+                        kept.push(Kept::Tree { name: name.into_owned(), below: std::rc::Rc::clone(below) });
+                    }
+                }
+                // A gitlink makes a note only, which the import does not keep.
+                "160000" => {}
+                "120000" if folds_to(&name, ".claude") => kept.push(Kept::Entry { name: name.into_owned(), mode: e.mode, id: e.id.clone(), kind: SettingsKind::ClaudeLink }),
+                _ => {
+                    if let Some(n) = SETTINGS_NAMES.into_iter().find(|s| folds_to(&name, s)) {
+                        kept.push(Kept::Entry { name: name.into_owned(), mode: e.mode, id: e.id.clone(), kind: SettingsKind::Named(n) });
+                    }
+                }
+            }
+        }
+        memo.insert(tree, std::rc::Rc::new(kept));
+        stack.pop();
+    }
+}
+
+/// Each entry D8 reads below a tree that keeps `kept` ([`kept_of`]), in
+/// `ls-tree -r`'s order: its path from that tree, its mode, its id and what
+/// it is ([`SettingsKind::ClaudeLink`], or [`SettingsKind::File`]: a
+/// settings-named entry right below a `.claude` directory), handed to
+/// `seen`. One path is built at a time, on one string; none is kept.
+/// Whether the walk ran whole: S10 phase 4 (F4-WALK-1), what each tree
+/// keeps is shared, but a tree that `k` routes reach is walked `k` times,
+/// so the walk stops at once, `false`, past [`SETTINGS_WALK_MAX`] nodes
+/// (each subtree entered, each entry reached) or [`SETTINGS_WALK_BYTES`]
+/// of paths (each name entered, each whole path handed on).
+fn each_setting<'k>(kept: &'k [Kept], mut seen: impl FnMut(&str, &'static str, &'k str, SettingsKind)) -> bool {
+    let mut path = String::new();
+    let (mut nodes, mut bytes) = (0usize, 0usize);
+    // Each tree being walked: what it keeps, the next of it, whether it is a `.claude` directory, and the length
+    // of `path` before its name.
+    let mut stack: Vec<(&'k [Kept], usize, bool, usize)> = vec![(kept, 0, false, 0)];
+    while let Some(top) = stack.last_mut() {
+        let (list, at, claude, len) = *top;
+        let Some(k) = list.get(at) else {
+            path.truncate(len);
+            stack.pop();
+            continue;
+        };
+        top.1 += 1;
+        nodes += 1;
+        if nodes > SETTINGS_WALK_MAX {
+            return false;
+        }
+        match k {
+            Kept::Tree { name, below } => {
+                bytes += name.len() + 1;
+                if bytes > SETTINGS_WALK_BYTES {
+                    return false;
+                }
+                let len = path.len();
+                path.push_str(name);
+                path.push('/');
+                stack.push((below.as_slice(), 0, folds_to(name, ".claude"), len));
+            }
+            Kept::Entry { name, mode, id, kind } => {
+                let kind = match kind {
+                    SettingsKind::Named(n) if claude => SettingsKind::File(n),
+                    SettingsKind::Named(_) => continue,
+                    other => *other,
+                };
+                bytes += path.len() + name.len();
+                if bytes > SETTINGS_WALK_BYTES {
+                    return false;
+                }
+                let len = path.len();
+                path.push_str(name);
+                seen(&path, mode, id.as_str(), kind);
+                path.truncate(len);
+            }
+        }
+    }
+    true
+}
+
+/// What one tip reads of the settings below its tree (`kept`), as
+/// [`scan_settings_within`] walks its listing: each `.claude` link, and
+/// each settings file whose blob the Mac's HEAD does not hold at its path
+/// (`held`, path to blob), once per blob and path, handed to `step` with its
+/// path and blob: the name D8 reads it by, or `None` for a link (a
+/// `settings-symlink` finding at once). Whether the walk ran whole
+/// ([`each_setting`]).
+fn tip_settings<'k>(kept: &'k [Kept], held: &std::collections::HashMap<String, String>, mut step: impl FnMut(&str, &'k str, Option<&'static str>)) -> bool {
+    let mut read: HashSet<(&'k str, String)> = HashSet::new();
+    each_setting(kept, |path, mode, id, kind| match kind {
+        SettingsKind::ClaudeLink => {
+            if read.insert((id, path.to_string())) {
+                step(path, id, None);
+            }
+        }
+        SettingsKind::File(name) => {
+            if held.get(path).is_some_and(|h| h == id) || !read.insert((id, path.to_string())) {
+                return;
+            }
+            step(path, id, (mode != "120000").then_some(name));
+        }
+        SettingsKind::Named(_) => {}
+    })
+}
+
+/// D8 on the settings files of the trees the VM checks out, exactly as
+/// [`scan_settings_within`] reads each one's `ls-tree -r` (the same findings
+/// in the same order, per tip; S10 F4), without listing any: every distinct
+/// tree reachable from `tips` (`(label, tree id)`) and from `head` (the
+/// Mac's HEAD tree: a settings file whose blob it holds at that path is
+/// skipped, [`scan_settings_within`]'s `unchanged`) is read once, one
+/// `cat-file --batch` per depth, and parsed as git parses it
+/// ([`raw_entries`]: a tree git cannot walk refuses the import,
+/// `GIT_FAILED`); what each tree keeps is computed once however many tips
+/// hold it ([`kept_of`]). Then each distinct settings blob a tip reads is
+/// read once, and each tip's findings are made by a second walk of its own:
+/// no tip's paths are held beside another's. Tree-based, never taken from a
+/// listing of what is new: a blob the Mac already holds (a permissive
+/// fixture of its history) copied into `.claude/settings.json` is read
+/// there. Nothing when the workspace trusts its repo settings; no gitlink's
+/// note (the import keeps none).
+///
+/// S10 phase 4, within [`scan_settings_within`]'s bounds: a walk (HEAD's,
+/// or a tip's) past [`SETTINGS_WALK_MAX`] nodes or [`SETTINGS_WALK_BYTES`]
+/// of paths refuses the import (`GIT_FAILED`, F4-WALK-1); the settings
+/// blobs are sized first (one `cat-file --batch-check`) and one over
+/// `max_blob` is never read, [`BLOB_TOO_LARGE`] at each path a tip reads it
+/// at (F4-WALK-2); a tip keeps at most [`SETTINGS_FINDINGS_MAX`] settings
+/// findings, and past them the first of each rule not among them.
+pub fn settings_of_trees(git: &GitRun, set: &ScanSet, tips: &[(String, String)], head: Option<&str>, max_blob: u64) -> Result<Vec<Vec<Finding>>, BridgeError> {
+    use std::collections::HashMap;
+    if !set.repo_settings || tips.is_empty() {
+        return Ok(vec![Vec::new(); tips.len()]);
+    }
+    let roots: BTreeSet<&str> = tips.iter().map(|(_, t)| t.as_str()).chain(head).collect();
+    // Each tree as its subtrees and the entries D8 may read: a repository's other files are never held.
+    let wanted_entry = |e: &RawEntry| {
+        let name = String::from_utf8_lossy(&e.name);
+        e.mode == "40000" || (e.mode != "160000" && (folds_to(&name, ".claude") || SETTINGS_NAMES.iter().any(|s| folds_to(&name, s))))
+    };
+    let mut trees: HashMap<String, Vec<RawEntry>> = HashMap::new();
+    let mut level: Vec<String> = roots.iter().map(|t| (*t).to_string()).collect();
+    while !level.is_empty() {
+        let mut malformed: Option<String> = None;
+        read_objects(git, &level, |id, bytes| match raw_entries(bytes, id.len() / 2) {
+            Some(entries) => {
+                trees.insert(id.to_string(), entries.into_iter().filter(wanted_entry).collect());
+            }
+            None => {
+                malformed.get_or_insert_with(|| short(id));
+            }
+        })?;
+        if let Some(id) = malformed {
+            return Err(BridgeError::WorkspaceFailed { code: crate::wire::workspace::refusal::GIT_FAILED, message: format!("the tree {id} is malformed: git cannot walk it") });
+        }
+        let next: BTreeSet<String> = level.iter().filter_map(|t| trees.get(t)).flatten().filter(|e| e.mode == "40000" && !trees.contains_key(&e.id)).map(|e| e.id.clone()).collect();
+        level = next.into_iter().collect();
+    }
+    let mut memo: HashMap<String, std::rc::Rc<Vec<Kept>>> = HashMap::new();
+    for root in &roots {
+        kept_of(root, &trees, &mut memo);
+    }
+    drop(trees);
+    let kept = |tree: &str| memo.get(tree).map_or(&[][..], |k| k.as_slice());
+    let too_many = |tree: &str| BridgeError::WorkspaceFailed {
+        code: crate::wire::workspace::refusal::GIT_FAILED,
+        message: format!("the tree {} routes more settings paths than the import walks ({SETTINGS_WALK_MAX} entries, {} MiB of paths): refused", short(tree), SETTINGS_WALK_BYTES >> 20),
+    };
+    let mut held: HashMap<String, String> = HashMap::new();
+    if let Some(h) = head {
+        let whole = each_setting(kept(h), |path, _, id, kind| {
+            if matches!(kind, SettingsKind::File(_)) {
+                held.insert(path.to_string(), id.to_string());
+            }
+        });
+        if !whole {
+            return Err(too_many(h));
+        }
+    }
+    // The blobs the tips read, each by the names it is read as.
+    let mut wanted: HashMap<String, BTreeSet<&'static str>> = HashMap::new();
+    for (_, tree) in tips {
+        let whole = tip_settings(kept(tree), &held, |_, id, name| {
+            if let Some(name) = name {
+                wanted.entry(id.to_string()).or_default().insert(name);
+            }
+        });
+        if !whole {
+            return Err(too_many(tree));
+        }
+    }
+    let ids: Vec<String> = wanted.keys().cloned().collect();
+    // Sized first: a blob over the cap is never read (F4-WALK-2), and never passes for a clean file either.
+    let large: HashSet<&str> = ids.iter().zip(check(git, &ids)?).filter(|(_, c)| c.size > max_blob).map(|(id, _)| id.as_str()).collect();
+    let small: Vec<String> = ids.iter().filter(|id| !large.contains(id.as_str())).cloned().collect();
+    let mut found: HashMap<(String, &'static str), Vec<crate::bridge::scan::SettingsFinding>> = HashMap::new();
+    read_objects(git, &small, |id, bytes| {
+        for name in wanted.get(id).into_iter().flatten() {
+            // What any tip keeps of them (F4-WALK-1): a blob at many paths is many copies.
+            found.insert((id.to_string(), name), SettingsKept::kept_of(settings_findings_mode(name, bytes, &[], SettingsMode::Repo)));
+        }
+    })?;
+    Ok(tips
+        .iter()
+        .map(|(label, tree)| {
+            let mut findings = Vec::new();
+            let mut keep = SettingsKept::default();
+            let whole = tip_settings(kept(tree), &held, |path, id, name| {
+                let at = || format!("{label}:{}", shown_path(set, path));
+                let object = || Some(short(id));
+                match name {
+                    None => {
+                        if keep.admit(SETTINGS_SYMLINK) {
+                            findings.push(Finding { location: at(), object: object(), line: 0, rule: SETTINGS_SYMLINK.into(), key: None });
+                        }
+                    }
+                    Some(_) if large.contains(id) => {
+                        if keep.admit(BLOB_TOO_LARGE) {
+                            findings.push(Finding { location: at(), object: object(), line: 0, rule: BLOB_TOO_LARGE.into(), key: None });
+                        }
+                    }
+                    Some(name) => {
+                        for f in found.get(&(id.to_string(), name)).map_or(&[][..], Vec::as_slice) {
+                            if keep.admit(f.rule) {
+                                findings.push(settings_finding(set, at(), id, f.clone()));
+                            }
+                        }
+                    }
+                }
+            });
+            // The same walk ran whole for the reads above.
+            debug_assert!(whole, "the walk of {label} stopped");
+            findings
+        })
+        .collect())
 }
 
 /// L9 on the files the WIP adds (`added`, paths of `entries`, the WIP's
@@ -733,6 +1191,219 @@ mod tests {
         assert_eq!(tree_names(&bytes, 20), all);
         assert_eq!(tree_names(&bytes[..bytes.len() - 5], 20), all, "the last id cut: its name was read");
         assert!(tree_names(b"100644 x", 20).is_empty());
+    }
+
+    /// S10 F4: a tree object's entries as the walk of the settings reads
+    /// them: each mode as `ls-tree` shows it, by git's own rule (a regular
+    /// file by its owner's execute bit, `100664` as `100644`; a link; a
+    /// tree's `40000`; anything else, a bare `644` too, a gitlink), read as
+    /// git's `get_mode` reads it, in an unsigned int that wraps (so a mode
+    /// past 32 bits, which fsck lets through, is the entry git checks out:
+    /// `40000100644` a file, `40000040000` a tree), its name bytes and its id
+    /// in hex. A tree git refuses to walk is none: a mode with a byte that is
+    /// no octal digit, an empty mode, an empty name, a cut entry, a tail.
+    #[test]
+    fn a_trees_entries_read_with_ls_trees_modes() {
+        let tree = |named: &[(&str, &str)]| {
+            let mut bytes = Vec::new();
+            for (i, (mode, name)) in (1u8..).zip(named) {
+                bytes.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                bytes.extend_from_slice(&[i; 20]);
+            }
+            bytes
+        };
+        let named = [("100644", "a b.txt"), ("100664", "group.txt"), ("100755", "run.sh"), ("644", "bare.txt"), ("120000", ".claude"), ("40000", "dir"), ("160000", "sub"), ("40000100644", "wrapped.json"), ("40000040000", "wrapped-dir")];
+        let bytes = tree(&named);
+        let got: Vec<(&str, String, String)> = raw_entries(&bytes, 20).unwrap().into_iter().map(|e| (e.mode, String::from_utf8(e.name).unwrap(), e.id)).collect();
+        let want: Vec<(&str, String, String)> = [("100644", "a b.txt", 1u8), ("100644", "group.txt", 2), ("100755", "run.sh", 3), ("160000", "bare.txt", 4), ("120000", ".claude", 5), ("40000", "dir", 6), ("160000", "sub", 7), ("100644", "wrapped.json", 8), ("40000", "wrapped-dir", 9)]
+            .into_iter()
+            .map(|(m, n, i)| (m, n.to_string(), hex::encode([i; 20])))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(raw_entries(b"", 20).map(|e| e.len()), Some(0), "an empty tree");
+        assert!(raw_entries(&bytes[..bytes.len() - 5], 20).is_none(), "the last id cut");
+        let mut tail = bytes.clone();
+        tail.extend_from_slice(b"zz");
+        assert!(raw_entries(&tail, 20).is_none(), "a tail that is no entry");
+        for bad in [[("100644", "a"), ("x1", "bad")], [("100644", "a"), ("", "no-mode")], [("100644", "a"), ("+100644", "signed")], [("100644", "a"), ("100644", "")]] {
+            assert!(raw_entries(&tree(&bad), 20).is_none(), "{bad:?}");
+        }
+        assert_eq!((canon_mode(b"100600"), canon_mode(b"040000"), canon_mode(b"")), (Some("100644"), Some("40000"), None));
+        assert_eq!((canon_mode(b"77777777777100644"), canon_mode(b"40000100644"), canon_mode(b"40000040000"), canon_mode(b"40000120000")), (Some("100644"), Some("100644"), Some("40000"), Some("120000")));
+        assert_eq!((canon_mode(b"+100644"), canon_mode(b"100644 "), canon_mode(b"10064x")), (None, None, None));
+    }
+
+    /// S10 F4: what the walk keeps of a deep tree is each tree's own names,
+    /// never a copy of the paths below it per level, and every settings path
+    /// comes out whole, in `ls-tree -r`'s order. 300 levels of 100-character
+    /// names over 100 directories with a `.claude/settings.json` each (a pack
+    /// of some 60 KB from a VM): the walk keeps under 64 KiB of names, where
+    /// a copy per level would hold some 450 MB of paths; each of the 100
+    /// paths is 30 KB long. A directory whose only settings-named file is
+    /// outside a `.claude` is not kept, and that file never comes out; a
+    /// `.claude` link comes out as one.
+    #[test]
+    fn a_deep_walk_keeps_each_trees_own_names_and_builds_each_path_once() {
+        use std::collections::HashMap;
+        let id = |n: usize| format!("{n:040x}");
+        let entry = |mode: &'static str, name: &str, of: usize| RawEntry { mode, name: name.as_bytes().to_vec(), id: id(of) };
+        let mut trees: HashMap<String, Vec<RawEntry>> = HashMap::new();
+        // The bottom (tree 1): 100 directories (trees 1000…), each holding a `.claude` (trees 2000…) with its settings
+        // file (blobs 3000…); a `settings.json` beside them and a `cfg` (tree 4) holding one, outside any `.claude`.
+        let mut bottom: Vec<RawEntry> = (0..100).map(|i| entry("40000", &format!("d{i:02}"), 1000 + i)).collect();
+        bottom.push(entry("40000", "cfg", 4));
+        bottom.push(entry("100644", "settings.json", 9));
+        trees.insert(id(1), bottom);
+        trees.insert(id(4), vec![entry("100644", "settings.json", 10)]);
+        for i in 0..100 {
+            trees.insert(id(1000 + i), vec![entry("40000", ".claude", 2000 + i)]);
+            trees.insert(id(2000 + i), vec![entry("100644", "settings.json", 3000 + i)]);
+        }
+        let name = |level: usize| format!("{level:03}{}", "n".repeat(97));
+        // Levels 300 (the root, tree 10300) down to 1 (tree 10001), each the next one's only entry; level 1 names
+        // the bottom; the root holds a `.claude` link too.
+        for level in 1..=300 {
+            let below = if level == 1 { 1 } else { 10_000 + level - 1 };
+            let mut entries = vec![entry("40000", &name(level), below)];
+            if level == 300 {
+                entries.insert(0, entry("120000", ".Claude", 8));
+            }
+            trees.insert(id(10_000 + level), entries);
+        }
+        let mut memo = HashMap::new();
+        kept_of(&id(10_300), &trees, &mut memo);
+        let names: usize = memo.values().flat_map(|k| k.iter()).map(|k| match k {
+            Kept::Tree { name, .. } | Kept::Entry { name, .. } => name.len(),
+        }).sum();
+        assert!(names < 64 << 10, "{names} bytes of names kept");
+        assert!(!memo[&id(1)].iter().any(|k| matches!(k, Kept::Tree { name, .. } if name == "cfg")), "cfg's settings.json is outside a .claude: cfg is not kept");
+        let mut got: Vec<(String, &str, String, SettingsKind)> = Vec::new();
+        assert!(each_setting(&memo[&id(10_300)], |path, mode, id, kind| got.push((path.to_string(), mode, id.to_string(), kind))), "some 600 nodes and 3 MB of paths: within the caps");
+        let prefix: String = (1..=300).rev().map(|level| format!("{}/", name(level))).collect();
+        let mut want = vec![(".Claude".to_string(), "120000", id(8), SettingsKind::ClaudeLink)];
+        want.extend((0..100).map(|i| (format!("{prefix}d{i:02}/.claude/settings.json"), "100644", id(3000 + i), SettingsKind::File("settings.json"))));
+        assert_eq!(got.len(), want.len());
+        assert!(got == want, "the paths, whole, in order");
+        assert!(got[1].0.len() > 30_000);
+        // One tip's reads: each file once, the link a finding; a file HEAD holds at its path is skipped.
+        let held: HashMap<String, String> = [(want[1].0.clone(), id(3000)), (want[2].0.clone(), id(7))].into_iter().collect();
+        let mut steps: Vec<(String, Option<&str>)> = Vec::new();
+        assert!(tip_settings(&memo[&id(10_300)], &held, |path, _, name| steps.push((path.to_string(), name))));
+        assert_eq!(steps.len(), 100, "the link, and 99 files: d00's blob is HEAD's at its path, d01's is not");
+        assert_eq!((steps[0].1, steps[1].0.ends_with("/d01/.claude/settings.json"), steps[1].1), (None, true, Some("settings.json")));
+    }
+
+    /// Every name the Mac's disk folds to `name` (lowercase ASCII,
+    /// [`folds_to`]): each letter in either case, an `s` also U+017F, a `k`
+    /// also U+212A.
+    fn folded(name: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for c in name.chars() {
+            let forms: Vec<char> = match c {
+                's' => vec!['s', 'S', '\u{17f}'],
+                'k' => vec!['k', 'K', '\u{212a}'],
+                c if c.is_ascii_alphabetic() => vec![c, c.to_ascii_uppercase()],
+                c => vec![c],
+            };
+            out = out.into_iter().flat_map(|p| forms.iter().map(move |f| format!("{p}{f}"))).collect();
+        }
+        out
+    }
+
+    /// S10 phase 4 (F4-WALK-1): a walk stops at once past its caps, and says
+    /// so. 41 trees whose every level names the one below twice (`a`, `b`)
+    /// over one `.claude/settings.json` route 2^40 paths to it (git's own
+    /// `ls-tree -r` would list them all): each path costs the walk four
+    /// nodes, so it hands on about a quarter of [`SETTINGS_WALK_MAX`] of
+    /// them (65 536 nodes: never four times that, phase 4b V-5) and returns
+    /// false, and a tip's reads stop at the same path. 300 levels of 3000-byte names over a `.claude`
+    /// of 2000 names that fold to `settings.json` (of 13 824; each path some
+    /// 900 KB) stop on the bytes, after a few paths, far below the node cap.
+    #[test]
+    fn a_walk_past_its_caps_stops_at_once() {
+        use std::collections::HashMap;
+        let id = |n: usize| format!("{n:040x}");
+        let entry = |mode: &'static str, name: &str, of: usize| RawEntry { mode, name: name.as_bytes().to_vec(), id: id(of) };
+        // Tree 1 holds `.claude` (tree 2), which holds settings.json (blob 3); level k (1..=40, tree 100 + k) names
+        // level k - 1 (level 0 is tree 1) as `a` and as `b`.
+        let level = |k: usize| if k == 0 { 1 } else { 100 + k };
+        let mut trees: HashMap<String, Vec<RawEntry>> = HashMap::new();
+        trees.insert(id(1), vec![entry("40000", ".claude", 2)]);
+        trees.insert(id(2), vec![entry("100644", "settings.json", 3)]);
+        for k in 1..=40 {
+            trees.insert(id(level(k)), vec![entry("40000", "a", level(k - 1)), entry("40000", "b", level(k - 1))]);
+        }
+        let mut memo = HashMap::new();
+        kept_of(&id(level(40)), &trees, &mut memo);
+        assert_eq!(memo.len(), 42, "41 trees and .claude's, each kept once");
+        let root = &memo[&id(level(40))];
+        let mut seen = 0usize;
+        let whole = each_setting(root, |path, _, _, kind| {
+            assert!(path.len() == 40 * 2 + ".claude/settings.json".len() && kind == SettingsKind::File("settings.json"), "{path}");
+            seen += 1;
+        });
+        // Four nodes a path (a level's `a` or `b`, amortized over its two, then `.claude` and `settings.json`): the
+        // walk stops at the cap itself, never at a multiple of it.
+        assert!(!whole && seen > SETTINGS_WALK_MAX / 8 && seen <= SETTINGS_WALK_MAX / 4, "{seen} paths handed on of 2^40 (four nodes a path), whole: {whole}");
+        assert_eq!(SETTINGS_WALK_MAX, 1 << 16, "S10 §14: one walk visits at most 65 536 kept nodes");
+        let mut steps = 0usize;
+        assert!(!tip_settings(root, &HashMap::new(), |_, _, _| steps += 1));
+        assert_eq!(steps, seen, "each path read once, up to the same stop");
+        let variants = folded("settings.json");
+        assert_eq!(variants.len(), 13_824);
+        assert!(variants.iter().all(|v| folds_to(v, "settings.json")) && variants.iter().collect::<HashSet<_>>().len() == variants.len());
+        let mut trees: HashMap<String, Vec<RawEntry>> = HashMap::new();
+        trees.insert(id(2000), variants.iter().take(2000).enumerate().map(|(i, n)| entry("100644", n, 3000 + i)).collect());
+        trees.insert(id(1000), vec![entry("40000", ".claude", 2000)]);
+        for k in 1..=300 {
+            trees.insert(id(1000 + k), vec![entry("40000", &format!("{k:03}{}", "n".repeat(2997)), 1000 + k - 1)]);
+        }
+        let mut memo = HashMap::new();
+        kept_of(&id(1300), &trees, &mut memo);
+        let mut seen = 0usize;
+        assert!(!each_setting(&memo[&id(1300)], |path, _, _, _| {
+            assert!(path.len() > 900_000, "{}", path.len());
+            seen += 1;
+        }), "past the byte cap");
+        assert!((1..5).contains(&seen), "{seen} paths of some 900 KB each, of 2000");
+    }
+
+    /// S10 phase 4 (F4-WALK-1): what a tip keeps of its settings findings:
+    /// the first [`SETTINGS_FINDINGS_MAX`], and past them the first of each
+    /// rule not among them. A file's findings cut to what a fresh tip keeps
+    /// ([`SettingsKept::kept_of`]) lose nothing any tip keeps of them,
+    /// whatever it kept before.
+    #[test]
+    fn a_tip_keeps_its_first_settings_findings_and_each_rule() {
+        use crate::bridge::scan::SettingsFinding;
+        let f = |line: usize, rule: &'static str| SettingsFinding { line, rule, key: format!("k{line}") };
+        let mut file: Vec<SettingsFinding> = (1..=30).map(|i| f(i, "bypass-permissions")).collect();
+        file.insert(25, f(99, "repo-hooks"));
+        file.push(f(100, "repo-hooks"));
+        let cut = SettingsKept::kept_of(file.clone());
+        assert_eq!(cut.iter().map(|f| f.line).collect::<Vec<_>>(), (1..=20).chain([99]).collect::<Vec<_>>(), "the first 20, then repo-hooks' first");
+        for before in [vec![], vec!["broad-allow"; 3], vec!["bypass-permissions"; 25], vec!["repo-hooks"; 20], vec!["broad-allow"; 19]] {
+            let kept = |of: &[SettingsFinding]| {
+                let mut k = SettingsKept::default();
+                for rule in &before {
+                    k.admit(rule);
+                }
+                of.iter().filter(|f| k.admit(f.rule)).map(|f| f.line).collect::<Vec<_>>()
+            };
+            assert_eq!(kept(&cut), kept(&file), "after {before:?}");
+        }
+    }
+
+    /// S10 phase 4 (F4-WALK-2): a ref's settings findings after its
+    /// objects': a `blob-too-large` the objects' scan named at the same
+    /// place is not named twice; any other finding is appended as it is.
+    #[test]
+    fn a_settings_blob_too_large_is_named_once() {
+        let at = |location: &str, rule: &str| Finding { location: location.into(), object: Some("3f2a91c0e4b1".into()), line: 0, rule: rule.into(), key: None };
+        let mut findings = vec![at("box/x:.claude/settings.json", BLOB_TOO_LARGE)];
+        extend_settings(&mut findings, vec![at("box/x:.claude/settings.json", BLOB_TOO_LARGE), at("box/x:.claude/Settings.json", BLOB_TOO_LARGE), at("box/x:.claude", SETTINGS_SYMLINK), at("box/x:.claude", SETTINGS_SYMLINK)]);
+        let got: Vec<(&str, &str)> = findings.iter().map(|f| (f.location.as_str(), f.rule.as_str())).collect();
+        assert_eq!(got, [("box/x:.claude/settings.json", BLOB_TOO_LARGE), ("box/x:.claude/Settings.json", BLOB_TOO_LARGE), ("box/x:.claude", SETTINGS_SYMLINK), ("box/x:.claude", SETTINGS_SYMLINK)]);
     }
 
     /// F6: a refusal holds at most 20 lines. Twenty findings are all named;

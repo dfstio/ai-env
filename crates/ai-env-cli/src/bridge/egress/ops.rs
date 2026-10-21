@@ -42,6 +42,8 @@ pub const RELOAD_EXEC_S: u32 = 1500;
 /// squid`): above its fetch retries (≈ 310 s).
 pub const STATUS_EXEC_S: u32 = 400;
 /// `executionTimeout` of `dnf -y upgrade --security --releasever=latest` and the squid restart.
+/// S10 (F6): [`super::cli::PATCH_SCRIPT`] bounds dnf inside it (`timeout -k 30 1740`), so a hung
+/// dnf's tail is still printed.
 pub const PATCH_EXEC_S: u32 = 1800;
 
 /// A bounded poll: at most `tries` looks, `step` apart.

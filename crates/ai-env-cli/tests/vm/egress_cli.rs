@@ -1366,6 +1366,10 @@ fn proxy_patch_upgrades_then_restarts_squid_and_proves_it_serves() {
     t.invocation("ssm.get-command-invocation.1.json", 0, &format!("{before}\nNothing to do.\nComplete!\n{}\n", before.replace("before:", "after:")), "");
     let o = t.run(&["proxy", "patch"]);
     assert!(code(&o) == 0 && stdout(&o).contains("(the release and squid unchanged)"), "{}", stdout(&o));
+    // SSM cut the output before the after line (the document before S10): squid's package from the status run.
+    t.invocation("ssm.get-command-invocation.1.json", 0, &format!("{before}\nComplete!\n"), "");
+    let o = t.run(&["proxy", "patch"]);
+    assert!(code(&o) == 0 && stdout(&o).contains("after:  squid-6.13-1.amzn2023.0.1.aarch64 (from the status run; SSM cut the patch's output)") && stdout(&o).contains("squid=active"), "{}", stdout(&o));
     t.invocation("ssm.get-command-invocation.1.json", 0, &format!("{before}\nComplete!\n{after}\n"), "");
     // After the restart squid runs, but not the current parameters: not done.
     t.status_answer(" applied=no");
@@ -1375,7 +1379,7 @@ fn proxy_patch_upgrades_then_restarts_squid_and_proves_it_serves() {
     t.invocation("ssm.get-command-invocation.1.json", 1, "", "Error: Failed to download metadata for repo 'amazonlinux'\n");
     let o = t.run(&["proxy", "patch"]);
     assert!(code(&o) == 7 && stderr(&o).contains("Failed to download metadata"), "{}", stderr(&o));
-    assert_eq!(t.audit_rows("proxy_patch")[3]["detail"]["result"], "Failed exit 1");
+    assert_eq!(t.audit_rows("proxy_patch")[4]["detail"]["result"], "Failed exit 1");
     // A stopped proxy is not patched.
     t.proxy("stopped");
     let o = t.run(&["proxy", "patch"]);

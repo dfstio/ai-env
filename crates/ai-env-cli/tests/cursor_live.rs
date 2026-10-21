@@ -10,9 +10,20 @@
 //! `session show --settings-diff` writes (its diff, into the session's
 //! quarantine).
 //!
+//! S10 (part B's B4, in a `target/s8` fixture window whose folder goes in
+//! `WORKSPACE`, never the development chat): `t10_2` to `t10_5` and `t10_p`
+//! chain the audit's rows (`session_move`, `session_move_end`,
+//! `session_park`, `session_unpark`, `agent_reconnect`, `transcript_pull`,
+//! `transcript_push`, `session_remote_end`), in the order they were
+//! written, to the census end rows of their wrappers; T10.4 also reads the
+//! VM rows and the workspace rows (`state/vms`, `state/workspaces`) through
+//! the library, as no command prints them without asking AWS. Each chain is
+//! a pure reader with an offline test.
+//!
 //! Each test is `#[ignore]`d and skips, saying why, unless
 //! `AI_ENV_CURSOR_TESTS=1` and `AI_ENV_CURSOR_STEP` names its step (`t8_3`
-//! to `t8_7`): `make test-cursor STEP=t8_3 SINCE=…` runs
+//! to `t8_7`, `t9_s3`, `t10_2` to `t10_5`, `t10_p`):
+//! `make test-cursor STEP=t8_3 SINCE=…` runs
 //! `AI_ENV_CURSOR_TESTS=1 AI_ENV_CURSOR_STEP=t8_3 AI_ENV_CURSOR_SINCE=…
 //! cargo test -p ai-env-cli --features bridge --test cursor_live --
 //! --ignored --nocapture`. `AI_ENV_CURSOR_SINCE` is required (S9, L10): an
@@ -23,16 +34,28 @@
 //! never part of `make test`; the readers' own offline tests are.
 
 use ai_env_cli::bridge::config::Paths;
+use ai_env_cli::bridge::remote::link::{LossCause, MigrateTrigger, MoveKind};
+use ai_env_cli::bridge::remote::{audit_event, census_part};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The steps, as `AI_ENV_CURSOR_STEP` names them (S9: `t9_s3`, the S3 store's chats).
-const STEPS: [&str; 6] = ["t8_3", "t8_4", "t8_5", "t8_6", "t8_7", "t9_s3"];
+/// The steps, as `AI_ENV_CURSOR_STEP` names them (S9: `t9_s3`, the S3 store's chats; S10: `t10_2` to `t10_5` and
+/// `t10_p`, the continuity steps and the placeholder's picker reopen).
+const STEPS: [&str; 11] = ["t8_3", "t8_4", "t8_5", "t8_6", "t8_7", "t9_s3", "t10_2", "t10_3", "t10_4", "t10_5", "t10_p"];
 
 /// The remote sessions' mode notes (`remote::MODE_NOTES`).
 const REMOTE_MODES: [&str; 2] = ["mode:remote", "mode:remote(config)"];
+
+/// T10.2's bound on a reopen onto the VM its closing suspend left (v6 §5, S10: the chat continues within 15 s):
+/// the reopen's `init_ms`, from its census start to the forwarded `initialize` answer.
+const REOPEN_BUDGET_MS: u64 = 15_000;
+
+/// How an `agent_reconnect` row's reason begins after a sleep (`agent::session`'s clock checks): `woke after`
+/// when the wall clock ran on while the monotonic one stood still (the Mac slept: a lid closed), `no frame for`
+/// when both ran on and no frame came (the wrapper stopped: T10.2's SIGSTOP stand-in).
+const SLEEP_REASONS: [&str; 2] = ["woke after", "no frame for"];
 
 /// Whether `step`'s checks run: the gate `AI_ENV_CURSOR_TESTS=1` and `AI_ENV_CURSOR_STEP` naming it; else why not, on
 /// stderr. With the gate set, a step variable that is missing or names no step fails the run.
@@ -158,6 +181,24 @@ fn audit(event: &str, since: u64) -> Vec<Value> {
     let paths = Paths::resolve().expect("the bridge root");
     let rows = ai_env_cli::bridge::audit::read_rows(&paths.audit(), None).expect("the audit");
     rows.into_iter().filter(|r| r["event"] == event && r["ts"].as_str().and_then(ai_env_cli::wire::time::parse_rfc3339_utc).is_some_and(|s| s * 1000 >= since)).collect()
+}
+
+/// Every audit row written at or after `since` (Unix ms), in the order they were written: S10's chains read that
+/// order, as their rows often share a second.
+fn audit_since(since: u64) -> Vec<Value> {
+    let paths = Paths::resolve().expect("the bridge root");
+    let rows = ai_env_cli::bridge::audit::read_rows(&paths.audit(), None).expect("the audit");
+    rows.into_iter().filter(|r| at_ms(r).is_some_and(|t| t >= since)).collect()
+}
+
+/// An audit row's time, the start of its second (`ts`), in Unix ms.
+fn at_ms(row: &Value) -> Option<u64> {
+    row["ts"].as_str().and_then(ai_env_cli::wire::time::parse_rfc3339_utc).map(|s| s * 1000)
+}
+
+/// The detail value `key` of an audit row (every detail value is a string).
+fn detail<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
+    row["detail"][key].as_str()
 }
 
 /// `git args` in `ws` (read-only uses only), its stdout trimmed; exit 0 asserted.
@@ -484,6 +525,510 @@ fn t9_s3_evidence() {
     eprintln!("t9_s3: {id}: {} pushes; the view {messages} messages; reopened kept on {} and restored on {}; {} local resume(s) refused", pushes.len(), part(kept, "vm").unwrap_or_default(), part(restored, "vm").unwrap_or_default(), refused.len());
 }
 
+/// The first of `candidates` (newest first) that `check` passes; else the first one's `Err` (what the newest
+/// lacks), or `none()` when there is no candidate at all.
+fn first_passing<T, R>(candidates: impl IntoIterator<Item = T>, none: impl FnOnce() -> String, mut check: impl FnMut(T) -> Result<R, String>) -> Result<R, String> {
+    let mut why = None;
+    for candidate in candidates {
+        match check(candidate) {
+            Ok(found) => return Ok(found),
+            Err(e) => {
+                why.get_or_insert(e);
+            }
+        }
+    }
+    Err(why.unwrap_or_else(none))
+}
+
+/// Whether a census row ran in `ws` (its cwd there or below).
+fn in_ws(row: &Value, ws: &Path) -> bool {
+    row["cwd"].as_str().is_some_and(|c| Path::new(c).starts_with(ws))
+}
+
+/// The end row of wrapper `pid` whose run holds the second that starts at `at` (Unix ms, an audit row's time):
+/// started by that second's end and ended at or after its start; the newest start should a reused pid match twice.
+fn run_holding(census: &[Value], pid: u64, at: u64) -> Option<&Value> {
+    census.iter().filter(|r| r["pid"].as_u64() == Some(pid) && r["start"].as_u64().is_some_and(|s| s < at + 1000) && r["end"].as_u64().is_some_and(|e| e >= at)).max_by_key(|r| r["start"].as_u64())
+}
+
+/// The chat an end row's run served: its `--resume` id, else (a new chat's argv names none) the `session_id` of
+/// the `session_remote_end` audit row its wrapper wrote right after it, within a minute of the run's end.
+fn served(row: &Value, audit: &[Value]) -> Option<String> {
+    if let Some(id) = resumed(row) {
+        return Some(id);
+    }
+    let (pid, end) = (row["pid"].as_u64()?, row["end"].as_u64()?);
+    audit
+        .iter()
+        .filter(|r| r["event"] == audit_event::SESSION_REMOTE_END && r["pid"].as_u64() == Some(pid) && at_ms(r).is_some_and(|t| t + 999 >= end && t <= end + 60_000))
+        .find_map(|r| r["session_id"].as_str().map(str::to_string))
+}
+
+/// An end row's moves by kind (S10 §4.1, `moves:readdress=<n>,respawn=<n>,migrate=<n>`), in that order; `None`
+/// without the part (no move started) or with a kind or count that does not parse.
+fn moves(row: &Value) -> Option<[u32; 3]> {
+    let kinds = [MoveKind::Readdress, MoveKind::Respawn, MoveKind::Migrate].map(MoveKind::word);
+    let mut n = [0; 3];
+    for kv in part(row, census_part::MOVES)?.split(',') {
+        let (kind, count) = kv.split_once('=')?;
+        n[kinds.iter().position(|k| *k == kind)?] = count.parse().ok()?;
+    }
+    Some(n)
+}
+
+/// An end row's `inits:` or `echoes:` part (S10 §4.1, `<forwarded>/<swallowed>`) as its two counts.
+fn forwarded_swallowed(row: &Value, name: &str) -> Option<(u64, u64)> {
+    let counts = part(row, name)?;
+    let (forwarded, swallowed) = counts.split_once('/')?;
+    Some((forwarded.parse().ok()?, swallowed.parse().ok()?))
+}
+
+/// A note part's value for an evidence line, `-` when the row has none.
+fn shown(row: &Value, name: &str) -> String {
+    part(row, name).unwrap_or_else(|| "-".to_string())
+}
+
+/// T10.2's chain (S10), pure: since `since` (Unix ms), in `ws`, a chat
+/// reopened from the picker (an end row with `--resume`) onto the VM its
+/// closing suspend left (`vm_how:resumed`), its `initialize` answered
+/// within [`REOPEN_BUDGET_MS`] (`init_ms`); the same chat's end row before
+/// it on that VM (the close, [`served`]: a config probe's end row names no
+/// chat); and an `agent_reconnect` audit row of either run's wrapper
+/// (`pid`), carrying that run's spawn and written during it, after a sleep
+/// ([`SLEEP_REASONS`]: `woke after` for the lid, `no frame for` for the
+/// SIGSTOP stand-in), that run's end row showing `link_drops` of 1 or more.
+/// `Ok`: the close's and the reopen's end rows (for [`assert_closed_well`])
+/// and the evidence in one line; `Err`: what the newest reopen lacks, or
+/// that there is none.
+fn reopen_evidence(census: &[Value], audit: &[Value], ws: &Path, since: u64) -> Result<(Value, Value, String), String> {
+    use census_part::{CLOSE_MS, LINK_DROPS, SPAWN, VM, VM_HOW};
+    let ends = remote_ends(census, ws, since);
+    let reopens = ends.iter().rev().filter(|r| resumed(r).is_some() && part(r, VM_HOW).as_deref() == Some("resumed"));
+    let none = || format!("no chat of {} reopened from the picker onto its suspended VM since AI_ENV_CURSOR_SINCE (a remote end row with --resume and vm_how:resumed): close a chat, let the closing suspend run, then reopen it from the picker", ws.display());
+    first_passing(reopens, none, |reopen| {
+        let (id, vm, pid) = (resumed(reopen).unwrap_or_default(), shown(reopen, VM), reopen["pid"].as_u64().unwrap_or(0));
+        let init_ms = part(reopen, "init_ms").and_then(|ms| ms.parse::<u64>().ok()).ok_or_else(|| format!("the reopen of {id} (wrapper pid {pid}) on {vm} never answered initialize (no init_ms)"))?;
+        if init_ms >= REOPEN_BUDGET_MS {
+            return Err(format!("the reopen of {id} (wrapper pid {pid}) on {vm} answered initialize after {init_ms} ms (T10.2: under {REOPEN_BUDGET_MS} ms)"));
+        }
+        let start = reopen["start"].as_u64().unwrap_or(0);
+        let close = ends
+            .iter()
+            .filter(|c| c["end"].as_u64().is_some_and(|e| e <= start) && part(c, VM).as_deref() == Some(vm.as_str()) && served(c, audit).as_deref() == Some(id.as_str()))
+            .max_by_key(|c| c["end"].as_u64())
+            .ok_or_else(|| format!("no end row of {id} on {vm} before its reopen (wrapper pid {pid}) since AI_ENV_CURSOR_SINCE: the close (a run whose --resume, or whose wrapper's session_remote_end audit row, names the chat)"))?;
+        let slept = [reopen, close].into_iter().find_map(|run| {
+            let (rpid, spawn, from, to) = (run["pid"].as_u64()?, part(run, SPAWN)?, run["start"].as_u64()?, run["end"].as_u64()?);
+            audit
+                .iter()
+                .rev()
+                .find(|a| a["event"] == "agent_reconnect" && a["pid"].as_u64() == Some(rpid) && detail(a, "spawn") == Some(spawn.as_str()) && detail(a, "reason").is_some_and(|w| SLEEP_REASONS.iter().any(|p| w.starts_with(p))) && at_ms(a).is_some_and(|t| t + 999 >= from && t <= to))
+                .map(|a| (run, a))
+        });
+        let Some((run, row)) = slept else {
+            return Err(format!("no agent_reconnect audit row of {id}'s close (wrapper pid {}) or reopen (wrapper pid {pid}) after a sleep (its reason starting woke after, the lid, or no frame for, the wrapper stopped) carrying that run's spawn during it: close the lid for 3 minutes during a turn", close["pid"]));
+        };
+        let drops = part(run, LINK_DROPS).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        if drops < 1 {
+            return Err(format!("the run of {id} that slept (wrapper pid {}) shows link_drops {drops}: the sleep at {} lost no link", run["pid"], row["ts"]));
+        }
+        let evidence = format!(
+            "session {id}: closed by wrapper pid {} on {vm} (end:{}, close_ms {}), reopened by wrapper pid {pid} (vm_how:resumed, init_ms {init_ms}, under {REOPEN_BUDGET_MS}); wrapper pid {} slept ({} at {}, spawn {}), link_drops {drops}",
+            close["pid"],
+            shown(close, "end"),
+            shown(close, CLOSE_MS),
+            run["pid"],
+            detail(row, "reason").unwrap_or_default(),
+            row["ts"],
+            detail(row, "spawn").unwrap_or_default()
+        );
+        Ok((close.clone(), reopen.clone(), evidence))
+    })
+}
+
+/// T10.3's chain (S10), pure: since `since` (Unix ms), a `session_move`
+/// audit row of a live re-address off a terminated VM (`kind` readdress,
+/// `cause` vm_gone, `gen` 2 or more: a reopen's carry is generation 1);
+/// the end row of its wrapper (`pid`) whose run holds it, in `ws`, counting
+/// it in `moves` (`readdress` 1 or more) and showing the moved generation's
+/// `initialize` swallowed once (`inits:<n>/1`: the host saw one init for
+/// the turn sent again). Its `session_move_end`, when written (that
+/// wrapper's first after it, before its next move: a cut miss's retry
+/// writes the move's one row under the retry's generation), names where it
+/// went. `Ok`: that end row (for [`assert_closed_well`]) and the evidence
+/// in one line; `Err`: what the newest such move lacks, or that there is
+/// none.
+fn readdress_evidence(census: &[Value], audit: &[Value], ws: &Path, since: u64) -> Result<(Value, String), String> {
+    use census_part::{CUT, ECHOES, INITS, MOVES, MOVE_MS, VM};
+    let (kind, cause) = (MoveKind::Readdress.word(), LossCause::VmGone.word());
+    let moved = audit.iter().enumerate().rev().filter(|(_, r)| r["event"] == audit_event::SESSION_MOVE && at_ms(r).is_some_and(|t| t >= since) && detail(r, "kind") == Some(kind) && detail(r, "cause") == Some(cause) && detail(r, "gen").and_then(|g| g.parse::<u32>().ok()).is_some_and(|g| g >= 2));
+    let none = || "no session_move audit row of kind readdress whose cause is vm_gone (a live move, generation 2 or more: a reopen's carry is generation 1) since AI_ENV_CURSOR_SINCE: ai-env vm terminate the chat's VM during a turn in Cursor (T10.3)".to_string();
+    first_passing(moved, none, |(i, mv)| {
+        let pid = mv["pid"].as_u64().ok_or_else(|| format!("the session_move row names no pid: {mv}"))?;
+        let (session, gen, from) = (detail(mv, "session").unwrap_or("-"), detail(mv, "gen").unwrap_or("-"), detail(mv, "from_vm").unwrap_or("-"));
+        let end = run_holding(census, pid, at_ms(mv).unwrap_or_default()).ok_or_else(|| format!("no census end row of wrapper pid {pid} whose run holds its move at {}: close the chat (or reload Cursor), then check", mv["ts"]))?;
+        if !in_ws(end, ws) {
+            return Err(format!("the chat that moved at {} (wrapper pid {pid}) ran in {}, not in {} (AI_ENV_CURSOR_WORKSPACE)", mv["ts"], end["cwd"], ws.display()));
+        }
+        if moves(end).is_none_or(|n| n[0] < 1) {
+            return Err(format!("the end row of wrapper pid {pid} shows moves:{} where the re-address counts (readdress=1 or more)", shown(end, MOVES)));
+        }
+        if forwarded_swallowed(end, INITS).is_none_or(|(forwarded, swallowed)| forwarded < 1 || swallowed != 1) {
+            return Err(format!("the end row of wrapper pid {pid} shows inits:{} where the moved generation's init, swallowed once, reads inits:<n>/1", shown(end, INITS)));
+        }
+        let ours = |event: &str, r: &Value| r["event"] == event && r["pid"].as_u64() == Some(pid);
+        let went = audit[i + 1..]
+            .iter()
+            .take_while(|r| !ours(audit_event::SESSION_MOVE, r))
+            .find(|r| ours(audit_event::SESSION_MOVE_END, r))
+            .map_or_else(|| "-".to_string(), |r| format!("{} to {}", detail(r, "outcome").unwrap_or("-"), detail(r, "to_vm").unwrap_or("-")));
+        let evidence = format!(
+            "session {session}: wrapper pid {pid} moved it off {from} at {} (gen {gen}, readdress, vm_gone; its end: {went}); the end row on {}: moves:{}, move_ms:{}, cut:{}, inits:{}, echoes:{}",
+            mv["ts"],
+            shown(end, VM),
+            shown(end, MOVES),
+            shown(end, MOVE_MS),
+            shown(end, CUT),
+            shown(end, INITS),
+            shown(end, ECHOES)
+        );
+        Ok((end.clone(), evidence))
+    })
+}
+
+/// T10.4's chain (S10), pure: since `since` (Unix ms), either (a) a wall
+/// migration: a `session_move_end` audit row of kind migrate, done, and
+/// its `session_move` before it (the same wrapper and generation: phase
+/// B's) whose trigger is the wall; the end row of that wrapper whose run
+/// holds the move, in `ws`, counting it (`moves` migrate 1 or more); the
+/// old VM's row (`vm_rows`, as `registry::view` shows one) terminated by
+/// migrate; the move's seed from the old VM's last fetch (`seed` box); and
+/// a workspace row (`ws_rows`) recording the new VM seeded at or after the
+/// move's start (`seeded_at`: a kept seed rewrites no entry, so a reused
+/// VM's earlier seed is never this one) with a WIP snapshot (`seeded_wip`:
+/// the edit that fetch brought); or else (b) a reopen that carried its
+/// chat off its VM first (an end row in `ws` with `--resume` and
+/// `carried:migrate`, near the wall, or `carried:readdress`, past it).
+/// `Ok`: the chat's end row (for [`assert_closed_well`]) and the evidence
+/// in one line; `Err`: what the newest wall migration lacks, and that no
+/// reopen carried a chat.
+fn migration_evidence(census: &[Value], audit: &[Value], vm_rows: &[Value], ws_rows: &[Value], ws: &Path, since: u64) -> Result<(Value, String), String> {
+    use census_part::{CARRIED, MOVES, SEED, TRANSCRIPT, VM, VM_HOW};
+    let (migrate, wall) = (MoveKind::Migrate.word(), MigrateTrigger::Wall { left_s: 0 }.word());
+    let done = audit.iter().enumerate().rev().filter(|(_, r)| r["event"] == audit_event::SESSION_MOVE_END && at_ms(r).is_some_and(|t| t >= since) && detail(r, "kind") == Some(migrate) && detail(r, "outcome") == Some("done"));
+    let none = || "no migration done since AI_ENV_CURSOR_SINCE (a session_move_end audit row of kind migrate, outcome done)".to_string();
+    let walled = first_passing(done, none, |(i, moved)| {
+        let pid = moved["pid"].as_u64().ok_or_else(|| format!("the session_move_end row names no pid: {moved}"))?;
+        let (gen, from, to) = (detail(moved, "gen").unwrap_or("-"), detail(moved, "from_vm").unwrap_or("-"), detail(moved, "to_vm").unwrap_or("-"));
+        let start = audit[..i]
+            .iter()
+            .rev()
+            .find(|r| r["event"] == audit_event::SESSION_MOVE && r["pid"].as_u64() == Some(pid) && detail(r, "gen") == Some(gen) && detail(r, "kind") == Some(migrate))
+            .ok_or_else(|| format!("the migration of wrapper pid {pid} off {from} (gen {gen}) has no session_move row before its end at {}", moved["ts"]))?;
+        let trigger = detail(start, "trigger").unwrap_or("-");
+        if trigger != wall {
+            return Err(format!("the migration of wrapper pid {pid} off {from} at {} was triggered by {trigger}, not the wall: T10.4 (a) waits for the wall's margin (migrate_before_wall_s)", start["ts"]));
+        }
+        let end = run_holding(census, pid, at_ms(start).unwrap_or_default()).ok_or_else(|| format!("no census end row of wrapper pid {pid} whose run holds its migration at {}: close the chat (or reload Cursor), then check", start["ts"]))?;
+        if !in_ws(end, ws) {
+            return Err(format!("the chat that migrated at {} (wrapper pid {pid}) ran in {}, not in {} (AI_ENV_CURSOR_WORKSPACE)", start["ts"], end["cwd"], ws.display()));
+        }
+        if moves(end).is_none_or(|n| n[2] < 1) {
+            return Err(format!("the end row of wrapper pid {pid} shows moves:{} where the migration counts (migrate=1 or more)", shown(end, MOVES)));
+        }
+        let old = vm_rows.iter().find(|v| v["id"].as_str() == Some(from)).ok_or_else(|| format!("the old VM {from} has no row in state/vms (gc removes a terminated row after 7 days)"))?;
+        let by = old["terminated_by"].as_str().unwrap_or("-");
+        if by != migrate {
+            return Err(format!("the old VM {from}'s row says terminated_by {by} (status {}): the migration's terminate, by migrate once the new VM's spawn started, did not mark it", old["status"]));
+        }
+        let seed = detail(moved, "seed").unwrap_or("-");
+        if seed != "box" {
+            // `kept` under a carry is C1's occupied: phase A reused a VM another chat's checkout changed.
+            let fix = if seed == "kept" {
+                format!("{to} was reused and kept another chat's changed checkout (occupied): terminate the workspace's other suspended VMs, then run T10.4 (a) again")
+            } else {
+                "leave an uncommitted edit in the chat before the wall (T10.4 (a))".to_string()
+            };
+            return Err(format!("the migration of wrapper pid {pid} seeded {to} from {seed}, not from {from}'s last fetch (seed box): {fix}"));
+        }
+        // In seconds, as `seeded_at` is: phase B's seed follows its `session_move`, in that second or later.
+        let moved_s = at_ms(start).unwrap_or_default() / 1000;
+        let wip = ws_rows
+            .iter()
+            .find_map(|w| {
+                let entry = &w["vm"][to];
+                entry["seeded_at"].as_u64().filter(|s| *s >= moved_s).and_then(|_| entry["seeded_wip"].as_str()).filter(|c| !c.is_empty())
+            })
+            .ok_or_else(|| format!("no workspace row records the new VM {to} seeded with a WIP snapshot at or after the migration's start at {} (seeded_wip, seeded_at): leave an uncommitted edit before the wall (T10.4 (a))", start["ts"]))?;
+        let evidence = format!(
+            "a wall migration: wrapper pid {pid} moved session {} off {from} to {to} at {} (gen {gen}, how {}, seed {}, transcript {}); {from} terminated by migrate (leaving_for {}); {to} seeded with the WIP {wip}; the end row: moves:{}",
+            detail(moved, "session").unwrap_or("-"),
+            moved["ts"],
+            detail(moved, "how").unwrap_or("-"),
+            detail(moved, "seed").unwrap_or("-"),
+            detail(moved, "transcript").unwrap_or("-"),
+            old["leaving_for"].as_str().unwrap_or("-"),
+            shown(end, MOVES)
+        );
+        Ok((end.clone(), evidence))
+    });
+    let why = match walled {
+        Ok(found) => return Ok(found),
+        Err(why) => why,
+    };
+    let Some(end) = remote_ends(census, ws, since).into_iter().rev().find(|r| resumed(r).is_some() && part(r, CARRIED).is_some()) else {
+        return Err(format!("{why}; nor did a reopen carry a chat off its VM in {} since AI_ENV_CURSOR_SINCE (an end row with --resume and carried:migrate, near the wall, or carried:readdress, past it)", ws.display()));
+    };
+    let evidence = format!(
+        "a reopen's carry: session {} reopened by wrapper pid {} carried:{} onto {} (vm_how:{}, seed:{}, transcript:{}, moves:{})",
+        resumed(&end).unwrap_or_default(),
+        end["pid"],
+        shown(&end, CARRIED),
+        shown(&end, VM),
+        shown(&end, VM_HOW),
+        shown(&end, SEED),
+        shown(&end, TRANSCRIPT),
+        shown(&end, MOVES)
+    );
+    Ok((end, evidence))
+}
+
+/// T10.5's chain (S10), pure: since `since` (Unix ms), in the order the
+/// audit's rows were written: a park at a permission prompt
+/// (`session_park`, `why` prompt) and its unpark by the answer (that
+/// spawn's `session_unpark` after it, `by` control_response); then a move
+/// of that wrapper's chat (`session_move`) and its end (that wrapper's
+/// first `session_move_end` after it, before its next move: a cut miss's
+/// retry writes the move's one row under the retry's generation; done: the
+/// new VM); then a subtree pull, a `transcript_pull` of the chat into the
+/// new VM by that wrapper, written, from the move's start on, beyond the
+/// main transcript's one restore (unless the move's `transcript` is kept
+/// or none: a missing or unknown word counts one): the subagents' files
+/// follow the spawn. The end row of the wrapper whose run
+/// holds the move is in `ws`. `Ok`: that end row (for
+/// [`assert_closed_well`]) and the evidence in one line; `Err`: what the
+/// newest move lacks, or that there is none.
+fn park_evidence(census: &[Value], audit: &[Value], ws: &Path, since: u64) -> Result<(Value, String), String> {
+    use audit_event::{SESSION_MOVE, SESSION_MOVE_END, SESSION_PARK, SESSION_UNPARK, TRANSCRIPT_PULL};
+    use census_part::{MOVES, PARK, UNPARK_RESUMED};
+    let rows: Vec<&Value> = audit.iter().filter(|r| at_ms(r).is_some_and(|t| t >= since)).collect();
+    let moved = rows.iter().enumerate().rev().filter(|(_, r)| r["event"] == SESSION_MOVE);
+    let none = || "no session_move audit row since AI_ENV_CURSOR_SINCE: after the park and a Task-tool turn, ai-env vm terminate the chat's VM, then send the next message (T10.5's move)".to_string();
+    first_passing(moved, none, |(p, &mv)| {
+        let pid = mv["pid"].as_u64().ok_or_else(|| format!("the session_move row names no pid: {mv}"))?;
+        let ours = |event: &str, r: &Value| r["event"] == event && r["pid"].as_u64() == Some(pid);
+        let (before, after) = (&rows[..p], &rows[p + 1..]);
+        let (park, unpark) = before
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, r)| ours(SESSION_UNPARK, r) && detail(r, "by") == Some("control_response"))
+            .find_map(|(q, &unpark)| {
+                let spawn = detail(unpark, "spawn")?;
+                let park = before[..q].iter().rev().find(|r| ours(SESSION_PARK, r) && detail(r, "spawn") == Some(spawn))?;
+                (detail(park, "why") == Some("prompt")).then_some((*park, unpark))
+            })
+            .ok_or_else(|| format!("wrapper pid {pid} parked at no prompt before its move at {} (a session_park row with why prompt, then that spawn's session_unpark by control_response, the answer): leave the permission prompt unanswered past park_after_s and max_idle_s, then answer it", mv["ts"]))?;
+        let (session, gen) = (detail(mv, "session").unwrap_or("-"), detail(mv, "gen").unwrap_or("-"));
+        let done = after.iter().take_while(|r| !ours(SESSION_MOVE, r)).find(|r| ours(SESSION_MOVE_END, r)).ok_or_else(|| format!("the move of wrapper pid {pid} at {} (gen {gen}) has no session_move_end row: its claude never started on the new VM", mv["ts"]))?;
+        let outcome = detail(done, "outcome").unwrap_or("-");
+        if outcome != "done" {
+            return Err(format!("the move of wrapper pid {pid} at {} (gen {gen}) ended {outcome}, not done", mv["ts"]));
+        }
+        let to = detail(done, "to_vm").unwrap_or("-");
+        let pulled = after.iter().filter(|r| ours(TRANSCRIPT_PULL, r) && detail(r, "session") == Some(session) && detail(r, "vm") == Some(to) && detail(r, "outcome") == Some("written")).count();
+        let main = usize::from(!matches!(detail(done, "transcript"), Some("kept" | "none")));
+        let subtree = pulled.saturating_sub(main);
+        if subtree == 0 {
+            return Err(format!(
+                "no subtree pull into {to} after the move of wrapper pid {pid} at {}: {pulled} transcript_pull row(s) of {session} written there, the main transcript's {main} (transcript:{}): run a Task-tool turn and wait for its sync before the terminate",
+                mv["ts"],
+                detail(done, "transcript").unwrap_or("-")
+            ));
+        }
+        let end = run_holding(census, pid, at_ms(mv).unwrap_or_default()).ok_or_else(|| format!("no census end row of wrapper pid {pid} whose run holds its move at {}: close the chat (or reload Cursor), then check", mv["ts"]))?;
+        if !in_ws(end, ws) {
+            return Err(format!("the chat that moved at {} (wrapper pid {pid}) ran in {}, not in {} (AI_ENV_CURSOR_WORKSPACE)", mv["ts"], end["cwd"], ws.display()));
+        }
+        let evidence = format!(
+            "session {session}: wrapper pid {pid} parked spawn {} on {} at a prompt at {} (quiet_ms {}), unparked by the answer at {} (vm_state {}, {} ms); moved off {} to {to} at {} ({}, gen {gen}); {subtree} subtree pull(s) into {to} beside the main transcript's {main}; the end row: park:{}, unpark_resumed:{}, moves:{}",
+            detail(park, "spawn").unwrap_or("-"),
+            detail(park, "vm").unwrap_or("-"),
+            park["ts"],
+            detail(park, "quiet_ms").unwrap_or("-"),
+            unpark["ts"],
+            detail(unpark, "vm_state").unwrap_or("-"),
+            detail(unpark, "ms").unwrap_or("-"),
+            detail(mv, "from_vm").unwrap_or("-"),
+            mv["ts"],
+            detail(mv, "kind").unwrap_or("-"),
+            shown(end, PARK),
+            shown(end, UNPARK_RESUMED),
+            shown(end, MOVES)
+        );
+        Ok((end.clone(), evidence))
+    })
+}
+
+/// The placeholder's picker reopen (S10 F11, S9's left-over check), pure:
+/// since `since` (Unix ms), in `ws`, a new chat's first end row (no
+/// `--resume`; its chat named by its wrapper's `session_remote_end` audit
+/// row, [`served`]) that closed before any `transcript_push` of that chat
+/// (none at or before its end: the Mac held only the placeholder view,
+/// `Remote chat`), then a reopen of it from the picker (`--resume`) on
+/// that same VM (both end rows naming it, `vm:`) with its transcript kept
+/// there (`transcript:kept`), inside its wall: not carried off it
+/// (`carried:`, a reopen near or past the wall). `Ok`: the first run's and
+/// the reopen's end rows and the evidence in one line; `Err`: what the
+/// newest kept reopen lacks, or that there is none.
+fn placeholder_evidence(census: &[Value], audit: &[Value], ws: &Path, since: u64) -> Result<(Value, Value, String), String> {
+    use census_part::{CARRIED, CLOSE_MS, TRANSCRIPT, VM, VM_HOW};
+    let ends = remote_ends(census, ws, since);
+    let kept = ends.iter().rev().filter(|r| resumed(r).is_some() && part(r, TRANSCRIPT).as_deref() == Some("kept") && part(r, CARRIED).is_none());
+    let none = || format!("no chat of {} reopened from the picker with its transcript kept on its VM since AI_ENV_CURSOR_SINCE (a remote end row with --resume and transcript:kept, not carried:): open a new chat, close it before its first sync, then reopen it from the picker while its VM is still reusable", ws.display());
+    first_passing(kept, none, |reopen| {
+        let (id, pid) = (resumed(reopen).unwrap_or_default(), reopen["pid"].as_u64().unwrap_or(0));
+        let vm = part(reopen, VM).ok_or_else(|| format!("{id} was reopened kept (wrapper pid {pid}) but its end row names no VM"))?;
+        let start = reopen["start"].as_u64().unwrap_or(0);
+        let first = ends
+            .iter()
+            .filter(|f| resumed(f).is_none() && f["end"].as_u64().is_some_and(|e| e <= start) && served(f, audit).as_deref() == Some(id.as_str()))
+            .min_by_key(|f| f["start"].as_u64())
+            .ok_or_else(|| format!("{id} was reopened kept on {vm} (wrapper pid {pid}), but no new chat's end row before it served it since AI_ENV_CURSOR_SINCE (no --resume; its wrapper's session_remote_end audit row names the chat): open the new chat after the step's start"))?;
+        if part(first, VM).as_deref() != Some(vm.as_str()) {
+            return Err(format!("{id} began on {} (wrapper pid {}) and was reopened on {vm}: the reopen did not find its VM", shown(first, VM), first["pid"]));
+        }
+        let closed = first["end"].as_u64().unwrap_or(0);
+        if let Some(push) = audit.iter().find(|r| r["event"] == audit_event::TRANSCRIPT_PUSH && detail(r, "session") == Some(id.as_str()) && at_ms(r).is_some_and(|t| t <= closed)) {
+            return Err(format!("{id}'s first run (wrapper pid {}) synced before it closed (transcript_push at {}): close a new chat before its first sync", first["pid"], push["ts"]));
+        }
+        let evidence = format!(
+            "session {id}: a new chat (wrapper pid {}) on {vm} closed before any transcript_push of it (end:{}, close_ms {}), then reopened from the picker by wrapper pid {pid} on {vm} (vm_how:{}, transcript:kept, init_ms {})",
+            first["pid"],
+            shown(first, "end"),
+            shown(first, CLOSE_MS),
+            shown(reopen, VM_HOW),
+            shown(reopen, "init_ms")
+        );
+        Ok((first.clone(), reopen.clone(), evidence))
+    })
+}
+
+/// Every workspace row (`state/workspaces/<slug>.toml`, read through the library: no command prints them), as
+/// its JSON; a file that does not read is left out.
+fn workspace_rows(paths: &Paths) -> Vec<Value> {
+    let Ok(dir) = std::fs::read_dir(paths.workspaces()) else {
+        return Vec::new();
+    };
+    dir.filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".toml")).map(str::to_string))
+        .filter_map(|slug| ai_env_cli::bridge::workspace::rows::read(paths, &slug).ok())
+        .flat_map(|rows| rows.ws.into_values())
+        .filter_map(|row| serde_json::to_value(row).ok())
+        .collect()
+}
+
+/// T10.2 (S10, B4): a chat closed well, its VM suspended by the closing
+/// suspend, then reopened from the picker onto that VM (`vm_how:resumed`)
+/// within 15 s, and a sleep during a turn (the lid closed for 3 minutes,
+/// or the wrapper stopped) that cost a link and came back:
+/// [`reopen_evidence`]. Both runs closed well.
+#[test]
+#[ignore = "live evidence after T10.2 in Cursor: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t10_2 SINCE=… WORKSPACE=…"]
+fn t10_2_evidence() {
+    if !chosen("t10_2") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let (close, reopen, evidence) = reopen_evidence(&census(), &audit_since(since), &ws, since).unwrap_or_else(|why| panic!("T10.2: {why}"));
+    eprintln!("t10_2: {evidence}");
+    assert_closed_well(&close);
+    assert_closed_well(&reopen);
+}
+
+/// T10.3 (S10, B4): a chat whose VM was terminated during a turn moved to
+/// a new VM by itself ([`readdress_evidence`]: the move's audit row, the
+/// end row's `moves` and `inits:<n>/1`) and closed well; both dup probes
+/// were recorded no-duplicate since the step; and `move-note` was recorded
+/// `shown` (`probes::check_move_note_verdict`) beside the census's
+/// evidence of a move (`probes::move_evidence`).
+#[test]
+#[ignore = "live evidence after T10.3 in Cursor: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t10_3 SINCE=… WORKSPACE=…"]
+fn t10_3_evidence() {
+    if !chosen("t10_3") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let census = census();
+    let (end, evidence) = readdress_evidence(&census, &audit_since(since), &ws, since).unwrap_or_else(|why| panic!("T10.3: {why}"));
+    eprintln!("t10_3: {evidence}");
+    assert_closed_well(&end);
+    for probe in ["dup-init", "dup-user-replay"] {
+        let newest = lab_rows(probe, since).pop().unwrap_or_else(|| panic!("{probe}: nothing recorded since AI_ENV_CURSOR_SINCE (ai-env lab run {probe} --manual VERDICT, after the move)"));
+        assert_eq!(newest["verdict"].as_str(), Some("no-duplicate"), "{probe}: {newest}");
+    }
+    let rows: Vec<Value> = census.into_iter().filter(|r| r["start"].as_u64().unwrap_or(0) >= since && in_ws(r, &ws)).collect();
+    let moved = ai_env_cli::bridge::probes::move_evidence(&rows).unwrap_or_else(|why| panic!("move-note's evidence: {why}"));
+    let note = lab_rows("move-note", since).pop().unwrap_or_else(|| panic!("move-note: nothing recorded since AI_ENV_CURSOR_SINCE (ai-env lab run move-note --manual VERDICT, after the move in Cursor)"));
+    let verdict = note["verdict"].as_str().unwrap_or_default();
+    ai_env_cli::bridge::probes::check_move_note_verdict(verdict).unwrap_or_else(|why| panic!("{why}: {note}"));
+    assert_eq!(verdict, "shown", "move-note: Cursor did not show the move's informational line: {note}");
+    eprintln!("t10_3: move-note {verdict}; {moved}");
+}
+
+/// T10.4 (S10): a wall migration between turns (the move's audit rows,
+/// the old VM's row terminated by migrate, the new VM seeded with the
+/// WIP), or a reopen that carried its chat off its VM first (`carried:`):
+/// [`migration_evidence`]. The chat closed well.
+#[test]
+#[ignore = "live evidence after T10.4 in Cursor: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t10_4 SINCE=… WORKSPACE=…"]
+fn t10_4_evidence() {
+    use ai_env_cli::bridge::vm::registry;
+    if !chosen("t10_4") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let paths = Paths::resolve().expect("the bridge root");
+    let vm_rows: Vec<Value> = registry::list_rows(&paths).expect("the VM rows").iter().map(registry::view).collect();
+    let (end, evidence) = migration_evidence(&census(), &audit_since(since), &vm_rows, &workspace_rows(&paths), &ws, since).unwrap_or_else(|why| panic!("T10.4: {why}"));
+    eprintln!("t10_4: {evidence}");
+    assert_closed_well(&end);
+}
+
+/// T10.5 (S10, B4): a chat parked at a permission prompt and unparked by
+/// the answer, then moved to a new VM, its subagents' files pulled into it
+/// after the main transcript: [`park_evidence`]. It closed well. That the
+/// tool ran and the subagents' files are on the new VM's disk is checked
+/// by hand (`vm exec ls`).
+#[test]
+#[ignore = "live evidence after T10.5 in Cursor: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t10_5 SINCE=… WORKSPACE=…"]
+fn t10_5_evidence() {
+    if !chosen("t10_5") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let (end, evidence) = park_evidence(&census(), &audit_since(since), &ws, since).unwrap_or_else(|why| panic!("T10.5: {why}"));
+    eprintln!("t10_5: {evidence}");
+    assert_closed_well(&end);
+}
+
+/// F11 (S10, B4): a new chat closed before its first sync, then reopened
+/// from the picker on its VM with its transcript kept:
+/// [`placeholder_evidence`]. The reopen closed well; the first run may
+/// have closed mid-turn (`end:eof_kill`). Cursor's picker listing `Remote
+/// chat` is seen by hand.
+#[test]
+#[ignore = "live evidence after the placeholder's reopen in Cursor: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t10_p SINCE=… WORKSPACE=…"]
+fn t10_p_evidence() {
+    if !chosen("t10_p") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let (_, reopen, evidence) = placeholder_evidence(&census(), &audit_since(since), &ws, since).unwrap_or_else(|why| panic!("the placeholder's reopen: {why}"));
+    eprintln!("t10_p: {evidence}");
+    assert_closed_well(&reopen);
+}
+
 /// Offline (no gate, nothing live): the readers the checks rest on take the
 /// census's and the view's shapes: note parts by name (`vm` is not
 /// `vm_how`), remote end rows of the workspace since a time, a `--resume`
@@ -595,4 +1140,277 @@ fn reconnect_evidence_chains_the_drop_to_its_wrapper() {
     assert!(err(&census, &no_pid, &reconnects).starts_with("the drop_transport row names no wrapper pid"));
     // `all` (0) reads the earlier drop too: the newest one still decides.
     assert_eq!(reconnect_evidence(&census, &drops, &reconnects, 0).unwrap().0, census[1]);
+}
+
+/// The workspace of the S10 readers' offline tests (a `target/s8` fixture's).
+const FIXTURE_WS: &str = "/Users/mike/Documents/DeFi/ai-env/target/s8/w";
+
+/// S10 (T10.2): the reopen's chain, offline. The newest reopen onto a
+/// resumed VM within 15 s; the same chat's close before it on that VM,
+/// named by its wrapper's `session_remote_end` row (a config probe's end
+/// row on the VM names no chat, so it is never the close); a reconnect
+/// after a sleep (`woke after`, or `no frame for`) of either run's wrapper
+/// and spawn, during that run, which lost a link. Each broken link is
+/// named.
+#[test]
+fn reopen_evidence_chains_the_close_the_reopen_and_the_sleep() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-20T10:00:00Z"));
+    let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let end_row = |pid: u32, start: &str, end: &str, resume: Option<&str>, note: &str| {
+        let argv: Vec<&str> = ["/x/ai-env-claude", "/x/claude"].into_iter().chain(resume.map(|id| ["--resume", id]).into_iter().flatten()).collect();
+        serde_json::json!({"pid": pid, "start": t(start), "end": t(end), "exit": 0, "cwd": FIXTURE_WS, "argv": argv, "note": format!("mode:remote; {note}")})
+    };
+    let row = |ts: &str, event: &str, pid: u32, session: Option<&str>, detail: Value| serde_json::json!({"v": 1, "ts": ts, "event": event, "session_id": session, "pid": pid, "detail": detail});
+    let remote_end = |ts: &str, pid: u32, session: Option<&str>, spawn: &str| row(ts, "session_remote_end", pid, session, serde_json::json!({"vm": "microvm-a", "spawn": spawn, "gen": "1", "exit": "0", "end": "eof"}));
+    let reconnect = |ts: &str, pid: u32, spawn: &str, reason: &str| row(ts, "agent_reconnect", pid, None, serde_json::json!({"id": "microvm-a", "spawn": spawn, "reason": reason, "ms": "2300"}));
+    let probe = end_row(500, "2026-10-20T10:01:00Z", "2026-10-20T10:01:02Z", None, "end:eof; vm:microvm-a; vm_how:started; spawn:sp-0; close_ms:300; pid_rewrite:ok");
+    let chat = |vm: &str, drops: u32| end_row(501, "2026-10-20T10:01:00Z", "2026-10-20T10:05:00Z", None, &format!("end:eof; vm:{vm}; vm_how:started; spawn:sp-1; init_ms:9000; close_ms:600; link_drops:{drops}; pid_rewrite:ok"));
+    let reopen = |how: &str, init_ms: &str, drops: u32| end_row(502, "2026-10-20T10:20:00Z", "2026-10-20T10:40:00Z", Some(sid), &format!("end:eof; vm:microvm-a; vm_how:{how}; spawn:sp-2; init_ms:{init_ms}; close_ms:700; link_drops:{drops}; pid_rewrite:ok"));
+    let census = vec![probe.clone(), chat("microvm-a", 0), reopen("resumed", "4200", 1)];
+    let ends = [remote_end("2026-10-20T10:01:02Z", 500, None, "sp-0"), remote_end("2026-10-20T10:05:00Z", 501, Some(sid), "sp-1"), remote_end("2026-10-20T10:40:00Z", 502, Some(sid), "sp-2")];
+    let audit = |extra: &[Value]| ends.iter().chain(extra).cloned().collect::<Vec<Value>>();
+    let lid = [reconnect("2026-10-20T10:30:00Z", 502, "sp-2", "woke after 181 s asleep")];
+    let (close, back, evidence) = reopen_evidence(&census, &audit(&lid), ws, since).unwrap();
+    assert_eq!((&close, &back), (&census[1], &census[2]), "the chat's close (never the probe's end row), then its reopen");
+    assert_eq!(evidence, format!("session {sid}: closed by wrapper pid 501 on microvm-a (end:eof, close_ms 600), reopened by wrapper pid 502 (vm_how:resumed, init_ms 4200, under 15000); wrapper pid 502 slept (woke after 181 s asleep at \"2026-10-20T10:30:00Z\", spawn sp-2), link_drops 1"));
+    assert_closed_well(&close);
+    assert_closed_well(&back);
+    // The SIGSTOP stand-in's reason, and a sleep in the close's run, pass too.
+    let stopped = reopen_evidence(&census, &audit(&[reconnect("2026-10-20T10:31:00Z", 502, "sp-2", "no frame for 190 s")]), ws, since).unwrap().2;
+    assert!(stopped.ends_with("wrapper pid 502 slept (no frame for 190 s at \"2026-10-20T10:31:00Z\", spawn sp-2), link_drops 1"), "{stopped}");
+    let early = [probe.clone(), chat("microvm-a", 1), reopen("resumed", "4200", 0)];
+    let slept_first = reopen_evidence(&early, &audit(&[reconnect("2026-10-20T10:03:00Z", 501, "sp-1", "woke after 200 s asleep")]), ws, since).unwrap().2;
+    assert!(slept_first.contains("; wrapper pid 501 slept (woke after 200 s asleep at \"2026-10-20T10:03:00Z\", spawn sp-1), link_drops 1"), "{slept_first}");
+    // Each broken link, named.
+    let err = |census: &[Value], extra: &[Value]| reopen_evidence(census, &audit(extra), ws, since).unwrap_err();
+    assert!(err(&[probe.clone(), chat("microvm-a", 0), reopen("reused", "4200", 1)], &lid).starts_with(&format!("no chat of {FIXTURE_WS} reopened from the picker onto its suspended VM since AI_ENV_CURSOR_SINCE")), "a reused VM: no closing suspend ran");
+    assert!(err(&[probe.clone(), chat("microvm-a", 0), reopen("resumed", "15000", 1)], &lid).ends_with(&format!("{sid} (wrapper pid 502) on microvm-a answered initialize after 15000 ms (T10.2: under 15000 ms)")));
+    let no_close = format!("no end row of {sid} on microvm-a before its reopen (wrapper pid 502) since AI_ENV_CURSOR_SINCE");
+    assert!(err(&[probe.clone(), chat("microvm-b", 0), reopen("resumed", "4200", 1)], &lid).starts_with(&no_close), "the close on another VM");
+    assert!(reopen_evidence(&census, &[ends[0].clone(), ends[2].clone(), lid[0].clone()], ws, since).unwrap_err().starts_with(&no_close), "no session_remote_end row names the close's chat");
+    assert!(reopen_evidence(&census, &audit(&lid), ws, t("2026-10-20T10:02:00Z")).unwrap_err().starts_with(&no_close), "the close before the step");
+    let no_sleep = format!("no agent_reconnect audit row of {sid}'s close (wrapper pid 501) or reopen (wrapper pid 502) after a sleep");
+    assert!(err(&census, &[reconnect("2026-10-20T10:30:00Z", 502, "sp-2", "dropped by session drop-transport")]).starts_with(&no_sleep), "a drop's reconnect, not a sleep's");
+    assert!(err(&census, &[reconnect("2026-10-20T10:30:00Z", 502, "sp-9", "woke after 181 s asleep")]).starts_with(&no_sleep), "another spawn's");
+    assert!(err(&census, &[reconnect("2026-10-20T10:45:00Z", 502, "sp-2", "woke after 181 s asleep")]).starts_with(&no_sleep), "after the run");
+    assert!(err(&[probe, chat("microvm-a", 0), reopen("resumed", "4200", 0)], &lid).ends_with(&format!("the run of {sid} that slept (wrapper pid 502) shows link_drops 0: the sleep at \"2026-10-20T10:30:00Z\" lost no link")));
+}
+
+/// S10 (T10.3): the re-address's chain, offline. The newest live move off
+/// a terminated VM (kind readdress, cause vm_gone, generation 2 or more: a
+/// reopen's carry, generation 1, never counts), chained to its wrapper's
+/// end row in the workspace, which counts the move and one swallowed init;
+/// its `session_move_end` names where it went (under a cut miss's retry's
+/// generation too). Each broken link is named.
+#[test]
+fn readdress_evidence_chains_the_move_to_its_end_row() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-20T10:00:00Z"));
+    let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let end_row = |cwd: &str, moves: &str, inits: &str| {
+        let note = format!("mode:remote; end:eof; vm:microvm-b; vm_how:started; spawn:sp-2; init_ms:9000; {moves}move_ms:41000; cut:at; inits:{inits}; echoes:2/1; close_ms:600; link_drops:0; pid_rewrite:ok");
+        serde_json::json!({"pid": 601, "start": t("2026-10-20T10:01:00Z"), "end": t("2026-10-20T10:20:00Z"), "exit": 0, "cwd": cwd, "argv": ["/x/ai-env-claude", "/x/claude"], "note": note})
+    };
+    let row = |ts: &str, event: &str, pid: u32, detail: Value| serde_json::json!({"v": 1, "ts": ts, "event": event, "session_id": sid, "pid": pid, "detail": detail});
+    let moved = |ts: &str, pid: u32, gen: &str, cause: &str| row(ts, "session_move", pid, serde_json::json!({"session": sid, "gen": gen, "kind": "readdress", "cause": cause, "from_vm": "microvm-a", "outstanding": "1", "cancelled": "0"}));
+    let went = row("2026-10-20T10:05:41Z", "session_move_end", 601, serde_json::json!({"session": sid, "gen": "2", "kind": "readdress", "outcome": "done", "from_vm": "microvm-a", "to_vm": "microvm-b", "how": "started", "seed": "box", "transcript": "restored", "cut": "at", "touchid": "asked", "ms": "41000"}));
+    let counted = "moves:readdress=1,respawn=0,migrate=0; ";
+    let census = vec![end_row(FIXTURE_WS, counted, "2/1")];
+    // A reopen's carry off a gone VM (generation 1, newer here) is never T10.3's move.
+    let audit = vec![moved("2026-10-20T10:05:00Z", 601, "2", "vm_gone"), went, moved("2026-10-20T10:30:00Z", 602, "1", "vm_gone")];
+    let (end, evidence) = readdress_evidence(&census, &audit, ws, since).unwrap();
+    assert_eq!(end, census[0]);
+    assert_eq!(evidence, format!("session {sid}: wrapper pid 601 moved it off microvm-a at \"2026-10-20T10:05:00Z\" (gen 2, readdress, vm_gone; its end: done to microvm-b); the end row on microvm-b: moves:readdress=1,respawn=0,migrate=0, move_ms:41000, cut:at, inits:2/1, echoes:2/1"));
+    assert_closed_well(&end);
+    assert!(readdress_evidence(&census, &audit[..1], ws, since).unwrap().1.contains("(gen 2, readdress, vm_gone; its end: -)"), "its end not written yet");
+    // A cut miss's retry writes the move's one end row under its own generation (gen 3 for the gen 2 move).
+    let mut retried = audit.clone();
+    retried[1]["detail"]["gen"] = serde_json::json!("3");
+    assert!(readdress_evidence(&census, &retried, ws, since).unwrap().1.contains("(gen 2, readdress, vm_gone; its end: done to microvm-b)"), "the retry's end row");
+    // Each broken link, named.
+    let err = |census: &[Value], audit: &[Value], since: u64| readdress_evidence(census, audit, ws, since).unwrap_err();
+    let none = "no session_move audit row of kind readdress whose cause is vm_gone (a live move, generation 2 or more";
+    assert!(err(&census, &[moved("2026-10-20T10:05:00Z", 601, "2", "unreachable")], since).starts_with(none), "an unreachable VM's move");
+    assert!(err(&census, &audit, t("2026-10-20T10:06:00Z")).starts_with(none), "before the step");
+    assert!(err(&census, &audit[2..], since).starts_with(none), "a reopen's carry alone");
+    assert!(err(&[], &audit, since).starts_with("no census end row of wrapper pid 601 whose run holds its move at \"2026-10-20T10:05:00Z\""));
+    assert!(err(&[end_row("/Users/mike/Documents/DeFi/ai-env", counted, "2/1")], &audit, since).contains(&format!("not in {FIXTURE_WS} (AI_ENV_CURSOR_WORKSPACE)")), "the development checkout");
+    assert!(err(&[end_row(FIXTURE_WS, "", "2/1")], &audit, since).contains("shows moves:- where the re-address counts"));
+    assert!(err(&[end_row(FIXTURE_WS, "moves:readdress=0,respawn=1,migrate=0; ", "2/1")], &audit, since).contains("shows moves:readdress=0,respawn=1,migrate=0 where"));
+    assert!(err(&[end_row(FIXTURE_WS, counted, "2/0")], &audit, since).contains("shows inits:2/0 where the moved generation's init, swallowed once, reads inits:<n>/1"));
+    // The parts' readers.
+    let note = |n: &str| serde_json::json!({"note": format!("mode:remote; {n}")});
+    assert_eq!(moves(&note("moves:readdress=2,respawn=1,migrate=0")), Some([2, 1, 0]));
+    assert_eq!((moves(&note("moves:readdress=1,teleport=1")), moves(&note("end:eof"))), (None, None), "an unknown kind; no part");
+    assert_eq!((forwarded_swallowed(&note("inits:3/1"), "inits"), forwarded_swallowed(&note("inits:3"), "inits")), (Some((3, 1)), None));
+}
+
+/// S10 (T10.4): the migration's chain, offline. (a) A wall migration done
+/// (phase B's `session_move` and its end; phase A's row before it is the
+/// live generation's), its wrapper's end row counting it, the old VM's row
+/// terminated by migrate, the new VM seeded with a WIP by this move (seed
+/// box, seeded in or after its start's second); else (b) a reopen's carry
+/// (`carried:`). Each broken link of (a) is named, with (b)'s absence: a
+/// reused VM's earlier seed and a kept or Mac seed among them.
+#[test]
+fn migration_evidence_takes_a_wall_migration_or_a_reopens_carry() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-20T10:00:00Z"));
+    let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let end_row = |moves: &str| {
+        let note = format!("mode:remote; end:eof; vm:microvm-b; vm_how:started; spawn:sp-2; init_ms:9000; moves:{moves}; move_ms:30000; cut:none; inits:3/0; echoes:3/0; close_ms:600; link_drops:0; pid_rewrite:ok");
+        serde_json::json!({"pid": 701, "start": t("2026-10-20T10:00:00Z"), "end": t("2026-10-20T10:30:00Z"), "exit": 0, "cwd": FIXTURE_WS, "argv": ["/x/ai-env-claude", "/x/claude"], "note": note})
+    };
+    let row = |ts: &str, event: &str, detail: Value| serde_json::json!({"v": 1, "ts": ts, "event": event, "session_id": sid, "pid": 701, "detail": detail});
+    let started = |ts: &str, gen: &str, trigger: &str| row(ts, "session_move", serde_json::json!({"session": sid, "gen": gen, "kind": "migrate", "trigger": trigger, "from_vm": "microvm-a", "outstanding": "0", "cancelled": "0"}));
+    let ended = |outcome: &str| {
+        row("2026-10-20T10:12:30Z", "session_move_end", serde_json::json!({"session": sid, "gen": "2", "kind": "migrate", "outcome": outcome, "from_vm": "microvm-a", "to_vm": "microvm-b", "how": "started", "seed": "box", "transcript": "restored", "cut": "none", "touchid": "asked", "ms": "30000"}))
+    };
+    let audit = |trigger: &str, outcome: &str| vec![started("2026-10-20T10:10:00Z", "1", trigger), started("2026-10-20T10:12:00Z", "2", trigger), ended(outcome)];
+    let vm_row = |by: &str| serde_json::json!({"id": "microvm-a", "status": "terminated", "terminated_by": by, "leaving_for": "microvm-b"});
+    // `seeded_at` in Unix seconds, as `rows::record_seed` writes it; phase B's seed follows its `session_move` (10:12:00).
+    let ws_row = |at: &str, wip: Option<&str>| serde_json::json!({"root": FIXTURE_WS, "vm": {"microvm-b": {"seeded_at": t(at) / 1000, "mode": "clone", "seeded_wip": wip}}});
+    let seeded = |wip: Option<&str>| ws_row("2026-10-20T10:12:10Z", wip);
+    let census = vec![end_row("readdress=0,respawn=0,migrate=1")];
+    let vms = [vm_row("migrate"), serde_json::json!({"id": "microvm-b", "status": "running", "terminated_by": null})];
+    let wip = "c0ffee0000000000000000000000000000000001";
+    let (end, evidence) = migration_evidence(&census, &audit("wall", "done"), &vms, &[seeded(Some(wip))], ws, since).unwrap();
+    assert_eq!(end, census[0]);
+    assert_eq!(evidence, format!("a wall migration: wrapper pid 701 moved session {sid} off microvm-a to microvm-b at \"2026-10-20T10:12:30Z\" (gen 2, how started, seed box, transcript restored); microvm-a terminated by migrate (leaving_for microvm-b); microvm-b seeded with the WIP {wip}; the end row: moves:readdress=0,respawn=0,migrate=1"));
+    assert_closed_well(&end);
+    assert!(migration_evidence(&census, &audit("wall", "done"), &vms, &[ws_row("2026-10-20T10:12:00Z", Some(wip))], ws, since).is_ok(), "a seed in the move's own second");
+    // Each broken link of (a), named, when no reopen carried a chat.
+    let err = |census: &[Value], audit: &[Value], vms: &[Value], wip: Option<&str>| migration_evidence(census, audit, vms, &[seeded(wip)], ws, since).unwrap_err();
+    let nor = format!("; nor did a reopen carry a chat off its VM in {FIXTURE_WS} since AI_ENV_CURSOR_SINCE (an end row with --resume and carried:migrate, near the wall, or carried:readdress, past it)");
+    let why = err(&census, &audit("wall", "done"), &[vm_row("platform")], Some(wip));
+    assert!(why.starts_with("the old VM microvm-a's row says terminated_by platform (status \"terminated\")") && why.ends_with(&nor), "{why}");
+    assert!(err(&census, &audit("wall", "done"), &[], Some(wip)).starts_with("the old VM microvm-a has no row in state/vms"));
+    let no_wip = "no workspace row records the new VM microvm-b seeded with a WIP snapshot at or after the migration's start at \"2026-10-20T10:12:00Z\" (seeded_wip, seeded_at)";
+    assert!(err(&census, &audit("wall", "done"), &vms, None).starts_with(no_wip));
+    let stale = migration_evidence(&census, &audit("wall", "done"), &vms, &[ws_row("2026-10-20T10:05:00Z", Some(wip))], ws, since).unwrap_err();
+    assert!(stale.starts_with(no_wip), "a reused VM an earlier chat seeded before the move: {stale}");
+    for seed in ["kept", "mac"] {
+        let mut other = audit("wall", "done");
+        other[2]["detail"]["seed"] = serde_json::json!(seed);
+        let why = err(&census, &other, &vms, Some(wip));
+        assert!(why.starts_with(&format!("the migration of wrapper pid 701 seeded microvm-b from {seed}, not from microvm-a's last fetch (seed box)")), "{why}");
+        assert!(why.contains(if seed == "kept" { "(occupied): terminate the workspace's other suspended VMs" } else { "(seed box): leave an uncommitted edit" }), "{why}");
+    }
+    assert!(err(&census, &audit("command", "done"), &vms, Some(wip)).starts_with("the migration of wrapper pid 701 off microvm-a at \"2026-10-20T10:12:00Z\" was triggered by command, not the wall"), "session migrate's");
+    assert!(err(&census, &audit("wall", "stayed"), &vms, Some(wip)).starts_with("no migration done since AI_ENV_CURSOR_SINCE"), "phase B's fallback to the old VM");
+    assert!(err(&census, &audit("wall", "done")[2..], &vms, Some(wip)).starts_with("the migration of wrapper pid 701 off microvm-a (gen 2) has no session_move row before its end at \"2026-10-20T10:12:30Z\""));
+    assert!(err(&[], &audit("wall", "done"), &vms, Some(wip)).starts_with("no census end row of wrapper pid 701 whose run holds its migration at \"2026-10-20T10:12:00Z\""));
+    assert!(err(&[end_row("readdress=1,respawn=0,migrate=0")], &audit("wall", "done"), &vms, Some(wip)).starts_with("the end row of wrapper pid 701 shows moves:readdress=1,respawn=0,migrate=0 where the migration counts"));
+    // (b): a reopen's carry, whatever (a) lacks.
+    let carry = serde_json::json!({"pid": 702, "start": t("2026-10-20T10:40:00Z"), "end": t("2026-10-20T10:50:00Z"), "exit": 0, "cwd": FIXTURE_WS, "argv": ["/x/ai-env-claude", "/x/claude", "--resume", sid], "note": "mode:remote; end:eof; vm:microvm-c; vm_how:started; seed:seeded; transcript:restored; spawn:sp-3; init_ms:21000; moves:readdress=0,respawn=0,migrate=1; close_ms:600; carried:migrate; pid_rewrite:ok"});
+    let (end, evidence) = migration_evidence(&[census[0].clone(), carry.clone()], &audit("wall", "done"), &[vm_row("platform")], &[], ws, since).unwrap();
+    assert_eq!(end, carry);
+    assert_eq!(evidence, format!("a reopen's carry: session {sid} reopened by wrapper pid 702 carried:migrate onto microvm-c (vm_how:started, seed:seeded, transcript:restored, moves:readdress=0,respawn=0,migrate=1)"));
+    assert_closed_well(&end);
+}
+
+/// S10 (T10.5): the park's chain, offline, in the audit's order. A park
+/// at a prompt and its unpark by the answer, then a move done, then a
+/// subtree pull into the new VM by that wrapper beyond the main
+/// transcript's restore (before or after the move's end row: they race).
+/// The move's end row is the wrapper's first after it, whatever its
+/// generation (a cut miss's retry's). Each broken link is named: no
+/// subtree pull (the main one alone, another wrapper's, another VM's, a
+/// missing transcript word counting the main one), an idle park, an unpark
+/// by a user line or after the move, a failed move, no move end, no move
+/// since the step, no end row.
+#[test]
+fn park_evidence_chains_the_park_the_move_and_the_subtree_pull() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-20T10:00:00Z"));
+    let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let note = "mode:remote; end:eof; vm:microvm-b; vm_how:started; spawn:sp-2; init_ms:9000; moves:readdress=1,respawn=0,migrate=0; move_ms:41000; cut:none; inits:3/0; echoes:3/0; close_ms:600; link_drops:0; park:1; parked_s:610; unpark_ms:2400; unpark_resumed:1; pid_rewrite:ok";
+    let census = vec![serde_json::json!({"pid": 801, "start": t("2026-10-20T10:00:00Z"), "end": t("2026-10-20T10:40:00Z"), "exit": 0, "cwd": FIXTURE_WS, "argv": ["/x/ai-env-claude", "/x/claude"], "note": note})];
+    let row = |ts: &str, event: &str, pid: u32, detail: Value| serde_json::json!({"v": 1, "ts": ts, "event": event, "session_id": null, "pid": pid, "detail": detail});
+    let park = |why: &str| row("2026-10-20T10:05:00Z", "session_park", 801, serde_json::json!({"vm": "microvm-a", "spawn": "sp-1", "why": why, "quiet_ms": "300000"}));
+    let unpark = |ts: &str, by: &str| row(ts, "session_unpark", 801, serde_json::json!({"vm": "microvm-a", "spawn": "sp-1", "by": by, "vm_state": "suspended", "ms": "2400"}));
+    let answered = || unpark("2026-10-20T10:15:00Z", "control_response");
+    let moved = row("2026-10-20T10:20:00Z", "session_move", 801, serde_json::json!({"session": sid, "gen": "2", "kind": "readdress", "cause": "vm_gone", "from_vm": "microvm-a", "outstanding": "1", "cancelled": "0"}));
+    let went = |outcome: &str, transcript: &str| {
+        row("2026-10-20T10:20:30Z", "session_move_end", 801, serde_json::json!({"session": sid, "gen": "2", "kind": "readdress", "outcome": outcome, "from_vm": "microvm-a", "to_vm": "microvm-b", "how": "started", "seed": "box", "transcript": transcript, "cut": "none", "touchid": "asked", "ms": "30000"}))
+    };
+    let pull = |ts: &str, pid: u32, vm: &str| row(ts, "transcript_pull", pid, serde_json::json!({"session": sid, "vm": vm, "parts": "1", "bytes": "2048", "outcome": "written", "ms": "300"}));
+    // The main transcript's restore (M2, before the spawn), then a subagent's file (after the spawn).
+    let (main, sub) = (pull("2026-10-20T10:20:20Z", 801, "microvm-b"), pull("2026-10-20T10:20:31Z", 801, "microvm-b"));
+    let chain = |park: Value, unpark: Value, went: Value, after: &[Value]| -> Vec<Value> { [park, unpark, moved.clone(), main.clone(), went].into_iter().chain(after.iter().cloned()).collect() };
+    let audit = chain(park("prompt"), answered(), went("done", "restored"), std::slice::from_ref(&sub));
+    let (end, evidence) = park_evidence(&census, &audit, ws, since).unwrap();
+    assert_eq!(end, census[0]);
+    assert_eq!(evidence, format!("session {sid}: wrapper pid 801 parked spawn sp-1 on microvm-a at a prompt at \"2026-10-20T10:05:00Z\" (quiet_ms 300000), unparked by the answer at \"2026-10-20T10:15:00Z\" (vm_state suspended, 2400 ms); moved off microvm-a to microvm-b at \"2026-10-20T10:20:00Z\" (readdress, gen 2); 1 subtree pull(s) into microvm-b beside the main transcript's 1; the end row: park:1, unpark_resumed:1, moves:readdress=1,respawn=0,migrate=0"));
+    assert_closed_well(&end);
+    // The subtree's pull races the move's end row; a move whose transcript the new VM kept restores no main one.
+    assert!(park_evidence(&census, &[park("prompt"), answered(), moved.clone(), main.clone(), sub.clone(), went("done", "restored")], ws, since).is_ok());
+    let kept = park_evidence(&census, &chain(park("prompt"), answered(), went("done", "kept"), &[]), ws, since).unwrap().1;
+    assert!(kept.contains("; 1 subtree pull(s) into microvm-b beside the main transcript's 0;"), "{kept}");
+    // A cut miss's retry writes the move's one done row under its own generation (gen 3 for the gen 2 move).
+    let mut retried = went("done", "restored");
+    retried["detail"]["gen"] = serde_json::json!("3");
+    assert!(park_evidence(&census, &chain(park("prompt"), answered(), retried, std::slice::from_ref(&sub)), ws, since).is_ok(), "the retry's done row");
+    // Each broken link, named.
+    let err = |audit: &[Value]| park_evidence(&census, audit, ws, since).unwrap_err();
+    let no_subtree = format!("no subtree pull into microvm-b after the move of wrapper pid 801 at \"2026-10-20T10:20:00Z\": 1 transcript_pull row(s) of {sid} written there, the main transcript's 1 (transcript:restored)");
+    assert!(err(&chain(park("prompt"), answered(), went("done", "restored"), &[])).starts_with(&no_subtree), "the main transcript's restore alone");
+    assert!(err(&chain(park("prompt"), answered(), went("done", "restored"), &[pull("2026-10-20T10:25:00Z", 802, "microvm-b")])).starts_with(&no_subtree), "another wrapper's pull (a reopen's)");
+    assert!(err(&chain(park("prompt"), answered(), went("done", "restored"), &[pull("2026-10-20T10:25:00Z", 801, "microvm-a")])).starts_with(&no_subtree), "a pull into another VM");
+    let mut unworded = went("done", "restored");
+    unworded["detail"].as_object_mut().unwrap().remove("transcript");
+    let why = err(&chain(park("prompt"), answered(), unworded, &[]));
+    assert!(why.ends_with(&format!("1 transcript_pull row(s) of {sid} written there, the main transcript's 1 (transcript:-): run a Task-tool turn and wait for its sync before the terminate")), "a missing word counts the main restore: {why}");
+    let no_prompt = "wrapper pid 801 parked at no prompt before its move at \"2026-10-20T10:20:00Z\" (a session_park row with why prompt, then that spawn's session_unpark by control_response, the answer)";
+    assert!(err(&chain(park("idle"), answered(), went("done", "restored"), std::slice::from_ref(&sub))).starts_with(no_prompt), "an idle park");
+    assert!(err(&chain(park("prompt"), unpark("2026-10-20T10:15:00Z", "user"), went("done", "restored"), std::slice::from_ref(&sub))).starts_with(no_prompt), "unparked by a user line");
+    assert!(err(&[park("prompt"), moved.clone(), unpark("2026-10-20T10:21:00Z", "control_response"), main.clone(), went("done", "restored"), sub.clone()]).starts_with(no_prompt), "the answer after the move");
+    assert!(err(&chain(park("prompt"), answered(), went("failed", "restored"), std::slice::from_ref(&sub))).starts_with("the move of wrapper pid 801 at \"2026-10-20T10:20:00Z\" (gen 2) ended failed, not done"));
+    assert!(err(&[park("prompt"), answered(), moved.clone(), main.clone(), sub.clone()]).ends_with("(gen 2) has no session_move_end row: its claude never started on the new VM"));
+    assert!(park_evidence(&census, &audit, ws, t("2026-10-20T10:30:00Z")).unwrap_err().starts_with("no session_move audit row since AI_ENV_CURSOR_SINCE"));
+    assert!(park_evidence(&[], &audit, ws, since).unwrap_err().starts_with("no census end row of wrapper pid 801 whose run holds its move at \"2026-10-20T10:20:00Z\""));
+}
+
+/// S10 (F11): the placeholder's reopen, offline. A new chat's first run
+/// (its chat named by its wrapper's `session_remote_end` row) closed before
+/// any `transcript_push` of it (the reopen's sync comes after), then its
+/// reopen from the picker kept on that VM, not carried off it. Each broken
+/// link is named: a push before the close, another VM, a run naming no VM,
+/// no row naming the first run's chat, a restore instead of a kept
+/// transcript, a carry.
+#[test]
+fn placeholder_evidence_chains_the_unsynced_close_to_the_kept_reopen() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-20T10:00:00Z"));
+    let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let end_row = |pid: u32, start: &str, end: &str, resume: bool, note: &str| {
+        let argv: Vec<&str> = ["/x/ai-env-claude", "/x/claude"].into_iter().chain(resume.then_some(["--resume", sid]).into_iter().flatten()).collect();
+        serde_json::json!({"pid": pid, "start": t(start), "end": t(end), "exit": 0, "cwd": FIXTURE_WS, "argv": argv, "note": format!("mode:remote; {note}")})
+    };
+    // Closed during its first turn (S9 B6 (j): end:eof_kill), then reopened on its VM.
+    let first = |vm: &str| end_row(901, "2026-10-20T10:01:00Z", "2026-10-20T10:02:30Z", false, &format!("end:eof_kill; vm:{vm}; vm_how:started; spawn:sp-1; init_ms:9000; close_ms:1261; link_drops:0; pid_rewrite:ok"));
+    let reopen = |transcript: &str, carried: &str| end_row(902, "2026-10-20T10:05:00Z", "2026-10-20T10:10:00Z", true, &format!("end:eof; vm:microvm-a; vm_how:reused; transcript:{transcript}; spawn:sp-2; init_ms:3000; close_ms:600; link_drops:0; {carried}pid_rewrite:ok"));
+    let row = |ts: &str, event: &str, pid: u32, session: Option<&str>, detail: Value| serde_json::json!({"v": 1, "ts": ts, "event": event, "session_id": session, "pid": pid, "detail": detail});
+    let named = row("2026-10-20T10:02:30Z", "session_remote_end", 901, Some(sid), serde_json::json!({"vm": "microvm-a", "spawn": "sp-1", "gen": "1", "exit": "0", "end": "eof_kill"}));
+    let push = |ts: &str, pid: u32| row(ts, "transcript_push", pid, None, serde_json::json!({"session": sid, "vm": "microvm-a", "kind": "main", "from": "0", "len": "4096", "s3_status": "200", "ms": "200"}));
+    let census = vec![first("microvm-a"), reopen("kept", "")];
+    let audit = vec![named.clone(), push("2026-10-20T10:06:00Z", 902)];
+    let (began, back, evidence) = placeholder_evidence(&census, &audit, ws, since).unwrap();
+    assert_eq!((&began, &back), (&census[0], &census[1]));
+    assert_eq!(evidence, format!("session {sid}: a new chat (wrapper pid 901) on microvm-a closed before any transcript_push of it (end:eof_kill, close_ms 1261), then reopened from the picker by wrapper pid 902 on microvm-a (vm_how:reused, transcript:kept, init_ms 3000)"));
+    assert_closed_well(&back);
+    // Each broken link, named.
+    let err = |census: &[Value], audit: &[Value]| placeholder_evidence(census, audit, ws, since).unwrap_err();
+    assert!(err(&census, &[named.clone(), push("2026-10-20T10:02:00Z", 901)]).starts_with(&format!("{sid}'s first run (wrapper pid 901) synced before it closed (transcript_push at \"2026-10-20T10:02:00Z\")")));
+    assert!(err(&[first("microvm-b"), reopen("kept", "")], &audit).starts_with(&format!("{sid} began on microvm-b (wrapper pid 901) and was reopened on microvm-a")));
+    // Two runs naming no VM never match on the missing part.
+    let unplaced = end_row(901, "2026-10-20T10:01:00Z", "2026-10-20T10:02:30Z", false, "end:eof_kill; spawn:sp-1; close_ms:1261; link_drops:0; pid_rewrite:ok");
+    let reopened_nowhere = end_row(902, "2026-10-20T10:05:00Z", "2026-10-20T10:10:00Z", true, "end:eof; transcript:kept; close_ms:600; pid_rewrite:ok");
+    assert_eq!(err(&[unplaced.clone(), reopened_nowhere], &audit), format!("{sid} was reopened kept (wrapper pid 902) but its end row names no VM"));
+    assert!(err(&[unplaced, reopen("kept", "")], &audit).starts_with(&format!("{sid} began on - (wrapper pid 901) and was reopened on microvm-a")), "the first run names no VM");
+    assert!(err(&census, &audit[1..]).starts_with(&format!("{sid} was reopened kept on microvm-a (wrapper pid 902), but no new chat's end row before it served it")), "no session_remote_end row names the first run's chat");
+    let none = format!("no chat of {FIXTURE_WS} reopened from the picker with its transcript kept on its VM since AI_ENV_CURSOR_SINCE");
+    assert!(err(&[first("microvm-a"), reopen("restored", "")], &audit).starts_with(&none), "restored into a new VM");
+    assert!(err(&[first("microvm-a"), reopen("kept", "carried:migrate; ")], &audit).starts_with(&none), "carried off a VM near its wall");
 }

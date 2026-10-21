@@ -97,7 +97,15 @@ impl SysOps for TestSys {
     fn set_clock(&self, _: u64) -> Result<(), String> {
         panic!("a test must never step the clock")
     }
+    /// S10: a guest of 7852 MiB (the platform's 2048 MiB image minimum,
+    /// as S9 measured, is not what the guest sees).
+    fn meminfo(&self) -> Option<String> {
+        Some(MEMINFO.to_string())
+    }
 }
+
+/// [`TestSys`]'s `/proc/meminfo` (S10).
+const MEMINFO: &str = "MemTotal:        8040964 kB\nMemFree:         7612048 kB\nMemAvailable:    7703512 kB\n";
 
 fn uid_gid() -> (u32, u32) {
     (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw())
@@ -1560,10 +1568,10 @@ async fn a_delivered_credential_is_cached_and_shown_by_name_only() {
     s.run(true).await;
     let (mut w, has, caps, view) = hello_view(s.app).await;
     assert!(!has && view == CredentialView::default(), "nothing cached yet: {view:?}");
-    assert_eq!(caps, [CAP_CREDENTIAL_CACHE]);
+    assert_eq!(caps, bare_caps());
     let (st, _, body) = http(s.app, "GET", "/health", b"", None).await;
     assert_eq!(st, 200, "{body}");
-    assert_eq!(serde_json::from_str::<Health>(&body).unwrap().caps, [CAP_CREDENTIAL_CACHE], "{body}");
+    assert_eq!(serde_json::from_str::<Health>(&body).unwrap().caps, bare_caps(), "{body}");
     let value = dummy_value("cached");
     deliver(&mut w, &value, Some("seal-1")).await;
     let (_second, has, _, view) = hello_view(s.app).await;
@@ -2693,7 +2701,8 @@ impl Vm {
 
 /// The caps of a shim that serves the workspace (S9): `credential_cache`,
 /// `workspace_v1`, then `git_http_v1` and `transcript_s3_v1` once their
-/// routes are served (`shim::gitcgi::SERVED`, `shim::s3xfer::SERVED`).
+/// routes are served (`shim::gitcgi::SERVED`, `shim::s3xfer::SERVED`); S10:
+/// then `park_v1` once the park is (`shim::agent::PARK_SERVED`).
 fn shim_caps() -> Vec<&'static str> {
     let mut caps = vec![CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1];
     if ai_env_cli::shim::gitcgi::SERVED {
@@ -2701,6 +2710,19 @@ fn shim_caps() -> Vec<&'static str> {
     }
     if ai_env_cli::shim::s3xfer::SERVED {
         caps.push(CAP_TRANSCRIPT_S3_V1);
+    }
+    if ai_env_cli::shim::agent::PARK_SERVED {
+        caps.push(ai_env_cli::wire::frame::CAP_PARK_V1);
+    }
+    caps
+}
+
+/// The caps of a shim without a helper: `credential_cache`, and S10's
+/// `park_v1` once the park is served (with or without a helper).
+fn bare_caps() -> Vec<&'static str> {
+    let mut caps = vec![CAP_CREDENTIAL_CACHE];
+    if ai_env_cli::shim::agent::PARK_SERVED {
+        caps.push(ai_env_cli::wire::frame::CAP_PARK_V1);
     }
     caps
 }
@@ -2752,7 +2774,7 @@ async fn code_port_answers_401_then_the_seed_routes_with_the_bearer() {
         let (st, _, b) = http_with(old.code, "GET", p, &bearer_header(TOKEN), b"").await;
         assert!(st == 404 && b == NO_SUCH_ROUTE, "{p}: {st} {b}");
     }
-    assert_eq!(serde_json::from_str::<Health>(&http(old.app, "GET", "/health", b"", None).await.2).unwrap().caps, [CAP_CREDENTIAL_CACHE]);
+    assert_eq!(serde_json::from_str::<Health>(&http(old.app, "GET", "/health", b"", None).await.2).unwrap().caps, bare_caps());
     assert!(old.detail().await.0.workspace.is_none());
 }
 
@@ -3747,4 +3769,618 @@ async fn a_gzip_request_cut_short_never_looks_complete() {
     assert_eq!(st, 200, "{head}");
     let (body, complete) = dechunk(&raw);
     assert!(body.is_empty() && !complete, "{}", String::from_utf8_lossy(&raw));
+}
+
+// ---- S10: the park (`park_v1`), the persisted seed record, the suspend's work, the guest's memory ----
+//
+// plans/s10-contracts.md §1.2, §1.5, §6.4. The park's spawns run in a fresh
+// home (`spawning_stack`). Natively the busy check is its stdio part (the
+// CPU sampler is Linux's), so a park here asks a window of 0 unless the
+// window is what the test is about.
+
+use ai_env_cli::wire::frame::{Chunk, ParkOwner, ParkRefusal, SpawnDetail, CAP_PARK_V1, PARK_GRACE_MAX_S};
+
+/// The wrapper every park here names (the golden's: a pid and a start in October 2026).
+const PARK_OWNER: ParkOwner = ParkOwner { pid: 51_234, started: 1_792_483_200 };
+
+/// A `park` of `id`: its grace, its busy-check window, 500 ms of CPU a sample, stdout not held.
+fn park_frame(id: &SpawnId, grace_s: u32, min_quiet_s: u32) -> Frame {
+    Frame::Park { spawn_id: id.clone(), grace_s, min_quiet_s, cpu_busy_ms: 500, hold_output: false, owner: PARK_OWNER }
+}
+
+/// Send `frame` (a `park`) and read its answer; the socket's spawns' frames before it are passed over.
+async fn park(w: &mut Ws, frame: &Frame) -> Frame {
+    send_frame(w, frame).await;
+    loop {
+        match next_frame(w).await {
+            Ok(f @ (Frame::Parked { .. } | Frame::ParkRefused { .. })) => return f,
+            Ok(f) if f.spawn_id().is_some() => {}
+            other => panic!("the park's answer, got {other:?}"),
+        }
+    }
+}
+
+/// A `ping` and its `pong`; the socket's spawns' frames before it are passed over.
+async fn pong_past(w: &mut Ws, ts: u64) {
+    send_frame(w, &Frame::Ping { ts }).await;
+    loop {
+        match next_frame(w).await {
+            Ok(Frame::Pong { ts: got }) if got == ts => return,
+            Ok(f) if f.spawn_id().is_some() => {}
+            other => panic!("the pong of {ts}, got {other:?}"),
+        }
+    }
+}
+
+/// Is `frame` the `parked` of `id`?
+fn parked(frame: &Frame, id: &SpawnId) -> bool {
+    matches!(frame, Frame::Parked { spawn_id, .. } if spawn_id == id)
+}
+
+/// A refusal's reason.
+fn refusal(frame: Frame) -> ParkRefusal {
+    match frame {
+        Frame::ParkRefused { reason, .. } => reason,
+        other => panic!("park_refused, got {other:?}"),
+    }
+}
+
+/// `id`'s `/health/detail` entry.
+async fn spawn_detail(s: &Stack, id: &SpawnId) -> SpawnDetail {
+    let (d, _) = s.detail().await;
+    d.spawns.into_iter().find(|sp| sp.status.spawn_id == *id).unwrap_or_else(|| panic!("{id} is not in /health/detail"))
+}
+
+/// `id`'s detail once it satisfies `done`, within `secs`.
+async fn wait_detail(s: &Stack, id: &SpawnId, secs: u64, what: &str, done: impl Fn(&SpawnDetail) -> bool) -> SpawnDetail {
+    let until = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let d = spawn_detail(s, id).await;
+        if done(&d) {
+            return d;
+        }
+        assert!(Instant::now() < until, "{what}: not within {secs} s: {d:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Until `cond` holds, within `secs`.
+async fn wait_for(secs: u64, what: &str, mut cond: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(secs);
+    while !cond() {
+        assert!(Instant::now() < until, "{what}: not within {secs} s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// tests/fixtures/wire/park-golden.jsonl against the shim (S10 §1.6): the
+/// Mac's lines are sent as written but for the session token (this rig's)
+/// and the busy-check window of every park after the first (0 here, so the
+/// replay waits no 30 s), each `hello` on a socket of its own; each VM line
+/// is matched with the newest socket's next frame by its kind and its
+/// spawn, and by what the shim cannot vary: `park_v1` named, the resume
+/// `ok`, the acks' seqs and the bytes, the pong's ts, `procs` 0 (`cat` runs
+/// alone), the exit's seq and code. The first park is refused by the busy
+/// check: the golden's `busy` is what Linux's sampler says of a busy
+/// session; the check takes the stdio part first, and the turn's a moment
+/// ago makes it `output` here. The shim's re-ack of the written stdin on the
+/// new socket (a reattach acks again what was written, S6) is no golden
+/// line: taken and passed over. The spawn's detail names the park's owner
+/// exactly while it is parked: the unpark (which has no answer) and the
+/// resuming hello unpark it.
+#[tokio::test]
+async fn the_park_golden_replays_against_the_shim() {
+    let (s, _home) = spawning_stack().await;
+    let id = SpawnId("0192f1e0-2b7c-7c3a-9a1b-4d5e6f708196".into());
+    let mut sockets: Vec<Ws> = Vec::new();
+    let (mut parks, mut acked) = (0, 0);
+    for (i, line) in include_str!("fixtures/wire/park-golden.jsonl").lines().enumerate() {
+        let n = i + 1;
+        let raw = line.split_once(",\"frame\":").and_then(|(_, f)| f.strip_suffix('}')).unwrap_or_else(|| panic!("line {n}: no frame"));
+        let golden = Frame::from_json(raw).unwrap_or_else(|e| panic!("line {n}: {e}"));
+        if line.starts_with("{\"dir\":\"mac\"") {
+            let frame = match golden {
+                Frame::Hello { client, resume, idle_s, .. } => {
+                    sockets.push(ws(s.app).await);
+                    Frame::Hello { session_token: Secret::new(TOKEN.into()), client, resume, idle_s }
+                }
+                Frame::Park { spawn_id, grace_s, min_quiet_s, cpu_busy_ms, hold_output, owner } => {
+                    parks += 1;
+                    Frame::Park { spawn_id, grace_s, min_quiet_s: if parks == 1 { min_quiet_s } else { 0 }, cpu_busy_ms, hold_output, owner }
+                }
+                other => other,
+            };
+            send_frame(sockets.last_mut().expect("a hello first"), &frame).await;
+            continue;
+        }
+        let w = sockets.last_mut().expect("a socket");
+        let got = loop {
+            match next_frame(w).await.unwrap_or_else(|e| panic!("line {n}: the socket ended ({e:?})")) {
+                // The re-ack of a new attachment, no golden line.
+                Frame::StdinAck { seq, .. } if !matches!(golden, Frame::StdinAck { .. }) && seq == acked => {}
+                f => break f,
+            }
+        };
+        assert_eq!((got.kind(), got.spawn_id()), (golden.kind(), golden.spawn_id()), "line {n}: {got:?}");
+        match (&golden, &got) {
+            (Frame::HelloOk { resumed: want, .. }, Frame::HelloOk { caps, resumed, .. }) => {
+                assert!(caps.iter().any(|c| c == CAP_PARK_V1), "line {n}: {caps:?}");
+                assert_eq!(resumed, want, "line {n}");
+                if !resumed.is_empty() {
+                    assert_eq!(spawn_detail(&s, &id).await.parked, None, "line {n}: the resuming hello unparked it");
+                }
+            }
+            (Frame::Spawned { .. }, Frame::Spawned { .. }) => {}
+            (Frame::StdinAck { seq: want, .. }, Frame::StdinAck { seq, .. }) => {
+                assert_eq!(seq, want, "line {n}");
+                acked = *seq;
+            }
+            (Frame::Stdout { seq: want, data: bytes, .. }, Frame::Stdout { seq, data, .. }) => {
+                assert_eq!((seq, ai_env_cli::wire::chunk::decode(data).unwrap()), (want, ai_env_cli::wire::chunk::decode(bytes).unwrap()), "line {n}");
+            }
+            (Frame::ParkRefused { reason: ParkRefusal::Busy, .. }, Frame::ParkRefused { reason, procs, .. }) => {
+                assert_eq!((*reason, *procs), (ParkRefusal::Output, 0), "line {n}: the turn's stdio a moment ago");
+            }
+            (Frame::Parked { .. }, Frame::Parked { procs, .. }) => {
+                assert_eq!(*procs, 0, "line {n}: cat runs alone");
+                assert_eq!(spawn_detail(&s, &id).await.parked, Some(PARK_OWNER), "line {n}: its owner named");
+            }
+            (Frame::Pong { ts: want }, Frame::Pong { ts }) => {
+                assert_eq!(ts, want, "line {n}");
+                assert_eq!(spawn_detail(&s, &id).await.parked, None, "line {n}: the unpark before the ping");
+            }
+            (Frame::Exit { seq: want, code: c, .. }, Frame::Exit { seq, code, .. }) => assert_eq!((seq, code), (want, c), "line {n}"),
+            (want, got) => panic!("line {n}: no check of {} for {got:?}", want.kind()),
+        }
+    }
+    assert_eq!(parks, 3, "the golden's three parks");
+    wait_for(5, "the exit's ack releases the spawn", || s.state.spawns.status(None).is_empty()).await;
+}
+
+/// A park answers `parked` (its quiet, the processes but the leader) and
+/// sets the park grace: the spawn keeps its socket (no grace runs while it
+/// is attached; its owner is named), and when that socket goes the grace is
+/// the park's, not the detach grace; a park again takes the new grace. The
+/// Mac's own `detach` unparks first: its detach grace is the spawn's own.
+#[tokio::test]
+async fn a_park_sets_the_park_grace() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sleep", "60"], Some(60)).await;
+    match park(&mut w, &park_frame(&id, 1200, 0)).await {
+        Frame::Parked { spawn_id, quiet_s, procs: 0 } if spawn_id == id => assert!(quiet_s < 5, "{quiet_s}"),
+        other => panic!("parked, got {other:?}"),
+    }
+    let d = spawn_detail(&s, &id).await;
+    assert!(d.status.alive && d.detach_left_s.is_none() && d.parked == Some(PARK_OWNER), "parked, its socket kept: {d:?}");
+    assert!(parked(&park(&mut w, &park_frame(&id, 2400, 0)).await, &id), "parked again, on new terms");
+    drop(w);
+    let d = wait_detail(&s, &id, 5, "the park grace", |d| d.detach_left_s.is_some()).await;
+    let left = d.detach_left_s.unwrap_or_default();
+    assert!((2390..=2400).contains(&left) && d.parked == Some(PARK_OWNER) && !d.frozen, "the park grace, not the 60 s detach grace: {d:?}");
+    let mut w = ws_hello_ok(s.app).await;
+    let mine = SpawnId::new_v7();
+    start(&mut w, &mine, &["/bin/sleep", "60"], Some(60)).await;
+    assert!(parked(&park(&mut w, &park_frame(&mine, 1200, 0)).await, &mine));
+    send_frame(&mut w, &Frame::Detach { spawn_id: mine.clone(), is_final: false }).await;
+    let d = wait_detail(&s, &mine, 5, "the detach grace", |d| d.detach_left_s.is_some()).await;
+    assert!(d.detach_left_s.is_some_and(|left| left <= 60) && d.parked.is_none(), "the Mac's detach unparked it first: {d:?}");
+    s.state.spawns.shutdown("test").await;
+}
+
+/// The busy check's refusals, each named (S10 §1.2), and none of them
+/// parks: a grace of 0 or past `PARK_GRACE_MAX_S`, a window past an hour,
+/// or a spawn whose leader exited, `other`; another socket's spawn (or
+/// none at all), `not_attached`; stdout not acked, `unacked`; stdio within
+/// the window, `output`, with the quiet so far.
+#[tokio::test]
+async fn park_refusals_name_their_reason() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/cat"], Some(60)).await;
+    for (grace_s, min_quiet_s) in [(0, 0), (PARK_GRACE_MAX_S + 1, 0), (600, 3601)] {
+        assert_eq!(refusal(park(&mut w, &park_frame(&id, grace_s, min_quiet_s)).await), ParkRefusal::Other, "grace {grace_s}, window {min_quiet_s}");
+    }
+    let mut other = ws_hello_ok(s.app).await;
+    assert_eq!(refusal(park(&mut other, &park_frame(&id, 600, 0)).await), ParkRefusal::NotAttached, "another socket's");
+    assert_eq!(refusal(park(&mut other, &park_frame(&SpawnId::new_v7(), 600, 0)).await), ParkRefusal::NotAttached, "no such spawn");
+    send_frame(&mut w, &Frame::Stdin { spawn_id: id.clone(), seq: 1, data: Chunk { text: Some("x\n".into()), b64: None } }).await;
+    let out = loop {
+        match next_frame(&mut w).await {
+            Ok(Frame::Stdout { seq, .. }) => break seq,
+            Ok(_) => {}
+            Err(e) => panic!("cat's line: {e:?}"),
+        }
+    };
+    assert_eq!(refusal(park(&mut w, &park_frame(&id, 600, 0)).await), ParkRefusal::Unacked, "its line not acked");
+    send_frame(&mut w, &Frame::Ack { spawn_id: id.clone(), seq: out, err_seq: 0 }).await;
+    match park(&mut w, &park_frame(&id, 600, 30)).await {
+        Frame::ParkRefused { reason: ParkRefusal::Output, quiet_s, procs: 0, .. } => assert!(quiet_s < 30, "{quiet_s}"),
+        other => panic!("output, got {other:?}"),
+    }
+    assert_eq!(spawn_detail(&s, &id).await.parked, None, "no refusal parks");
+    let gone = SpawnId::new_v7();
+    start(&mut w, &gone, &["/bin/echo", "gone"], Some(60)).await;
+    wait_for(5, "echo's exit", || s.state.spawns.status(None).iter().any(|st| st.spawn_id == gone && !st.alive)).await;
+    assert_eq!(refusal(park(&mut w, &park_frame(&gone, 600, 0)).await), ParkRefusal::Other, "a leader gone");
+    s.state.spawns.shutdown("test").await;
+}
+
+/// `/health/detail` names a parked spawn's owner (`SpawnDetail.parked`:
+/// the wrapper's pid and start) and leaves the key out for one not parked.
+/// An `unpark` takes it away (no answer: the ping's pong is the next
+/// frame), and so does any frame for the spawn on its socket (`stdin`).
+#[tokio::test]
+async fn health_detail_names_a_parked_spawns_owner() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let (a, b) = (SpawnId::new_v7(), SpawnId::new_v7());
+    start(&mut w, &a, &["/bin/cat"], Some(60)).await;
+    start(&mut w, &b, &["/bin/sleep", "60"], Some(60)).await;
+    assert!(parked(&park(&mut w, &park_frame(&a, 1200, 0)).await, &a));
+    let (d, body) = s.detail().await;
+    let of = |id: &SpawnId| d.spawns.iter().find(|sp| sp.status.spawn_id == *id).map(|sp| sp.parked);
+    assert_eq!((of(&a), of(&b)), (Some(Some(PARK_OWNER)), Some(None)));
+    assert!(body.contains("\"parked\":{\"pid\":51234,\"started\":1792483200}") && body.matches("\"parked\"").count() == 1, "{body}");
+    send_frame(&mut w, &Frame::Unpark { spawn_id: a.clone() }).await;
+    ping(&mut w, 1).await;
+    assert_eq!(spawn_detail(&s, &a).await.parked, None, "unparked");
+    assert!(parked(&park(&mut w, &park_frame(&a, 1200, 0)).await, &a));
+    send_frame(&mut w, &Frame::Stdin { spawn_id: a.clone(), seq: 1, data: Chunk { text: Some("x\n".into()), b64: None } }).await;
+    // Its stdin_ack (and cat's line) may come first.
+    pong_past(&mut w, 2).await;
+    assert_eq!(spawn_detail(&s, &a).await.parked, None, "a frame for it unparks it");
+    s.state.spawns.shutdown("test").await;
+}
+
+/// `hold_output` (B0's fallback): while parked, the spawn's stdout waits in
+/// its window, read but not sent (and its exit after it); the unpark sends both.
+#[tokio::test]
+async fn a_park_holding_output_sends_it_at_the_unpark() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sh", "-c", "sleep 1; echo held"], Some(60)).await;
+    let hold = Frame::Park { spawn_id: id.clone(), grace_s: 600, min_quiet_s: 0, cpu_busy_ms: 500, hold_output: true, owner: PARK_OWNER };
+    assert!(parked(&park(&mut w, &hold).await, &id));
+    wait_detail(&s, &id, 10, "the line read and the leader gone", |d| d.status.out_seq == 1 && !d.status.alive).await;
+    ping(&mut w, 1).await;
+    send_frame(&mut w, &Frame::Unpark { spawn_id: id.clone() }).await;
+    match next_frame(&mut w).await {
+        Ok(Frame::Stdout { spawn_id, seq: 1, data }) if spawn_id == id => assert_eq!(ai_env_cli::wire::chunk::decode(&data).unwrap(), b"held\n"),
+        other => panic!("the held line at the unpark, got {other:?}"),
+    }
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::Exit { spawn_id, code: Some(0), .. }) if spawn_id == id), "then its exit");
+}
+
+/// A parked spawn whose socket goes lives its park grace, not its detach
+/// grace, and stays parked (its owner named) with no socket; a hello
+/// resuming it unparks it and attaches it again (no grace runs), and when
+/// that socket goes too its grace is its detach grace again.
+#[tokio::test]
+async fn a_lost_parked_socket_uses_the_park_grace() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sleep", "60"], Some(30)).await;
+    assert!(parked(&park(&mut w, &park_frame(&id, 900, 0)).await, &id));
+    drop(w);
+    let d = wait_detail(&s, &id, 5, "the park grace", |d| d.detach_left_s.is_some()).await;
+    assert!(d.detach_left_s.is_some_and(|left| (890..=900).contains(&left)) && d.parked == Some(PARK_OWNER) && !d.status.attached, "{d:?}");
+    let mut b = ws(s.app).await;
+    send_frame(&mut b, &hello_resuming(TOKEN, vec![ResumePoint { spawn_id: id.clone(), from_seq: None, err_from_seq: None }])).await;
+    match next_frame(&mut b).await {
+        Ok(Frame::HelloOk { resumed, .. }) => assert_eq!(resumed, [Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }]),
+        other => panic!("hello_ok, got {other:?}"),
+    }
+    let d = spawn_detail(&s, &id).await;
+    assert!(d.detach_left_s.is_none() && d.parked.is_none(), "unparked, attached: {d:?}");
+    drop(b);
+    let d = wait_detail(&s, &id, 5, "the detach grace", |d| d.detach_left_s.is_some()).await;
+    assert!(d.detach_left_s.is_some_and(|left| left <= 30) && d.parked.is_none(), "{d:?}");
+    s.state.spawns.shutdown("test").await;
+}
+
+/// The park grace freezes and thaws as every grace does: parked with 2 s,
+/// `/suspend` closes the socket and the grace starts frozen, so nothing
+/// ends the spawn while the VM is suspended; `/resume` thaws it and the
+/// whole grace then runs out (TERM).
+#[tokio::test]
+async fn the_park_grace_freezes_and_thaws() {
+    let (s, _home) = spawning_stack().await;
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sleep", "60"], Some(60)).await;
+    assert!(parked(&park(&mut w, &park_frame(&id, 2, 0)).await, &id));
+    let (answer, ()) = tokio::join!(hook(s.hooks, "suspend", b"{}"), async { while next_frame(&mut w).await.is_ok() {} });
+    assert_eq!(answer.0, 200, "{}", answer.1);
+    let d = wait_detail(&s, &id, 5, "the frozen park grace", |d| d.detach_left_s.is_some()).await;
+    assert!(d.frozen && d.detach_left_s == Some(2) && d.parked == Some(PARK_OWNER), "{d:?}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(s.state.spawns.live(), 1, "frozen: alive past its 2 s");
+    let t = Instant::now();
+    assert_eq!(hook(s.hooks, "resume", b"{}").await.0, 200);
+    wait_for(6, "the TERM after the thawed grace", || s.state.spawns.live() == 0).await;
+    let took = t.elapsed();
+    assert!(took >= Duration::from_millis(1800) && took < Duration::from_millis(3800), "the whole grace after /resume, then TERM: {took:?}");
+}
+
+/// A park grace that runs out with no socket ends the spawn as a detach
+/// grace does: TERM to its group (its trap leaves the mark), KILL 2 s
+/// later; its record goes (its exit is nobody's).
+#[tokio::test]
+async fn an_expired_park_grace_sends_term() {
+    let (s, home) = spawning_stack().await;
+    let mark = std::fs::canonicalize(home.path()).unwrap().join("term");
+    let script = format!("trap \"echo term > '{}'; exit 0\" TERM; sleep 600 & wait", mark.display());
+    let mut w = ws_hello_ok(s.app).await;
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sh", "-c", &script], Some(600)).await;
+    assert!(parked(&park(&mut w, &park_frame(&id, 1, 0)).await, &id));
+    let t = Instant::now();
+    drop(w);
+    wait_for(6, "the TERM's mark", || mark.exists()).await;
+    let took = t.elapsed();
+    assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(3500), "its 1 s park grace, then TERM: {took:?}");
+    wait_for(6, "the spawn's end", || s.state.spawns.live() == 0).await;
+    wait_for(6, "its record released", || s.state.spawns.status(None).is_empty()).await;
+}
+
+/// A parked socket's idle timer is off: after `parked` its idle deadline
+/// is `PARKED_IDLE_MAX`, so it outlives several of its `idle_s`, and any
+/// inbound frame brings `idle_s` back (1001 then). The spawn, still parked
+/// (a ping is no frame for it), then lives its park grace. One `idle_s`
+/// second is 20 ms here (`AgentRegistry::set_idle_unit`): 30 are 600 ms.
+#[tokio::test]
+async fn a_parked_sockets_idle_timer_is_off() {
+    let (s, _home) = spawning_stack().await;
+    s.state.agents.set_idle_unit(Duration::from_millis(20));
+    let mut w = ws(s.app).await;
+    send_frame(&mut w, &Frame::Hello { session_token: Secret::new(TOKEN.into()), client: ClientInfo { name: "shim_local".into(), version: "0.0.1".into(), host: "test@host".into() }, resume: vec![], idle_s: Some(30) }).await;
+    assert!(matches!(next_frame(&mut w).await, Ok(Frame::HelloOk { .. })));
+    let id = SpawnId::new_v7();
+    start(&mut w, &id, &["/bin/sleep", "60"], Some(60)).await;
+    assert!(parked(&park(&mut w, &park_frame(&id, 600, 0)).await, &id));
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    ping(&mut w, 1).await;
+    let quiet = Instant::now();
+    assert_eq!(next_frame(&mut w).await, Err(Some(CLOSE_GOING_AWAY)), "idle_s again since the ping");
+    assert!(quiet.elapsed() < Duration::from_millis(1800), "{:?}", quiet.elapsed());
+    let d = wait_detail(&s, &id, 5, "the park grace", |d| d.detach_left_s.is_some()).await;
+    assert!(d.parked == Some(PARK_OWNER) && d.detach_left_s.is_some_and(|left| (590..=600).contains(&left)), "{d:?}");
+    s.state.spawns.shutdown("test").await;
+}
+
+impl Vm {
+    /// The same VM's shim started again (S10, W3 #2): a new state and new
+    /// listeners on the same disk, `/run` done.
+    async fn restarted(&self) -> Stack {
+        let o = ShimOpts { fs_root: Some(self.root.join("vm")), home: self.root.join("vm/Users/agent"), helper: Some(PathBuf::from(bin())), git: self.s.state.opts.git.clone(), ..opts(None, HookSource::Log, 0) };
+        let s = stack(o).await;
+        s.run(true).await;
+        s
+    }
+}
+
+/// S10 (W3 #2): the record a seed leaves is kept in the VM's
+/// `/var/lib/ai-env/seed-record.json` (under the fs root here), 0600 in a
+/// 0700 directory, `{"v":1,"record":…}`. A shim started again on the same
+/// disk (a restart: a new state, new listeners) has it from the start:
+/// `GET /seed` reads the VM seeded and pristine, `/health/detail` names
+/// it, and the Mac's next commit goes in as an update, its record kept in
+/// the file in place of the first.
+#[tokio::test]
+async fn the_seed_record_survives_a_shim_restart() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let vm = Vm::new().await;
+    let seed = vm.clone_mac().await;
+    let record = vm.s.state.workspace.record().expect("recorded");
+    let file = vm.disk(ai_env_cli::shim::asagent::SEED_RECORD_PATH);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{{\"v\":1,\"record\":{}}}\n", serde_json::to_string(&record).unwrap()));
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(file.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    let again = vm.restarted().await;
+    assert_eq!(again.state.workspace.record(), Some(record.clone()), "the restarted shim's record");
+    let (st, _, b) = request(again.code, "GET", &format!("/seed?path={WS}"), "", None).await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&b));
+    let state: SeedState = serde_json::from_slice(&b).unwrap();
+    assert!(state.pristine && state.record.as_ref() == Some(&record) && state.tip.as_deref() == Some(seed.head.as_str()), "{state:?}");
+    assert_eq!(again.detail().await.0.workspace.and_then(|w| w.seed), Some(record));
+    let mac = vm.mac();
+    write_file(&mac.join("a.txt"), "after the restart\n");
+    git(&mac, &["commit", "-q", "-am", "c3"]);
+    let (m, body) = update_body(&mac, &seed, &seed.head, &seed.head);
+    let (st, _, b) = request(again.code, "PUT", &format!("/seed?path={WS}&mode=update&branch=main&expect={}", seed.head), "", Some(&body)).await;
+    assert_eq!(st, 201, "{}", String::from_utf8_lossy(&b));
+    let kept = again.state.workspace.record().expect("the update's record");
+    assert_eq!((kept.head.as_str(), kept.mode), (m.head.as_str(), ai_env_cli::wire::workspace::SeedMode::Update));
+    assert!(std::fs::read_to_string(&file).unwrap().contains(&m.head), "the file holds the update's record");
+}
+
+/// S10 (W3 #2): after a shim restart a clone into the workspace, whose
+/// `.git` holds this VM's seed (the record kept on disk names it), counts as
+/// seeded: 409 `changed` with that record's state (the Mac reads the state
+/// again and updates), never S8's 409 `path_occupied`, and nothing in the
+/// checkout moves. A record file that fails its checks is ignored: such a
+/// restarted shim knows no seed, and the clone is `path_occupied` as before.
+#[tokio::test]
+async fn a_clone_into_a_matching_git_counts_as_seeded() {
+    let vm = Vm::new().await;
+    let seed = vm.clone_mac().await;
+    let record = vm.s.state.workspace.record().expect("recorded");
+    let again = vm.restarted().await;
+    let (_, body) = clone_body(&vm.mac(), Some("main"));
+    let clone = format!("/seed?path={WS}&mode=clone&branch=main");
+    let (st, _, b) = request(again.code, "PUT", &clone, "", Some(&body)).await;
+    let r = refusal_of(&b);
+    assert!(st == 409 && r.code == "changed" && r.state.as_ref().and_then(|s| s.record.as_ref()) == Some(&record), "{st} {r:?}");
+    assert_eq!(git(&vm.ws(), &["rev-parse", "HEAD"]), seed.head, "nothing moved");
+    let file = vm.disk(ai_env_cli::shim::asagent::SEED_RECORD_PATH);
+    let text = std::fs::read_to_string(&file).unwrap().replacen("{\"v\":1,", "{\"v\":2,", 1);
+    std::fs::write(&file, text).unwrap();
+    let blind = vm.restarted().await;
+    assert_eq!(blind.state.workspace.record(), None, "a file of another version is ignored");
+    let (st, _, b) = request(blind.code, "PUT", &clone, "", Some(&body)).await;
+    assert_eq!((st, refusal_of(&b).code.as_str()), (409, "path_occupied"));
+}
+
+/// S10: `GET /seed` reports the VM's `.git/shallow` (`SeedState.shallow`):
+/// after a first seed its one boundary, the head; at most
+/// `SHALLOW_REPORT_MAX` ids; past the cap none (the Mac then takes its
+/// row's list).
+#[tokio::test]
+async fn seed_state_reports_shallow_capped() {
+    use ai_env_cli::wire::workspace::SHALLOW_REPORT_MAX;
+    let vm = Vm::new().await;
+    let seed = vm.clone_mac().await;
+    assert_eq!(vm.state().await.shallow, Some(vec![seed.head.clone()]));
+    let shallow = vm.ws().join(".git/shallow");
+    let mut ids: Vec<String> = (1..SHALLOW_REPORT_MAX).map(|n| format!("{n:040x}")).collect();
+    ids.push(seed.head.clone());
+    ids.sort();
+    std::fs::write(&shallow, ids.iter().map(|id| format!("{id}\n")).collect::<String>()).unwrap();
+    assert_eq!(vm.state().await.shallow, Some(ids.clone()), "the cap itself");
+    std::fs::write(&shallow, format!("{}{:040x}\n", ids.iter().map(|id| format!("{id}\n")).collect::<String>(), SHALLOW_REPORT_MAX)).unwrap();
+    assert_eq!(vm.state().await.shallow, None, "past the cap");
+}
+
+/// S10 (W3 #11): `/suspend`'s snapshot is a task of its own the hook
+/// awaits: a hook client that goes while it runs (its request dropped, as
+/// S8's snapshot was with it, its helper killed before its ref) leaves it
+/// running, and the `refs/wip/*` ref is made all the same. The helper's git
+/// is slowed at the snapshot's `write-tree`, so the client goes mid-run.
+#[tokio::test]
+async fn the_suspend_work_finishes_when_the_hook_client_goes() {
+    let vm = Vm::with(|root| slow_git(root, "write-tree", 2)).await;
+    vm.clone_mac().await;
+    let ws = vm.ws();
+    write_file(&ws.join("a.txt"), "uncommitted at suspend\n");
+    let mut c = tokio::net::TcpStream::connect(vm.s.hooks).await.unwrap();
+    c.write_all(format!("POST {PREFIX}/suspend HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes()).await.unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while vm.workspace_view().await.busy.as_deref() != Some("snapshot") {
+        assert!(Instant::now() < until, "the snapshot never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(c);
+    let until = Instant::now() + Duration::from_secs(30);
+    let wip = loop {
+        let refs = git(&ws, &["for-each-ref", "--format=%(refname)", "refs/wip/"]);
+        if !refs.is_empty() {
+            break refs;
+        }
+        assert!(Instant::now() < until, "no refs/wip/* after the hook client went");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(git(&ws, &["show", &format!("{}:a.txt", wip.trim())]), "uncommitted at suspend");
+    wait_workspace_idle(&vm).await;
+}
+
+/// S10 (W3 #11), the order of `/suspend`: the sockets hear of it and close
+/// only once its snapshot and tail push are done (or past their bound):
+/// the `hook_suspend` event a socket gets comes after the `refs/wip/*` ref
+/// exists, the helper's git slowed 2 s at the snapshot's `write-tree`. (A
+/// socket closed first would let the Mac's suspend go on while the VM's
+/// snapshot still runs.)
+#[tokio::test]
+async fn suspend_closes_the_sockets_after_its_snapshot() {
+    let vm = Vm::with(|root| slow_git(root, "write-tree", 2)).await;
+    vm.clone_mac().await;
+    let ws = vm.ws();
+    write_file(&ws.join("a.txt"), "uncommitted at suspend\n");
+    let mut w = ws_hello_ok(vm.s.app).await;
+    let started = Instant::now();
+    let (answer, (event, heard, wip)) = tokio::join!(hook(vm.s.hooks, "suspend", b"{}"), async {
+        let event = loop {
+            match tokio::time::timeout(Duration::from_secs(30), w.next()).await.expect("the suspend's event within 30 s") {
+                Some(Ok(Message::Text(t))) => break Frame::from_json(t.as_str()).unwrap_or_else(|e| panic!("{e}")),
+                Some(Ok(_)) => {}
+                other => panic!("the socket ended before the suspend's event: {other:?}"),
+            }
+        };
+        (event, started.elapsed(), git(&ws, &["for-each-ref", "--format=%(refname)", "refs/wip/"]))
+    });
+    assert_eq!(answer.0, 200, "{}", answer.1);
+    assert!(matches!(event, Frame::Event { kind: EventKind::HookSuspend, .. }), "{event:?}");
+    assert_eq!(wip.lines().count(), 1, "the snapshot's ref was there when the socket heard of the suspend ({heard:?} in): {wip:?}");
+    assert!(heard >= Duration::from_secs(2), "heard of only after the slowed snapshot: {heard:?}");
+    wait_workspace_idle(&vm).await;
+}
+
+/// S10: the guest's memory (§1.5). `/health` and `/health/detail` carry
+/// `mem_total_mib`, `MemTotal` read once at start (`TestSys`'s
+/// `/proc/meminfo`: 8040964 kB, 7852 MiB, last in the document); a machine
+/// without the file leaves it out. The run report carries `mem_total_kb`
+/// and `mem_available_kb` from `<root>/proc/meminfo` (a planted tree: the
+/// binary's report on the Mac is the portable twin), `null` when unreadable.
+#[tokio::test]
+async fn the_run_report_and_health_carry_mem_total() {
+    let s = Stack::log().await;
+    let (st, _, body) = http(s.app, "GET", "/health", b"", None).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(serde_json::from_str::<Health>(&body).unwrap().mem_total_mib == Some(7852) && body.ends_with(",\"mem_total_mib\":7852}"), "{body}");
+    s.run(true).await;
+    let (d, body) = s.detail().await;
+    assert!(d.health.mem_total_mib == Some(7852) && body.contains("\"mem_total_mib\":7852"), "{body}");
+    let machine = ShimState::new("/nonexistent/claude".into());
+    assert_eq!(machine.health().await.mem_total_mib.is_some(), cfg!(target_os = "linux"), "this machine's own /proc/meminfo");
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("proc")).unwrap();
+    std::fs::write(t.path().join("proc/meminfo"), MEMINFO).unwrap();
+    let id = "microvm-00000000-0000-4000-8000-000000000010";
+    let r = ai_env_cli::shim::sys::read_report(t.path(), "run", Some(id));
+    assert_eq!((r["mem_total_kb"].as_u64(), r["mem_available_kb"].as_u64(), r["microvm_id"].as_str()), (Some(8_040_964), Some(7_703_512), Some(id)), "{r}");
+    std::fs::remove_file(t.path().join("proc/meminfo")).unwrap();
+    let r = ai_env_cli::shim::sys::read_report(t.path(), "terminate", None);
+    assert!(r["mem_total_kb"].is_null() && r["mem_available_kb"].is_null(), "{r}");
+}
+
+/// S10 (§13): `--cold-warm read` reads the claude binary through once, in
+/// the background, right after the first `/run` it accepts (its size and
+/// path logged); without the flag (`off`, the image's ENTRYPOINT) nothing
+/// is read.
+#[test]
+fn the_cold_warm_read_reads_the_claude_binary_after_run() {
+    let t = tempfile::tempdir().unwrap();
+    let claude = fake_claude(t.path(), "");
+    let size = std::fs::metadata(&claude).unwrap().len();
+    let run = format!("{PREFIX}/run");
+    for (extra, warms) in [(&["--cold-warm", "read"][..], true), (&[][..], false)] {
+        let shim = Shim::start(&claude, extra);
+        let hooks_addr = shim.addr("hooks");
+        assert_eq!(http_sync_body(hooks_addr, "POST", &run, &run_body("microvm-00000000-0000-4000-8000-000000000011", Some(&payload_json("mike@mbp")))).0, 200);
+        shim.wait_line(10, |l| l.starts_with("ai-env: run-report "));
+        if warms {
+            let line = shim.wait_line(10, |l| l.starts_with("ai-env: cold-warm read "));
+            assert!(line.starts_with(&format!("ai-env: cold-warm read {size} bytes of {} in ", claude.display())), "{line}");
+        } else {
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!shim.lines.lock().unwrap().iter().any(|l| l.contains("cold-warm")), "off: no warm");
+        }
+    }
+}
+
+/// S10's gates in image/Dockerfile (§1.7, §6.4): right after the claude
+/// binary's hash, every string the moved chat relies on (the cut's flag and
+/// its miss, `wire::claude::CUT_MISS_MARKER`; a fresh chat's flag and its
+/// refusal), each a build failure naming it; after the shim, the seed
+/// record's directory, root's and 0700, and the gate that the image bakes
+/// no record in. The ENTRYPOINT passes no `--cold-warm` (off).
+#[test]
+fn the_image_gates_the_claude_strings_and_bakes_no_seed_record() {
+    let df = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/Dockerfile")).unwrap();
+    let at = |what: &str| df.find(what).unwrap_or_else(|| panic!("{what} missing from image/Dockerfile"));
+    let (hash, gate, chmod) = (at("sha256sum --check --strict;"), at("for want in "), at("chmod 0755 /usr/local/bin/claude;"));
+    assert!(hash < gate && gate < chmod, "the strings gate right after the hash");
+    let line = df[gate..].lines().next().unwrap_or_default();
+    for want in ["--resume-session-at", ai_env_cli::wire::claude::CUT_MISS_MARKER, "--session-id", "is already in use"] {
+        assert!(line.contains(&format!(" '{want}'")), "{want} in {line}");
+    }
+    assert!(df[gate..chmod].contains("grep -qaF -e \"$want\" /usr/local/bin/claude || { echo \"claude ${CLAUDE_VERSION} lacks the string S10 relies on: $want\"; exit 1; }"));
+    let (shim, dir, empty) = (at("COPY ai-env /usr/local/bin/ai-env"), at("install -d -m 0700 -o 0 -g 0 /var/lib/ai-env;"), at("test -z \"$(find /var/lib/ai-env -mindepth 1 -print -quit)\""));
+    assert!(shim < dir && dir < empty && at("ENTRYPOINT ") > empty, "the record's gate after the shim");
+    assert!(ai_env_cli::shim::asagent::SEED_RECORD_PATH.starts_with("/var/lib/ai-env/"));
+    assert!(!entrypoint().iter().any(|w| w.starts_with("--cold-warm")), "the warm is off in the image");
 }

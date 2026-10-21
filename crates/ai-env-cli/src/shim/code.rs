@@ -4,7 +4,8 @@
 //! them (`wire::workspace`), each run by the agent's helper (`asagent`), and
 //! only on a shim that has one (it then names `CAP_WORKSPACE_V1`; without
 //! one they answer 404, as an older shim's do):
-//! * `GET /seed?path=`: the workspace's `SeedState` (D3's inputs);
+//! * `GET /seed?path=`: the workspace's `SeedState` (D3's inputs; S10: with
+//!   the VM's `.git/shallow`, so the helper answers in the payload form);
 //! * `PUT /seed?path=&mode=&branch=|detached=true&expect=`: a
 //!   `SeedManifest` line, then the pack; `Content-Length` required (else
 //!   411 `bad_request`), at most `SEED_BODY_MAX` (else 413), streamed to the
@@ -151,8 +152,14 @@ async fn get_seed(State(state): State<Arc<ShimState>>, req: Request) -> Response
         args.push(flag("record", serde_json::to_string(r).unwrap_or_default()));
     }
     let cmd = AgentCmd { op, args, budget: budget::SEED_STATE, stdin: false, during_stop: false };
-    let out = asagent::run_op::<SeedState>(&state, cmd, None).await;
-    asagent::respond(op, started, out, |_| 200)
+    // S10: the helper answers in the payload form (`SeedState.shallow` can pass a head line).
+    match asagent::run_op_payload::<SeedState>(&state, cmd).await {
+        Ok(reply) => {
+            asagent::log(op, 200, None, started);
+            asagent::answered(200, &reply)
+        }
+        Err(r) => asagent::refuse(op, started, &r),
+    }
 }
 
 /// `PUT /seed?…`: the body streamed to the helper's `seed-apply`; the new

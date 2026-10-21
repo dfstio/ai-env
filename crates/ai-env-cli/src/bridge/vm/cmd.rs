@@ -1154,7 +1154,7 @@ async fn run_cmd<A: MicrovmApi + crate::bridge::s3::S3Sign>(ctx: &Ctx, api: &A, 
     } else {
         outln!("{}", started_line(&row, &vm, run_ms, running_ms));
     }
-    let items = gc::reconcile_local(api, &ctx.paths, &plan.image_arn).await;
+    let items = gc::reconcile_applied(api, &ctx.paths, &plan.image_arn).await;
     if ctx.cfg.vm.auto_gc {
         auto_gc(ctx, api, items.as_deref().unwrap_or_default(), &vm.id).await;
     } else {
@@ -1226,7 +1226,7 @@ async fn list<A: MicrovmApi>(ctx: &Ctx, api: &A, all: bool, json: bool) -> Resul
             outln!("{id:<46} {state:<12} {age:>7} {left:>9}  {place:<24} {source}");
         }
     }
-    gc_hint(gc::reconcile_local(api, &ctx.paths, &arn).await);
+    gc_hint(gc::reconcile_applied(api, &ctx.paths, &arn).await);
     Ok(())
 }
 
@@ -1541,7 +1541,7 @@ async fn smoke<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, pla
     } else {
         outln!("smoke {}: {summary}", verdict.word());
     }
-    gc_hint(gc::reconcile_local(api, &ctx.paths, &plan.image_arn).await);
+    gc_hint(gc::reconcile_applied(api, &ctx.paths, &plan.image_arn).await);
     verdict.result(&summary)
 }
 

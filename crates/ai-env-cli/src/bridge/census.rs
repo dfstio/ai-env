@@ -143,13 +143,15 @@ fn parent_pid() -> u32 {
     0
 }
 
-/// What the next token is the value of (rules 1 and 3 of [`redact_argv`]).
+/// What the next token is the value of (rules 1 and 3 of [`redact_argv`],
+/// and S10 F7's thinking budget).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pending {
     Nothing,
     Env,
     Header,
     McpConfig,
+    ThinkingBudget,
 }
 
 /// The value of `--flag=value` when `tok` has that shape.
@@ -181,7 +183,17 @@ fn joined_value<'a>(tok: &'a str, flag: &str) -> Option<&'a str> {
 ///    the header name, the server names) are what gets scrubbed and the
 ///    placeholder is appended afterwards: scrubbing the finished token
 ///    would mask the placeholder a second time (`GITHUB_TOKEN=[…]` is
-///    key-shaped) and lose the recorded length.
+///    key-shaped) and lose the recorded length. Likewise the panel's
+///    thinking budget (S10 F7): `--max-thinking-tokens=` with 1 to 7 digits
+///    is a number, never a credential, so only its value is scrubbed (the
+///    whole token is key-shaped, `token` being a key name, and would lose
+///    the number); any other value of it is masked whole,
+///    `--max-thinking-tokens=[redacted:len=N]` (`scrub` would stop at a `,`,
+///    `}` or `"` and keep the rest), and an empty one is left as it is. The
+///    token after `--max-thinking-tokens` (2.1.278's spelling, which the
+///    router reads as its value too) follows the same rule, a bare `--` or
+///    a flag of rules 1 and 3 (`--env`, `-e`, `--header`, `-H`,
+///    `--mcp-config`) never being its value (those rules hold).
 #[must_use]
 pub fn redact_argv(argv: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len());
@@ -195,7 +207,8 @@ pub fn redact_argv(argv: &[String]) -> Vec<String> {
             Pending::Env => out.push(mask_env(tok)),
             Pending::Header => out.push(mask_header(tok)),
             Pending::McpConfig => out.push(mask_mcp_config(tok)),
-            Pending::Nothing => {
+            Pending::ThinkingBudget if !matches!(tok.as_str(), "--" | "--env" | "-e" | "--header" | "-H" | "--mcp-config") => out.push(mask_thinking_budget(tok)),
+            Pending::Nothing | Pending::ThinkingBudget => {
                 if tok == "--" {
                     out.push("--".to_string());
                     let rest = &argv[i + 1..];
@@ -213,11 +226,14 @@ pub fn redact_argv(argv: &[String]) -> Vec<String> {
                     out.push(format!("--header={}", mask_header(v)));
                 } else if let Some(v) = joined_value(tok, "--mcp-config") {
                     out.push(format!("--mcp-config={}", mask_mcp_config(v)));
+                } else if let Some(v) = joined_value(tok, "--max-thinking-tokens") {
+                    out.push(format!("--max-thinking-tokens={}", mask_thinking_budget(v)));
                 } else {
                     pending = match tok.as_str() {
                         "--env" | "-e" => Pending::Env,
                         "--header" | "-H" => Pending::Header,
                         "--mcp-config" => Pending::McpConfig,
+                        "--max-thinking-tokens" => Pending::ThinkingBudget,
                         _ => Pending::Nothing,
                     };
                     out.push(scrub(tok).into_owned());
@@ -228,6 +244,23 @@ pub fn redact_argv(argv: &[String]) -> Vec<String> {
         pending = Pending::Nothing;
     }
     out
+}
+
+/// A thinking budget as the extension writes it (`31999`): 1 to 7 ASCII
+/// digits (S10 F7).
+fn is_thinking_budget(value: &str) -> bool {
+    (1..=7).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A thinking budget's value in the census (S10 F7): 1 to 7 digits kept
+/// (scrubbed only), an empty one left as it is, anything else
+/// `[redacted:len=N]`.
+fn mask_thinking_budget(value: &str) -> String {
+    if value.is_empty() || is_thinking_budget(value) {
+        scrub(value).into_owned()
+    } else {
+        format!("[redacted:len={}]", value.len())
+    }
 }
 
 /// `NAME=value` → `NAME=[redacted:len=N]`; no `=` → `[redacted:len=N]`.
@@ -558,6 +591,71 @@ mod tests {
         assert_eq!(got[4], "--resume=sk-ant-[redacted:len=33]");
     }
 
+    /// S10 F7: the panel's thinking budget is a number, never a credential:
+    /// a `--max-thinking-tokens=` of 1 to 7 digits is kept as written
+    /// (`scrub` alone masks it, `token` being a key name); any other value is
+    /// masked whole (a letter in it, a sign, 8 digits or more, a token, or a
+    /// `,`, `}` or `"` that `scrub` would stop at, keeping what follows), an
+    /// empty one is left as it is; the space-separated form (2.1.278's, the
+    /// value the next token, as the router reads it) follows the same rule,
+    /// and a bare `--` is never its value. The three session fixtures are
+    /// the census's form of a 2.1.303 chat: their budget reads 31999, and
+    /// the census writes them as they are.
+    #[test]
+    fn a_digits_only_thinking_budget_is_kept_and_anything_else_masked() {
+        let one = |tok: &str| redact_argv(&v(&["w", "/b/claude", tok])).remove(2);
+        for kept in ["--max-thinking-tokens=31999", "--max-thinking-tokens=0", "--max-thinking-tokens=1234567", "--max-thinking-tokens="] {
+            assert_eq!(one(kept), kept);
+        }
+        let tok = format!("{}oat01-{}", "sk-ant-", "Q".repeat(20));
+        for (given, want) in [
+            ("--max-thinking-tokens=12a".to_string(), "--max-thinking-tokens=[redacted:len=3]".to_string()),
+            ("--max-thinking-tokens=-1".to_string(), "--max-thinking-tokens=[redacted:len=2]".to_string()),
+            ("--max-thinking-tokens=12345678".to_string(), "--max-thinking-tokens=[redacted:len=8]".to_string()),
+            ("--max-thinking-tokens=３１９９９".to_string(), "--max-thinking-tokens=[redacted:len=15]".to_string()),
+            (format!("--max-thinking-tokens={tok}"), format!("--max-thinking-tokens=[redacted:len={}]", tok.len())),
+            ("--max-thinking-tokens==1".to_string(), "--max-thinking-tokens=[redacted:len=2]".to_string()),
+            ("--max-thinking-tokens=1,2345678".to_string(), "--max-thinking-tokens=[redacted:len=9]".to_string()),
+            ("--max-thinking-tokens=31999,--x=y".to_string(), "--max-thinking-tokens=[redacted:len=11]".to_string()),
+            ("--max-thinking-tokens=1\"abc".to_string(), "--max-thinking-tokens=[redacted:len=5]".to_string()),
+            ("--max-thinking-tokens=1}x".to_string(), "--max-thinking-tokens=[redacted:len=3]".to_string()),
+        ] {
+            assert_eq!(one(&given), want, "{given}");
+        }
+        assert_eq!(redact_argv(&v(&["w", "/b/claude", "--max-thinking-tokens", "31999"]))[2..], v(&["--max-thinking-tokens", "31999"]), "2.1.278's spelling");
+        for (given, want) in [
+            ("12345678".to_string(), "[redacted:len=8]".to_string()),
+            ("-1".to_string(), "[redacted:len=2]".to_string()),
+            ("hunter2".to_string(), "[redacted:len=7]".to_string()),
+            ("1,--x=y".to_string(), "[redacted:len=7]".to_string()),
+            (tok.clone(), format!("[redacted:len={}]", tok.len())),
+            ("1234567".to_string(), "1234567".to_string()),
+            (String::new(), String::new()),
+        ] {
+            assert_eq!(redact_argv(&v(&["w", "/b/claude", "--max-thinking-tokens", &given, "--verbose"]))[2..], v(&["--max-thinking-tokens", &want, "--verbose"]), "2.1.278's spelling: {given:?}");
+        }
+        assert_eq!(redact_argv(&v(&["w", "/b/claude", "--max-thinking-tokens", "--", "github", "npx", "x"]))[2..], v(&["--max-thinking-tokens", "--", "github", "\u{2026}"]), "a bare -- is rule 2's, never the budget");
+        assert_eq!(redact_argv(&v(&["w", "/b/claude", "--max-thinking-tokens", "--env", "FOO=hunter2"]))[2..], v(&["--max-thinking-tokens", "--env", "FOO=[redacted:len=7]"]), "--env is rule 1's, never the budget");
+        assert_eq!(redact_argv(&v(&["w", "/b/claude", "--max-thinking-tokens", "-H", "X-Api-Key: abc123"]))[2..], v(&["--max-thinking-tokens", "-H", "X-Api-Key: [redacted:len=6]"]), "-H is rule 1's, never the budget");
+        let mcp = r#"{"mcpServers":{"github":{"command":"npx","env":{"GITHUB_TOKEN":"hunter2"}}}}"#;
+        for (flag, value) in [("--env", "FOO=hunter2"), ("-e", "FOO=hunter2"), ("--header", "X-Api-Key: abc123"), ("-H", "X-Api-Key: abc123"), ("--mcp-config", mcp)] {
+            let after = redact_argv(&v(&["w", "/b/claude", "--max-thinking-tokens", flag, value]));
+            assert_eq!(after[3..], redact_argv(&v(&["w", "/b/claude", flag, value]))[2..], "{flag} keeps its rule after --max-thinking-tokens");
+            assert!(!after.iter().any(|t| t.contains("hunter2") || t.contains("abc123")), "{after:?}");
+        }
+        for (name, text) in [
+            ("session", include_str!("../../tests/fixtures/argv/session.json")),
+            ("session_multiroot", include_str!("../../tests/fixtures/argv/session_multiroot.json")),
+            ("session_resume", include_str!("../../tests/fixtures/argv/session_resume.json")),
+        ] {
+            let args = fixture_argv(text);
+            assert!(args.iter().any(|a| a == "--max-thinking-tokens=31999"), "{name}: {args:?}");
+            let mut full = v(&[WRAPPER, BUNDLED]);
+            full.extend(args.iter().cloned());
+            assert_eq!(redact_argv(&full)[2..], args[..], "{name}");
+        }
+    }
+
     #[test]
     fn ext_version_from_bundle_path() {
         assert_eq!(ext_version_from_real_binary(Some(&OsString::from(BUNDLED))).as_deref(), Some("2.1.278"));
@@ -569,12 +667,10 @@ mod tests {
     #[test]
     fn build_row_on_the_session_fixture() {
         let args = fixture_argv(include_str!("../../tests/fixtures/argv/session.json"));
-        // The fixture is the census's form; the spawn carries the number.
-        let spawned: Vec<String> = args.iter().map(|a| if a == "--max-thinking-tokens=[redacted:len=5]" { "--max-thinking-tokens=31999".to_string() } else { a.clone() }).collect();
-        let route = classify(&spawned);
+        let route = classify(&args);
         assert!(matches!(route, Route::Remote(_)));
         let mut argv: Vec<OsString> = vec![OsString::from(WRAPPER), OsString::from(BUNDLED)];
-        argv.extend(spawned.iter().map(OsString::from));
+        argv.extend(args.iter().map(OsString::from));
         let cwd = Path::new("/Users/mike/Documents/DeFi/ai-env");
         let row = build_row(&argv, &route, Some(cwd), None);
 
@@ -591,7 +687,7 @@ mod tests {
         assert_eq!(row.ts, rfc3339_utc(row.start / 1000), "ts is derived from the same clock read as start");
         assert_eq!(row.argv[0], WRAPPER);
         assert_eq!(row.argv[1], BUNDLED);
-        assert_eq!(row.argv[2..], args[..], "the row is the fixture: only the thinking budget is masked");
+        assert_eq!(row.argv[2..], args[..], "the row is the fixture, its thinking budget included (S10 F7)");
         assert_eq!(row.cwd.as_deref(), Some("/Users/mike/Documents/DeFi/ai-env"));
         assert!(row.note.is_none() && row.end.is_none() && row.exit.is_none());
 

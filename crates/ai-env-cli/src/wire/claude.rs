@@ -25,6 +25,19 @@
 //! * `{"type":"user","uuid":…,…}` (host → child), echoed back with
 //!   `"isReplay":true` under `--replay-user-messages`;
 //! * `{"type":"result","subtype":…,"is_error":…,"errors":[…],"user_message_uuid":…,"user_message_uuids":[…],…}`.
+//!
+//! S10 (plans/s10-contracts.md §3.2) reads three more, each forwarded as
+//! [`ChildFrame::Other`] was (only the pump's bookkeeping looks at them):
+//! * child → host `{"type":"assistant","uuid":…,"parent_tool_use_id":…,…}`
+//!   (top level when `parent_tool_use_id` is absent or `null`): the leaf a
+//!   moved CLI resumes at;
+//! * `{"type":"keep_alive"}` both ways (dropped while a session is parked);
+//! * child → host `{"type":"control_cancel_request","request_id":…}`: the
+//!   CLI withdraws its own request.
+//!
+//! And it writes two lines to the host: the move's informational note
+//! ([`informational_line`]) and the withdrawal of a dead CLI's request
+//! ([`control_cancel_line`]).
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -60,6 +73,10 @@ pub const CUMULATIVE_SUBTYPE: &str = "apply_flag_settings";
 /// AND carried as `errors[0]` of an `error_during_execution` result on stdout.
 pub const RESUME_MISS_MARKER: &str = "No conversation found with session ID:";
 
+/// S10: the CLI's cut-miss text (`--resume-session-at=<uuid>` names no
+/// message of the transcript), carried as a resume miss's is.
+pub const CUT_MISS_MARKER: &str = "No message found with message.uuid of:";
+
 /// What the pump needs to know about one child → host line.
 #[derive(Debug, Clone)]
 pub enum ChildFrame<'a> {
@@ -83,8 +100,15 @@ pub enum ChildFrame<'a> {
         user_message_uuid: Option<Cow<'a, str>>,
         user_message_uuids: Vec<Cow<'a, str>>,
     },
-    /// Everything else (`assistant`, `stream_event`, `keep_alive`, other
-    /// `system` subtypes, non-JSON noise): forwarded untouched.
+    /// S10: an `assistant` frame; `top_level` when its `parent_tool_use_id`
+    /// is absent or `null` (not a subagent's).
+    Assistant { uuid: Option<Cow<'a, str>>, top_level: bool },
+    /// S10: `keep_alive`.
+    KeepAlive,
+    /// S10: `control_cancel_request` from the CLI: it withdraws its own request.
+    ControlCancel { request_id: Option<Cow<'a, str>> },
+    /// Everything else (`stream_event`, other `system` subtypes, non-JSON
+    /// noise): forwarded untouched.
     Other,
 }
 
@@ -101,7 +125,9 @@ pub enum HostFrame<'a> {
     /// A user message (the uuid is minted by the extension's webview; absent
     /// on some synthetic sends).
     User { uuid: Option<Cow<'a, str>> },
-    /// Everything else (`keep_alive`, non-JSON): forwarded untouched.
+    /// S10: `keep_alive`.
+    KeepAlive,
+    /// Everything else (non-JSON, other types): forwarded untouched.
     Other,
 }
 
@@ -123,7 +149,9 @@ impl PartialEq for ChildFrame<'_> {
                 F::Result { subtype: s1, is_error: e1, first_error: f1, user_message_uuid: u1, user_message_uuids: v1 },
                 F::Result { subtype: s2, is_error: e2, first_error: f2, user_message_uuid: u2, user_message_uuids: v2 },
             ) => s1 == s2 && e1 == e2 && f1 == f2 && u1 == u2 && v1 == v2,
-            (F::Other, F::Other) => true,
+            (F::Assistant { uuid: a, top_level: x }, F::Assistant { uuid: b, top_level: y }) => a == b && x == y,
+            (F::ControlCancel { request_id: a }, F::ControlCancel { request_id: b }) => a == b,
+            (F::KeepAlive, F::KeepAlive) | (F::Other, F::Other) => true,
             _ => false,
         }
     }
@@ -138,7 +166,7 @@ impl PartialEq for HostFrame<'_> {
             }
             (H::ControlCancel { request_id: a }, H::ControlCancel { request_id: b }) | (H::ControlResponse { request_id: a }, H::ControlResponse { request_id: b }) => a == b,
             (H::User { uuid: a }, H::User { uuid: b }) => a == b,
-            (H::Other, H::Other) => true,
+            (H::KeepAlive, H::KeepAlive) | (H::Other, H::Other) => true,
             _ => false,
         }
     }
@@ -177,6 +205,9 @@ struct Peek<'a> {
     user_message_uuid: Option<&'a RawValue>,
     #[serde(borrow, default)]
     user_message_uuids: Option<&'a RawValue>,
+    /// `None` when absent or `null` (serde reads a `null` option as none).
+    #[serde(borrow, default)]
+    parent_tool_use_id: Option<&'a RawValue>,
 }
 
 /// The two fields of a nested `request` / `response` object.
@@ -250,6 +281,9 @@ pub fn classify_child(line: &[u8]) -> ChildFrame<'_> {
             user_message_uuid: text(p.user_message_uuid),
             user_message_uuids: texts(p.user_message_uuids),
         },
+        "assistant" => ChildFrame::Assistant { uuid: text(p.uuid), top_level: p.parent_tool_use_id.is_none() },
+        "keep_alive" => ChildFrame::KeepAlive,
+        "control_cancel_request" => ChildFrame::ControlCancel { request_id: text(p.request_id) },
         _ => ChildFrame::Other,
     }
 }
@@ -272,6 +306,7 @@ pub fn classify_host(line: &[u8]) -> HostFrame<'_> {
         "control_cancel_request" => HostFrame::ControlCancel { request_id: text(p.request_id) },
         "control_response" => HostFrame::ControlResponse { request_id: inner(p.response).and_then(|r| text(r.request_id)) },
         "user" => HostFrame::User { uuid: text(p.uuid) },
+        "keep_alive" => HostFrame::KeepAlive,
         _ => HostFrame::Other,
     }
 }
@@ -283,17 +318,45 @@ pub fn is_state_subtype(subtype: &str) -> bool {
 }
 
 /// The CLI's resume-miss result: an error `result` whose first error starts
-/// with [`RESUME_MISS_MARKER`]. The sibling print-path failures
-/// (`No message found with message.uuid of: …`, the drop-guard refusal)
-/// share the frame shape, so the text decides, never the shape.
+/// with [`RESUME_MISS_MARKER`]. The sibling print-path failures (the cut
+/// miss, [`CUT_MISS_MARKER`]; the drop-guard refusal) share the frame
+/// shape, so the text decides, never the shape.
 #[must_use]
 pub fn is_resume_miss(frame: &ChildFrame<'_>) -> bool {
     matches!(frame, ChildFrame::Result { is_error: true, first_error: Some(e), .. } if e.starts_with(RESUME_MISS_MARKER))
 }
 
+/// S10: the CLI's cut miss: an error `result` whose first error starts with
+/// [`CUT_MISS_MARKER`] (`--resume-session-at` named a message the transcript
+/// lacks). Told by its text, as a resume miss is.
+#[must_use]
+pub fn is_cut_miss(frame: &ChildFrame<'_>) -> bool {
+    matches!(frame, ChildFrame::Result { is_error: true, first_error: Some(e), .. } if e.starts_with(CUT_MISS_MARKER))
+}
+
 /// A JSON string literal for `s` (quotes and escapes included).
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// S10 (L3): the note the pump writes to the host only, never to a child
+/// and never into the transcript:
+/// `{"type":"system","subtype":"informational","level":"warning","content":<text>,"session_id":<sid>,"uuid":<uuid>}`,
+/// `session_id` left out when `None`. The caller mints `uuid` (a fresh uuid
+/// v7). The extension shows it as a line of the chat when `level` is not
+/// `info` and the chat already has content.
+#[must_use]
+pub fn informational_line(text: &str, session_id: Option<&str>, uuid: &str) -> Bytes {
+    let sid = session_id.map(|s| format!(",\"session_id\":{}", json_str(s))).unwrap_or_default();
+    Bytes::from(format!("{{\"type\":\"system\",\"subtype\":\"informational\",\"level\":\"warning\",\"content\":{}{sid},\"uuid\":{}}}", json_str(text), json_str(uuid)))
+}
+
+/// S10 (L4): `{"type":"control_cancel_request","request_id":<id>}` for the
+/// host: a request of a CLI that is gone is withdrawn (the extension
+/// dismisses its prompt).
+#[must_use]
+pub fn control_cancel_line(request_id: &str) -> Bytes {
+    Bytes::from(format!("{{\"type\":\"control_cancel_request\",\"request_id\":{}}}", json_str(request_id)))
 }
 
 /// `{"type":"control_request","request_id":<id>,"request":<raw>}` — a
@@ -396,9 +459,69 @@ mod tests {
             assert_eq!(classify_child(line), ChildFrame::Other, "{:?}", String::from_utf8_lossy(line));
             assert_eq!(classify_host(line), HostFrame::Other, "{:?}", String::from_utf8_lossy(line));
         }
-        assert_eq!(classify_child(br#"{"type":"keep_alive"}"#), ChildFrame::Other);
-        assert_eq!(classify_child(br#"{"type":"assistant","message":{"content":[]}}"#), ChildFrame::Other);
         assert_eq!(classify_child(br#"{"type":"system","subtype":"status"}"#), ChildFrame::Other);
+        assert_eq!(classify_child(br#"{"type":"stream_event","event":{}}"#), ChildFrame::Other);
+    }
+
+    /// S10 (§3.2): `assistant`, `keep_alive` and the CLI's own
+    /// `control_cancel_request` classify; an assistant frame is top level
+    /// when its `parent_tool_use_id` is absent or `null`; a field of the
+    /// wrong type reads as absent; the host's `keep_alive` too.
+    #[test]
+    fn assistant_keep_alive_and_cancel_frames_classify() {
+        let top = br#"{"type":"assistant","message":{"role":"assistant","content":[]},"parent_tool_use_id":null,"session_id":"s","uuid":"a-1"}"#;
+        assert_eq!(classify_child(top), ChildFrame::Assistant { uuid: Some("a-1".into()), top_level: true });
+        assert_eq!(classify_child(br#"{"type":"assistant","message":{"content":[]}}"#), ChildFrame::Assistant { uuid: None, top_level: true }, "absent: top level");
+        let sub = br#"{"type":"assistant","message":{},"parent_tool_use_id":"toolu_01","uuid":"a-2"}"#;
+        assert_eq!(classify_child(sub), ChildFrame::Assistant { uuid: Some("a-2".into()), top_level: false }, "a subagent's");
+        assert_eq!(classify_child(br#"{"type":"assistant","uuid":7}"#), ChildFrame::Assistant { uuid: None, top_level: true }, "a uuid of the wrong type reads as absent");
+        assert_eq!(classify_child(br#"{"type":"keep_alive"}"#), ChildFrame::KeepAlive);
+        assert_eq!(classify_host(br#"{"type":"keep_alive"}"#), HostFrame::KeepAlive);
+        assert_eq!(classify_child(br#"{"type":"control_cancel_request","request_id":"perm-1-1"}"#), ChildFrame::ControlCancel { request_id: Some("perm-1-1".into()) });
+        assert_eq!(classify_child(br#"{"type":"control_cancel_request"}"#), ChildFrame::ControlCancel { request_id: None });
+        assert_ne!(classify_child(br#"{"type":"keep_alive"}"#), ChildFrame::Other, "no longer Other");
+        assert_ne!(ChildFrame::Assistant { uuid: None, top_level: true }, ChildFrame::Assistant { uuid: None, top_level: false });
+    }
+
+    /// The two lines S10's pump writes to the host, byte for byte: the
+    /// informational note (with and without a session id, its text escaped)
+    /// and the withdrawal of a request, which reads back as the CLI's own
+    /// cancel. The note is `Other` to the pump: it is never bookkept.
+    #[test]
+    fn the_informational_and_cancel_lines_are_byte_exact() {
+        let uuid = "0199f0e1-0000-7000-8000-000000000001";
+        let note = informational_line("ai-env: the chat continues on microvm-1", Some("11111111-2222-4333-8444-555555555555"), uuid);
+        assert_eq!(
+            &note[..],
+            br#"{"type":"system","subtype":"informational","level":"warning","content":"ai-env: the chat continues on microvm-1","session_id":"11111111-2222-4333-8444-555555555555","uuid":"0199f0e1-0000-7000-8000-000000000001"}"#
+        );
+        let bare = informational_line("a \"quoted\"\nline", None, uuid);
+        assert_eq!(&bare[..], br#"{"type":"system","subtype":"informational","level":"warning","content":"a \"quoted\"\nline","uuid":"0199f0e1-0000-7000-8000-000000000001"}"#);
+        let v: serde_json::Value = serde_json::from_slice(&bare).unwrap();
+        assert_eq!((v["content"].as_str(), v.get("session_id")), (Some("a \"quoted\"\nline"), None));
+        assert_eq!(classify_child(&note), ChildFrame::Other);
+        let cancel = control_cancel_line("perm-1-1");
+        assert_eq!(&cancel[..], br#"{"type":"control_cancel_request","request_id":"perm-1-1"}"#);
+        assert_eq!(classify_child(&cancel), ChildFrame::ControlCancel { request_id: Some("perm-1-1".into()) });
+        assert_eq!(classify_host(&cancel), HostFrame::ControlCancel { request_id: Some("perm-1-1".into()) });
+        assert_eq!(&control_cancel_line("q\"7")[..], br#"{"type":"control_cancel_request","request_id":"q\"7"}"#);
+    }
+
+    /// A cut miss (`--resume-session-at` naming a message the transcript
+    /// lacks) and a resume miss share the result's shape: the text tells
+    /// them apart, and neither is the other.
+    #[test]
+    fn a_cut_miss_is_told_by_its_text() {
+        let cut = br#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No message found with message.uuid of: 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a61"]}"#;
+        let resume = br#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: 11111111-2222-4333-8444-555555555555"]}"#;
+        assert!(is_cut_miss(&classify_child(cut)) && !is_resume_miss(&classify_child(cut)));
+        assert!(is_resume_miss(&classify_child(resume)) && !is_cut_miss(&classify_child(resume)));
+        let not_error = br#"{"type":"result","subtype":"success","is_error":false,"errors":["No message found with message.uuid of: x"]}"#;
+        assert!(!is_cut_miss(&classify_child(not_error)), "only an error result");
+        let later = br#"{"type":"result","is_error":true,"errors":["boom","No message found with message.uuid of: x"]}"#;
+        assert!(!is_cut_miss(&classify_child(later)), "only the first error counts");
+        assert!(!is_cut_miss(&ChildFrame::Other));
+        assert_eq!(CUT_MISS_MARKER, "No message found with message.uuid of:");
     }
 
     #[test]

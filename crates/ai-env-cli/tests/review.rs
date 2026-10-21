@@ -348,6 +348,28 @@ fn a_settings_file_copied_from_a_blob_the_remote_holds_is_reviewed() {
     assert_eq!(got, want.map(|(r, p, c)| (r.to_string(), p.to_string(), c.clone())), "{v}");
 }
 
+/// S10 phase 4b (F4-WALK-2, V-4): a settings file over `[seed].max_blob_mib`
+/// is sized and never read. It is `blob-too-large` at the commit and path
+/// that brought it, once (the objects' scan and D8 name the same place),
+/// and nothing comes from its bytes: neither D8's `broad-allow` for the
+/// `Bash(*)` it holds, which reading it would find, nor the policy rule.
+#[test]
+fn a_settings_file_over_the_blob_cap_is_too_large_and_never_read() {
+    let w = World::new();
+    let (repo, _origin, _) = w.pushed("app");
+    std::fs::write(w.bridge().join("bridge.toml"), "[seed]\nmax_blob_mib = 1\n").unwrap();
+    let pad = "x".repeat(1024 * 1024);
+    w.write(&repo, ".claude/settings.json", &format!("{{\"permissions\": {{\"allow\": [\"Bash(*)\"]}}, \"pad\": \"{pad}\"}}\n"));
+    let c1 = w.commit(&repo, "settings past the cap");
+    let blob = w.git(&repo, &["rev-parse", "HEAD:.claude/settings.json"]);
+    let o = w.ai_env(&repo, &["box", "review", "HEAD"], None);
+    assert_eq!(o.status.code(), Some(9), "{}", text(&o.stderr));
+    let line = format!("  commit {}:.claude/settings.json (blob {}): rule blob-too-large (over [seed].max_blob_mib)\n", short(&c1), short(&blob));
+    assert!(text(&o.stdout).contains(&format!("1 finding(s):\n{line}")), "{}", text(&o.stdout));
+    let v = json_of(&w.ai_env(&repo, &["box", "review", "HEAD", "--json"], None));
+    assert_eq!(v["findings"], json!([{ "rule": "blob-too-large", "path": ".claude/settings.json", "line": null, "commit": c1 }]), "{v}");
+}
+
 /// A merge whose result drops `Cargo.lock` (neither parent deleted it) is a
 /// finding named at the merge (its first-parent diff), once, though the
 /// head also lacks it against the merge base; put back by a later commit,

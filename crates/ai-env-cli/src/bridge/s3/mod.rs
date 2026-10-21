@@ -175,3 +175,15 @@ pub fn cmd_migrate_s9(store: &Keystore, yes: bool, json: bool) -> crate::errors:
 pub fn forget_purge(store: &Keystore, paths: &Paths, sid: &str) -> Result<bool, BridgeError> {
     commands::forget_purge(store, paths, sid)
 }
+
+/// S10 (F1): [`forget_purge`] of several sessions at once, for `session
+/// forget UUID... --purge` once `registry::forget_check` passed for each:
+/// whether each removed anything, in their order ([`commands::forget_purge_many`]).
+pub fn forget_purge_many(store: &Keystore, paths: &Paths, sids: &[String]) -> Result<Vec<bool>, BridgeError> {
+    commands::forget_purge_many(store, paths, sids)
+}
+
+/// S10 (R1): the most tail links a chat's chain is followed through, from
+/// its `committed` offset, when the Mac hands the VM the next tail URL or
+/// restores the chat (plans/s10-contracts.md §1.4).
+pub const TAIL_CHAIN_MAX: usize = 32;

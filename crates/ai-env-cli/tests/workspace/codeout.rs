@@ -679,3 +679,353 @@ fn the_commit_only_rule_meets_what_box_refs_let_through() {
     assert!(!git_ok(&mac.dir, &["cat-file", "-e", &blob]), "the blob stayed in the scratch");
     assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
 }
+
+// ---- S10 F4: the import batch ---------------------------------------------------------------------
+
+/// Every box and quarantine ref of the Mac's repository `dir` deleted, and
+/// the clean-object caches of `paths` with them: the Mac as before its first
+/// import.
+fn forget_imports(dir: &Path, paths: &ai_env_cli::bridge::config::Paths) {
+    forget_imports_refs_only(dir);
+    let _ = std::fs::remove_dir_all(paths.scan_cache());
+}
+
+/// S10 F4's equivalence fixture: the batch import (one listing and one
+/// scan of every ref's new objects, D8 from one walk of the trees, S9's
+/// per-ref pass only on a finding) gives exactly S9's per-ref import, by
+/// every field: promoted, quarantined, the findings in their order and
+/// their places, skipped, tips. The VM's branches: two clean ones and a
+/// twin, a secret per branch (in the tip, in a commit's history only, in a
+/// commit message), a settings widening, a `.claude` link, a path named
+/// after a key, a blob over the cap, one dirty blob shared by two branches
+/// (both quarantined, each at its own path), and the fixture-blob attack: a
+/// permissive file of the Mac's own history copied to
+/// `.claude/settings.json` (the union never lists that blob, the Mac has
+/// it; the walk of the tree reads it). And two trees written raw with a
+/// mode past 32 bits that git reads wrapped and fsck lets through: a
+/// `.claude/settings.json` of mode `40000100644` (git's `100644`) and a
+/// `.claude` of mode `40000040000` (a tree), each a broad allow (the walk
+/// reads each entry as git does: none is left out). The Mac's own settings
+/// file holds a hook, which no ref that leaves it as it is has read (S9's
+/// `unchanged`). Again with a warm clean cache, and a set of clean refs
+/// alone (the batch's fast path): the same.
+#[test]
+fn the_import_batch_equals_the_per_ref_scan() {
+    use ai_env_cli::bridge::codeout::import_per_ref;
+    let w = World::new();
+    let mac = w.repo("app");
+    let permissive = "{\"permissions\": {\"allow\": [\"Bash(*)\"]}}\n";
+    mac.write("fixtures/permissive.json", permissive);
+    // The Mac's own settings hold a hook: D8 would flag it, but a VM's ref that leaves the file as it is is not read.
+    mac.write(".claude/settings.json", "{\"hooks\": {\"Stop\": [{\"command\": \"x\"}]}}\n");
+    let base = mac.commit("a fixture and the Mac's settings");
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let key = format!("{}{}", "AKIA", "Z3".repeat(8));
+    let other = format!("{}{}", "AKIA", "Q7".repeat(8));
+    let secret = format!("aws_access_key_id = {key}\n");
+    let shared = format!("[default]\naws_access_key_id = {other}\n");
+    // A widening of the VM's own (not the fixture's bytes).
+    let allow: &[u8] = b"{\"permissions\":{\"allow\":[\"Bash(*)\"]}}\n";
+    let big = vec![b'z'; 8192];
+    let clean_a = commit_with(&vm, &base, &[("100644", "a.txt", b"a\n")], "clean a");
+    let held = commit_with(&vm, &base, &[("100644", "old.conf", secret.as_bytes())], "a secret");
+    let base_tree = git(&vm, &["rev-parse", &format!("{base}^{{tree}}")]);
+    let history = git(&vm, &["commit-tree", &base_tree, "-p", &held, "-m", "the secret removed"]);
+    let branches: Vec<(&str, String)> = vec![
+        ("clean-a", clean_a.clone()),
+        ("clean-b", commit_with(&vm, &base, &[("100644", "b.txt", b"b\n"), ("100644", "docs/settings.json", allow)], "clean b: no settings file of D8's")),
+        ("twin", clean_a),
+        ("secret", commit_with(&vm, &base, &[("100644", "deploy.conf", secret.as_bytes())], "a secret in the tip")),
+        ("history", history),
+        ("msg", commit_with(&vm, &base, &[("100644", "m.txt", b"m\n")], &format!("deploy with {key}"))),
+        ("widen", commit_with(&vm, &base, &[("100644", ".claude/settings.local.json", allow)], "a broad allow")),
+        ("link", commit_with(&vm, &base, &[("120000", "pkg/.claude", b"conf")], "a linked .claude")),
+        ("pathname", commit_with(&vm, &base, &[("100644", &format!("notes/{key}.txt"), b"x\n")], "a path named after a key")),
+        ("big", commit_with(&vm, &base, &[("100644", "assets/big.bin", &big)], "a blob over the cap")),
+        ("shared-1", commit_with(&vm, &base, &[("100644", "x/creds.txt", shared.as_bytes())], "shared, here")),
+        ("shared-2", commit_with(&vm, &base, &[("100644", "y/other.txt", shared.as_bytes())], "shared, there")),
+        ("attack", commit_with(&vm, &base, &[("100644", ".claude/settings.json", permissive.as_bytes())], "the Mac's own fixture as the settings")),
+        ("mode-file", raw_settings(&vm, &base, "40000", "40000100644", allow, "a settings file whose mode is past 32 bits")),
+        ("mode-dir", raw_settings(&vm, &base, "40000040000", "100644", allow, "a .claude whose mode is past 32 bits")),
+    ];
+    let fixture = git(&mac.dir, &["rev-parse", &format!("{base}:fixtures/permissive.json")]);
+    assert_eq!(git(&vm, &["rev-parse", &format!("{}:.claude/settings.json", branches[12].1)]), fixture, "the attack's settings blob is the Mac's fixture");
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let run = |refs: &BTreeMap<String, String>, per_ref: bool| {
+        let file = w.root.join("codeout.pack");
+        let manifest = codeout_of(&vm, refs, &base, &file);
+        let i = Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &file, haves: std::slice::from_ref(&base), max_blob: 4096, keep_wip: 64 };
+        if per_ref {
+            import_per_ref(&i).unwrap()
+        } else {
+            import(&i).unwrap()
+        }
+    };
+    let refs: BTreeMap<String, String> = branches.iter().map(|(b, id)| (format!("refs/heads/{b}"), id.clone())).collect();
+    let per = run(&refs, true);
+    let names = |m: &BTreeMap<String, String>, prefix: &str| m.keys().map(|k| k.strip_prefix(prefix).unwrap_or(k).to_string()).collect::<Vec<_>>();
+    assert_eq!(names(&per.promoted, BOX_REFS), ["clean-a", "clean-b", "twin"], "{per:?}");
+    assert_eq!(names(&per.quarantined, BOX_QUARANTINE_REFS), ["attack", "big", "history", "link", "mode-dir", "mode-file", "msg", "pathname", "secret", "shared-1", "shared-2", "widen"], "{per:?}");
+    let rules: Vec<(&str, &str)> = per.findings.iter().map(|f| (f.location.as_str(), f.rule.as_str())).collect();
+    for (at, rule) in [
+        (format!("{BOX_REFS}attack:.claude/settings.json"), "broad-allow"),
+        (format!("{BOX_REFS}big:assets/big.bin"), "blob-too-large"),
+        (format!("{BOX_REFS}link:pkg/.claude"), "settings-symlink"),
+        (format!("{BOX_REFS}mode-dir:.claude/settings.json"), "broad-allow"),
+        (format!("{BOX_REFS}mode-file:.claude/settings.json"), "broad-allow"),
+        (format!("{BOX_REFS}shared-1:x/creds.txt"), "aws-access-key-id"),
+        (format!("{BOX_REFS}shared-2:y/other.txt"), "aws-access-key-id"),
+        (format!("{BOX_REFS}widen:.claude/settings.local.json"), "broad-allow"),
+    ] {
+        assert!(rules.contains(&(at.as_str(), rule)), "{at}: {rule} in {rules:?}");
+    }
+    assert!(per.findings.iter().any(|f| f.location == format!("commit {}:old.conf", &held[..12])), "the history's secret, by its commit: {rules:?}");
+    assert!(per.findings.iter().any(|f| f.location.starts_with("commit ") && !f.location.contains(':')), "the message's: {rules:?}");
+    assert!(per.findings.iter().any(|f| f.location == "a path name"), "the key-named path: {rules:?}");
+    assert!(per.findings.iter().all(|f| !f.text().contains(&key) && !f.text().contains(&other)), "no value in a finding");
+    // The batch, from the same start: every field equal.
+    forget_imports(&mac.dir, &paths);
+    let batch = run(&refs, false);
+    assert_eq!(batch, per, "the batch is the per-ref scan");
+    // Again with the clean cache the batch left: the same.
+    forget_imports_refs_only(&mac.dir);
+    assert_eq!(run(&refs, false), per, "a warm cache changes no finding");
+    // Clean refs alone: the batch's fast path (no ref's own listing) gives the same as well.
+    let clean: BTreeMap<String, String> = refs.iter().filter(|(r, _)| ["clean-a", "clean-b", "twin"].iter().any(|b| r.ends_with(&format!("/{b}")))).map(|(r, id)| (r.clone(), id.clone())).collect();
+    forget_imports(&mac.dir, &paths);
+    let per = run(&clean, true);
+    forget_imports(&mac.dir, &paths);
+    assert_eq!(run(&clean, false), per);
+    assert_eq!(per.promoted.len(), 3);
+}
+
+/// A commit on `base` in `repo` whose tree is `base`'s with its `.claude`
+/// replaced by one holding `settings.json` (`bytes`), both trees written
+/// raw (`hash-object -t tree --literally`) with the mode given:
+/// `claude_mode` for the `.claude` entry, `file_mode` for the file's (S10
+/// F4: a mode git reads wrapped, as `40000100644` for `100644`).
+fn raw_settings(repo: &Path, base: &str, claude_mode: &str, file_mode: &str, bytes: &[u8], msg: &str) -> String {
+    let id_of = |o: std::process::Output| {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let tree = |raw: &[u8]| id_of(git_out(repo, &["hash-object", "-t", "tree", "--literally", "-w", "--stdin"], Some(raw)));
+    let entry = |mode: &str, name: &str, id: &str| [format!("{mode} {name}\0").into_bytes(), hex::decode(id).unwrap()].concat();
+    let blob = id_of(git_out(repo, &["hash-object", "-w", "--stdin"], Some(bytes)));
+    let claude = tree(&entry(file_mode, "settings.json", &blob));
+    let mut root = Vec::new();
+    for l in git(repo, &["ls-tree", base]).lines() {
+        let (head, name) = l.split_once('\t').unwrap();
+        let fields: Vec<&str> = head.split(' ').collect();
+        root.extend(match name {
+            ".claude" => entry(claude_mode, name, &claude),
+            _ => entry(fields[0].trim_start_matches('0'), name, fields[2]),
+        });
+    }
+    assert!(git(repo, &["ls-tree", base]).lines().any(|l| l.ends_with("\t.claude")), "the base holds a .claude");
+    git(repo, &["commit-tree", &tree(&root), "-p", base, "-m", msg])
+}
+
+/// The box and quarantine refs of `dir` deleted, the clean-object cache kept.
+fn forget_imports_refs_only(dir: &Path) {
+    let refs = git(dir, &["for-each-ref", "--format=delete %(refname)", BOX_REFS, BOX_QUARANTINE_REFS]);
+    let o = git_out(dir, &["update-ref", "--stdin"], Some(format!("{refs}\n").as_bytes()));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// `n` branches `b000`… in the VM's checkout `vm`, each at a commit of its
+/// own on its HEAD (a file of its own), written by one `git fast-import` as
+/// the agent: each branch's full name to its commit.
+fn vm_branches(vm: &Path, n: usize) -> BTreeMap<String, String> {
+    let head = as_agent(vm, &["rev-parse", "HEAD"]);
+    let mut stream = String::new();
+    for i in 0..n {
+        let (name, body) = (format!("b{i:03}"), format!("branch {i}\n"));
+        stream.push_str(&format!("commit refs/heads/{name}\ncommitter claude-agent <claude-agent@ai-env.invalid> 1791792000 +0000\ndata {}\n{name}\nfrom {head}\nM 100644 inline {name}.txt\ndata {}\n{body}\n", name.len() + 1, body.len()));
+    }
+    stream.push_str("done\n");
+    let o = git_out(vm, &["-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "fast-import", "--quiet", "--done"], Some(stream.as_bytes()));
+    assert!(o.status.success(), "fast-import: {}", String::from_utf8_lossy(&o.stderr));
+    let made: BTreeMap<String, String> = git(vm, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/b*"]).lines().filter_map(|l| l.split_once(' ')).map(|(r, id)| (r.to_string(), id.to_string())).collect();
+    assert_eq!(made.len(), n, "the VM's branches");
+    made
+}
+
+/// The most git runs the Mac makes for one `box fetch` that imports
+/// [`BOUND_REFS`] new branches (S10 F4): what the fetch costs whatever the
+/// refs' count, with room; S9's import alone ran four or more per ref.
+const GIT_RUNS_MAX: usize = 40;
+/// The VM branches of the git-call bound.
+const BOUND_REFS: usize = 300;
+
+/// S10 F4's bound on git calls, through the endpoint and the native shim's
+/// real helper: 300 VM branches come out of one `box fetch` (`POST
+/// /codeout`), each promoted at its commit, while the Mac's git (the fake
+/// git's log, deterministic) runs at most [`GIT_RUNS_MAX`] times in all:
+/// one `rev-list` (the union), no `ls-tree` (the settings walk reads the
+/// trees with `cat-file`), no run per ref. S9's import ran a `rev-list`,
+/// two `cat-file`s and an `ls-tree` per ref (over 1200 here).
+#[test]
+fn three_hundred_vm_branches_import_in_a_bounded_number_of_git_runs() {
+    let mut p = super::common::Harness::prepare();
+    let rig = p.rig();
+    let (work, dir) = (rig.work(), rig.work().display().to_string());
+    rig.start_vm();
+    let o = rig.run(&["box", "seed", &dir, "--json"], None);
+    assert!(o.status.success(), "box seed: {}", String::from_utf8_lossy(&o.stderr));
+    let branches = vm_branches(&rig.vm_path(&work), BOUND_REFS);
+    let from = rig.mac_git_calls().len();
+    let t = std::time::Instant::now();
+    let o = rig.run(&["box", "fetch", &dir, "--json"], None);
+    let took = t.elapsed();
+    assert!(o.status.success(), "box fetch: {}", String::from_utf8_lossy(&o.stderr));
+    let boxed: BTreeMap<String, String> = git(&work, &["for-each-ref", "--format=%(refname) %(objectname)", &format!("{BOX_REFS}b*")]).lines().filter_map(|l| l.split_once(' ')).map(|(r, id)| (r.replace(BOX_REFS, "refs/heads/"), id.to_string())).collect();
+    assert!(boxed == branches, "{} of {} branches promoted", boxed.len(), branches.len());
+    let ran = rig.mac_git_calls()[from..].to_vec();
+    let mut subs: BTreeMap<String, usize> = BTreeMap::new();
+    for call in &ran {
+        *subs.entry(call.sub().unwrap_or("-").to_string()).or_default() += 1;
+    }
+    eprintln!("box fetch of {BOUND_REFS} VM branches: {} git runs on the Mac in {took:?}: {subs:?}", ran.len());
+    assert!(ran.len() <= GIT_RUNS_MAX, "{} git runs for {BOUND_REFS} refs: {subs:?}", ran.len());
+    assert_eq!((subs.get("rev-list").copied(), subs.get("ls-tree").copied()), (Some(1), None), "{subs:?}");
+}
+
+// ---- S10 phase 4: the import's bounds (F4-WALK-1, F4-WALK-2) ----------------------------------------
+
+/// `bytes` written as a blob in `repo`: its id.
+fn blob_in(repo: &Path, bytes: &[u8]) -> String {
+    let o = git_out(repo, &["hash-object", "-w", "--stdin"], Some(bytes));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A tree written in `repo` by `git mktree` from `ls-tree` lines (`<mode>
+/// <type> <id>\t<name>`, any order; names git takes apart, a case apart
+/// too, as they are): its id.
+fn mktree(repo: &Path, lines: &[String]) -> String {
+    let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let o = git_out(repo, &["mktree"], Some(input.as_bytes()));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A commit on `base` in `repo` whose tree is `base`'s with `name` the tree `tree` too.
+fn commit_with_tree(repo: &Path, base: &str, name: &str, tree: &str, msg: &str) -> String {
+    let mut lines: Vec<String> = git(repo, &["ls-tree", base]).lines().map(str::to_string).collect();
+    lines.push(format!("040000 tree {tree}\t{name}"));
+    git(repo, &["commit-tree", &mktree(repo, &lines), "-p", base, "-m", msg])
+}
+
+/// S10 phase 4 (F4-WALK-1): a ref whose `.claude` holds 64 names that fold
+/// to `settings.json`, all one blob of 40 `bypassPermissions` strings,
+/// would copy the blob's 40 findings to each of its 64 paths (2560, or
+/// tens of gigabytes from 13 824 names over a larger blob). The import keeps
+/// the tip's first `SETTINGS_FINDINGS_MAX` settings findings (every rule
+/// among them: the blob has one), all at the first path, the same in both
+/// modes; the ref is quarantined, a clean one beside it promoted.
+#[test]
+fn a_tips_settings_findings_are_capped_alike_in_both_modes() {
+    use ai_env_cli::bridge::codeout::import_per_ref;
+    use ai_env_cli::bridge::workspace::blobscan::SETTINGS_FINDINGS_MAX;
+    let w = World::new();
+    let mac = w.repo("app");
+    let base = mac.head();
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let keys: Vec<String> = (0..40).map(|i| format!("  \"k{i}\": \"bypassPermissions\"")).collect();
+    let blob = blob_in(&vm, format!("{{\n{}\n}}\n", keys.join(",\n")).as_bytes());
+    // Each case of the first six letters: 64 names git keeps apart, one file on the Mac's disk.
+    let names: Vec<String> = (0..64u32).map(|mask| "settings.json".chars().enumerate().map(|(i, c)| if (mask >> i) & 1 == 1 { c.to_ascii_uppercase() } else { c }).collect()).collect();
+    let claude = mktree(&vm, &names.iter().map(|n| format!("100644 blob {blob}\t{n}")).collect::<Vec<_>>());
+    let wide = commit_with_tree(&vm, &base, ".claude", &claude, "one settings blob at 64 names");
+    let clean = commit_with(&vm, &base, &[("100644", "clean.txt", b"c\n")], "clean");
+    let refs = BTreeMap::from([("refs/heads/wide".to_string(), wide.clone()), ("refs/heads/clean".to_string(), clean.clone())]);
+    let file = w.root.join("codeout.pack");
+    let manifest = codeout_of(&vm, &refs, &base, &file);
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let i = Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &file, haves: std::slice::from_ref(&base), max_blob: 64 << 20, keep_wip: 64 };
+    let per = import_per_ref(&i).unwrap();
+    assert_eq!((&per.promoted, &per.quarantined), (&BTreeMap::from([(format!("{BOX_REFS}clean"), clean)]), &BTreeMap::from([(format!("{BOX_QUARANTINE_REFS}wide"), wide)])), "{per:?}");
+    assert_eq!(per.findings.len(), SETTINGS_FINDINGS_MAX, "the first: {:?}", per.findings.first());
+    let first = format!("{BOX_REFS}wide:.claude/{}", names.iter().min().unwrap());
+    assert!(per.findings.iter().all(|f| f.rule == "bypass-permissions" && f.location == first && f.object.as_deref() == Some(&blob[..12])), "{:?}", per.findings.iter().find(|f| f.location != first || f.rule != "bypass-permissions"));
+    forget_imports(&mac.dir, &paths);
+    assert_eq!(import(&i).unwrap(), per, "the batch keeps the same");
+}
+
+/// S10 phase 4 (F4-WALK-2): a settings blob over the cap is never read,
+/// and never passes for a clean file. The Mac's own history holds a JSON
+/// object of over 2 MiB that D8 finds nothing in (`fixtures/big.json`); a
+/// VM ref copies it to `.claude/settings.json` (the union never lists that
+/// blob: the Mac has it). Under a 1 MiB cap the ref is quarantined with
+/// `blob-too-large` at that path, once, the same in both modes (read
+/// whole, D8 found nothing and promoted it).
+#[test]
+fn a_settings_blob_over_the_cap_is_quarantined_unread_in_both_modes() {
+    use ai_env_cli::bridge::codeout::import_per_ref;
+    let w = World::new();
+    let mac = w.repo("app");
+    let big = format!("{{{}}}\n", " ".repeat(2 << 20));
+    mac.write("fixtures/big.json", &big);
+    let base = mac.commit("a large fixture");
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let copied = commit_with(&vm, &base, &[("100644", ".claude/settings.json", big.as_bytes())], "the fixture as the settings");
+    let blob = git(&mac.dir, &["rev-parse", &format!("{base}:fixtures/big.json")]);
+    assert_eq!(git(&vm, &["rev-parse", &format!("{copied}:.claude/settings.json")]), blob, "the Mac's own blob");
+    let refs = BTreeMap::from([("refs/heads/copied".to_string(), copied.clone())]);
+    let file = w.root.join("codeout.pack");
+    let manifest = codeout_of(&vm, &refs, &base, &file);
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let i = Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &file, haves: std::slice::from_ref(&base), max_blob: 1 << 20, keep_wip: 64 };
+    let per = import_per_ref(&i).unwrap();
+    assert_eq!(per.quarantined, BTreeMap::from([(format!("{BOX_QUARANTINE_REFS}copied"), copied)]), "{per:?}");
+    let at = format!("{BOX_REFS}copied:.claude/settings.json");
+    let found: Vec<(&str, Option<&str>, &str)> = per.findings.iter().map(|f| (f.location.as_str(), f.object.as_deref(), f.rule.as_str())).collect();
+    assert_eq!(found, [(at.as_str(), Some(&blob[..12]), "blob-too-large")]);
+    forget_imports(&mac.dir, &paths);
+    assert_eq!(import(&i).unwrap(), per, "the batch: the same");
+}
+
+/// S10 phase 4 (F4-WALK-1): a ref whose tree routes more paths to its
+/// settings than the import walks (41 trees, every level naming the one
+/// below twice: 2^40 paths to one `.claude/settings.json`, in a pack of a
+/// few KB that git's fsck lets through) refuses the import at once, where
+/// S9's `ls-tree -r` would list every path: no ref moves, box or
+/// quarantine, and no incoming ref is left.
+#[test]
+fn a_tree_routing_too_many_settings_paths_refuses_the_import() {
+    use ai_env_cli::bridge::errors::BridgeError;
+    let w = World::new();
+    let mac = w.repo("app");
+    let base = mac.head();
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let blob = blob_in(&vm, b"{}\n");
+    let claude = mktree(&vm, &[format!("100644 blob {blob}\tsettings.json")]);
+    let mut tree = mktree(&vm, &[format!("040000 tree {claude}\t.claude")]);
+    for _ in 0..40 {
+        tree = mktree(&vm, &[format!("040000 tree {tree}\ta"), format!("040000 tree {tree}\tb")]);
+    }
+    let dag = commit_with_tree(&vm, &base, "dag", &tree, "2^40 paths to one settings file");
+    let refs = BTreeMap::from([("refs/heads/dag".to_string(), dag)]);
+    let file = w.root.join("codeout.pack");
+    let manifest = codeout_of(&vm, &refs, &base, &file);
+    let before = mac.state();
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let t = std::time::Instant::now();
+    let e = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack: &file, haves: std::slice::from_ref(&base), max_blob: 64 << 20, keep_wip: 64 }).unwrap_err();
+    assert!(t.elapsed() < std::time::Duration::from_secs(30), "{:?}", t.elapsed());
+    assert!(matches!(&e, BridgeError::WorkspaceFailed { code, message } if *code == ai_env_cli::wire::workspace::refusal::GIT_FAILED && message.contains("routes more settings paths than the import walks")), "{e:?}");
+    for name in [format!("{BOX_REFS}dag"), format!("{BOX_QUARANTINE_REFS}dag")] {
+        assert!(!git_ok(&mac.dir, &["rev-parse", "--verify", "--quiet", &name]), "{name}");
+    }
+    assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
+    assert_eq!(mac.state().refs, before.refs, "no ref moved");
+}

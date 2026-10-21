@@ -164,6 +164,15 @@ on_links!(
         h.expect_out(|v| is_response_to(v, &init_id), T);
         h.expect_out(|v| is_response_to(v, &perm_id), T);
         h.expect_out(|v| is_response_to(v, &flags_id), T);
+        if link.is_remote() {
+            // The subtree's files follow the spawn (the code-out trigger's first transcript step, given up at the
+            // close): the close waits for them, so a turn quicker than that step is no failure.
+            let sub = h.vm_projects().join(&slug).join(&sid).join("subagents").join("agent-a1.jsonl");
+            let until = std::time::Instant::now() + T;
+            while !sub.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         h.close_stdin();
         let (status, took) = h.wait(EXIT);
         let transcript = h.transcript();

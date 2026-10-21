@@ -153,7 +153,8 @@ impl Rig {
                         consumed.stderr_done(seq);
                     }
                     SpawnEvent::Exit(e) => exit = Some(e),
-                    SpawnEvent::Note(_) | SpawnEvent::Link(_) => {}
+                    // S10: `vm exec`'s session never parks.
+                    SpawnEvent::Note(_) | SpawnEvent::Link(_) | SpawnEvent::Park(_) => {}
                 }
             }
             (out, err, pid, exit)

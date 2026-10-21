@@ -128,7 +128,7 @@ fn part_of(key: &S3Key, version: &str, bytes: &[u8]) -> PullPart {
 }
 
 fn pull_of(parts: Vec<PullPart>, whole: Option<&[u8]>) -> TranscriptPull {
-    TranscriptPull { rel: rel(), parts, sha256: whole.map(sha), owner: OWNER.into(), proxy: Some(PROXY.into()) }
+    TranscriptPull { rel: rel(), parts, sha256: whole.map(sha), owner: OWNER.into(), proxy: Some(PROXY.into()), share: 1 }
 }
 
 /// `body`'s refusal code and message.
@@ -147,10 +147,11 @@ fn put_lines(len: usize, checksum: Option<&str>) -> String {
     lines
 }
 
-/// A whole configuration: its common lines, then `tail`.
+/// A whole configuration: its common lines (S10: the stall limit after
+/// `max-time`, 1024 bytes a second for 60 s), then `tail`.
 fn config(url: &PresignedUrl, proto: &str, max_time: &str, proxy: Option<&str>, tail: &str) -> String {
     let proxy = proxy.map(|p| format!("proxy = \"{p}\"\n")).unwrap_or_default();
-    format!("url = \"{}\"\nsilent\nshow-error\nproto = \"={proto}\"\nconnect-timeout = 20\nmax-time = {max_time}\n{WRITE_OUT}\n{proxy}{tail}", url.expose())
+    format!("url = \"{}\"\nsilent\nshow-error\nproto = \"={proto}\"\nconnect-timeout = 20\nmax-time = {max_time}\nspeed-limit = 1024\nspeed-time = 60\n{WRITE_OUT}\n{proxy}{tail}", url.expose())
 }
 
 /// A call's configuration with its `max-time` value as `<t>`, and that value.
@@ -356,11 +357,13 @@ async fn push_refuses_symlinked_transcript() {
     assert!(rig.calls().is_empty() || rig.calls().len() == 1, "at most the pull's GET, which the helper's refusal ended: {:?}", rig.calls());
 }
 
-/// curl's configuration is pinned line by line (S9 §3.4): a push through
-/// the proxy, a pull part, a tail at `/suspend`, a lab URL (plain http);
-/// every call's argv is exactly `-q -K /dev/fd/3`, its only descriptor past
-/// stderr is fd 3, it runs as the shim's uid when the shim is not root (as
-/// `ai-env-net` when it is), and `max-time` is the budget left.
+/// curl's configuration is pinned line by line (S9 §3.4; S10: with the
+/// stall limit, `speed-limit = 1024` and `speed-time = 60`, on every call):
+/// a push through the proxy, a pull part, a tail at `/suspend`, a lab URL
+/// (plain http); every call's argv is exactly `-q -K /dev/fd/3`, its only
+/// descriptor past stderr is fd 3, it runs as the shim's uid when the shim
+/// is not root (as `ai-env-net` when it is), and `max-time` is the budget
+/// left (a pull's, S10, `budget::pull_budget` at its share).
 #[tokio::test]
 async fn the_curl_config_is_pinned() {
     let rig = Rig::new().await;
@@ -391,7 +394,8 @@ async fn the_curl_config_is_pinned() {
         config(&lab.url, "http", "<t>", None, &put_lines(text.len(), Some(&checksum))),
         config(&tail.url, "https", "<t>", Some(PROXY), &put_lines(11, None)),
     ];
-    let budgets = [60 + 30, 60 + 30, 60 + 30, 8];
+    let pull_s = ai_env_cli::wire::workspace::budget::pull_budget(text.len() as u64, 1).as_secs();
+    let budgets = [60 + 30, pull_s, 60 + 30, 8];
     // SAFETY: geteuid cannot fail.
     let uid = unsafe { libc::geteuid() };
     for ((call, want), most) in calls.iter().zip(&want).zip(budgets) {
@@ -449,6 +453,89 @@ async fn the_tail_is_pushed_at_suspend_and_terminate() {
     assert!(calls[1].conf("url")[0].contains(&format!("/v1/{next}/vm/g1/t/0000000000000000?")), "{:?}", calls[1].conf("url"));
 }
 
+/// S10 (R1): a tail's URL goes only once S3 answered its push. curl
+/// without an HTTP status (the proxy refused) and S3's 503 keep it, and the
+/// next hook pushes the same key again, the bytes past its `from` as the
+/// file holds them then; S3's 200 ends it (the next hook pushes nothing),
+/// and so does 412 (a push before stored the key).
+#[tokio::test]
+async fn a_tail_url_is_kept_on_no_status_or_a_5xx() {
+    let rig = Rig::new().await;
+    let saved = rig.root.join("saved");
+    let first = b"{\"type\":\"user\"}\n".repeat(4);
+    put(&rig.file(), &first);
+    let now = ai_env_cli::wire::time::unix_now();
+    let tail_at = |from: u64| TranscriptTail {
+        rel: rel(),
+        from,
+        url: url(&S3Key::Tail { session: S8_ID.into(), gen: 1, offset: from }, SIGNED_HEADERS_TAIL, None),
+        owner: OWNER.into(),
+        proxy: Some(PROXY.into()),
+        expires_at: now + 3600,
+    };
+    let append = |bytes: &[u8]| std::fs::OpenOptions::new().append(true).open(rig.file()).unwrap().write_all(bytes).unwrap();
+    let tail = tail_at(first.len() as u64);
+    assert_eq!(rig.post("/transcript/tail", &tail).await.0, 204);
+    let late = b"{\"type\":\"assistant\"}\n".to_vec();
+    append(&late);
+    for (knobs, what) in [(vec![("S3CURL_FAIL", "7")], "curl without a status"), (vec![("S3CURL_STATUS", "503"), ("S3CURL_CODE", "SlowDown")], "S3's 503")] {
+        let n = rig.calls().len();
+        rig.knobs(&knobs);
+        assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
+        let calls = rig.calls();
+        assert_eq!(calls.len(), n + 1, "{what}: pushed once: {calls:?}");
+        assert_eq!(calls[n].conf("url"), [tail.url.expose()], "{what}: to its tail's key");
+    }
+    // Kept: the next hook pushes the same key, the bytes past from as the file holds them now.
+    let more = b"{\"type\":\"summary\"}\n".to_vec();
+    append(&more);
+    rig.knobs(&[("S3CURL_SAVE", saved.to_str().unwrap())]);
+    assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls[2].conf("url"), [tail.url.expose()]);
+    assert_eq!(std::fs::read(saved.join("3.put")).unwrap(), [&late[..], &more[..]].concat());
+    // S3 answered 200: the URL is spent.
+    append(b"{\"n\":4}\n");
+    assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
+    assert_eq!(rig.calls().len(), 3, "a spent URL is never pushed again");
+    // A 412 (a push before stored the key) spends the next one.
+    let next = tail_at(std::fs::metadata(rig.file()).unwrap().len());
+    assert_eq!(rig.post("/transcript/tail", &next).await.0, 204);
+    append(b"{\"n\":5}\n");
+    rig.knobs(&[("S3CURL_STATUS", "412"), ("S3CURL_CODE", "PreconditionFailed")]);
+    assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
+    assert_eq!(rig.calls().len(), 4);
+    append(b"{\"n\":6}\n");
+    rig.knobs(&[]);
+    assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
+    assert_eq!(rig.calls().len(), 4, "412 spent it too");
+}
+
+/// S10: a pull's budget is `budget::pull_budget` at its share (the pulls
+/// that run at once, `TranscriptPull.share`): curl's `max-time` for a pull
+/// of 50 MB is at most 140 s at share 1, and over it (at most 290 s) at
+/// share 4. A share out of 1 to 4 is 400 `bad_request`, and no curl runs.
+#[tokio::test]
+async fn a_pull_is_budgeted_at_its_share() {
+    let rig = Rig::new().await;
+    rig.knobs(&[("S3CURL_BODIES", rig.root.join("bodies").to_str().unwrap())]);
+    let part = PullPart { url: url(&base(1), SIGNED_HEADERS_GET, Some("fv1")), len: 50_000_000, sha256: Some("ab".repeat(32)) };
+    for (share, low, high) in [(1, 1, 140), (4, 141, 290)] {
+        let pull = TranscriptPull { share, ..pull_of(vec![part.clone()], None) };
+        let (st, _, body) = rig.post("/transcript/pull", &pull).await;
+        assert_eq!(st, 200, "share {share}: the part is short, nothing written: {}", String::from_utf8_lossy(&body));
+        let (_, secs) = timed(rig.calls().last().expect("a GET"));
+        assert!((low..=high).contains(&secs), "share {share}: max-time {secs}");
+    }
+    let n = rig.calls().len();
+    for share in [0, 5] {
+        let (st, _, b) = rig.post("/transcript/pull", &TranscriptPull { share, ..pull_of(vec![part.clone()], None) }).await;
+        assert_eq!((st, refused(&b).0.as_str()), (400, "bad_request"), "share {share}");
+    }
+    assert_eq!(rig.calls().len(), n, "no curl for a share out of range");
+}
+
 /// A tail is only ever a session's main transcript's (S9 §13, I2): its key
 /// names no file, so `POST /transcript/tail` of a subtree file is 400
 /// `bad_request` and kept nowhere (`/suspend` and `/terminate` push nothing
@@ -470,7 +557,7 @@ async fn a_tail_of_a_subtree_file_is_refused() {
     std::fs::OpenOptions::new().append(true).open(rig.projects().join(&sub)).unwrap().write_all(b"{\"agent\":2}\n").unwrap();
     assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
     let file = S3Key::File { session: S8_ID.into(), sha256: sha(&agent) };
-    let pull = TranscriptPull { rel: sub, parts: vec![part_of(&file, "fv1", &agent), PullPart { url: url(&tail_key, SIGNED_HEADERS_GET, None), len: 12, sha256: None }], sha256: None, owner: OWNER.into(), proxy: Some(PROXY.into()) };
+    let pull = TranscriptPull { rel: sub, parts: vec![part_of(&file, "fv1", &agent), PullPart { url: url(&tail_key, SIGNED_HEADERS_GET, None), len: 12, sha256: None }], sha256: None, owner: OWNER.into(), proxy: Some(PROXY.into()), share: 1 };
     let (st, _, b) = rig.post("/transcript/pull", &pull).await;
     let (code, message) = refused(&b);
     assert_eq!((st, code.as_str()), (400, "bad_request"), "{message}");

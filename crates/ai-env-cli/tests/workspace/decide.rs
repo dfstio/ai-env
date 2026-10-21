@@ -14,7 +14,7 @@ fn record(path: &str, head: &str, wip_tree: Option<&str>) -> SeedRecord {
 }
 
 fn state(rec: Option<SeedRecord>, tip: &str, clean: bool, pristine: bool) -> SeedState {
-    SeedState { record: rec, tip: Some(tip.into()), branch: Some("main".into()), clean, pristine }
+    SeedState { record: rec, tip: Some(tip.into()), branch: Some("main".into()), clean, pristine, shallow: None }
 }
 
 fn mac<'a>(head: &'a str, wip_tree: Option<&'static str>) -> MacSeed<'a> {

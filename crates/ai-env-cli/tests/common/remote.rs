@@ -60,9 +60,33 @@
 //! rig holds its binary's wall-clock lane shared while it lives, so a test
 //! that measures a close budget, holding the lane alone ([`alone`]), runs
 //! beside no other remote session.
+//!
+//! S10 (plans/s10-contracts.md §8.2): one shim and one disk per VM. The
+//! endpoint is routed per VM (`FakeEndpoint::start_per_vm`): the first VM a
+//! request reaches gets the shim made with the rig (`rig.shim`, its disk
+//! `<tmp>/vm`, so `vm_root()`, `vm_path()`, `vm_projects()` and
+//! `vm_spawns()` keep meaning that VM), and each later one, at its first
+//! request, a shim of its own, as at its boot: its fs_root `<tmp>/vm-<n>`
+//! (n = 2, 3, … in the order of the VMs' first requests), its home the
+//! Mac's `HOME` under it, the same fakes and knobs files (`vm-claude`,
+//! `vm-git`, `vm-curl`: the fake claude's generations still count on, and
+//! its logs stay the rig's), its listeners on the rig's runtime, its fake
+//! claude probed. [`RemoteRig::vm_ids`], [`RemoteRig::shim_of`] and the
+//! other `_of` accessors name each VM's. The fake API plays the platform's
+//! wall (`FakeState::enforce_wall`, set here): a VM ends at `started +
+//! max_duration_s`, and the endpoint's tick posts its `/terminate`;
+//! [`RemoteRig::bring_wall_near`] ages a VM on both sides. Its end waits
+//! for the VM's shim, as the platform's VM ends once its terminate hook
+//! returned (`FakeState::terminate_after_hook`, set here too): the
+//! endpoint's factory records each VM it runs on a shim (`hook_ran`), each
+//! shim's hooks listener its `/terminate` answer (`terminate_answered`,
+//! [`answering_terminate`]), and a TERMINATING VM a shim ran turns
+//! TERMINATED at the first look after that answer.
+//! [`RemoteRig::config`] edits bridge.toml as TOML. The rig's drop waits on
+//! every shim's helpers and stops every shim's spawns.
 #![allow(dead_code)]
 
-use super::fake_endpoint::FakeEndpoint;
+use super::fake_endpoint::{FakeEndpoint, VmFactory, VmRoutes};
 use super::green_world::{self, Green};
 use super::fake_s3::FakeS3;
 use super::{curl_calls, fake_master, git_calls, install_fake_curl, install_fake_git, link_fake, write_knobs, CurlCall, GitCall, FAKE_V2, REMOVED_ENV, SESSION_ARGV};
@@ -71,15 +95,14 @@ use ai_env_cli::bridge::vm::fake_file::FileFakeMicrovmApi;
 use ai_env_cli::shim::health::{BoundPorts, ProbeSpec, ShimOpts, ShimState};
 use ai_env_cli::shim::peer::Peer;
 use ai_env_cli::shim::sys::RealSys;
-use ai_env_cli::wire::frame::{SpawnStatus, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
-use ai_env_cli::wire::workspace::{APP_PORT, CODE_PORT};
+use ai_env_cli::wire::frame::{SpawnStatus, CAP_GIT_HTTP_V1, CAP_PARK_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 /// Every wait of the rig: one of its commands, a request through the endpoint.
@@ -199,33 +222,55 @@ fn dechunk(mut b: &[u8]) -> Vec<u8> {
 /// The remote link's world in one tempdir (the module doc).
 pub struct RemoteRig {
     root: PathBuf,
-    /// The in-process shim: the VM.
+    /// The in-process shim of the first VM a request reaches (made with the
+    /// rig, probed at its start): the VM of every test before S10.
     pub shim: Arc<ShimState>,
     /// Its listeners on loopback: the runtime hooks, the app port's, the code port's.
     pub hooks: SocketAddr,
     pub app: SocketAddr,
     pub code: SocketAddr,
-    /// The routed endpoint in front of them, the platform's hook client for the shim.
+    /// The endpoint in front of every VM's listeners, routed per VM and
+    /// port, the platform's hook client for each VM's shim.
     pub endpoint: FakeEndpoint,
     /// The tests' S3 (S9): every process's `AI_ENV_BRIDGE_LAB_S3_ADDR`.
     s3: FakeS3,
     token: String,
     head: String,
-    /// The shim's routers and spawns run here; dropped last but for `lane`.
+    /// S10: each VM's shim, in the order of its first request (the endpoint's factory, [`vm_factory`], fills it).
+    shims: Arc<Mutex<Shims>>,
+    /// Every shim's routers and spawns run here; dropped last but for `lane`.
     rt: tokio::runtime::Runtime,
     /// Its share of the binary's wall-clock lane ([`alone`]), kept until all of the rig is gone.
     lane: LaneShare,
 }
 
+/// The rig's VMs and their shims (S10), in the order of their first
+/// requests; the shim made with the rig waits in `first` for the first VM.
+struct Shims {
+    first: Option<(Arc<ShimState>, VmRoutes)>,
+    vms: Vec<VmShim>,
+}
+
+/// One VM's shim and its listeners.
+struct VmShim {
+    vm: String,
+    shim: Arc<ShimState>,
+    routes: VmRoutes,
+}
+
 impl Drop for RemoteRig {
     fn drop(&mut self) {
         // A closing suspend's `/suspend` (its snapshot) and a code-out still
-        // in the VM run to their answer before the shim's helpers are
+        // in the VM run to their answer before the shims' helpers are
         // stopped below (bounded).
         self.settle_hooks(SETTLE_LIMIT);
-        let shim = self.shim.clone();
+        // Every VM's shim stops its spawns (S10: a shim per VM), side by side.
+        let shims = self.all_shims();
         self.rt.block_on(async move {
-            let _ = tokio::time::timeout(Duration::from_secs(6), shim.spawns.shutdown("test")).await;
+            let stops: Vec<_> = shims.into_iter().map(|shim| tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(6), shim.spawns.shutdown("test")).await })).collect();
+            for stop in stops {
+                let _ = stop.await;
+            }
         });
     }
 }
@@ -246,42 +291,25 @@ impl RemoteRig {
     pub fn with_vm_knobs(root: &Path, knobs: &[(&str, &str)]) -> RemoteRig {
         // Never beside a test that holds the lane alone (one that measures a close).
         let lane = LaneShare::take();
-        // The agent's home exists, as the image's /Users/mike does.
-        let home = root.join("vm").join(root.strip_prefix("/").unwrap_or(root));
-        for dir in [root.join("bridge"), root.join("keys"), root.join("bin"), root.join("work"), home.clone()] {
+        for dir in [root.join("bridge"), root.join("keys"), root.join("bin"), root.join("work")] {
             std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
         }
         let work = root.join("work");
         let head = fixture_repo(&work);
         let fake = root.join("fake.json");
-        std::fs::write(&fake, serde_json::to_string_pretty(&FakeState { auto_advance: true, ..FakeState::new() }).expect("the fake's state")).expect("write fake.json");
+        // S10: the platform's wall, asked for (`FakeState::enforce_wall`), and its end waiting for the VM's shim (`terminate_after_hook`).
+        std::fs::write(&fake, serde_json::to_string_pretty(&FakeState { auto_advance: true, enforce_wall: true, terminate_after_hook: true, ..FakeState::new() }).expect("the fake's state")).expect("write fake.json");
         link_fake(fake_master(), FAKE_V2, &root.join("vm-claude"));
         install_fake_git(&root.join("bin").join("git"), &root.join("git-mac.log"), &[]);
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("the rig's runtime");
-        // SAFETY: getuid and getgid cannot fail.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        let opts = ShimOpts {
-            fs_root: Some(root.join("vm")),
-            home,
-            uid,
-            gid,
-            helper: Some(PathBuf::from(env!("CARGO_BIN_EXE_ai-env"))),
-            git: root.join("vm-git"),
-            curl: root.join("vm-curl"),
-            ..ShimOpts::default()
-        };
-        let shim = Arc::new(ShimState::with(root.join("vm-claude"), opts, ProbeSpec::default(), Arc::new(RealSys)));
-        shim.set_bound();
-        let (hooks, app, code) = rt.block_on(async {
-            (
-                serve(ai_env_cli::shim::hooks::router(shim.clone())).await,
-                serve(ai_env_cli::shim::health::router(shim.clone())).await,
-                serve(ai_env_cli::shim::code::router(shim.clone())).await,
-            )
-        });
-        shim.set_ports(BoundPorts { hooks: hooks.port(), app: app.port(), code: code.port() });
-        let endpoint = FakeEndpoint::start_routed(&fake, &[(APP_PORT, app), (CODE_PORT, code)], Some(hooks));
-        let rig = RemoteRig { root: root.to_path_buf(), shim, hooks, app, code, endpoint, s3: FakeS3::start(), token: green_world::setup_token("Rr"), head, rt, lane };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("the rig's runtime");
+        // The first VM's shim, made now (probed below, once the knobs are
+        // written): the endpoint hands it to the first VM a request reaches,
+        // and builds every later VM a shim of its own.
+        let (shim, routes) = vm_shim(rt.handle(), root, "vm").unwrap_or_else(|e| panic!("the first VM's shim: {e}"));
+        let shims = Arc::new(Mutex::new(Shims { first: Some((shim.clone(), routes)), vms: Vec::new() }));
+        let endpoint = FakeEndpoint::start_per_vm(&fake, vm_factory(&shims, rt.handle(), root));
+        let VmRoutes { hooks, app, code } = routes;
+        let rig = RemoteRig { root: root.to_path_buf(), shim, hooks, app, code, endpoint, s3: FakeS3::start(), token: green_world::setup_token("Rr"), head, shims, rt, lane };
         rig.set_vm_knobs(knobs);
         // Installs the VM's fake git (its knobs file with it), which the shim runs only once asked to.
         rig.set_vm_git_knobs(&[]);
@@ -300,6 +328,10 @@ impl RemoteRig {
         let at = rig.endpoint.addr;
         rig.update_fake(|s| {
             s.health_caps.extend([CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1].map(str::to_string));
+            // S10: `park_v1` too once the shim parks (`shim::agent::PARK_SERVED`), as its `hello_ok` names it.
+            if ai_env_cli::shim::agent::PARK_SERVED {
+                s.health_caps.push(CAP_PARK_V1.to_string());
+            }
             s.health_detail_at = Some(at);
         });
         rig
@@ -514,8 +546,23 @@ impl RemoteRig {
     /// `vm run --egress vpc --workspace <work> --json`: the workspace's vpc
     /// VM, which the endpoint runs on the shim at its first request; its id.
     pub fn start_vm(&self) -> String {
+        self.vm_run(&[])
+    }
+
+    /// `vm run … --new` (S10): one more vpc VM for the workspace, beside the
+    /// one it has, which the endpoint runs on a shim of its own at its first
+    /// request; its id.
+    pub fn start_new_vm(&self) -> String {
+        self.vm_run(&["--new"])
+    }
+
+    /// `vm run --egress vpc --workspace <work> <more> --json`: the VM's id.
+    fn vm_run(&self, more: &[&str]) -> String {
         let work = self.work().display().to_string();
-        let o = self.run(&["vm", "run", "--egress", "vpc", "--workspace", &work, "--json"], None);
+        let mut args = vec!["vm", "run", "--egress", "vpc", "--workspace", &work];
+        args.extend_from_slice(more);
+        args.push("--json");
+        let o = self.run(&args, None);
         assert!(o.status.success(), "vm run: {}", String::from_utf8_lossy(&o.stderr));
         let v: Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("vm run --json ({e}): {}", String::from_utf8_lossy(&o.stdout)));
         v["id"].as_str().unwrap_or_else(|| panic!("no id in {v}")).to_string()
@@ -603,6 +650,146 @@ fn fixture_repo(work: &Path) -> String {
     git(&["add", "README.md"]);
     git(&["commit", "-q", "-m", FIXTURE_MESSAGE]);
     String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout).trim().to_string()
+}
+
+/// A VM's in-process shim (S10: one per VM), its three listeners served on
+/// `rt`: its fs_root `<root>/<dir>`, its home the Mac's `HOME` (`root`)
+/// under it, made as the image's /Users/mike is; the rig's fakes and their
+/// knobs files (`vm-claude`, `vm-git`, `vm-curl`), this user's uid and gid,
+/// the built `ai-env` its helper; its hooks' `/terminate` answers recorded
+/// in the rig's fake ([`answering_terminate`]). Bound, not probed.
+fn vm_shim(rt: &tokio::runtime::Handle, root: &Path, dir: &str) -> std::io::Result<(Arc<ShimState>, VmRoutes)> {
+    let fs_root = root.join(dir);
+    let home = fs_root.join(root.strip_prefix("/").unwrap_or(root));
+    std::fs::create_dir_all(&home)?;
+    // SAFETY: getuid and getgid cannot fail.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let opts = ShimOpts {
+        fs_root: Some(fs_root),
+        home,
+        uid,
+        gid,
+        helper: Some(PathBuf::from(env!("CARGO_BIN_EXE_ai-env"))),
+        git: root.join("vm-git"),
+        curl: root.join("vm-curl"),
+        ..ShimOpts::default()
+    };
+    let shim = Arc::new(ShimState::with(root.join("vm-claude"), opts, ProbeSpec::default(), Arc::new(RealSys)));
+    shim.set_bound();
+    let hooks_router = answering_terminate(ai_env_cli::shim::hooks::router(shim.clone()), shim.clone(), root.join("fake.json"));
+    let (hooks, app, code) = rt.block_on(async {
+        (
+            serve(hooks_router).await,
+            serve(ai_env_cli::shim::health::router(shim.clone())).await,
+            serve(ai_env_cli::shim::code::router(shim.clone())).await,
+        )
+    });
+    shim.set_ports(BoundPorts { hooks: hooks.port(), app: app.port(), code: code.port() });
+    Ok((shim, VmRoutes { hooks, app, code }))
+}
+
+/// How long the endpoint waits for a hook's answer (its `STEP_LIMIT`):
+/// past it the platform's end no longer waits for the shim.
+const HOOK_POST_LIMIT: Duration = Duration::from_secs(10);
+
+/// What a shim's hooks listener needs to record its `/terminate` answers ([`answering_terminate`]).
+#[derive(Clone)]
+struct TerminateMark {
+    shim: Arc<ShimState>,
+    fake: PathBuf,
+}
+
+/// `router`, a VM shim's hooks, with each `/terminate` answer recorded in
+/// the rig's fake at `fake` (S10, `FakeState::terminate_answered`, which
+/// `terminate_after_hook` waits for): once the shim's answer is ready,
+/// before it goes back (the endpoint records the hook only once it has
+/// it), or once the endpoint's post gives up ([`HOOK_POST_LIMIT`], the
+/// request then dropped). The VM is the one the shim's `/run` named; a
+/// shim no `/run` reached records nothing.
+fn answering_terminate(router: axum::Router, shim: Arc<ShimState>, fake: PathBuf) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(TerminateMark { shim, fake }, mark_terminate))
+}
+
+async fn mark_terminate(axum::extract::State(m): axum::extract::State<TerminateMark>, req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let terminate = req.method() == axum::http::Method::POST && req.uri().path().ends_with("/terminate");
+    let Some(vm) = terminate.then(|| m.shim.run.view().microvm_id).flatten() else {
+        return next.run(req).await;
+    };
+    // Detached: it still records the give-up when the endpoint drops the request.
+    let gave_up = tokio::spawn(record_terminate_answered(m.fake.clone(), vm.clone(), Some(HOOK_POST_LIMIT)));
+    let answer = next.run(req).await;
+    gave_up.abort();
+    record_terminate_answered(m.fake, vm, None).await;
+    answer
+}
+
+/// `vm` into the fake's `terminate_answered` (after `after`, when given),
+/// under the file's lock, off the runtime's threads; a failure is said on
+/// stderr (the VM's wait then ends at `TERMINATE_HOOK_WAIT_S`).
+async fn record_terminate_answered(fake: PathBuf, vm: String, after: Option<Duration>) {
+    if let Some(after) = after {
+        tokio::time::sleep(after).await;
+    }
+    let saved = tokio::task::spawn_blocking(move || {
+        FileFakeMicrovmApi::open(&fake).and_then(|api| {
+            api.with(|s| {
+                s.terminate_answered.insert(vm);
+                Ok(())
+            })
+        })
+    })
+    .await;
+    if !matches!(saved, Ok(Ok(()))) {
+        eprintln!("the rig: a shim's /terminate answer is not recorded in the fake: {saved:?}");
+    }
+}
+
+/// The endpoint's factory (S10): the first VM a request reaches gets the
+/// shim made with the rig; each later one, `<root>/vm-<n>`, a shim of its
+/// own (n = 2, 3, …), its fake claude probed as at its boot; a VM keeps its
+/// shim. Each VM it hands a shim is recorded in the fake (`hook_ran`): the
+/// endpoint runs it there next (`/run`, then every later hook), so its end
+/// waits for that shim's `/terminate` answer (`terminate_after_hook`). It
+/// runs on the endpoint's blocking threads and blocks on the rig's
+/// runtime, `rt`.
+fn vm_factory(shims: &Arc<Mutex<Shims>>, rt: &tokio::runtime::Handle, root: &Path) -> VmFactory {
+    let (shims, rt, root) = (shims.clone(), rt.clone(), root.to_path_buf());
+    Arc::new(move |vm: &str| {
+        let routes = {
+            let mut s = shims.lock().unwrap_or_else(PoisonError::into_inner);
+            match s.vms.iter().find(|v| v.vm == vm) {
+                Some(known) => known.routes,
+                None => {
+                    let (shim, routes) = match s.first.take() {
+                        Some(first) => first,
+                        None => {
+                            let (shim, routes) = vm_shim(&rt, &root, &format!("vm-{}", s.vms.len() + 1))?;
+                            rt.block_on(shim.probe_once()).map_err(std::io::Error::other)?;
+                            (shim, routes)
+                        }
+                    };
+                    s.vms.push(VmShim { vm: vm.to_string(), shim, routes });
+                    routes
+                }
+            }
+        };
+        // Outside the shims' lock: the fake's lock never nests in it.
+        FileFakeMicrovmApi::open(&root.join("fake.json"))
+            .and_then(|api| {
+                api.with(|s| {
+                    s.hook_ran.insert(vm.to_string());
+                    Ok(())
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        Ok(routes)
+    })
+}
+
+/// The `[name]` table of a TOML document, made when it is missing (S10, for
+/// [`RemoteRig::config`]'s edits); panics when `name` holds anything else.
+pub fn toml_table<'a>(doc: &'a mut toml::Table, name: &str) -> &'a mut toml::Table {
+    doc.entry(name).or_insert_with(|| toml::Value::Table(toml::Table::new())).as_table_mut().unwrap_or_else(|| panic!("bridge.toml's {name} is not a table"))
 }
 
 /// Serve `router` on 127.0.0.1 (a free port) on the current runtime, as the shim's worker does.
@@ -731,12 +918,12 @@ impl Drop for LaneShare {
 }
 
 impl RemoteRig {
-    /// Until the shim was told, and answered, every move the fake's state
-    /// made for each VM the endpoint ran on it (a closing suspend's
+    /// Until each VM's shim was told, and answered, every move the fake's
+    /// state made for each VM the endpoint ran (a closing suspend's
     /// `SuspendMicrovm` is a `/suspend` and its snapshot): the last hook
     /// recorded per VM (each recorded once answered, or once its post gave
     /// up) agrees with the VM's state as the endpoint reads it; and until no
-    /// workspace helper runs in the shim (a per-result code-out, its WIP
+    /// workspace helper runs in any shim (a per-result code-out, its WIP
     /// snapshot, still on its way when the wrapper exited). At most
     /// `within`; whether it settled. Never panics (the rig's drop).
     pub fn settle_hooks(&self, within: Duration) -> bool {
@@ -762,7 +949,7 @@ impl RemoteRig {
                     Some(_) => true,
                 })
             });
-            if settled && self.shim.spawns.helpers() == 0 {
+            if settled && self.all_shims().iter().all(|shim| shim.spawns.helpers() == 0) {
                 return true;
             }
             if Instant::now() >= until {
@@ -792,6 +979,112 @@ impl RemoteRig {
     #[must_use]
     pub fn vm_env_log(&self) -> PathBuf {
         self.root.join("vm-env.log")
+    }
+}
+
+// ---- S10 (R): a shim and a disk per VM, the wall, bridge.toml as TOML ----------------------------
+
+impl RemoteRig {
+    fn shims(&self) -> MutexGuard<'_, Shims> {
+        self.shims.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every shim of the rig: the one made with it first (whether or not a
+    /// VM took it), then each later VM's.
+    fn all_shims(&self) -> Vec<Arc<ShimState>> {
+        let mut out = vec![self.shim.clone()];
+        out.extend(self.shims().vms.iter().filter(|v| !Arc::ptr_eq(&v.shim, &self.shim)).map(|v| v.shim.clone()));
+        out
+    }
+
+    /// The VMs a request through the endpoint reached, in the order of their
+    /// first ones: each has a shim and a disk of its own (the first
+    /// `rig.shim` and `<tmp>/vm`, the n-th `<tmp>/vm-<n>`).
+    #[must_use]
+    pub fn vm_ids(&self) -> Vec<String> {
+        self.shims().vms.iter().map(|v| v.vm.clone()).collect()
+    }
+
+    /// The last VM a request reached first.
+    #[must_use]
+    pub fn newest_vm(&self) -> Option<String> {
+        self.shims().vms.last().map(|v| v.vm.clone())
+    }
+
+    /// `vm`'s shim; panics naming `vm` when no request reached it yet.
+    #[must_use]
+    pub fn shim_of(&self, vm: &str) -> Arc<ShimState> {
+        let found = self.shims().vms.iter().find(|v| v.vm == vm).map(|v| v.shim.clone());
+        found.unwrap_or_else(|| panic!("no shim for {vm}: no request reached it yet (the rig's VMs: {:?})", self.vm_ids()))
+    }
+
+    /// `vm`'s disk: its shim's fs_root (`vm_root()` for the first VM).
+    #[must_use]
+    pub fn vm_root_of(&self, vm: &str) -> PathBuf {
+        self.shim_of(vm).opts.fs_root.clone().unwrap_or_else(|| panic!("{vm}'s shim has no fs_root"))
+    }
+
+    /// Where `vm`'s `path` (absolute, as in the VM) is on this disk.
+    #[must_use]
+    pub fn vm_path_of(&self, vm: &str, path: &Path) -> PathBuf {
+        self.shim_of(vm).at(path)
+    }
+
+    /// `vm`'s agent `HOME` on this disk: the Mac's `HOME` under its fs_root.
+    #[must_use]
+    pub fn vm_home_of(&self, vm: &str) -> PathBuf {
+        self.shim_of(vm).opts.home.clone()
+    }
+
+    /// `vm`'s transcripts: its `CLAUDE_CONFIG_DIR` `/projects`.
+    #[must_use]
+    pub fn vm_projects_of(&self, vm: &str) -> PathBuf {
+        self.vm_home_of(vm).join(".claude").join("projects")
+    }
+
+    /// `vm`'s spawns now (id, pid, state).
+    #[must_use]
+    pub fn vm_spawns_of(&self, vm: &str) -> Vec<SpawnStatus> {
+        self.shim_of(vm).spawns.status(None)
+    }
+
+    /// Edit bridge.toml as TOML (in place of appending text, which breaks on
+    /// a second `[vm]` table): `edit` gets the document ([`toml_table`]
+    /// finds or makes a table), written back whole, its comments not kept.
+    pub fn config(&self, edit: impl FnOnce(&mut toml::Table)) {
+        let path = self.bridge().join("bridge.toml");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let mut doc: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{} is no TOML document: {e}", path.display()));
+        edit(&mut doc);
+        let text = toml::to_string(&doc).unwrap_or_else(|e| panic!("render {}: {e}", path.display()));
+        std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    /// Age `vm` so `left_s` seconds of its wall are left: its start in the
+    /// fake moved back (`FakeState::age`), and its row's `started_at` and
+    /// `wall_deadline` on the Mac set to the same start and wall (a VM with
+    /// no row: the fake's alone), so the fake's wall (the rig's
+    /// `enforce_wall`: at 0 left the next look ends it) and the Mac's
+    /// `wall_left` agree. The row moves first: once the fake is aged, the
+    /// rig's tick may end the VM at its wall, which the platform never does
+    /// before the row's deadline. Panics when the fake lacks the VM or its
+    /// start, or when less than `left_s` is left already.
+    pub fn bring_wall_near(&self, vm: &str, left_s: u64) {
+        let now = ai_env_cli::wire::time::unix_now();
+        let st = self.fake();
+        let v = st.vms.get(vm).unwrap_or_else(|| panic!("no VM {vm} in the fake"));
+        let started = v.started_at_unix.and_then(|t| u64::try_from(t).ok()).unwrap_or_else(|| panic!("{vm} has no start in the fake"));
+        let wall = started + u64::try_from(v.max_duration_s).unwrap_or(0);
+        let by = wall.checked_sub(now + left_s).unwrap_or_else(|| panic!("{vm} has less than {left_s} s of its wall left already ({} s)", wall.saturating_sub(now)));
+        let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(self.bridge(), None);
+        ai_env_cli::bridge::vm::registry::update_row(&paths, vm, |row| {
+            row.started_at = Some(started.saturating_sub(by));
+            row.wall_deadline = Some(wall - by);
+        })
+        .unwrap_or_else(|e| panic!("{vm}'s row: {e}"));
+        // Only `age` moves a start: the copy above still holds. Apart from
+        // the row's update, so the rows' lock and the fake's never nest.
+        self.update_fake(|s| s.age(vm, by));
     }
 }
 

@@ -13,9 +13,13 @@
 //! terminated (`policy`), so a failed terminate or a crash between
 //! RunMicrovm and the gate cannot leave a VM with the wrong egress behind.
 //!
-//! [`reconcile_local`] is the opportunistic variant for `vm run|list|smoke`
-//! (no probes, no action, one hint line); [`terminate_all_plan`] is the
-//! survey behind `vm terminate --all` (D29).
+//! [`reconcile_local`] is the opportunistic survey (no probes, no action,
+//! one hint line). S10's [`reconcile_apply_local`] acts on it locally (the
+//! rows of VMs the platform ended, old terminated rows, the session rows a
+//! dead wrapper left on a VM that is gone; never a terminate, never a Touch
+//! ID): at a wrapper's start at most every [`GC_RECONCILE_EVERY`], and at
+//! every `vm run|list|smoke` ([`reconcile_applied`], before their hint).
+//! [`terminate_all_plan`] is the survey behind `vm terminate --all` (D29).
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState, VmSummary};
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
@@ -550,15 +554,7 @@ where
                 terminate_and_record(api, paths, &id, by, None).await.map(|_| report.terminated += 1)
             }
             GcAction::MarkTerminated => match row_of(&item) {
-                // Under the rows lock: what another process wrote meanwhile is kept.
-                Some(row) => registry::update_row(paths, &row.id, |r| {
-                    r.status = RowStatus::Terminated;
-                    r.terminated_at.get_or_insert(now);
-                    r.terminated_by.get_or_insert_with(|| "platform".to_string());
-                    r.state_seen = Some(VmState::Terminated.as_str().to_string());
-                    r.state_seen_at = Some(now);
-                })
-                .and_then(|written| written.map(|_| report.marked += 1).ok_or_else(|| BridgeError::Config(format!("gc: row {id} vanished")))),
+                Some(row) => mark_gone(paths, &row.id, now).map(|()| report.marked += 1),
                 None => Err(BridgeError::Config(format!("gc: no row for {id}"))),
             },
             GcAction::Adopt => match (row_of(&item), infos.get(&id)) {
@@ -604,12 +600,200 @@ where
     Ok(report)
 }
 
+/// The row of a VM the platform ended (`registry:gone`) says so: terminated
+/// at `now`, `terminated_by` `platform` unless it names who (`vm gc --yes`,
+/// and S10's reconcile, which terminates nothing). Under the rows lock: what
+/// another process wrote meanwhile is kept.
+fn mark_gone(paths: &Paths, id: &str, now: u64) -> Result<(), BridgeError> {
+    registry::update_row(paths, id, |r| {
+        r.status = RowStatus::Terminated;
+        r.terminated_at.get_or_insert(now);
+        r.terminated_by.get_or_insert_with(|| "platform".to_string());
+        r.state_seen = Some(VmState::Terminated.as_str().to_string());
+        r.state_seen_at = Some(now);
+    })
+    .and_then(|written| written.map(|_| ()).ok_or_else(|| BridgeError::Config(format!("gc: row {id} vanished"))))
+}
+
 /// The opportunistic reconcile of `vm run|list|smoke` (plan S4 D17): the
 /// survey and [`classify`] without `/health` probes and without acting
 /// (every action `Report`), for [`hint_line`].
 pub async fn reconcile_local<A: MicrovmApi>(api: &A, paths: &Paths, image_arn: &str) -> Result<Vec<GcItem>, BridgeError> {
     let Survey { listing, rows, unsurveyed } = survey_local(api, paths, image_arn).await?;
     Ok(classify_surveyed(&listing, &rows, &BTreeMap::new(), unix_now(), &owner(), &GcOpts::default(), &unsurveyed))
+}
+
+/// S10 (L12): `vm run|list|smoke`'s reconcile: [`reconcile_apply_local`]
+/// whatever `state/gc.stamp` says, then the items it left, for
+/// [`hint_line`]. While another process reconciles (or when the apply
+/// failed, which is a log line), the survey alone ([`reconcile_local`]).
+pub async fn reconcile_applied<A: MicrovmApi>(api: &A, paths: &Paths, image_arn: &str) -> Result<Vec<GcItem>, BridgeError> {
+    match apply_local(api, paths, image_arn, None).await {
+        Ok(Some((_, items))) => Ok(items),
+        Ok(None) => reconcile_local(api, paths, image_arn).await,
+        Err(e) => {
+            tracing::warn!("gc reconcile: {e}");
+            reconcile_local(api, paths, image_arn).await
+        }
+    }
+}
+
+/// [`reconcile_apply_local`]'s body: the report, and every item it did not
+/// act on (an action that failed is kept, logged).
+async fn apply_local<A: MicrovmApi>(api: &A, paths: &Paths, image_arn: &str, every: Option<Duration>) -> Result<Option<(ReconcileReport, Vec<GcItem>)>, BridgeError> {
+    let started = std::time::Instant::now();
+    let Some(_held) = crate::bridge::vm::lock::try_lock_exclusive(&paths.gc_lock())? else {
+        tracing::debug!("gc reconcile: another process holds {}", paths.gc_lock().display());
+        return Ok(None);
+    };
+    let now = unix_now();
+    if let Some(age) = every.and_then(|every| read_stamp(paths).and_then(|at| now.checked_sub(at)).filter(|age| *age < every.as_secs())) {
+        tracing::debug!("gc reconcile: the last one ran {age} s ago");
+        return Ok(None);
+    }
+    // The attempt is stamped, not the success: a survey that fails (a throttled or unreachable API) waits its
+    // interval too, so wrapper starts never pile ListMicrovms on an API that does not answer.
+    write_stamp(paths, now);
+    let Survey { listing, rows, unsurveyed } = survey_local(api, paths, image_arn).await?;
+    let by_stem: BTreeMap<String, &VmRow> = rows.iter().map(|r| (r.stem(), r)).collect();
+    let mut report = ReconcileReport::default();
+    let mut left = Vec::new();
+    for item in classify_surveyed(&listing, &rows, &BTreeMap::new(), now, &owner(), &GcOpts::default(), &unsurveyed) {
+        let row = item.stem.as_ref().and_then(|s| by_stem.get(s).copied());
+        let done = match (item.class, row) {
+            (GcClass::RegistryGone, Some(row)) => mark_gone(paths, &row.id, now).map(|()| report.marked += 1),
+            (GcClass::TerminatedOld, Some(row)) => registry::remove_row(paths, row).map(|_| report.removed += 1),
+            _ => {
+                left.push(item);
+                continue;
+            }
+        };
+        if let Err(e) = done {
+            tracing::warn!("gc reconcile: {} {}: {e}", item.class.name(), item.id.as_deref().unwrap_or_default());
+            left.push(item);
+        }
+    }
+    report.closed = close_dead_sessions(api, paths, &listing, &|row| crate::bridge::registry::confirm_wrapper(row, row.pid).is_ok()).await;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(marked = report.marked, removed = report.removed, closed = report.closed, ms, "gc reconcile");
+    audit_event(
+        paths,
+        crate::bridge::remote::audit_event::VM_GC_RECONCILE,
+        &[("marked", report.marked.to_string()), ("removed", report.removed.to_string()), ("closed", report.closed.to_string()), ("ms", ms.to_string())],
+    );
+    Ok(Some((report, left)))
+}
+
+/// Session rows a dead wrapper left open on a VM that is gone become
+/// `closed` (S10 L12): a row is closed only when no live VM of the survey
+/// is its VM and its VM row says terminated (with no row, GetMicrovm says
+/// gone), its wrapper is dead (`wrapper_lives` says no: the reconcile's is
+/// `registry::confirm_wrapper`) and no offline `session migrate` holds it;
+/// and only if the row read again just before is the one judged (a wrapper
+/// that took it meanwhile keeps it). What fails is a log line; the count is
+/// what was closed.
+async fn close_dead_sessions<A: MicrovmApi>(api: &A, paths: &Paths, listing: &[VmSummary], wrapper_lives: &(dyn Fn(&crate::bridge::registry::SessionRow) -> bool + Sync)) -> u32 {
+    use crate::bridge::registry::pid_alive;
+    let live: BTreeSet<&str> = listing.iter().filter(|s| !s.state.is_terminal()).map(|s| s.id.as_str()).collect();
+    let sessions = match crate::bridge::registry::list(paths) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("gc reconcile: the session rows: {e}");
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for row in sessions {
+        let Some(vm) = row.microvm_id.as_deref().filter(|vm| row.status != "closed" && !live.contains(vm)) else { continue };
+        if row.migrating_pid.is_some_and(pid_alive) || wrapper_lives(&row) || !vm_gone(api, paths, vm).await {
+            continue;
+        }
+        match close_row(paths, &row) {
+            Ok(true) => {
+                tracing::info!("gc reconcile: session {} closed (its VM {vm} is gone, and its wrapper pid {} too)", row.session_id, row.pid);
+                closed += 1;
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("gc reconcile: session {}: {e}", row.session_id),
+        }
+    }
+    closed
+}
+
+/// Is `id`, which no live VM of the survey is, gone: its row terminated,
+/// or (with no row) GetMicrovm says NotFound or terminal? Anything unsure is no.
+async fn vm_gone<A: MicrovmApi>(api: &A, paths: &Paths, id: &str) -> bool {
+    match registry::read_row(paths, id) {
+        Ok(Some(row)) => row.status == RowStatus::Terminated,
+        Ok(None) => match api.get(id).await {
+            Ok(vm) => vm.state.is_terminal(),
+            Err(e) => matches!(e, BridgeError::VmNotFound(_)),
+        },
+        Err(e) => {
+            tracing::warn!("gc reconcile: vm row {id}: {e}");
+            false
+        }
+    }
+}
+
+/// `seen` written again `closed`, when its file still holds the row judged
+/// (the same wrapper, status, VM and creation); whether it was.
+fn close_row(paths: &Paths, seen: &crate::bridge::registry::SessionRow) -> Result<bool, BridgeError> {
+    let Some(mut row) = crate::bridge::registry::read(paths, &seen.session_id)? else { return Ok(false) };
+    if (row.pid, &row.status, &row.microvm_id, &row.created) != (seen.pid, &seen.status, &seen.microvm_id, &seen.created) {
+        return Ok(false);
+    }
+    row.status = "closed".into();
+    crate::bridge::registry::write(paths, &row)?;
+    Ok(true)
+}
+
+/// The last reconcile's unix seconds (`state/gc.stamp`); `None` without one,
+/// or when it does not read as one.
+fn read_stamp(paths: &Paths) -> Option<u64> {
+    crate::bridge::registry::read_regular_file(&paths.gc_stamp()).ok().flatten()?.trim().parse().ok()
+}
+
+/// `state/gc.stamp` says `now` (0600, never through a symlink, and never
+/// waiting on a FIFO put there: `O_NONBLOCK` makes its open fail at once,
+/// while the lock is held); a failure is a log line.
+fn write_stamp(paths: &Paths, now: u64) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = paths.gc_stamp();
+    let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(&path).and_then(|mut f| writeln!(f, "{now}"));
+    if let Err(e) = written {
+        tracing::warn!("gc reconcile: {} not written: {e}", path.display());
+    }
+}
+
+/// S10 (L12): a wrapper's reconcile runs at most this often (`state/gc.stamp`).
+pub const GC_RECONCILE_EVERY: Duration = Duration::from_secs(15 * 60);
+/// S10 (L12): generation 1 starts its reconcile this long after its `Started`.
+pub const GC_RECONCILE_AFTER: Duration = Duration::from_secs(10);
+
+/// What [`reconcile_apply_local`] did (S10): rows it marked terminated (the
+/// platform ended their VM), terminated rows it removed, session rows it
+/// closed (their VM gone, their wrapper dead).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub marked: u32,
+    pub removed: u32,
+    pub closed: u32,
+}
+
+/// S10 (L12): [`reconcile_local`]'s survey and [`classify`] with no
+/// `/health` probe, then acted on locally: a `registry:gone` row marked
+/// terminated (`terminated_by` `platform`), a `terminated-old` row removed,
+/// a session row whose VM is gone and whose wrapper is dead closed; never
+/// a terminate, never a Touch ID. `None` when `state/gc.lock` is held or
+/// `state/gc.stamp` is younger than `every` (`vm run`, `vm list` and `vm
+/// smoke` pass `None`: always, [`reconcile_applied`]). Each one that starts
+/// stamps `state/gc.stamp`, failed or not (an API that does not answer is
+/// asked again only past `every`), and each one that ran writes its
+/// `vm_gc_reconcile` row (the counts, its ms).
+pub async fn reconcile_apply_local<A: MicrovmApi>(api: &A, paths: &Paths, image_arn: &str, every: Option<Duration>) -> Result<Option<ReconcileReport>, BridgeError> {
+    Ok(apply_local(api, paths, image_arn, every).await?.map(|(report, _)| report))
 }
 
 /// One line for `vm run|list|smoke` when gc has something to look at
@@ -790,5 +974,126 @@ mod tests {
         assert_eq!((synced.lock().unwrap().clone(), report.terminated), (vec![vm.id.clone()], 1));
         assert_eq!(report.errors, [format!("{}: the transcript of a session was not synced before it ends", vm.id)], "the warning recorded, the termination done");
         assert_eq!(registry::read_row(&paths, &vm.id).unwrap().unwrap().status, RowStatus::Terminated);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod p_tests {
+    use super::*;
+    use crate::bridge::api::{Call, FakeMicrovmApi};
+    use crate::bridge::registry::{self as sessions, SessionRow};
+
+    fn listed(id: &str, state: VmState) -> VmSummary {
+        VmSummary { id: id.into(), state, image_arn: "arn".into(), image_version: "1.0".into(), started_at_unix: Some(1) }
+    }
+
+    /// Session row `n` of `vm` (none: a local session) in `status`, its wrapper `pid`.
+    fn session(n: u64, status: &str, vm: Option<&str>, pid: u32) -> SessionRow {
+        SessionRow { session_id: format!("0192f1e0-0000-7000-8000-{n:012x}"), status: status.into(), mode: "remote".into(), pid, created: sessions::now_rfc3339(), microvm_id: vm.map(str::to_string), ..SessionRow::default() }
+    }
+
+    /// A pid no process has now (a child that ran and was reaped).
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// S10 L12: the reconcile closes a session row only when its VM is gone
+    /// (no live VM of the survey, and its row terminated, or with no row
+    /// GetMicrovm's NotFound), its wrapper is dead and no offline `session
+    /// migrate` holds it. A live wrapper's row (the judge says so of pid
+    /// 4242 here), a live VM's, one whose VM row still says it runs (an
+    /// image the survey did not list), a closed one, a local one and a
+    /// migrating one stay as they were; GetMicrovm is asked only of the VM
+    /// no row names.
+    #[tokio::test]
+    async fn only_a_dead_wrappers_row_on_a_gone_vm_is_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        let api = FakeMicrovmApi::new();
+        let dead = dead_pid();
+        for (id, status) in [("microvm-gone", RowStatus::Terminated), ("microvm-live", RowStatus::Running), ("microvm-unseen", RowStatus::Running)] {
+            registry::write_row(&paths, &VmRow { id: id.into(), status, client_token: "0192f1e0-0000-7000-8000-0000000000c1".into(), ..VmRow::default() }).unwrap();
+        }
+        let rows = [
+            session(1, "active", Some("microvm-gone"), dead),
+            session(2, "parked", Some("microvm-gone"), 4242),
+            session(3, "detached", Some("microvm-live"), dead),
+            session(4, "closed", Some("microvm-gone"), dead),
+            session(5, "active", None, dead),
+            SessionRow { migrating_pid: Some(std::process::id()), ..session(6, "migrating", Some("microvm-gone"), dead) },
+            session(7, "active", Some("microvm-nowhere"), dead),
+            session(8, "parked", Some("microvm-unseen"), dead),
+        ];
+        for r in &rows {
+            sessions::write(&paths, r).unwrap();
+        }
+        let listing = [listed("microvm-live", VmState::Suspended), listed("microvm-gone", VmState::Terminated)];
+        let closed = close_dead_sessions(&api, &paths, &listing, &|r| r.pid == 4242).await;
+        let status: Vec<String> = rows.iter().map(|r| sessions::read(&paths, &r.session_id).unwrap().unwrap().status).collect();
+        assert_eq!(status, ["closed", "parked", "detached", "closed", "active", "migrating", "closed", "parked"]);
+        assert_eq!(closed, 2);
+        assert_eq!(api.calls(), [Call::Get("microvm-nowhere".into())], "GetMicrovm only of the VM no row names");
+        let kept = sessions::read(&paths, &rows[0].session_id).unwrap().unwrap();
+        assert_eq!(kept, SessionRow { status: "closed".into(), ..rows[0].clone() }, "only its status changed");
+    }
+
+    /// The row closed is the row judged: one its wrapper wrote again
+    /// meanwhile (another pid: a reopen) is left as that wrapper wrote it.
+    #[test]
+    fn a_row_written_again_meanwhile_is_not_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        let judged = session(1, "parked", Some("microvm-gone"), 77);
+        let reopened = SessionRow { pid: 78, status: "active".into(), ..judged.clone() };
+        sessions::write(&paths, &reopened).unwrap();
+        assert!(!close_row(&paths, &judged).unwrap());
+        assert_eq!(sessions::read(&paths, &judged.session_id).unwrap().unwrap(), reopened);
+        assert!(close_row(&paths, &reopened).unwrap());
+        assert_eq!(sessions::read(&paths, &judged.session_id).unwrap().unwrap().status, "closed");
+        assert!(!close_row(&paths, &session(2, "active", Some("microvm-gone"), 77)).unwrap(), "no row: nothing to close");
+    }
+
+    /// `state/gc.stamp`: none until a reconcile wrote one, then its unix
+    /// seconds, 0600; never read or written through a symlink, and a FIFO
+    /// put in its place blocks neither (the reconcile holds `state/gc.lock`
+    /// meanwhile).
+    #[test]
+    fn the_stamp_is_private_and_never_followed() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        std::fs::create_dir_all(paths.root.join("state")).unwrap();
+        assert_eq!(read_stamp(&paths), None);
+        write_stamp(&paths, 1_790_000_000);
+        assert_eq!(read_stamp(&paths), Some(1_790_000_000));
+        assert_eq!(std::fs::metadata(paths.gc_stamp()).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::write(paths.gc_stamp(), "not a number\n").unwrap();
+        assert_eq!(read_stamp(&paths), None, "an unreadable stamp is none: the reconcile runs");
+        std::fs::remove_file(paths.gc_stamp()).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::write(&elsewhere, "1790000000\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.gc_stamp()).unwrap();
+        assert_eq!(read_stamp(&paths), None, "not read through a symlink");
+        write_stamp(&paths, 5);
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "1790000000\n", "not written through a symlink");
+        std::fs::remove_file(paths.gc_stamp()).unwrap();
+        let fifo = std::ffi::CString::new(paths.gc_stamp().into_os_string().into_vec()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(read_stamp(&paths), None, "a FIFO is no stamp");
+        // In a thread of its own: a write that waited for the FIFO's reader would never come back.
+        let (done, wrote) = std::sync::mpsc::channel();
+        let stamp_paths = paths.clone();
+        std::thread::spawn(move || {
+            write_stamp(&stamp_paths, 5);
+            let _ = done.send(());
+        });
+        assert!(wrote.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "writing the stamp waited on a FIFO");
+        assert!(std::fs::symlink_metadata(paths.gc_stamp()).unwrap().file_type().is_fifo(), "left as it was");
     }
 }

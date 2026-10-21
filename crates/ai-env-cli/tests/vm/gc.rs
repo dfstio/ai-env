@@ -1,7 +1,9 @@
 //! `vm::gc`: the nine classes of the plan S4 §7 table in one scenario, the
 //! dry run that writes nothing, what `--yes` and `--include-orphans` do,
 //! adoption of a crashed run, stale pending rows, the local reconcile and
-//! the `vm terminate --all` survey.
+//! the `vm terminate --all` survey; S10's reconcile that acts on rows
+//! locally (L12: a parked chat's VM kept, one the platform ended
+//! reconciled, never a terminate, once per 15 minutes).
 use crate::common::{api, created_at, fast, health_claiming, run_direct, run_direct_image, snapshot, started_ago, Env, Spy, FOREIGN};
 use ai_env_cli::bridge::api::{Call, FakeMicrovmApi, VmState, FAKE_IMAGE_ARN};
 use ai_env_cli::bridge::errors::BridgeError;
@@ -12,6 +14,9 @@ use ai_env_cli::bridge::vm::run::{select_vm, RunFlags, Selected};
 use ai_env_cli::wire::time::unix_now;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+// S10 (L12): the local reconcile.
+use ai_env_cli::bridge::registry::{self as sessions, SessionRow};
+use ai_env_cli::bridge::vm::gc::{reconcile_applied, reconcile_apply_local, ReconcileReport, GC_RECONCILE_AFTER, GC_RECONCILE_EVERY};
 
 const GONE_ID: &str = "microvm-00000000-0000-4000-8000-0000000000f1";
 const OLD_ID: &str = "microvm-00000000-0000-4000-8000-0000000000f2";
@@ -334,6 +339,8 @@ fn gc_and_run_futures_are_send() {
     let api = api();
     send(gc(&api, &api, &env.paths, FAKE_IMAGE_ARN, &YES));
     send(reconcile_local(&api, &env.paths, FAKE_IMAGE_ARN));
+    send(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)));
+    send(reconcile_applied(&api, &env.paths, FAKE_IMAGE_ARN));
     send(terminate_all_plan(&api, &api, &env.paths, FAKE_IMAGE_ARN));
     let pending = VmRow::default();
     send(ai_env_cli::bridge::vm::run::adopt_after_ambiguous(&api, &api, &env.paths, &pending, 0, fast()));
@@ -431,4 +438,250 @@ async fn gc_surveys_the_images_of_pending_rows() {
     assert!(env.paths.vms().join(format!("{}.toml", blind.stem())).exists(), "kept");
     let plan = terminate_all_plan(&spy, &spy, &env.paths, FAKE_IMAGE_ARN).await.unwrap();
     assert!(plan.iter().all(|i| i.id.is_some()), "rows without a VM are not in the terminate --all plan: {plan:?}");
+}
+
+// ---- S10 (L12): the local reconcile, at a wrapper's start and at `vm run|list|smoke` ----
+
+/// A session row on `vm` in `status`, its wrapper `pid`, written now.
+fn session_row(env: &Env, vm: &str, status: &str, pid: u32) -> SessionRow {
+    let row = SessionRow {
+        session_id: uuid::Uuid::now_v7().to_string(),
+        status: status.into(),
+        mode: "remote".into(),
+        route: "remote".into(),
+        pid,
+        created: sessions::now_rfc3339(),
+        last_seen: sessions::now_rfc3339(),
+        microvm_id: Some(vm.to_string()),
+        ..SessionRow::default()
+    };
+    sessions::write(&env.paths, &row).unwrap();
+    row
+}
+
+fn session_status(env: &Env, row: &SessionRow) -> String {
+    sessions::read(&env.paths, &row.session_id).unwrap().unwrap().status
+}
+
+/// A pid no process has now (a child that ran and was reaped).
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// A live process the reconcile's judge (`registry::confirm_wrapper`) takes
+/// for a wrapper: `/bin/sleep` copied as `ai-env-claude` in `dir` (the judge
+/// reads the executable's file name and start; on macOS the copy is signed
+/// ad hoc, since a copied system binary is killed at its start), killed and
+/// reaped on drop.
+struct LiveWrapper(std::process::Child);
+
+impl LiveWrapper {
+    fn start(dir: &std::path::Path) -> LiveWrapper {
+        let exe = dir.join("ai-env-claude");
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        #[cfg(target_vendor = "apple")]
+        {
+            let signed = std::process::Command::new("/usr/bin/codesign").args(["--sign", "-", "--force"]).arg(&exe).output().unwrap();
+            assert!(signed.status.success(), "codesign: {}", String::from_utf8_lossy(&signed.stderr));
+        }
+        LiveWrapper(std::process::Command::new(&exe).arg("30").stdin(std::process::Stdio::null()).spawn().unwrap())
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for LiveWrapper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A parked chat (S10 §D): its VM suspended by the platform's idle policy
+/// while its wrapper (here this process) stays open. The reconcile leaves
+/// all of it: the VM is never resumed, probed or terminated, its row and
+/// its session row (`parked`) stay as they were; and so do an expired VM
+/// and an orphan beside it (the reconcile terminates nothing). A chat
+/// parked on a VM the platform ended, whose wrapper lives (an
+/// `ai-env-claude` started before its row was written), keeps its row too:
+/// only the VM's row is marked. `vm run|list|smoke`'s variant does the same.
+#[tokio::test]
+async fn a_parked_vm_whose_wrapper_lives_is_kept() {
+    let env = Env::new();
+    let api = api();
+    let id = start(&env, &api, env.flags()).await;
+    api.set_state(&id, VmState::Suspended);
+    let chat = session_row(&env, &id, "parked", std::process::id());
+    let expired = start(&env, &api, RunFlags { workspace: None, ..env.flags() }).await;
+    let mut row = env.row(&expired);
+    row.wall_deadline = Some(unix_now() + 30);
+    registry::write_row(&env.paths, &row).unwrap();
+    let orphan = run_direct(&api, &owner(), &created_at(-20)).await.id;
+    api.advance_all();
+    started_ago(&api, &orphan, 7200);
+    let ended = start(&env, &api, RunFlags { workspace: None, ..env.flags() }).await;
+    api.set_state(&ended, VmState::Terminated);
+    let wrapper = LiveWrapper::start(env.dir.path());
+    let live = session_row(&env, &ended, "parked", wrapper.pid());
+    sessions::confirm_wrapper(&live, wrapper.pid()).expect("the judge takes it for a live wrapper");
+    let (parked_row, mark) = (env.row(&id), api.calls().len());
+    let report = reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap();
+    assert_eq!(report, Some(ReconcileReport { marked: 1, removed: 0, closed: 0 }), "the ended VM's row marked, no session row closed");
+    let items = reconcile_applied(&api, &env.paths, FAKE_IMAGE_ARN).await.unwrap();
+    let calls = api.calls()[mark..].to_vec();
+    assert!(terminated(&calls).is_empty(), "never a terminate: {calls:?}");
+    for vm in [&id, &expired, &orphan, &ended] {
+        never_probed(&api, &calls, vm);
+    }
+    assert_eq!(api.state().vms[&id].state, VmState::Suspended, "never resumed");
+    assert!(env.row(&id) == parked_row, "its row as it was");
+    assert_eq!(session_status(&env, &chat), "parked");
+    let ended_row = env.row(&ended);
+    assert_eq!((ended_row.status, ended_row.terminated_by.as_deref()), (RowStatus::Terminated, Some("platform")), "the ended VM's row marked");
+    assert_eq!(session_status(&env, &live), "parked", "a live wrapper's row is its own to close, VM gone or not");
+    drop(wrapper);
+    let states = {
+        let st = api.state();
+        (st.vms[&expired].state.clone(), st.vms[&orphan].state.clone())
+    };
+    assert_eq!(states, (VmState::Running, VmState::Running));
+    let got = by_class(&items);
+    assert_eq!(only(&got, "registry:expired"), expired, "the hint still names the expired VM: {items:?}");
+    assert_eq!(only(&got, "registry:live"), id);
+}
+
+/// v6's exit criterion (S10 L12): a chat parked on a VM the platform then
+/// ended (its wall, or `[vm].suspended_s`) is reconciled at the next
+/// invocation, with no probe and no terminate: the VM's row marked
+/// terminated (`platform`, as gc's), and so is one whose VM GetMicrovm no
+/// longer finds; the session rows a dead wrapper left on them closed; a
+/// row terminated a week ago removed; one `vm_gc_reconcile` row with the
+/// counts. `vm list`'s reconcile then finds nothing left, and its hint
+/// says nothing of them.
+#[tokio::test]
+async fn a_parked_vm_the_platform_ended_is_reconciled_at_the_next_invocation() {
+    let env = Env::new();
+    let api = api();
+    let now = unix_now();
+    let id = start(&env, &api, env.flags()).await;
+    registry::update_row(&env.paths, &id, |r| r.status = RowStatus::Suspended).unwrap();
+    api.set_state(&id, VmState::Terminated);
+    let chat = session_row(&env, &id, "parked", dead_pid());
+    let unlisted = VmRow { id: GONE_ID.into(), status: RowStatus::Running, client_token: uuid::Uuid::now_v7().to_string(), image_arn: FAKE_IMAGE_ARN.into(), created: created_at(0), wall_deadline: Some(now + 3600), ..VmRow::default() };
+    registry::write_row(&env.paths, &unlisted).unwrap();
+    let other = session_row(&env, GONE_ID, "detached", dead_pid());
+    let old = VmRow {
+        id: OLD_ID.into(),
+        status: RowStatus::Terminated,
+        client_token: uuid::Uuid::now_v7().to_string(),
+        image_arn: FAKE_IMAGE_ARN.into(),
+        created: created_at(-9 * 86_400_000),
+        terminated_at: Some(now - 8 * 86_400),
+        terminated_by: Some("operator".into()),
+        ..VmRow::default()
+    };
+    registry::write_row(&env.paths, &old).unwrap();
+    let mark = api.calls().len();
+    let report = reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap();
+    assert_eq!(report, Some(ReconcileReport { marked: 2, removed: 1, closed: 2 }));
+    for gone in [id.as_str(), GONE_ID] {
+        let row = env.row(gone);
+        assert_eq!((row.status, row.terminated_by.as_deref(), row.state_seen.as_deref()), (RowStatus::Terminated, Some("platform"), Some("TERMINATED")), "{gone}");
+        assert!(row.terminated_at.is_some_and(|t| t >= now), "{gone}");
+    }
+    assert!(registry::read_row(&env.paths, OLD_ID).unwrap().is_none(), "the old terminated row removed");
+    assert_eq!((session_status(&env, &chat), session_status(&env, &other)), ("closed".to_string(), "closed".to_string()));
+    let calls = api.calls()[mark..].to_vec();
+    assert!(terminated(&calls).is_empty() && !calls.iter().any(|c| matches!(c, Call::Token { .. } | Call::Health { .. } | Call::Resume(_))), "{calls:?}");
+    let rows = env.events("vm_gc_reconcile");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let d = &rows[0]["detail"];
+    assert_eq!((d["marked"].as_str(), d["removed"].as_str(), d["closed"].as_str()), (Some("2"), Some("1"), Some("2")));
+    assert!(d["ms"].as_str().is_some_and(|ms| ms.parse::<u64>().is_ok()), "{d}");
+    let items = reconcile_applied(&api, &env.paths, FAKE_IMAGE_ARN).await.unwrap();
+    assert_eq!(hint_line(&items), None, "nothing left to say: {items:?}");
+    assert_eq!(env.events("vm_gc_reconcile").len(), 2, "vm list's reconcile ran, whatever the stamp said");
+}
+
+/// The reconcile acts on rows only (S10 L12): over the nine-class scenario
+/// it marks the two gone rows and removes the old one, and terminates
+/// nothing (the expired VM, the orphan and the foreign VM run on), probes
+/// nothing (no token, no `/health`: the suspended VM is never woken),
+/// adopts nothing and keeps the pending rows. It runs at most once per
+/// `GC_RECONCILE_EVERY` (`state/gc.stamp`, 0600: within it, not even a
+/// survey), never while another process holds `state/gc.lock` (0600), and
+/// whatever the stamp says when `vm run|list|smoke` ask (`every` none).
+#[tokio::test]
+async fn the_reconcile_never_terminates_and_runs_once_per_15_minutes() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!((GC_RECONCILE_EVERY, GC_RECONCILE_AFTER), (Duration::from_secs(15 * 60), Duration::from_secs(10)));
+    let env = Env::new();
+    let api = api();
+    let n = nine(&env, &api).await;
+    let mark = api.calls().len();
+    let first = reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap();
+    assert_eq!(first, Some(ReconcileReport { marked: 2, removed: 1, closed: 0 }));
+    let calls = api.calls()[mark..].to_vec();
+    assert!(terminated(&calls).is_empty(), "never a terminate: {calls:?}");
+    assert!(!calls.iter().any(|c| matches!(c, Call::Token { .. } | Call::Health { .. } | Call::Resume(_))), "no probe, no resume: {calls:?}");
+    let states = {
+        let st = api.state();
+        [&n.expired, &n.orphan, &n.foreign, &n.suspended, &n.adopt_vm].map(|id| st.vms[id].state.clone())
+    };
+    assert_eq!(states, [VmState::Running, VmState::Running, VmState::Running, VmState::Suspended, VmState::Running]);
+    assert_eq!(env.row(&n.expired).status, RowStatus::Running, "the expired VM is gc's to terminate, with --yes");
+    for stem in [&n.adopt_stem, &n.stale_stem] {
+        assert!(env.paths.vms().join(format!("{stem}.toml")).exists(), "pending rows stay ({stem})");
+    }
+    for gone in [n.gone_listed.as_str(), GONE_ID] {
+        assert_eq!((env.row(gone).status, env.row(gone).terminated_by), (RowStatus::Terminated, Some("platform".to_string())), "{gone}");
+    }
+    assert!(registry::read_row(&env.paths, OLD_ID).unwrap().is_none());
+    for file in [env.paths.gc_stamp(), env.paths.gc_lock()] {
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600, "{}", file.display());
+    }
+    // Within 15 minutes: nothing, not even a survey.
+    let mark = api.calls().len();
+    assert_eq!(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap(), None);
+    assert_eq!(api.calls().len(), mark, "no survey within the 15 minutes");
+    assert_eq!(env.events("vm_gc_reconcile").len(), 1);
+    // Fifteen minutes later: again (nothing left to do).
+    std::fs::write(env.paths.gc_stamp(), format!("{}\n", unix_now() - 15 * 60 - 1)).unwrap();
+    assert_eq!(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap(), Some(ReconcileReport::default()));
+    // Another process reconciling: nothing, whatever `every` says.
+    let held = ai_env_cli::bridge::vm::lock::try_lock_exclusive(&env.paths.gc_lock()).unwrap().expect("nobody holds it");
+    assert_eq!(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, None).await.unwrap(), None);
+    drop(held);
+    // `vm run|list|smoke`: whatever the stamp says (it is a moment old).
+    assert_eq!(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, None).await.unwrap(), Some(ReconcileReport::default()));
+    assert_eq!(env.events("vm_gc_reconcile").len(), 3);
+    assert!(terminated(&api.calls()).is_empty(), "never a terminate");
+}
+
+/// S10 (L12): `state/gc.stamp` is the attempt's, not the success's. A
+/// reconcile whose ListMicrovms fails (a throttled API) is an error, and
+/// stamped: a second one within 15 minutes asks the API nothing, so wrapper
+/// starts never pile surveys on an API that does not answer; past them it
+/// runs again.
+#[tokio::test]
+async fn a_failed_reconcile_still_waits_its_interval() {
+    let env = Env::new();
+    let api = api();
+    api.fail_on("list", BridgeError::Throttled("Rate exceeded".into()), false);
+    let e = reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap_err();
+    assert!(matches!(e, BridgeError::Throttled(_)), "{e}");
+    assert!(api.calls().iter().any(|c| matches!(c, Call::List(_))), "the survey asked: {:?}", api.calls());
+    assert!(env.paths.gc_stamp().is_file(), "the attempt stamped");
+    assert!(env.events("vm_gc_reconcile").is_empty(), "no row for a reconcile that did not run");
+    let mark = api.calls().len();
+    assert_eq!(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap(), None);
+    assert_eq!(api.calls().len(), mark, "within 15 minutes of the failed one: no call");
+    std::fs::write(env.paths.gc_stamp(), format!("{}\n", unix_now() - 15 * 60 - 1)).unwrap();
+    assert_eq!(reconcile_apply_local(&api, &env.paths, FAKE_IMAGE_ARN, Some(GC_RECONCILE_EVERY)).await.unwrap(), Some(ReconcileReport::default()));
+    assert_eq!(env.events("vm_gc_reconcile").len(), 1);
 }

@@ -45,6 +45,13 @@
 //!   [`AgentRegistry::close_all_with`] (stop, `/suspend`, `/terminate`) sends
 //!   an optional event to the sockets past hello, then Close with its code,
 //!   to every socket, and waits at most 1 s.
+//! - **Park** (S10, `park_v1`, named while [`PARK_SERVED`]): a `park` is
+//!   the spawn manager's (`SpawnManager::park`: the busy check, then the
+//!   park), answered `parked` or `park_refused`. After `parked` the socket's
+//!   idle deadline is [`PARKED_IDLE_MAX`]: a parked socket is silent by
+//!   design; any inbound frame brings `idle_s` back. `unpark` has no answer
+//!   (the Mac's `ping` beside it gets the socket's proof). `parked` and
+//!   `park_refused` are the VM's kinds, a `bad_frame` from the Mac.
 //!
 //! Logging is lifecycle only: never a frame body, a token or an argument.
 use crate::shim::health::ShimState;
@@ -52,9 +59,10 @@ use crate::shim::peer::{drain, Peer, PeerFacts};
 pub use crate::shim::spawn::ConnGen;
 use crate::shim::spawn::{Outbox, SpawnRequest};
 use crate::wire::frame::{
-    ClientInfo, CredentialErrCode, ErrorCode, Frame, HelloErrCode, ResumePoint, SpawnErrCode, SpawnId, WireError, CLOSE_GOING_AWAY, CLOSE_HELLO_DEADLINE, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, CLOSE_WIRE_VERSION, CONTROL_FRAME_MAX, HELLO_DEADLINE, IDLE_DEFAULT_S,
-    IDLE_MAX_S, IDLE_MIN_S, MAX_UNAUTHENTICATED, SEND_TIMEOUT, WIRE_VERSION, WS_MAX_MESSAGE,
+    ClientInfo, CredentialErrCode, ErrorCode, Frame, HelloErrCode, ParkRefusal, ResumePoint, SpawnErrCode, SpawnId, WireError, CLOSE_GOING_AWAY, CLOSE_HELLO_DEADLINE, CLOSE_HELLO_REFUSED, CLOSE_PROTOCOL, CLOSE_TOO_BIG, CLOSE_WIRE_VERSION, CONTROL_FRAME_MAX, HELLO_DEADLINE,
+    IDLE_DEFAULT_S, IDLE_MAX_S, IDLE_MIN_S, MAX_UNAUTHENTICATED, SEND_TIMEOUT, WIRE_VERSION, WS_MAX_MESSAGE,
 };
+use crate::wire::frame::PARKED_IDLE_MAX;
 use crate::wire::redact::Secret;
 use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
@@ -78,6 +86,10 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
+
+/// Whether this build parks spawns (S10) and names `park_v1`. A build that
+/// does not refuses every `park` (`other`) and ignores `unpark`.
+pub const PARK_SERVED: bool = true;
 
 /// How long [`AgentRegistry::close_all_with`] waits for the sockets to go.
 pub const CLOSE_ALL_WAIT: Duration = Duration::from_secs(1);
@@ -134,6 +146,9 @@ pub struct AgentRegistry {
     conns: Mutex<BTreeMap<ConnGen, Entry>>,
     /// Notified whenever a socket leaves.
     gone: Notify,
+    /// One second of `hello.idle_s` for the sockets from now on (`None`: a
+    /// second; tests shorten it).
+    idle_unit: Mutex<Option<Duration>>,
 }
 
 impl AgentRegistry {
@@ -144,6 +159,19 @@ impl AgentRegistry {
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<ConnGen, Entry>> {
         self.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Count `hello.idle_s` in units of `unit` instead of seconds, for the
+    /// sockets upgraded from now on (tests: a parked socket's idle deadline
+    /// is [`PARKED_IDLE_MAX`] whatever the unit).
+    pub fn set_idle_unit(&self, unit: Duration) {
+        *self.idle_unit.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(unit);
+    }
+
+    /// The live timers, with the unit [`Self::set_idle_unit`] set.
+    fn timing(&self) -> Timing {
+        let unit = *self.idle_unit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Timing { idle_unit: unit.unwrap_or(Timing::LIVE.idle_unit), ..Timing::LIVE }
     }
 
     /// A fresh connection generation (never 0).
@@ -330,8 +358,8 @@ pub async fn upgrade(State(state): State<Arc<ShimState>>, mut req: Request) -> R
         }
     };
     let reg = Registration { state: state.clone(), gen };
+    let timing = state.agents.timing();
     tokio::spawn(async move {
-        let timing = Timing::LIVE;
         let upgraded = match tokio::time::timeout(timing.hello, on_upgrade).await {
             Ok(Ok(u)) => u,
             Ok(Err(e)) => {
@@ -678,6 +706,24 @@ impl Session {
                 self.outcome(spawn_id, r).await
             }
             Frame::Ping { ts } => self.send(Frame::Pong { ts }).await,
+            // S10: a build that does not park refuses, whatever it asks.
+            Frame::Park { spawn_id, .. } if !PARK_SERVED => self.send(Frame::ParkRefused { spawn_id, reason: ParkRefusal::Other, quiet_s: 0, procs: 0, cpu_ms: 0 }).await,
+            Frame::Park { spawn_id, grace_s, min_quiet_s, cpu_busy_ms, hold_output, owner } => {
+                let answer = spawns.park(gen, &spawn_id, crate::shim::spawn::ParkAsk { grace_s, min_quiet_s, cpu_busy_ms, hold_output, owner }).await;
+                let parked = matches!(answer, Frame::Parked { .. });
+                let flow = self.send(answer).await;
+                if parked {
+                    // A parked socket is silent by design: this idle deadline until the next inbound frame.
+                    self.deadline = Instant::now() + PARKED_IDLE_MAX;
+                }
+                flow
+            }
+            Frame::Unpark { spawn_id } => {
+                if PARK_SERVED {
+                    spawns.unpark(gen, &spawn_id);
+                }
+                Flow::Continue
+            }
             // A second hello, or a kind only the VM sends.
             Frame::Hello { .. }
             | Frame::HelloOk { .. }
@@ -692,7 +738,9 @@ impl Session {
             | Frame::Event { .. }
             | Frame::Error { .. }
             | Frame::CredentialOk { .. }
-            | Frame::CredentialErr { .. } => self.violation(ErrorCode::BadFrame, None).await,
+            | Frame::CredentialErr { .. }
+            | Frame::Parked { .. }
+            | Frame::ParkRefused { .. } => self.violation(ErrorCode::BadFrame, None).await,
         }
     }
 
@@ -1013,10 +1061,15 @@ mod tests {
     /// A state after `/run`: with the commitment to [`token`], or fail-closed.
     fn state(commit: bool) -> Arc<ShimState> {
         let s = Arc::new(ShimState::new(PathBuf::from("/nonexistent/claude")));
+        claim(&s, commit);
+        s
+    }
+
+    /// `/run` on `s`: with the commitment to [`token`], or fail-closed.
+    fn claim(s: &ShimState, commit: bool) {
         let payload = commit.then(|| RunHookPayload::new(&Secret::new(token()), "mike@mbp", "2026-10-03T08:00:00Z"));
         s.run.claim(&[1; 32], || RunRecord { microvm_id: Some("mvm-unit".into()), payload, body_sha256: [1; 32], at: std::time::Instant::now(), boot_nonce: "0".repeat(32) });
         s.run.mark_seen();
-        s
     }
 
     /// A served socket over an in-memory pipe; the client end.
@@ -1345,6 +1398,59 @@ mod tests {
             };
             assert_eq!((got, close), (want, Some(CLOSE_GOING_AWAY)));
         }
+    }
+
+    /// S10's park on the socket (phase 0's refusal-only test, replaced): the
+    /// cap is named; a `park` of the socket's own spawn is the spawn
+    /// manager's (its busy check: `spawn.rs` and tests/shim_local.rs try the
+    /// refusals), answered `parked`, and the parked socket outlives its
+    /// idle deadline, which is `PARKED_IDLE_MAX` until the next inbound
+    /// frame brings `idle_s` back (then 1001). A grace out of range is
+    /// `other`, another socket's spawn `not_attached`; an `unpark` gets no
+    /// answer. `parked` and `park_refused` are the VM's kinds: from the Mac
+    /// they break the protocol.
+    #[tokio::test]
+    async fn a_park_is_answered_and_the_parked_socket_outlives_its_idle_deadline() {
+        use crate::shim::health::{ProbeSpec, ShimOpts};
+        use crate::wire::frame::{ParkOwner, CAP_PARK_V1};
+        let home = tempfile::tempdir().unwrap();
+        let opts = ShimOpts { home: std::fs::canonicalize(home.path()).unwrap(), ..ShimOpts::default() };
+        let s = Arc::new(ShimState::with(PathBuf::from("/nonexistent/claude"), opts, ProbeSpec::default(), Arc::new(crate::shim::sys::RealSys)));
+        claim(&s, true);
+        assert!(PARK_SERVED && s.caps().iter().any(|c| c == CAP_PARK_V1));
+        let mut c = connect(&s, FAST).await;
+        send(&mut c, &hello_frame(&token(), vec![], Some(IDLE_MIN_S))).await;
+        assert!(matches!(next(&mut c).await, Ok(Frame::HelloOk { caps, .. }) if caps.iter().any(|c| c == CAP_PARK_V1)));
+        let id = SpawnId::new_v7();
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: Some(60), credential: None };
+        send(&mut c, &spawn).await;
+        assert!(matches!(next(&mut c).await, Ok(Frame::Spawned { spawn_id, .. }) if spawn_id == id));
+        let owner = ParkOwner { pid: 51_234, started: 1_792_483_200 };
+        let park = |grace_s: u32| Frame::Park { spawn_id: id.clone(), grace_s, min_quiet_s: 0, cpu_busy_ms: 500, hold_output: false, owner };
+        send(&mut c, &park(0)).await;
+        assert!(matches!(next(&mut c).await, Ok(Frame::ParkRefused { reason: ParkRefusal::Other, .. })), "a grace of 0");
+        let mut other = hello_ok(&s, FAST).await;
+        send(&mut other, &park(600)).await;
+        assert!(matches!(next(&mut other).await, Ok(Frame::ParkRefused { reason: ParkRefusal::NotAttached, quiet_s: 0, procs: 0, cpu_ms: 0, .. })));
+        send(&mut c, &park(600)).await;
+        assert!(matches!(next(&mut c).await, Ok(Frame::Parked { spawn_id, procs: 0, .. }) if spawn_id == id));
+        assert_eq!(s.spawns.detail()[0].parked, Some(owner));
+        // FAST's idle_s of 30 is 300 ms: parked, the socket outlives three of them.
+        tokio::time::sleep(FAST.idle_unit * (IDLE_MIN_S * 3)).await;
+        send(&mut c, &Frame::Unpark { spawn_id: id.clone() }).await;
+        // The next frame is the pong: nothing answered the unpark.
+        ping_pong(&mut c, 3).await;
+        assert_eq!(s.spawns.detail()[0].parked, None, "unparked");
+        let quiet = Instant::now();
+        assert_eq!(next(&mut c).await, Err(Some(CLOSE_GOING_AWAY)), "idle_s again since the unpark");
+        assert!(quiet.elapsed() < FAST.idle_unit * (IDLE_MIN_S * 3), "{:?}", quiet.elapsed());
+        for vm_only in [Frame::Parked { spawn_id: id.clone(), quiet_s: 1, procs: 0 }, Frame::ParkRefused { spawn_id: id.clone(), reason: ParkRefusal::Busy, quiet_s: 1, procs: 1, cpu_ms: 1 }] {
+            let mut c = hello_ok(&s, FAST).await;
+            send(&mut c, &vm_only).await;
+            assert!(matches!(next(&mut c).await, Ok(Frame::Error { code: ErrorCode::BadFrame, .. })), "{}", vm_only.kind());
+            assert_eq!(next(&mut c).await, Err(Some(CLOSE_PROTOCOL)), "{}", vm_only.kind());
+        }
+        s.spawns.shutdown("test").await;
     }
 
     #[tokio::test]

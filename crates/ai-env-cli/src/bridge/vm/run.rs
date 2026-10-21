@@ -235,6 +235,11 @@ pub struct RunPlan {
     /// config error, longer than 4096 is sent as is (the API decides).
     /// `None` from [`RunPlan::from_cfg`].
     pub pad_payload_to: Option<usize>,
+    /// S10: VMs SELECT_VM must not take (a move's old VM): `reuse_candidate`
+    /// refuses them, and every row with `leaving_for` set (a migration's old
+    /// VM while its retire counts its spawns; one kept loses the mark).
+    /// Empty from [`RunPlan::from_cfg`]; honoured from S10 wave 1b (C).
+    pub avoid: Vec<String>,
 }
 
 /// Which VM SELECT_VM takes for a workspace (S8 plan §1, §3 P2).
@@ -362,6 +367,7 @@ impl RunPlan {
             choice: Choice::Workspace,
             workspace_cap: false,
             transcript_cap: false,
+            avoid: Vec::new(),
         })
     }
 }
@@ -513,30 +519,52 @@ pub async fn resolve_image_version<A: MicrovmApi>(api: &A, arn: &str, want: &str
 
 // ---- polling ---------------------------------------------------------------------------
 
-/// A state poll: one `GetMicrovm` every `step` for at most `budget`.
+/// A state poll: one `GetMicrovm` every `step` for at most `budget`; S10:
+/// after the first waits of `ramp`, in order (a `Duration::ZERO` entry is no
+/// wait), then every `step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Poll {
     pub step: Duration,
     pub budget: Duration,
+    /// S10: the first waits before the `step`s (honoured from S10 wave 1b, C).
+    pub ramp: [Duration; 3],
 }
 
 impl Poll {
     /// PENDING → RUNNING after `RunMicrovm` / resume: 1 s steps for 60 s (plan S4 D16).
-    pub const RUNNING: Poll = Poll { step: Duration::from_secs(1), budget: Duration::from_secs(60) };
+    pub const RUNNING: Poll = Poll { step: Duration::from_secs(1), budget: Duration::from_secs(60), ramp: [Duration::ZERO; 3] };
 
     /// Suspend, resume and terminate settling: 1 s steps for 30 s.
-    pub const SETTLE: Poll = Poll { step: Duration::from_secs(1), budget: Duration::from_secs(30) };
+    pub const SETTLE: Poll = Poll { step: Duration::from_secs(1), budget: Duration::from_secs(30), ramp: [Duration::ZERO; 3] };
 
-    /// Every second of step and budget becomes `ms_per_second` milliseconds
-    /// (`AI_ENV_BRIDGE_LAB_BACKOFF_MS`; the tests use `Some(1)`); `None`
-    /// leaves the poll as it is.
+    /// S10: a suspended VM resumed (P2's reuse of one, a move's `running()`):
+    /// 200, 300 and 500 ms, then 1 s steps, 60 s in all.
+    pub const RESUMED: Poll = Poll { step: Duration::from_secs(1), budget: Duration::from_secs(60), ramp: [Duration::from_millis(200), Duration::from_millis(300), Duration::from_millis(500)] };
+
+    /// Every second of step, budget and ramp becomes `ms_per_second`
+    /// milliseconds (`AI_ENV_BRIDGE_LAB_BACKOFF_MS`; the tests use
+    /// `Some(1)`); `None` leaves the poll as it is.
     #[must_use]
     pub fn scaled(self, ms_per_second: Option<u64>) -> Poll {
         let Some(ms) = ms_per_second else {
             return self;
         };
         let scale = |d: Duration| Duration::from_micros(u64::try_from(d.as_micros()).unwrap_or(u64::MAX).saturating_mul(ms) / 1000);
-        Poll { step: scale(self.step), budget: scale(self.budget) }
+        Poll { step: scale(self.step), budget: scale(self.budget), ramp: self.ramp.map(scale) }
+    }
+}
+
+impl Poll {
+    /// S10 (F9): this poll for a VM just resumed: [`Poll::RESUMED`]'s ramp at
+    /// this poll's own scale (each wait the same share of `step` as in
+    /// `RESUMED`, so a lab-scaled poll ramps as scaled), its step and budget
+    /// as they are. The waits [`wait_for_state`] makes after a ResumeMicrovm
+    /// (P2's reuse of a suspended VM, a move's `running()`).
+    #[must_use]
+    pub fn resumed(self) -> Poll {
+        let base = Poll::RESUMED.step.as_micros().max(1);
+        let at_scale = |d: Duration| Duration::from_micros(u64::try_from(d.as_micros().saturating_mul(self.step.as_micros()) / base).unwrap_or(u64::MAX));
+        Poll { ramp: Poll::RESUMED.ramp.map(at_scale), ..self }
     }
 }
 
@@ -585,6 +613,8 @@ fn transient_get(e: &BridgeError) -> bool {
 /// otherwise (exit 8); a transient failure ([`transient_get`]: throttled,
 /// ambiguous, an SDK error of `get_microvm`) is retried within the budget; past the budget the result is `Sdk { op:
 /// "wait" }` (exit 7) naming the id, the last state and the last error.
+/// Between two looks it waits `poll.ramp`'s entries first, in order (S10:
+/// a `Duration::ZERO` entry is no wait), then `poll.step`.
 pub async fn wait_for_state<A: MicrovmApi>(api: &A, id: &str, want: &VmState, poll: Poll) -> Result<VmInfo, BridgeError> {
     wait_inner(api, id, want, poll, false).await
 }
@@ -602,6 +632,8 @@ async fn wait_inner<A: MicrovmApi>(api: &A, id: &str, want: &VmState, poll: Poll
     let mut last: Option<VmInfo> = None;
     // Set by every answer: the error of this round, or none after a state.
     let mut last_error: Option<String>;
+    // S10: the ramp's waits first (a ZERO entry is none), then the step's.
+    let mut ramp = poll.ramp.into_iter().filter(|d| !d.is_zero());
     loop {
         match api.get(id).await {
             Ok(vm) if &vm.state == want => return Ok(vm),
@@ -629,7 +661,7 @@ async fn wait_inner<A: MicrovmApi>(api: &A, id: &str, want: &VmState, poll: Poll
             let tail = last_error.map(|e| format!("; last error: {e}")).unwrap_or_default();
             return Err(BridgeError::Sdk { op: "wait", message: format!("{id} not {} after {} (last state {seen}){tail}", want.as_str(), human(poll.budget)) });
         }
-        tokio::time::sleep(poll.step).await;
+        tokio::time::sleep(ramp.next().unwrap_or(poll.step)).await;
     }
 }
 
@@ -1186,7 +1218,7 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
     if !plan.wait {
         return Ok(Selected::Started { row, vm, run_ms, running_ms: 0 });
     }
-    match wait_after_run(api, &id, Poll { step: poll.step, budget: left }).await {
+    match wait_after_run(api, &id, Poll { step: poll.step, budget: left, ramp: poll.ramp }).await {
         // The RUNNING answer is a GetMicrovm too: its egress, when it reports one, must still pass.
         Ok(vm) if !vm.egress.is_empty() && !expected.matches(&vm.egress, alias.as_ref()) => {
             let error = reject_echo(api, paths, &id, Some(&expected), &vm.egress, "run", plan.purpose).await;
@@ -1362,9 +1394,15 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted
 /// connectors than `wanted` (a row without connectors, written before S5,
 /// goes to the gate); with `workspace_cap`, none whose caps lack
 /// `workspace_v1`; with `transcript_cap` (S9), none whose caps lack
-/// `transcript_s3_v1`.
+/// `transcript_s3_v1`. S10: none in the plan's `avoid` (a move's old VM,
+/// even when `preferred`), and none whose chat a migration moved on
+/// (`leaving_for` set while its retire counts its spawns: synced and
+/// terminated when no other chat's spawn lives there; kept otherwise, and
+/// then unmarked, an ordinary workspace VM again).
 pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, workspace: &str, version: Option<&str>, preferred: Option<&str>, now: u64) -> bool {
     !r.is_pending_row()
+        && !plan.avoid.contains(&r.id)
+        && r.leaving_for.is_none()
         && r.workspace.as_deref() == Some(workspace)
         && r.status != RowStatus::Terminated
         && r.wall_left(now).is_some_and(|left| left > i64::from(plan.migrate_before_wall_s))
@@ -1380,7 +1418,8 @@ pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, 
 /// One reuse candidate, as [`try_reuse`] and a pinned VM ([`select_pinned`])
 /// take it: `Ok(Ok(_))` reused, `Ok(Err(why))` passed over, `Err` the run's
 /// failure. `GetMicrovm` decides: RUNNING is reused, PENDING is waited for
-/// (RUNNING with `poll`), SUSPENDING/SUSPENDED is resumed, then RUNNING. A VM
+/// (RUNNING with `poll`), SUSPENDING/SUSPENDED is resumed, then RUNNING
+/// (S10, F9: with `poll`'s resumed ramp, [`Poll::resumed`]). A VM
 /// the service reports TERMINATING/TERMINATED (at once or while waiting) is
 /// marked terminated and passed over; `ResourceNotFound` marks a
 /// running/suspended row terminated, while a pending/unknown row (possibly
@@ -1450,7 +1489,8 @@ async fn reuse_row<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, row: V
                     Ok(()) | Err(BridgeError::Conflict(_)) => {}
                     Err(e) => return Err(e),
                 }
-                wait_for_state(api, &id, &VmState::Running, poll).await.map(|vm| Some((vm, true)))
+                // S10 (F9): a resume takes 1.5 to 2.5 s; the first looks come sooner than the step.
+                wait_for_state(api, &id, &VmState::Running, poll.resumed()).await.map(|vm| Some((vm, true)))
             }
             // A state this build does not know: never reused.
             _ => Ok(None),
@@ -1669,7 +1709,7 @@ pub async fn adopt_after_ambiguous_for<A: MicrovmApi, E: EndpointClient>(api: &A
     let mut unresolved = Vec::new();
     for s in candidates {
         if s.state == VmState::Pending {
-            let left = Poll { step: poll.step, budget: deadline.saturating_duration_since(Instant::now()) };
+            let left = Poll { step: poll.step, budget: deadline.saturating_duration_since(Instant::now()), ramp: poll.ramp };
             match wait_for_state(api, &s.id, &VmState::Running, left).await {
                 Ok(_) => {}
                 Err(BridgeError::Terminated(_) | BridgeError::VmNotFound(_)) => continue,
@@ -1767,9 +1807,14 @@ mod tests {
     #[test]
     fn poll_scaling() {
         assert_eq!(Poll::RUNNING.scaled(None), Poll::RUNNING);
-        assert_eq!(Poll::RUNNING.scaled(Some(1)), Poll { step: Duration::from_millis(1), budget: Duration::from_millis(60) });
-        assert_eq!(Poll::SETTLE.scaled(Some(20)), Poll { step: Duration::from_millis(20), budget: Duration::from_millis(600) });
+        assert_eq!(Poll::RUNNING.scaled(Some(1)), Poll { step: Duration::from_millis(1), budget: Duration::from_millis(60), ramp: [Duration::ZERO; 3] });
+        assert_eq!(Poll::SETTLE.scaled(Some(20)), Poll { step: Duration::from_millis(20), budget: Duration::from_millis(600), ramp: [Duration::ZERO; 3] });
         assert_eq!(Poll::SETTLE.scaled(Some(1000)), Poll::SETTLE);
+        // S10: the resumed VM's ramp, scaled as the step is.
+        let ms = Duration::from_millis;
+        assert_eq!((Poll::RESUMED.ramp, Poll::RESUMED.step, Poll::RESUMED.budget), ([ms(200), ms(300), ms(500)], Duration::from_secs(1), Duration::from_secs(60)));
+        assert_eq!(Poll::RESUMED.scaled(Some(10)).ramp, [ms(2), ms(3), ms(5)]);
+        assert_eq!(Poll::RESUMED.scaled(Some(1000)), Poll::RESUMED);
     }
 
     #[test]
@@ -2034,5 +2079,58 @@ mod tests {
             // A row without egress expects no echo: a mismatch, whose pending row cannot be read.
             let _ = promote_adopted(&api, &paths, &pending, &vm, "sweep", "test").await;
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod c2_tests {
+    use super::*;
+
+    /// S10 (F9): a poll for a VM just resumed takes `RESUMED`'s ramp at its
+    /// own scale (the unscaled poll its ramp as it is, a lab-scaled one the
+    /// same ramp scaled as `RESUMED.scaled` scales it), its step and budget
+    /// unchanged.
+    #[test]
+    fn a_resumed_poll_ramps_at_its_own_scale() {
+        assert_eq!(Poll::RUNNING.resumed(), Poll::RESUMED);
+        for ms in [1, 10, 100, 1000] {
+            assert_eq!(Poll::RUNNING.scaled(Some(ms)).resumed(), Poll::RESUMED.scaled(Some(ms)), "{ms} ms a second");
+        }
+        let settle = Poll::SETTLE.resumed();
+        assert_eq!((settle.step, settle.budget, settle.ramp), (Poll::SETTLE.step, Poll::SETTLE.budget, Poll::RESUMED.ramp));
+        assert_eq!(Poll::RESUMED.resumed(), Poll::RESUMED);
+    }
+
+    /// The time `wait_for_state` takes to see RUNNING after `misses`
+    /// GetMicrovm answers it tries again past (throttled), its waits `poll`'s.
+    async fn waited(poll: Poll, misses: usize) -> Duration {
+        let api = api::FakeMicrovmApi::new();
+        let id = "microvm-00000000-0000-4000-8000-0000000000f9";
+        api.insert_vm(VmInfo { state: VmState::Running, ..gone_info(id) });
+        for _ in 0..misses {
+            api.fail_on("get", BridgeError::Throttled("Rate exceeded".into()), false);
+        }
+        let t0 = Instant::now();
+        let vm = wait_for_state(&api, id, &VmState::Running, poll).await.unwrap();
+        assert_eq!((vm.state, api.calls().len()), (VmState::Running, misses + 1));
+        t0.elapsed()
+    }
+
+    /// S10 (F9): a poll waits its ramp's entries first, then its steps; a
+    /// `Duration::ZERO` entry is no wait (RUNNING and SETTLE ramp nothing:
+    /// S9's steps). At 200 ms a second, three looks the VM was not ready
+    /// for cost the resumed ramp's 40 + 60 + 100 ms, where the steps alone
+    /// cost 3 × 200 ms.
+    #[tokio::test]
+    async fn the_wait_takes_the_ramp_first_then_the_steps() {
+        let resumed = waited(Poll::RUNNING.scaled(Some(200)).resumed(), 3).await;
+        let stepped = waited(Poll::RUNNING.scaled(Some(200)), 3).await;
+        assert!(resumed >= Duration::from_millis(200) && resumed < Duration::from_millis(500), "the ramp: {resumed:?}");
+        assert!(stepped >= Duration::from_millis(600), "the steps: {stepped:?}");
+        // Past the ramp: the step. A zero entry is skipped, not a look at once.
+        let gapped = Poll { ramp: [Duration::from_millis(40), Duration::ZERO, Duration::from_millis(60)], ..Poll::RUNNING.scaled(Some(200)) };
+        let t = waited(gapped, 3).await;
+        assert!(t >= Duration::from_millis(300) && t < Duration::from_millis(600), "40, 60, then a 200 ms step: {t:?}");
     }
 }

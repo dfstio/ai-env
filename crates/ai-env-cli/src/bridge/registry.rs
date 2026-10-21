@@ -28,8 +28,21 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Schema version written into every row's `v` field.
-pub const REGISTRY_SCHEMA_V: u8 = 1;
+/// Schema version written into every row's `v` field. S10's 2 marks a
+/// wrapper that handles [`MIGRATE_SIGNAL`] (`session migrate` signals no row
+/// below it: SIGUSR1 ends an S9 wrapper); nothing else reads `v`, and S9
+/// builds read a `v = 2` row as before.
+pub const REGISTRY_SCHEMA_V: u8 = 2;
+
+/// A row's `status` (S10 §6.1): `active` (a live wrapper serves the chat),
+/// `detached` (the link is down, or a loss waits for the next input),
+/// `parked` (S10 §D), `migrating` (a move runs, or an offline `session
+/// migrate` with `migrating_pid`), `closed` (no wrapper).
+pub const STATUSES: [&str; 5] = ["active", "detached", "parked", "migrating", "closed"];
+
+/// The most `vms` entries a row keeps: an earlier wrapper's as a prefix, then
+/// this process's, the oldest dropped (S10 §6.1).
+pub const VMS_KEPT: usize = 64;
 
 /// What the registry records of the host's state requests: digests plus a
 /// summary of allowlisted fields, never request bytes.
@@ -73,7 +86,7 @@ pub struct SessionRow {
     pub created: String,
     /// RFC 3339 UTC; rewritten on each forwarded `result` and at exit.
     pub last_seen: String,
-    /// `active` | `closed` (S8/S10 add `detached` | `migrating`).
+    /// One of [`STATUSES`]: `active` | `closed`; S8's `detached`; S10's `parked` | `migrating`.
     pub status: String,
     /// `local-child` | `local-scratch` | `remote`.
     pub mode: String,
@@ -100,6 +113,8 @@ pub struct SessionRow {
     pub last_acked_seq: Option<u64>,
     pub seeded_head: Option<String>,
     pub last_wip_fetch: Option<String>,
+    /// One entry per child generation ([`VmEntry`], read with
+    /// [`VmEntry::from_value`]): kept as TOML values so every older row reads.
     pub vms: Vec<toml::Value>,
     /// S9: `"s3"` once the session's transcript is kept in S3 (never on this Mac).
     pub transcript_home: Option<String>,
@@ -107,6 +122,42 @@ pub struct SessionRow {
     pub origin: Option<String>,
     /// S9: `<slug>/<sid>.jsonl`, the view's rel under the Mac's projects directory.
     pub view: Option<String>,
+    /// S10: the pid of the offline `session migrate` moving the chat (the
+    /// row `migrating` meanwhile): `forget` and a reopen wait while it lives.
+    pub migrating_pid: Option<u32>,
+}
+
+/// One child generation's `SessionRow.vms` entry. Lenient: an older wrapper's entry lacks the S10 fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VmEntry {
+    pub gen: u32,
+    pub vm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<String>,
+    pub from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// S10: why it started: `first`, `retry`, `readdress:<cause>`, `respawn:<cause>`, `migrate:<trigger>` (`wall`, `command`);
+    /// a reopen's carry (§2.7): `migrate:reopen` (the old VM near its wall) or `readdress:vm_gone` (it was gone).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    /// S10: how it ended: `exit`, `close`, `lost:<cause>`, `moved`, `failed`, `detached`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// S10: the wrapper process that ran it (gens restart at 1 in each process).
+    pub pid: u32,
+}
+
+impl VmEntry {
+    /// One `vms` entry as a row holds it: the fields it has, the others
+    /// their defaults (an S8 or S9 wrapper's entry has no `why`, `end` or
+    /// `pid`); `None` for a value that is no such table (a field of the
+    /// wrong type included).
+    #[must_use]
+    pub fn from_value(value: &toml::Value) -> Option<VmEntry> {
+        value.clone().try_into().ok()
+    }
 }
 
 /// What [`forget`] removed.
@@ -318,8 +369,8 @@ fn sort_rows(rows: &mut [SessionRow]) {
 /// Delete a session's row, its scratch config dir and its quarantine (S8:
 /// the settings captures, `quarantine/<id>`).
 ///
-/// Refuses a non-uuid, and a row whose `status` is `active` while its wrapper
-/// pid is alive. The scratch dir is DERIVED from the id
+/// Refuses a non-uuid, and a row a live wrapper or an offline `session
+/// migrate` still holds ([`forget_check`]). The scratch dir is DERIVED from the id
 /// (`<root>/state/scratch/<id>`), never taken from the row's `scratch_dir`, and
 /// is removed only when `symlink_metadata` says it is a real directory — a
 /// symlink there is left alone, and so is its target; the quarantine
@@ -344,21 +395,52 @@ pub fn forget(paths: &Paths, session_id: &str) -> Result<ForgetReport, BridgeErr
         Err(e) if e.kind() == ErrorKind::NotFound => false,
         Err(e) => return Err(io_at("cannot stat", &paths.quarantine())(e)),
     };
+    // S10 §6.5: a `session migrate` request no wrapper took (its command killed before the signal) goes too.
+    remove_if_present(&paths.session_migrate_request(session_id))?;
     let removed_row = remove_if_present(&row_path)?;
     Ok(ForgetReport { removed_row, removed_scratch, removed_quarantine })
 }
 
-/// [`forget`]'s two refusals, before anything is removed (S9: `session
-/// forget --purge` runs them before its S3 half, so a live session's
-/// transcript is never deleted): a non-uuid; an `active` row whose wrapper
-/// pid is alive; a scratch dir whose owner is alive (`Config`, exit 1). A
-/// row that does not parse is warned about and passes (a corrupt row cannot
-/// belong to a live wrapper); an I/O error reading it is returned.
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod c3_tests {
+    use super::*;
+
+    /// S10 §6.5: forgetting a session removes its `session migrate` request
+    /// too (one no wrapper took), never another session's.
+    #[test]
+    fn forget_removes_the_sessions_migrate_request() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let (one, two) = ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a51", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a52");
+        std::fs::create_dir_all(p.sessions()).unwrap();
+        for sid in [one, two] {
+            std::fs::write(p.session_migrate_request(sid), "{}").unwrap();
+        }
+        forget(&p, one).unwrap();
+        assert!(!p.session_migrate_request(one).exists(), "the forgotten session's request is gone");
+        assert!(p.session_migrate_request(two).exists(), "another session's stays");
+    }
+}
+
+/// [`forget`]'s refusals, before anything is removed (S9: `session forget
+/// --purge` runs them before its S3 half, so a live session's transcript is
+/// never deleted): a non-uuid; a row that is not `closed` while its wrapper
+/// pid is alive, whatever its status (S10: `detached`, `parked` and
+/// `migrating` are a live wrapper's too); a row whose `migrating_pid` (an
+/// offline `session migrate`) is alive; a scratch dir whose owner is alive
+/// (`Config`, exit 1). A row that does not parse is warned about and passes
+/// (a corrupt row cannot belong to a live wrapper); an I/O error reading it
+/// is returned.
 pub fn forget_check(paths: &Paths, session_id: &str) -> Result<(), BridgeError> {
     path_for(paths, session_id)?;
     match read(paths, session_id) {
-        Ok(Some(row)) if row.status == "active" && pid_alive(row.pid) => {
-            return Err(BridgeError::Config(format!("session {session_id} is still active (wrapper pid {}); close it first", row.pid)));
+        Ok(Some(row)) if row.status != "closed" && pid_alive(row.pid) => {
+            let status = if row.status.is_empty() { "open" } else { row.status.as_str() };
+            return Err(BridgeError::Config(format!("session {session_id} is still {status} (wrapper pid {}); close it first", row.pid)));
+        }
+        Ok(Some(row)) if row.migrating_pid.is_some_and(pid_alive) => {
+            return Err(BridgeError::Config(format!("session {session_id} is being moved to a new VM (pid {}); forget it once the move ended", row.migrating_pid.unwrap_or_default())));
         }
         Ok(_) => {}
         Err(e @ BridgeError::Config(_)) => tracing::warn!("session registry: forgetting an unreadable row: {e}"),
@@ -498,32 +580,44 @@ pub fn cmd_show(uuid: &str, json: bool) -> crate::errors::Result<()> {
     Ok(())
 }
 
-/// `ai-env session forget UUID [--purge]`: delete the row, the derived
-/// scratch dir and the session's quarantine (refused while the session is
-/// active); with `--purge` (S9) first its S3 transcript, its manifest,
-/// `state/transcripts/<sid>/` and the view (`s3::forget_purge`), only once
-/// [`forget_check`] passed. A non-uuid is a usage error (exit 2); nothing to
-/// remove exits 1 with `no session <uuid>`.
-pub fn cmd_forget(store: &crate::store::Keystore, uuid: &str, purge: bool) -> crate::errors::Result<()> {
-    if !is_uuid(uuid) {
-        return Err(CliError::Usage(format!("not a session id: {uuid}")));
+/// `ai-env session forget UUID... [--purge]`: delete each session's row,
+/// the derived scratch dir and its quarantine (refused while a wrapper still
+/// serves it); with `--purge` (S9) first their S3 transcripts, manifests,
+/// `state/transcripts/<sid>/` and views (S10: `s3::forget_purge_many`, one
+/// unseal for all), only once [`forget_check`] passed for every id. Every id
+/// is checked first: a non-uuid is a usage error (exit 2) before anything,
+/// a refusal exit 1 naming its id with nothing removed. An id with nothing
+/// to remove says `no session <uuid>`, and the command exits 1 after the others.
+pub fn cmd_forget(store: &crate::store::Keystore, uuids: &[String], purge: bool) -> crate::errors::Result<()> {
+    if let Some(bad) = uuids.iter().find(|u| !is_uuid(u)) {
+        return Err(CliError::Usage(format!("not a session id: {bad}")));
     }
     let paths = Paths::resolve()?;
-    forget_session(store, &paths, uuid, purge)
+    forget_sessions(store, &paths, uuids, purge)
 }
 
-/// [`cmd_forget`] once the id and the paths are in hand: the checks, then the purge (with `purge`), then [`forget`].
-fn forget_session(store: &crate::store::Keystore, paths: &Paths, uuid: &str, purge: bool) -> crate::errors::Result<()> {
-    forget_check(paths, uuid)?;
-    let purged = if purge { crate::bridge::s3::forget_purge(store, paths, uuid)? } else { false };
-    let what = forget_suffix(forget(paths, uuid)?);
-    match (what, purged) {
-        (Some(what), true) => outln!("forgot {uuid}{what} and purged its transcript"),
-        (Some(what), false) => outln!("forgot {uuid}{what}"),
-        (None, true) => outln!("forgot {uuid} (its transcript purged)"),
-        (None, false) => bail!("no session {uuid}"),
+/// [`cmd_forget`] once the ids and the paths are in hand: every id's
+/// checks, then the purge of them all (with `purge`), then [`forget`] of each.
+fn forget_sessions(store: &crate::store::Keystore, paths: &Paths, uuids: &[String], purge: bool) -> crate::errors::Result<()> {
+    for uuid in uuids {
+        forget_check(paths, uuid)?;
     }
-    Ok(())
+    let purged = if purge { crate::bridge::s3::forget_purge_many(store, paths, uuids)? } else { vec![false; uuids.len()] };
+    let mut missing: Vec<&str> = Vec::new();
+    for (uuid, purged) in uuids.iter().zip(purged.into_iter().chain(std::iter::repeat(false))) {
+        let what = forget_suffix(forget(paths, uuid)?);
+        match (what, purged) {
+            (Some(what), true) => outln!("forgot {uuid}{what} and purged its transcript"),
+            (Some(what), false) => outln!("forgot {uuid}{what}"),
+            (None, true) => outln!("forgot {uuid} (its transcript purged)"),
+            (None, false) => missing.push(uuid),
+        }
+    }
+    let Some((last, earlier)) = missing.split_last() else { return Ok(()) };
+    for uuid in earlier {
+        eprintln!("ai-env: no session {uuid}");
+    }
+    bail!("no session {last}")
 }
 
 /// The signal `session drop-transport` sends the wrapper that owns a remote
@@ -533,6 +627,14 @@ fn forget_session(store: &crate::store::Keystore, paths: &Paths, uuid: &str, pur
 /// `LinkFactory::drop_transport`: a remote link closes its socket from the
 /// wrapper's side and reattaches; a local child is left alone.
 pub const DROP_TRANSPORT_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+/// The signal `session migrate` sends the live wrapper of a remote session
+/// (S10 §7.1): SIGUSR1, after it wrote `state/sessions/<sid>.migrate.json`.
+/// The pump installs its handler in every piped mode beside
+/// [`DROP_TRANSPORT_SIGNAL`]'s, as `HostSignal::Migrate`. Its default action
+/// ends a process, and an S9 wrapper installs none: the command signals only
+/// a row whose `v` is 2 or more ([`REGISTRY_SCHEMA_V`]).
+pub const MIGRATE_SIGNAL: libc::c_int = libc::SIGUSR1;
 
 /// The check `session drop-transport` makes before it signals (S8 T8.6):
 /// the row is `active` (a `detached` one is already reattaching, a `closed`
@@ -765,6 +867,7 @@ mod tests {
             transcript_home: Some("s3".into()),
             origin: Some("vm".into()),
             view: Some(format!("-Users-mike-Documents-DeFi-ai-env/{sid}.jsonl")),
+            migrating_pid: Some(4251),
         }
     }
 
@@ -1143,14 +1246,89 @@ mod tests {
         let store = crate::store::Keystore::resolve(Some(d.path().join("keys"))).unwrap();
         let live = SessionRow { status: "active".into(), mode: "remote".into(), pid: std::process::id(), ..row(1, "") };
         write(&p, &live).unwrap();
-        let e = forget_session(&store, &p, &id(1), true).unwrap_err();
+        let e = forget_sessions(&store, &p, &[id(1)], true).unwrap_err();
         assert_eq!(e.exit_code(), 1);
         assert!(e.to_string().contains("is still active") && !e.to_string().contains("not built"), "the check first: {e}");
         assert_eq!(read(&p, &id(1)).unwrap(), Some(live), "nothing removed");
         write(&p, &row(2, "")).unwrap();
-        forget_session(&store, &p, &id(2), false).unwrap();
+        forget_sessions(&store, &p, &[id(2)], false).unwrap();
         assert_eq!(read(&p, &id(2)).unwrap(), None, "without --purge: S8's forget");
-        assert!(forget_session(&store, &p, &id(2), false).unwrap_err().to_string().contains("no session"));
+        assert!(forget_sessions(&store, &p, &[id(2)], false).unwrap_err().to_string().contains("no session"));
+    }
+
+    /// S10 (§6.1, F1): `forget` refuses a row a live wrapper still serves,
+    /// whatever its status (`active`, `detached`, `parked`, `migrating`, or
+    /// none), and one an offline `session migrate` is moving; a closed row of
+    /// a live pid, and a dead wrapper's row of any status, go. With several
+    /// ids every check runs first: one refusal removes nothing.
+    #[test]
+    fn forget_refuses_a_live_wrappers_row_whatever_its_status() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        let store = crate::store::Keystore::resolve(Some(d.path().join("keys"))).unwrap();
+        let me = std::process::id();
+        for (n, status) in (1..).zip(["active", "detached", "parked", "migrating", ""]) {
+            let live = SessionRow { status: status.into(), pid: me, ..row(n, "") };
+            write(&p, &live).unwrap();
+            let e = forget(&p, &id(n)).unwrap_err().to_string();
+            assert!(e.contains(&format!("session {} is still ", id(n))) && e.contains(&format!("(wrapper pid {me})")), "{status:?}: {e}");
+            assert!(path_for(&p, &id(n)).unwrap().exists(), "{status:?}: nothing removed");
+            write(&p, &SessionRow { pid: i32::MAX as u32, ..live }).unwrap();
+            assert!(forget(&p, &id(n)).unwrap().removed_row, "{status:?}: a dead wrapper's row goes");
+        }
+        // A closed row whose pid lives (the pid reused): no wrapper serves it.
+        write(&p, &SessionRow { pid: me, ..row(10, "") }).unwrap();
+        assert!(forget(&p, &id(10)).unwrap().removed_row);
+        // An offline `session migrate` moving a closed row.
+        let moving = SessionRow { status: "migrating".into(), pid: i32::MAX as u32, migrating_pid: Some(me), ..row(11, "") };
+        write(&p, &moving).unwrap();
+        let e = forget(&p, &id(11)).unwrap_err().to_string();
+        assert!(e.contains(&format!("session {} is being moved to a new VM (pid {me})", id(11))), "{e}");
+        write(&p, &SessionRow { migrating_pid: Some(i32::MAX as u32), ..moving }).unwrap();
+        assert!(forget(&p, &id(11)).unwrap().removed_row, "the move's command is gone");
+        // Several ids: the live one refuses them all, nothing removed; then the closed ones go, one line each.
+        write(&p, &row(12, "")).unwrap();
+        write(&p, &SessionRow { status: "parked".into(), pid: me, ..row(13, "") }).unwrap();
+        let e = forget_sessions(&store, &p, &[id(12), id(13)], false).unwrap_err().to_string();
+        assert!(e.contains(&format!("session {} is still parked", id(13))), "{e}");
+        assert!(path_for(&p, &id(12)).unwrap().exists(), "every id is checked before any goes");
+        write(&p, &row(13, "")).unwrap();
+        forget_sessions(&store, &p, &[id(12), id(13)], false).unwrap();
+        assert!(!path_for(&p, &id(12)).unwrap().exists() && !path_for(&p, &id(13)).unwrap().exists());
+        // An id with nothing to remove: the others still go, then exit 1 naming it.
+        write(&p, &row(14, "")).unwrap();
+        let e = forget_sessions(&store, &p, &[id(15), id(14)], false).unwrap_err();
+        assert_eq!((e.exit_code(), e.to_string()), (1, format!("no session {}", id(15))));
+        assert!(!path_for(&p, &id(14)).unwrap().exists(), "the other id went");
+        assert_eq!(STATUSES, ["active", "detached", "parked", "migrating", "closed"]);
+        assert_eq!((REGISTRY_SCHEMA_V, MIGRATE_SIGNAL, VMS_KEPT), (2, libc::SIGUSR1, 64));
+    }
+
+    /// S10 (§6.1): a `vms` entry reads leniently: an S8 or S9 wrapper's
+    /// (no `why`, `end` or `pid`) with defaults, an S10 one whole; one that
+    /// is no table, or holds a field of the wrong type, reads as none. An
+    /// entry without the S10 words writes none of them.
+    #[test]
+    fn vm_entries_read_leniently() {
+        let old: toml::Value = toml::from_str("gen = 1\nvm = \"microvm-1\"\nspawn = \"s1\"\nfrom = \"2026-10-01T10:00:00Z\"\nto = \"2026-10-01T11:00:00Z\"\n").unwrap();
+        assert_eq!(
+            VmEntry::from_value(&old),
+            Some(VmEntry { gen: 1, vm: "microvm-1".into(), spawn: Some("s1".into()), from: "2026-10-01T10:00:00Z".into(), to: Some("2026-10-01T11:00:00Z".into()), why: String::new(), end: None, pid: 0 })
+        );
+        let new = VmEntry { gen: 2, vm: "microvm-2".into(), spawn: None, from: "2026-10-20T10:00:00Z".into(), to: None, why: "readdress:vm_gone".into(), end: Some("moved".into()), pid: 4242 };
+        let value = toml::Value::try_from(&new).unwrap();
+        assert_eq!(VmEntry::from_value(&value), Some(new.clone()));
+        let text = toml::to_string(&value).unwrap();
+        assert!(text.contains("why = \"readdress:vm_gone\"") && text.contains("pid = 4242") && !text.contains("spawn"), "{text}");
+        let plain = toml::to_string(&toml::Value::try_from(&VmEntry { why: String::new(), end: None, ..new }).unwrap()).unwrap();
+        assert!(!plain.contains("why") && !plain.contains("end"), "{plain}");
+        assert_eq!(VmEntry::from_value(&toml::Value::String("microvm-1".into())), None);
+        let bad: toml::Value = toml::from_str("gen = \"one\"\nvm = \"microvm-1\"\n").unwrap();
+        assert_eq!(VmEntry::from_value(&bad), None);
+        assert_eq!(VmEntry::from_value(&toml::from_str::<toml::Value>("future = 1\n").unwrap()), Some(VmEntry::default()), "an unknown key is no harm");
+        // A row whose vms mixes both still reads whole.
+        let row = SessionRow { vms: vec![old, value], ..SessionRow::default() };
+        assert_eq!(row.vms.iter().filter_map(VmEntry::from_value).map(|e| e.gen).collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]

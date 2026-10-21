@@ -87,7 +87,7 @@ use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::remote::audit_event;
 use crate::bridge::scan::allow_beyond_policy;
 use crate::bridge::scan::{settings_findings_mode, SettingsMode};
-use crate::bridge::workspace::blobscan::{finding_lines, folds_to, has_marker, is_claude_dir, is_dotenv_name, read_objects, scan_objects, scan_settings, settings_name, shown_path, CleanCache, Finding, ScanReport, ScanSet, TreeEntry, FINDINGS_MAX, ID_SHOWN};
+use crate::bridge::workspace::blobscan::{finding_lines, folds_to, has_marker, is_claude_dir, is_dotenv_name, read_objects, scan_objects, scan_settings_within, settings_name, shown_path, CleanCache, Finding, ScanReport, ScanSet, TreeEntry, FINDINGS_MAX, ID_SHOWN};
 use crate::bridge::workspace::blobscan::{SETTINGS_NAMES, SETTINGS_SYMLINK};
 use crate::bridge::workspace::pack::Listed;
 use crate::errors::CliError;
@@ -840,7 +840,7 @@ impl Review {
 /// that brings a file no merge base holds at its path, at the commit that
 /// made it (`log --raw --full-history --diff-merges=first-parent`): D8's
 /// repo mode and its links on the settings files
-/// (`blobscan::scan_settings`, unless the workspace trusts its settings:
+/// (`blobscan::scan_settings_within`, unless the workspace trusts its settings:
 /// such a link is then a policy finding), an allow entry beyond the policy
 /// ([`RULE_ALLOW_NOT_IN_POLICY`]: new against the merge base and the
 /// commits reviewed before it), L9's dotenv rule, and the Cargo rules (a
@@ -1288,7 +1288,7 @@ fn place(set: &ScanSet, commit: &str, path: &str) -> String {
 /// that made it, `mbs` the merge bases, `olds` the tips a push replaces. A
 /// change counts when it brings a blob to a watched path that no merge base
 /// holds at that path (a file copied there from one the remote has
-/// elsewhere counts too): D8's repo mode and its links (`scan_settings`);
+/// elsewhere counts too): D8's repo mode and its links (`scan_settings_within`);
 /// an allow entry beyond the policy; a plaintext dotenv; a `Cargo.lock`'s
 /// new sources and changed checksums; cargo configuration's new source
 /// replacement and patches. A link where cargo reads its files is a
@@ -1304,7 +1304,8 @@ fn place(set: &ScanSet, commit: &str, path: &str) -> String {
 /// inside a file is against the merge bases' file at that path and the
 /// versions reviewed before it, so each entry is named once, where it first
 /// came. A blob over `max_blob` is never read (`scan_objects` names it
-/// `blob-too-large` when the range brought it). A key that trips a rule
+/// `blob-too-large` when the range brought it; D8 sizes a settings file
+/// first and names it so at its path). A key that trips a rule
 /// itself (a registry named by a credentialed URL) is left out.
 ///
 /// A path an alias stands on ([`link_aliases`]: a link the merge bases or
@@ -1345,7 +1346,9 @@ fn rule_findings(cx: &Cx<'_>, changes: &[Change], head: &str, mbs: &[String], ol
         }
     }
     let mut d8 = ScanReport::default();
-    scan_settings(git, &trees, cx.set, &|_| false, &mut d8)?;
+    // Bounded (S10 phase 4b, F4-WALK-2): a settings file over `max_blob` is sized, never read, `blob-too-large` at its
+    // commit and path (the objects' scan named the same, which `review_range` keeps once); each label's findings capped.
+    scan_settings_within(git, &trees, cx.set, &|_| false, cx.max_blob, &mut d8)?;
     out.extend(d8.findings);
     // The documents the other rules read, the merge bases' versions of their paths, and the first parents' locks.
     let doc = |c: &Change| {

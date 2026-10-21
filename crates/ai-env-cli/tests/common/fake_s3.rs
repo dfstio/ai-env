@@ -32,7 +32,16 @@
 //! `continuation-token`) answer S3's XML. A script ([`FakeS3::script`])
 //! makes the next requests answer a status, cut their answer or wait; a
 //! part's script ([`FakeS3::script_part`]) does it to the next uploads of
-//! one part number only, whatever else is in flight.
+//! one part number only, whatever else is in flight, and (S10 F5) a
+//! PutObject's ([`FakeS3::script_put`]) and a CompleteMultipartUpload's
+//! ([`FakeS3::script_complete`]) to the next of those only. S10 (F5) adds
+//! what a slow or lossy network does: a body that stops being read after
+//! some bytes ([`S3Action::Stall`]), a body read whole and never answered
+//! ([`S3Action::Silent`]), a request done whose answer is lost
+//! ([`S3Action::Drop`]), and a body read at a set pace
+//! ([`S3Action::Throttle`]: an uplink the parts in flight share); a scripted
+//! status may be a 409 (`OperationAborted`, `ConditionalRequestConflict`)
+//! or a 400 (`RequestTimeout`).
 //! Every request is recorded ([`S3Request`]): never a signature's or a
 //! credential's value.
 #![allow(dead_code)]
@@ -99,6 +108,18 @@ pub enum S3Action {
     CutAfter { bytes: u64 },
     /// Wait this long, then answer as usual.
     Delay(Duration),
+    /// S10 (F5): read this many bytes of the body, then nothing more and no
+    /// answer, the connection held open (a stalled uplink: the client's
+    /// writes back up once the kernel's buffers are full).
+    Stall { after: u64 },
+    /// S10 (F5): read the body whole, then no answer, the connection held open.
+    Silent,
+    /// S10 (F5): do the request (an object stored, an upload completed),
+    /// then close the connection with no answer (one lost on the way).
+    Drop,
+    /// S10 (F5): read the body at this many bytes a second, then answer as
+    /// usual (one of the parts that share an uplink).
+    Throttle { per_s: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +148,10 @@ struct State {
     script: VecDeque<S3Action>,
     /// Part number → what its next UploadParts do (taken before `script`).
     part_script: BTreeMap<u32, VecDeque<S3Action>>,
+    /// What the next PutObjects (not a part) do (taken before `script`).
+    put_script: VecDeque<S3Action>,
+    /// What the next CompleteMultipartUploads do (taken before `script`).
+    complete_script: VecDeque<S3Action>,
 }
 
 impl State {
@@ -256,6 +281,18 @@ impl FakeS3 {
     /// requests take the queue's again.
     pub fn script_part(&self, number: u32, actions: Vec<S3Action>) {
         self.state().part_script.entry(number).or_default().extend(actions);
+    }
+
+    /// Queue `actions` for the next PutObjects (a part's upload is no
+    /// PutObject), as [`FakeS3::script_part`] does for a part.
+    pub fn script_put(&self, actions: Vec<S3Action>) {
+        self.state().put_script.extend(actions);
+    }
+
+    /// Queue `actions` for the next CompleteMultipartUploads, as
+    /// [`FakeS3::script_part`] does for a part.
+    pub fn script_complete(&self, actions: Vec<S3Action>) {
+        self.state().complete_script.extend(actions);
     }
 
     /// A URL of this fake signed now with `LAB_KEY_ID` and `LAB_SECRET`, for
@@ -398,6 +435,7 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         411 => "Length Required",
         412 => "Precondition Failed",
         500 => "Internal Server Error",
@@ -448,12 +486,22 @@ async fn read_head(stream: &mut TcpStream) -> Option<(Req, Vec<u8>)> {
 /// Read the body after `first` until `len` bytes (a scripted cut passes its
 /// own, smaller `len`); `false` when the connection ended first.
 async fn read_body(stream: &mut TcpStream, req: &mut Req, first: Vec<u8>, len: u64) -> bool {
+    read_body_at(stream, req, first, len, None).await
+}
+
+/// [`read_body`], each read followed by the wait that keeps it to `per_s`
+/// bytes a second when one is given (S10 F5: [`S3Action::Throttle`]).
+async fn read_body_at(stream: &mut TcpStream, req: &mut Req, first: Vec<u8>, len: u64, per_s: Option<u64>) -> bool {
     req.body = first;
     let mut chunk = vec![0u8; 64 * 1024];
     while (req.body.len() as u64) < len {
-        match stream.read(&mut chunk).await {
+        let n = match stream.read(&mut chunk).await {
             Ok(0) | Err(_) => return false,
-            Ok(n) => req.body.extend_from_slice(&chunk[..n]),
+            Ok(n) => n,
+        };
+        req.body.extend_from_slice(&chunk[..n]);
+        if let Some(rate) = per_s.filter(|r| *r > 0) {
+            tokio::time::sleep(Duration::from_micros(n as u64 * 1_000_000 / rate)).await;
         }
     }
     req.body.truncate(usize::try_from(len).unwrap_or(usize::MAX));
@@ -463,12 +511,19 @@ async fn read_body(stream: &mut TcpStream, req: &mut Req, first: Vec<u8>, len: u
 async fn serve(mut stream: TcpStream, shared: Shared) {
     let Some((mut req, first)) = read_head(&mut stream).await else { return };
     let part = if req.method == "PUT" { req.param("partNumber").and_then(|n| n.parse::<u32>().ok()) } else { None };
+    let (is_put, is_complete) = {
+        let object = req.raw_path.strip_prefix('/').is_some_and(|p| p.contains('/'));
+        (req.method == "PUT" && object && req.param("uploadId").is_none(), req.method == "POST" && req.param("uploadId").is_some())
+    };
     let action = {
         let mut st = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match part.and_then(|n| st.part_script.get_mut(&n).and_then(VecDeque::pop_front)) {
-            Some(a) => Some(a),
-            None => st.script.pop_front(),
-        }
+        let own = match part {
+            Some(n) => st.part_script.get_mut(&n).and_then(VecDeque::pop_front),
+            None if is_put => st.put_script.pop_front(),
+            None if is_complete => st.complete_script.pop_front(),
+            None => None,
+        };
+        own.or_else(|| st.script.pop_front())
     };
     if let Some(S3Action::Delay(d)) = &action {
         tokio::time::sleep(*d).await;
@@ -506,8 +561,24 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
                 return;
             }
         }
-        if !read_body(&mut stream, &mut req, first, len).await {
+        if let Some(S3Action::Stall { after }) = &action {
+            // Some of the body, then no read and no answer: the connection's budget (or the fake's drop) ends it.
+            let _ = read_body(&mut stream, &mut req, first, len.min(*after)).await;
             shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
+            tokio::time::sleep(CONNECTION_LIMIT).await;
+            return;
+        }
+        let per_s = match &action {
+            Some(S3Action::Throttle { per_s }) => Some(*per_s),
+            _ => None,
+        };
+        if !read_body_at(&mut stream, &mut req, first, len, per_s).await {
+            shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
+            return;
+        }
+        if action == Some(S3Action::Silent) {
+            shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
+            tokio::time::sleep(CONNECTION_LIMIT).await;
             return;
         }
     }
@@ -516,6 +587,13 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
         (None, Some(S3Action::Status { status, code })) => Answer::error(*status, code),
         (None, _) => respond(&req, &bucket, &key, &params, &shared),
     };
+    if action == Some(S3Action::Drop) {
+        // Done (its effect stands), the answer lost: the connection closes with none.
+        record.code = answer.code.clone();
+        shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
+        let _ = stream.shutdown().await;
+        return;
+    }
     let cut = match &action {
         Some(S3Action::CutAfter { bytes }) if !writes => Some(usize::try_from(*bytes).unwrap_or(usize::MAX).min(answer.body.len())),
         _ => None,

@@ -65,7 +65,9 @@ recipient only — never an `AGE-SECRET-KEY` private identity (the CLI refuses i
 In the bridge's remote mode a Cursor chat whose workspace is under the configured roots runs
 in a disposable AWS MicroVM, not on the Mac. The Mac keeps the editor and the git history; the
 VM has a copy of the checkout to work in. The chat's transcript stays in the VM and in S3: the
-Mac holds only a view of its last 10 messages, which Cursor's history lists and reopens.
+Mac holds only a view of its last 10 messages, which Cursor's history lists and reopens. A chat
+outlives its VM: a lost VM moves it to a new one, a VM near its 8-hour wall migrates it between
+turns, and an idle chat parks (its VM suspends) until the next message.
 
 **Signs you are in the VM:** `cat /proc/1/comm` prints `ai-env`, `id -u` prints `1000`, the
 checkout sits at the same path as on the Mac (under `/Users/mike`), and `git remote` prints
@@ -79,15 +81,34 @@ nothing. Its `~/.claude/CLAUDE.md` holds the rules, in short:
 - no IDE tools, no package installs (the network reaches the Anthropic API and crates.io),
   and never a credential on disk, in a commit or in a command line.
 
+**After a move, and while parked** (in the VM). A move to a new VM leaves a note in the chat
+(`ai-env: this chat's VM … was lost …`, or `moving the chat off …` before the wall), which
+Cursor shows and you never receive. The new VM's checkout is the old VM's work as the Mac last
+fetched it: its commits and uncommitted files as of the last turn's end, so an edit made after
+that is gone. The message the loss interrupted reaches you again: do its work again, checking
+the files first. Background tasks and MCP servers you started did not survive: start again
+what you need. An idle chat parks and its VM is suspended until the next message: whatever
+waits quietly in it (a timer, a `sleep`, a server, a job waiting on the network) is frozen
+until then, while a process that keeps the CPU busy (a build, a test run) holds the park off
+and finishes.
+
 **On the Mac**, these show and bring back what a VM did (each `ai-env` command that reaches
 AWS asks for one Touch ID):
 
 ```sh doc-test
-ai-env session list                # the chats the wrapper ran (session show UUID names a chat's VM)
+ai-env session list                # the chats the wrapper ran, each one's status (parked, migrating, …)
+ai-env session show UUID           # one chat's VM, and in vms every VM it ran on and why it moved
 ai-env box fetch WORKSPACE --wip   # the VM's commits and uncommitted files into refs/remotes/box/*
 ai-env box review BRANCH           # what a push of BRANCH would carry (no AWS, no Touch ID; exit 9 on a finding)
-ai-env vm list                     # the VMs that run or are suspended
+ai-env vm list                     # the VMs that run or are suspended (then the registry reconciled, locally)
 ```
+
+A move to a new VM costs the user one Touch ID, for the setup token, in a dialog the wrapper
+opens: after a lost VM a dismissed one ends the chat (exit 3, none in time 5), while before the
+wall the chat stays where it is and asks again after the next turn. A restart of claude on the
+same VM asks none while that VM holds the token (one after a park), and an unpark asks none.
+`ai-env session migrate UUID` moves a chat to a new VM now and ends its old VM (one Touch ID):
+it is the user's to run, never yours.
 
 Review with git (`git log --oneline BRANCH..box/BRANCH`) and merge by hand; never push a
 `box/*` or `box-quarantine/*` ref. `ai-env vm terminate ID` ends a VM (the next chat seeds a
@@ -112,18 +133,21 @@ Mac. `claude -c` or `claude --resume` in a terminal would load the view as if it
 chat (the wrapper refuses that, exit 9, but a terminal's claude never passes through it), and so
 would a Cursor reload with the wrapper off while such a chat's tab is open. `ai-env session stage`,
 `session sync`, `session gc --remote --yes`, `session migrate-s9 --yes` and
-`session forget UUID --purge` move or delete transcripts in S3 and ask for Touch IDs: they are the
-user's to run, never yours (without `--yes`, `session gc --remote` and `session migrate-s9` only
-list, with no AWS call).
+`session forget UUID... --purge` (one Touch ID for all the ids) move or delete transcripts in S3
+and ask for Touch IDs: they are the user's to run, never yours (without `--yes`,
+`session gc --remote` and `session migrate-s9` only list, with no AWS call).
 
 **Exits Cursor shows** as `Claude Code process exited with code N`, the last stderr line
-(`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed (nothing started;
-reopen the chat) · `5` no Touch ID in time, no sealed setup-token, or Anthropic refused it
-(`ai-env creds status`) · `7` AWS, or a VM image older than S9's remote sessions (the line names
-what it lacks; `make deploy`, which asks the user for the deployer's key) · `8` the VM is gone
-or unreachable (reopen the chat from the picker) · `9` a policy refusal: a secret or a widening
+(`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed, a move's too
+(reopen the chat) · `5` no Touch ID in time (a move's too), no sealed setup-token, or Anthropic
+refused it (`ai-env creds status`) · `7` AWS, or a VM image older than S9's remote sessions (the
+line names what it lacks; `make deploy`, which asks the user for the deployer's key) · `8` the VM
+is gone or unreachable and the chat could not move: past `[vm] max_readdress` moves (3 per
+wrapper), a VM pinned by `AI_ENV_BRIDGE_VM`, or a move that failed with 8 (reopen the chat from
+the picker) · `9` a policy refusal: a secret or a widening
 setting in what the seed would carry (`ai-env box seed` lists the findings), a workspace that is
-not a git repository, too many VMs (`ai-env vm list`), the credential gate
+not a git repository, too many VMs (the line names the suspended ones no open chat holds;
+`ai-env vm terminate ID` frees a slot, the user's call), the credential gate
 (`refused before any Touch ID: no credential for a vpc VM …`: the user runs the
 `ai-env egress check` (or `ai-env lab run dns-path`) the line names; since S9 a pass from
 before the check's S3 cases does not count), a chat transcript over the 64 MiB a reopen

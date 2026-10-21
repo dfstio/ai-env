@@ -152,6 +152,19 @@ pub trait SysOps: Send + Sync {
     fn boottime_ms(&self) -> Option<u64> {
         None
     }
+    /// `/proc/meminfo`'s text (S10: the guest's memory, [`parse_meminfo`];
+    /// Linux; None elsewhere, and from a machine without one).
+    fn meminfo(&self) -> Option<String> {
+        None
+    }
+}
+
+/// `MemTotal` and `MemAvailable` of a `/proc/meminfo` text, in kB (the
+/// file's unit, KiB); each `None` when its line is missing or does not parse.
+#[must_use]
+pub fn parse_meminfo(text: &str) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')).and_then(|v| v.trim().strip_suffix("kB")).and_then(|v| v.trim().parse().ok());
+    (field("MemTotal"), field("MemAvailable"))
 }
 
 /// Measure (and under `forward`, step) the clock; never fails.
@@ -275,6 +288,11 @@ impl SysOps for RealSys {
     #[cfg(target_os = "linux")]
     fn boottime_ms(&self) -> Option<u64> {
         clock_ms(libc::CLOCK_BOOTTIME)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn meminfo(&self) -> Option<String> {
+        std::fs::read_to_string("/proc/meminfo").ok()
     }
 }
 
@@ -523,6 +541,9 @@ pub struct ReportFacts<'a> {
     pub uid: u32,
     /// The shim's effective gid.
     pub gid: u32,
+    /// S10: `/proc/meminfo`'s `MemTotal` and `MemAvailable` (kB).
+    pub mem_total_kb: Option<u64>,
+    pub mem_available_kb: Option<u64>,
 }
 
 impl std::fmt::Debug for ReportFacts<'_> {
@@ -539,6 +560,8 @@ impl std::fmt::Debug for ReportFacts<'_> {
             .field("stat_lines", &format_args!("{}", stats.as_deref().unwrap_or("None")))
             .field("uid", &self.uid)
             .field("gid", &self.gid)
+            .field("mem_total_kb", &self.mem_total_kb)
+            .field("mem_available_kb", &self.mem_available_kb)
             .finish()
     }
 }
@@ -546,8 +569,9 @@ impl std::fmt::Debug for ReportFacts<'_> {
 /// The run report's JSON from [`ReportFacts`] (pure, so it is tested on every
 /// platform): `hook`, `microvm_id`, `boot_id`, `disk_total_bytes`,
 /// `disk_used_bytes`, `env` (`names`, `values`), `aws_credential_env`,
-/// `zombies`, `uid`, `gid`; a missing source is `null`. No credential value
-/// can reach it: `env.values` holds the [`REPORT_ENV_VALUES`] only.
+/// `zombies`, `uid`, `gid`, and (S10) `mem_total_kb`, `mem_available_kb`;
+/// a missing source is `null`. No credential value can reach it:
+/// `env.values` holds the [`REPORT_ENV_VALUES`] only.
 #[must_use]
 pub fn assemble_report(f: &ReportFacts<'_>) -> serde_json::Value {
     let env = f.environ.map(parse_environ);
@@ -562,6 +586,8 @@ pub fn assemble_report(f: &ReportFacts<'_>) -> serde_json::Value {
         "zombies": f.stat_lines.map(count_zombies),
         "uid": f.uid,
         "gid": f.gid,
+        "mem_total_kb": f.mem_total_kb,
+        "mem_available_kb": f.mem_available_kb,
     })
 }
 
@@ -586,14 +612,16 @@ fn proc_stat_lines(proc: &Path) -> Option<Vec<String>> {
 /// The Linux run report with every source under `root` (`/` on the machine;
 /// a planted tree in the tests, so the paths below are exercised on every
 /// platform): `proc/sys/kernel/random/boot_id`, `proc/1/environ`,
-/// `proc/<pid>/stat`, statvfs of `root`, and the shim's own uid/gid.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_json::Value {
+/// `proc/<pid>/stat`, (S10) `proc/meminfo`, statvfs of `root`, and the
+/// shim's own uid/gid.
+#[must_use]
+pub fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_json::Value {
     let proc = root.join("proc");
     let boot_id = read_trim(proc.join("sys/kernel/random/boot_id"));
     let environ = std::fs::read(proc.join("1/environ")).ok();
     let stats = proc_stat_lines(&proc);
     let stat_refs: Option<Vec<&str>> = stats.as_ref().map(|v| v.iter().map(String::as_str).collect());
+    let (mem_total_kb, mem_available_kb) = std::fs::read_to_string(proc.join("meminfo")).map_or((None, None), |t| parse_meminfo(&t));
     assemble_report(&ReportFacts {
         hook,
         microvm_id,
@@ -603,6 +631,8 @@ fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_json:
         stat_lines: stat_refs.as_deref(),
         uid: nix::unistd::geteuid().as_raw(),
         gid: nix::unistd::getegid().as_raw(),
+        mem_total_kb,
+        mem_available_kb,
     })
 }
 
@@ -869,13 +899,13 @@ mod tests {
     }
 
     fn facts() -> ReportFacts<'static> {
-        ReportFacts { hook: "run", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0 }
+        ReportFacts { hook: "run", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0, mem_total_kb: None, mem_available_kb: None }
     }
 
     #[test]
     fn report_shape_with_and_without_sources() {
         let empty = assemble_report(&facts());
-        for key in ["microvm_id", "boot_id", "disk_total_bytes", "disk_used_bytes", "env", "aws_credential_env", "zombies"] {
+        for key in ["microvm_id", "boot_id", "disk_total_bytes", "disk_used_bytes", "env", "aws_credential_env", "zombies", "mem_total_kb", "mem_available_kb"] {
             assert!(empty[key].is_null(), "a missing source is null: {key} in {empty}");
         }
         assert_eq!((empty["hook"].as_str(), empty["uid"].as_u64(), empty["gid"].as_u64()), (Some("run"), Some(0), Some(0)));
@@ -890,7 +920,10 @@ mod tests {
             stat_lines: Some(&stats),
             uid: 0,
             gid: 0,
+            mem_total_kb: Some(8_000_000),
+            mem_available_kb: Some(7_000_000),
         });
+        assert_eq!((full["mem_total_kb"].as_u64(), full["mem_available_kb"].as_u64()), (Some(8_000_000), Some(7_000_000)));
         assert_eq!(full["hook"], "terminate");
         assert_eq!(full["microvm_id"], "microvm-00000000-0000-4000-8000-000000000001");
         assert_eq!(full["boot_id"], "b1");
@@ -916,7 +949,10 @@ mod tests {
             assert!(!d.contains(value.as_str()) && !d.contains(bytes.trim_matches(['[', ']'])), "{name}: {d}");
             assert!(!d.contains(name), "not even the names: {d}");
         }
-        assert_eq!(format!("{:?}", facts()), "ReportFacts { hook: \"run\", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0 }");
+        assert_eq!(
+            format!("{:?}", facts()),
+            "ReportFacts { hook: \"run\", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0, mem_total_kb: None, mem_available_kb: None }"
+        );
     }
 
     /// A `/proc` as the Linux reader sees it, under a temp root: the paths
@@ -949,10 +985,12 @@ mod tests {
                 ("40/stat", b"40 (sleep) S 1 40"),
                 ("self/stat", b"99 (self) Z 1"),
                 ("sys/stat", b"98 (sys) Z 1"),
+                ("meminfo", b"MemTotal:        8040964 kB\nMemFree:         7612048 kB\nMemAvailable:    7703512 kB\nBuffers:            2048 kB\n"),
             ],
         );
         std::fs::create_dir_all(t.path().join("proc/41")).unwrap();
         let r = read_report(t.path(), "terminate", Some("microvm-00000000-0000-4000-8000-000000000007"));
+        assert_eq!((r["mem_total_kb"].as_u64(), r["mem_available_kb"].as_u64()), (Some(8_040_964), Some(7_703_512)), "S10: the guest's memory: {r}");
         assert_eq!(r["hook"], "terminate");
         assert_eq!(r["microvm_id"], "microvm-00000000-0000-4000-8000-000000000007");
         assert_eq!(r["boot_id"], boot, "trimmed: {r}");
@@ -970,7 +1008,7 @@ mod tests {
         // Nothing planted: every /proc field is null, the disk still answers.
         let empty = tempfile::tempdir().unwrap();
         let r = read_report(empty.path(), "run", None);
-        for key in ["microvm_id", "boot_id", "env", "aws_credential_env", "zombies"] {
+        for key in ["microvm_id", "boot_id", "env", "aws_credential_env", "zombies", "mem_total_kb", "mem_available_kb"] {
             assert!(r[key].is_null(), "{key} in {r}");
         }
         assert!(r["disk_total_bytes"].as_u64().is_some_and(|t| t > 0), "{r}");
@@ -1003,6 +1041,23 @@ mod tests {
             assert_eq!(r["unsupported"], true, "{r}");
         }
         assert!(run_report("terminate", None)["microvm_id"].is_null());
+    }
+
+    /// S10: `MemTotal` and `MemAvailable` in kB, each `None` without its
+    /// line or with one that is not `<n> kB`; a name that only starts the
+    /// same is another line. The machine's text on Linux only.
+    #[test]
+    fn meminfo_names_total_and_available_in_kb() {
+        let text = "MemTotal:        8040964 kB\nMemFree:         7612048 kB\nMemAvailable:    7703512 kB\n";
+        assert_eq!(parse_meminfo(text), (Some(8_040_964), Some(7_703_512)));
+        assert_eq!(parse_meminfo("MemTotalX: 5 kB\nMemTotal: 7 kB\n"), (Some(7), None));
+        assert_eq!(parse_meminfo("MemTotal: 7\nMemAvailable: x kB\n"), (None, None));
+        assert_eq!(parse_meminfo(""), (None, None));
+        let real = RealSys.meminfo();
+        assert_eq!(real.is_some(), cfg!(target_os = "linux"));
+        if let Some(t) = real {
+            assert!(parse_meminfo(&t).0.is_some_and(|kb| kb > 0), "{t}");
+        }
     }
 
     #[test]

@@ -257,3 +257,18 @@ fn the_clean_cache_is_reused_and_a_rules_change_starts_it_over() {
     let text = seed_of(&w, &repo, "[seed]\nmax_blob_mib = 1\nmax_wip_mib = 1\nwrapper_inline_mib = 1\n").unwrap_err();
     assert!(text.starts_with("HEAD:big.bin (blob ") && text.ends_with(": rule blob-too-large (over [seed].max_blob_mib)"), "{text}");
 }
+
+/// S10 phase 4b (F4-WALK-2, V-4): a settings file over `[seed].max_blob_mib`
+/// is sized and never read. The seed is refused naming it `blob-too-large`
+/// at its path, once (the objects' scan and D8 name the same blob there),
+/// and nothing comes from its bytes: no `broad-allow` for the `Bash(*)` it
+/// holds, which D8 finds once it reads the file.
+#[test]
+fn a_settings_file_over_the_blob_cap_is_too_large_and_never_read() {
+    let w = World::new();
+    let repo = w.repo("app");
+    repo.write(".claude/settings.json", &format!("{{\"permissions\": {{\"allow\": [\"Bash(*)\"]}}, \"pad\": \"{}\"}}\n", "x".repeat(1024 * 1024)));
+    repo.commit("settings past the cap");
+    let text = seed_of(&w, &repo, "[seed]\nmax_blob_mib = 1\nmax_wip_mib = 1\nwrapper_inline_mib = 1\n").unwrap_err();
+    assert_eq!(text, format!("HEAD:.claude/settings.json (blob {}): rule blob-too-large (over [seed].max_blob_mib)", blob(&repo, "HEAD:.claude/settings.json")));
+}

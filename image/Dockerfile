@@ -70,7 +70,10 @@ RUN set -eu; \
 
 # Claude Code, pinned by version, size and SHA-256 (image/claude.lock, written
 # by `make claude-pin`). HTTPS only; the gate runs --version with a cleared
-# environment and a throwaway HOME, then removes every trace of it.
+# environment and a throwaway HOME, then removes every trace of it. Right
+# after the hash, S10's strings gate: the binary holds every text the moved
+# chat relies on (the cut's flag and its miss, a fresh chat's flag and its
+# refusal); a missing one fails the build naming it.
 COPY claude.lock /etc/ai-env/claude.lock
 RUN set -eu; \
     chmod 0644 /etc/ai-env/claude.lock; \
@@ -80,6 +83,10 @@ RUN set -eu; \
     size=$(stat -c %s /usr/local/bin/claude); \
     test "$size" = "$CLAUDE_SIZE" || { echo "claude: size $size, the lock pins $CLAUDE_SIZE"; exit 1; }; \
     echo "${CLAUDE_SHA256}  /usr/local/bin/claude" | sha256sum --check --strict; \
+    for want in '--resume-session-at' 'No message found with message.uuid of:' '--session-id' 'is already in use'; do \
+      LC_ALL=C grep -qaF -e "$want" /usr/local/bin/claude || { echo "claude ${CLAUDE_VERSION} lacks the string S10 relies on: $want"; exit 1; }; \
+    done; \
+    echo "claude strings gate: the cut's and the fresh chat's four strings"; \
     chmod 0755 /usr/local/bin/claude; \
     gate=$(mktemp -d); \
     out=$(env -i HOME="$gate" PATH=/usr/local/bin:/usr/bin:/bin timeout 30 /usr/local/bin/claude --version); \
@@ -108,9 +115,18 @@ RUN set -eu; \
     git config --system push.default nothing; \
     git config --system maintenance.auto false
 
-# The shim last: it changes most often.
+# The shim last: it changes most often. Then S10's seed-record gate: the
+# shim keeps the VM's last seed's record in /var/lib/ai-env/seed-record.json
+# (root's, 0600) so a shim restart keeps it; the directory is root's, 0700,
+# and empty in the image, which every VM shares: a record baked in would be
+# every VM's.
 COPY ai-env /usr/local/bin/ai-env
 RUN chmod 0755 /usr/local/bin/ai-env && /usr/local/bin/ai-env --version
+RUN set -eu; \
+    install -d -m 0700 -o 0 -g 0 /var/lib/ai-env; \
+    test "$(stat -c '%u:%g %a' /var/lib/ai-env)" = "0:0 700" || { echo "/var/lib/ai-env is $(stat -c '%u:%g %a' /var/lib/ai-env), not root's 0700"; exit 1; }; \
+    test -z "$(find /var/lib/ai-env -mindepth 1 -print -quit)" || { echo "a seed record is baked into the image: $(ls -A /var/lib/ai-env)"; exit 1; }; \
+    echo "seed-record gate: /var/lib/ai-env root 0700, empty"
 
 EXPOSE 8080 9000 9418
 ENTRYPOINT ["/usr/local/bin/ai-env","shim","--app-port","8080","--hooks-port","9000","--code-port","9418","--claude","/usr/local/bin/claude","--home","/Users/mike","--uid","1000","--hook-source","peer"]

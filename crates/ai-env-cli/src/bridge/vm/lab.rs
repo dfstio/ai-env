@@ -724,6 +724,8 @@ async fn exec_agent_partial_with<A: MicrovmApi, E: EndpointClient>(env: &AgentEn
                     err.extend_from_slice(&bytes);
                     consumed.stderr_done(seq);
                 }
+                // S10: a probe's session never parks.
+                SpawnEvent::Park(report) => tracing::debug!("a park report: {report:?}"),
                 SpawnEvent::Note(_) | SpawnEvent::Link(_) | SpawnEvent::Exit(_) => {}
             }
         }
