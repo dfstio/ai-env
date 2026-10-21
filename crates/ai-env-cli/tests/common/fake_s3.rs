@@ -61,7 +61,7 @@ const REGION: &str = "eu-central-1";
 /// The longest request head the fake reads.
 const HEAD_MAX: usize = 64 * 1024;
 /// One connection's whole budget.
-const CONNECTION_LIMIT: Duration = Duration::from_secs(120);
+const CONNECTION_LIMIT: Duration = Duration::from_secs(600);
 
 /// One object version or delete marker, as [`FakeS3::objects`] lists them.
 #[derive(Debug, Clone, PartialEq, Eq)]
