@@ -2116,6 +2116,8 @@ impl Pump {
     }
 
     fn on_child_line(&mut self, line: Bytes) {
+        // Part B: a move's resent line went out under a fresh uuid; its frames come back under the original.
+        let line = self.state.restore_resent(&line).unwrap_or(line);
         let frame = claude::classify_child(&line);
         match &frame {
             ChildFrame::Mirror { file_path, entries } => {
@@ -5464,6 +5466,18 @@ mod tests {
             format!(r#"{{"type":"system","subtype":"init","session_id":"{sid}","cwd":"/w"}}"#)
         }
 
+        /// Part B (22 Oct): a move's line sent again goes out under a fresh uuid (claude skips a line whose uuid
+        /// its session holds): `got` with that uuid put back to `want`'s when the two differ in it alone; the same
+        /// uuid fails the comparison.
+        fn resent(got: Option<String>, want: &str) -> Option<String> {
+            let uuid_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).ok().and_then(|v| v["uuid"].as_str().map(str::to_string));
+            let (Some(g), Some(w)) = (got.as_deref().and_then(uuid_of), uuid_of(want)) else { return got };
+            if g == w {
+                return got.map(|s| format!("{s} (sent again under its own uuid)"));
+            }
+            got.map(|s| s.replace(&format!("\"{g}\""), &format!("\"{w}\"")))
+        }
+
         fn user(n: u32) -> String {
             format!(r#"{{"type":"user","uuid":"{n:08x}-0000-4000-8000-{n:012x}","message":{{"role":"user","content":"line {n}"}}}}"#)
         }
@@ -7003,7 +7017,7 @@ mod tests {
                 }
                 gen2.started().await;
                 let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
-                assert_eq!(gen2.next_input().await, Some(user(1)), "the line again");
+                assert_eq!(resent(gen2.next_input().await, &user(1)), Some(user(1)), "the line again");
                 gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
                 gen2.line(&init_frame(SID)).await;
                 host.wait_for("the account's note", |v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains("Claude account"))).await;
@@ -7089,7 +7103,7 @@ mod tests {
                 let mode2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed mode")).unwrap();
                 assert_eq!((init2["request"]["subtype"].as_str(), mode2["request"]["mode"].as_str()), (Some("initialize"), Some("plan")));
                 assert!(init2["request_id"] != "i1" && mode2["request_id"] != "m1", "fresh ids: {init2} {mode2}");
-                assert_eq!(gen2.next_input().await, Some(user(2)), "the line again, verbatim");
+                assert_eq!(resent(gen2.next_input().await, &user(2)), Some(user(2)), "the line again, its uuid fresh");
                 gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
                 gen2.line(&answer(mode2["request_id"].as_str().unwrap(), "{}")).await;
                 for line in [init_frame(SID), echo(2), assistant("a-2"), result_for(2)] {
@@ -7187,7 +7201,7 @@ mod tests {
                 gen2.started().await;
                 let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
                 assert_eq!(init2["request"]["subtype"], "initialize");
-                assert_eq!(gen2.next_input().await, Some(user(3)), "the line again, verbatim");
+                assert_eq!(resent(gen2.next_input().await, &user(3)), Some(user(3)), "the line again, its uuid fresh");
                 gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
                 for line in [init_frame(SID), echo(3), result_for(3)] {
                     gen2.line(&line).await;
@@ -7202,7 +7216,7 @@ mod tests {
                 moved_to(&hand, "microvm-3", MoveKind::Readdress, "none");
                 gen3.started().await;
                 let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
-                assert_eq!(gen3.next_input().await, Some(user(4)));
+                assert_eq!(resent(gen3.next_input().await, &user(4)), Some(user(4)));
                 gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
                 for line in [init_frame(SID), echo(4), assistant("a-4"), result_for(4)] {
                     gen3.line(&line).await;
@@ -7390,7 +7404,7 @@ mod tests {
                 moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
                 gen2.started().await;
                 let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
-                assert_eq!(gen2.next_input().await, Some(user(1)));
+                assert_eq!(resent(gen2.next_input().await, &user(1)), Some(user(1)));
                 gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
                 host.send(&late("c1")).await;
                 gen2.line(&ask("c2", "can_use_tool")).await;
@@ -7472,7 +7486,7 @@ mod tests {
                     moved_to(&hand, "microvm-2", MoveKind::Readdress, "at");
                     gen2.started().await;
                     assert!(gen2.next_input().await.is_some_and(|l| l.contains("\"initialize\"")));
-                    assert_eq!(gen2.next_input().await, Some(user(2)));
+                    assert_eq!(resent(gen2.next_input().await, &user(2)), Some(user(2)));
                     assert_eq!(notes(&host), [note_moving("microvm-1", LossCause::VmGone)], "nothing says the chat goes on before its CLI resumed");
                     let text = if cut { format!("No message found with message.uuid of: {}", "a-1") } else { format!("No conversation found with session ID: {SID}") };
                     gen2.line(&miss(&text)).await;
@@ -7512,7 +7526,7 @@ mod tests {
                     hand.borrow_mut().snap.moved = Some(crate::bridge::remote::link::MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "cached", seed: "kept", stayed: false, account: None, account_from: None });
                     gen3.started().await;
                     let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
-                    assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
+                    assert_eq!(resent(gen3.next_input().await, &user(2)), Some(user(2)), "the line again");
                     gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
                     for line in [init_frame(SID), result_for(2)] {
                         gen3.line(&line).await;
@@ -7574,7 +7588,7 @@ mod tests {
                 hand.borrow_mut().snap.moved = Some(MoveDone { kind: MoveKind::Respawn, cut: "at", touchid: "cached", seed: "kept", stayed: false, account: Some("work".into()), account_from: Some("default".into()) });
                 gen2.started().await;
                 assert!(gen2.next_input().await.is_some_and(|l| l.contains("\"initialize\"")));
-                assert_eq!(gen2.next_input().await, Some(user(2)));
+                assert_eq!(resent(gen2.next_input().await, &user(2)), Some(user(2)));
                 gen2.line(miss).await;
                 gen2.exit(1).await;
                 // Its retry: the VM held neither seal any more, so one Touch ID, for the installed one (default again).
@@ -7584,7 +7598,7 @@ mod tests {
                 hand.borrow_mut().snap.moved = Some(MoveDone { kind: MoveKind::Respawn, cut: "none", touchid: "asked", seed: "kept", stayed: false, account: Some("default".into()), account_from: Some("work".into()) });
                 gen3.started().await;
                 let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
-                assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
+                assert_eq!(resent(gen3.next_input().await, &user(2)), Some(user(2)), "the line again");
                 gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
                 for line in [init_frame(SID), result_for(2)] {
                     gen3.line(&line).await;
@@ -7644,7 +7658,7 @@ mod tests {
                     moved_to(&hand, "microvm-2", MoveKind::Readdress, "at");
                     gen2.started().await;
                     let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
-                    assert_eq!(gen2.next_input().await, Some(user(2)));
+                    assert_eq!(resent(gen2.next_input().await, &user(2)), Some(user(2)));
                     gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
                     let continues = note_continues("microvm-2");
                     host.wait_for("the note that the chat goes on", |v| v["content"] == continues.as_str()).await;
@@ -7679,7 +7693,7 @@ mod tests {
                     }
                     gen3.started().await;
                     let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
-                    assert_eq!(gen3.next_input().await, Some(user(2)), "the line again");
+                    assert_eq!(resent(gen3.next_input().await, &user(2)), Some(user(2)), "the line again");
                     gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4444}"#)).await;
                     for line in [init_frame(SID), result_for(2)] {
                         gen3.line(&line).await;
@@ -7947,7 +7961,7 @@ mod tests {
                 moved_to(&hand, "microvm-3", MoveKind::Readdress, "none");
                 gen3.started().await;
                 let init3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed initialize")).unwrap();
-                assert_eq!(gen3.next_input().await, Some(user(1)), "the line again");
+                assert_eq!(resent(gen3.next_input().await, &user(1)), Some(user(1)), "the line again");
                 let int3: Value = serde_json::from_str(&gen3.next_input().await.expect("the replayed interrupt, last")).unwrap();
                 assert_eq!((init3["request"]["subtype"].as_str(), int3["request"]["subtype"].as_str()), (Some("initialize"), Some("interrupt")));
                 gen3.line(&answer(init3["request_id"].as_str().unwrap(), r#"{"pid":4545}"#)).await;
@@ -8512,7 +8526,7 @@ mod tests {
                 moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
                 gen2.started().await;
                 let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
-                assert_eq!(gen2.next_input().await, Some(user(2)), "the line again");
+                assert_eq!(resent(gen2.next_input().await, &user(2)), Some(user(2)), "the line again");
                 gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
                 // A phase A end that comes late finds no migration: nothing switches at the quiet point.
                 gen2.send(ChildEvent::MoveReady(MoveReady { to_vm: "microvm-2".into(), how: "started", ms: 20 })).await;

@@ -46,6 +46,9 @@
 #                             later than the wrapper's grace for one)
 #   FAKE_MISS_EXIT_DELAY_MS   ms: a resume miss waits this long between its result line and
 #                             its exit (S7: a child still exiting when the wrapper's grace ends)
+#   FAKE_DEDUP_RESUMED=1      a user line whose uuid the resumed transcript holds (FAKE_RESUME_NEEDS_FILE's
+#                             file) gets its isReplay echo and no turn, as claude 2.1.305 skips a
+#                             duplicate (part B, 22 Oct): a move must resend a line under a fresh uuid
 #   FAKE_MISS_WAITS_FOR_EOF=1 a miss (resume or cut) then reads its stdin to the end before its
 #                             exit 1, as claude 2.1.305 does after an error result (part B, 22 Oct):
 #                             the wrapper must end it, never wait for it
@@ -1000,6 +1003,10 @@ on_user() {
   fi
   if [ -n "$u" ]; then
     printf '{"type":"user","message":{"role":"user","content":"echo"},"session_id":"%s","parent_tool_use_id":null,"uuid":"%s","isReplay":true}\n' "$sid" "$u"
+  fi
+  # Part B: a duplicate of a line the resumed session holds runs no turn (claude's skipDuplicate).
+  if [ "${FAKE_DEDUP_RESUMED:-0}" = "1" ] && [ -n "$u" ] && [ -n "${resumed:-}" ] && [ -f "$resumed" ] && grep -q "\"uuid\":\"$u\"" "$resumed"; then
+    return
   fi
   # A1: a turn refused for the account's usage limit ends here: no reply, no effects.
   if usage_limited_turn; then

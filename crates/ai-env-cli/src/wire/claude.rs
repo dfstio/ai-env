@@ -441,6 +441,22 @@ pub fn rewrite_initialize_pid(line: &[u8], to: u32) -> Option<(Bytes, u64)> {
 /// the line). `None` when `from` does not occur exactly once — the caller
 /// then forwards the line unchanged.
 #[must_use]
+/// The JSON string `from` (quoted, so only a whole string value matches) in
+/// `line` as `to`, at most `max` times present, or `None` when it is absent,
+/// present more often, or the line is not UTF-8. Part B (22 Oct): a move's
+/// resent user line goes out under a fresh uuid (claude skips a line whose
+/// uuid its session already holds), and the new CLI's frames come back under
+/// the original ([`crate::bridge::hoststate::HostState::restore_resent`]).
+pub fn swap_json_str(line: &[u8], from: &str, to: &str, max: usize) -> Option<Bytes> {
+    let hay = std::str::from_utf8(line).ok()?;
+    let needle = json_str(from);
+    let n = hay.matches(needle.as_str()).count();
+    if n == 0 || n > max {
+        return None;
+    }
+    Some(Bytes::from(hay.replace(needle.as_str(), &json_str(to))))
+}
+
 pub fn rewrite_response_id(line: &[u8], from: &str, to: &str) -> Option<Bytes> {
     let needle = json_str(from);
     let hay = std::str::from_utf8(line).ok()?;

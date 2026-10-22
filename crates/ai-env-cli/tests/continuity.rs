@@ -40,6 +40,20 @@ const EXIT: Duration = Duration::from_secs(30);
 /// The fake claude as the real CLI is: an init with each turn, its transcript written, a resume needing it.
 const CLI: [(&str, &str); 3] = [("FAKE_INIT_AT_TURN", "1"), ("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_RESUME_NEEDS_FILE", "1")];
 
+/// Part B (22 Oct): a move's line sent again is the host's line under a
+/// fresh uuid (claude skips a line whose uuid its session holds, which
+/// `FAKE_DEDUP_RESUMED` models in the moves that send one again): the same
+/// JSON but its `uuid`, and that one another.
+fn resent_as(got: Option<&String>, want: &str) -> bool {
+    let (Some(got), Ok(mut want)) = (got.and_then(|g| serde_json::from_str::<serde_json::Value>(g).ok()), serde_json::from_str::<serde_json::Value>(want)) else { return false };
+    let mut got = got;
+    let fresh = got["uuid"].as_str().map(str::to_string);
+    let own = want["uuid"].as_str().map(str::to_string);
+    got["uuid"] = serde_json::Value::Null;
+    want["uuid"] = serde_json::Value::Null;
+    fresh.is_some() && fresh != own && got == want
+}
+
 /// `CLI`'s knobs, then `more`.
 fn knobs<'a>(more: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
     CLI.iter().copied().chain(more.iter().copied()).collect()
@@ -500,7 +514,7 @@ fn t10_3_mid_turn_resends_the_line_once() {
     let mark = p.root.join("turn.mark");
     let mark_s = mark.display().to_string();
     let resume = format!("--resume={sid}");
-    let mut h = p.spawn_on(Link::Remote, "", &[&resume], &knobs(&[("FAKE_TURN_MS", "60000"), ("FAKE_TURN_MARK", &mark_s)]));
+    let mut h = p.spawn_on(Link::Remote, "", &[&resume], &knobs(&[("FAKE_TURN_MS", "60000"), ("FAKE_TURN_MARK", &mark_s), ("FAKE_DEDUP_RESUMED", "1")]));
     started(&mut h);
     let u1 = h.send_user("a line with a long tool");
     wait_for_mark(&mark, 1, 1);
@@ -525,7 +539,7 @@ fn t10_3_mid_turn_resends_the_line_once() {
     assert!(argv[1].contains(&resume), "{:?}", argv[1]);
     assert!(argv[1].contains(&format!("--resume-session-at={a0}")), "{:?}", argv[1]);
     assert!(h.env_log().iter().any(|l| *l == format!("gen 2 cut at={a0} found")), "{:?}", h.env_log());
-    assert_eq!(h.stdin_of(2).last(), h.sent.last(), "the line again, verbatim, last");
+    assert!(resent_as(h.stdin_of(2).last(), h.sent.last().expect("the line")), "the line again, its uuid fresh, last: {:?}", h.stdin_of(2).last());
     assert!(out.iter().any(|v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains(&vm1) && c.contains("the interrupted message is sent again"))), "the note");
     let echo = out.iter().position(|v| is_echo_of(v, &u1)).expect("the echo");
     let assistants: Vec<&str> = out[echo..].iter().filter(|v| v["type"] == "assistant").filter_map(|v| v["uuid"].as_str()).collect();
@@ -1494,7 +1508,7 @@ mod joint {
     /// the dead CLI never had the line).
     #[test]
     fn a_parked_vm_that_hits_its_wall_moves_at_the_next_line() {
-        let mut h = Harness::prepare().spawn_on(Link::Remote, "", &[], &knobs(&[WIP, PARK]));
+        let mut h = Harness::prepare().spawn_on(Link::Remote, "", &[], &knobs(&[WIP, PARK, ("FAKE_DEDUP_RESUMED", "1")]));
         started(&mut h);
         let u1 = turn(&mut h, "one");
         let sid = session_of(&mut h);
@@ -1534,7 +1548,7 @@ mod joint {
         let d = &rows[done]["detail"];
         assert_eq!((d["touchid"].as_str(), d["seed"].as_str(), d["cut"].as_str(), d["gen"].as_str()), (Some("asked"), Some("box"), Some("none"), Some("2")), "{d}");
         let line = h.sent.last().cloned().expect("the line");
-        assert_eq!(h.stdin_of(2).last(), Some(&line), "the line again, verbatim, last");
+        assert!(resent_as(h.stdin_of(2).last(), &line), "the line again, its uuid fresh, last: {:?}", h.stdin_of(2).last());
         assert!(!h.stdin_of(1).contains(&line), "the ended VM's claude never had it");
         let out = h.out_json();
         for u in [&u1, &u2] {

@@ -157,6 +157,10 @@ pub struct HostState {
     window: BTreeSet<String>,
     swallow_init: bool,
     swallow_echo: BTreeSet<String>,
+    /// Part B (22 Oct): this generation's resent lines, the fresh uuid each
+    /// went out under → its original ([`HostState::replay_move`],
+    /// [`HostState::restore_resent`]).
+    resent_as: BTreeMap<String, String>,
     gen: u32,
     init_seen_this_gen: bool,
     inits_forwarded: u32,
@@ -181,6 +185,7 @@ impl Default for HostState {
             window: BTreeSet::new(),
             swallow_init: false,
             swallow_echo: BTreeSet::new(),
+            resent_as: BTreeMap::new(),
             gen: 1,
             init_seen_this_gen: false,
             inits_forwarded: 0,
@@ -314,6 +319,22 @@ impl HostState {
     pub fn begin_gen(&mut self, gen: u32) {
         self.gen = gen;
         self.init_seen_this_gen = false;
+        self.resent_as.clear();
+    }
+
+    /// Part B (22 Oct): `line` from this generation's CLI with every fresh uuid
+    /// a resent line went out under ([`HostState::replay_move`]) put back to its
+    /// original, so the echo, the swallow rules, the result that retires the
+    /// line and the host all see the host's own uuid; `None` when the line
+    /// names none.
+    pub fn restore_resent(&self, line: &[u8]) -> Option<Bytes> {
+        let mut out: Option<Bytes> = None;
+        for (fresh, original) in &self.resent_as {
+            if let Some(b) = claude::swap_json_str(out.as_deref().unwrap_or(line), fresh, original, usize::MAX) {
+                out = Some(b);
+            }
+        }
+        out
     }
 
     /// Decide one child → host frame (mirror frames, the local oauth answer
@@ -449,6 +470,18 @@ impl HostState {
     /// Call [`HostState::begin_gen`] first and [`HostState::fail_in_flight`] after.
     pub fn replay_move(&mut self, fresh_id: &mut dyn FnMut() -> String) -> Vec<Bytes> {
         let mut out = self.replay_lines(fresh_id);
+        // Part B (22 Oct): claude skips a user line whose uuid its session already holds (`skipDuplicate`: an
+        // `isReplay` acknowledgment, no turn), and the moved CLI's transcript holds the interrupted line. Each line
+        // resent goes out under a fresh uuid; the new CLI's frames come back under the original (`restore_resent`).
+        let start = out.len().saturating_sub(self.outstanding.len());
+        for (i, l) in self.outstanding.iter().enumerate() {
+            let Some(original) = l.uuid.as_deref() else { continue };
+            let fresh = fresh_id();
+            if let Some(line) = claude::swap_json_str(&out[start + i], original, &fresh, 1) {
+                out[start + i] = line;
+                self.resent_as.insert(fresh, original.to_string());
+            }
+        }
         let interrupts: Vec<String> = self.pending.iter().filter(|(_, sub)| sub.as_str() == INTERRUPT_SUBTYPE).map(|(id, _)| id.clone()).collect();
         for original in interrupts {
             let Ok(request) = RawValue::from_string(format!(r#"{{"subtype":"{INTERRUPT_SUBTYPE}"}}"#)) else { continue };
@@ -987,12 +1020,16 @@ mod p0_tests {
         let lines = texts(&st.replay_move(&mut ids()));
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].contains(r#""request_id":"fresh-1""#) && lines[0].contains("initialize"), "{}", lines[0]);
-        assert_eq!(lines[1], USER1, "the line sent again");
-        assert_eq!(lines[2], r#"{"type":"control_request","request_id":"fresh-2","request":{"subtype":"interrupt"}}"#, "the interrupt last, under a fresh id");
+        // Part B: the line goes out under a fresh uuid (claude skips one its session holds), its frames come back under its own.
+        assert_eq!(lines[1], USER1.replace(r#""uuid":"u1""#, r#""uuid":"fresh-2""#), "the line sent again, its uuid fresh");
+        assert_eq!(lines[2], r#"{"type":"control_request","request_id":"fresh-3","request":{"subtype":"interrupt"}}"#, "the interrupt last, under a fresh id");
+        let back = st.restore_resent(br#"{"type":"result","user_message_uuid":"fresh-2","user_message_uuids":["fresh-2"]}"#).expect("the fresh uuid named");
+        assert_eq!(&back[..], br#"{"type":"result","user_message_uuid":"u1","user_message_uuids":["u1"]}"#);
+        assert!(st.restore_resent(br#"{"type":"result","user_message_uuid":"u9"}"#).is_none(), "a line naming none is left as it is");
         let failed = texts(&st.fail_in_flight());
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(failed[0].contains(r#""request_id":"mcp-7""#), "{}", failed[0]);
-        match child(&mut st, &answer("fresh-2")) {
+        match child(&mut st, &answer("fresh-3")) {
             ChildVerdict::Rewritten(b) => assert_eq!(String::from_utf8(b.to_vec()).unwrap(), answer("int-9")),
             other => panic!("the interrupt's answer carries the host's id: {other:?}"),
         }
