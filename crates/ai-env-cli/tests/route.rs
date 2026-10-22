@@ -82,23 +82,24 @@ fn fixture_directory_equals_fixture_names() {
     assert_eq!(on_disk, declared, "tests/fixtures/argv/*.json and wire::argv::FIXTURE_NAMES disagree (left: disk, right: declared)");
 }
 
-/// Whether fixture `name`'s `ext_version` holds: `FIXTURE_EXT_VERSION`; for
-/// a kept fixture (S10 F10, `KEPT_FIXTURES`, which a re-capture rewrites
-/// only from a row of its shape) it or an older N.N.N, the one of its own
-/// capture or tag.
-fn tag_holds(name: &str, ext_version: &str) -> bool {
+/// Whether a fixture's `ext_version` holds: `FIXTURE_EXT_VERSION` or an
+/// older N.N.N, the one of its own capture or tag: a re-capture rewrites a
+/// fixture only from a row of its shape, and Cursor's extension stays fresh
+/// (Mike, 22 Oct 2026), so one no capture remade keeps its older tag.
+fn tag_holds(_name: &str, ext_version: &str) -> bool {
     fn version(v: &str) -> Option<[u32; 3]> {
         let mut parts = v.split('.').map(|p| Some(p).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).and_then(|p| p.parse::<u32>().ok()));
         let out = [parts.next()??, parts.next()??, parts.next()??];
         parts.next().is_none().then_some(out)
     }
-    ext_version == FIXTURE_EXT_VERSION || (KEPT_FIXTURES.contains(&name) && version(ext_version).zip(version(FIXTURE_EXT_VERSION)).is_some_and(|(v, at)| v <= at))
+    version(ext_version).zip(version(FIXTURE_EXT_VERSION)).is_some_and(|(v, at)| v <= at)
 }
 
-/// Every fixture is tagged with the extension it was captured from,
-/// `FIXTURE_EXT_VERSION`; a kept one (S10 F10) with it or an older N.N.N, so
-/// moving `FIXTURE_EXT_VERSION` after a re-capture that found no row of a
-/// kept shape fails nothing; never a newer or a malformed one.
+/// Every fixture is tagged with the extension it was captured from:
+/// `FIXTURE_EXT_VERSION`, or an older N.N.N for one the newest capture found
+/// no row of (a kept shape, or one not made since), so moving
+/// `FIXTURE_EXT_VERSION` after a re-capture fails nothing; never a newer or a
+/// malformed one.
 #[test]
 fn every_fixture_is_tagged_with_the_captured_extension_version() {
     let all = load_fixtures();
@@ -106,8 +107,8 @@ fn every_fixture_is_tagged_with_the_captured_extension_version() {
     for f in &all {
         assert!(tag_holds(&f.name, &f.ext_version), "fixture {} was captured from another extension version ({}, not {FIXTURE_EXT_VERSION})", f.name, f.ext_version);
     }
-    assert!(tag_holds("version", "2.1.278") && tag_holds("version", FIXTURE_EXT_VERSION) && tag_holds("session", FIXTURE_EXT_VERSION));
-    for (name, tag) in [("session", "2.1.278"), ("version", "99.0.0"), ("version", "2.1"), ("version", "2.1.x"), ("version", "2.1.278.1"), ("version", "")] {
+    assert!(tag_holds("version", "2.1.278") && tag_holds("version", FIXTURE_EXT_VERSION) && tag_holds("session", FIXTURE_EXT_VERSION) && tag_holds("session", "2.1.278"));
+    for (name, tag) in [("session", "99.0.0"), ("version", "99.0.0"), ("version", "2.1"), ("version", "2.1.x"), ("version", "2.1.278.1"), ("version", "")] {
         assert!(!tag_holds(name, tag), "{name} tagged {tag:?}");
     }
 }
@@ -153,7 +154,7 @@ fn t1_5_add_dir_and_outside_roots() {
     let all = load_fixtures();
     let multi = fixture(&all, "session_multiroot");
     let multi_dirs = &multi.session.as_ref().expect("session_multiroot carries a session").add_dirs;
-    assert_eq!(multi_dirs, &["/Users/mike/other".to_string()], "the multi-root row is the only one with --add-dir");
+    assert_eq!(multi_dirs, &["/Users/mike/s10-argv-b".to_string()], "the multi-root row is the only one with --add-dir");
     match decide(&multi.argv, Some(&r.inside), Some(&r.cfg)) {
         Route::Remote(s) => assert_eq!(s.add_dirs, *multi_dirs),
         other => panic!("session_multiroot inside the root: {other:?}"),

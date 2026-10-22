@@ -1,6 +1,6 @@
 {
   "name": "session",
-  "ext_version": "2.1.303",
+  "ext_version": "2.1.307",
   "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
   "route": "remote",
   "session": {

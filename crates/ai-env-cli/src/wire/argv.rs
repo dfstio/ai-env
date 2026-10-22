@@ -66,7 +66,7 @@ pub fn split(argv: &[OsString]) -> Result<Invocation, ArgvError> {
 /// ([`KEPT_FIXTURES`]), and `design-login`, `edit-permission-rules` and
 /// `--claude-in-chrome-mcp` only in flows the capture skipped (part B's
 /// Cursor checklist makes them).
-pub const FIXTURE_EXT_VERSION: &str = "2.1.303";
+pub const FIXTURE_EXT_VERSION: &str = "2.1.307";
 
 /// Every fixture name under `tests/fixtures/argv/` (one source of truth:
 /// the in-crate KAT includes exactly these, `tests/route.rs` checks the
@@ -468,21 +468,23 @@ mod tests {
         }
     }
 
-    /// Whether fixture `name`'s `ext_version` holds: `FIXTURE_EXT_VERSION`;
-    /// for a kept fixture (S10 F10, `KEPT_FIXTURES`, which a re-capture
-    /// rewrites only from a row of its shape) it or an older N.N.N.
-    fn tag_holds(name: &str, ext_version: &str) -> bool {
+    /// Whether a fixture's `ext_version` holds: `FIXTURE_EXT_VERSION` or an
+    /// older N.N.N. A re-capture rewrites a fixture only from a row of its
+    /// shape, and Cursor's extension stays fresh (Mike, 22 Oct 2026: S10's
+    /// 2.1.307 capture remade 5 of the 17), so one no capture remade keeps
+    /// the tag of its own; never a newer or a malformed one.
+    fn tag_holds(_name: &str, ext_version: &str) -> bool {
         fn version(v: &str) -> Option<[u32; 3]> {
             let mut parts = v.split('.').map(|p| Some(p).filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).and_then(|p| p.parse::<u32>().ok()));
             let out = [parts.next()??, parts.next()??, parts.next()??];
             parts.next().is_none().then_some(out)
         }
-        ext_version == FIXTURE_EXT_VERSION || (KEPT_FIXTURES.contains(&name) && version(ext_version).zip(version(FIXTURE_EXT_VERSION)).is_some_and(|(v, at)| v <= at))
+        version(ext_version).zip(version(FIXTURE_EXT_VERSION)).is_some_and(|(v, at)| v <= at)
     }
 
     #[test]
     fn kat_fixtures() {
-        assert!(tag_holds("bare", "2.1.278") && !tag_holds("bare", "99.0.0") && !tag_holds("session", "2.1.278"), "a kept fixture may keep an older tag, no other");
+        assert!(tag_holds("bare", "2.1.278") && tag_holds("session", "2.1.278") && !tag_holds("session", "99.0.0") && !tag_holds("session", "2.1"), "a fixture may keep an older tag, never a newer or a malformed one");
         for text in FIXTURES {
             let f: Fixture = serde_json::from_str(text).expect("fixture json");
             assert!(tag_holds(&f.name, &f.ext_version), "fixture {} is tagged with another extension version ({})", f.name, f.ext_version);

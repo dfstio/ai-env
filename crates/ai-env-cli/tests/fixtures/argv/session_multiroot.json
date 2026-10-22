@@ -1,12 +1,12 @@
 {
   "name": "session_multiroot",
-  "ext_version": "2.1.303",
-  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--add-dir=/Users/mike/other", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
+  "ext_version": "2.1.307",
+  "argv": ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--max-thinking-tokens=31999", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local", "--permission-mode=default", "--include-partial-messages", "--add-dir=/Users/mike/s10-argv-b", "--debug", "--debug-to-stderr", "--enable-auth-status", "--no-chrome", "--replay-user-messages"],
   "route": "remote",
   "session": {
     "resume": null,
     "thinking_disabled": false,
-    "add_dirs": ["/Users/mike/other"],
+    "add_dirs": ["/Users/mike/s10-argv-b"],
     "permission_mode": "default",
     "model": null,
     "has_mcp_config": false,
