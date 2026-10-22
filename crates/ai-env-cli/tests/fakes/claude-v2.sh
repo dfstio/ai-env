@@ -46,6 +46,9 @@
 #                             later than the wrapper's grace for one)
 #   FAKE_MISS_EXIT_DELAY_MS   ms: a resume miss waits this long between its result line and
 #                             its exit (S7: a child still exiting when the wrapper's grace ends)
+#   FAKE_MISS_WAITS_FOR_EOF=1 a miss (resume or cut) then reads its stdin to the end before its
+#                             exit 1, as claude 2.1.305 does after an error result (part B, 22 Oct):
+#                             the wrapper must end it, never wait for it
 #   FAKE_MISS_AFTER_INIT=1    the same miss (stderr line + error result, exit 1) right
 #                             after the init frame: the host has seen the init
 #   FAKE_INIT_AT_TURN=1       the init frame comes with every user turn instead of once after
@@ -461,6 +464,9 @@ print_miss() {
   printf '{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"%s","total_cost_usd":0,"usage":{},"modelUsage":{},"permission_denials":[],"uuid":"x","errors":["%s"],"result_index":0}\n' "$other_sid" "$1"
   if [ -n "${FAKE_MISS_EXIT_DELAY_MS:-}" ]; then
     sleep "$((FAKE_MISS_EXIT_DELAY_MS / 1000)).$(printf '%03d' $((FAKE_MISS_EXIT_DELAY_MS % 1000)))"
+  fi
+  if [ -n "${FAKE_MISS_WAITS_FOR_EOF:-}" ]; then
+    cat >/dev/null
   fi
   exit 1
 }

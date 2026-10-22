@@ -2101,6 +2101,8 @@ struct Chat {
     turn: LiveTurn,
     /// When that user line was sent.
     turn_from: Instant,
+    /// The wrapper's log in the test's root, when the chat was opened there ([`Chat::log_tail`]).
+    log: Option<std::path::PathBuf>,
 }
 
 impl Chat {
@@ -2125,7 +2127,9 @@ impl Chat {
             .stderr(std::process::Stdio::piped());
         let child = cmd.spawn().expect("ai-env-claude runs");
         announce_touch_id(test, &format!("ai-env-claude (pid {}) in {}", child.id(), cwd.display()));
-        Chat::over(test, child)
+        let mut chat = Chat::over(test, child);
+        chat.log = Some(live.paths.wrapper_log());
+        chat
     }
 
     /// A chat over `child`, its stdio piped: each stdout line read on a thread, its stderr kept as it comes by another.
@@ -2154,7 +2158,7 @@ impl Chat {
                 }
             }
         });
-        Chat { test, stdin: child.stdin.take(), child, lines, stderr, stderr_reader: Some(stderr_reader), stdout: Vec::new(), session: None, turn: LiveTurn::default(), turn_from: Instant::now() }
+        Chat { test, stdin: child.stdin.take(), child, lines, stderr, stderr_reader: Some(stderr_reader), stdout: Vec::new(), session: None, turn: LiveTurn::default(), turn_from: Instant::now(), log: None }
     }
 
     fn pid(&self) -> u32 {
@@ -2325,9 +2329,10 @@ impl Chat {
         let test = self.test;
         assert_eq!(self.turn.uuid, uuid, "{test}: the turn read is the newest user line's");
         if self.turn.results == 0 && self.read_until(limit, Asks::AllowAll, |v| v["type"] == "result").is_none() {
-            let (used, asked) = (self.turn.used.clone(), self.turn.asked.clone());
+            let (used, asked, notes) = (self.turn.used.clone(), self.turn.asked.clone(), self.turn.notes.clone());
             let err = self.stderr_now();
-            panic!("{test}: no result within {limit:?} (tools used: {used:?}, asked for: {asked:?}); the wrapper's stderr: {err}");
+            let log = self.log_tail();
+            panic!("{test}: no result within {limit:?} (tools used: {used:?}, asked for: {asked:?}, notes: {notes:?}); the wrapper's stderr: {err}\nthe wrapper's log, its end:\n{log}");
         }
         std::mem::take(&mut self.turn)
     }
@@ -2417,6 +2422,14 @@ impl Chat {
 
     /// The wrapper's stderr so far, all of it once the wrapper exited (S10 reads it live), setup-tokens and
     /// account ids masked.
+    /// The last 40 lines of the wrapper's log (its root's `logs/wrapper.log`), scrubbed: what a failed live turn
+    /// prints, since the root goes with the test.
+    fn log_tail(&self) -> String {
+        let text = self.log.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        ai_env_cli::wire::redact::scrub(&lines[lines.len().saturating_sub(40)..].join("\n")).into_owned()
+    }
+
     fn stderr_now(&mut self) -> String {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
             if let Some(h) = self.stderr_reader.take() {
@@ -4087,6 +4100,26 @@ fn is_permission_for(v: &serde_json::Value, tool: &str) -> bool {
     v["type"] == "control_request" && v["request"]["subtype"] == "can_use_tool" && v["request"]["tool_name"] == tool
 }
 
+/// Whether `v` is claude's call of `tool` (an assistant frame's `tool_use`
+/// block): what a turn shows of a command claude runs without asking
+/// (claude 2.1.305 runs `sleep` and `echo` with no `can_use_tool`; part B,
+/// 22 Oct). A test that waits for a tool to start takes either sign.
+fn is_tool_use(v: &serde_json::Value, tool: &str) -> bool {
+    v["type"] == "assistant" && v["message"]["content"].as_array().is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == tool))
+}
+
+/// A Bash call is seen whether claude asked for it or ran it unasked, and
+/// nothing else counts as one.
+#[test]
+fn a_bash_call_is_seen_asked_or_not() {
+    let asked = serde_json::json!({"type": "control_request", "request_id": "r-1", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}});
+    let ran = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "running"}, {"type": "tool_use", "id": "t-1", "name": "Bash", "input": {}}]}});
+    let other = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t-2", "name": "Read", "input": {}}]}});
+    let text = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Bash"}]}});
+    let seen = |v: &serde_json::Value| is_permission_for(v, "Bash") || is_tool_use(v, "Bash");
+    assert!(seen(&asked) && seen(&ran) && !seen(&other) && !seen(&text));
+}
+
 /// Whether `v` is ai-env's informational line `text` (L3: `wire::claude::informational_line`).
 fn is_note(v: &serde_json::Value, text: &str) -> bool {
     v["type"] == "system" && v["subtype"] == "informational" && v["content"] == text
@@ -4428,9 +4461,10 @@ fn live_s10_close_reopen_and_sleep() {
     let recall = second.turn("Which word did I ask you to remember? Reply with the word only.");
     let answer = recall.result["result"].as_str().unwrap_or_default().to_string();
     assert!(answer.contains(&word), "{TEST}: the answer {answer:?} lacks the word");
-    // The lid: the wrapper stopped once the Bash call is allowed, the sleep running in the VM.
+    // The lid: the wrapper stopped once the Bash call is allowed (or runs unasked: claude 2.1.305 asks nothing for a
+    // sleep), the sleep running in the VM.
     let uuid = second.send_user("Run exactly this command with your Bash tool, then reply with its output only: sleep 30; echo slept");
-    if second.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash")).is_none() {
+    if second.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash") || is_tool_use(v, "Bash")).is_none() {
         let err = second.stderr_now();
         panic!("{TEST}: no Bash call within {LIVE_TURN_LIMIT:?}; the wrapper's stderr: {err}");
     }
@@ -4496,7 +4530,7 @@ fn live_s10_terminate_mid_turn_readdresses() {
     assert_eq!(told.result["is_error"], false, "{TEST}: {}", told.result);
     let vm1 = chat.session_vm(&live);
     let uuid = chat.send_user("Run exactly this command with your Bash tool, then reply with its output only: sleep 90; echo slept");
-    if chat.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash")).is_none() {
+    if chat.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash") || is_tool_use(v, "Bash")).is_none() {
         let err = chat.stderr_now();
         panic!("{TEST}: no Bash call within {LIVE_TURN_LIMIT:?}; the wrapper's stderr: {err}");
     }

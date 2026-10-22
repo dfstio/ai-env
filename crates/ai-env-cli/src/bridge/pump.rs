@@ -212,6 +212,11 @@ pub const INIT_FAIL_FAST: Duration = Duration::from_secs(10);
 /// first turn: holding the copy until that init would keep it for as long as
 /// a resumed chat sits idle.
 const RESUME_MISS_GRACE: Duration = Duration::from_secs(2);
+/// How long the CLI whose error result is held ([`Pump::hold_miss`]) has to
+/// exit after its EOF before it is killed: far beyond claude's exit at an EOF
+/// (0.5 to 0.9 s, S7 and S8), so a slow exit keeps its exit 1 and with it the
+/// retry; one that never exits fails its move instead of hanging the chat.
+const HELD_MISS_END_AFTER: Duration = Duration::from_secs(10);
 /// The most of an error text the end row keeps from the extension's answer.
 const SYNTHETIC_ERROR_CHARS: usize = 160;
 /// The wrapper's exit once Anthropic refused a remote session's token (S7
@@ -1175,6 +1180,11 @@ struct Pump {
     stdout_eof: bool,
     stderr_eof: bool,
     held_miss: Option<Bytes>,
+    /// When the CLI whose error result is held ([`Pump::hold_miss`]), sent its
+    /// EOF then, is killed if it has not exited ([`HELD_MISS_END_AFTER`]):
+    /// claude does not exit at an error result while its stdin is open
+    /// (2.1.305, part B), so a held miss never waits on the CLI's own end.
+    held_end_at: Option<Instant>,
     retries: u32,
     /// Host EOF or SIGTERM seen: never respawn after it.
     close_requested: bool,
@@ -1468,6 +1478,7 @@ impl Pump {
             stdout_eof: false,
             stderr_eof: false,
             held_miss: None,
+            held_end_at: None,
             retries: 0,
             close_requested: false,
             first_session_id: None,
@@ -2091,6 +2102,19 @@ impl Pump {
         self.start_ladder(None, now + self.timings.sigterm_kill_after, now + REJECT_HARD_STOP, false, true);
     }
 
+    /// Hold the CLI's error result `line` until its end decides it (a moved
+    /// CLI's or a resume's miss: §2.9, S9), and end that CLI now: its EOF,
+    /// queued after what the host already sent it (the input queue is cleared
+    /// at its end, so no later generation reads it), then a kill
+    /// [`HELD_MISS_END_AFTER`] later if it is still alive. claude exits 1 at
+    /// the EOF after an error result (S7, S8), the code the cut miss's retry
+    /// and the resume's respawn expect.
+    fn hold_miss(&mut self, line: Bytes) {
+        self.held_miss = Some(line);
+        self.in_q.push_back(ChildInput::Eof);
+        self.held_end_at = Some(Instant::now() + HELD_MISS_END_AFTER);
+    }
+
     fn on_child_line(&mut self, line: Bytes) {
         let frame = claude::classify_child(&line);
         match &frame {
@@ -2129,12 +2153,12 @@ impl Pump {
         let start_miss = self.gen_move.is_some() && !self.gen_init && (claude::is_cut_miss(&frame) || claude::is_resume_miss(&frame));
         if (start_miss || self.move_unconfirmed()) && self.held_miss.is_none() && matches!(frame, ChildFrame::Result { is_error: true, .. }) {
             tracing::info!(gen = self.gen, cut = claude::is_cut_miss(&frame), resume = claude::is_resume_miss(&frame), late = !self.move_unconfirmed(), "the moved CLI failed before it resumed; holding the result until the child exits");
-            self.held_miss = Some(line.clone());
+            self.hold_miss(line.clone());
             return;
         }
         if claude::is_resume_miss(&frame) && self.retry_possible() && self.held_miss.is_none() {
             tracing::info!("resume miss reported by generation {}; holding the result until the child exits", self.gen);
-            self.held_miss = Some(line.clone());
+            self.hold_miss(line.clone());
             return;
         }
         if matches!(frame, ChildFrame::Init { .. }) && !self.gen_init {
@@ -2529,6 +2553,7 @@ impl Pump {
         self.child_input = None;
         self.child_signal = None;
         self.in_q.clear();
+        self.held_end_at = None;
         let closing = self.close_requested || self.finish.is_some() || self.ladder.is_some();
         // S10: a moved CLI that ended on its own before it showed it resumed, with no error result held (a start-up
         // refusal on stderr alone: `--session-id`'s `is already in use`), did not resume the session either.
@@ -3557,6 +3582,7 @@ impl Pump {
         all.extend(self.delay_until);
         all.extend(self.replay_deadline);
         all.extend(self.move_resumed_by);
+        all.extend(self.held_end_at.filter(|_| self.child_alive()));
         if let Some(Migration { phase: MigPhase::Switching { detach_at, .. }, .. }) = &self.migration {
             all.extend(detach_at.filter(|_| self.child_alive()));
         }
@@ -3617,6 +3643,13 @@ impl Pump {
             // S10 §B: the old CLI did not end at its EOF within the remote rung: `detach{final}` (the shim's ladder ends it).
             tracing::info!(gen = self.gen, "the switch: the old CLI did not exit at its EOF in time: detach{{final}}");
             self.signal_child(Sig::Kill);
+        }
+        if self.held_end_at.is_some_and(|t| now >= t) {
+            self.held_end_at = None;
+            if self.held_miss.is_some() && self.child_alive() {
+                tracing::info!(gen = self.gen, "the CLI whose error result is held did not exit at its EOF in time: ended");
+                self.signal_child(Sig::Kill);
+            }
         }
         if self.move_resumed_by.is_some_and(|t| now >= t) {
             self.move_resumed_by = None;

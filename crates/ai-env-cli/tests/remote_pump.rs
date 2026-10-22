@@ -1107,6 +1107,31 @@ fn a_resume_miss_retries_on_the_same_vm_with_its_transcript_and_no_second_touch_
     }
 }
 
+/// Part B (22 Oct): claude 2.1.305 does not exit at an error result while
+/// its stdin is open, so a miss whose CLI waits for its EOF
+/// (FAKE_MISS_WAITS_FOR_EOF) must still be retried: the wrapper ends the CLI
+/// whose result it holds (its EOF), never waits on it. Before the fix the
+/// held miss waited for an exit that never came and the turn hung.
+#[test]
+fn a_miss_whose_cli_waits_for_its_eof_is_ended_and_retried() {
+    let p = Harness::prepare();
+    let sid = common::uuid(0x8860);
+    let earlier = format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#, common::uuid(0x8861));
+    p.plant_transcript(&sid, &[earlier.as_str()]);
+    let resume = format!("--resume={sid}");
+    let knobs = [("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_RESUME_FAIL_AFTER_ACK", "1"), ("FAKE_MISS_WAITS_FOR_EOF", "1"), ("AI_ENV_BRIDGE_LAB_TRANSCRIPT", "skip")];
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &knobs);
+    let init = h.send_initialize();
+    h.expect_out(|v| is_response_to(v, &init), T);
+    let u = h.send_user("after the miss");
+    h.expect_out(|v| is_result_for(v, &u), T);
+    h.close_stdin();
+    let (status, _) = h.wait(EXIT);
+    assert_eq!(status.code(), Some(0), "{}", h.transcript());
+    let resumed: Vec<String> = read(&h.root().join("env.log")).lines().filter(|l| l.contains("resumed")).map(str::to_string).collect();
+    assert_eq!(resumed, ["gen 1 resumed lines=missing", "gen 2 resumed lines=1"]);
+}
+
 /// A1: a resume miss's retry keeps the first start's account, as it asks
 /// no Touch ID: `work` made the active account while the first CLI is up
 /// (between its answer to `initialize` and its miss) changes nothing for
