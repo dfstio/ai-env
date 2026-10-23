@@ -222,19 +222,23 @@ fn g1(repo_root: &Path) -> GateResult {
 }
 
 /// G2 as the operator identity (`operator`: its resolution, `Err` the
-/// labelled refusal); the `aws --version` probe stays plain.
+/// labelled refusal); the `aws --version` probe stays plain. It passes when
+/// eu-central-1 lists `al2023-1`. eu-west-3's answer is recorded, never
+/// judged: its 403 was S0's sign that the service ran in eu-central-1 alone
+/// (the profile's default region had none), not an IAM pin. AWS has since
+/// opened it there (part B, 22 Oct 2026), and ai-env pins its region in code
+/// (T3.5's negative, `make preview-scratch NEGATIVE=region`).
 fn g2(operator: Option<&std::result::Result<(), String>>) -> GateResult {
     let t = Duration::from_secs(30);
     if run_capture("aws", &["--version"], Duration::from_secs(5)).is_err() {
-        return gate("G2", "region + API", "aws lambda-microvms list-managed-microvm-images", "al2023-1 listed / eu-west-3 403", "aws cli not found".into(), GateStatus::Skipped);
+        return gate("G2", "region + API", "aws lambda-microvms list-managed-microvm-images", "al2023-1 listed (eu-west-3 recorded)", "aws cli not found".into(), GateStatus::Skipped);
     }
     if let Some(Err(e)) = operator {
-        return gate("G2", "region + API", "aws lambda-microvms list-managed-microvm-images --region eu-central-1 | --region eu-west-3", "al2023-1 listed / 403", e.clone(), GateStatus::Fail);
+        return gate("G2", "region + API", "aws lambda-microvms list-managed-microvm-images --region eu-central-1 | --region eu-west-3", "al2023-1 listed (eu-west-3 recorded)", e.clone(), GateStatus::Fail);
     }
     let central = operator_capture(&["lambda-microvms", "list-managed-microvm-images", "--region", "eu-central-1", "--output", "json"], t);
     let west = operator_capture(&["lambda-microvms", "list-managed-microvm-images", "--region", "eu-west-3", "--output", "json"], t);
     let central_ok = central.as_ref().is_ok_and(|j| j.contains("al2023-1"));
-    let west_403 = west.as_ref().is_err_and(|e| e.contains("403") || e.contains("AccessDenied"));
     let obs = format!(
         "eu-central-1: {}; eu-west-3: {}",
         match &central {
@@ -244,16 +248,16 @@ fn g2(operator: Option<&std::result::Result<(), String>>) -> GateResult {
         },
         match &west {
             Err(e) => e.clone(),
-            Ok(_) => "unexpectedly succeeded".to_string(),
+            Ok(_) => "answers too (the service runs there now; ai-env stays pinned to eu-central-1)".to_string(),
         }
     );
     gate(
         "G2",
         "region + API",
         "aws lambda-microvms list-managed-microvm-images --region eu-central-1 | --region eu-west-3",
-        "al2023-1 listed / 403",
+        "al2023-1 listed (eu-west-3 recorded)",
         obs,
-        if central_ok && west_403 { GateStatus::Pass } else { GateStatus::Fail },
+        if central_ok { GateStatus::Pass } else { GateStatus::Fail },
     )
 }
 
