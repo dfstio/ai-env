@@ -833,9 +833,10 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     cfg.seed.validate().map_err(|e| config(&e))?;
     let ctx = Ctx::for_wrapper(&sess.paths, cfg).map_err(|e| config(&e))?;
     // S11 (A.4): V from argv[1]'s bundle, and the staged claudes a spawn may name (local reads only); D5 (LD-10): V
-    // seen or signed starts its admission detached (logged), before any refusal below: nothing here waits or refuses.
+    // seen or signed, or failed at Docker (Mike's retry, 24 Oct: the trigger judges its tries and cooldown), starts
+    // its admission detached (logged), before any refusal below: nothing here waits or refuses.
     let claude = crate::bridge::claude::plan_for(&sess.paths, sess.start_row.ext.as_deref());
-    if let (Some(v), Some("seen" | "signed")) = (claude.ext.as_deref(), claude.phase.as_deref()) {
+    if let Some(v) = claude.ext.as_deref().filter(|_| claude.phase.as_deref().is_some_and(crate::bridge::claude::auto_admit_phase)) {
         let admit = crate::bridge::claude::maybe_auto_admit(&sess.paths, cfg, v);
         tracing::info!(version = v, ?admit, "claude: automatic admission");
     }
@@ -1977,13 +1978,14 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     // first output for the next generation (the link starts it only when V did not run). Nothing here waits.
     let claude = claude_ask(plan, gen, &row);
     let spec = spawn_spec(plan, ctx, &row, &spawn_id, argv, claude.sent.clone());
-    let after_output = crate::bridge::claude::fetch::after_output(plan, ctx, Arc::clone(&api), &row, &vm, session_id.clone());
     let transcript = session_sync(plan);
     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::clone(&api), dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: plan.capture_settings, transcript });
     if let Some(id) = &session_id {
         // A resumed or moved session's id is known before its init: the settings' start capture runs beside the spawn (T8.7).
         trigger.set_session(id);
     }
+    // The fetch's row names this generation and the chat's session as the trigger knows it once the fetch ended.
+    let after_output = crate::bridge::claude::fetch::after_output(plan, ctx, Arc::clone(&api), &row, &vm, gen, fetch_session(&trigger, session_id.as_deref(), &spec.argv));
     let id = vm.id.clone();
     let report = delivery.report();
     let session = tokio::task::spawn_local(session(Rc::clone(plan), gen, plan.ctx(), api, ep, row, vm, spec, io, delivery, trigger.watch()));
@@ -2008,6 +2010,17 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
 /// that takes the chat's transcript to S3 and its view to the picker.
 fn session_sync(plan: &SessionPlan) -> Option<crate::bridge::s3::TranscriptSync> {
     plan.transcript_sync.clone().filter(|_| plan.capture_settings)
+}
+
+/// S11 (A3): the session V's fetch after the first output names in its `claude_fetch` row, read once the fetch
+/// ended: the generation's trigger's ([`TriggerWatch::session`]: a resumed or moved session's from the spawn, a new
+/// chat's once the pump adopted its init), never the session the spawn's `argv` forks ([`forks_session`]:
+/// `--fork-session` beside its `--resume` of `session_id`), whose fork's own id comes with its init.
+fn fetch_session(trigger: &CodeoutTrigger, session_id: Option<&str>, argv: &[String]) -> impl Fn() -> Option<String> + 'static {
+    let end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let forked = session_id.filter(|sid| forks_session(&argv[..end], sid)).map(str::to_string);
+    let watch = trigger.watch();
+    move || watch.session().filter(|s| forked.as_ref() != Some(s))
 }
 
 // ---- S10: a move's generation (plans/s10-contracts.md §2.7, §2.9) ----------------------------
@@ -5507,6 +5520,36 @@ mod tests {
         assert!(audit.is_empty() && !w.paths.unseal_lock().exists(), "P0 wrote no audit row and asked for no Touch ID: {audit:?}");
     }
 
+    /// D5 at P0 (Mike's retry, 24 Oct): a remote chat's start hands its V to the automatic admission when V is
+    /// signed (or seen) or failed at Docker, and the trigger judges the rest. V's lock is taken (the trigger went
+    /// past the record) for a signed V and for a Docker failure with tries left past its cooldown; never for one
+    /// within its cooldown, a spent one or another failed step. With no `ai-env` beside this test binary the
+    /// trigger starts nothing (`no_sibling`), and the plan is made either way.
+    #[test]
+    fn p0_hands_a_docker_failure_with_tries_left_to_the_automatic_admission() {
+        use crate::bridge::claude::tests::{put, put_docker};
+        use crate::bridge::claude::{ADMIT_COOLDOWN, ADMIT_DOCKER_TRIES};
+        // The trigger starts the `ai-env` beside the running binary, a real admission: none may be there.
+        assert!(!matches!(crate::bridge::sibling::find_sibling("ai-env"), crate::bridge::sibling::Sibling::Next(_)), "an ai-env beside the test binary");
+        // Under the fake API (a lab shell's knobs) the trigger stops at `lab`, before any lock: nothing to observe.
+        if crate::bridge::lab::vm_knobs().fake_api.is_some() {
+            return;
+        }
+        let w = World::new("");
+        let ago = |s: u64| crate::wire::time::rfc3339_utc(crate::wire::time::unix_now() - s);
+        put(&w.paths, "2.1.320", 'a', "signed");
+        put_docker(&w.paths, "2.1.321", 'b', 1, &ago(ADMIT_COOLDOWN.as_secs() + 60));
+        put_docker(&w.paths, "2.1.322", 'c', 2, &ago(60));
+        put_docker(&w.paths, "2.1.323", 'd', ADMIT_DOCKER_TRIES, &ago(ADMIT_COOLDOWN.as_secs() + 60));
+        put(&w.paths, "2.1.324", 'e', "failed");
+        for (v, taken) in [("2.1.320", true), ("2.1.321", true), ("2.1.322", false), ("2.1.323", false), ("2.1.324", false)] {
+            let mut sess = w.session(&ARGS);
+            sess.start_row.ext = Some(v.to_string());
+            let plan = precheck_with(&sess, &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{v}: {}", f.line()));
+            assert_eq!((plan.claude.ext.as_deref(), w.paths.claude_lock(v).exists()), (Some(v), taken), "{v}: {:?}", plan.claude.phase);
+        }
+    }
+
     /// Each P0 failure is its own kind, exit code and line, before any AWS
     /// call or Touch ID (P0 makes neither: no backend exists yet; nothing
     /// is audited but the gate's local refusal).
@@ -5969,7 +6012,7 @@ mod tests {
     /// A code-out trigger of `plan`'s workspace on a data plane no call
     /// reaches: a fetch fails once it has the workspace's fetch lock (the
     /// workspace does not exist).
-    fn trigger_of(plan: &SessionPlan) -> CodeoutTrigger {
+    pub(super) fn trigger_of(plan: &SessionPlan) -> CodeoutTrigger {
         let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: crate::wire::redact::Secret::new("t".into()), vpc: true, shell: false };
         let (api, dp, tokens) = (Arc::new(crate::bridge::api::FakeMicrovmApi::new()), Arc::new(crate::bridge::dataplane::Unreached), Arc::new(crate::bridge::dataplane::Unreached));
         CodeoutTrigger::spawn(CodeoutCtx { api, dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: false, transcript: None })
@@ -6654,16 +6697,62 @@ mod a3_tests {
         let t = std::time::Instant::now();
         let row = row_with(true, &[]);
         let _ = claude_ask(&plan, 1, &row);
-        let after = crate::bridge::claude::fetch::after_output(&plan, &plan.ctx(), Arc::clone(&api), &row, &vm_info(), None);
+        let after = crate::bridge::claude::fetch::after_output(&plan, &plan.ctx(), Arc::clone(&api), &row, &vm_info(), 1, || None);
         assert!(after.is_some());
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         assert!(api.calls().is_empty(), "nothing asked: {:?}", api.calls());
         drop(after);
-        assert!(crate::bridge::claude::fetch::after_output(&plan, &plan.ctx(), Arc::clone(&api), &row_with(false, &[]), &vm_info(), None).is_none(), "no cap");
+        assert!(crate::bridge::claude::fetch::after_output(&plan, &plan.ctx(), Arc::clone(&api), &row_with(false, &[]), &vm_info(), 1, || None).is_none(), "no cap");
         let admitted = planned(tempfile::tempdir().unwrap().path(), Some("2.1.308"));
-        assert!(crate::bridge::claude::fetch::after_output(&admitted, &admitted.ctx(), Arc::clone(&api), &row, &vm_info(), None).is_none(), "V not staged");
+        assert!(crate::bridge::claude::fetch::after_output(&admitted, &admitted.ctx(), Arc::clone(&api), &row, &vm_info(), 1, || None).is_none(), "V not staged");
         let none = planned(tempfile::tempdir().unwrap().path(), None);
-        assert!(crate::bridge::claude::fetch::after_output(&none, &none.ctx(), api, &row, &vm_info(), None).is_none(), "no V");
+        assert!(crate::bridge::claude::fetch::after_output(&none, &none.ctx(), api, &row, &vm_info(), 1, || None).is_none(), "no V");
+    }
+
+    /// The `claude_fetch` row of V's fetch after the first output of generation `gen`, spawned with `argv`, whose
+    /// trigger was named `named` at the spawn (as [`spawn`] names it) and then `adopted` (as the pump's adoption of an
+    /// init names it) before the fetch ended (here at once: no S3 target, `failed`): its envelope's session, its
+    /// detail's, its `gen`.
+    fn fetch_row(plan: &SessionPlan, gen: u32, argv: &[String], named: Option<&str>, adopted: Option<&str>) -> (Option<String>, Option<String>, Option<String>) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let trigger = super::tests::trigger_of(plan);
+            if let Some(id) = named {
+                trigger.set_session(id);
+            }
+            let api = Arc::new(crate::bridge::api::FakeMicrovmApi::new());
+            let after = crate::bridge::claude::fetch::after_output(plan, &plan.ctx(), api, &row_with(true, &[]), &vm_info(), gen, fetch_session(&trigger, named, argv)).expect("V nameable, the cap named");
+            if let Some(id) = adopted {
+                trigger.set_session(id);
+            }
+            after.0.await;
+        });
+        let rows = crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap();
+        let row = rows.into_iter().rfind(|r| r["event"] == event::CLAUDE_FETCH).expect("a claude_fetch row");
+        assert_eq!((row["detail"]["why"].as_str(), row["detail"]["outcome"].as_str()), (Some("after_output"), Some("failed")), "{row}");
+        let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
+        (text(&row["session_id"]), text(&row["detail"]["session"]), text(&row["detail"]["gen"]))
+    }
+
+    /// The row of V's fetch after the first output (part B's B3 found a new chat's with neither) names its
+    /// generation, and the chat's session as the trigger knows it once the fetch ended: a new chat's id once the pump
+    /// adopted its first turn's init (which comes after the first output, the answer to the host's `initialize`; none
+    /// before it), a resumed or moved chat's from its spawn, a fork's own id once its init named it, never the session
+    /// it forked.
+    #[test]
+    fn the_after_output_row_names_the_chats_session_and_generation() {
+        let d = tempfile::tempdir().unwrap();
+        let plan = planned(d.path(), Some("2.1.310"));
+        let (sid, fork) = ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c");
+        let named = |s: &str, gen: &str| (Some(s.to_string()), Some(s.to_string()), Some(gen.to_string()));
+        let argv = |extra: &[&str]| -> Vec<String> { plan.argv.iter().cloned().chain(extra.iter().map(|a| (*a).to_string())).collect() };
+        assert_eq!(fetch_row(&plan, 1, &argv(&[]), None, Some(sid)), named(sid, "1"), "a new chat: its init came before the fetch ended");
+        assert_eq!(fetch_row(&plan, 1, &argv(&[]), None, None), (None, None, Some("1".into())), "no init yet: no session, the generation all the same");
+        assert_eq!(fetch_row(&plan, 2, &argv(&["--resume", sid]), Some(sid), None), named(sid, "2"), "a resumed chat: from its spawn");
+        let forks = argv(&["--resume", sid, "--fork-session"]);
+        assert_eq!(fetch_row(&plan, 1, &forks, Some(sid), None), (None, None, Some("1".into())), "a fork its init has not named: never the session it forked");
+        assert_eq!(fetch_row(&plan, 1, &forks, Some(sid), Some(fork)), named(fork, "1"), "a fork its init named");
+        assert_eq!(fetch_row(&plan, 3, &move_argv(&forks, Some(fork), &Cut::None), Some(fork), None), named(fork, "3"), "the named fork moved: resumed as any");
     }
 
     /// A same-VM respawn restores the transcript only for a resumed chat: a resume miss's session, else the

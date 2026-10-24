@@ -8,7 +8,8 @@
 #   FAKE_MAKE_LOG      when set, each call's argv is appended here, one line
 #   FAKE_MAKE_ENV_LOG  when set, each call appends one line: the names of the environment it started with (before the
 #                      knobs file), but the shell's own (PWD, SHLVL, OLDPWD, _), sorted, space-separated
-#   FAKE_MAKE_OUT      printed as the run's last line (default "test result: ok. 3 passed")
+#   FAKE_MAKE_OUT      printed as the run's last line (default "test result: ok. 3 passed"); a value of several lines
+#                      (a cargo test failure's output) is its last lines; no backslash (macOS sh's echo reads one)
 #   FAKE_MAKE_EXIT     the exit status (default 0)
 #   FAKE_MAKE_SLEEP    when set, a `sleep` of that many seconds runs (a child in make's process group) before the
 #                      output

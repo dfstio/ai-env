@@ -686,7 +686,9 @@
         "signer",
         "markers",
         "docker_image",
-        "auto"
+        "auto",
+        "attempt",
+        "test"
       ],
       "required": [
         "version",

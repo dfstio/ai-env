@@ -1338,7 +1338,7 @@ fn the_s10_sections_vm_keys_are_bridge_toml_at_their_defaults() {
 /// code changes fails here before the docs drift from it.
 #[test]
 fn the_s11_section_states_what_the_code_does() {
-    use ai_env_cli::bridge::claude::{ADMIT_COOLDOWN, CLAUDE_GC_KEEP_LOCAL, CLAUDE_GC_KEEP_STAGED, STAGER_MAX_DURATION_S};
+    use ai_env_cli::bridge::claude::{ADMIT_COOLDOWN, ADMIT_DOCKER_TRIES, CLAUDE_GC_KEEP_LOCAL, CLAUDE_GC_KEEP_STAGED, STAGER_MAX_DURATION_S};
     use ai_env_cli::bridge::remote::{audit_event, census_part, AFTER_OUTPUT_FALLBACK, ARGV_DROP_MAX, CLAUDE_SRC_WHYS, WARM_CLAUDE_WAIT};
     use ai_env_cli::bridge::{audit, cost, panel, s3::stage};
     use ai_env_cli::commands::DoctorLine;
@@ -1361,6 +1361,7 @@ fn the_s11_section_states_what_the_code_does() {
         format!("`{fallback}`"),
         "`[claude].auto_admit` is on (the default)".into(),
         format!("more than {} minutes ago", ADMIT_COOLDOWN.as_secs() / 60),
+        format!("up to {ADMIT_DOCKER_TRIES} attempts in all, {} minutes apart", ADMIT_COOLDOWN.as_secs() / 60),
         format!("no credential, {STAGER_MAX_DURATION_S} s"),
         format!("{} s after its start", AFTER_OUTPUT_FALLBACK.as_secs()),
         format!("waiting up to {} s", WARM_CLAUDE_WAIT.as_secs()),

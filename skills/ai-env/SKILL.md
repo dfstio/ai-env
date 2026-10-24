@@ -130,8 +130,9 @@ Docker tests), stages it in S3, and VMs fetch it; until then chats run an older 
 the image's own claude (a chat's census row says which: `claude_src:`). Never suggest turning
 Cursor's Auto Update off. `ai-env claude status` shows each version's phase (no AWS, no Touch ID).
 `ai-env claude admit` runs this checkout's Docker tests on a new version for minutes (the user's to
-start; in remote mode the wrapper starts it by itself): while one runs, do not edit the ai-env
-checkout (it tests the working tree, and an edit fails it). `ai-env claude stage`, `update`, `forget` and `gc --yes` change
+start; in remote mode the wrapper starts it by itself, and tries a failed Docker run again, 3 attempts
+in all, 15 minutes apart): while one runs, do not edit the ai-env checkout (it tests the working tree,
+and an edit fails it). `ai-env claude stage`, `update`, `forget` and `gc --yes` change
 S3 and ask for Touch IDs: the user's to run, never yours.
 
 **The audit, the cost and the panel.** `ai-env audit tail`, `ai-env audit grep` and `ai-env cost`

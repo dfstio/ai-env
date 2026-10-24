@@ -979,8 +979,14 @@ ai-env wrapper uninstall --write                    # no wrapper at all: Cursor 
 ```
 
 **A Touch ID per session (D1).** Every remote wrapper process unseals the runtime key itself: one Touch
-ID each for the chat, Cursor's config probe and the prewarm below, and for any other session Cursor
-starts under the roots (the sign-in, prompt-suggestion queries when enabled). With a current
+ID each for the chat and the prewarm below, and for any other session Cursor starts under the roots:
+the sign-in, prompt-suggestion queries when enabled, and Cursor's config probe, which it starts only
+when a Claude view asks for its config and no chat claims the request within 0.5 s: after the wrapper
+setting is set or cleared, a sign-in or sign-out, or a chat that ended before answering `initialize`.
+A new tab's chat launches within tens of milliseconds and answers the request itself (a tab Cursor
+restores with a window may launch later, and its launch then stops the probe that started meanwhile),
+so a window's first Claude tab asks two (the prewarm's, then its chat's) when the workspace has no VM
+to reuse, and every later tab one (a prewarm that stages a new version aside: stage S11). With a current
 `combined.env` that one prompt also opens the setup-token for a VM that does not hold it yet (without
 one, that is a second prompt). Nothing keeps a key between processes
 (S15's daemon is the later fix), so a Cursor reload costs two to four prompts, shown one at a time. The
@@ -1898,22 +1904,30 @@ compressed `session stage`. Its image is 13.0: an older VM keeps running chats o
    a `[!! ]` row naming the next step, never a `[NO ]`.
 2. In remote mode the first wrapper that sees V (Cursor's `auth status --json` when a window opens, or
    a remote chat's start) starts `ai-env claude admit V --auto` detached, with no Touch ID and nothing
-   in Cursor's way, when `[claude].auto_admit` is on (the default), this Mac's record of V is missing
-   or not past `signed`, the last try for V ended more than 15 minutes ago (`state/claude/V.lock` holds its
-   outcome) and an `ai-env` sits next to the wrapper. The admission then needs Docker answering,
-   cargo on its PATH (Cursor's), this checkout and the local image `ai-env-agent:local` (`make
-   image-build-local`); without one it records nothing, and the lock says which (`skipped(no_docker)`,
-   `skipped(no_cargo)`, `skipped(no_checkout)`, `skipped(no_image)`). In passthrough nothing starts
-   it: run `ai-env claude admit`.
+   in Cursor's way, when `[claude].auto_admit` is on (the default), this Mac's record of V is missing,
+   not past `signed`, or `failed(docker)` with attempts left (step 3), the last try for V ended more
+   than 15 minutes ago (`state/claude/V.lock` holds its outcome) and an `ai-env` sits next to the
+   wrapper. The admission then needs Docker answering, cargo on its PATH (Cursor's), this checkout and
+   the local image `ai-env-agent:local` (`make image-build-local`); without one it records nothing,
+   and the lock says which (`skipped(no_docker)`, `skipped(no_cargo)`, `skipped(no_checkout)`,
+   `skipped(no_image)`). In passthrough nothing starts it: run `ai-env claude admit`.
 3. The admission (no Touch ID, no AWS call): the release's `manifest.json` and its signature, checked
    by `gpgv` against the vendored key alone; the Linux arm64 binary, downloaded and checked against the
    signed size and SHA-256; its markers (texts the code relies on, the strings a move needs among
    them); then `make claude-admit-docker`, this checkout's claude-facing Docker tests run on that
    binary in `target/claude-admit` (the first build takes several GB and many minutes, a later one 2 to
    5 minutes), with no key in its environment. The verdict goes into `state/claude/V.toml`: admitted,
-   or `failed(STEP)`, which stands until `ai-env claude admit V --redo`; a step that may pass again
-   (the network, gpgv missing) records nothing. The tests run on the working tree: no edit in the
-   checkout while an admission runs, or it fails (`failed(docker)`, then `--redo`).
+   or `failed(STEP)`, which stands until `ai-env claude admit V --redo`, but for `failed(docker)`: a
+   Docker run that failed (a busy Mac's load can fail one) is tried again by the automatic admission,
+   up to 3 attempts in all, 15 minutes apart, each attempt checking every step again (the signed
+   manifest, the binary's size and SHA-256, its markers) before the tests. The record counts the
+   failures and keeps the failing tests' lines and first panic (`ai-env claude admit V --json` shows
+   them; the next run writes `logs/claude-admit-V.log` anew); `ai-env claude status` and doctor name
+   the first failing test, the attempt and when the next one may start, or that the attempts are
+   spent. A refused signature, binary or marker is never tried again by itself, and `--redo` runs
+   whatever the count. A step that may pass again (the network, gpgv missing) records nothing. The
+   tests run on the working tree: no edit in the checkout while an admission runs, or it fails
+   (`failed(docker)`: tried again 15 minutes later, or `--redo`).
 4. The stage (one Touch ID, the runtime key's): a stager VM (`--egress internet`, no credential, 900 s,
    purpose `claude-stage`) streams V's release from downloads.claude.ai into an S3 PUT the Mac presigned
    with the signed length, the SHA-256 and a new-only condition, so S3 takes no other bytes; the Mac
@@ -1962,13 +1976,15 @@ holds, its `412`, counts as staged). `ai-env claude update [VERSION]` admits whe
 `--local`, which leaves S3 as it is), its binary on this Mac and its record, and refuses a version a
 live Cursor window runs unless `--force`. `ai-env claude gc --yes` keeps in S3 the 3 newest staged
 versions, the bundle's and every live window's, deletes the others' objects (one Touch ID), and keeps
-the 2 newest binaries on this Mac. Their audit rows are `claude_admit` (with `auto` for the wrapper's)
-and `claude_stage`; the VMs' fetches write `claude_fetch` and `claude_object_bad`.
+the 2 newest binaries on this Mac. Their audit rows are `claude_admit` (with `auto` for the wrapper's,
+and a Docker failure's `attempt` and first failing `test`) and `claude_stage`; the VMs' fetches write
+`claude_fetch` and `claude_object_bad`.
 
 **Doctor, wrapper status and the pin.** One row per version the installed bundle or a live window
 runs, newest first, never `[NO ]`: `[ok ]` when chats run it (staged, or the image's own claude),
 else `[!! ]` naming the claude chats run meanwhile and the next command (`ai-env claude admit`,
-`stage`, or `admit --redo` after a failure); then
+`stage`, or `admit --redo` after a failure; a Docker failure's row names its first failing test and
+its attempt, then the automatic retry and from when, or that the attempts are spent); then
 `[-  ] the image's claude 2.1.305 runs where no staged version can`. S10's image
 claude row and its Auto Update advice are gone. `ai-env infra pin --check-bundle` says
 `pin: lock 2.1.305 is the image's fallback; Cursor bundle V: VMs follow it (ai-env claude status)`

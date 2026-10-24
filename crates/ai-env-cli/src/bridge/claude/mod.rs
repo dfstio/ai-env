@@ -24,6 +24,11 @@ use std::time::Duration;
 
 /// D5 (LD-11): an automatic admission of a version is tried again only this long after the last one ended.
 pub const ADMIT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// D5 as Mike amended it on 24 Oct (a Docker run failed once under load on a busy Mac, then passed three times):
+/// the automatic admission runs a version whose Docker tests failed (`failed(docker)`) again while fewer than this
+/// many Docker failures are recorded for it ([`Record::docker_failures`]), each try [`ADMIT_COOLDOWN`] after the
+/// last one ended; every other failed step stays final for it, and `--redo` admits again whatever the count.
+pub const ADMIT_DOCKER_TRIES: u32 = 3;
 /// The admission's Docker run (`make claude-admit-docker`) is ended past this.
 pub const ADMIT_MAKE_BOUND: Duration = Duration::from_secs(30 * 60);
 /// `ai-env claude gc` keeps this many newest staged versions' objects (beside the bundle's and every live window's).
@@ -94,6 +99,19 @@ pub struct AdmissionRow {
     pub markers: Option<String>,
     /// The Docker run's last line.
     pub docker: Option<String>,
+    /// `failed(docker)`: the first failing test's name (cargo's `test NAME ... FAILED`, else libtest's closing
+    /// `failures:` list), when the log names one that is an id (at most 200 characters, none the scrubber changes).
+    pub docker_test: Option<String>,
+    /// How many Docker runs of this version failed since it was last admitted, the last one included (`--auto` or
+    /// by hand; [`ADMIT_DOCKER_TRIES`]); 0, and absent from the file, once admitted. A record from before the count
+    /// reads 0 ([`Record::docker_failures`] counts its own failure).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub docker_failures: u32,
+    /// `failed(docker)`: the make log's excerpt (`admit::docker_excerpt`): each failing test's line and each
+    /// thread's first panic, else the log's last lines; scrubbed, at most 300 characters a line, 12 lines and 4 KiB.
+    /// The next run writes the log anew; the record keeps what failed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub docker_excerpt: Vec<String>,
     /// The local image's id the tests ran on.
     pub docker_image: Option<String>,
     /// The ai-env version that ran it.
@@ -101,6 +119,12 @@ pub struct AdmissionRow {
     /// The wrapper's `--auto` child ran it.
     pub auto: bool,
     pub at: String,
+}
+
+/// A count left out of the record while it is 0, so a record that never failed at Docker (an admitted one too) holds
+/// no key an older ai-env, whose records refuse unknown keys, would not read.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +317,60 @@ impl Record {
         let sha256 = sig.linux_sha256.clone()?;
         Some(ClaudeRef { version: self.version.clone(), sha256 })
     }
+
+    /// Its Docker failures since it was last admitted (`admission.docker_failures`); a `failed(docker)` record
+    /// written before the count (which reads 0) counts its own failure, 1.
+    #[must_use]
+    pub fn docker_failures(&self) -> u32 {
+        let n = self.admission.as_ref().map_or(0, |a| a.docker_failures);
+        if self.failed_at_docker() {
+            n.max(1)
+        } else {
+            n
+        }
+    }
+
+    /// `phase() == failed(docker)`: the Docker tests' make failed (its time bound included); a stop by a signal or
+    /// an image changed under the run records nothing.
+    fn failed_at_docker(&self) -> bool {
+        matches!(self.phase(), Phase::Failed(step) if step == "docker")
+    }
+
+    /// D5's retry (Mike's rule, 24 Oct): the automatic admission runs it again, as for a missing or `signed` record,
+    /// once its cooldown is over ([`Record::auto_retry_from`]): its admission failed at `docker` with fewer than
+    /// [`ADMIT_DOCKER_TRIES`] Docker failures recorded. Every other failed step stays final until `--redo`: the
+    /// signature, the download's size or sha256 (`failed(download)`), the markers, and a VM's `version` or two bad
+    /// `stage`s.
+    #[must_use]
+    pub fn auto_retry(&self) -> bool {
+        self.failed_at_docker() && self.docker_failures() < ADMIT_DOCKER_TRIES
+    }
+
+    /// When [`Record::auto_retry`] holds: the Unix time its retry may start, [`ADMIT_COOLDOWN`] after the failure's
+    /// `at` (a failure by hand writes no `finished_at` into the lock, so its own time counts too); `None` when it does
+    /// not hold or that time does not read (then the lock's `finished_at` alone spaces the tries).
+    #[must_use]
+    pub fn auto_retry_from(&self) -> Option<u64> {
+        let at = self.admission.as_ref().filter(|_| self.auto_retry()).and_then(|a| crate::wire::time::parse_rfc3339_utc(&a.at))?;
+        Some(at.saturating_add(ADMIT_COOLDOWN.as_secs()))
+    }
+}
+
+/// A Docker failure's count as every view says it: `attempt N of ADMIT_DOCKER_TRIES` (past them, by `--redo`:
+/// `attempt N`).
+#[must_use]
+pub fn attempt_words(n: u32) -> String {
+    if n <= ADMIT_DOCKER_TRIES {
+        format!("attempt {n} of {ADMIT_DOCKER_TRIES}")
+    } else {
+        format!("attempt {n}")
+    }
+}
+
+/// When an automatic retry of `r` may start, as the views say it: ` from <RFC 3339 UTC>` (empty when its time does
+/// not read).
+fn retry_when(r: &Record) -> String {
+    r.auto_retry_from().map(|t| format!(" from {}", crate::wire::time::rfc3339_utc(t))).unwrap_or_default()
 }
 
 /// `N.N.N` as numbers, for ordering versions part by part.
@@ -428,13 +506,15 @@ pub fn needs_staging(paths: &Paths, version: &str) -> bool {
     matches!(Record::load(paths, version), Ok(Some(r)) if matches!(r.phase(), Phase::Admitted | Phase::Stale))
 }
 
-/// D5 (§4.7): when V's record is missing or `signed`, the cooldown is over and its lock is free, `ai-env claude
-/// admit <v> --auto` started detached. File reads, at most one double fork; never a wait. In order:
-/// `[claude].auto_admit` (`off`); under the fake API, the three admission knobs (`lab`); V's record (`has_record`
-/// for any phase past `signed`, or a record that does not read); `state/claude/<v>.lock` taken without waiting
-/// (`admitting` while held) and its `finished_at=` line (`recent` within [`ADMIT_COOLDOWN`]); the sibling `ai-env`
-/// next to the wrapper (`no_sibling`); then the prewarm's double fork (`spawn_failed`), the lock's open file on
-/// fd 3, stdio on `/dev/null`, the prewarm's environment.
+/// D5 (§4.7): when V's record is missing or `signed`, or (Mike's rule, 24 Oct) `failed(docker)` with tries left
+/// ([`Record::auto_retry`]), the cooldown is over and its lock is free, `ai-env claude admit <v> --auto` started
+/// detached. File reads, at most one double fork; never a wait. In order: `[claude].auto_admit` (`off`); under the
+/// fake API, the three admission knobs (`lab`); V's record (`has_record` for any phase past `signed` but a Docker
+/// failure with tries left, or a record that does not read; `recent` while that failure is younger than
+/// [`ADMIT_COOLDOWN`]); `state/claude/<v>.lock` taken without waiting (`admitting` while held) and its
+/// `finished_at=` line (`recent` within [`ADMIT_COOLDOWN`]); the sibling `ai-env` next to the wrapper
+/// (`no_sibling`); then the prewarm's double fork (`spawn_failed`), the lock's open file on fd 3, stdio on
+/// `/dev/null`, the prewarm's environment.
 pub fn maybe_auto_admit(paths: &Paths, cfg: &BridgeConfig, version: &str) -> AutoAdmit {
     let sibling = || match crate::bridge::sibling::find_sibling("ai-env") {
         crate::bridge::sibling::Sibling::Next(p) => Some(p),
@@ -455,6 +535,13 @@ fn auto_admit_with(paths: &Paths, cfg: &BridgeConfig, knobs: &crate::bridge::lab
     match Record::load(paths, version) {
         Ok(None) => {}
         Ok(Some(r)) if matches!(r.phase(), Phase::Seen | Phase::Signed) => {}
+        // A Docker failure with tries left: again, once its own cooldown is over too (a run by hand ends without a
+        // `finished_at`). The child reads the record again under the lock.
+        Ok(Some(r)) if r.auto_retry() => {
+            if r.auto_retry_from().is_some_and(|from| crate::wire::time::unix_now() < from) {
+                return AutoAdmit::Skipped("recent");
+            }
+        }
         _ => return AutoAdmit::Skipped("has_record"),
     }
     let lock = match crate::bridge::remote::prewarm::cooldown_lock(&paths.claude_lock(version), ADMIT_COOLDOWN, "admitting") {
@@ -481,6 +568,13 @@ pub enum AutoAdmit {
     Skipped(&'static str),
 }
 
+/// The phase words (`Phase::word`, as `ClaudePlan.phase` holds them) a remote P0 hands to [`maybe_auto_admit`]:
+/// `seen`, `signed` and `failed(docker)`, whose tries and cooldown the trigger judges itself.
+#[must_use]
+pub fn auto_admit_phase(word: &str) -> bool {
+    matches!(word, "seen" | "signed" | "failed(docker)")
+}
+
 /// The installed Cursor bundle's Claude Code version (`doctor::pick_bundle` of `~/.cursor/extensions`, as
 /// `infra pin --bundle-version` reads it), `N.N.N` only.
 #[must_use]
@@ -490,7 +584,7 @@ pub fn installed_bundle() -> Option<String> {
 }
 
 /// Why a failed version failed, as `status` and the doctor rows say it: the signature's word, the markers' missing
-/// one, the Docker run's last line, or the step's own words.
+/// one, the first failing Docker test (`test NAME failed`), else the Docker run's last line, or the step's own words.
 #[must_use]
 pub fn failed_why(r: &Record) -> Option<String> {
     if let Some(sig) = r.signature.as_ref().filter(|s| s.outcome == "failed") {
@@ -499,7 +593,7 @@ pub fn failed_why(r: &Record) -> Option<String> {
     let adm = r.admission.as_ref().filter(|a| a.outcome == "failed")?;
     Some(match adm.step.as_deref() {
         Some("markers") => adm.markers.clone().unwrap_or_else(|| "a marker is missing".into()),
-        Some("docker") => adm.docker.clone().unwrap_or_else(|| "the Docker tests failed".into()),
+        Some("docker") => adm.docker_test.as_ref().map(|t| format!("test {t} failed")).or_else(|| adm.docker.clone()).unwrap_or_else(|| "the Docker tests failed".into()),
         Some("download") => "the binary is not the signed manifest's".into(),
         Some("version") => "a VM found another version in it".into(),
         Some("stage") => "VMs refused two stages in a row".into(),
@@ -508,9 +602,12 @@ pub fn failed_why(r: &Record) -> Option<String> {
 }
 
 /// `status --json`'s document (pure): every version the records, the installed bundle and the live windows name,
-/// newest first, with its phase, ref, size, staging state, admission time and why it failed (absent values `null`).
+/// newest first, with its phase, ref, size, staging state, admission time and why it failed (absent values `null`),
+/// its Docker failures since it was last admitted (`docker_failures`, 0 without one) and, for a Docker failure the
+/// automatic admission runs again (`auto_admit` on and the wrapper's mode `remote`, doctor's T6: in passthrough no
+/// wrapper starts it; tries left), the time that retry may start (`retry_from`, RFC 3339 UTC, else `null`).
 #[must_use]
-pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], image: Option<&str>, auto_admit: bool) -> serde_json::Value {
+pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], image: Option<&str>, auto_admit: bool, remote: bool) -> serde_json::Value {
     let mut versions: Vec<String> = records.iter().map(|r| r.version.clone()).chain(bundle.map(str::to_string)).chain(windows.iter().cloned()).filter(|v| crate::wire::pin::is_version(v)).collect();
     versions.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
     versions.dedup();
@@ -526,6 +623,8 @@ pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], 
                 "staged": r.and_then(|r| r.staging.as_ref()).map(|s| s.state.clone()),
                 "admitted_at": r.and_then(|r| r.admission.as_ref()).filter(|a| a.outcome == "admitted").map(|a| a.at.clone()),
                 "why": r.and_then(failed_why),
+                "docker_failures": r.map_or(0, Record::docker_failures),
+                "retry_from": r.filter(|_| auto_admit && remote).and_then(Record::auto_retry_from).map(crate::wire::time::rfc3339_utc),
             })
         })
         .collect();
@@ -535,13 +634,15 @@ pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], 
     serde_json::json!({ "versions": rows, "bundle": bundle, "windows": win, "image": image, "auto_admit": auto_admit })
 }
 
-/// `status`'s text lines from its document: one per version (its phase, who runs it, why it failed), then the image's
-/// fallback and the automatic admission's setting.
+/// `status`'s text lines from its document: one per version (its phase, who runs it, why it failed; a Docker
+/// failure's attempt and whether an automatic retry follows, from when, or that its tries are spent), then the
+/// image's fallback and the automatic admission's setting.
 #[must_use]
 pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
     let s = |v: &serde_json::Value| v.as_str().map(str::to_string);
     let bundle = s(&doc["bundle"]);
     let windows: Vec<String> = doc["windows"].as_array().map(|a| a.iter().filter_map(s).collect()).unwrap_or_default();
+    let auto_admit = doc["auto_admit"].as_bool() == Some(true);
     let mut lines = Vec::new();
     for v in doc["versions"].as_array().into_iter().flatten() {
         let version = s(&v["version"]).unwrap_or_default();
@@ -552,9 +653,11 @@ pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
         if windows.contains(&version) {
             runs.push("a live Cursor window");
         }
-        let mut line = format!("claude {version}: {}", s(&v["phase"]).unwrap_or_default());
+        let phase = s(&v["phase"]).unwrap_or_default();
+        let mut line = format!("claude {version}: {phase}");
         if let Some(why) = s(&v["why"]) {
-            line.push_str(&format!(" ({why})"));
+            let docker = if phase == "failed(docker)" { docker_status(&version, v) } else { String::new() };
+            line.push_str(&format!(" ({why}{docker})"));
         }
         if !runs.is_empty() {
             line.push_str(&format!("; run by {}", runs.join(" and ")));
@@ -565,20 +668,38 @@ pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
         lines.push("no Claude Code version known yet (no record, no Cursor bundle, no live window)".into());
     }
     lines.push(format!("the image's claude {} runs where no staged version can", s(&doc["image"]).unwrap_or_else(|| "unknown".into())));
-    let auto = if doc["auto_admit"].as_bool() == Some(true) { "on: a wrapper starts ai-env claude admit <v> --auto while Docker answers" } else { "off: only ai-env claude admit or update admits" };
+    let auto = if auto_admit { "on: a wrapper starts ai-env claude admit <v> --auto while Docker answers" } else { "off: only ai-env claude admit or update admits" };
     lines.push(format!("automatic admission ([claude].auto_admit): {auto}"));
     lines
 }
 
+/// A Docker failure's part of `status`' parenthetical, from its row: `; attempt N of 3`, then whether the automatic
+/// admission runs it again (`; an automatic retry from <T> (the next remote wrapper starts it)`, the row's
+/// `retry_from`: `auto_admit` on in remote mode) or its tries are spent (`, no automatic retry left: fix it, then
+/// ai-env claude admit <v> --redo`).
+fn docker_status(version: &str, row: &serde_json::Value) -> String {
+    let n = row["docker_failures"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+    let attempt = attempt_words(n);
+    if n >= ADMIT_DOCKER_TRIES {
+        format!("; {attempt}, no automatic retry left: fix it, then ai-env claude admit {version} --redo")
+    } else if let Some(from) = row["retry_from"].as_str() {
+        format!("; {attempt}; an automatic retry from {from} (the next remote wrapper starts it)")
+    } else {
+        format!("; {attempt}")
+    }
+}
+
 /// `ai-env claude status [--json]` (§7.1): local reads only, no Touch ID: the records, the installed bundle, the live
-/// windows (the census), the deployed image's claude (`state/infra.toml`) and `[claude].auto_admit`.
+/// windows (the census), the deployed image's claude (`state/infra.toml`), `[claude].auto_admit` and `[wrapper].mode`
+/// (a Docker failure's retry promised only in remote mode, as doctor's T6 rule).
 pub fn cmd_status(json: bool) -> crate::errors::Result<()> {
     let paths = Paths::resolve()?;
-    let auto_admit = BridgeConfig::load(&paths).ok().flatten().unwrap_or_default().claude.auto_admit;
+    let cfg = BridgeConfig::load(&paths).ok().flatten().unwrap_or_default();
+    let remote = matches!(cfg.wrapper.wrapper_mode(), Ok(crate::bridge::config::WrapperMode::Remote));
     let records = load_all(&paths);
     let windows: Vec<String> = crate::bridge::doctor::running_windows().into_iter().map(|w| w.ext).filter(|e| crate::wire::pin::is_version(e)).collect();
     let image = crate::bridge::infra::read_infra_state(&paths).ok().flatten().and_then(|s| s.claude_version);
-    let doc = status_doc(&records, installed_bundle().as_deref(), &windows, image.as_deref(), auto_admit);
+    let doc = status_doc(&records, installed_bundle().as_deref(), &windows, image.as_deref(), cfg.claude.auto_admit, remote);
     if json {
         crate::outln!("{}", serde_json::to_string_pretty(&doc).map_err(|e| crate::errors::CliError::Msg(format!("cannot render JSON: {e}")))?);
     } else {
@@ -793,13 +914,13 @@ pub(crate) mod tests {
         for (v, c, phase) in [("2.1.306", 'a', "seen"), ("2.1.307", 'b', "signed"), ("2.1.308", 'c', "admitted"), ("2.1.309", 'd', "failed"), ("2.1.310", 'e', "staged"), ("2.1.311", 'f', "stale")] {
             put(&p, v, c, phase);
         }
-        let doc = status_doc(&load_all(&p), Some("2.1.320"), &["2.1.310".to_string(), "2.1.310".to_string()], Some("2.1.305"), true);
+        let doc = status_doc(&load_all(&p), Some("2.1.320"), &["2.1.310".to_string(), "2.1.310".to_string()], Some("2.1.305"), true, true);
         let phases: Vec<(String, String)> = doc["versions"].as_array().unwrap().iter().map(|v| (v["version"].as_str().unwrap().to_string(), v["phase"].as_str().unwrap().to_string())).collect();
         let want = [("2.1.320", "seen"), ("2.1.311", "stale"), ("2.1.310", "staged"), ("2.1.309", "failed(markers)"), ("2.1.308", "admitted"), ("2.1.307", "signed"), ("2.1.306", "seen")];
         assert_eq!(phases, want.map(|(v, p)| (v.to_string(), p.to_string())));
         let row = |v: &str| doc["versions"].as_array().unwrap().iter().find(|r| r["version"] == v).unwrap().clone();
-        assert_eq!(row("2.1.310"), serde_json::json!({"version": "2.1.310", "phase": "staged", "sha256": "e".repeat(64), "size": 290, "staged": "staged", "admitted_at": "2026-10-23T10:05:00Z", "why": null}));
-        assert_eq!(row("2.1.320"), serde_json::json!({"version": "2.1.320", "phase": "seen", "sha256": null, "size": null, "staged": null, "admitted_at": null, "why": null}));
+        assert_eq!(row("2.1.310"), serde_json::json!({"version": "2.1.310", "phase": "staged", "sha256": "e".repeat(64), "size": 290, "staged": "staged", "admitted_at": "2026-10-23T10:05:00Z", "why": null, "docker_failures": 0, "retry_from": null}));
+        assert_eq!(row("2.1.320"), serde_json::json!({"version": "2.1.320", "phase": "seen", "sha256": null, "size": null, "staged": null, "admitted_at": null, "why": null, "docker_failures": 0, "retry_from": null}));
         assert_eq!(row("2.1.309")["why"], "missing:auto_mode");
         assert_eq!((doc["bundle"].as_str(), doc["image"].as_str(), doc["auto_admit"].as_bool()), (Some("2.1.320"), Some("2.1.305"), Some(true)));
         assert_eq!(doc["windows"], serde_json::json!(["2.1.310"]));
@@ -808,7 +929,7 @@ pub(crate) mod tests {
             assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
         }
         assert!(lines.last().unwrap().starts_with("automatic admission ([claude].auto_admit): on"), "{lines:?}");
-        let none = status_lines(&status_doc(&[], None, &[], None, false));
+        let none = status_lines(&status_doc(&[], None, &[], None, false, false));
         assert_eq!(none.len(), 3, "{none:?}");
         assert!(none[1].contains("unknown") && none[2].contains(": off"), "{none:?}");
     }
@@ -875,4 +996,172 @@ pub(crate) mod tests {
         assert!(needs_staging(&p, "2.1.316") && !needs_staging(&p, "2.1.317"));
     }
 
+    /// A record of `v` whose admission failed at `docker` (the make log's `l2_x` failed), `failures` recorded (0: a
+    /// record from before the count), at `at` (RFC 3339 UTC).
+    pub(crate) fn put_docker(p: &Paths, v: &str, c: char, failures: u32, at: &str) -> Record {
+        put(p, v, c, "signed");
+        Record::update(p, v, |r| {
+            r.admission = Some(AdmissionRow {
+                outcome: "failed".into(),
+                step: Some("docker".into()),
+                markers: Some("ok".into()),
+                docker: Some("make: *** [claude-admit-docker] Error 101".into()),
+                docker_test: Some("l2_x".into()),
+                docker_failures: failures,
+                docker_excerpt: vec!["test l2_x ... FAILED".into()],
+                ai_env: "0.1.0".into(),
+                auto: true,
+                at: at.into(),
+                ..AdmissionRow::default()
+            });
+        })
+        .unwrap()
+    }
+
+    /// Mike's rule (24 Oct): D5's trigger forks for a Docker failure with 0 (a record from before the count), 1 or 2
+    /// failures recorded once its cooldown is over, as for a missing or signed record; never within the cooldown
+    /// (the lock's `finished_at`, or the failure's own time: a run by hand writes no `finished_at`), while the lock
+    /// is held, at 3, nor for any other failed step (the signature; the download's size or sha256, recorded as
+    /// `failed(download)`; the markers; a VM's version or two bad stages). P0 hands it `failed(docker)` too.
+    #[test]
+    fn auto_admit_retries_a_docker_failure_with_tries_left_after_its_cooldown() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cfg = BridgeConfig::default();
+        let knobs = crate::bridge::lab::VmKnobs::default();
+        let child = dir.path().join("admit.sh");
+        let log = dir.path().join("admit.log");
+        std::fs::write(&child, format!("#!/bin/sh\necho \"$@\" >> '{}'\nprintf 'finished_at=%s\\noutcome=failed(docker)\\n' \"$(date +%s)\" >&3\n", log.display())).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sibling = || Some(child.clone());
+        let now = crate::wire::time::unix_now();
+        let old = crate::wire::time::rfc3339_utc(now - ADMIT_COOLDOWN.as_secs() - 60);
+        let trigger = |v: &str| auto_admit_with(&p, &cfg, &knobs, v, &sibling);
+        let settled = |v: &str| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let r = trigger(v);
+                if r != AutoAdmit::Skipped("admitting") || std::time::Instant::now() > until {
+                    return r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        for (v, failures) in [("2.1.320", 0), ("2.1.321", 1), ("2.1.322", 2)] {
+            let r = put_docker(&p, v, 'a', failures, &old);
+            assert!(r.auto_retry() && auto_admit_phase(&r.phase().word()), "{v}");
+            assert!(matches!(trigger(v), AutoAdmit::Spawned(pid) if pid > 0), "{v}: {failures} recorded");
+            assert_eq!(settled(v), AutoAdmit::Skipped("recent"), "{v}: the child's end starts the cooldown");
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "claude admit 2.1.320 --auto\nclaude admit 2.1.321 --auto\nclaude admit 2.1.322 --auto\n");
+        // The tries spent: the record stands until --redo.
+        for failures in [3, 4] {
+            let r = put_docker(&p, "2.1.323", 'b', failures, &old);
+            assert!(!r.auto_retry());
+            assert_eq!(trigger("2.1.323"), AutoAdmit::Skipped("has_record"), "{failures} recorded");
+        }
+        // Within the cooldown of the failure's own time (a run by hand): no lock taken, no fork.
+        put_docker(&p, "2.1.324", 'c', 1, &crate::wire::time::rfc3339_utc(now - 60));
+        assert_eq!(trigger("2.1.324"), AutoAdmit::Skipped("recent"));
+        assert!(!p.claude_lock("2.1.324").exists(), "decided from the record alone");
+        // Within the lock's `finished_at` cooldown; while another holds the lock.
+        put_docker(&p, "2.1.325", 'd', 1, &old);
+        std::fs::write(p.claude_lock("2.1.325"), format!("finished_at={}\noutcome=skipped(no_docker)\n", now - 60)).unwrap();
+        assert_eq!(trigger("2.1.325"), AutoAdmit::Skipped("recent"));
+        put_docker(&p, "2.1.326", 'e', 2, &old);
+        let held = crate::bridge::vm::lock::try_lock_exclusive(&p.claude_lock("2.1.326")).unwrap().expect("the lock is free");
+        assert_eq!(trigger("2.1.326"), AutoAdmit::Skipped("admitting"));
+        drop(held);
+        // Every other failed step stays final for the automatic path, whatever its time.
+        let failed_sig = Record::update(&p, "2.1.330", |r| r.signature = Some(SignatureRow { outcome: "failed".into(), why: Some("bad".into()), at: old.clone(), ..SignatureRow::default() })).unwrap();
+        assert_eq!(failed_sig.phase().word(), "failed(signature)");
+        for (v, step) in [("2.1.331", "download"), ("2.1.332", "markers"), ("2.1.333", "version"), ("2.1.334", "stage")] {
+            put_docker(&p, v, 'f', 1, &old);
+            let r = Record::update(&p, v, |r| r.admission.as_mut().unwrap().step = Some(step.into())).unwrap();
+            assert_eq!((r.phase().word(), r.auto_retry(), auto_admit_phase(&r.phase().word())), (format!("failed({step})"), false, false));
+        }
+        for v in ["2.1.330", "2.1.331", "2.1.332", "2.1.333", "2.1.334"] {
+            assert_eq!(trigger(v), AutoAdmit::Skipped("has_record"), "{v}");
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3, "no other fork");
+        for (word, handed) in [("seen", true), ("signed", true), ("failed(docker)", true), ("failed(markers)", false), ("admitted", false), ("staged", false), ("stale", false)] {
+            assert_eq!(auto_admit_phase(word), handed, "{word}");
+        }
+    }
+
+    /// A record written before the count (an older ai-env's `failed(docker)`) reads, and counts its failure as 1;
+    /// a record that never failed at Docker holds none of the new keys, so an older ai-env still reads it.
+    #[test]
+    fn a_record_from_before_the_count_reads_and_counts_its_docker_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir_all(p.claude_dir()).unwrap();
+        let sha = "a".repeat(64);
+        let old = format!(
+            "v = 1\nversion = \"2.1.309\"\ncreated = \"2026-10-23T10:00:00Z\"\n\n[signature]\noutcome = \"ok\"\nlinux_sha256 = \"{sha}\"\nlinux_size = 290\nat = \"2026-10-23T10:00:00Z\"\n\n[admission]\noutcome = \"failed\"\nstep = \"docker\"\nmarkers = \"ok\"\ndocker = \"make: *** [claude-admit-docker] Error 101\"\nai_env = \"0.1.0\"\nauto = true\nat = \"2026-10-23T10:05:00Z\"\n"
+        );
+        std::fs::write(p.claude_record("2.1.309"), old).unwrap();
+        let r = Record::load(&p, "2.1.309").unwrap().expect("it reads");
+        let adm = r.admission.clone().unwrap();
+        assert_eq!((adm.docker_failures, adm.docker_test.as_deref(), adm.docker_excerpt.len()), (0, None, 0), "absent keys read as their defaults");
+        assert_eq!((r.phase().word(), r.docker_failures(), r.auto_retry()), ("failed(docker)".to_string(), 1, true));
+        assert_eq!(r.auto_retry_from(), crate::wire::time::parse_rfc3339_utc("2026-10-23T10:20:00Z"), "its own time plus the cooldown");
+        assert_eq!(failed_why(&r).as_deref(), Some("make: *** [claude-admit-docker] Error 101"), "no test named: the last line");
+        // Written again (a verdict of the stage, say): still none of the new keys.
+        Record::update(&p, "2.1.309", |_| {}).unwrap();
+        let text = std::fs::read_to_string(p.claude_record("2.1.309")).unwrap();
+        assert!(!text.contains("docker_failures") && !text.contains("docker_excerpt") && !text.contains("docker_test"), "{text}");
+        // A count, a test and an excerpt round-trip; an admission clears them from the file.
+        let counted = put_docker(&p, "2.1.310", 'b', 2, "2026-10-23T10:05:00Z");
+        assert_eq!(Record::load(&p, "2.1.310").unwrap(), Some(counted.clone()));
+        assert_eq!((counted.docker_failures(), counted.auto_retry(), failed_why(&counted).as_deref()), (2, true, Some("test l2_x failed")));
+        let admitted = Record::update(&p, "2.1.310", |r| r.admission = Some(AdmissionRow { outcome: "admitted".into(), markers: Some("ok".into()), ai_env: "0.1.0".into(), at: "t".into(), ..AdmissionRow::default() })).unwrap();
+        assert_eq!((admitted.docker_failures(), admitted.auto_retry(), admitted.auto_retry_from()), (0, false, None));
+        let text = std::fs::read_to_string(p.claude_record("2.1.310")).unwrap();
+        assert!(!text.contains("docker_failures") && !text.contains("docker_excerpt") && !text.contains("docker_test"), "{text}");
+        // A failure's time that does not read: due at once (the lock's `finished_at` still spaces the tries).
+        let odd = put_docker(&p, "2.1.311", 'c', 1, "t");
+        assert_eq!((odd.auto_retry(), odd.auto_retry_from()), (true, None));
+    }
+
+    /// `status` names a Docker failure's first failing test and its attempt, then the automatic retry and from when
+    /// (`[claude].auto_admit` on in remote mode: in passthrough no wrapper starts it, doctor's T6), or the tries spent
+    /// and the `--redo`; `--json` carries the count and the time.
+    #[test]
+    fn status_says_a_docker_failures_attempt_and_its_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
+        put_docker(&p, "2.1.321", 'b', 3, "2026-10-24T13:50:00Z");
+        put_docker(&p, "2.1.322", 'c', 0, "2026-10-24T13:50:00Z");
+        put(&p, "2.1.323", 'd', "failed");
+        let doc = status_doc(&load_all(&p), None, &[], Some("2.1.305"), true, true);
+        let row = |v: &str| doc["versions"].as_array().unwrap().iter().find(|r| r["version"] == v).unwrap().clone();
+        assert_eq!((row("2.1.320")["why"].as_str(), row("2.1.320")["docker_failures"].as_u64(), row("2.1.320")["retry_from"].as_str()), (Some("test l2_x failed"), Some(1), Some("2026-10-24T14:05:00Z")));
+        assert_eq!((row("2.1.321")["docker_failures"].as_u64(), row("2.1.321")["retry_from"].clone()), (Some(3), serde_json::Value::Null), "spent: no retry");
+        assert_eq!((row("2.1.322")["docker_failures"].as_u64(), row("2.1.322")["retry_from"].as_str()), (Some(1), Some("2026-10-24T14:05:00Z")), "a record from before the count");
+        assert_eq!((row("2.1.323")["docker_failures"].as_u64(), row("2.1.323")["retry_from"].clone()), (Some(0), serde_json::Value::Null), "markers: final");
+        let lines = status_lines(&doc);
+        for want in [
+            "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry from 2026-10-24T14:05:00Z (the next remote wrapper starts it))",
+            "claude 2.1.321: failed(docker) (test l2_x failed; attempt 3 of 3, no automatic retry left: fix it, then ai-env claude admit 2.1.321 --redo)",
+            "claude 2.1.322: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry from 2026-10-24T14:05:00Z (the next remote wrapper starts it))",
+            "claude 2.1.323: failed(markers) (missing:auto_mode)",
+        ] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
+        }
+        // The automatic admission off, or on in passthrough: the attempt only, no retry promised.
+        for (auto_admit, remote) in [(false, true), (true, false)] {
+            let off = status_doc(&load_all(&p), None, &[], Some("2.1.305"), auto_admit, remote);
+            assert_eq!(off["versions"].as_array().unwrap().iter().find(|r| r["version"] == "2.1.320").unwrap()["retry_from"], serde_json::Value::Null, "{auto_admit} {remote}");
+            let lines = status_lines(&off);
+            assert!(lines.iter().any(|l| l == "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3)"), "{lines:?}");
+            assert!(lines.iter().any(|l| l.starts_with("claude 2.1.321: failed(docker) (test l2_x failed; attempt 3 of 3, no automatic retry left: ")), "{lines:?}");
+        }
+        // Past the tries by --redo: the attempt alone.
+        put_docker(&p, "2.1.321", 'b', 4, "2026-10-24T13:50:00Z");
+        let lines = status_lines(&status_doc(&load_all(&p), None, &[], None, true, true));
+        assert!(lines.iter().any(|l| l.starts_with("claude 2.1.321: failed(docker) (test l2_x failed; attempt 4, no automatic retry left: ")), "{lines:?}");
+    }
 }

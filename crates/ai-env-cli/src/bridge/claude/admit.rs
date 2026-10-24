@@ -8,9 +8,14 @@
 //! signed manifest's or a missing marker are refusals (exit 9) that stay
 //! until `--redo`. `--auto` is the wrapper's detached child (D5): quiet, its
 //! lock adopted from fd 3, its outcome written into the lock, never a
-//! non-zero exit.
+//! non-zero exit. A failed Docker run (`failed(docker)`, exit 1) is counted
+//! in the record with the make log's excerpt (`docker_excerpt`); `--auto`
+//! runs such a record again, every step checked again as `--redo` would,
+//! while fewer than `ADMIT_DOCKER_TRIES` Docker failures are recorded and
+//! its cooldown is over (Mike's rule, 24 Oct: one Docker failure under load
+//! no longer leaves a version unadmitted).
 use super::release::{self, LabProgram, ReleaseError};
-use super::{AdmissionRow, DownloadRow, Phase, Record, SignatureRow, ADMIT_MAKE_BOUND, CLAUDE_GC_KEEP_LOCAL};
+use super::{AdmissionRow, DownloadRow, Phase, Record, SignatureRow, ADMIT_DOCKER_TRIES, ADMIT_MAKE_BOUND, CLAUDE_GC_KEEP_LOCAL};
 use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::lab::VmKnobs;
@@ -27,6 +32,17 @@ pub const LOCAL_IMAGE: &str = "ai-env-agent:local";
 const DOCKER_BOUND: Duration = Duration::from_secs(10);
 /// The longest Docker line a record keeps.
 const DOCKER_LINE_MAX: usize = 300;
+/// The most lines a Docker failure's excerpt keeps ([`docker_excerpt`]).
+const DOCKER_EXCERPT_LINES: usize = 12;
+/// The most bytes it keeps, a newline counted after each line.
+const DOCKER_EXCERPT_BYTES: usize = 4096;
+/// The log's last non-empty lines it keeps when no line names a failing test or a panic.
+const DOCKER_EXCERPT_TAIL: usize = 5;
+/// The longest test name a record keeps as `docker_test` (an id: the audit's `test`, the views' `test NAME failed`;
+/// this checkout's Docker tests are named in under 100 characters). A longer one is the log's text, not an id: no name
+/// is kept, its line stays in the excerpt, cut there (and an audit row past `MAX_AUDIT_ROW_BYTES` would not be written
+/// at all).
+const DOCKER_TEST_MAX: usize = 200;
 /// How long the binary's download may take (§3.2).
 const DOWNLOAD_MAX_TIME_S: u32 = 900;
 
@@ -451,11 +467,89 @@ fn run_make(make: &Path, repo: &Path, bin: &Path, version: &str, sha256: &str, l
     }
 }
 
+/// The log's text (lossy UTF-8), empty when it cannot be read.
+fn log_text(log: &Path) -> String {
+    std::fs::read(log).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+}
+
 /// The log's last non-empty line, scrubbed, at most [`DOCKER_LINE_MAX`] characters.
-fn last_line(log: &Path) -> String {
-    let text = std::fs::read(log).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+fn last_line(text: &str) -> String {
     let line = text.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("(no output)");
     crate::wire::redact::scrub(line).chars().take(DOCKER_LINE_MAX).collect()
+}
+
+/// A test's name as libtest prints it (`l2_x`, `module::l2_x`): ASCII letters, digits, `_` and `:` only.
+fn test_name(word: &str) -> Option<&str> {
+    (!word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')).then_some(word)
+}
+
+/// What a Docker failure keeps of the make log in its record (Mike's rule, 24 Oct: the next run writes the log
+/// anew, so the record says which test failed and how): the first failing test's name (none past [`DOCKER_TEST_MAX`]
+/// characters or when the scrubber would change it), and the lines that say what failed, in the log's order. Each
+/// failing test's `test NAME ... FAILED` (cargo's line); a name only libtest's closing `failures:` list holds (its
+/// line split by output the test did not capture) as `failures: NAME`; and each thread's first panic: its
+/// `panicked at` line and the line after it (the message's first line, unless blank, libtest's backtrace note or
+/// another panic). With none of them (a build that failed, a run killed at its bound), the log's last
+/// [`DOCKER_EXCERPT_TAIL`] non-empty lines. Each line trimmed, scrubbed (`wire::redact::scrub`) and cut to
+/// [`DOCKER_LINE_MAX`] characters; at most [`DOCKER_EXCERPT_LINES`] lines and [`DOCKER_EXCERPT_BYTES`] bytes, the
+/// first ones kept (pure).
+pub(crate) fn docker_excerpt(log: &str) -> (Option<String>, Vec<String>) {
+    let lines: Vec<&str> = log.lines().collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut threads: Vec<&str> = Vec::new();
+    let mut picked: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if let Some(name) = line.strip_prefix("test ").and_then(|r| r.strip_suffix(" ... FAILED")).and_then(|r| r.split_whitespace().next()).and_then(test_name) {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+                picked.push(line.to_string());
+            }
+        } else if line == "failures:" {
+            // libtest's closing list, one name a line indented by four spaces (its first `failures:` heads the
+            // tests' output instead: a blank line follows it).
+            while let Some(name) = lines.get(i + 1).and_then(|l| l.strip_prefix("    ")).map(str::trim).and_then(test_name) {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                    picked.push(format!("failures: {name}"));
+                }
+                i += 1;
+            }
+        } else if let Some(at) = line.find(" panicked at ") {
+            // `thread 'NAME' panicked at FILE:LINE:COL:`, its message on the next line; a test's thread is named
+            // after it, so the first panic of each thread is each failing test's.
+            let thread = &line[..at];
+            if !threads.contains(&thread) {
+                threads.push(thread);
+                picked.push(line.to_string());
+                let message = |l: &&str| !l.is_empty() && !l.starts_with("note: run with `RUST_BACKTRACE") && !l.contains(" panicked at ");
+                if let Some(message) = lines.get(i + 1).map(|l| l.trim()).filter(message) {
+                    picked.push(message.to_string());
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    if picked.is_empty() {
+        let tail: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        picked = tail[tail.len().saturating_sub(DOCKER_EXCERPT_TAIL)..].iter().map(|l| (*l).to_string()).collect();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut bytes = 0;
+    for line in picked {
+        let line: String = crate::wire::redact::scrub(&line).chars().take(DOCKER_LINE_MAX).collect();
+        if kept.len() == DOCKER_EXCERPT_LINES || bytes + line.len() + 1 > DOCKER_EXCERPT_BYTES {
+            break;
+        }
+        bytes += line.len() + 1;
+        kept.push(line);
+    }
+    // A name stays an id (the audit's `test`): one longer than DOCKER_TEST_MAX, or that the scrubber would change, is
+    // none.
+    let first = names.into_iter().next().filter(|n| n.len() <= DOCKER_TEST_MAX && crate::wire::redact::scrub(n) == n.as_str());
+    (first, kept)
 }
 
 // ---- the admission ------------------------------------------------------------------------------------------------
@@ -532,7 +626,6 @@ pub fn prune_local(paths: &Paths, own: Option<&str>) -> Vec<String> {
 /// fetch, gpgv, the download, the Docker tests, a failed record shown, a lab run without its knobs), 9 a refusal
 /// (the signature, the bytes, a marker).
 pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, opts: AdmitOpts) -> Result<Record, CliError> {
-    let _ = cfg;
     let started = Instant::now();
     if !crate::wire::pin::is_version(version) {
         return Err(CliError::Usage(format!("not a claude version (N.N.N): {version:?}")));
@@ -553,9 +646,13 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
         }
     };
     at_step(&mut lock, "record");
-    // Step 3: a decided record stands without --redo.
+    // Step 3: a decided record stands without --redo. Under --auto a Docker failure with tries left whose cooldown is
+    // over (what D5's trigger read, read again under the lock) is admitted again, every step below checked again as
+    // for --redo: the signed manifest fetched and verified anew, the kept binary's size and sha256 held against it
+    // (else downloaded again), its markers, then the Docker tests (Mike's rule, 24 Oct).
     if let Some(record) = super::Record::load(paths, version)? {
-        if !opts.redo {
+        let retry = opts.auto && record.auto_retry() && record.auto_retry_from().is_none_or(|from| crate::wire::time::unix_now() >= from);
+        if !opts.redo && !retry {
             match record.phase() {
                 Phase::Admitted | Phase::Staged | Phase::Stale => {
                     end(&mut lock, "admitted");
@@ -652,7 +749,7 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
         };
         if (n, s.as_str()) != (size, sha256.as_str()) {
             let _ = std::fs::remove_file(&partial);
-            super::Record::update(paths, version, |r| r.admission = Some(failed("download", None, None)))?;
+            super::Record::update(paths, version, |r| r.admission = Some(AdmissionRow { docker_failures: r.docker_failures(), ..failed("download", None, None) }))?;
             audit(paths, version, "failed", started, opts.auto, &[("step", "download".into()), ("sha256", sha256.clone()), ("signer", verified.signer.clone())]);
             end(&mut lock, "failed(download)");
             return Err(CliError::Policy(format!("claude {version}: the downloaded binary is {n} bytes, sha256 {}…, not the signed manifest's {size} bytes, {}…: not admitted", short(&s), short(&sha256))));
@@ -672,7 +769,7 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
     };
     if let Some(name) = missing {
         let markers = format!("missing:{name}");
-        super::Record::update(paths, version, |r| r.admission = Some(failed("markers", Some(markers.clone()), None)))?;
+        super::Record::update(paths, version, |r| r.admission = Some(AdmissionRow { docker_failures: r.docker_failures(), ..failed("markers", Some(markers.clone()), None) }))?;
         audit(paths, version, "failed", started, opts.auto, &[("step", "markers".into()), ("sha256", sha256.clone()), ("signer", verified.signer.clone()), ("markers", markers.clone())]);
         end(&mut lock, "failed(markers)");
         return Err(CliError::Policy(format!("claude {version}: its Linux binary lacks the marker {name} (a text the code relies on): not admitted")));
@@ -697,7 +794,11 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
             false
         }
     };
-    let docker_line = last_line(&log);
+    let text = log_text(&log);
+    let docker_line = last_line(&text);
+    // A failure keeps what failed in the record, since the next run writes the log anew: its first failing test and
+    // the log's excerpt.
+    let (docker_test, docker_excerpt) = if passed { (None, Vec::new()) } else { docker_excerpt(&text) };
     // The tests ran on the image step 3 named only while the tag still names it at their end: a rebuild (or a
     // Docker gone) meanwhile leaves the run unattributable, so nothing is recorded and it may pass again.
     let after = local_image_id();
@@ -713,19 +814,32 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
         step: (!passed).then(|| "docker".into()),
         markers: Some("ok".into()),
         docker: Some(docker_line.clone()),
+        docker_test: docker_test.clone(),
+        docker_failures: 0,
+        docker_excerpt,
         docker_image: docker_image.clone(),
         ai_env: env!("CARGO_PKG_VERSION").into(),
         auto: opts.auto,
         at: at(),
     };
-    // Step 8: recorded, audited; the local binaries past the 2 newest admitted go.
-    let record = super::Record::update(paths, version, |r| r.admission = Some(row))?;
+    // Step 8: recorded, audited; the local binaries past the 2 newest admitted go. A failure is counted on the ones
+    // recorded before it (read under the records lock); an admission clears the count (Mike's rule, 24 Oct).
+    let record = super::Record::update(paths, version, |r| {
+        let failures = if passed { 0 } else { r.docker_failures().saturating_add(1) };
+        r.admission = Some(AdmissionRow { docker_failures: failures, ..row });
+    })?;
+    let attempt = record.admission.as_ref().map_or(0, |a| a.docker_failures);
     let mut extra = vec![("sha256", sha256.clone()), ("signer", verified.signer.clone()), ("markers", "ok".to_string())];
     if let Some(id) = &docker_image {
         extra.push(("docker_image", id.clone()));
     }
     if !passed {
         extra.insert(0, ("step", "docker".to_string()));
+        // Which Docker failure of V this is, and its first failing test (ids and numbers only).
+        extra.push(("attempt", attempt.to_string()));
+        if let Some(test) = &docker_test {
+            extra.push(("test", test.clone()));
+        }
     }
     audit(paths, version, if passed { "admitted" } else { "failed" }, started, opts.auto, &extra);
     end(&mut lock, if passed { "admitted" } else { "failed(docker)" });
@@ -735,7 +849,16 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
         }
         Ok(record)
     } else {
-        Err(CliError::Msg(format!("claude {version}: its Docker tests failed: {docker_line} (the log: {}): not admitted; fix it, then ai-env claude admit {version} --redo", log.display())))
+        let failed_test = docker_test.map(|t| format!("test {t} failed; ")).unwrap_or_default();
+        let spent = if attempt >= ADMIT_DOCKER_TRIES { ", no automatic retry left" } else { "" };
+        // D5's trigger runs it again only with `[claude].auto_admit` on and the wrapper's mode remote (doctor's T6).
+        let auto = cfg.claude.auto_admit && matches!(cfg.wrapper.wrapper_mode(), Ok(crate::bridge::config::WrapperMode::Remote));
+        let next = if auto && record.auto_retry() {
+            format!("an automatic retry{} (the next remote wrapper starts it), or fix it, then ai-env claude admit {version} --redo", super::retry_when(&record))
+        } else {
+            format!("fix it, then ai-env claude admit {version} --redo")
+        };
+        Err(CliError::Msg(format!("claude {version}: its Docker tests failed: {docker_line} (the log: {}): not admitted ({failed_test}{}{spent}); {next}", log.display(), super::attempt_words(attempt))))
     }
 }
 
@@ -744,17 +867,18 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
 
-/// ` (<why>)` of a failed record: the signature's word, the markers' or the Docker line.
 /// A failed admission's line: its step and why, and the `--redo` that admits it again (`admit` without `--redo`
 /// shows it, exit 1; a stage refuses the version with it, exit 9).
 pub(crate) fn failed_line(version: &str, step: &str, record: &Record) -> String {
     format!("claude {version}: admission failed at {step}{}: fix it, then ai-env claude admit {version} --redo", failed_why(record))
 }
 
+/// ` (<why>)` of a failed record: the signature's word, the markers', the first failing Docker test, or the Docker
+/// line.
 fn failed_why(record: &Record) -> String {
     let why = match (&record.signature, &record.admission) {
         (Some(s), _) if s.outcome == "failed" => s.why.clone(),
-        (_, Some(a)) => a.markers.clone().filter(|m| m.starts_with("missing:")).or_else(|| a.docker.clone()),
+        (_, Some(a)) => a.markers.clone().filter(|m| m.starts_with("missing:")).or_else(|| a.docker_test.as_ref().map(|t| format!("test {t} failed"))).or_else(|| a.docker.clone()),
         _ => None,
     };
     why.map(|w| format!(" ({w})")).unwrap_or_default()
@@ -779,7 +903,8 @@ pub fn version_or_bundle(version: Option<&str>, command: &str) -> Result<String,
 }
 
 /// The JSON document of an admission's end: `outcome` first (§7.1; a struct keeps its fields' order), then the
-/// record as it stands.
+/// record as it stands: a Docker failure's first failing test, its count since the last admission (0 without one)
+/// and the make log's excerpt (`null` without one) after the Docker run's last line.
 #[derive(Debug, serde::Serialize)]
 struct AdmitDoc {
     outcome: &'static str,
@@ -790,6 +915,9 @@ struct AdmitDoc {
     signer: Option<String>,
     markers: Option<String>,
     docker: Option<String>,
+    docker_test: Option<String>,
+    docker_failures: u32,
+    docker_excerpt: Option<Vec<String>>,
     docker_image: Option<String>,
     at: Option<String>,
 }
@@ -807,6 +935,9 @@ fn admit_json(paths: &Paths, version: &str, outcome: &'static str) -> AdmitDoc {
         signer: sig.as_ref().and_then(|s| s.signer.clone()),
         markers: adm.as_ref().and_then(|a| a.markers.clone()),
         docker: adm.as_ref().and_then(|a| a.docker.clone()),
+        docker_test: adm.as_ref().and_then(|a| a.docker_test.clone()),
+        docker_failures: record.as_ref().map_or(0, Record::docker_failures),
+        docker_excerpt: adm.as_ref().map(|a| a.docker_excerpt.clone()).filter(|e| !e.is_empty()),
         docker_image: adm.as_ref().and_then(|a| a.docker_image.clone()),
         at: adm.as_ref().map(|a| a.at.clone()),
     }
@@ -911,6 +1042,142 @@ mod tests {
         let none = String::from_utf8_lossy(&all_markers()).replace(" \\u00B7 resets ", " resets ").into_bytes();
         std::fs::write(&p, none).unwrap();
         assert_eq!(missing_marker(&p), Some("rate_limit_resets"));
+    }
+
+    /// The tail of a make log whose Docker test `l2_x` failed, as cargo and libtest print it (B4 (a)'s failure ended
+    /// on make's line alone).
+    const CARGO_FAILURE: &str = "\
+   Compiling ai-env-cli v0.11.0 (/Users/someone/ai-env/crates/ai-env-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 01s
+     Running tests/docker_exec.rs (target/claude-admit/debug/deps/docker_exec-0123456789abcdef)
+
+running 2 tests
+test l2_claude_auth_status_json_is_logged_out_with_no_network ... ok
+test l2_x ... FAILED
+
+failures:
+
+---- l2_x stdout ----
+
+thread 'l2_x' panicked at tests/docker_exec.rs:123:5:
+assertion `left == right` failed: the pinned claude did not answer
+  left: None
+ right: Some(\"2.1.310\")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    l2_x
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.04s
+
+error: test failed, to rerun pass `-p ai-env-cli --test docker_exec`
+make: *** [claude-admit-docker] Error 101
+";
+
+    /// Mike's rule (24 Oct): a Docker failure keeps the failing test's line and its first panic (the location and
+    /// the message after it), the first failing test named; a test only the closing `failures:` list names (its
+    /// line split by output it did not capture) too; each thread's first panic once; with none of them, the log's
+    /// last 5 lines.
+    #[test]
+    fn the_docker_excerpt_names_the_failing_tests_and_their_first_panic() {
+        let (first, excerpt) = docker_excerpt(CARGO_FAILURE);
+        assert_eq!(first.as_deref(), Some("l2_x"));
+        assert_eq!(excerpt, ["test l2_x ... FAILED", "thread 'l2_x' panicked at tests/docker_exec.rs:123:5:", "assertion `left == right` failed: the pinned claude did not answer"]);
+        assert_eq!(last_line(CARGO_FAILURE), "make: *** [claude-admit-docker] Error 101", "the record's `docker` stays the last line");
+        // A test whose `test NAME ... ` line the container's own output split: the closing list names it; the old
+        // panic format (its message on the line) keeps no backtrace note; a second panic of a thread is not kept.
+        let split = "\
+running 2 tests
+test l2_a ... docker: Error response from daemon: Conflict.
+FAILED
+test l2_b ... FAILED
+
+failures:
+
+---- l2_a stdout ----
+thread 'l2_a' panicked at 'the container did not start', tests/shim_docker.rs:2545:9
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+thread 'l2_a' panicked at tests/shim_docker.rs:2600:1:
+a second panic while unwinding
+---- l2_b stdout ----
+thread 'l2_b' panicked at tests/docker_exec.rs:916:5:
+no claude --version
+
+failures:
+    l2_a
+    l2_b
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 1 filtered out; finished in 9.10s
+";
+        let (first, excerpt) = docker_excerpt(split);
+        assert_eq!(first.as_deref(), Some("l2_b"), "the first named in the log's order");
+        assert_eq!(
+            excerpt,
+            [
+                "test l2_b ... FAILED",
+                "thread 'l2_a' panicked at 'the container did not start', tests/shim_docker.rs:2545:9",
+                "thread 'l2_b' panicked at tests/docker_exec.rs:916:5:",
+                "no claude --version",
+                "failures: l2_a",
+            ]
+        );
+        // Nothing names a test or a panic (a build that failed): the last 5 non-empty lines.
+        let build = "error[E0425]: cannot find value `x` in this scope\n  --> tests/docker_exec.rs:10:5\n\nFor more information about this error, try `rustc --explain E0425`.\nerror: could not compile `ai-env-cli` (test \"docker_exec\") due to 1 previous error\nmake: *** [claude-admit-docker] Error 101\n\n";
+        let (first, excerpt) = docker_excerpt(build);
+        assert_eq!(first, None);
+        assert_eq!(
+            excerpt,
+            [
+                "error[E0425]: cannot find value `x` in this scope",
+                "--> tests/docker_exec.rs:10:5",
+                "For more information about this error, try `rustc --explain E0425`.",
+                "error: could not compile `ai-env-cli` (test \"docker_exec\") due to 1 previous error",
+                "make: *** [claude-admit-docker] Error 101",
+            ]
+        );
+        assert_eq!(docker_excerpt(""), (None, Vec::new()));
+    }
+
+    /// The excerpt's bounds: each line scrubbed, then cut to 300 characters; at most 12 lines and 4 KiB (a newline
+    /// counted after each), the first ones kept; a name past 200 characters, or one the scrubber would change, is
+    /// named nowhere.
+    #[test]
+    fn the_docker_excerpt_is_scrubbed_and_bounded() {
+        let secret = format!("sk-ant-oat01-{}", "Q".repeat(40));
+        let log = format!("test l2_x ... FAILED\nthread 'l2_x' panicked at tests/docker_exec.rs:1:1:\nthe token {secret} was refused; {}\n", "z".repeat(1000));
+        let (_, excerpt) = docker_excerpt(&log);
+        assert_eq!(excerpt.len(), 3);
+        assert!(!excerpt[2].contains(&secret) && excerpt[2].starts_with("the token sk-ant-[redacted:len="), "{}", excerpt[2]);
+        assert_eq!(excerpt[2].chars().count(), DOCKER_LINE_MAX, "cut after the scrub");
+        let many: String = (0..20).map(|i| format!("test l2_t{i} ... FAILED\n")).collect();
+        let (first, excerpt) = docker_excerpt(&many);
+        assert_eq!((first.as_deref(), excerpt.len(), excerpt[11].as_str()), (Some("l2_t0"), DOCKER_EXCERPT_LINES, "test l2_t11 ... FAILED"));
+        // Two-byte characters: 4 KiB ends it before 12 lines.
+        let wide: String = (0..12).map(|i| format!("thread 't{i}' panicked at {}\n", "é".repeat(400))).collect();
+        let (_, excerpt) = docker_excerpt(&wide);
+        let bytes: usize = excerpt.iter().map(|l| l.len() + 1).sum();
+        assert!(bytes <= DOCKER_EXCERPT_BYTES && excerpt.len() < DOCKER_EXCERPT_LINES && !excerpt.is_empty(), "{} lines, {bytes} bytes", excerpt.len());
+        assert!(excerpt.iter().all(|l| l.chars().count() <= DOCKER_LINE_MAX));
+        // A name past DOCKER_TEST_MAX characters is the log's text, not an id: named nowhere (a record's `docker_test`,
+        // the views' `test NAME failed`, the audit's `test`, whose row past 64 KiB would not be written), its line kept
+        // and cut like any other; one of DOCKER_TEST_MAX is named.
+        for len in [DOCKER_TEST_MAX + 1, 100_000] {
+            let (first, excerpt) = docker_excerpt(&format!("test {} ... FAILED\n", "n".repeat(len)));
+            assert_eq!((first, excerpt.len()), (None, 1), "{len}");
+            assert!(excerpt[0].starts_with("test nnn") && excerpt[0].chars().count() == ("test ".len() + len + " ... FAILED".len()).min(DOCKER_LINE_MAX), "{len}");
+        }
+        let (first, _) = docker_excerpt(&format!("failures:\n    {}\n", "n".repeat(DOCKER_TEST_MAX + 1)));
+        assert_eq!(first, None, "the closing list's name too");
+        let (first, _) = docker_excerpt(&format!("test {} ... FAILED\n", "n".repeat(DOCKER_TEST_MAX)));
+        assert_eq!(first.map(|n| n.len()), Some(DOCKER_TEST_MAX));
+        // A failing test's name is an id or nothing: `test` in the audit never carries what the scrubber masks.
+        let registered = "l2_registered_secret_name_0123456789";
+        crate::wire::redact::register_secret(registered);
+        let (first, excerpt) = docker_excerpt(&format!("test {registered} ... FAILED\n"));
+        assert!(crate::wire::redact::forget_secret(registered));
+        assert_eq!(first, None);
+        assert!(excerpt[0].contains("[redacted:len=") && !excerpt[0].contains(registered), "{excerpt:?}");
     }
 
     #[test]

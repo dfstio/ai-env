@@ -1409,6 +1409,13 @@ impl TriggerWatch {
         !st.pending && !st.busy
     }
 
+    /// S11 (A3): the session the trigger names now ([`CodeoutTrigger::set_session`]'s last: a `--resume`'s or a
+    /// move's from its spawn, the one the pump adopted from a `system/init` otherwise); `None` before any.
+    #[must_use]
+    pub fn session(&self) -> Option<String> {
+        self.shared.state().session.clone()
+    }
+
     /// Until [`TriggerWatch::done`] (cancel-safe); the caller bounds it.
     pub async fn wait_done(&self) {
         loop {

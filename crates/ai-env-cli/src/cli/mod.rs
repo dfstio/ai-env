@@ -902,10 +902,10 @@ pub enum ClaudeCmd {
     Admit {
         #[arg(value_parser = claude_version)]
         version: Option<String>,
-        /// Admit again a version already admitted or failed
+        /// Admit again a version already admitted or failed, whatever its Docker failures
         #[arg(long)]
         redo: bool,
-        /// Started by the wrapper (D5): quiet, its lock on fd 3; skips when Docker, the checkout or the local image is missing
+        /// Started by the wrapper (D5): quiet, its lock on fd 3; skips when Docker, the checkout or the local image is missing; admits again a version whose Docker tests failed while fewer than 3 Docker failures are recorded, 15 minutes after the last
         #[arg(long, hide = true)]
         auto: bool,
         #[arg(long)]

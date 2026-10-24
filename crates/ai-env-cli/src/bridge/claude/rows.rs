@@ -3,24 +3,24 @@
 //! fallback note, and the newest remote chat's `claude_src`. Never `[NO ]`:
 //! a version VMs cannot run yet leaves chats on what they hold, and no row
 //! offers turning Cursor's auto-update off (VMs follow it with no deploy).
-use super::{failed_why, version_key, Phase, Record};
+use super::{failed_why, version_key, Phase, Record, ADMIT_DOCKER_TRIES};
 use crate::bridge::census::RunningExtension;
 use crate::commands::{DoctorLine, Tag};
 
 /// One row per version the installed bundle or a live window runs (newest first), then the image's fallback note.
 /// Never `[NO ]`. None when neither a bundle nor a window names a version (LD-36). A version that is the image's
 /// own claude, while no other staged version is named before the image's (P4 names those; a VM that holds one runs
-/// it), runs everywhere already: `[ok ]` unless its admission failed. The seen row promises automatic admission
-/// ([`rows_claude_auto`] with `auto` false never does).
+/// it), runs everywhere already: `[ok ]` unless its admission failed. The seen row promises automatic admission,
+/// and a Docker failure's row its automatic retry ([`rows_claude_auto`] with `auto` false never does).
 #[must_use]
 pub fn rows_claude(records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension]) -> Vec<DoctorLine> {
     rows_claude_auto(records, image, bundle, running, true)
 }
 
-/// [`rows_claude`], the seen row's `(automatic while Docker answers: [claude].auto_admit)` only with `auto`: the
-/// caller knows `[claude].auto_admit` is on and the effective mode is remote (automatic admission starts only at a
-/// remote wrapper's `auth status --json` and a remote session's P0); without it the row names `ai-env claude admit
-/// <v>` alone.
+/// [`rows_claude`], the seen row's `(automatic while Docker answers: [claude].auto_admit)` and a Docker failure's
+/// `an automatic retry from <T>` only with `auto`: the caller knows `[claude].auto_admit` is on and the effective
+/// mode is remote (automatic admission starts only at a remote wrapper's `auth status --json` and a remote session's
+/// P0); without it the seen row names `ai-env claude admit <v>` alone, and a Docker failure's its `--redo`.
 #[must_use]
 pub fn rows_claude_auto(records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension], auto: bool) -> Vec<DoctorLine> {
     let mut versions: Vec<&str> = bundle.into_iter().chain(running.iter().map(|w| w.ext.as_str())).filter(|v| crate::wire::pin::is_version(v)).collect();
@@ -64,7 +64,23 @@ fn row_of(v: &str, records: &[Record], image: Option<&str>, bundle: Option<&str>
         Phase::Staged => DoctorLine::row(Tag::Ok, format!("{head}: admitted and staged; VMs fetch it after a chat's first output")),
         Phase::Failed(step) => {
             let why = record.and_then(failed_why).unwrap_or_else(|| step.clone());
-            DoctorLine::row(Tag::Warn, format!("{head}: admission failed at {step} ({why}); chats run {fallback}  <- fix it, then ai-env claude admit {v} --redo"))
+            match record.filter(|_| step == "docker") {
+                // Mike's rule (24 Oct): a Docker failure's attempt, and the automatic retry that follows (from when)
+                // or the tries spent.
+                Some(r) => {
+                    let n = r.docker_failures();
+                    let attempt = super::attempt_words(n);
+                    if auto && r.auto_retry() {
+                        let when = super::retry_when(r);
+                        DoctorLine::row(Tag::Warn, format!("{head}: admission failed at docker ({why}; {attempt}); chats run {fallback}  <- an automatic retry{when} (the next remote wrapper starts it), or ai-env claude admit {v} --redo now"))
+                    } else if n >= ADMIT_DOCKER_TRIES {
+                        DoctorLine::row(Tag::Warn, format!("{head}: admission failed at docker ({why}; {attempt}, no automatic retry left); chats run {fallback}  <- fix it, then ai-env claude admit {v} --redo"))
+                    } else {
+                        DoctorLine::row(Tag::Warn, format!("{head}: admission failed at docker ({why}; {attempt}); chats run {fallback}  <- fix it, then ai-env claude admit {v} --redo"))
+                    }
+                }
+                None => DoctorLine::row(Tag::Warn, format!("{head}: admission failed at {step} ({why}); chats run {fallback}  <- fix it, then ai-env claude admit {v} --redo")),
+            }
         }
         // V not nameable: P4 names the other staged versions, and a VM that holds one runs it before the image's.
         _ if image == Some(v) && others.is_empty() => DoctorLine::row(Tag::Ok, format!("{head}: the image's own claude; chats run it with nothing to fetch")),
@@ -180,6 +196,29 @@ mod tests {
         }
         assert!(rows_claude(&records, Some("2.1.305"), None, &[]).is_empty());
         assert!(rows_claude(&records, Some("2.1.305"), None, &[window(1, "unrecognised")]).is_empty());
+    }
+
+    /// Mike's rule (24 Oct): a Docker failure's row names its first failing test and its attempt, then the automatic
+    /// retry and from when (`auto`: remote, `[claude].auto_admit` on) or, its tries spent, the `--redo`; without
+    /// `auto`, the `--redo` alone. Still `[!! ]`, never `[NO ]`.
+    #[test]
+    fn rows_claude_say_a_docker_failures_attempt_and_retry() {
+        use crate::bridge::claude::tests::put_docker;
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::from_root_and_env(dir.path().join("bridge"), None);
+        put(&p, "2.1.310", 'e', "staged");
+        put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
+        put_docker(&p, "2.1.321", 'b', 3, "2026-10-24T13:50:00Z");
+        let records = crate::bridge::claude::load_all(&p);
+        let row = |v: &str, auto: bool| text(&rows_claude_auto(&records, Some("2.1.305"), Some(v), &[], auto)[0]);
+        assert_eq!(
+            row("2.1.320", true),
+            (Tag::Warn, "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run 2.1.310  <- an automatic retry from 2026-10-24T14:05:00Z (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now".into())
+        );
+        assert_eq!(row("2.1.320", false), (Tag::Warn, "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run 2.1.310  <- fix it, then ai-env claude admit 2.1.320 --redo".into()));
+        for auto in [true, false] {
+            assert_eq!(row("2.1.321", auto), (Tag::Warn, "claude 2.1.321 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 3 of 3, no automatic retry left); chats run 2.1.310  <- fix it, then ai-env claude admit 2.1.321 --redo".into()));
+        }
     }
 
     /// No row offers turning Cursor's auto-update off: VMs follow its claude with no deploy.

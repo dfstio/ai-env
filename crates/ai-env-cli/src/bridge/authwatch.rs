@@ -156,13 +156,27 @@ pub const RETRY_LIMIT: u32 = 3;
 /// 5.0 s after it. Its valid answer, unlike 2.1.302's, failed the turn too,
 /// 1.2 s after the ask, then exit 1: the code that asks, takes the answer
 /// and retries after a 401 is 2.1.302's (the two bundles compared), and no
-/// field here rests on that run.
+/// field here rests on that run. Claude 2.1.310 (Cursor's bundle, the same
+/// runs: S11 part B, B1 (g), 24 Oct 2026, `logs/log56.txt`) gave the same
+/// timers, so [`AUTH_TIMERS_REVIEWED`] holds its row after this one, which
+/// stays 2.1.305's (the image's claude, the version the fakes print): the
+/// ask 1.04-1.34 s after the spawn; with no answer the turn failed 30.0 s
+/// after the ask (refresh@1339, is_error@31359) and no exit came before the
+/// 150 s bound; a null answer failed it 1.0 s after the ask, and 0.9 s after
+/// its stdin closed the CLI exited 1 (refresh@1312, result@2350, exit
+/// 1@3298); the 401 wait of 5000 moved the ask to 6.0 s and the null
+/// answer's failed turn to 5.1 s after it (refresh@6021, result@11072); a
+/// valid answer brought the reply 2.1 s after the ask, and exit 0
+/// (refresh@1043, result@3192, exit@3881).
 pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.305", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
-/// S11 (L3): every claude version a reviewed `oauth-t1` run measured, oldest first; `AUTH_TIMERS` is the last. An
-/// unmeasured version runs on the retry rule; nothing is measured or inherited automatically.
-pub const AUTH_TIMERS_REVIEWED: [AuthTimers; 2] = [
+/// S11 (L3): every claude version a reviewed `oauth-t1` run measured, oldest first, each once. `AUTH_TIMERS`
+/// (2.1.305, the image's claude, which the fakes print and the tests compare with) is one of them, no longer the
+/// last: 2.1.310 followed (Mike's review, 24 Oct 2026). An unmeasured version runs on the retry rule; nothing is
+/// measured or inherited automatically.
+pub const AUTH_TIMERS_REVIEWED: [AuthTimers; 3] = [
     AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false },
     AUTH_TIMERS,
+    AuthTimers { claude: "2.1.310", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false },
 ];
 
 /// The reviewed timers of `claude` (a version), when a reviewed run measured it.
@@ -1144,25 +1158,31 @@ mod tests {
     }
 
     /// AUTH_TIMERS is what `oauth-t1` measured (S7 B11 on claude 2.1.296, S8
-    /// part B on 2.1.302, S10 part B on 2.1.305): a changed value comes from
-    /// a new measurement, for the version it names.
+    /// part B on 2.1.302, S10 part B on 2.1.305; S11 part B on 2.1.310, its
+    /// row the reviewed table's): a changed value comes from a new
+    /// measurement, for the version it names.
     #[test]
     fn auth_timers_are_what_oauth_t1_measured() {
         assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.305", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
-        // S11 (L3): the reviewed table, S8 part B's 2.1.302 then AUTH_TIMERS.
+        // S11 (L3): the reviewed table, S8 part B's 2.1.302, AUTH_TIMERS, then S11 part B's 2.1.310 (24 Oct).
         assert_eq!(
             AUTH_TIMERS_REVIEWED,
-            [AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false }, AUTH_TIMERS]
+            [
+                AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false },
+                AUTH_TIMERS,
+                AuthTimers { claude: "2.1.310", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false },
+            ]
         );
     }
 
-    /// S11 (L3): the reviewed versions are sorted oldest first, each once, the last `AUTH_TIMERS`; `timers_for`
-    /// finds exactly them.
+    /// S11 (L3): the reviewed versions are sorted oldest first, each once, `AUTH_TIMERS` among them (no longer the
+    /// last since 2.1.310 joined); `timers_for` finds exactly them.
     #[test]
-    fn the_reviewed_timers_are_sorted_unique_and_end_in_auth_timers() {
+    fn the_reviewed_timers_are_sorted_unique_and_hold_auth_timers() {
         let key = |v: &str| v.split('.').map(|p| p.parse::<u64>().unwrap()).collect::<Vec<_>>();
         assert!(AUTH_TIMERS_REVIEWED.windows(2).all(|w| key(w[0].claude) < key(w[1].claude)), "sorted and unique");
-        assert_eq!(AUTH_TIMERS_REVIEWED.last(), Some(&AUTH_TIMERS));
+        assert!(AUTH_TIMERS_REVIEWED.contains(&AUTH_TIMERS));
+        assert_eq!(timers_for("2.1.310").map(|t| t.claude), Some("2.1.310"), "S11 part B's measurement, reviewed");
         for t in &AUTH_TIMERS_REVIEWED {
             assert!(crate::wire::pin::is_version(t.claude), "{}", t.claude);
             assert_eq!(timers_for(t.claude), Some(t));

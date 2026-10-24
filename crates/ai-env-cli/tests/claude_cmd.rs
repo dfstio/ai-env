@@ -593,7 +593,9 @@ fn admit_fails_on_a_missing_marker_before_docker() {
     assert_eq!(w.audit("claude_admit")[0]["detail"]["markers"], "missing:session_id");
 }
 
-/// The Docker tests failing: exit 1, `failed(docker)`, the run's last line recorded; its log kept 0600.
+/// The Docker tests failing: exit 1, `failed(docker)`, the run's last line recorded; its log kept 0600. In
+/// passthrough (this world's mode) no wrapper runs it again: the error and `status` name the attempt and promise no
+/// automatic retry (doctor's T6).
 #[test]
 fn admit_records_a_docker_failure() {
     let w = W::new();
@@ -603,6 +605,9 @@ fn admit_records_a_docker_failure() {
     let out = w.ai(&["claude", "admit", V]);
     assert_eq!(out.status.code(), Some(1), "{}", all(&out));
     assert!(text(&out.stderr).contains("its Docker tests failed: test l2_claude_version_matches_the_lock ... FAILED"), "{}", all(&out));
+    assert!(text(&out.stderr).contains(&format!("not admitted (test l2_claude_version_matches_the_lock failed; attempt 1 of 3); fix it, then ai-env claude admit {V} --redo")), "{}", all(&out));
+    let status = text(&w.ai(&["claude", "status"]).stdout);
+    assert!(status.contains(&format!("claude {V}: failed(docker) (test l2_claude_version_matches_the_lock failed; attempt 1 of 3)")), "{status}");
     let r = w.record(V).unwrap();
     let adm = r.admission.clone().unwrap();
     assert_eq!((r.phase().word(), adm.docker.as_deref()), ("failed(docker)".to_string(), Some("test l2_claude_version_matches_the_lock ... FAILED")));
@@ -610,6 +615,197 @@ fn admit_records_a_docker_failure() {
     let d = &w.audit("claude_admit")[0]["detail"];
     assert_eq!((d["outcome"].as_str(), d["step"].as_str()), (Some("failed"), Some("docker")));
     assert_eq!(std::fs::metadata(w.paths().logs().join(format!("claude-admit-{V}.log"))).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+/// The fake make's output when a Docker test fails, as cargo and libtest print it (24 Oct, B4 (a): the record kept
+/// make's last line alone, which names no test).
+const CARGO_FAILURE: &str = "test l2_claude_auth_status_json_is_logged_out_with_no_network ... ok
+test l2_x ... FAILED
+
+failures:
+
+---- l2_x stdout ----
+
+thread 'l2_x' panicked at tests/docker_exec.rs:123:5:
+assertion `left == right` failed: the pinned claude did not answer
+  left: None
+ right: Some(\"2.1.308\")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    l2_x
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 120.04s
+
+error: test failed, to rerun pass `-p ai-env-cli --test docker_exec`
+make: *** [claude-admit-docker] Error 101";
+
+/// V's last Docker failure moved back past its cooldown, as if 16 minutes had gone by.
+fn backdate(w: &W) {
+    let then = ai_env_cli::wire::time::rfc3339_utc(ai_env_cli::wire::time::unix_now() - 16 * 60);
+    Record::update(&w.paths(), V, |r| r.admission.as_mut().expect("an admission").at = then).unwrap();
+}
+
+/// Mike's rule (24 Oct): a Docker failure is counted (by hand or `--auto`) with the failing test and its panic kept
+/// in the record (`--json`, `status`), audited with its attempt and test; `--auto` runs it again, every step checked
+/// again (the signed manifest fetched and verified anew), only once its cooldown is over and until 3 failures are
+/// recorded; then it stands until `--redo`, which runs whatever the count, and an admission clears the count.
+#[test]
+fn admit_auto_retries_a_docker_failure_until_its_tries_are_spent() {
+    let w = W::new();
+    let bytes = claude_bytes(V);
+    w.serve(V, &bytes, true, None);
+    let toml = w.root().join("bridge/bridge.toml");
+    let mut cfg = std::fs::read_to_string(&toml).unwrap();
+    cfg.push_str("\n[wrapper]\nmode = \"remote\"\n");
+    std::fs::write(&toml, cfg).unwrap();
+    w.make_knobs(&[("FAKE_MAKE_EXIT", "2"), ("FAKE_MAKE_OUT", CARGO_FAILURE)]);
+    let p = w.paths();
+    let out = w.ai(&["claude", "admit", V]);
+    assert_eq!(out.status.code(), Some(1), "{}", all(&out));
+    let r = w.record(V).unwrap();
+    let adm = r.admission.clone().unwrap();
+    assert_eq!((r.phase().word(), adm.docker_failures, adm.docker_test.as_deref(), adm.docker.as_deref()), ("failed(docker)".to_string(), 1, Some("l2_x"), Some("make: *** [claude-admit-docker] Error 101")));
+    assert_eq!(adm.docker_excerpt, ["test l2_x ... FAILED", "thread 'l2_x' panicked at tests/docker_exec.rs:123:5:", "assertion `left == right` failed: the pinned claude did not answer"]);
+    let from = ai_env_cli::wire::time::rfc3339_utc(ai_env_cli::wire::time::parse_rfc3339_utc(&adm.at).unwrap() + 15 * 60);
+    let err = text(&out.stderr);
+    assert!(err.contains(&format!("claude {V}: its Docker tests failed: make: *** [claude-admit-docker] Error 101 (the log: ")), "{err}");
+    assert!(err.contains(&format!("not admitted (test l2_x failed; attempt 1 of 3); an automatic retry from {from} (the next remote wrapper starts it), or fix it, then ai-env claude admit {V} --redo")), "{err}");
+    let d = &w.audit("claude_admit")[0]["detail"];
+    assert_eq!((d["outcome"].as_str(), d["step"].as_str(), d["attempt"].as_str(), d["test"].as_str(), d["auto"].as_str()), (Some("failed"), Some("docker"), Some("1"), Some("l2_x"), Some("false")));
+    let doc: Value = serde_json::from_slice(&w.ai(&["claude", "admit", V, "--json"]).stdout).unwrap();
+    assert_eq!((doc["outcome"].as_str(), doc["docker_failures"].as_u64(), doc["docker_test"].as_str()), (Some("failed"), Some(1), Some("l2_x")));
+    assert_eq!(doc["docker_excerpt"], serde_json::json!(adm.docker_excerpt));
+    let status = text(&w.ai(&["claude", "status"]).stdout);
+    assert!(status.contains(&format!("claude {V}: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry from {from} (the next remote wrapper starts it))")), "{status}");
+    // --auto within the failure's cooldown: nothing fetched or run; its lock says the record stands.
+    let out = w.ai(&["claude", "admit", V, "--auto"]);
+    assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+    assert_eq!((w.lines("curl").len(), w.lines("make").len()), (3, 1), "within the cooldown");
+    assert!(std::fs::read_to_string(p.claude_lock(V)).unwrap().ends_with("\noutcome=failed(docker)\n"));
+    // Past it: run again, the manifest and its signature fetched and verified anew, the kept binary (the signed
+    // bytes) not fetched again; counted, audited with `auto`, until 3 are recorded.
+    for attempt in [2u32, 3] {
+        backdate(&w);
+        let curl = w.lines("curl").len();
+        let out = w.ai(&["claude", "admit", V, "--auto"]);
+        assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+        assert_eq!((w.lines("make").len(), w.lines("curl").len()), (attempt as usize, curl + 2), "attempt {attempt}");
+        let r = w.record(V).unwrap();
+        let adm = r.admission.clone().unwrap();
+        assert_eq!((r.phase().word(), adm.docker_failures, adm.auto, adm.docker_test.as_deref()), ("failed(docker)".to_string(), attempt, true, Some("l2_x")));
+        assert_eq!(adm.docker_excerpt, ["test l2_x ... FAILED", "thread 'l2_x' panicked at tests/docker_exec.rs:123:5:", "assertion `left == right` failed: the pinned claude did not answer"], "attempt {attempt}");
+        let rows = w.audit("claude_admit");
+        let d = &rows.last().unwrap()["detail"];
+        assert_eq!((d["attempt"].as_str(), d["test"].as_str(), d["auto"].as_str()), (Some(attempt.to_string().as_str()), Some("l2_x"), Some("true")), "{rows:?}");
+        assert!(std::fs::read_to_string(p.claude_lock(V)).unwrap().ends_with("\noutcome=failed(docker)\n"));
+    }
+    // Spent: --auto runs nothing, whatever the time; status names the --redo.
+    backdate(&w);
+    let out = w.ai(&["claude", "admit", V, "--auto"]);
+    assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+    assert_eq!((w.lines("make").len(), w.record(V).unwrap().docker_failures()), (3, 3), "no fourth automatic run");
+    let status = text(&w.ai(&["claude", "status"]).stdout);
+    assert!(status.contains(&format!("claude {V}: failed(docker) (test l2_x failed; attempt 3 of 3, no automatic retry left: fix it, then ai-env claude admit {V} --redo)")), "{status}");
+    // --redo runs whatever the count: a fourth failure, then an admission, which clears the count and the excerpt.
+    let out = w.ai(&["claude", "admit", V, "--redo"]);
+    assert_eq!(out.status.code(), Some(1), "{}", all(&out));
+    assert!(text(&out.stderr).contains(&format!("not admitted (test l2_x failed; attempt 4, no automatic retry left); fix it, then ai-env claude admit {V} --redo")), "{}", all(&out));
+    assert_eq!((w.lines("make").len(), w.record(V).unwrap().docker_failures()), (4, 4));
+    w.make_knobs(&[]);
+    let out = w.ai(&["claude", "admit", V, "--redo"]);
+    assert!(out.status.success(), "{}", all(&out));
+    let r = w.record(V).unwrap();
+    let adm = r.admission.clone().unwrap();
+    assert_eq!((r.phase(), adm.docker_failures, adm.docker_test, adm.docker_excerpt.len()), (Phase::Admitted, 0, None, 0));
+    let file = std::fs::read_to_string(p.claude_record(V)).unwrap();
+    assert!(!file.contains("docker_failures") && !file.contains("docker_excerpt"), "an older ai-env reads it: {file}");
+    let rows = w.audit("claude_admit");
+    let d = &rows.last().unwrap()["detail"];
+    assert_eq!((d["outcome"].as_str(), d.get("attempt"), d.get("test")), (Some("admitted"), None, None));
+}
+
+/// The automatic retry keeps custody (Mike's rule, 24 Oct): a kept binary that is not the signed manifest's is
+/// downloaded again and checked, so the Docker tests run only on bytes this run verified; bytes the release serves
+/// that are not the manifest's are `failed(download)`, which, like a refused signature or a missing marker, the
+/// automatic path never runs again; a fetch that may pass again records nothing and counts nothing.
+#[test]
+fn admit_auto_retry_tests_only_bytes_it_verified() {
+    let w = W::new();
+    let bytes = claude_bytes(V);
+    w.serve(V, &bytes, true, None);
+    w.make_knobs(&[("FAKE_MAKE_EXIT", "2"), ("FAKE_MAKE_OUT", CARGO_FAILURE)]);
+    let p = w.paths();
+    assert_eq!(w.ai(&["claude", "admit", V]).status.code(), Some(1));
+    // The kept binary changed since (a flipped byte): the retry downloads the signed bytes again before make.
+    let mut changed = bytes.clone();
+    changed[10] ^= 1;
+    std::fs::write(p.claude_bin(V), &changed).unwrap();
+    backdate(&w);
+    w.make_knobs(&[]);
+    let out = w.ai(&["claude", "admit", V, "--auto"]);
+    assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+    let curl = w.lines("curl");
+    assert_eq!(curl.len(), 6, "the manifest, its signature and the binary, again: {curl:?}");
+    assert!(curl[5].ends_with(&format!("/{V}/linux-arm64/claude")), "{curl:?}");
+    assert_eq!(std::fs::read(p.claude_bin(V)).unwrap(), bytes, "the signed bytes");
+    let make = w.lines("make");
+    assert_eq!(make.len(), 2);
+    assert!(make[1].ends_with(&format!("CLAUDE_SHA256={}", sha(&bytes))), "{make:?}");
+    let r = w.record(V).unwrap();
+    assert_eq!((r.phase(), r.download.clone().unwrap().sha256, r.docker_failures()), (Phase::Admitted, sha(&bytes), 0));
+    // Another world: after a Docker failure the release serves bytes that are not the manifest's, and the kept
+    // binary is gone: the retry refuses them (failed(download)), runs no Docker test, and is never retried.
+    let w = W::new();
+    w.serve(V, &bytes, true, None);
+    w.make_knobs(&[("FAKE_MAKE_EXIT", "2"), ("FAKE_MAKE_OUT", CARGO_FAILURE)]);
+    let p = w.paths();
+    assert_eq!(w.ai(&["claude", "admit", V]).status.code(), Some(1));
+    w.serve(V, &bytes, true, Some(&changed));
+    std::fs::remove_file(p.claude_bin(V)).unwrap();
+    backdate(&w);
+    assert_eq!(w.ai(&["claude", "admit", V, "--auto"]).status.code(), Some(0));
+    let r = w.record(V).unwrap();
+    assert_eq!((r.phase().word(), r.docker_failures(), r.auto_retry()), ("failed(download)".to_string(), 1, false));
+    assert!(!p.claude_bin(V).exists() && w.lines("make").len() == 1, "nothing kept, no Docker test");
+    assert!(std::fs::read_to_string(p.claude_lock(V)).unwrap().ends_with("\noutcome=failed(download)\n"));
+    let curl = w.lines("curl").len();
+    backdate(&w);
+    assert_eq!(w.ai(&["claude", "admit", V, "--auto"]).status.code(), Some(0));
+    assert_eq!((w.lines("curl").len(), w.lines("make").len()), (curl, 1), "final for the automatic path");
+    // A retry whose signature cannot be fetched records nothing (it may pass again): failed(docker) as it was, its
+    // failure not counted again, still due. One whose signature gpgv refuses is failed(signature), which no retry
+    // runs again, though the Docker failure's row stands under it.
+    let w = W::new();
+    w.serve(V, &bytes, true, None);
+    w.make_knobs(&[("FAKE_MAKE_EXIT", "2"), ("FAKE_MAKE_OUT", CARGO_FAILURE)]);
+    assert_eq!(w.ai(&["claude", "admit", V]).status.code(), Some(1));
+    w.serve(V, &bytes, false, None);
+    backdate(&w);
+    assert_eq!(w.ai(&["claude", "admit", V, "--auto"]).status.code(), Some(0));
+    let r = w.record(V).unwrap();
+    assert_eq!((r.phase().word(), r.docker_failures(), r.auto_retry(), w.lines("make").len()), ("failed(docker)".to_string(), 1, true, 1), "a fetch that may pass again");
+    w.serve(V, &bytes, true, None);
+    w.gpgv_knobs(&[("FAKE_GPGV_VERIFY", "bad")]);
+    assert_eq!(w.ai(&["claude", "admit", V, "--auto"]).status.code(), Some(0));
+    let r = w.record(V).unwrap();
+    assert_eq!((r.phase().word(), r.auto_retry(), r.admission.as_ref().map(|a| (a.step.clone(), a.docker_failures))), ("failed(signature)".to_string(), false, Some((Some("docker".to_string()), 1))));
+    assert!(std::fs::read_to_string(w.paths().claude_lock(V)).unwrap().ends_with("\noutcome=failed(signature)\n"));
+    let curl = w.lines("curl").len();
+    w.gpgv_knobs(&[("FAKE_GPGV_VERIFY", "good")]);
+    backdate(&w);
+    assert_eq!(w.ai(&["claude", "admit", V, "--auto"]).status.code(), Some(0));
+    assert_eq!((w.lines("curl").len(), w.lines("make").len()), (curl, 1), "a refused signature is final for the automatic path");
+    // A missing marker is final for it too.
+    let w = W::new();
+    let unmarked: Vec<u8> = text(&claude_bytes(V)).replace("--session-id", "--session-xd").into_bytes();
+    w.serve(V, &unmarked, true, None);
+    assert_eq!(w.ai(&["claude", "admit", V]).status.code(), Some(9));
+    backdate(&w);
+    assert_eq!(w.ai(&["claude", "admit", V, "--auto"]).status.code(), Some(0));
+    assert_eq!((w.lines("curl").len(), w.lines("make").len()), (3, 0), "nothing fetched again, no Docker test");
+    assert!(std::fs::read_to_string(w.paths().claude_lock(V)).unwrap().ends_with("\noutcome=failed(markers)\n"));
 }
 
 /// `--auto` (D5's child): without Docker it records nothing, writes `finished_at=` and `outcome=skipped(no_docker)`

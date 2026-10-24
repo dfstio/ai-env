@@ -251,7 +251,9 @@ pub static EVENTS: &[EventSpec] = &[
     ev("vm_gc_reconcile", &["marked", "removed", "closed", "ms"], NO, NO, NoSession, NONE),
     ev("session_account", &["session", "gen", "kind", "from", "from_tag", "to", "to_tag"], NO, NO, Detail("session"), NONE),
     ev("usage_limited", &["account", "tag", "kind", "resets_at", "text", "gen", "source"], NO, NO, Envelope, NONE),
-    ev("claude_admit", &["version", "outcome", "ms"], &["step", "why", "sha256", "signer", "markers", "docker_image", "auto"], NO, NoSession, NONE),
+    // A Docker failure's row adds its `attempt` (V's Docker failures since it was last admitted) and its first
+    // failing `test` (Mike's retry of a Docker failure, 24 Oct).
+    ev("claude_admit", &["version", "outcome", "ms"], &["step", "why", "sha256", "signer", "markers", "docker_image", "auto", "attempt", "test"], NO, NoSession, NONE),
     ev("claude_stage", &["version", "sha256", "outcome", "ms"], &["vm", "s3_status", "step", "why"], &["vm"], NoSession, NONE),
     ev("claude_fetch", &["vm", "version", "sha256", "outcome", "ms"], &["session", "gen", "why", "got_len"], &["vm"], Detail("session"), ACTIVITY),
     ev("claude_object_bad", &["version", "sha256", "vm", "outcome"], &["got_len", "bad_stages"], &["vm"], NoSession, NONE),

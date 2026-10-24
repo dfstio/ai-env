@@ -45,8 +45,10 @@ impl FetchWhy {
 /// V's fetch into `vm` (its row, its info), its result judged and audited: a presigned GET (`CLAUDE_EXPIRY`),
 /// `POST /claude/stage` with `wait_s`, then `GET /claude/stage` every `CLAUDE_POLL_EVERY` until `poll_for` from the
 /// fetch's start ends, the POST's wait counted in it (both scaled by the lab's backoff knob). A VM whose recorded caps lack `claude_stage_v1` is `NoCap`, nothing sent.
+/// The row names `session()` as it reads once the fetch ended (a new chat's id comes with its init, which may follow
+/// the fetch's start) and `gen`.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_into<A: MicrovmApi + S3Sign + 'static>(ctx: &Ctx, api: &std::sync::Arc<A>, row: &VmRow, vm: &VmInfo, want: &ClaudeRef, size: u64, wait_s: u32, poll_for: std::time::Duration, why: FetchWhy, session: Option<&str>) -> FetchOutcome {
+pub async fn fetch_into<A: MicrovmApi + S3Sign + 'static>(ctx: &Ctx, api: &std::sync::Arc<A>, row: &VmRow, vm: &VmInfo, want: &ClaudeRef, size: u64, wait_s: u32, poll_for: std::time::Duration, why: FetchWhy, session: &dyn Fn() -> Option<String>, gen: Option<u32>) -> FetchOutcome {
     let t0 = std::time::Instant::now();
     let mut got_len = None;
     let outcome = if row_has_cap(row) {
@@ -65,7 +67,7 @@ pub async fn fetch_into<A: MicrovmApi + S3Sign + 'static>(ctx: &Ctx, api: &std::
         let target = target?;
         crate::bridge::s3::client::S3Client::new(&**api, &target)?.delete(&key).await
     };
-    apply(&ctx.paths, &vm.id, want, &outcome, ms, why, session, delete).await;
+    apply(&ctx.paths, &vm.id, want, &outcome, ms, why, session().as_deref(), gen, delete).await;
     outcome
 }
 
@@ -233,7 +235,7 @@ impl FetchOutcome {
 /// admission (`failed(version)`); anything else leaves the record as it is. Every other outcome writes
 /// `claude_fetch`.
 #[allow(clippy::too_many_arguments)]
-async fn apply<F, Fut>(paths: &Paths, vm: &str, want: &ClaudeRef, outcome: &FetchOutcome, ms: u64, why: FetchWhy, session: Option<&str>, delete: F)
+async fn apply<F, Fut>(paths: &Paths, vm: &str, want: &ClaudeRef, outcome: &FetchOutcome, ms: u64, why: FetchWhy, session: Option<&str>, gen: Option<u32>, delete: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), BridgeError>>,
@@ -310,6 +312,7 @@ where
     }
     let mut pairs = vec![("vm", vm.to_string()), ("version", v.to_string()), ("sha256", want.sha256.clone()), ("outcome", outcome.word().to_string()), ("ms", ms.to_string())];
     pairs.extend(session.map(|s| ("session", s.to_string())));
+    pairs.extend(gen.map(|g| ("gen", g.to_string())));
     pairs.push(("why", why.word().to_string()));
     if let FetchOutcome::ChecksumMismatch { got_len: Some(n) } = outcome {
         pairs.push(("got_len", n.to_string()));
@@ -334,15 +337,17 @@ fn nameable_v(paths: &Paths, plan: &SessionPlan) -> Option<(ClaudeRef, u64)> {
 
 /// The generation's fetch after its first output (`PipelineEnd.after_output`): `Some` only when V is nameable and the
 /// VM names the cap; the link starts it only when V did not run (LD-6). `wait_s` 0, polled up to `CLAUDE_POLL_FOR`.
+/// Its row names generation `gen` and the chat's session as `session` reads it once the fetch ended: a new chat's id
+/// comes with its first turn's init, after the first output (the answer to the host's `initialize`) started the fetch.
 #[must_use]
-pub fn after_output<A: MicrovmApi + S3Sign + 'static>(plan: &SessionPlan, ctx: &Ctx, api: std::sync::Arc<A>, row: &VmRow, vm: &VmInfo, session: Option<String>) -> Option<AfterOutput> {
+pub fn after_output<A: MicrovmApi + S3Sign + 'static>(plan: &SessionPlan, ctx: &Ctx, api: std::sync::Arc<A>, row: &VmRow, vm: &VmInfo, gen: u32, session: impl Fn() -> Option<String> + 'static) -> Option<AfterOutput> {
     if !row_has_cap(row) {
         return None;
     }
     let (want, size) = nameable_v(&plan.paths, plan)?;
     let (ctx, row, vm) = (ctx_of(ctx), row.clone(), vm.clone());
     Some(AfterOutput(Box::pin(async move {
-        fetch_into(&ctx, &api, &row, &vm, &want, size, 0, CLAUDE_POLL_FOR, FetchWhy::AfterOutput, session.as_deref()).await;
+        fetch_into(&ctx, &api, &row, &vm, &want, size, 0, CLAUDE_POLL_FOR, FetchWhy::AfterOutput, &session, Some(gen)).await;
     })))
 }
 
@@ -355,7 +360,7 @@ pub fn prefetch_phase_a<A: MicrovmApi + S3Sign + 'static>(plan: &SessionPlan, ct
     let Some((want, size)) = nameable_v(&plan.paths, plan) else { return };
     let (ctx, row, vm, session) = (ctx_of(ctx), row.clone(), vm.clone(), plan.resume.clone());
     tokio::task::spawn_local(async move {
-        fetch_into(&ctx, &api, &row, &vm, &want, size, 0, CLAUDE_POLL_FOR, FetchWhy::PhaseA, session.as_deref()).await;
+        fetch_into(&ctx, &api, &row, &vm, &want, size, 0, CLAUDE_POLL_FOR, FetchWhy::PhaseA, &|| session.clone(), None).await;
     });
 }
 
@@ -443,7 +448,7 @@ pub async fn warm_fetch<A: MicrovmApi + S3Sign + 'static>(ctx: &Ctx, api: &std::
     let left = WARM_CLAUDE_WAIT.saturating_sub(t0.elapsed());
     let wait_s = u32::try_from(left.as_secs()).unwrap_or(u32::MAX).min(CLAUDE_WAIT_MAX_S);
     let why = if prewarm { FetchWhy::Prewarm } else { FetchWhy::Warm };
-    let outcome = fetch_into(ctx, api, row, vm, &cref, size, wait_s, left, why, None).await;
+    let outcome = fetch_into(ctx, api, row, vm, &cref, size, wait_s, left, why, &|| None, None).await;
     let secs = |d: Duration| format!("{:.1}", d.as_secs_f64());
     let staged = staged_in.is_some();
     match outcome {
@@ -476,6 +481,7 @@ mod tests {
     use crate::bridge::claude::Phase;
 
     const VM: &str = "microvm-claude01";
+    const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
 
     fn paths(dir: &std::path::Path) -> Paths {
         Paths::from_root_and_env(dir.join("bridge"), None)
@@ -496,7 +502,7 @@ mod tests {
     /// Applies `outcome` for `w` with a delete that records its call and answers `ok`.
     fn applied(p: &Paths, w: &ClaudeRef, outcome: &FetchOutcome, ok: bool) -> bool {
         let called = std::cell::Cell::new(false);
-        on_local(apply(p, VM, w, outcome, 1234, FetchWhy::AfterOutput, Some("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"), || {
+        on_local(apply(p, VM, w, outcome, 1234, FetchWhy::AfterOutput, Some(SID), Some(1), || {
             called.set(true);
             async move {
                 if ok {
@@ -510,8 +516,9 @@ mod tests {
     }
 
     /// A VM's 422 `checksum_mismatch`: the object deleted (the runtime key's DeleteObject), the record `stale`
-    /// with the report and the stage counted, `claude_object_bad` and `claude_fetch` written; a failed delete says
-    /// so. `cached` and `image` change nothing and write nothing.
+    /// with the report and the stage counted, `claude_object_bad` and `claude_fetch` written (its session, in the
+    /// envelope too, and its generation); a failed delete says so. `cached` and `image` change nothing and write
+    /// nothing.
     #[test]
     fn a_422_deletes_the_object_and_marks_it_stale() {
         let dir = tempfile::tempdir().unwrap();
@@ -535,6 +542,7 @@ mod tests {
         let fetch = rows(&p, "claude_fetch");
         assert_eq!(fetch.len(), 1);
         assert_eq!((fetch[0]["detail"]["outcome"].as_str(), fetch[0]["detail"]["why"].as_str(), fetch[0]["detail"]["got_len"].as_str()), (Some("checksum_mismatch"), Some("after_output"), Some("17")));
+        assert_eq!((fetch[0]["session_id"].as_str(), fetch[0]["detail"]["session"].as_str(), fetch[0]["detail"]["gen"].as_str()), (Some(SID), Some(SID), Some("1")));
         // A second VM's report of the same stage: counted as a report, never as a second stage; its delete failing is said.
         assert!(applied(&p, &w, &FetchOutcome::ChecksumMismatch { got_len: None }, false));
         let s = Record::load(&p, "2.1.310").unwrap().unwrap().staging.unwrap();
