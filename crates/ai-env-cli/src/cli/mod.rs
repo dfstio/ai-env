@@ -219,8 +219,8 @@ pub enum Cmd {
         /// One JSON document
         #[arg(long)]
         json: bool,
-        /// A Cost Explorer answer (aws ce get-cost-and-usage … --group-by Type=DIMENSION,Key=USAGE_TYPE) to judge the estimate against, over its own days
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["since", "until"])]
+        /// Cost Explorer's figures to judge the estimate against: the JSON of aws ce get-cost-and-usage … --group-by Type=DIMENSION,Key=USAGE_TYPE, or the console's CSV of costs by usage type, daily; over the file's days, or only those within --since/--until
+        #[arg(long, value_name = "FILE")]
         compare: Option<PathBuf>,
     },
     /// A local control panel on 127.0.0.1: sessions, VMs, the audit, settings diffs and cost; suspend, resume, migrate, terminate and refresh (one Touch ID each)
@@ -2215,6 +2215,9 @@ mod s11_tests {
         assert_eq!((since.as_deref(), until.as_deref()), (Some("7d"), Some("2026-10-23")));
         let Cmd::Cost { since: None, until: None, by: None, json: false, compare: Some(file) } = cmd(&["cost", "--compare", "ce.json"]) else { panic!("cost --compare") };
         assert_eq!(file, std::path::PathBuf::from("ce.json"));
+        // --since/--until narrow a --compare file to their days (one day of a longer console CSV).
+        let Cmd::Cost { since: Some(s), until: Some(u), compare: Some(_), .. } = cmd(&["cost", "--compare", "costs.csv", "--since", "2026-10-22", "--until", "2026-10-23"]) else { panic!("cost --compare --since --until") };
+        assert_eq!((s.as_str(), u.as_str()), ("2026-10-22", "2026-10-23"));
         let Cmd::Panel { cmd: PanelCmd::Serve { port: Some(0), bind: Some(bind) } } = cmd(&["panel", "serve", "--port", "0", "--bind", "127.0.0.1"]) else { panic!("panel serve") };
         assert_eq!(bind, "127.0.0.1");
         let Cmd::Panel { cmd: PanelCmd::Serve { port: None, bind: None } } = cmd(&["panel", "serve"]) else { panic!("panel serve's defaults") };
@@ -2223,8 +2226,6 @@ mod s11_tests {
             &["audit", "tail", "-n", "0"],
             &["audit", "tail", "--actor", "robot"],
             &["cost", "--by", "week"],
-            &["cost", "--compare", "f", "--since", "1d"],
-            &["cost", "--compare", "f", "--until", "1d"],
             &["panel", "serve", "--port", "70000"],
             &["panel"],
         ] {

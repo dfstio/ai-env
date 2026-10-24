@@ -17,9 +17,14 @@ use std::path::Path;
 /// The env name prefixes the env row judges.
 pub const ENV_PREFIXES: [&str; 8] = ["CLAUDE_", "ANTHROPIC_", "MCP_", "DISABLE_", "ENABLE_", "MAX_", "BASH_", "OTEL_"];
 /// Env names an extension sets that are reviewed and not forwarded: (name, why).
-/// Empty in phase 0: part B's P0 doctor run gives the first list, which the
-/// lead classifies (a step-L fix).
-pub const ENV_REVIEWED: &[(&str, &str)] = &[];
+/// Part B's P0 doctor run (24 Oct 2026) gave the first list, from the 2.1.301 to
+/// 2.1.303 windows' session rows; remote chats have run without each since S8.
+pub const ENV_REVIEWED: &[(&str, &str)] = &[
+    ("CLAUDE_CODE_CONFIG_PROBE", "marks the extension's config probe; remote probes have run without it since S8"),
+    ("CLAUDE_CODE_EMIT_STARTUP_TIMING", "start-up timing for the extension's own log; nothing remote reads it"),
+    ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "the question tool's preview format; remote chats have run without it since S8 (a forwarding candidate)"),
+    ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "the SDK's session-state reading; remote chats have run without it since S8 (a forwarding candidate)"),
+];
 /// The most names or flags one row lists before ` (+<k> more)`.
 pub const DRIFT_LIST_MAX: usize = 12;
 /// The most of one `extension.js` the view row reads.
