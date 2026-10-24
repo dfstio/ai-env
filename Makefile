@@ -117,11 +117,15 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
 	@echo "check-bins: ok"
 
+# S11: the integration tests hold more descriptors than macOS's default soft limit (256: `launchctl limit maxfiles`);
+# each test line raises its shell's soft limit to 10240 when it is lower (never lowers it, never fails the line).
+TEST_NOFILE = n=$$(ulimit -n); { [ "$$n" = unlimited ] || [ "$$n" -ge 10240 ]; } || ulimit -n 10240 2>/dev/null || true;
+
 test: ## Unit + integration tests in all four feature sets; S11: the audit is strict (AI_ENV_AUDIT_STRICT=1: an unregistered event or key fails its write)
-	AI_ENV_AUDIT_STRICT=1 $(CARGO) test --workspace
-	AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features
-	AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features shim
-	AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features bridge
+	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test --workspace
+	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features
+	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features shim
+	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features bridge
 
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
 # AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend; S7: the

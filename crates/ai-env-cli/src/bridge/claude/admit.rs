@@ -943,6 +943,22 @@ mod tests {
         assert_eq!(kept, [os("PATH", "/usr/bin:/bin"), os("HOME", "/h")]);
     }
 
+    /// The lock, retried for up to 5 s: between its fork and its exec, a child another test of this binary spawns
+    /// holds every descriptor of this process (close-on-exec ones too), so a lock this test just let go may read as
+    /// held for a moment.
+    fn take_soon(p: &Paths, version: &str) -> Option<VersionLock> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(l) = VersionLock::take(p, version).unwrap() {
+                return Some(l);
+            }
+            if std::time::Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn the_version_lock_is_single_flight_and_records_its_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -958,10 +974,10 @@ mod tests {
         held.finish("admitted");
         assert!(std::fs::read_to_string(p.claude_lock("2.1.308")).unwrap().ends_with("\noutcome=admitted\n"), "rewritten from its first byte");
         drop(held);
-        assert!(VersionLock::take(&p, "2.1.308").unwrap().is_some(), "released");
+        assert!(take_soon(&p, "2.1.308").is_some(), "released");
         // Handed over (D5): the other descriptor of the open file (the child's fd 3) keeps the lock after this
         // process's copy is dropped (a drop never unlocks); it goes with the last one.
-        let lock = VersionLock::take(&p, "2.1.308").unwrap().expect("free");
+        let lock = take_soon(&p, "2.1.308").expect("free");
         // SAFETY: dup(2) of the lock's open descriptor; the copy is closed below.
         let child = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&lock)) };
         assert!(child >= 0);
@@ -969,17 +985,17 @@ mod tests {
         assert!(VersionLock::take(&p, "2.1.308").unwrap().is_none(), "still held through the child's descriptor");
         // SAFETY: close(2) of the descriptor dup'ed above, once.
         unsafe { libc::close(child) };
-        assert!(VersionLock::take(&p, "2.1.308").unwrap().is_some(), "released with the last descriptor");
+        assert!(take_soon(&p, "2.1.308").is_some(), "released with the last descriptor");
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(p.claude_lock("2.1.308")).unwrap().permissions().mode() & 0o777, 0o600);
         // --auto: an exit without an outcome (an early `?`, a panic) writes `error(<step>)` from the drop; one
         // with an outcome is left as it is.
-        let mut auto = VersionLock::take(&p, "2.1.310").unwrap().expect("free");
+        let mut auto = take_soon(&p, "2.1.310").expect("free");
         auto.auto_step = Some("signature");
         drop(auto);
         let text = std::fs::read_to_string(p.claude_lock("2.1.310")).unwrap();
         assert!(text.starts_with("finished_at=") && text.ends_with("\noutcome=error(signature)\n"), "{text}");
-        let mut auto = VersionLock::take(&p, "2.1.310").unwrap().expect("free");
+        let mut auto = take_soon(&p, "2.1.310").expect("free");
         auto.auto_step = Some("docker");
         auto.finish("admitted");
         drop(auto);

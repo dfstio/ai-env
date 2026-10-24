@@ -896,6 +896,9 @@ struct VmSt {
     refused_rel: Option<String>,
     /// S11: each pulled part's `encoding`, in order.
     pull_encodings: Vec<Option<PartEncoding>>,
+    /// Each pulled part as it came (asked len, S3's status, the body's len, whether it matched): a failed pull's
+    /// test names them.
+    pull_parts: Vec<(u64, u16, u64, bool)>,
 }
 
 /// G5's shim as the Mac sees it: every request checked as the shim checks
@@ -1027,6 +1030,7 @@ impl DataPlane for FakeVm {
             let body = if status == 200 && encoded && p.encoding == Some(PartEncoding::Gzip) { gunzip(&body).unwrap_or_default() } else { body };
             let got = sha(&body);
             let ok = status == 200 && body.len() as u64 == p.len && p.sha256.as_ref().is_none_or(|s| *s == got);
+            self.st.lock().unwrap().pull_parts.push((p.len, status, body.len() as u64, ok));
             reports.push(PullPartReport { s3_status: status, len: body.len() as u64, sha256: got, ok });
             if !ok {
                 return Ok(DpReply::ok(200, TranscriptPullReply { written: false, size: old_size, sha256: None, parts: reports }));
@@ -1624,7 +1628,10 @@ fn a_reopen_pulls_at_most_the_inline_cap_and_the_retry_any_size() {
     }
     assert_eq!(pulled(), ["failed"], "no pull audited since");
     // No deadline: the same chat, pulled whole.
-    assert_eq!(r.restore_within(&builder, None).unwrap(), TranscriptOutcome::Restored { parts: 2, bytes: INLINE_MAX + 100 });
+    let whole = r.restore_within(&builder, None);
+    let parts = r.vm.st.lock().unwrap().pull_parts.clone();
+    let asked: Vec<(String, String, u16)> = r.w.s3.requests().iter().filter(|q| q.method == "GET").map(|q| (q.key.clone(), q.method.clone(), q.status)).collect();
+    assert_eq!(whole.as_ref().ok(), Some(&TranscriptOutcome::Restored { parts: 2, bytes: INLINE_MAX + 100 }), "{whole:?}; the VM's parts (asked len, status, got len, ok): {parts:?}; S3's GETs: {asked:?}");
     assert!(r.vm.file().unwrap() == [base.as_slice(), tail.as_slice()].concat(), "the base, then the tail");
     assert_eq!(pulled(), ["failed", "written"]);
     let rows = r.w.rows("transcript_pull");
